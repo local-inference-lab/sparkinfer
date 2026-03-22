@@ -43,8 +43,8 @@ import functools
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
-from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa
-from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfb
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.utils.blockscaled_layout import BlockScaledBasicChunk
 
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -79,6 +79,51 @@ def _patched_extract(self):
 
 
 utils.PersistentTileSchedulerParams.__extract_mlir_values__ = _patched_extract
+
+
+# Local reimplementation of the old sm120_make_smem_layout_sfa/sfb which
+# produced simple 3D (MN, K, STAGE) layouts.  The upstream cutlass library
+# renamed these to make_smem_layout_sfa/sfb and changed them to produce 4D
+# layouts with tiled_divide/logical_divide structure for tcgen05 MMA, which
+# is incompatible with the warp-level MMA access patterns in this kernel.
+@dsl_user_op
+def make_smem_layout_sfa(
+    tiled_mma, tile_shape_mnk, sf_vec_size, num_stages,
+    *, loc=None, ip=None,
+):
+    tile_shape = (
+        tile_shape_mnk[0] // cute.size(tiled_mma.thr_id.shape),
+        tile_shape_mnk[2],
+    )
+    smem_layout = cute.tile_to_shape(
+        BlockScaledBasicChunk(sf_vec_size).layout, tile_shape, (2, 1),
+    )
+    return cute.append(
+        smem_layout,
+        cute.make_layout(
+            num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout)),
+        ),
+    )
+
+
+@dsl_user_op
+def make_smem_layout_sfb(
+    tiled_mma, tile_shape_mnk, sf_vec_size, num_stages,
+    *, loc=None, ip=None,
+):
+    tile_shape = (
+        cute.round_up(tile_shape_mnk[1], 128),
+        tile_shape_mnk[2],
+    )
+    smem_layout = cute.tile_to_shape(
+        BlockScaledBasicChunk(sf_vec_size).layout, tile_shape, (2, 1),
+    )
+    return cute.append(
+        smem_layout,
+        cute.make_layout(
+            num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout)),
+        ),
+    )
 
 
 class DenseGemmKernel:
@@ -180,13 +225,13 @@ class DenseGemmKernel:
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
         # Compute the smem size of SFA/SFB
-        sfa_smem_layout_per_stage = sm120_make_smem_layout_sfa(
+        sfa_smem_layout_per_stage = make_smem_layout_sfa(
             self.tiled_mma,
             self.tile_shape_mnk,
             self.sf_vec_size,
             1,
         )
-        sfb_smem_layout_per_stage = sm120_make_smem_layout_sfb(
+        sfb_smem_layout_per_stage = make_smem_layout_sfb(
             self.tiled_mma,
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -1266,13 +1311,13 @@ class DenseGemmKernel:
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 
-        sfa_smem_layout_staged = sm120_make_smem_layout_sfa(
+        sfa_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma,
             tile_shape_mnk,
             sf_vec_size,
             ab_stage,
         )
-        sfb_smem_layout_staged = sm120_make_smem_layout_sfb(
+        sfb_smem_layout_staged = make_smem_layout_sfb(
             tiled_mma,
             tile_shape_mnk,
             sf_vec_size,

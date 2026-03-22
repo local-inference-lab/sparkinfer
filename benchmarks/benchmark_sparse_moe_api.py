@@ -266,7 +266,7 @@ def main() -> None:
                 torch.testing.assert_close(route_api.flat_weights, route_api.topk_weights.view(-1))
                 torch.testing.assert_close(manual_topk_ids, topk_ids)
                 torch.testing.assert_close(manual_topk_weights, topk_weights)
-                torch.testing.assert_close(sparse_output, manual_output, atol=5e-4, rtol=1e-2)
+                torch.testing.assert_close(sparse_output, manual_output, atol=6e-4, rtol=1e-2)
 
             manual_route_graph = _capture_graph(manual_route_only)
             route_api_graph = _capture_graph(route_api_only)

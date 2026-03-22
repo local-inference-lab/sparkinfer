@@ -111,8 +111,8 @@ from b12x.cute.fp4 import (
 )
 from b12x.gemm.dense import (
     DenseGemmKernel,
-    sm120_make_smem_layout_sfa,
-    sm120_make_smem_layout_sfb,
+    make_smem_layout_sfa,
+    make_smem_layout_sfb,
 )
 from b12x.cute.fp4 import scatter_add_bf16x2
 
@@ -383,10 +383,10 @@ class MoEStaticKernel:
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
-        sfa_smem = sm120_make_smem_layout_sfa(
+        sfa_smem = make_smem_layout_sfa(
             self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, 1,
         )
-        sfb_smem = sm120_make_smem_layout_sfb(
+        sfb_smem = make_smem_layout_sfb(
             self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, 1,
         )
 

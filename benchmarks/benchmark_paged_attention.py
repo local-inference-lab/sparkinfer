@@ -254,7 +254,7 @@ def _capture_b12x_graph(
         causal=True,
         num_splits=num_splits,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
     def run() -> None:
         b12x_paged_attention_forward(
@@ -266,6 +266,7 @@ def _capture_b12x_graph(
             cu_seqlens_q,
             workspace=workspace,
             plan=plan,
+            output=workspace.output,
             k_descale=k_descale,
             v_descale=v_descale,
         )
