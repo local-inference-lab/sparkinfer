@@ -34,7 +34,7 @@ def test_prefix_cache_enabled_for_tp_hybrid_with_snapshots():
     )
 
 
-def test_layer_compile_disabled_by_default():
+def test_layer_compile_disabled_when_explicitly_disabled():
     assert not _should_enable_layer_compile(
         is_hybrid=False,
         compile_layers=False,

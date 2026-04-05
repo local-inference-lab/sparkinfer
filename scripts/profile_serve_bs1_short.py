@@ -216,6 +216,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    os.environ.setdefault("B12X_ENABLE_PROFILE_RANGES", "1")
+
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
     launch_tp(
         _profile_worker,

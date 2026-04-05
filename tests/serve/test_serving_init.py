@@ -78,6 +78,8 @@ def test_serving_engine_passes_runtime_limits_to_model_runner(monkeypatch):
     assert runner_kwargs["max_batch_size"] == 256
     assert runner_kwargs["max_total_tokens"] == 16384
     assert engine.runtime_policy()["max_running"] == 256
+    assert engine.runtime_policy()["compile_layers"] is True
+    assert engine.runtime_policy()["capture_prefill_graph"] is False
 
 
 def test_serving_engine_enables_hybrid_layer_compile_without_legacy_warmup(monkeypatch):
@@ -184,10 +186,107 @@ def test_serving_engine_skips_decode_warmup_when_decode_graphs_are_enabled(monke
         "/tmp/fake-model",
         device="cpu",
         graph_batch_sizes=[1, 2, 4],
+        compile_layers=False,
     )
 
     assert len(warmup_kwargs) == 1
     assert warmup_kwargs[0]["warm_decode"] is False
+
+
+def test_serving_engine_does_not_capture_prefill_graph_by_default(monkeypatch):
+    cfg = SimpleNamespace(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        vocab_size=16,
+        layer_types=None,
+    )
+    fake_model = SimpleNamespace(config=cfg)
+    capture_kwargs = []
+
+    class _FakeRunner:
+        def __init__(self, model, kv_mgr, **kwargs):
+            del model, kv_mgr, kwargs
+
+        def warmup(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+        def capture_decode_graphs(self, *args, **kwargs):
+            del args
+            capture_kwargs.append(dict(kwargs))
+
+        def compile_model(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+    monkeypatch.setattr("serve.engine.serving.load_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("serve.engine.serving.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr("serve.engine.serving._estimate_loaded_model_bytes", lambda model: 0)
+    monkeypatch.setattr("serve.engine.serving.PagePool", _FakePagePool)
+    monkeypatch.setattr("serve.engine.serving.PrefixCheckpointCache", lambda pool, state_arena=None: SimpleNamespace(pool=pool))
+    monkeypatch.setattr("serve.engine.serving.start_startup_session", lambda: None)
+    monkeypatch.setattr("torch.cuda.mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
+    monkeypatch.setattr("serve.engine.runner.ModelRunner", _FakeRunner)
+
+    ServingEngine(
+        "/tmp/fake-model",
+        device="cpu",
+        graph_batch_sizes=[1, 2, 4],
+    )
+
+    assert len(capture_kwargs) == 1
+    assert capture_kwargs[0]["batch_sizes"] == [1, 2, 4]
+    assert capture_kwargs[0]["prefill_chunk_size"] is None
+
+
+def test_serving_engine_can_opt_into_prefill_graph_capture(monkeypatch):
+    cfg = SimpleNamespace(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        vocab_size=16,
+        layer_types=None,
+    )
+    fake_model = SimpleNamespace(config=cfg)
+    capture_kwargs = []
+
+    class _FakeRunner:
+        def __init__(self, model, kv_mgr, **kwargs):
+            del model, kv_mgr, kwargs
+
+        def warmup(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+        def capture_decode_graphs(self, *args, **kwargs):
+            del args
+            capture_kwargs.append(dict(kwargs))
+
+        def compile_model(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+    monkeypatch.setattr("serve.engine.serving.load_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("serve.engine.serving.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr("serve.engine.serving._estimate_loaded_model_bytes", lambda model: 0)
+    monkeypatch.setattr("serve.engine.serving.PagePool", _FakePagePool)
+    monkeypatch.setattr("serve.engine.serving.PrefixCheckpointCache", lambda pool, state_arena=None: SimpleNamespace(pool=pool))
+    monkeypatch.setattr("serve.engine.serving.start_startup_session", lambda: None)
+    monkeypatch.setattr("torch.cuda.mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
+    monkeypatch.setattr("serve.engine.runner.ModelRunner", _FakeRunner)
+
+    ServingEngine(
+        "/tmp/fake-model",
+        device="cpu",
+        graph_batch_sizes=[1, 2, 4],
+        capture_prefill_graph=True,
+        prefill_chunk_size=1024,
+    )
+
+    assert len(capture_kwargs) == 1
+    assert capture_kwargs[0]["batch_sizes"] == [1, 2, 4]
+    assert capture_kwargs[0]["prefill_chunk_size"] == 1024
 
 
 def test_paged_attention_uses_extend_workspace_for_unsupported_decode_shapes():

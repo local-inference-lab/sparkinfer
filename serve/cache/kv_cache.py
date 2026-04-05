@@ -11,7 +11,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import torch
-from torch.profiler import record_function
+
+from b12x.profiling import record_function
 
 from serve.cache.page_pool import PagePool, _PAGE_SIZE
 

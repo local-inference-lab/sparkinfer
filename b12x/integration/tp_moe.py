@@ -10,13 +10,14 @@ import cutlass
 import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
-from torch.profiler import record_function
 
-from b12x.cute.fp4 import align_up, as_grouped_scale_view
+from b12x.cute.fp4 import align_up, as_grouped_scale_view, quantize_grouped_nvfp4_torch
+from b12x.profiling import record_function
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
 from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
 from b12x.integration.triton_route import route_topk as triton_route_topk
 from b12x.moe.fused import MoEDynamicKernel, MoEMicroKernel, MoEStaticKernel
+from b12x.moe.fused.pre_mlp_route_pack import build_compact_route_metadata
 from b12x.moe.tuning import lookup_max_active_clusters
 
 _NVFP4_BLOCK_SIZE = 16
@@ -24,6 +25,7 @@ _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 2
+_TILE_AMAX_GS_RCP = 1.0 / (6.0 * 448.0)
 
 
 @dataclass(kw_only=True)
@@ -50,6 +52,8 @@ class TPMoEWorkspace:
     packed_a_flat: torch.Tensor | None = None
     scale_flat: torch.Tensor | None = None
     packed_a_storage_ptr: object = None
+    fc1_tile_scale: torch.Tensor | None = None
+    fc1_tile_alpha: torch.Tensor | None = None
     route_workspace: "_TPRouteWorkspace | None" = None
 
 
@@ -127,6 +131,169 @@ class B12XTopKRouting:
     router_logits: torch.Tensor | None = None
     flat_ids: torch.Tensor | None = None
     flat_weights: torch.Tensor | None = None
+
+
+def _expand_expert_vector(
+    values: torch.Tensor,
+    expected_experts: int,
+    *,
+    name: str,
+) -> torch.Tensor:
+    flat = values.reshape(-1)
+    if flat.numel() == 1:
+        return flat.expand(expected_experts).contiguous()
+    if flat.numel() != expected_experts:
+        raise ValueError(
+            f"{name} expert mismatch: expected {expected_experts}, got {flat.numel()}"
+        )
+    return flat.contiguous()
+
+
+def _append_expert_bank(
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+) -> B12XFP4ExpertWeights:
+    """Append a single shared expert as a virtual extra expert bank."""
+    sparse_E = sparse_experts.w1_fp4.shape[0]
+    shared_E = shared_expert.w1_fp4.shape[0]
+    if shared_E <= 0:
+        raise ValueError("shared_expert must contain at least one expert")
+    if sparse_experts.w1_fp4.shape[1:] != shared_expert.w1_fp4.shape[1:]:
+        raise ValueError(
+            "shared_expert w1 shape mismatch: expected "
+            f"{tuple(sparse_experts.w1_fp4.shape[1:])}, got {tuple(shared_expert.w1_fp4.shape[1:])}"
+        )
+    if sparse_experts.w2_fp4.shape[1:] != shared_expert.w2_fp4.shape[1:]:
+        raise ValueError(
+            "shared_expert w2 shape mismatch: expected "
+            f"{tuple(sparse_experts.w2_fp4.shape[1:])}, got {tuple(shared_expert.w2_fp4.shape[1:])}"
+        )
+    if sparse_experts.w1_blockscale.shape[1:] != shared_expert.w1_blockscale.shape[1:]:
+        raise ValueError(
+            "shared_expert w1 blockscale mismatch: expected "
+            f"{tuple(sparse_experts.w1_blockscale.shape[1:])}, got {tuple(shared_expert.w1_blockscale.shape[1:])}"
+        )
+    if sparse_experts.w2_blockscale.shape[1:] != shared_expert.w2_blockscale.shape[1:]:
+        raise ValueError(
+            "shared_expert w2 blockscale mismatch: expected "
+            f"{tuple(sparse_experts.w2_blockscale.shape[1:])}, got {tuple(shared_expert.w2_blockscale.shape[1:])}"
+        )
+    return B12XFP4ExpertWeights(
+        a1_gscale=torch.cat(
+            [
+                _expand_expert_vector(
+                    sparse_experts.a1_gscale,
+                    sparse_E,
+                    name="sparse_experts.a1_gscale",
+                ),
+                _expand_expert_vector(
+                    shared_expert.a1_gscale,
+                    shared_E,
+                    name="shared_expert.a1_gscale",
+                ),
+            ]
+        ).contiguous(),
+        w1_fp4=torch.cat([sparse_experts.w1_fp4, shared_expert.w1_fp4], dim=0).contiguous(),
+        w1_blockscale=torch.cat(
+            [sparse_experts.w1_blockscale, shared_expert.w1_blockscale],
+            dim=0,
+        ).contiguous(),
+        w1_alphas=torch.cat(
+            [
+                _expand_expert_vector(
+                    sparse_experts.w1_alphas,
+                    sparse_E,
+                    name="sparse_experts.w1_alphas",
+                ),
+                _expand_expert_vector(
+                    shared_expert.w1_alphas,
+                    shared_E,
+                    name="shared_expert.w1_alphas",
+                ),
+            ]
+        ).contiguous(),
+        a2_gscale=torch.cat(
+            [
+                _expand_expert_vector(
+                    sparse_experts.a2_gscale,
+                    sparse_E,
+                    name="sparse_experts.a2_gscale",
+                ),
+                _expand_expert_vector(
+                    shared_expert.a2_gscale,
+                    shared_E,
+                    name="shared_expert.a2_gscale",
+                ),
+            ]
+        ).contiguous(),
+        w2_fp4=torch.cat([sparse_experts.w2_fp4, shared_expert.w2_fp4], dim=0).contiguous(),
+        w2_blockscale=torch.cat(
+            [sparse_experts.w2_blockscale, shared_expert.w2_blockscale],
+            dim=0,
+        ).contiguous(),
+        w2_alphas=torch.cat(
+            [
+                _expand_expert_vector(
+                    sparse_experts.w2_alphas,
+                    sparse_E,
+                    name="sparse_experts.w2_alphas",
+                ),
+                _expand_expert_vector(
+                    shared_expert.w2_alphas,
+                    shared_E,
+                    name="shared_expert.w2_alphas",
+                ),
+            ]
+        ).contiguous(),
+    )
+
+
+def _shared_expert_gate_weights(
+    hidden_states: torch.Tensor,
+    *,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    gate = F.linear(hidden_states, gate_weight, gate_bias)
+    return torch.sigmoid(gate).to(torch.float32)
+
+
+def _append_shared_expert_routing(
+    sparse_routing: B12XTopKRouting,
+    *,
+    shared_gate_weights: torch.Tensor,
+    shared_expert_id: int,
+) -> B12XTopKRouting:
+    if shared_gate_weights.ndim == 1:
+        shared_gate_weights = shared_gate_weights.unsqueeze(-1)
+    if shared_gate_weights.ndim != 2 or shared_gate_weights.shape[1] != 1:
+        raise ValueError(
+            "shared_gate_weights must have shape [num_tokens, 1], got "
+            f"{tuple(shared_gate_weights.shape)}"
+        )
+    if shared_gate_weights.shape[0] != sparse_routing.topk_ids.shape[0]:
+        raise ValueError(
+            "shared_gate_weights batch mismatch: expected "
+            f"{sparse_routing.topk_ids.shape[0]}, got {shared_gate_weights.shape[0]}"
+        )
+    shared_ids = torch.full(
+        (shared_gate_weights.shape[0], 1),
+        shared_expert_id,
+        dtype=sparse_routing.topk_ids.dtype,
+        device=sparse_routing.topk_ids.device,
+    )
+    topk_ids = torch.cat([sparse_routing.topk_ids, shared_ids], dim=1).contiguous()
+    topk_weights = torch.cat(
+        [sparse_routing.topk_weights.to(torch.float32), shared_gate_weights.to(torch.float32)],
+        dim=1,
+    ).contiguous()
+    return B12XTopKRouting(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=sparse_routing.router_logits,
+        flat_ids=topk_ids.reshape(-1).contiguous(),
+        flat_weights=topk_weights.reshape(-1).contiguous(),
+    )
 
 
 @dataclass(kw_only=True)
@@ -227,6 +394,7 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 
 _FAST_MATH_DEFAULT = _env_flag("B12X_FAST_MATH", default=True)
+_FC2_TILE_AMAX_ENV = "B12X_MOE_FC2_TILE_AMAX"
 
 
 def _first_env(*names: str) -> str | None:
@@ -235,6 +403,10 @@ def _first_env(*names: str) -> str | None:
         if value is not None:
             return value
     return None
+
+
+def _effective_fc2_tile_amax(fc2_tile_amax: bool) -> bool:
+    return fc2_tile_amax or _env_flag(_FC2_TILE_AMAX_ENV, default=False)
 
 
 def _get_static_compact_cutover_pairs() -> int:
@@ -319,6 +491,66 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
         if scale.numel() != weight_E:
             raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
         return _get_plain_cuda_tensor(scale, dtype=torch.float32)
+
+
+def _effective_input_scales(
+    scale: torch.Tensor,
+    weight_E: int,
+    *,
+    input_scales_are_reciprocal: bool,
+) -> torch.Tensor:
+    prepared = _prepare_expert_scale(scale, weight_E)
+    if not input_scales_are_reciprocal:
+        return prepared
+    reciprocal = torch.zeros_like(prepared)
+    nonzero = prepared != 0
+    reciprocal[nonzero] = prepared[nonzero].reciprocal()
+    return reciprocal
+
+
+def _grouped_scale_view_to_swizzled_u8(
+    scale_view: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    rows_padded = align_up(rows, 128)
+    cols_padded = align_up(cols // _NVFP4_BLOCK_SIZE, 4)
+    swizzled = scale_view.permute(5, 2, 4, 0, 1, 3).contiguous()
+    swizzled = swizzled.reshape(scale_view.shape[-1], rows_padded, cols_padded)
+    return swizzled.view(torch.uint8)
+
+
+def _quantize_routed_tile_nvfp4(
+    rows_f32: torch.Tensor,
+    *,
+    hidden_size: int,
+    tile_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = rows_f32.device
+    valid_rows = rows_f32.shape[0]
+    cols_pad = align_up(hidden_size // _NVFP4_BLOCK_SIZE, 4)
+    packed = torch.zeros((_LEVEL_TILE_M, hidden_size // 2), dtype=torch.uint8, device=device)
+    swizzled = torch.zeros((_LEVEL_TILE_M, cols_pad), dtype=torch.uint8, device=device)
+    if valid_rows == 0:
+        return packed, swizzled
+    tile_amax = float(rows_f32.abs().amax().item())
+    if tile_amax == 0.0:
+        return packed, swizzled
+
+    tile = torch.zeros((1, _LEVEL_TILE_M, hidden_size), dtype=torch.float32, device=device)
+    tile[0, :valid_rows].copy_(rows_f32)
+    row_counts = torch.tensor([valid_rows], dtype=torch.int32, device=device)
+    global_scale = torch.tensor([tile_scale], dtype=torch.float32, device=device)
+    packed_grouped, scale_view = quantize_grouped_nvfp4_torch(tile, row_counts, global_scale)
+    packed.copy_(packed_grouped[..., 0])
+    swizzled.copy_(_grouped_scale_view_to_swizzled_u8(scale_view, rows=_LEVEL_TILE_M, cols=hidden_size)[0])
+    return packed, swizzled
+
+
+def _flatten_token_indices(topk_ids: torch.Tensor) -> torch.Tensor:
+    num_tokens, top_k = topk_ids.shape
+    return torch.arange(num_tokens, device=topk_ids.device, dtype=torch.int32).repeat_interleave(top_k)
 
 
 def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -577,6 +809,7 @@ def _alloc_workspace(
 
     if implementation == "static":
         static_rows_pad_k = align_up(max_rows, 128)
+        static_tile_count = static_rows_pad_k // _LEVEL_TILE_M
         workspace = TPCompactStaticWorkspace(
             **common_kwargs,
             routed_rows_capacity=routed_rows,
@@ -584,6 +817,8 @@ def _alloc_workspace(
             token_weights=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
             packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
             packed_input_scale=torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
+            fc1_tile_scale=torch.empty(state_E, static_tile_count, dtype=torch.float32, device=device),
+            fc1_tile_alpha=torch.empty(state_E, static_tile_count, dtype=torch.float32, device=device),
             active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
             weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
             global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
@@ -607,6 +842,8 @@ def _alloc_workspace(
         token_weights=torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device),
         packed_input=torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device),
         packed_input_scale=torch.empty(dynamic_rows_padded, cols_pad_k, dtype=torch.uint8, device=device),
+        fc1_tile_scale=torch.empty(dynamic_tiles, dtype=torch.float32, device=device),
+        fc1_tile_alpha=torch.empty(dynamic_tiles, dtype=torch.float32, device=device),
         expert_write_rows=torch.zeros(state_E, dtype=torch.int32, device=device),
         expert_tile_base=torch.zeros(state_E + 1, dtype=torch.int32, device=device),
         input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
@@ -1047,6 +1284,401 @@ def allocate_tp_moe_workspace_pool() -> TPMoEWorkspacePool:
     return TPMoEWorkspacePool()
 
 
+def _cpu_routed_pairs(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> list[tuple[int, int, float]]:
+    ids_cpu = topk_ids.to(device="cpu", dtype=torch.int64)
+    weights_cpu = topk_weights.to(device="cpu", dtype=torch.float32)
+    routed: list[tuple[int, int, float]] = []
+    for token_idx in range(ids_cpu.shape[0]):
+        for slot_idx in range(ids_cpu.shape[1]):
+            routed.append(
+                (
+                    token_idx,
+                    int(ids_cpu[token_idx, slot_idx].item()),
+                    float(weights_cpu[token_idx, slot_idx].item()),
+                )
+            )
+    return routed
+
+
+def _choose_fc1_tile_scale(
+    rows_f32: torch.Tensor,
+    *,
+    expert_scale: float,
+    fc1_tile_amax: bool,
+) -> float:
+    if not fc1_tile_amax:
+        return expert_scale if expert_scale > 0.0 else 1.0
+    tile_amax = float(rows_f32.abs().amax().item()) if rows_f32.numel() > 0 else 0.0
+    if tile_amax == 0.0:
+        return expert_scale if expert_scale > 0.0 else 1.0
+    return tile_amax * _TILE_AMAX_GS_RCP
+
+
+def _populate_static_prequantized_workspace_host(
+    workspace: TPCompactStaticWorkspace,
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    fc1_tile_amax: bool,
+) -> None:
+    device = a.device
+    hidden_size = a.shape[1]
+    routed = _cpu_routed_pairs(topk_ids, topk_weights)
+
+    expert_to_local: dict[int, int] = {}
+    routed_rows: list[list[tuple[int, float]]] = []
+    for token_idx, expert_idx, router_weight in routed:
+        local_idx = expert_to_local.get(expert_idx)
+        if local_idx is None:
+            local_idx = len(routed_rows)
+            expert_to_local[expert_idx] = local_idx
+            routed_rows.append([])
+        routed_rows[local_idx].append((token_idx, router_weight))
+
+    workspace.row_counts.zero_()
+    workspace.token_map.zero_()
+    workspace.token_weights.zero_()
+    workspace.packed_input.zero_()
+    workspace.packed_input_scale.zero_()
+    workspace.fc1_tile_scale.zero_()
+    workspace.fc1_tile_alpha.zero_()
+    workspace.active_expert_count.zero_()
+    workspace.weight_expert_ids.zero_()
+    workspace.global_to_local_expert.fill_(-1)
+    workspace.active_expert_count[0] = len(routed_rows)
+
+    for expert_idx, local_idx in expert_to_local.items():
+        workspace.weight_expert_ids[local_idx] = expert_idx
+        workspace.global_to_local_expert[expert_idx] = local_idx
+        entries = routed_rows[local_idx]
+        row_count = len(entries)
+        workspace.row_counts[local_idx] = row_count
+        if row_count == 0:
+            continue
+
+        token_idx = torch.tensor([tok for tok, _ in entries], dtype=torch.int32, device=device)
+        token_weights_t = torch.tensor([w for _, w in entries], dtype=torch.float32, device=device)
+        workspace.token_map[local_idx, :row_count].copy_(token_idx)
+        workspace.token_weights[local_idx, :row_count].copy_(token_weights_t)
+
+        expert_scale = float(expert_input_scale[expert_idx].item())
+        expert_alpha_value = float(expert_alpha[expert_idx].item())
+        for tile_idx, start in enumerate(range(0, row_count, _LEVEL_TILE_M)):
+            end = min(start + _LEVEL_TILE_M, row_count)
+            gather_idx = torch.tensor(
+                [tok for tok, _ in entries[start:end]],
+                dtype=torch.long,
+                device=device,
+            )
+            tile_rows = a.index_select(0, gather_idx).float()
+            tile_scale = _choose_fc1_tile_scale(
+                tile_rows,
+                expert_scale=expert_scale,
+                fc1_tile_amax=fc1_tile_amax,
+            )
+            packed_tile, swizzled_tile = _quantize_routed_tile_nvfp4(
+                tile_rows,
+                hidden_size=hidden_size,
+                tile_scale=tile_scale,
+            )
+            workspace.packed_input[local_idx, start:end].copy_(packed_tile[: end - start])
+            tile_row_base = tile_idx * _LEVEL_TILE_M
+            workspace.packed_input_scale[
+                local_idx,
+                tile_row_base : tile_row_base + _LEVEL_TILE_M,
+            ].copy_(swizzled_tile)
+            workspace.fc1_tile_scale[local_idx, tile_idx] = tile_scale
+            if expert_scale > 0.0:
+                workspace.fc1_tile_alpha[local_idx, tile_idx] = expert_alpha_value * (tile_scale / expert_scale)
+            else:
+                workspace.fc1_tile_alpha[local_idx, tile_idx] = expert_alpha_value
+
+
+def _populate_static_prequantized_workspace_device(
+    workspace: TPCompactStaticWorkspace,
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    fc1_tile_amax: bool,
+) -> None:
+    device = a.device
+    hidden_size = a.shape[1]
+
+    workspace.row_counts.zero_()
+    workspace.token_map.zero_()
+    workspace.token_weights.zero_()
+    workspace.packed_input.zero_()
+    workspace.packed_input_scale.zero_()
+    workspace.fc1_tile_scale.zero_()
+    workspace.fc1_tile_alpha.zero_()
+    workspace.active_expert_count.zero_()
+    workspace.weight_expert_ids.zero_()
+    workspace.global_to_local_expert.fill_(-1)
+
+    metadata = build_compact_route_metadata(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        weight_E=workspace.weight_E,
+    )
+    active_expert_count = metadata.active_expert_count
+    workspace.active_expert_count[0] = active_expert_count
+    if active_expert_count == 0:
+        return
+
+    workspace.weight_expert_ids[:active_expert_count].copy_(metadata.weight_expert_ids)
+    workspace.global_to_local_expert.copy_(metadata.local_of_global)
+    workspace.row_counts[:active_expert_count].copy_(metadata.counts)
+    workspace.token_map[metadata.sorted_local, metadata.row_idx] = metadata.sorted_tokens
+    workspace.token_weights[metadata.sorted_local, metadata.row_idx] = metadata.sorted_weights
+
+    counts_cpu = metadata.counts.tolist()
+    weight_expert_ids_cpu = metadata.weight_expert_ids.tolist()
+    start = 0
+    cols_pad_k = workspace.packed_input_scale.shape[-1]
+    for local_idx, (expert_idx, row_count) in enumerate(zip(weight_expert_ids_cpu, counts_cpu)):
+        if row_count == 0:
+            continue
+        token_idx = metadata.sorted_tokens[start : start + row_count].to(torch.long)
+        rows_f32 = a.index_select(0, token_idx).float()
+        num_tiles = (row_count + _LEVEL_TILE_M - 1) // _LEVEL_TILE_M
+        rows_pad = num_tiles * _LEVEL_TILE_M
+        tile_rows = torch.zeros((num_tiles, _LEVEL_TILE_M, hidden_size), dtype=torch.float32, device=device)
+        tile_rows.view(rows_pad, hidden_size)[:row_count].copy_(rows_f32)
+        row_counts = torch.full((num_tiles,), _LEVEL_TILE_M, dtype=torch.int32, device=device)
+        row_counts[-1] = row_count - (num_tiles - 1) * _LEVEL_TILE_M
+
+        expert_scale = float(expert_input_scale[expert_idx].item())
+        tile_scale_values = []
+        for tile_idx in range(num_tiles):
+            valid_rows = int(row_counts[tile_idx].item())
+            tile_scale_values.append(
+                _choose_fc1_tile_scale(
+                    tile_rows[tile_idx, :valid_rows],
+                    expert_scale=expert_scale,
+                    fc1_tile_amax=fc1_tile_amax,
+                )
+            )
+        tile_scale = torch.tensor(tile_scale_values, dtype=torch.float32, device=device)
+
+        packed_grouped, scale_view = quantize_grouped_nvfp4_torch(tile_rows, row_counts, tile_scale)
+        packed_tiles = packed_grouped.permute(2, 0, 1).contiguous().view(rows_pad, hidden_size // 2)
+        swizzled_tiles = _grouped_scale_view_to_swizzled_u8(
+            scale_view,
+            rows=_LEVEL_TILE_M,
+            cols=hidden_size,
+        ).view(num_tiles * _LEVEL_TILE_M, cols_pad_k)
+        workspace.packed_input[local_idx, :row_count].copy_(packed_tiles[:row_count])
+        workspace.packed_input_scale[local_idx, :rows_pad].copy_(swizzled_tiles)
+        workspace.fc1_tile_scale[local_idx, :num_tiles].copy_(tile_scale)
+
+        expert_alpha_value = float(expert_alpha[expert_idx].item())
+        if expert_scale > 0.0:
+            workspace.fc1_tile_alpha[local_idx, :num_tiles].copy_(
+                torch.tensor(
+                    [expert_alpha_value * (scale / expert_scale) for scale in tile_scale_values],
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+        else:
+            workspace.fc1_tile_alpha[local_idx, :num_tiles].fill_(expert_alpha_value)
+        start += row_count
+
+
+def _populate_dynamic_prequantized_workspace_host(
+    workspace: TPDynamicWorkspace,
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    n: int,
+    fc1_tile_amax: bool,
+) -> None:
+    device = a.device
+    hidden_size = a.shape[1]
+    routed = _cpu_routed_pairs(topk_ids, topk_weights)
+    rows_by_expert: list[list[tuple[int, float]]] = [[] for _ in range(workspace.weight_E)]
+    for token_idx, expert_idx, router_weight in routed:
+        rows_by_expert[expert_idx].append((token_idx, router_weight))
+
+    workspace.row_counts.zero_()
+    workspace.token_map.zero_()
+    workspace.token_weights.zero_()
+    workspace.packed_input.zero_()
+    workspace.packed_input_scale.zero_()
+    workspace.fc1_tile_scale.zero_()
+    workspace.fc1_tile_alpha.zero_()
+    workspace.expert_write_rows.zero_()
+    workspace.expert_tile_base.zero_()
+    workspace.pair_head.zero_()
+    workspace.producers_done_count.zero_()
+    workspace.all_work_published.zero_()
+    workspace.task_head.zero_()
+    workspace.task_tail.zero_()
+    workspace.task_ready.zero_()
+    workspace.task_expert.zero_()
+    workspace.task_m_tile.zero_()
+    workspace.task_slice_begin.zero_()
+    workspace.task_slice_count.zero_()
+    workspace.task_valid_rows.zero_()
+    workspace.tile_write_count.zero_()
+
+    tile_acc = 0
+    for expert_idx, entries in enumerate(rows_by_expert):
+        row_count = len(entries)
+        workspace.row_counts[expert_idx] = row_count
+        workspace.expert_tile_base[expert_idx] = tile_acc
+        tile_acc += (row_count + _LEVEL_TILE_M - 1) // _LEVEL_TILE_M
+    workspace.expert_tile_base[workspace.weight_E] = tile_acc
+    if tile_acc > workspace.physical_tiles_capacity:
+        raise ValueError(
+            "prequantized dynamic workspace physical-tile capacity mismatch: "
+            f"expected at least {tile_acc}, got {workspace.physical_tiles_capacity}"
+        )
+
+    gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
+    task_tail = 0
+    for expert_idx, entries in enumerate(rows_by_expert):
+        row_count = len(entries)
+        if row_count == 0:
+            continue
+        expert_scale = float(expert_input_scale[expert_idx].item())
+        expert_alpha_value = float(expert_alpha[expert_idx].item())
+        for tile_idx, start in enumerate(range(0, row_count, _LEVEL_TILE_M)):
+            end = min(start + _LEVEL_TILE_M, row_count)
+            phys_tile = int(workspace.expert_tile_base[expert_idx].item()) + tile_idx
+            phys_row = phys_tile * _LEVEL_TILE_M
+
+            token_idx = torch.tensor([tok for tok, _ in entries[start:end]], dtype=torch.int32, device=device)
+            token_weights_t = torch.tensor([w for _, w in entries[start:end]], dtype=torch.float32, device=device)
+            workspace.token_map[phys_row : phys_row + (end - start)].copy_(token_idx)
+            workspace.token_weights[phys_row : phys_row + (end - start)].copy_(token_weights_t)
+
+            gather_idx = token_idx.to(torch.long)
+            tile_rows = a.index_select(0, gather_idx).float()
+            tile_scale = _choose_fc1_tile_scale(
+                tile_rows,
+                expert_scale=expert_scale,
+                fc1_tile_amax=fc1_tile_amax,
+            )
+            packed_tile, swizzled_tile = _quantize_routed_tile_nvfp4(
+                tile_rows,
+                hidden_size=hidden_size,
+                tile_scale=tile_scale,
+            )
+            workspace.packed_input[0, phys_row : phys_row + _LEVEL_TILE_M].copy_(packed_tile)
+            workspace.packed_input_scale[phys_row : phys_row + _LEVEL_TILE_M].copy_(swizzled_tile)
+            workspace.fc1_tile_scale[phys_tile] = tile_scale
+            if expert_scale > 0.0:
+                workspace.fc1_tile_alpha[phys_tile] = expert_alpha_value * (tile_scale / expert_scale)
+            else:
+                workspace.fc1_tile_alpha[phys_tile] = expert_alpha_value
+
+            remaining = gate_tile_cnt
+            slice_begin = 0
+            while remaining > 0:
+                if task_tail >= workspace.task_capacity:
+                    raise ValueError(
+                        "prequantized dynamic workspace task capacity mismatch: "
+                        f"expected at least {task_tail + 1}, got {workspace.task_capacity}"
+                    )
+                slice_count = min(_DYNAMIC_SLICE_CHUNK, remaining)
+                workspace.task_ready[task_tail] = 1
+                workspace.task_expert[task_tail] = expert_idx
+                workspace.task_m_tile[task_tail] = phys_tile
+                workspace.task_slice_begin[task_tail] = slice_begin
+                workspace.task_slice_count[task_tail] = slice_count
+                workspace.task_valid_rows[task_tail] = end - start
+                task_tail += 1
+                slice_begin += slice_count
+                remaining -= slice_count
+
+    workspace.task_tail[0] = task_tail
+    workspace.all_work_published[0] = 1
+
+
+def _populate_prequantized_workspace_host(
+    workspace: TPMoEWorkspace,
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    n: int,
+    fc1_tile_amax: bool,
+) -> None:
+    if isinstance(workspace, TPCompactStaticWorkspace):
+        _populate_static_prequantized_workspace_host(
+            workspace,
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            expert_input_scale=expert_input_scale,
+            expert_alpha=expert_alpha,
+            fc1_tile_amax=fc1_tile_amax,
+        )
+        return
+    if isinstance(workspace, TPDynamicWorkspace):
+        _populate_dynamic_prequantized_workspace_host(
+            workspace,
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            expert_input_scale=expert_input_scale,
+            expert_alpha=expert_alpha,
+            n=n,
+            fc1_tile_amax=fc1_tile_amax,
+        )
+        return
+    raise TypeError(f"unsupported workspace type {type(workspace).__name__}")
+
+
+def _populate_prequantized_workspace(
+    workspace: TPMoEWorkspace,
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    n: int,
+    fc1_tile_amax: bool,
+) -> None:
+    if isinstance(workspace, TPCompactStaticWorkspace):
+        _populate_static_prequantized_workspace_device(
+            workspace,
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            expert_input_scale=expert_input_scale,
+            expert_alpha=expert_alpha,
+            fc1_tile_amax=fc1_tile_amax,
+        )
+        return
+    _populate_prequantized_workspace_host(
+        workspace,
+        a=a,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        expert_input_scale=expert_input_scale,
+        expert_alpha=expert_alpha,
+        n=n,
+        fc1_tile_amax=fc1_tile_amax,
+    )
+
+
 def _get_kernel_cache(impl: str) -> Dict[Tuple, Tuple]:
     if impl == "micro":
         return _MICRO_KERNEL_CACHE
@@ -1099,6 +1731,8 @@ def _get_static_kernel(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    fc2_tile_amax: bool,
+    prequantized_input: bool,
     mac_override: int | None = None,
 ):
     sf_vec_size = 16
@@ -1107,7 +1741,7 @@ def _get_static_kernel(
     global _LAST_KERNEL
     cache_key = (
         "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, fc2_tile_amax, prequantized_input,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1131,6 +1765,8 @@ def _get_static_kernel(
         output_tile_count_n=max(1, (n + 128 - 1) // 128),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        fc2_tile_amax=fc2_tile_amax,
+        prequantized_input=prequantized_input,
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1186,14 +1822,24 @@ def _get_static_kernel(
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
     )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
+    if prequantized_input:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype,
+            (state_E * (rows_pad_k // _LEVEL_TILE_M),),
+            assumed_align=16,
+        )
+    else:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype, (weight_E,), assumed_align=16,
+        )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
+    )
+    fc1_tile_scale_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype, (state_E * (rows_pad_k // _LEVEL_TILE_M),), assumed_align=16,
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
@@ -1214,6 +1860,7 @@ def _get_static_kernel(
         b_down_fake, sfb_down_fake,
         row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
+        fc1_tile_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),
     )
@@ -1237,6 +1884,8 @@ def _get_micro_kernel(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    fc2_tile_amax: bool,
+    prequantized_input: bool,
     mac_override: int | None = None,
 ):
     sf_vec_size = 16
@@ -1245,7 +1894,7 @@ def _get_micro_kernel(
     global _LAST_KERNEL
     cache_key = (
         "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, fc2_tile_amax, prequantized_input,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1268,6 +1917,8 @@ def _get_micro_kernel(
         output_tile_count_n=max(1, (n + 128 - 1) // 128),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        fc2_tile_amax=fc2_tile_amax,
+        prequantized_input=prequantized_input,
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1323,14 +1974,24 @@ def _get_micro_kernel(
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
     )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
+    if prequantized_input:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype,
+            (state_E * (rows_pad_k // _LEVEL_TILE_M),),
+            assumed_align=16,
+        )
+    else:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype, (weight_E,), assumed_align=16,
+        )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
+    )
+    fc1_tile_scale_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype, (state_E * (rows_pad_k // _LEVEL_TILE_M),), assumed_align=16,
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
@@ -1351,6 +2012,7 @@ def _get_micro_kernel(
         b_down_fake, sfb_down_fake,
         row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
+        fc1_tile_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),
     )
@@ -1407,6 +2069,7 @@ class _DynamicMoELaunch:
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
         global_scale: cute.Tensor,
+        fc1_tile_scale_ptr: cute.Pointer,
         scatter_ptr: cute.Pointer,
         token_map_ptr: cute.Pointer,
         token_weights_ptr: cute.Pointer,
@@ -1450,6 +2113,8 @@ class _DynamicMoELaunch:
             (max_tasks,), stride=(1,)))
         tile_write_count = cute.make_tensor(tile_write_count_ptr, layout=cute.make_layout(
             (max_phys_tiles,), stride=(1,)))
+        fc1_tile_scale = cute.make_tensor(fc1_tile_scale_ptr, layout=cute.make_layout(
+            (max_phys_tiles,), stride=(1,)))
         self._kernel(
             a_input, topk_ids, topk_weights_t,
             packed_a, sfa_ptr, packed_a_storage, scale_storage,
@@ -1463,6 +2128,7 @@ class _DynamicMoELaunch:
             b_down, sfb_down_ptr,
             row_counts, expert_write_rows, expert_tile_base,
             input_global_scale, alpha, down_alpha, global_scale,
+            fc1_tile_scale,
             scatter_output, token_map, token_weights_t,
             max_active_clusters=max_active_clusters,
             stream=stream,
@@ -1480,15 +2146,18 @@ def _get_dynamic_kernel(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    prequantized_input: bool,
+    fc1_tile_amax: bool,
     mac_override: int | None = None,
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
+    dynamic_tiles_ph, _, _ = _dynamic_task_geometry(E, n, m * num_topk)
 
     global _LAST_KERNEL
     cache_key = (
         "dynamic", E, k, n, num_topk, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, prequantized_input, fc1_tile_amax,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1513,6 +2182,8 @@ def _get_dynamic_kernel(
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        prequantized_input=prequantized_input,
+        fc1_tile_amax=fc1_tile_amax,
     )
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -1579,16 +2250,23 @@ def _get_dynamic_kernel(
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (E,), assumed_align=16,
     )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16,
-    )
+    if prequantized_input and fc1_tile_amax:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype, (dynamic_tiles_ph,), assumed_align=16,
+        )
+    else:
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            alpha_dtype, (E,), assumed_align=16,
+        )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (E,), assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (E,), assumed_align=16,
     )
-    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    fc1_tile_scale_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    scatter_dtype = cutlass.Float32 if prequantized_input else a_dtype
+    scatter_fake = make_ptr(scatter_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     compiled = cute.compile(
@@ -1606,6 +2284,7 @@ def _get_dynamic_kernel(
         b_down_fake, sfb_down_fake,
         row_counts_fake, expert_write_rows_fake, expert_tile_base_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
+        fc1_tile_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         1, 1, 1, 1, 1, mac, current_cuda_stream(),
     )
@@ -1635,21 +2314,31 @@ def _launch_dynamic(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    prequantized_input: bool,
+    fc1_tile_amax: bool,
     stream,
 ) -> None:
-    effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
-    if not _dynamic_multicta_enabled():
+    if prequantized_input:
         effective_mac = 1
+    else:
+        effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
+        if not _dynamic_multicta_enabled():
+            effective_mac = 1
     compiled, mac = _get_dynamic_kernel(
         E, m, k, n, num_topk, max_rows,
         topk_ids_dtype=topk_ids_dtype,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        prequantized_input=prequantized_input,
+        fc1_tile_amax=fc1_tile_amax,
         mac_override=effective_mac,
     )
     _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
     ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
     ids_align = 4 if flat_ids.dtype == torch.int32 else 8
+    launch_scatter_output = scatter_output
+    if prequantized_input:
+        launch_scatter_output = torch.zeros_like(scatter_output, dtype=torch.float32)
     compiled(
         _gptr(cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, flat_ids, ids_align),
@@ -1671,8 +2360,11 @@ def _launch_dynamic(
         weights.w13_fp4, weights.sfb_w13_ptr,
         weights.down_fp4, weights.sfb_down_ptr,
         workspace.row_counts, workspace.expert_write_rows, workspace.expert_tile_base,
-        workspace.input_gs, weights.w1_alpha, weights.w2_alpha, workspace.down_input_scale,
-        _gptr(cutlass.BFloat16, scatter_output),
+        workspace.input_gs,
+        workspace.fc1_tile_alpha if (prequantized_input and fc1_tile_amax) else weights.w1_alpha,
+        weights.w2_alpha, workspace.down_input_scale,
+        _gptr(cutlass.Float32, workspace.fc1_tile_scale.view(-1), 16),
+        _gptr(cutlass.Float32 if prequantized_input else cutlass.BFloat16, launch_scatter_output),
         _gptr(cutlass.Int32, workspace.token_map, 4),
         _gptr(cutlass.Float32, workspace.token_weights, 4),
         m, max_rows,
@@ -1681,6 +2373,8 @@ def _launch_dynamic(
         workspace.physical_tiles_capacity,
         mac, stream,
     )
+    if prequantized_input:
+        scatter_output.copy_(launch_scatter_output.to(dtype=scatter_output.dtype))
 
 
 def _launch_compact_static(
@@ -1702,6 +2396,8 @@ def _launch_compact_static(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    fc2_tile_amax: bool,
+    prequantized_input: bool,
     stream,
 ) -> None:
     use_micro = routed_rows <= _get_micro_compact_cutover_pairs()
@@ -1717,27 +2413,34 @@ def _launch_compact_static(
         # barriers without owning useful work.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         micro_mac = min(_get_impl_mac("micro", routed_rows=routed_rows), micro_work_tiles)
-        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-        triton_compact_topk_ids(
-            flat_ids,
-            compact_ids,
-            workspace.weight_expert_ids,
-            workspace.active_expert_count,
-        )
         compiled, mac = _get_micro_kernel(
             workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            fc2_tile_amax=fc2_tile_amax,
+            prequantized_input=prequantized_input,
             mac_override=micro_mac,
         )
-        launch_ids = compact_ids
+        if prequantized_input:
+            launch_ids = flat_ids
+        else:
+            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+            triton_compact_topk_ids(
+                flat_ids,
+                compact_ids,
+                workspace.weight_expert_ids,
+                workspace.active_expert_count,
+            )
+            launch_ids = compact_ids
     else:
         compiled, mac = _get_static_kernel(
             workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=topk_ids_dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            fc2_tile_amax=fc2_tile_amax,
+            prequantized_input=prequantized_input,
             mac_override=static_mac,
         )
         launch_ids = flat_ids
@@ -1749,10 +2452,117 @@ def _launch_compact_static(
         weights.w13_fp4, weights.sfb_w13_ptr,
         weights.down_fp4, weights.sfb_down_ptr,
         workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
-        input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
+        input_gs,
+        workspace.fc1_tile_alpha.view(-1) if prequantized_input else weights.w1_alpha,
+        weights.w2_alpha, down_input_scale,
+        workspace.fc1_tile_scale.view(-1),
         scatter_output, workspace.token_map, workspace.token_weights,
         mac, stream,
     )
+
+
+def _launch_prequantized_moe_consumer(
+    a: torch.Tensor,
+    *,
+    experts: B12XFP4ExpertWeights,
+    workspace: TPMoEWorkspace,
+    routing: B12XTopKRouting,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = True,
+    fc2_tile_amax: bool = False,
+) -> torch.Tensor:
+    m, k = a.shape
+    weight_E = experts.w1_fp4.shape[0]
+    n = experts.w2_fp4.shape[2] * 2
+    num_topk = routing.topk_ids.shape[1]
+    routed_rows = m * num_topk
+    device = a.device
+
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    fc2_tile_amax = _effective_fc2_tile_amax(fc2_tile_amax)
+
+    stream = current_cuda_stream()
+    flat_ids = _flatten_routing_ids(routing.topk_ids)
+    flat_weights = _flatten_routing_weights(routing.topk_weights)
+    wv = _get_weight_views(
+        experts.w1_fp4,
+        experts.w1_blockscale,
+        experts.w2_fp4,
+        experts.w2_blockscale,
+        experts.w1_alphas,
+        experts.w2_alphas,
+        n,
+        k,
+    )
+
+    if output is None:
+        scatter_output = torch.zeros(m, k, dtype=a.dtype, device=device)
+    else:
+        scatter_output = output
+    if scatter_output.shape != (m, k):
+        raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+    if scatter_output.dtype != a.dtype:
+        raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+    if scatter_output.device != device:
+        raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+    if not scatter_output.is_contiguous():
+        raise ValueError("output must be contiguous")
+
+    if isinstance(workspace, TPDynamicWorkspace):
+        if fc2_tile_amax:
+            raise NotImplementedError("fc2_tile_amax is currently only implemented for compact static/micro backends")
+        _launch_dynamic(
+            workspace=workspace,
+            weights=wv,
+            a=a,
+            flat_ids=flat_ids,
+            flat_weights=flat_weights,
+            scatter_output=scatter_output,
+            E=weight_E,
+            m=m,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            routed_rows=routed_rows,
+            max_rows=workspace.max_rows,
+            topk_ids_dtype=flat_ids.dtype,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            fast_math=fast_math,
+            prequantized_input=True,
+            fc1_tile_amax=fc1_tile_amax,
+            stream=stream,
+        )
+        return scatter_output
+
+    assert isinstance(workspace, TPCompactStaticWorkspace)
+    input_gs = _prepare_expert_scale(experts.a1_gscale, weight_E)
+    down_input_scale = _prepare_expert_scale(experts.a2_gscale, weight_E)
+    _launch_compact_static(
+        workspace=workspace,
+        weights=wv,
+        a=a,
+        flat_ids=flat_ids,
+        flat_weights=flat_weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        scatter_output=scatter_output,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        routed_rows=routed_rows,
+        topk_ids_dtype=flat_ids.dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc2_tile_amax=fc2_tile_amax,
+        prequantized_input=True,
+        stream=stream,
+    )
+    return scatter_output
 
 
 @torch._dynamo.disable
@@ -1775,6 +2585,7 @@ def b12x_moe_fp4(
     input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
+    fc2_tile_amax: bool = False,
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -1806,6 +2617,7 @@ def b12x_moe_fp4(
         raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
+    fc2_tile_amax = _effective_fc2_tile_amax(fc2_tile_amax)
     # Shared scalar input scales are weight-side constants in the benchmarked
     # path, so treat them as static and avoid re-expanding them every launch.
     effective_input_scales_static = (
@@ -1844,6 +2656,7 @@ def b12x_moe_fp4(
                 input_scales_are_reciprocal=input_scales_are_reciprocal,
                 input_scales_static=effective_input_scales_static,
                 fast_math=fast_math,
+                fc2_tile_amax=fc2_tile_amax,
             )
         return chunk_output
 
@@ -1909,6 +2722,8 @@ def b12x_moe_fp4(
         raise ValueError("output must be contiguous")
 
     if impl == "dynamic":
+        if fc2_tile_amax:
+            raise NotImplementedError("fc2_tile_amax is currently only implemented for compact static/micro backends")
         _launch_dynamic(
             workspace=s,
             weights=wv,
@@ -1926,6 +2741,8 @@ def b12x_moe_fp4(
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            prequantized_input=False,
+            fc1_tile_amax=False,
             stream=stream,
         )
     else:
@@ -1947,9 +2764,826 @@ def b12x_moe_fp4(
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            fc2_tile_amax=fc2_tile_amax,
+            prequantized_input=False,
             stream=stream,
         )
     return scatter_output
+
+
+@torch._dynamo.disable
+def b12x_moe_fp4_prequantized(
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = True,
+    fc2_tile_amax: bool = False,
+) -> torch.Tensor:
+    """MoE path that prebuilds routed NVFP4 activations on the host.
+
+    This is an internal validation seam for kernels that consume prequantized
+    FC1 inputs plus per-tile FP32 activation scales instead of quantizing BF16
+    activations in-kernel.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError("prequantized activation preparation is not supported during CUDA graph capture")
+
+    m, k = a.shape
+    E = w1_fp4.shape[0]
+    weight_E = E
+    n = w2_fp4.shape[2] * 2
+    num_topk = topk_ids.shape[1]
+    routed_rows = m * num_topk
+    device = a.device
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=a.dtype,
+        topk_ids=topk_ids,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation == "dynamic" and m > plan.max_tokens_per_launch:
+        raise ValueError("prequantized activation path does not support chunked launches")
+
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    fc2_tile_amax = _effective_fc2_tile_amax(fc2_tile_amax)
+    effective_input_scales_static = (
+        input_scales_static
+        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
+    )
+    s = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    if s.fc1_tile_scale is None:
+        raise ValueError("workspace is missing FC1 tile scale storage")
+    if s.fc1_tile_alpha is None:
+        raise ValueError("workspace is missing FC1 tile alpha storage")
+
+    effective_input_scale = _effective_input_scales(
+        a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    selected = _route_pack_prequantized_fp4(
+        a,
+        workspace=s,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=w1_alphas,
+        n=n,
+        fc1_tile_amax=fc1_tile_amax,
+        routing=B12XTopKRouting(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ),
+    )
+
+    return _launch_prequantized_moe_consumer(
+        a,
+        experts=B12XFP4ExpertWeights(
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+        ),
+        workspace=s,
+        routing=selected,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc1_tile_amax=fc1_tile_amax,
+        fc2_tile_amax=fc2_tile_amax,
+    )
+
+
+def _b12x_gemma_sparse_moe_fp4_static(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    experts: B12XFP4ExpertWeights,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = True,
+    fc2_tile_amax: bool = False,
+):
+    """Internal static-only compact path: fused Gemma pre-MLP + route-pack + prequantized MoE."""
+    normed_hidden_states, normed_residual = pre_mlp_runtime.allreduce_gemma_rmsnorm(
+        hidden_states,
+        residual,
+        norm_weight,
+        norm_eps,
+        peer_input_ptrs=peer_input_ptrs,
+        out=None,
+        residual_out=residual_out,
+    )
+    m, k = normed_hidden_states.shape
+    weight_E = experts.w1_fp4.shape[0]
+    n = experts.w2_fp4.shape[2] * 2
+    num_topk = routing.topk_ids.shape[1] if routing is not None else int(top_k)
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=normed_hidden_states.device,
+        dtype=normed_hidden_states.dtype,
+        topk_ids=None if routing is None else routing.topk_ids,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError("static compact fused Gemma MoE path only supports compact/static launches")
+
+    effective_input_scales_static = (
+        input_scales_static
+        or (experts.a1_gscale.numel() == 1 and experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=experts.a1_gscale,
+        a2_gscale=experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    assert isinstance(resolved_workspace, TPCompactStaticWorkspace)
+
+    effective_input_scale = _effective_input_scales(
+        experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    selected = _route_pack_prequantized_fp4(
+        normed_hidden_states,
+        workspace=resolved_workspace,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=experts.w1_alphas,
+        n=n,
+        fc1_tile_amax=fc1_tile_amax,
+        routing=routing,
+        top_k=top_k,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize_topk=renormalize_topk,
+    )
+    moe_out = _launch_prequantized_moe_consumer(
+        normed_hidden_states,
+        experts=experts,
+        workspace=resolved_workspace,
+        routing=selected,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc1_tile_amax=fc1_tile_amax,
+        fc2_tile_amax=fc2_tile_amax,
+    )
+    if return_routing:
+        return moe_out, normed_residual, selected
+    return moe_out, normed_residual
+
+
+def _b12x_gemma_moe_block_fp4_static(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+):
+    """Internal static-only compact path that integrates sparse and shared experts."""
+    normed_hidden_states, normed_residual = pre_mlp_runtime.allreduce_gemma_rmsnorm(
+        hidden_states,
+        residual,
+        norm_weight,
+        norm_eps,
+        peer_input_ptrs=peer_input_ptrs,
+        out=None,
+        residual_out=residual_out,
+    )
+    if routing is not None:
+        if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
+            raise ValueError(
+                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+            )
+        sparse_selected = routing
+    else:
+        if top_k is None:
+            raise ValueError("top_k is required when routing is not provided")
+        sparse_selected = b12x_route_experts_fast(
+            normed_hidden_states,
+            top_k=top_k,
+            gate_weight=gate_weight,
+            gate_bias=gate_bias,
+            router_logits=router_logits,
+            renormalize=renormalize_topk,
+            workspace=workspace,
+        )
+    _validate_sparse_routing(normed_hidden_states, sparse_selected)
+    shared_weights = _shared_expert_gate_weights(
+        normed_hidden_states,
+        gate_weight=shared_gate_weight,
+        gate_bias=shared_gate_bias,
+    )
+    shared_expert_id = sparse_experts.w1_fp4.shape[0]
+    combined_selected = _append_shared_expert_routing(
+        sparse_selected,
+        shared_gate_weights=shared_weights,
+        shared_expert_id=shared_expert_id,
+    )
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+    m, k = normed_hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = combined_selected.topk_ids.shape[1]
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=normed_hidden_states.device,
+        dtype=normed_hidden_states.dtype,
+        topk_ids=combined_selected.topk_ids,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError("static compact fused Gemma MoE path only supports compact/static launches")
+
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    assert isinstance(resolved_workspace, TPCompactStaticWorkspace)
+    effective_input_scale = _effective_input_scales(
+        combined_experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    _populate_prequantized_workspace(
+        resolved_workspace,
+        a=normed_hidden_states,
+        topk_ids=combined_selected.topk_ids,
+        topk_weights=combined_selected.topk_weights,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=_expand_expert_vector(
+            combined_experts.w1_alphas,
+            weight_E,
+            name="combined_experts.w1_alphas",
+        ),
+        n=n,
+        fc1_tile_amax=fc1_tile_amax,
+    )
+    moe_out = _launch_prequantized_moe_consumer(
+        normed_hidden_states,
+        experts=combined_experts,
+        workspace=resolved_workspace,
+        routing=combined_selected,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc1_tile_amax=fc1_tile_amax,
+        fc2_tile_amax=fc2_tile_amax,
+    )
+    if return_routing:
+        return moe_out, normed_residual, combined_selected
+    return moe_out, normed_residual
+
+
+def _b12x_gemma_moe_block_fp4_static_producer(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+):
+    (
+        normed_hidden_states,
+        normed_residual,
+        resolved_workspace,
+        combined_experts,
+        combined_selected,
+    ) = _prepare_gemma_moe_block_fp4_static_producer(
+        hidden_states,
+        residual,
+        pre_mlp_runtime=pre_mlp_runtime,
+        pre_mlp_ipc=pre_mlp_ipc,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        sparse_experts=sparse_experts,
+        shared_expert=shared_expert,
+        shared_gate_weight=shared_gate_weight,
+        combined_experts=combined_experts,
+        workspace=workspace,
+        routing=routing,
+        top_k=top_k,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize_topk=renormalize_topk,
+        residual_out=residual_out,
+        peer_input_ptrs=peer_input_ptrs,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        fc1_tile_amax=fc1_tile_amax,
+        shared_gate_bias=shared_gate_bias,
+    )
+    moe_out = _launch_prequantized_moe_consumer(
+        normed_hidden_states,
+        experts=combined_experts,
+        workspace=resolved_workspace,
+        routing=combined_selected,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc1_tile_amax=False,
+        fc2_tile_amax=fc2_tile_amax,
+    )
+    if return_routing:
+        return moe_out, normed_residual, combined_selected
+    return moe_out, normed_residual
+
+
+def _b12x_gemma_moe_block_fp4_static_monolithic(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    top_k: int,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+):
+    (
+        producer,
+        resolved_workspace,
+        combined_experts,
+        combined_selected,
+    ) = _prepare_gemma_moe_block_fp4_static_monolithic(
+        hidden_states,
+        residual,
+        pre_mlp_runtime=pre_mlp_runtime,
+        pre_mlp_ipc=pre_mlp_ipc,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        sparse_experts=sparse_experts,
+        shared_expert=shared_expert,
+        shared_gate_weight=shared_gate_weight,
+        combined_experts=combined_experts,
+        workspace=workspace,
+        top_k=top_k,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        residual_out=residual_out,
+        peer_input_ptrs=peer_input_ptrs,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        fc1_tile_amax=fc1_tile_amax,
+        shared_gate_bias=shared_gate_bias,
+        renormalize_topk=renormalize_topk,
+    )
+    moe_out = _launch_prequantized_moe_consumer(
+        producer.normalized,
+        experts=combined_experts,
+        workspace=resolved_workspace,
+        routing=combined_selected,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc1_tile_amax=False,
+        fc2_tile_amax=fc2_tile_amax,
+    )
+    if return_routing:
+        return moe_out, producer.residual_out, combined_selected
+    return moe_out, producer.residual_out
+
+
+def _prepare_gemma_moe_block_fp4_static_monolithic(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    top_k: int,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fc1_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+):
+    from b12x.moe.fused.pre_mlp_static import UnifiedPreMLPIPC
+    from b12x.moe.fused.pre_mlp_static_monolithic_optimized import (
+        monolithic_allreduce_route_prepack_static,
+    )
+
+    if fc1_tile_amax:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_monolithic currently supports fc1_tile_amax=False only"
+        )
+    if gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_monolithic does not yet support gate_bias"
+        )
+    if shared_gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_monolithic does not yet support shared_gate_bias"
+        )
+    if pre_mlp_runtime is None and pre_mlp_ipc is None:
+        raise ValueError("expected pre_mlp_runtime or pre_mlp_ipc")
+    if pre_mlp_runtime is not None and pre_mlp_ipc is not None:
+        raise ValueError("pass either pre_mlp_runtime or pre_mlp_ipc, not both")
+
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+
+    m, k = hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = int(top_k) + 1
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        topk_ids=None,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError(
+            "static compact fused Gemma MoE path only supports compact/static launches"
+        )
+
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    assert isinstance(resolved_workspace, TPCompactStaticWorkspace)
+
+    if pre_mlp_ipc is None:
+        pre_mlp_ipc = UnifiedPreMLPIPC.from_oneshot_runtime(
+            pre_mlp_runtime,
+            inp=hidden_states,
+            peer_input_ptrs=peer_input_ptrs,
+        )
+
+    effective_input_scale = _effective_input_scales(
+        combined_experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    expert_alpha = _expand_expert_vector(
+        combined_experts.w1_alphas,
+        weight_E,
+        name="combined_experts.w1_alphas",
+    )
+
+    producer = monolithic_allreduce_route_prepack_static(
+        hidden_states,
+        residual,
+        norm_weight,
+        gate_weight,
+        shared_gate_weight,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=expert_alpha,
+        workspace=resolved_workspace,
+        ipc=pre_mlp_ipc,
+        top_k=top_k,
+        renormalize_topk=renormalize_topk,
+        eps=norm_eps,
+        normalized_out=None,
+        residual_out=residual_out,
+    )
+    combined_selected = B12XTopKRouting(
+        topk_weights=producer.topk_weights,
+        topk_ids=producer.topk_ids,
+        router_logits=None,
+        flat_ids=producer.topk_ids.view(-1),
+        flat_weights=producer.topk_weights.view(-1),
+    )
+    return (
+        producer,
+        resolved_workspace,
+        combined_experts,
+        combined_selected,
+    )
+
+
+def _prepare_gemma_moe_block_fp4_static_producer(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fc1_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+):
+    from b12x.moe.fused.pre_mlp_static import (
+        slice_a_allreduce_residual_gemma_rmsnorm,
+        slice_c_compact_route_assignment,
+        slice_d_quantize_fc1_inputs,
+    )
+    from b12x.moe.fused.pre_mlp_static_hot import (
+        MAX_STAGE2_TOTAL_PAIRS,
+        stage2_compact_route_metadata,
+        stage2_quantize_fc1_inputs,
+    )
+
+    if fc1_tile_amax:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_producer currently supports fc1_tile_amax=False only"
+        )
+    if routing is not None:
+        if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
+            raise ValueError(
+                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+            )
+        sparse_selected = routing
+    else:
+        if top_k is None:
+            raise ValueError("top_k is required when routing is not provided")
+    if pre_mlp_runtime is None and pre_mlp_ipc is None:
+        raise ValueError("expected pre_mlp_runtime or pre_mlp_ipc")
+    if pre_mlp_runtime is not None and pre_mlp_ipc is not None:
+        raise ValueError("pass either pre_mlp_runtime or pre_mlp_ipc, not both")
+
+    if pre_mlp_ipc is not None:
+        slice_a = slice_a_allreduce_residual_gemma_rmsnorm(
+            hidden_states,
+            residual,
+            norm_weight,
+            eps=norm_eps,
+            ipc=pre_mlp_ipc,
+            normalized_out=None,
+            residual_out=residual_out,
+        )
+        normed_hidden_states = slice_a.normalized
+        normed_residual = slice_a.residual_out
+    else:
+        normed_hidden_states, normed_residual = pre_mlp_runtime.allreduce_gemma_rmsnorm(
+            hidden_states,
+            residual,
+            norm_weight,
+            norm_eps,
+            peer_input_ptrs=peer_input_ptrs,
+            out=None,
+            residual_out=residual_out,
+        )
+
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+    shared_expert_id = sparse_experts.w1_fp4.shape[0]
+    if routing is None:
+        sparse_selected = b12x_route_experts_fast(
+            normed_hidden_states,
+            top_k=top_k,
+            gate_weight=gate_weight,
+            gate_bias=gate_bias,
+            router_logits=router_logits,
+            renormalize=renormalize_topk,
+            workspace=workspace,
+        )
+    shared_weights = _shared_expert_gate_weights(
+        normed_hidden_states,
+        gate_weight=shared_gate_weight,
+        gate_bias=shared_gate_bias,
+    )
+    combined_selected = _append_shared_expert_routing(
+        sparse_selected,
+        shared_gate_weights=shared_weights,
+        shared_expert_id=shared_expert_id,
+    )
+
+    m, k = normed_hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = combined_selected.topk_ids.shape[1]
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=normed_hidden_states.device,
+        dtype=normed_hidden_states.dtype,
+        topk_ids=combined_selected.topk_ids,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError("static compact fused Gemma MoE path only supports compact/static launches")
+
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    assert isinstance(resolved_workspace, TPCompactStaticWorkspace)
+
+    effective_input_scale = _effective_input_scales(
+        combined_experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    expert_alpha = _expand_expert_vector(
+        combined_experts.w1_alphas,
+        weight_E,
+        name="combined_experts.w1_alphas",
+    )
+    if combined_selected.topk_ids.numel() <= MAX_STAGE2_TOTAL_PAIRS:
+        stage2_compact_route_metadata(
+            resolved_workspace,
+            topk_ids=combined_selected.topk_ids,
+            topk_weights=combined_selected.topk_weights,
+        )
+    else:
+        slice_c_compact_route_assignment(
+            resolved_workspace,
+            topk_ids=combined_selected.topk_ids,
+            topk_weights=combined_selected.topk_weights,
+        )
+    if combined_selected.topk_ids.numel() <= MAX_STAGE2_TOTAL_PAIRS:
+        stage2_quantize_fc1_inputs(
+            resolved_workspace,
+            normalized_hidden_states=normed_hidden_states,
+            expert_input_scale=effective_input_scale,
+            expert_alpha=expert_alpha,
+            fc1_tile_amax=False,
+        )
+    else:
+        slice_d_quantize_fc1_inputs(
+            resolved_workspace,
+            normalized_hidden_states=normed_hidden_states,
+            expert_input_scale=effective_input_scale,
+            expert_alpha=expert_alpha,
+            fc1_tile_amax=False,
+        )
+    return (
+        normed_hidden_states,
+        normed_residual,
+        resolved_workspace,
+        combined_experts,
+        combined_selected,
+    )
 
 
 def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouting) -> None:
@@ -1987,6 +3621,55 @@ def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouti
             "flat_weights size mismatch: expected "
             f"{routing.topk_weights.numel()}, got {routing.flat_weights.numel()}"
         )
+
+
+def _route_pack_prequantized_fp4(
+    hidden_states: torch.Tensor,
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    expert_input_scale: torch.Tensor,
+    expert_alpha: torch.Tensor,
+    n: int,
+    fc1_tile_amax: bool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+) -> B12XTopKRouting:
+    """Internal stage-B seam: route hidden states and fill the prequantized FC1 workspace."""
+    if routing is not None:
+        if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
+            raise ValueError(
+                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+            )
+        selected = routing
+    else:
+        if top_k is None:
+            raise ValueError("top_k is required when routing is not provided")
+        selected = b12x_route_experts_fast(
+            hidden_states,
+            top_k=top_k,
+            gate_weight=gate_weight,
+            gate_bias=gate_bias,
+            router_logits=router_logits,
+            renormalize=renormalize_topk,
+            workspace=workspace,
+        )
+
+    _validate_sparse_routing(hidden_states, selected)
+    _populate_prequantized_workspace(
+        workspace,
+        a=hidden_states,
+        topk_ids=selected.topk_ids,
+        topk_weights=selected.topk_weights,
+        expert_input_scale=expert_input_scale,
+        expert_alpha=expert_alpha,
+        n=n,
+        fc1_tile_amax=fc1_tile_amax,
+    )
+    return selected
 
 
 def _alloc_route_workspace(
@@ -2288,6 +3971,7 @@ def b12x_sparse_moe_fp4(
     input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
+    fc2_tile_amax: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
     """Sparse-block FP4 MoE wrapper above the routed-expert TP primitive.
 
@@ -2334,6 +4018,7 @@ def b12x_sparse_moe_fp4(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
         fast_math=fast_math,
+        fc2_tile_amax=fc2_tile_amax,
     )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)

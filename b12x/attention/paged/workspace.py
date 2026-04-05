@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
-from torch.profiler import record_function
+
+from b12x.profiling import record_function
 
 from .planner import (
     PagedPlan,

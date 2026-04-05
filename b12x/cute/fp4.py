@@ -143,8 +143,8 @@ def quantize_grouped_nvfp4_torch(
         x = input_tensor[group_idx, :valid_rows].float()
         sliced = x.view(valid_rows, cols // SF_VEC_SIZE, SF_VEC_SIZE)
         block_max = sliced.abs().amax(dim=-1, keepdim=True).to(torch.float32)
-        scale = (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX)).to(torch.float8_e4m3fn).to(torch.float32)
-        output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx]))
+        scale = (block_max / (FLOAT4_E2M1_MAX * global_scale[group_idx])).to(torch.float8_e4m3fn).to(torch.float32)
+        output_scale = 1.0 / (scale * global_scale[group_idx])
         clipped = torch.clamp(sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).view(valid_rows, cols)
         quantized[group_idx, :valid_rows] = _fp4_quantize_values(clipped)
         scales[group_idx, :valid_rows] = scale.squeeze(-1)
@@ -611,6 +611,25 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
             ],
             "atom.global.add.s32 $0, [$1], $2;",
             "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None) -> Float32:
+    """Global memory float32 atomic add. Returns old value."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Float32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.add.f32 $0, [$1], $2;",
+            "=f,l,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

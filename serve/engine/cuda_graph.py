@@ -17,7 +17,8 @@ from typing import Callable, Optional
 import os
 import torch
 import torch.nn.functional as F
-from torch.profiler import record_function
+
+from b12x.profiling import record_function
 
 from serve.engine.runner import _shared_attn_workspace_key
 from serve.engine.step_state import StepState

@@ -11,7 +11,8 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.profiler import record_function
+
+from b12x.profiling import record_function
 
 from serve.cache.kv_cache import KVCacheManager
 from serve.cache.page_pool import PagePool

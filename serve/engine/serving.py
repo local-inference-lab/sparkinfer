@@ -16,10 +16,10 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from torch.profiler import record_function
 
 from transformers import AutoTokenizer
 
+from b12x.profiling import record_function
 from serve.cache.page_pool import PagePool
 from serve.cache.prefix_checkpoint_cache import PrefixCheckpointCache
 from serve.engine.request import Request
@@ -147,7 +147,7 @@ class ServingEngine:
         graph_batch_sizes: list[int] | None = None,
         prefill_chunk_size: int = 512,
         capture_prefill_graph: bool = False,
-        compile_layers: bool = False,
+        compile_layers: bool = True,
         max_running: int | None = None,
         max_waiting: int = 256,
         max_prefill_tokens: int = 4096,

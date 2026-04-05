@@ -338,6 +338,78 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
     assert small_metrics.cos > 0.9998
 
 
+def test_static_prequantized_device_populator_matches_host_reference() -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+    x, topk_ids, topk_weights = make_routed_inputs(spec, 12, seed=1777, device=device)
+
+    host_workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids,
+        input_scales_static=True,
+    )
+    device_workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids,
+        input_scales_static=True,
+    )
+    assert isinstance(host_workspace, tp_moe.TPCompactStaticWorkspace)
+    assert isinstance(device_workspace, tp_moe.TPCompactStaticWorkspace)
+
+    effective_input_scale = tp_moe._effective_input_scales(
+        weights.w13_input_scale_per_expert,
+        spec.num_experts,
+        input_scales_are_reciprocal=False,
+    )
+    tp_moe._populate_static_prequantized_workspace_host(
+        host_workspace,
+        a=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=weights.g1_alphas_per_expert,
+        fc1_tile_amax=True,
+    )
+    tp_moe._populate_static_prequantized_workspace_device(
+        device_workspace,
+        a=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        expert_input_scale=effective_input_scale,
+        expert_alpha=weights.g1_alphas_per_expert,
+        fc1_tile_amax=True,
+    )
+
+    assert torch.equal(device_workspace.active_expert_count, host_workspace.active_expert_count)
+    active_experts = int(host_workspace.active_expert_count.item())
+    assert torch.equal(
+        device_workspace.weight_expert_ids[:active_experts],
+        host_workspace.weight_expert_ids[:active_experts],
+    )
+    assert torch.equal(device_workspace.global_to_local_expert, host_workspace.global_to_local_expert)
+    assert torch.equal(device_workspace.row_counts, host_workspace.row_counts)
+    assert torch.equal(device_workspace.token_map, host_workspace.token_map)
+    assert torch.equal(device_workspace.token_weights, host_workspace.token_weights)
+    assert torch.equal(device_workspace.packed_input, host_workspace.packed_input)
+    assert torch.equal(device_workspace.packed_input_scale, host_workspace.packed_input_scale)
+    assert torch.equal(device_workspace.fc1_tile_scale, host_workspace.fc1_tile_scale)
+    assert torch.equal(device_workspace.fc1_tile_alpha, host_workspace.fc1_tile_alpha)
+
+
 def test_dynamic_chunk_limit_uses_compact_layout() -> None:
     old_limit = tp_moe._safe_token_chunk(512, 4096, 256, 10)
     compact_limit = tp_moe._safe_dynamic_token_chunk(512, 4096, 256, 10)

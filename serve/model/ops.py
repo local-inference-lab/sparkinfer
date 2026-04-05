@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch.profiler import record_function
+
+from b12x.profiling import record_function
 
 
 def rms_norm(

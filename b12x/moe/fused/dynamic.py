@@ -79,7 +79,7 @@ from b12x.gemm.dense import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
-from b12x.cute.fp4 import scatter_add_bf16x2
+from b12x.cute.fp4 import atomic_add_global_f32, scatter_add_bf16x2
 
 
 _SF_VEC_SIZE = 16
@@ -247,12 +247,16 @@ class MoEDynamicKernel:
         *,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
+        prequantized_input: bool = False,
+        fc1_tile_amax: bool = False,
     ):
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
+        self.prequantized_input = prequantized_input
+        self.fc1_tile_amax = fc1_tile_amax
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.cluster_shape_mnk = (1, 1, 1)
@@ -436,6 +440,7 @@ class MoEDynamicKernel:
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
         global_scale: cute.Tensor,
+        fc1_tile_scale: cute.Tensor,
         scatter_output: cute.Tensor,   # [num_tokens, K]
         token_map: cute.Tensor,
         token_weights: cute.Tensor,
@@ -703,245 +708,242 @@ class MoEDynamicKernel:
         num_k_tiles = (cols + Int32(63)) // Int32(64)
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
-        full_tile_publish_enabled = total_pairs >= Int32(self.tile_shape_mnk[0])
+        full_tile_publish_enabled = Int32(0)
+        if not self.prequantized_input:
+            full_tile_publish_enabled = (
+                Int32(1)
+                if total_pairs >= Int32(self.tile_shape_mnk[0])
+                else Int32(0)
+            )
 
-        # Phase 0: cooperative init — zero routing state, queue state, and output
-        task_capacity = Int32(task_ready.shape[0])
-        tile_write_slots = Int32(tile_write_count.shape[0])
-        i = flat_tid
-        while i < num_experts:
-            row_counts[i] = Int32(0)
-            expert_write_rows[i] = Int32(0)
-            i += flat_stride
-        if flat_tid < num_experts + Int32(1):
-            expert_tile_base[flat_tid] = Int32(0)
+        if not self.prequantized_input:
+            # Phase 0: cooperative init — zero routing state, queue state, and output
+            task_capacity = Int32(task_ready.shape[0])
+            tile_write_slots = Int32(tile_write_count.shape[0])
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                expert_write_rows[i] = Int32(0)
+                i += flat_stride
+            if flat_tid < num_experts + Int32(1):
+                expert_tile_base[flat_tid] = Int32(0)
 
-        scatter_total = num_tokens * cols
-        j = flat_tid
-        while j < scatter_total:
-            scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
-            j += flat_stride
+            scatter_total = num_tokens * cols
+            j = flat_tid
+            while j < scatter_total:
+                scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
+                j += flat_stride
 
-        k = flat_tid
-        while k < task_capacity:
-            task_ready[k] = Int32(0)
-            task_expert[k] = Int32(0)
-            task_m_tile[k] = Int32(0)
-            task_slice_begin[k] = Int32(0)
-            task_slice_count[k] = Int32(0)
-            task_valid_rows[k] = Int32(0)
-            k += flat_stride
+            k = flat_tid
+            while k < task_capacity:
+                task_ready[k] = Int32(0)
+                task_expert[k] = Int32(0)
+                task_m_tile[k] = Int32(0)
+                task_slice_begin[k] = Int32(0)
+                task_slice_count[k] = Int32(0)
+                task_valid_rows[k] = Int32(0)
+                k += flat_stride
 
-        if full_tile_publish_enabled > Int32(0):
-            tw = flat_tid
-            while tw < tile_write_slots:
-                tile_write_count[tw] = Int32(0)
-                tw += flat_stride
+            if full_tile_publish_enabled > Int32(0):
+                tw = flat_tid
+                while tw < tile_write_slots:
+                    tile_write_count[tw] = Int32(0)
+                    tw += flat_stride
 
-        if flat_tid == Int32(0):
-            pair_head[Int32(0)] = Int32(0)
-            producers_done_count[Int32(0)] = Int32(0)
-            all_work_published[Int32(0)] = Int32(0)
-            task_head[Int32(0)] = Int32(0)
-            task_tail[Int32(0)] = Int32(0)
+                if flat_tid == Int32(0):
+                    pair_head[Int32(0)] = Int32(0)
+                    producers_done_count[Int32(0)] = Int32(0)
+                    all_work_published[Int32(0)] = Int32(0)
+                    task_head[Int32(0)] = Int32(0)
+                task_tail[Int32(0)] = Int32(0)
 
-        cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
-
-        # Phase 1: histogram routed rows per expert.
-        hist_idx = flat_tid
-        while hist_idx < total_pairs:
-            expert_id = topk_ids[hist_idx].to(Int32)
-            atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
-            hist_idx += flat_stride
-
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
-
-        if flat_tid == Int32(0):
-            tile_acc = Int32(0)
-            expert_idx = Int32(0)
-            while expert_idx < num_experts:
-                expert_tile_base[expert_idx] = tile_acc
-                rows = row_counts[expert_idx]
-                tile_acc += (
-                    rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
-                ) // Int32(self.tile_shape_mnk[0])
-                expert_idx += Int32(1)
-            expert_tile_base[num_experts] = tile_acc
-
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
-
-        # Phase 2: warp-private route/pack producers into compact physical tiles.
-        lane_id = Int32(tidx) & Int32(31)
-        num_cta_warps = Int32(self.num_mma_warps + 1)
-        produce_active = Int32(1)
-        while produce_active > Int32(0):
-            batch_base = Int32(0)
-            if is_cta_leader > Int32(0):
-                batch_base = atomic_add_global_i32(
-                    get_ptr_as_int64(pair_head, Int32(0)),
-                    num_cta_warps,
-                )
-                _st_shared_i32(ctrl_base_addr + Int32(28), batch_base)
             cute.arch.sync_threads()
-            batch_base = _ld_shared_i32(ctrl_base_addr + Int32(28))
-            if batch_base >= total_pairs:
-                produce_active = Int32(0)
-            else:
-                pair_idx = batch_base + warp_idx
-                if pair_idx < total_pairs:
-                    expert_id = topk_ids[pair_idx].to(Int32)
-                    token_idx = pair_idx // num_topk
-                    weight = topk_weights[pair_idx].to(cutlass.Float32)
-
-                    row = Int32(0)
-                    phys_tile = Int32(0)
-                    if lane_id == Int32(0):
-                        row = atomic_add_global_i32(
-                            get_ptr_as_int64(expert_write_rows, expert_id),
-                            Int32(1),
-                        )
-                        phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
-                        phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
-                        st_global_i32(get_ptr_as_int64(token_map, phys_row), token_idx)
-                        st_global_f32(get_ptr_as_int64(token_weights, phys_row), weight)
-
-                    row = cute.arch.shuffle_sync(row, Int32(0))
-                    phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
-                    expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
-                    token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
-
-                    gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-                    if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                        if self.fast_math:
-                            gs_value = rcp_approx_ftz(gs_value)
-                        else:
-                            gs_value = cutlass.Float32(1.0) / gs_value
-                    sf_idx = lane_id
-                    while sf_idx < sf_blocks_per_row:
-                        block_start = sf_idx * Int32(16)
-                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        block_max = cutlass.Float32(0.0)
-                        for elem_idx in cutlass.range_constexpr(16):
-                            value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
-                            values[elem_idx] = value
-                            block_max = fmax_f32(block_max, fabs_f32(value))
-                        packed64 = Uint64(0)
-                        scale_byte = Uint8(0)
-                        if self.fast_math:
-                            packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                        else:
-                            packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
-
-                        output_offset = (
-                            (phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])) * output_bytes_per_row
-                            + sf_idx * Int32(8)
-                        )
-                        st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
-
-                        k_tile_idx = sf_idx // Int32(4)
-                        outer_m_idx = row % Int32(32)
-                        inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                        inner_k_idx = sf_idx % Int32(4)
-                        scale_offset = (
-                            phys_tile * num_k_tiles * Int32(32 * 4 * 4)
-                            + k_tile_idx * Int32(32 * 4 * 4)
-                            + outer_m_idx * Int32(4 * 4)
-                            + inner_m_idx * Int32(4)
-                            + inner_k_idx
-                        )
-                        scale_storage[scale_offset] = scale_byte
-                        sf_idx += Int32(32)
-
-                    if full_tile_publish_enabled > Int32(0):
-                        cute.arch.sync_warp()
-                        # When the whole launch has fewer than one M-tile of routed
-                        # rows, only the final partial-tile flush can publish work.
-                        # Skip the per-row fence/counter path in that common micro case.
-                        _threadfence()
-                        cute.arch.sync_warp()
-
-                        if lane_id == Int32(0):
-                            completed = atomic_add_global_i32(
-                                get_ptr_as_int64(tile_write_count, phys_tile),
-                                Int32(1),
-                            ) + Int32(1)
-                            if completed == Int32(self.tile_shape_mnk[0]):
-                                self._publish_ready_tasks(
-                                    task_tail, task_ready,
-                                    task_expert, task_m_tile,
-                                    task_slice_begin, task_slice_count, task_valid_rows,
-                                    route_gate_tile_cnt, task_slice_chunk,
-                                    expert_id, phys_tile, Int32(self.tile_shape_mnk[0]),
-                                )
-
-        cute.arch.sync_threads()
-        # Conservative publish fence before the last-producer CTA flushes any
-        # partial tiles. All producer threads in the CTA must have ordered
-        # their global writes before lane 0 can publish work.
-        _threadfence()
-        cute.arch.sync_threads()
-
-        if full_tile_publish_enabled == Int32(0):
-            # Micro batches cannot fill a full M tile, so overlap is impossible.
-            # Rendezvous once, publish the final partial tiles, then consume.
             self._resident_grid_barrier(
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
 
-            if is_cta_leader > Int32(0):
-                expert_flush = Int32(bidz)
-                while expert_flush < num_experts:
-                    rows = row_counts[expert_flush]
-                    if rows > Int32(0):
-                        self._publish_ready_tasks(
-                            task_tail, task_ready,
-                            task_expert, task_m_tile,
-                            task_slice_begin, task_slice_count, task_valid_rows,
-                            route_gate_tile_cnt, task_slice_chunk,
-                            expert_flush, expert_tile_base[expert_flush], rows,
-                        )
-                    expert_flush += Int32(gdim_z)
+            hist_idx = flat_tid
+            while hist_idx < total_pairs:
+                expert_id = topk_ids[hist_idx].to(Int32)
+                atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
+                hist_idx += flat_stride
 
             self._resident_grid_barrier(
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
+
             if flat_tid == Int32(0):
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
-                )
-        elif is_cta_leader > Int32(0):
-            prev_done = atomic_add_global_i32(
-                get_ptr_as_int64(producers_done_count, Int32(0)),
-                Int32(1),
+                tile_acc = Int32(0)
+                expert_idx = Int32(0)
+                while expert_idx < num_experts:
+                    expert_tile_base[expert_idx] = tile_acc
+                    rows = row_counts[expert_idx]
+                    tile_acc += (
+                        rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                    ) // Int32(self.tile_shape_mnk[0])
+                    expert_idx += Int32(1)
+                expert_tile_base[num_experts] = tile_acc
+
+            self._resident_grid_barrier(
+                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
-            if prev_done == Int32(gdim_z) - Int32(1):
-                expert_flush = Int32(0)
-                while expert_flush < num_experts:
-                    rows = row_counts[expert_flush]
-                    rem = rows % Int32(self.tile_shape_mnk[0])
-                    if rem != Int32(0):
-                        partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(self.tile_shape_mnk[0])
-                        self._publish_ready_tasks(
-                            task_tail, task_ready,
-                            task_expert, task_m_tile,
-                            task_slice_begin, task_slice_count, task_valid_rows,
-                            route_gate_tile_cnt, task_slice_chunk,
-                            expert_flush, partial_m_tile, rem,
-                        )
-                    expert_flush += Int32(1)
-                _threadfence()
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
+
+            lane_id = Int32(tidx) & Int32(31)
+            num_cta_warps = Int32(self.num_mma_warps + 1)
+            produce_active = Int32(1)
+            while produce_active > Int32(0):
+                batch_base = Int32(0)
+                if is_cta_leader > Int32(0):
+                    batch_base = atomic_add_global_i32(
+                        get_ptr_as_int64(pair_head, Int32(0)),
+                        num_cta_warps,
+                    )
+                    _st_shared_i32(ctrl_base_addr + Int32(28), batch_base)
+                cute.arch.sync_threads()
+                batch_base = _ld_shared_i32(ctrl_base_addr + Int32(28))
+                if batch_base >= total_pairs:
+                    produce_active = Int32(0)
+                else:
+                    pair_idx = batch_base + warp_idx
+                    if pair_idx < total_pairs:
+                        expert_id = topk_ids[pair_idx].to(Int32)
+                        token_idx = pair_idx // num_topk
+                        weight = topk_weights[pair_idx].to(cutlass.Float32)
+
+                        row = Int32(0)
+                        phys_tile = Int32(0)
+                        if lane_id == Int32(0):
+                            row = atomic_add_global_i32(
+                                get_ptr_as_int64(expert_write_rows, expert_id),
+                                Int32(1),
+                            )
+                            phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
+                            phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
+                            st_global_i32(get_ptr_as_int64(token_map, phys_row), token_idx)
+                            st_global_f32(get_ptr_as_int64(token_weights, phys_row), weight)
+
+                        row = cute.arch.shuffle_sync(row, Int32(0))
+                        phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
+                        expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
+                        token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
+
+                        gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                        if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
+                            if self.fast_math:
+                                gs_value = rcp_approx_ftz(gs_value)
+                            else:
+                                gs_value = cutlass.Float32(1.0) / gs_value
+                        sf_idx = lane_id
+                        while sf_idx < sf_blocks_per_row:
+                            block_start = sf_idx * Int32(16)
+                            values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                            block_max = cutlass.Float32(0.0)
+                            for elem_idx in cutlass.range_constexpr(16):
+                                value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
+                                values[elem_idx] = value
+                                block_max = fmax_f32(block_max, fabs_f32(value))
+                            packed64 = Uint64(0)
+                            scale_byte = Uint8(0)
+                            if self.fast_math:
+                                packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
+                            else:
+                                packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+
+                            output_offset = (
+                                (phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])) * output_bytes_per_row
+                                + sf_idx * Int32(8)
+                            )
+                            st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
+
+                            k_tile_idx = sf_idx // Int32(4)
+                            outer_m_idx = row % Int32(32)
+                            inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
+                            inner_k_idx = sf_idx % Int32(4)
+                            scale_offset = (
+                                phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                + k_tile_idx * Int32(32 * 4 * 4)
+                                + outer_m_idx * Int32(4 * 4)
+                                + inner_m_idx * Int32(4)
+                                + inner_k_idx
+                            )
+                            scale_storage[scale_offset] = scale_byte
+                            sf_idx += Int32(32)
+
+                        if full_tile_publish_enabled > Int32(0):
+                            cute.arch.sync_warp()
+                            _threadfence()
+                            cute.arch.sync_warp()
+
+                            if lane_id == Int32(0):
+                                completed = atomic_add_global_i32(
+                                    get_ptr_as_int64(tile_write_count, phys_tile),
+                                    Int32(1),
+                                ) + Int32(1)
+                                if completed == Int32(self.tile_shape_mnk[0]):
+                                    self._publish_ready_tasks(
+                                        task_tail, task_ready,
+                                        task_expert, task_m_tile,
+                                        task_slice_begin, task_slice_count, task_valid_rows,
+                                        route_gate_tile_cnt, task_slice_chunk,
+                                        expert_id, phys_tile, Int32(self.tile_shape_mnk[0]),
+                                    )
+
+            cute.arch.sync_threads()
+            _threadfence()
+            cute.arch.sync_threads()
+
+            if full_tile_publish_enabled == Int32(0):
+                self._resident_grid_barrier(
+                    barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+                )
+
+                if is_cta_leader > Int32(0):
+                    expert_flush = Int32(bidz)
+                    while expert_flush < num_experts:
+                        rows = row_counts[expert_flush]
+                        if rows > Int32(0):
+                            self._publish_ready_tasks(
+                                task_tail, task_ready,
+                                task_expert, task_m_tile,
+                                task_slice_begin, task_slice_count, task_valid_rows,
+                                route_gate_tile_cnt, task_slice_chunk,
+                                expert_flush, expert_tile_base[expert_flush], rows,
+                            )
+                        expert_flush += Int32(gdim_z)
+
+                self._resident_grid_barrier(
+                    barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+                )
+                if flat_tid == Int32(0):
+                    _st_global_release_i32(
+                        get_ptr_as_int64(all_work_published, Int32(0)),
+                        Int32(1),
+                    )
+            elif is_cta_leader > Int32(0):
+                prev_done = atomic_add_global_i32(
+                    get_ptr_as_int64(producers_done_count, Int32(0)),
                     Int32(1),
                 )
+                if prev_done == Int32(gdim_z) - Int32(1):
+                    expert_flush = Int32(0)
+                    while expert_flush < num_experts:
+                        rows = row_counts[expert_flush]
+                        rem = rows % Int32(self.tile_shape_mnk[0])
+                        if rem != Int32(0):
+                            partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(self.tile_shape_mnk[0])
+                            self._publish_ready_tasks(
+                                task_tail, task_ready,
+                                task_expert, task_m_tile,
+                                task_slice_begin, task_slice_count, task_valid_rows,
+                                route_gate_tile_cnt, task_slice_chunk,
+                                expert_flush, partial_m_tile, rem,
+                            )
+                        expert_flush += Int32(1)
+                    _threadfence()
+                    _st_global_release_i32(
+                        get_ptr_as_int64(all_work_published, Int32(0)),
+                        Int32(1),
+                    )
 
         gA = cute.local_tile(mA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
         # Single tiled view over concatenated w13 [2*I_tp, K, E].
@@ -1136,7 +1138,11 @@ class MoEDynamicKernel:
                 task_slice_count_val = _ld_shared_i32(ctrl_base_addr + Int32(20))
                 task_valid_rows_val = _ld_shared_i32(ctrl_base_addr + Int32(24))
 
-                alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                alpha_value = cutlass.Float32(0.0)
+                if self.prequantized_input and self.fc1_tile_amax:
+                    alpha_value = alpha[task_m_tile_idx].to(cutlass.Float32)
+                else:
+                    alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
                 valid_rows = task_valid_rows_val
                 tile_m_base = task_m_tile_idx * Int32(self.tile_shape_mnk[0])
 
@@ -1541,11 +1547,21 @@ class MoEDynamicKernel:
                                 sc_v1 = cutlass.Float32(
                                     sC[warp_m_base + local_row, warp_n_base + local_pair_col * Int32(2) + Int32(1), epi_buffer]
                                 )
-                                scatter_add_bf16x2(
-                                    get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
-                                    wv * sc_v0,
-                                    wv * sc_v1,
-                                )
+                                if self.prequantized_input:
+                                    atomic_add_global_f32(
+                                        get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
+                                        wv * sc_v0,
+                                    )
+                                    atomic_add_global_f32(
+                                        get_ptr_as_int64(scatter_output, tok * scatter_N + global_col + Int32(1)),
+                                        wv * sc_v1,
+                                    )
+                                else:
+                                    scatter_add_bf16x2(
+                                        get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
+                                        wv * sc_v0,
+                                        wv * sc_v1,
+                                    )
                                 pair_idx += Int32(self.num_threads_per_warp)
 
                             # Post-scatter barrier: needed to ensure all warps
@@ -1621,8 +1637,6 @@ class MoEDynamicKernel:
                     # Ensures MMA warps finish scatter before DMA starts next task's FC1.
                     self.pass_sync_barrier.arrive_and_wait()
                     slice_idx += Int32(1)
-
-
 
         if warp_idx == self.tma_load_warp_id:
             ml_pipeline.producer_tail(prod_state)

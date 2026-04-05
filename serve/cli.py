@@ -38,7 +38,7 @@ def _parse_graph_batch_sizes(spec: str | None, *, enabled: bool) -> list[int]:
 
 def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p, top_k, rep_penalty,
          serve_mode=False, port=8000, capture_prefill_graph=False, enable_thinking=True, no_graph=False,
-         compile_layers=False, load_backend="auto", log_level="info", graph_batch_sizes=None,
+         compile_layers=True, load_backend="auto", log_level="info", graph_batch_sizes=None,
          prefill_chunk_size=512, max_running=None, max_waiting=256, max_prefill_tokens=4096,
          enable_webui=False):
     rank = tp_group.rank if tp_group else 0
@@ -181,8 +181,11 @@ def main():
     parser.add_argument("--web-ui", action="store_true",
                         help="Enable the built-in browser chat UI at /ui (server mode only)")
     parser.add_argument("--port", type=int, default=8000, help="API server port")
-    parser.add_argument("--capture-prefill-graph", action="store_true",
-                        help="Capture CUDA graphs for prefill chunks (needs more memory)")
+    parser.set_defaults(capture_prefill_graph=False)
+    parser.add_argument("--capture-prefill-graph", dest="capture_prefill_graph", action="store_true",
+                        help="Enable prefill CUDA graph capture")
+    parser.add_argument("--no-prefill-graph", dest="capture_prefill_graph", action="store_false",
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         "--graph-batch-sizes",
         type=str,
@@ -217,8 +220,11 @@ def main():
                         help="Disable thinking/reasoning for reasoning models (Qwen3.5)")
     parser.add_argument("--no-graph", action="store_true",
                         help="Disable CUDA graph capture (run eager)")
-    parser.add_argument("--compile", action="store_true",
-                        help="Enable per-layer torch.compile (experimental)")
+    parser.set_defaults(compile_layers=True)
+    parser.add_argument("--compile", dest="compile_layers", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--no-compile", dest="compile_layers", action="store_false",
+                        help="Disable per-layer torch.compile")
     parser.add_argument(
         "--load-backend",
         choices=("auto", "distributed", "local"),
@@ -244,7 +250,7 @@ def main():
         args=(args.model_path, args.max_tokens, args.chat, args.prompt,
               args.temperature, args.top_p, args.top_k, args.repetition_penalty,
               args.serve, args.port, args.capture_prefill_graph,
-              not args.no_think, args.no_graph, args.compile, args.load_backend, args.log_level,
+              not args.no_think, args.no_graph, args.compile_layers, args.load_backend, args.log_level,
               args.graph_batch_sizes, args.prefill_chunk_size, args.max_running,
               args.max_waiting, args.max_prefill_tokens, args.web_ui),
         gpu_ids=gpu_ids,

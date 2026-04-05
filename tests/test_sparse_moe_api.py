@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import os
 
 import torch
 
@@ -129,10 +130,11 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
+        fc2_tile_amax=False,
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
-        del input_scales_are_reciprocal, input_scales_static, fast_math
+        del input_scales_are_reciprocal, input_scales_static, fast_math, fc2_tile_amax
         captured["a"] = a
         captured["topk_weights"] = topk_weights
         captured["topk_ids"] = topk_ids
@@ -184,6 +186,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
+        fc2_tile_amax=False,
     ):
         del args
         captured["workspace"] = workspace
@@ -191,6 +194,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["input_scales_are_reciprocal"] = input_scales_are_reciprocal
         captured["input_scales_static"] = input_scales_static
         captured["fast_math"] = fast_math
+        captured["fc2_tile_amax"] = fc2_tile_amax
         if output is None:
             return torch.ones_like(hidden_states)
         output.fill_(1.0)
@@ -216,6 +220,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "input_scales_are_reciprocal": True,
         "input_scales_static": True,
         "fast_math": False,
+        "fc2_tile_amax": False,
     }
 
 
@@ -247,6 +252,81 @@ def test_sparse_moe_fp4_scales_output_in_place() -> None:
 
     assert actual is output
     torch.testing.assert_close(actual, torch.full_like(hidden_states, 0.5))
+
+
+def test_b12x_moe_fp4_env_forces_fc2_tile_amax() -> None:
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int64)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    plan = tp_moe.TPMoEPlan(
+        implementation="static",
+        state_E=2,
+        weight_E=experts.w1_fp4.shape[0],
+        routed_rows=2,
+        max_rows=2,
+        k=hidden_states.shape[1],
+        n=experts.w2_fp4.shape[2] * 2,
+        num_topk=1,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        max_tokens_per_launch=hidden_states.shape[0],
+    )
+    workspace = tp_moe.TPCompactStaticWorkspace(
+        implementation="static",
+        state_E=2,
+        weight_E=experts.w1_fp4.shape[0],
+        max_rows=2,
+        k=hidden_states.shape[1],
+        n=experts.w2_fp4.shape[2] * 2,
+        num_topk=1,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        row_counts=torch.zeros(2, dtype=torch.int32),
+        token_map=torch.zeros(2, 2, dtype=torch.int32),
+        token_weights=torch.zeros(2, 2, dtype=torch.float32),
+        packed_input=torch.zeros(2, 2, hidden_states.shape[1] // 2, dtype=torch.uint8),
+        packed_input_scale=torch.zeros(2, 128, 4, dtype=torch.uint8),
+        barrier_count=torch.zeros(1, dtype=torch.int32),
+        barrier_epoch=torch.zeros(1, dtype=torch.int32),
+        routed_rows_capacity=2,
+        active_expert_count=torch.zeros(1, dtype=torch.int32),
+        weight_expert_ids=torch.arange(2, dtype=torch.int32),
+        global_to_local_expert=torch.zeros(experts.w1_fp4.shape[0], dtype=torch.int32),
+        compact_topk_ids=torch.zeros(2, dtype=torch.int32),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_launch_compact_static(**kwargs):
+        captured["fc2_tile_amax"] = kwargs["fc2_tile_amax"]
+        return None
+
+    with (
+        patch.dict(os.environ, {"B12X_MOE_FC2_TILE_AMAX": "1"}, clear=False),
+        patch.object(tp_moe, "_make_workspace_plan", return_value=plan),
+        patch.object(tp_moe, "_resolve_workspace", return_value=workspace),
+        patch.object(tp_moe, "_get_weight_views", return_value=object()),
+        patch.object(tp_moe, "current_cuda_stream", return_value=object()),
+        patch.object(tp_moe, "_launch_compact_static", side_effect=fake_launch_compact_static),
+    ):
+        out = tp_moe.b12x_moe_fp4(
+            hidden_states,
+            experts.a1_gscale,
+            experts.w1_fp4,
+            experts.w1_blockscale,
+            experts.w1_alphas,
+            experts.a2_gscale,
+            experts.w2_fp4,
+            experts.w2_blockscale,
+            experts.w2_alphas,
+            topk_weights,
+            topk_ids,
+            workspace=workspace,
+            fc2_tile_amax=False,
+        )
+
+    assert captured["fc2_tile_amax"] is True
+    assert out.shape == hidden_states.shape
 
 
 def test_sparse_moe_fp4_requires_topk_or_routing() -> None:

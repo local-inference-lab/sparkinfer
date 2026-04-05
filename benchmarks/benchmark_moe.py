@@ -214,6 +214,22 @@ class ExpertWeights:
     g2_alphas_per_expert: torch.Tensor
 
 
+@dataclass
+class SharedExpertWeights:
+    layer_idx: int
+    spec: ModelSpec
+    w13_weight: torch.Tensor
+    w13_blockscale_swizzled: torch.Tensor
+    w2_weight: torch.Tensor
+    w2_blockscale_swizzled: torch.Tensor
+    w13_input_scale_quant: torch.Tensor
+    w2_input_scale_quant: torch.Tensor
+    w13_input_scale: torch.Tensor
+    w2_input_scale: torch.Tensor
+    g1_alphas: torch.Tensor
+    g2_alphas: torch.Tensor
+
+
 def load_expert_weights(
     model_path: pathlib.Path,
     spec: ModelSpec,
@@ -311,6 +327,69 @@ def load_expert_weights(
     )
 
 
+def load_shared_expert_weights(
+    model_path: pathlib.Path,
+    spec: ModelSpec,
+    *,
+    layer_idx: int = 0,
+) -> SharedExpertWeights:
+    cfg = json.loads((model_path / "config.json").read_text())["text_config"]
+    assert cfg["shared_expert_intermediate_size"] == spec.intermediate_size
+    assert cfg["hidden_size"] == spec.hidden_size
+
+    device = torch.device("cuda")
+    K = spec.hidden_size
+    I_tp = spec.I_tp
+    prefix = f"model.language_model.layers.{layer_idx}.mlp.shared_expert"
+    loader = IndexedSafetensorLoader(model_path)
+
+    tp_off = spec.tp_rank * I_tp
+    tp_off_packed = spec.tp_rank * (I_tp // 2)
+    tp_sf_cols = I_tp // 16
+    tp_sf_off = spec.tp_rank * tp_sf_cols
+
+    gate_w = loader.get_tensor(f"{prefix}.gate_proj.weight").narrow(0, tp_off, I_tp).to(device)
+    gate_sf = loader.get_tensor(f"{prefix}.gate_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
+    gate_gs = loader.get_tensor(f"{prefix}.gate_proj.weight_scale_2").to(device)
+    gate_is = loader.get_tensor(f"{prefix}.gate_proj.input_scale").to(device)
+
+    up_w = loader.get_tensor(f"{prefix}.up_proj.weight").narrow(0, tp_off, I_tp).to(device)
+    up_sf = loader.get_tensor(f"{prefix}.up_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
+
+    down_w = loader.get_tensor(f"{prefix}.down_proj.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
+    down_sf = loader.get_tensor(f"{prefix}.down_proj.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+    down_gs = loader.get_tensor(f"{prefix}.down_proj.weight_scale_2").to(device)
+    down_is = loader.get_tensor(f"{prefix}.down_proj.input_scale").to(device)
+
+    w13_weight = torch.cat([up_w, gate_w], dim=0).unsqueeze(0).contiguous()
+    w13_sf = torch.cat([up_sf, gate_sf], dim=0).unsqueeze(0).contiguous()
+    w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
+    w2_weight = down_w.unsqueeze(0).contiguous()
+    w2_blockscale_swizzled = swizzle_block_scale(down_sf.unsqueeze(0))
+
+    w13_input_scale = gate_is.to(torch.float32).reshape(1)
+    w2_input_scale = down_is.to(torch.float32).reshape(1)
+    w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
+    w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
+    g1_alphas = (w13_input_scale * gate_gs.to(torch.float32)).to(torch.float32)
+    g2_alphas = (w2_input_scale * down_gs.to(torch.float32)).to(torch.float32)
+
+    return SharedExpertWeights(
+        layer_idx=layer_idx,
+        spec=spec,
+        w13_weight=w13_weight,
+        w13_blockscale_swizzled=w13_blockscale_swizzled,
+        w2_weight=w2_weight,
+        w2_blockscale_swizzled=w2_blockscale_swizzled,
+        w13_input_scale_quant=w13_input_scale_quant,
+        w2_input_scale_quant=w2_input_scale_quant,
+        w13_input_scale=w13_input_scale,
+        w2_input_scale=w2_input_scale,
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+    )
+
+
 def load_expert_weight_stack(
     model_path: pathlib.Path,
     spec: ModelSpec,
@@ -350,6 +429,17 @@ def load_gate_weight(
     return gate_weight.to(device=torch.device("cuda")).contiguous()
 
 
+def load_shared_gate_weight(
+    model_path: pathlib.Path,
+    *,
+    layer_idx: int = 0,
+) -> torch.Tensor:
+    weight = IndexedSafetensorLoader(model_path).get_tensor(
+        f"model.language_model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+    )
+    return weight.to(device=torch.device("cuda"), dtype=torch.bfloat16).contiguous()
+
+
 def make_input_activations(
     spec: ModelSpec,
     m: int,
@@ -358,7 +448,76 @@ def make_input_activations(
 ) -> torch.Tensor:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    x = torch.randn(m, spec.hidden_size, generator=generator, dtype=torch.float32)
+    num_heads = 16
+    if spec.hidden_size % num_heads != 0:
+        raise ValueError(f"hidden_size={spec.hidden_size} must be divisible by {num_heads}")
+    head_dim = spec.hidden_size // num_heads
+
+    q = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
+    k = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
+    v = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
+
+    logits = torch.einsum("thd,shd->hts", q, k) / (head_dim ** 0.5)
+
+    # Add realistic pre-softmax structure:
+    # - locality bias
+    # - per-head bias offsets
+    # - occasional large positive logit spikes that create concentrated attention
+    pos = torch.arange(m, dtype=torch.float32)
+    locality_bias = -0.18 * (pos[:, None] - pos[None, :]).abs()
+    head_bias = 0.35 * torch.randn(num_heads, 1, 1, generator=generator, dtype=torch.float32)
+    logits = logits + locality_bias.unsqueeze(0) + head_bias
+
+    spike_mask = torch.rand(num_heads, m, m, generator=generator, dtype=torch.float32) < 0.01
+    if spike_mask.any():
+        spike_mag = torch.exp(1.0 + 0.8 * torch.randn(num_heads, m, m, generator=generator, dtype=torch.float32))
+        logits = logits + spike_mask.to(torch.float32) * spike_mag
+
+    attn = torch.softmax(logits, dim=-1)
+    x = torch.einsum("hts,shd->thd", attn, v).reshape(m, spec.hidden_size)
+
+    # Post-attention RMSNorm-like shaping, without injecting new variance after normalization.
+    row_rms = x.square().mean(dim=-1, keepdim=True).add_(1e-6).sqrt_()
+    x = x / row_rms
+    return x.to(device=device, dtype=torch.bfloat16)
+
+
+def make_global_scale_overflow_activations(
+    spec: ModelSpec,
+    m: int,
+    seed: int,
+    device: torch.device,
+    *,
+    global_scale: float,
+    spike_multiple: float = 8.0,
+    background_scale: float = 0.02,
+) -> torch.Tensor:
+    """Construct RMSNorm-like activations with one block-local overflow spike per row.
+
+    The planted spike exceeds the largest value representable by the FP4+FP8
+    activation quantizer under a fixed outer input scale:
+
+        max_representable = 6 * max_fp8_e4m3 * global_scale
+
+    The rest of the 16-value block is attenuated so the row is dominated by
+    that single outlier, which is the adversarial case for a coarse global
+    input scale.
+    """
+    x = make_input_activations(spec, m, seed, device).float()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + 97)
+
+    fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    spike_value = spike_multiple * 6.0 * fp8_e4m3_max * float(global_scale)
+    num_blocks = spec.hidden_size // 16
+
+    for row in range(m):
+        block_idx = int(torch.randint(num_blocks, (1,), generator=generator).item())
+        block_start = block_idx * 16
+        x[row, block_start:block_start + 16] *= background_scale
+        sign = -1.0 if torch.rand((), generator=generator).item() < 0.5 else 1.0
+        x[row, block_start] = sign * spike_value
+
     return x.to(device=device, dtype=torch.bfloat16)
 
 
@@ -637,6 +796,7 @@ def run_moe_layer_chain(
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
     fast_math: bool,
+    fc2_tile_amax: bool = False,
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
@@ -671,6 +831,7 @@ def run_moe_layer_chain(
             topk_weights,
             topk_ids,
             fast_math=fast_math,
+            fc2_tile_amax=fc2_tile_amax,
             output=output,
             workspace=workspace,
             input_scales_static=True,
@@ -687,6 +848,7 @@ def capture_moe_layer_chain(
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
     fast_math: bool,
+    fc2_tile_amax: bool = False,
     output_buffers: Sequence[torch.Tensor],
     workspace,
 ) -> torch.cuda.CUDAGraph:
@@ -699,6 +861,7 @@ def capture_moe_layer_chain(
             topk_ids_per_layer,
             topk_weights_per_layer,
             fast_math=fast_math,
+            fc2_tile_amax=fc2_tile_amax,
             output_buffers=output_buffers,
             workspace=workspace,
         )
@@ -800,6 +963,7 @@ def bench_multilayer_graph_mode(
             topk_ids_bufs,
             topk_weights_bufs,
             fast_math=args.fast_math,
+            fc2_tile_amax=args.fc2_tile_amax,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
         )
@@ -811,6 +975,7 @@ def bench_multilayer_graph_mode(
             topk_ids_bufs,
             topk_weights_bufs,
             fast_math=args.fast_math,
+            fc2_tile_amax=args.fc2_tile_amax,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
         )
@@ -823,6 +988,7 @@ def bench_multilayer_graph_mode(
                 topk_ids_bufs,
                 topk_weights_bufs,
                 fast_math=args.fast_math,
+                fc2_tile_amax=args.fc2_tile_amax,
                 output_buffers=eager_output_bufs,
                 workspace=shared_workspace,
             )
@@ -956,6 +1122,12 @@ def bench_e2e() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--fc2-tile-amax",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable compact static/micro FC2 tile-amax quantization.",
+    )
     args = parser.parse_args()
     batch_sizes = (
         args.batch_sizes
@@ -990,6 +1162,7 @@ def bench_e2e() -> None:
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
+    print(f"FC2 tile amax: {'on' if args.fc2_tile_amax else 'off'}")
     print(f"Graph mode: {args.graph_mode}")
     print(f"Timing passes per batch size: {args.repeats} x {args.iters} iterations")
     print(
@@ -1036,6 +1209,7 @@ def bench_e2e() -> None:
         topk_ids_w,
         workspace=warmup_workspace,
         fast_math=args.fast_math,
+        fc2_tile_amax=args.fc2_tile_amax,
     )
     torch.cuda.synchronize()
     print(" done.")
@@ -1075,6 +1249,7 @@ def bench_e2e() -> None:
                     topk_ids_local,
                     workspace=backend_workspace,
                     fast_math=args.fast_math,
+                    fc2_tile_amax=args.fc2_tile_amax,
                     output=backend_output,
                 )
 
