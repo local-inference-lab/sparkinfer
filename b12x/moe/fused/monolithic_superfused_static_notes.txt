@@ -1,0 +1,24 @@
+Use `MoESuperfusedStaticKernel` as the static backend class in place of the split producer+consumer launch when:
+- activations are BF16,
+- routing is sparse top-k plus one appended shared expert,
+- the consumer still uses the compact-static grouped schedule.
+
+Expected runtime arguments:
+1. Eight peer input tensors for oneshot allreduce (`inp0..inp7`), duplicated as needed.
+2. Eight signal pointers plus `self_signal` and `rank`.
+3. `residual_in`, `normalized_out` (or dummy), `residual_out`.
+4. `norm_weight`, `sparse_gate_weight`, `shared_gate_weight`.
+5. `topk_ids_flat`, `topk_weights_flat` scratch/output.
+6. Packed-workspace tensors: `packed_a`, `sfa_ptr`, `packed_a_storage`, `scale_storage`,
+   `row_counts`, `active_expert_count`, `weight_expert_ids`, `global_to_local_expert`,
+   `fc1_tile_scale`, `fc1_tile_alpha`, `token_map`, `token_weights`.
+7. Weight tensors/scales: `b_w13`, `sfb_w13_ptr`, `b_down`, `sfb_down_ptr`,
+   `input_global_scale`, `expert_alpha`, `down_alpha`, `global_scale`.
+8. `scatter_output`, `max_active_clusters`, `eps`, `stream`.
+
+Important behavior:
+- Phase 1 writes the compact prequantized workspace directly.
+- Phase 2 always consumes `fc1_tile_alpha` (the prequantized-input alpha path).
+- `fc1_tile_scale` is populated for contract completeness but not consumed by the current compute body.
+- This version uses resident-CTA token striding (`token_idx = bidz + k*gdim_z`) so it stays compatible with the resident grid barrier.
+- Expert-row append order is the phase-1 atomic append order, which is semantically correct for the consumer contract but not guaranteed to be byte-identical to a host-side deterministic pack order.

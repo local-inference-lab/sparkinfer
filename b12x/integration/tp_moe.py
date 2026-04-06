@@ -3271,6 +3271,317 @@ def _b12x_gemma_moe_block_fp4_static_monolithic(
     return moe_out, producer.residual_out
 
 
+def _b12x_gemma_moe_block_fp4_static_superfused_parity(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    top_k: int,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+):
+    from b12x.moe.fused.monolithic_superfused_static_parity_runtime import (
+        launch_superfused_static_parity,
+    )
+    from b12x.moe.fused.pre_mlp_static import UnifiedPreMLPIPC
+
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    fc2_tile_amax = _effective_fc2_tile_amax(fc2_tile_amax)
+
+    if fc1_tile_amax:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_superfused_parity currently supports fc1_tile_amax=False only"
+        )
+    if gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_superfused_parity does not yet support gate_bias"
+        )
+    if shared_gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_static_superfused_parity does not yet support shared_gate_bias"
+        )
+    if pre_mlp_runtime is None and pre_mlp_ipc is None:
+        raise ValueError("expected pre_mlp_runtime or pre_mlp_ipc")
+    if pre_mlp_runtime is not None and pre_mlp_ipc is not None:
+        raise ValueError("pass either pre_mlp_runtime or pre_mlp_ipc, not both")
+
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+
+    m, k = hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = int(top_k) + 1
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        topk_ids=None,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError(
+            "superfused parity static path only supports compact/static launches"
+        )
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+    assert isinstance(resolved_workspace, TPCompactStaticWorkspace)
+
+    if pre_mlp_ipc is None:
+        pre_mlp_ipc = UnifiedPreMLPIPC.from_oneshot_runtime(
+            pre_mlp_runtime,
+            inp=hidden_states,
+            peer_input_ptrs=peer_input_ptrs,
+        )
+
+    weights = _get_weight_views(
+        combined_experts.w1_fp4,
+        combined_experts.w1_blockscale,
+        combined_experts.w2_fp4,
+        combined_experts.w2_blockscale,
+        combined_experts.w1_alphas,
+        combined_experts.w2_alphas,
+        n,
+        k,
+    )
+    input_gs = _effective_input_scales(
+        combined_experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    down_input_scale = _prepare_expert_scale(combined_experts.a2_gscale, weight_E)
+    expert_alpha = _expand_expert_vector(
+        combined_experts.w1_alphas,
+        weight_E,
+        name="combined_experts.w1_alphas",
+    )
+    down_alpha = _expand_expert_vector(
+        combined_experts.w2_alphas,
+        weight_E,
+        name="combined_experts.w2_alphas",
+    )
+
+    moe_out, residual_out_tensor, _, topk_ids_flat, topk_weights_flat = launch_superfused_static_parity(
+        hidden_states=hidden_states,
+        residual=residual,
+        norm_weight=norm_weight,
+        gate_weight=gate_weight,
+        shared_gate_weight=shared_gate_weight,
+        ipc=pre_mlp_ipc,
+        workspace=resolved_workspace,
+        weights=weights,
+        input_global_scale=input_gs,
+        expert_alpha=expert_alpha,
+        down_alpha=down_alpha,
+        global_scale=down_input_scale,
+        num_sparse_experts=sparse_experts.w1_fp4.shape[0],
+        top_k=top_k,
+        output=output,
+        residual_out=residual_out,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        fc2_tile_amax=fc2_tile_amax,
+        renormalize_topk=renormalize_topk,
+        eps=norm_eps,
+        emit_routing_output=return_routing,
+    )
+
+    if return_routing:
+        routing = B12XTopKRouting(
+            topk_weights=topk_weights_flat.view(m, num_topk),
+            topk_ids=topk_ids_flat.view(m, num_topk),
+            router_logits=None,
+            flat_ids=topk_ids_flat,
+            flat_weights=topk_weights_flat,
+        )
+        return moe_out, residual_out_tensor, routing
+    return moe_out, residual_out_tensor
+
+
+def _b12x_gemma_moe_block_fp4_micro_megafused(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    top_k: int,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    normalized_debug_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    producer_fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+):
+    from b12x.moe.fused.micro_megafused import megafused_allreduce_route_compute_micro
+    from b12x.moe.fused.pre_mlp_static import UnifiedPreMLPIPC
+
+    del fast_math
+    del producer_fast_math
+    del fc2_tile_amax
+
+    if fc1_tile_amax:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_micro_megafused currently supports fc1_tile_amax=False only"
+        )
+    if gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_micro_megafused does not yet support gate_bias"
+        )
+    if shared_gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_micro_megafused does not yet support shared_gate_bias"
+        )
+    if pre_mlp_runtime is None and pre_mlp_ipc is None:
+        raise ValueError("expected pre_mlp_runtime or pre_mlp_ipc")
+    if pre_mlp_runtime is not None and pre_mlp_ipc is not None:
+        raise ValueError("pass either pre_mlp_runtime or pre_mlp_ipc, not both")
+
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+
+    m, k = hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = int(top_k) + 1
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        topk_ids=None,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
+    if plan.implementation != "static":
+        raise ValueError("micro megafused path only supports compact/static launches")
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    _ = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+
+    if pre_mlp_ipc is None:
+        pre_mlp_ipc = UnifiedPreMLPIPC.from_oneshot_runtime(
+            pre_mlp_runtime,
+            inp=hidden_states,
+            peer_input_ptrs=peer_input_ptrs,
+        )
+
+    effective_fc1_input_scale = _effective_input_scales(
+        combined_experts.a1_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    effective_fc2_input_scale = _effective_input_scales(
+        combined_experts.a2_gscale,
+        weight_E,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    w1_alpha = _expand_expert_vector(
+        combined_experts.w1_alphas,
+        weight_E,
+        name="combined_experts.w1_alphas",
+    )
+    w2_alpha = _expand_expert_vector(
+        combined_experts.w2_alphas,
+        weight_E,
+        name="combined_experts.w2_alphas",
+    )
+    megafused_out, megafused_residual_out, normalized_debug_out, topk_ids_out, topk_weights_out = (
+        megafused_allreduce_route_compute_micro(
+            hidden_states,
+            residual,
+            norm_weight,
+            gate_weight,
+            shared_gate_weight,
+            w1_fp4_u8=combined_experts.w1_fp4,
+            w1_scale_u8=combined_experts.w1_blockscale.view(torch.uint8),
+            w1_alpha=w1_alpha,
+            input_global_scale=effective_fc1_input_scale,
+            w2_fp4_u8=combined_experts.w2_fp4,
+            w2_scale_u8=combined_experts.w2_blockscale.view(torch.uint8),
+            w2_alpha=w2_alpha,
+            fc2_global_scale=effective_fc2_input_scale,
+            ipc=pre_mlp_ipc,
+            top_k=top_k,
+            renormalize_topk=renormalize_topk,
+            eps=norm_eps,
+            output=output,
+            residual_out=residual_out,
+            normalized_out=normalized_debug_out,
+        )
+    )
+    if return_routing:
+        routing = B12XTopKRouting(
+            topk_weights=topk_weights_out,
+            topk_ids=topk_ids_out,
+            router_logits=None,
+            flat_ids=topk_ids_out.view(-1),
+            flat_weights=topk_weights_out.view(-1),
+        )
+        return megafused_out, megafused_residual_out, routing
+    return megafused_out, megafused_residual_out
+
+
 def _prepare_gemma_moe_block_fp4_static_monolithic(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
