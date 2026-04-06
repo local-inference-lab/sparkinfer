@@ -18,6 +18,7 @@ start working as soon as a tile is published.
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -75,7 +76,7 @@ from b12x.moe.fused.pre_mlp_static import _exp2_approx_ftz_f32
 
 _SF_VEC_SIZE = 16
 _LEVEL_TILE_M = 128
-_TASK_SLICE_CHUNK = 1
+_TASK_SLICE_CHUNK = int(os.environ.get("B12X_DYNAMIC_SUPERFUSED_TASK_SLICE_CHUNK", "1"))
 LOG2_E = 1.4426950408889634
 _WARP_SIZE = 32
 _SUPERFUSED_NORM_WARP_IDX = 0
@@ -1345,9 +1346,6 @@ class MoEDynamicSuperfusedKernel:
 
             has_task = _ld_shared_i32(ctrl_base_addr + Int32(0))
             is_done = _ld_shared_i32(ctrl_base_addr + Int32(4))
-            if has_task > Int32(0):
-                claimed_slot = _ld_shared_i32(ctrl_base_addr + Int32(28))
-                _ld_global_acquire_i32(get_ptr_as_int64(task_ready, claimed_slot))
             if has_task == Int32(0):
                 if is_done > Int32(0):
                     consumer_live = Int32(0)
@@ -1385,7 +1383,6 @@ class MoEDynamicSuperfusedKernel:
                 mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rGate, mode=[1])
                 mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rGate, mode=[2])
                 epi_buffer = Int32(0)
-
                 down_alpha_value = down_alpha[task_expert_idx].to(cutlass.Float32)
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
@@ -1581,14 +1578,14 @@ class MoEDynamicSuperfusedKernel:
                                 tRS_sD[(None, None, None, silu_epi_buffer)],
                             )
                             cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier.arrive_and_wait()
-
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
                         epi_rows = epi_m_valid
                         if epi_rows > Int32(self.epi_tile[0]):
                             epi_rows = Int32(self.epi_tile[0])
                         if epi_rows < Int32(0):
                             epi_rows = Int32(0)
+                        self.epilog_sync_barrier.arrive_and_wait()
+
                         quant_idx = Int32(tidx)
                         while quant_idx < epi_rows * sf_blocks_per_row:
                             local_row = quant_idx // sf_blocks_per_row
@@ -1656,7 +1653,6 @@ class MoEDynamicSuperfusedKernel:
                     warp_in_tile = Int32(tidx) >> Int32(5)
                     warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
                     warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
-
                     csA_phase2 = csA[None, None, None, 0]
                     csSFA_phase2 = csSFA[None, None, None, 0]
 
@@ -1749,7 +1745,6 @@ class MoEDynamicSuperfusedKernel:
                                 local_pair_col = pair_idx & Int32(31)  # % 32
                                 global_row = tile_m_base + rows_offset + warp_m_base + local_row
                                 global_col = tile_n_base_cur + warp_n_base + local_pair_col * Int32(2)
-                                # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
                                 tok = Int32(0)
                                 wv = cutlass.Float32(0.0)
                                 if lane_id == Int32(0):
@@ -1770,14 +1765,15 @@ class MoEDynamicSuperfusedKernel:
                                 )
                                 pair_idx += Int32(self.num_threads_per_warp)
 
-                            # Post-scatter barrier: needed to ensure all warps
-                            # finish scatter before next output tile's pipeline ops
-                            # (pipeline consumer is collective across all MMA warps).
-                            self.epilog_sync_barrier.arrive_and_wait()
+                        # Post-scatter barrier: needed to ensure all warps finish
+                        # the current output tile before the next collective phase2
+                        # pipeline step. This only needs to happen once per output tile.
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                     # Final pass_sync: protect sA from next task's FC1 loads.
                     # DMA warp waits here too after finishing all B_down loads.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    if task_slice_count_val > Int32(1):
+                        self.pass_sync_barrier.arrive_and_wait()
                     slice_idx += Int32(1)
 
             elif warp_idx == self.tma_load_warp_id:
@@ -1841,7 +1837,8 @@ class MoEDynamicSuperfusedKernel:
 
                     # Final pass_sync: match MMA warps' barrier after FC2 sweep.
                     # Ensures MMA warps finish scatter before DMA starts next task's FC1.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    if task_slice_count_val > Int32(1):
+                        self.pass_sync_barrier.arrive_and_wait()
                     slice_idx += Int32(1)
 
         if warp_idx == self.tma_load_warp_id:
