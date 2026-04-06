@@ -1,0 +1,296 @@
+Annotated m=1 Nsight Compute notes for:
+  b12x/moe/fused/dynamic_superfused.py
+
+This is intentionally a companion note, not a runnable kernel.
+It exists to preserve the profiling context without cluttering the
+production kernel with profiling-only comments.
+
+Profile setup that produced these notes:
+  - world_size=2
+  - m=1
+  - lineinfo enabled via CUTE_DSL_LINEINFO=1
+  - PTX retained via CUTE_DSL_KEEP_PTX=1
+  - helper harness:
+      debug_dynamic_superfused_ncu_m1.py
+
+High-level result:
+  - one CTA per SM: grid=(1,1,188), block=(160,1,1)
+  - achieved occupancy on an active SM is already maxed for this shape
+  - the dominant issue is not launch underfill anymore
+  - the kernel is dominated by CTA barrier stalls, then scoreboard/wait stalls
+
+Top stall classes from the m=1 lineinfo profile:
+  - barrier_not_issued: ~49.5k samples
+  - long_scoreboard_not_issued: ~6.1k
+  - short_scoreboard_not_issued: ~4.0k
+  - wait_not_issued: ~3.2k
+
+Important caveat:
+  Nsight's Python/CuTe line mapping is noisy on multiline expressions.
+  In particular, some of the heaviest work collapses onto lines that are not
+  themselves the real bottleneck (for example line 847 in the struct layout).
+  The line ranges below are the manually interpreted hot regions.
+
+
+-----------------------------------------------------------------------------
+1. CTA setup and shared pipeline state
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  781-847
+
+Why it matters:
+  - This region defines the shared control block and the staged shared-memory
+    buffers used by the three internal pipelines.
+  - Nsight sometimes attributes a large amount of steady-state traffic to
+    line 847 (`sSFB_up`) because the generated line mapping collapses the
+    storage layout and nearby pipeline code together.
+
+Snippet:
+
+  781  tidx, _, _ = cute.arch.thread_idx()
+  784  warp_idx = cute.arch.warp_idx()
+  ...
+  816  @cute.struct
+  817  class Storage:
+  ...
+  836      sSFA: ...
+  840      sSFB: ...
+  844      sSFB_up: ...
+  848      sC: ...
+
+Interpretation:
+  - Treat this as "pipeline backing state / smem footprint", not as an
+    actionable single source line.
+
+
+-----------------------------------------------------------------------------
+2. Consumer task claim rendezvous
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1328-1354
+
+Snippet:
+
+  1332  if prev_head == head:
+  1333      _spin_wait_global_eq_i32(...)
+  1334      _st_shared_i32(...)
+  ...
+  1344  cute.arch.sync_threads()
+  1346  has_task = _ld_shared_i32(...)
+  1351  if has_task == Int32(0):
+  1352      if is_done > Int32(0):
+  1353          consumer_live = Int32(0)
+
+Why it is hot:
+  - This is the CTA-wide rendezvous between the loader/control warp and the
+    MMA warps for each claimed task.
+  - The lineinfo profile shows meaningful barrier and wait pressure here.
+
+What to keep in mind:
+  - This synchronization is part of the task handoff overhead at tiny m.
+  - It is not the biggest single arithmetic cost, but it is on the hot path
+    of every claimed task.
+
+
+-----------------------------------------------------------------------------
+3. FC1 gate pass
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1406-1479
+
+Snippet:
+
+  1410  cons_state.reset_count()
+  1411  peek = ml_pipeline.consumer_try_wait(cons_state)
+  1412  ml_pipeline.consumer_wait(cons_state, peek)
+  ...
+  1417  cute.copy(smem_copy_A, ...)
+  1418  cute.copy(smem_copy_B, ...)
+  1421  cute.copy(smem_copy_SFA, ...)
+  1422  cute.copy(smem_copy_SFB, ...)
+  ...
+  1436  ml_pipeline.consumer_wait(cons_state, peek)
+  ...
+  1441  cute.gemm(...)
+  ...
+  1452  cute.copy(smem_copy_SFA, ...)
+  1453  cute.copy(smem_copy_SFB, ...)
+  ...
+  1468  cute.gemm(...)
+  ...
+  1478  self.pass_sync_barrier.arrive_and_wait()
+
+Why it is hot:
+  - This is the first FC1 consumer half for each slice.
+  - The profile shows real long-scoreboard and wait pressure around the
+    `consumer_wait` and staged `cute.copy(...)` loads.
+  - The `cute.gemm(...)` body is one of the major instruction-volume regions.
+  - `pass_sync_barrier` is a real barrier hotspot.
+
+Interpretation:
+  - Gate and up currently serialize through a cross-warp handoff on shared A.
+  - This is a major part of the m=1 latency story.
+
+
+-----------------------------------------------------------------------------
+4. FC1 up pass
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1480-1545
+
+Snippet:
+
+  1481  up_acc.fill(0.0)
+  1483  peek = up_pipeline.consumer_try_wait(up_cons_state)
+  1484  up_pipeline.consumer_wait(up_cons_state, peek)
+  ...
+  1489  cute.copy(smem_copy_A, ...)
+  1490  cute.copy(smem_copy_B, ...)
+  1493  cute.copy(smem_copy_SFA, ...)
+  1494  cute.copy(smem_copy_SFB, ...)
+  ...
+  1508  up_pipeline.consumer_wait(up_cons_state, peek)
+  ...
+  1513  cute.gemm(...)
+  ...
+  1520  cute.copy(smem_copy_A, ...)
+  1521  cute.copy(smem_copy_B, ...)
+  1522  cute.copy(smem_copy_SFA, ...)
+  1523  cute.copy(smem_copy_SFB, ...)
+  ...
+  1538  cute.gemm(...)
+
+Why it is hot:
+  - Same pattern as the gate pass, but for the up half.
+  - The profile shows substantial instruction volume here and more scoreboard
+    pressure around the staged loads and consumer waits.
+
+Interpretation:
+  - Gate+up together dominate the slice-local FC1 cost.
+  - If we reduce any control overhead, these loops remain the core arithmetic
+    body to optimize next.
+
+
+-----------------------------------------------------------------------------
+5. FC2 sweep
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1692-1708
+
+Snippet:
+
+  1692  down_acc.fill(0.0)
+  1693  for k_block_idx in ...:
+  ...
+  1700      cute.copy(smem_copy_B, ...)
+  1703      cute.copy(smem_copy_SFB, ...)
+  ...
+  1706      mma_atom.set(...)
+  1708      cute.gemm(...)
+
+Why it is hot:
+  - This is the FC2 GEMM sweep over all output tiles for the claimed slice.
+  - It shows up clearly in instruction count and some wait/scoreboard pressure.
+
+Interpretation:
+  - FC2 is not free, but for m=1 the synchronization around FC1/FC2 is still
+    a bigger issue than raw FC2 bandwidth.
+
+
+-----------------------------------------------------------------------------
+6. Scatter path
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1710-1776
+
+Snippet:
+
+  1722  acc_vec = tRS_rD.load()
+  1723  acc_vec = acc_vec.to(cutlass.BFloat16)
+  1726  cute.copy(tiled_copy_r2s, ...)
+  1731  cute.arch.fence_proxy("async.shared", space="cta")
+  ...
+  1756  tok = token_map[global_row].to(Int32)
+  1757  wv = token_weights[global_row].to(cutlass.Float32)
+  ...
+  1761  sC[...]
+  1766  scatter_add_bf16x2(...)
+  ...
+  1776  self.epilog_sync_barrier.arrive_and_wait()
+
+Why it matters:
+  - This is where FC2 output is converted and scattered back to token space.
+  - The scatter barrier is one of the explicit cross-warp synchronization
+    points in the steady-state loop.
+
+Interpretation:
+  - At m=1 this is a real latency component, but still secondary to the main
+    FC1 producer/consumer synchronization.
+
+
+-----------------------------------------------------------------------------
+7. DMA/control warp side of the steady-state loop
+-----------------------------------------------------------------------------
+
+Relevant lines:
+  1783-1850
+
+Snippet:
+
+  1795  # W13 is laid out as [up, gate] ...
+  1804  ml_pipeline.producer_acquire(prod_state)
+  1805  cute.copy(tma_a, ...)
+  1806  cute.copy(tma_b_w13, ...)
+  1807  cute.copy(tma_sfa, ...)
+  1808  cute.copy(tma_sfb_w13, ...)
+  ...
+  1814  self.pass_sync_barrier.arrive_and_wait()
+  ...
+  1819  up_pipeline.producer_acquire(up_prod_state)
+  1820  cute.copy(tma_a, ...)
+  1821  cute.copy(tma_b_w13, ...)
+  1822  cute.copy(tma_sfa, ...)
+  1823  cute.copy(tma_sfb_w13, ...)
+  ...
+  1836  phase2_pipeline.producer_acquire(phase2_prod_state)
+  1837  cute.copy(tma_b_down, ...)
+  1838  cute.copy(tma_sfb_down, ...)
+  ...
+  1844  self.pass_sync_barrier.arrive_and_wait()
+  ...
+  1848  ml_pipeline.producer_tail(prod_state)
+  1849  up_pipeline.producer_tail(up_prod_state)
+  1850  phase2_pipeline.producer_tail(phase2_prod_state)
+
+Why it is hot:
+  - These are the producer-side TMA loads and the barriers that hand ownership
+    back and forth between DMA and MMA warps.
+  - In the lineinfo report, this region is a major source of barrier stalls.
+
+Interpretation:
+  - The kernel is correctly queue-driven now, but it still pays multiple
+    explicit phase handoffs per slice.
+  - Those handoffs are currently the clearest structural latency target.
+
+
+-----------------------------------------------------------------------------
+Bottom line for m=1
+-----------------------------------------------------------------------------
+
+1. Launch underfill is no longer the main issue. We are already at one CTA/SM.
+2. The kernel is dominated by synchronization and staged pipeline handoffs.
+3. FC1 gate/up consumer waits plus pass-sync barriers are the first place to
+   attack if we want lower m=1 latency.
+4. FC2 and scatter matter, but they do not look like the primary blocker yet.
+
+Supporting artifacts:
+  - harness:
+      debug_dynamic_superfused_ncu_m1.py
+  - dumped PTX:
+      /tmp/cute_dumps_dynamic_superfused_profile/

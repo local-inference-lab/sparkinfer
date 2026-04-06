@@ -91,6 +91,32 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     down_input_scale_src_ptr: int = 0
 
 
+@dataclass(kw_only=True)
+class TPDynamicSuperfusedWorkspace(TPMoEWorkspace):
+    routed_rows_capacity: int
+    physical_tiles_capacity: int
+    task_capacity: int
+    max_tiles_per_expert: int
+    input_gs: torch.Tensor
+    down_input_scale: torch.Tensor
+    token_head: torch.Tensor
+    next_tile_alloc: torch.Tensor
+    producers_done_count: torch.Tensor
+    all_work_published: torch.Tensor
+    task_head: torch.Tensor
+    task_tail: torch.Tensor
+    task_ready: torch.Tensor
+    task_expert: torch.Tensor
+    task_m_tile: torch.Tensor
+    task_slice_begin: torch.Tensor
+    task_slice_count: torch.Tensor
+    task_valid_rows: torch.Tensor
+    expert_tile_ptr: torch.Tensor
+    tile_write_count: torch.Tensor
+    input_gs_src_ptr: int = 0
+    down_input_scale_src_ptr: int = 0
+
+
 @dataclass
 class TPMoEWorkspacePool:
     """Caller-owned capacity-based workspace cache partitioned by CUDA stream.
@@ -734,8 +760,41 @@ def _dynamic_task_geometry_from_routing(
     return exact_tiles, gate_tile_cnt, max_tasks
 
 
+def _dynamic_superfused_task_geometry(
+    weight_E: int,
+    n: int,
+    routed_rows: int,
+) -> tuple[int, int, int, int]:
+    routed_rows = max(1, routed_rows)
+    physical_tiles = routed_rows
+    gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
+    task_capacity = physical_tiles * gate_tile_cnt
+    max_tiles_per_expert = max(1, (routed_rows + _LEVEL_TILE_M - 1) // _LEVEL_TILE_M)
+    return physical_tiles, gate_tile_cnt, task_capacity, max_tiles_per_expert
+
+
 def _refresh_dynamic_workspace_scales(
     workspace: TPDynamicWorkspace,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    input_scales_static: bool,
+) -> None:
+    a1_src_ptr = a1_gscale.data_ptr()
+    a2_src_ptr = a2_gscale.data_ptr()
+    if (
+        not input_scales_static
+        or workspace.input_gs_src_ptr != a1_src_ptr
+        or workspace.down_input_scale_src_ptr != a2_src_ptr
+    ):
+        workspace.input_gs.copy_(a1_gscale.expand(workspace.weight_E))
+        workspace.down_input_scale.copy_(a2_gscale.expand(workspace.weight_E))
+        workspace.input_gs_src_ptr = a1_src_ptr if input_scales_static else 0
+        workspace.down_input_scale_src_ptr = a2_src_ptr if input_scales_static else 0
+
+
+def _refresh_dynamic_superfused_workspace_scales(
+    workspace: TPDynamicSuperfusedWorkspace,
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     *,
@@ -862,6 +921,79 @@ def _alloc_workspace(
         tile_write_count=torch.zeros(dynamic_tiles, dtype=torch.int32, device=device),
     )
     _refresh_dynamic_workspace_scales(
+        workspace,
+        a1_gscale,
+        a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    _finalize_workspace_views(workspace)
+    return workspace
+
+
+def _alloc_dynamic_superfused_workspace(
+    *,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    routed_rows: int,
+    input_scales_static: bool,
+) -> TPDynamicSuperfusedWorkspace:
+    physical_tiles, _, task_capacity, max_tiles_per_expert = _dynamic_superfused_task_geometry(
+        weight_E,
+        n,
+        routed_rows,
+    )
+    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    rows_padded = physical_tiles * _LEVEL_TILE_M
+    workspace = TPDynamicSuperfusedWorkspace(
+        implementation="dynamic_superfused",
+        state_E=weight_E,
+        weight_E=weight_E,
+        max_rows=rows_padded,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        routed_rows_capacity=routed_rows,
+        physical_tiles_capacity=physical_tiles,
+        task_capacity=task_capacity,
+        max_tiles_per_expert=max_tiles_per_expert,
+        row_counts=torch.zeros(weight_E, dtype=torch.int32, device=device),
+        token_map=torch.zeros(rows_padded, dtype=torch.int32, device=device),
+        token_weights=torch.zeros(rows_padded, dtype=torch.float32, device=device),
+        packed_input=torch.empty(1, rows_padded, k // 2, dtype=torch.uint8, device=device),
+        packed_input_scale=torch.empty(rows_padded, cols_pad_k, dtype=torch.uint8, device=device),
+        barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
+        barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
+        input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
+        down_input_scale=torch.empty(weight_E, dtype=torch.float32, device=device),
+        token_head=torch.zeros(1, dtype=torch.int32, device=device),
+        next_tile_alloc=torch.zeros(1, dtype=torch.int32, device=device),
+        producers_done_count=torch.zeros(1, dtype=torch.int32, device=device),
+        all_work_published=torch.zeros(1, dtype=torch.int32, device=device),
+        task_head=torch.zeros(1, dtype=torch.int32, device=device),
+        task_tail=torch.zeros(1, dtype=torch.int32, device=device),
+        task_ready=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        task_expert=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        task_m_tile=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        task_slice_begin=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        task_slice_count=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        task_valid_rows=torch.zeros(task_capacity, dtype=torch.int32, device=device),
+        expert_tile_ptr=torch.full(
+            (weight_E, max_tiles_per_expert),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        ),
+        tile_write_count=torch.zeros(physical_tiles, dtype=torch.int32, device=device),
+    )
+    _refresh_dynamic_superfused_workspace_scales(
         workspace,
         a1_gscale,
         a2_gscale,
@@ -1050,6 +1182,8 @@ def _validate_workspace(
         raise TypeError("expected a TPCompactStaticWorkspace for the compact static backend")
     if plan.implementation == "dynamic" and not isinstance(workspace, TPDynamicWorkspace):
         raise TypeError("expected a TPDynamicWorkspace for the dynamic backend")
+    if plan.implementation == "dynamic_superfused" and not isinstance(workspace, TPDynamicSuperfusedWorkspace):
+        raise TypeError("expected a TPDynamicSuperfusedWorkspace for the dynamic superfused backend")
     if isinstance(workspace, TPCompactStaticWorkspace) and workspace.routed_rows_capacity < plan.routed_rows:
         raise ValueError(
             "workspace routed-row capacity mismatch: "
@@ -1096,7 +1230,7 @@ def _workspace_pool_key(
     # Pool-backed static and dynamic workspaces are capacity-based. Avoid
     # exact-shape keys here or long-tail prompt lengths will accumulate one
     # retained workspace per distinct routed-row count.
-    if implementation in ("static", "dynamic"):
+    if implementation in ("static", "dynamic", "dynamic_superfused"):
         state_E = -1
         max_rows = -1
     return (
@@ -3269,6 +3403,218 @@ def _b12x_gemma_moe_block_fp4_static_monolithic(
     if return_routing:
         return moe_out, producer.residual_out, combined_selected
     return moe_out, producer.residual_out
+
+
+def _resolve_dynamic_superfused_workspace(
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    *,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    input_scales_static: bool,
+) -> TPDynamicSuperfusedWorkspace:
+    rows_padded = max(1, routed_rows) * _LEVEL_TILE_M
+    if isinstance(workspace, TPMoEWorkspacePool):
+        stream_key = current_cuda_stream()
+        key = (
+            "dynamic_superfused",
+            stream_key,
+            -1,
+            weight_E,
+            -1,
+            k,
+            n,
+            num_topk,
+            device,
+            dtype,
+        )
+        resolved = workspace.workspaces.get(key)
+        if resolved is None:
+            resolved = _alloc_dynamic_superfused_workspace(
+                weight_E=weight_E,
+                k=k,
+                n=n,
+                num_topk=num_topk,
+                device=device,
+                dtype=dtype,
+                a1_gscale=a1_gscale,
+                a2_gscale=a2_gscale,
+                routed_rows=routed_rows,
+                input_scales_static=input_scales_static,
+            )
+            workspace.workspaces[key] = resolved
+        else:
+            assert isinstance(resolved, TPDynamicSuperfusedWorkspace)
+            _refresh_dynamic_superfused_workspace_scales(
+                resolved,
+                a1_gscale,
+                a2_gscale,
+                input_scales_static=input_scales_static,
+            )
+        assert isinstance(resolved, TPDynamicSuperfusedWorkspace)
+        return resolved
+
+    if not isinstance(workspace, TPDynamicSuperfusedWorkspace):
+        raise TypeError("expected a TPDynamicSuperfusedWorkspace or workspace pool")
+    expected = ("dynamic_superfused", weight_E, k, n, num_topk, device, dtype)
+    actual = (
+        workspace.implementation,
+        workspace.weight_E,
+        workspace.k,
+        workspace.n,
+        workspace.num_topk,
+        workspace.device,
+        workspace.dtype,
+    )
+    if actual != expected:
+        raise ValueError(f"workspace metadata mismatch: expected {expected}, got {actual}")
+    if workspace.routed_rows_capacity < routed_rows:
+        raise ValueError(
+            "workspace routed-row capacity mismatch: "
+            f"expected at least {routed_rows}, got {workspace.routed_rows_capacity}"
+        )
+    if workspace.max_rows < rows_padded:
+        raise ValueError(
+            "workspace row capacity mismatch: "
+            f"expected at least {rows_padded}, got {workspace.max_rows}"
+        )
+    _refresh_dynamic_superfused_workspace_scales(
+        workspace,
+        a1_gscale,
+        a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    return workspace
+
+
+def _b12x_gemma_moe_block_fp4_dynamic_superfused(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    pre_mlp_runtime=None,
+    pre_mlp_ipc=None,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    sparse_experts: B12XFP4ExpertWeights,
+    shared_expert: B12XFP4ExpertWeights,
+    shared_gate_weight: torch.Tensor,
+    combined_experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    top_k: int,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+    return_routing: bool = False,
+    peer_input_ptrs: tuple[int, ...] | None = None,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    fc1_tile_amax: bool = False,
+    fc2_tile_amax: bool = False,
+    shared_gate_bias: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+):
+    from b12x.moe.fused.dynamic_superfused_runtime import launch_dynamic_superfused
+    from b12x.moe.fused.pre_mlp_static import UnifiedPreMLPIPC
+
+    del return_routing, fc1_tile_amax, fc2_tile_amax
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    if gate_bias is not None:
+        raise NotImplementedError("_b12x_gemma_moe_block_fp4_dynamic_superfused does not yet support gate_bias")
+    if shared_gate_bias is not None:
+        raise NotImplementedError(
+            "_b12x_gemma_moe_block_fp4_dynamic_superfused does not yet support shared_gate_bias"
+        )
+    if pre_mlp_runtime is None and pre_mlp_ipc is None:
+        raise ValueError("expected pre_mlp_runtime or pre_mlp_ipc")
+    if pre_mlp_runtime is not None and pre_mlp_ipc is not None:
+        raise ValueError("pass either pre_mlp_runtime or pre_mlp_ipc, not both")
+
+    if combined_experts is None:
+        combined_experts = _append_expert_bank(sparse_experts, shared_expert)
+
+    if pre_mlp_ipc is None:
+        pre_mlp_ipc = UnifiedPreMLPIPC.from_oneshot_runtime(
+            pre_mlp_runtime,
+            inp=hidden_states,
+            peer_input_ptrs=peer_input_ptrs,
+        )
+
+    m, k = hidden_states.shape
+    weight_E = combined_experts.w1_fp4.shape[0]
+    n = combined_experts.w2_fp4.shape[2] * 2
+    num_topk = int(top_k) + 1
+    effective_input_scales_static = (
+        input_scales_static
+        or (combined_experts.a1_gscale.numel() == 1 and combined_experts.a2_gscale.numel() == 1)
+    )
+    resolved_workspace = _resolve_dynamic_superfused_workspace(
+        workspace,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        routed_rows=m * num_topk,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        a1_gscale=combined_experts.a1_gscale,
+        a2_gscale=combined_experts.a2_gscale,
+        input_scales_static=effective_input_scales_static,
+    )
+
+    weights = _get_weight_views(
+        combined_experts.w1_fp4,
+        combined_experts.w1_blockscale,
+        combined_experts.w2_fp4,
+        combined_experts.w2_blockscale,
+        combined_experts.w1_alphas,
+        combined_experts.w2_alphas,
+        n,
+        k,
+    )
+    down_input_scale = _prepare_expert_scale(combined_experts.a2_gscale, weight_E)
+    expert_alpha = _expand_expert_vector(
+        combined_experts.w1_alphas,
+        weight_E,
+        name="combined_experts.w1_alphas",
+    )
+    down_alpha = _expand_expert_vector(
+        combined_experts.w2_alphas,
+        weight_E,
+        name="combined_experts.w2_alphas",
+    )
+
+    moe_out, residual_out_tensor = launch_dynamic_superfused(
+        hidden_states=hidden_states,
+        residual=residual,
+        norm_weight=norm_weight,
+        gate_weight=gate_weight,
+        shared_gate_weight=shared_gate_weight,
+        ipc=pre_mlp_ipc,
+        workspace=resolved_workspace,
+        weights=weights,
+        input_global_scale=resolved_workspace.input_gs,
+        expert_alpha=expert_alpha,
+        down_alpha=down_alpha,
+        global_scale=down_input_scale,
+        num_sparse_experts=sparse_experts.w1_fp4.shape[0],
+        top_k=top_k,
+        output=output,
+        residual_out=residual_out,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        renormalize_topk=renormalize_topk,
+        eps=norm_eps,
+    )
+    return moe_out, residual_out_tensor
 
 
 def _b12x_gemma_moe_block_fp4_static_superfused_parity(
