@@ -1846,10 +1846,18 @@ def b12x_moe_fp4(
     workloads use dynamic. Large token batches are chunked only when the chosen
     backend cannot describe the required work buffers in a single launch.
     """
+    if activation not in {"silu", "relu2"}:
+        raise ValueError(f"unsupported activation {activation!r}")
     m, k = a.shape
     E = w1_fp4.shape[0]
     weight_E = E
     n = w2_fp4.shape[2] * 2  # intermediate_size
+    expected_w1_rows = n if activation == "relu2" else 2 * n
+    if w1_fp4.shape[1] != expected_w1_rows:
+        raise ValueError(
+            f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
+            f"{activation!r}, got {w1_fp4.shape[1]}"
+        )
     num_topk = topk_ids.shape[1]
     routed_rows = m * num_topk
     device = a.device
@@ -2357,6 +2365,7 @@ def b12x_sparse_moe_fp4(
     input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
+    activation: str = "silu",
 ) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
     """Sparse-block FP4 MoE wrapper above the routed-expert TP primitive.
 
@@ -2403,6 +2412,7 @@ def b12x_sparse_moe_fp4(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
         fast_math=fast_math,
+        activation=activation,
     )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)
