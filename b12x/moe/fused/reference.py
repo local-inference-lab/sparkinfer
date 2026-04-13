@@ -63,6 +63,12 @@ def moe_reference_f32(
 ) -> torch.Tensor:
     if activation not in {"silu", "relu2"}:
         raise ValueError(f"unsupported activation {activation!r}")
+    expected_w1_rows = 2 * I_tp if activation == "silu" else I_tp
+    if w1_fp4.shape[1] != expected_w1_rows:
+        raise ValueError(
+            f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
+            f"{activation!r}, got {w1_fp4.shape[1]}"
+        )
     del E
     is_gated = activation != "relu2"
     block_size = 16
@@ -170,6 +176,12 @@ def moe_reference_nvfp4(
 ) -> torch.Tensor:
     if activation not in {"silu", "relu2"}:
         raise ValueError(f"unsupported activation {activation!r}")
+    expected_w1_rows = 2 * I_tp if activation == "silu" else I_tp
+    if w1_fp4.shape[1] != expected_w1_rows:
+        raise ValueError(
+            f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
+            f"{activation!r}, got {w1_fp4.shape[1]}"
+        )
     is_gated = activation != "relu2"
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)

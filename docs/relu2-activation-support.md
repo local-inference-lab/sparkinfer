@@ -137,10 +137,11 @@ Each relu2 variant is a copy of its SiLU counterpart (~1700 lines) with:
 1. Add `activation: str = "silu"` parameter to `b12x_moe_fp4()` and launcher
    functions
 2. Select kernel class based on activation
-3. In `_get_weight_views()`: use `w1_fp4.shape[1]` instead of `2 * n`
-4. In `__call__` of dynamic kernel: compute `gate_tile_cnt` without `/2` for
-   non-gated (this is in host code, so `if/else` is fine)
-5. TMA fake tensor shapes: use actual `w1_N` dimension
+3. In `_get_weight_views()`: derive `w1_n` from `n` and `is_gated` parameter
+4. In `__call__` of dynamic kernel: compute `gate_tile_cnt` without the `*2`
+   divisor (this line is DSL-traced but `b_w13.shape[0]` is a compile-time
+   constant from the TMA descriptor, so the division is resolved at trace time)
+5. TMA fake tensor shapes: use `w1_n` (not hardcoded `2*n`)
 
 ### Changes to vLLM integration (b12x_moe.py)
 
