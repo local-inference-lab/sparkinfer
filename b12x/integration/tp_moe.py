@@ -646,13 +646,13 @@ def _get_weight_views(
     w2_alphas: torch.Tensor,
     n: int,
     k: int,
+    *,
+    is_gated: bool = True,
 ) -> _WeightViews:
-    """Create weight views from the concatenated expert-weight layout.
+    """Create weight views from the expert-weight layout.
 
-    The kernel accepts concatenated ``w13`` data with shape ``[2*n, k//2, E]``
-    directly via a single TMA descriptor, so the large FP4 weight tensors stay
-    as views. Only the small scale-factor tensors need compact contiguous
-    storage.
+    For gated (SiLU): w1 is ``[E, 2*n, k//2]`` (gate+up concatenated).
+    For non-gated (relu2): w1 is ``[E, n, k//2]`` (single FC1 weight).
     """
     global _LAST_WEIGHTS
     key = (
@@ -662,6 +662,7 @@ def _get_weight_views(
         w2_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
         w2_alphas.data_ptr(),
+        is_gated,
     )
     last_wkey, last_wval = _LAST_WEIGHTS
     if last_wkey == key:
@@ -671,13 +672,14 @@ def _get_weight_views(
         _LAST_WEIGHTS = (key, cached)
         return cached
 
-    # Permute [E, 2*n, k//2] → [2*n, k//2, E] (view, no copy!)
-    w13 = w1_fp4.permute(1, 2, 0)     # [2*n, k//2, E]
+    # Permute [E, w1_n, k//2] → [w1_n, k//2, E] (view, no copy!)
+    w13 = w1_fp4.permute(1, 2, 0)     # [w1_n, k//2, E]
     down = w2_fp4.permute(1, 2, 0)    # [k, n//2, E]
 
-    # Concatenated w13 scale factors (6D MMA view, small contiguous copy)
+    # w13 scale factors (6D MMA view, small contiguous copy)
+    w1_n = 2 * n if is_gated else n
     bs_u8 = w1_blockscale.view(torch.uint8)
-    w13_sf = as_grouped_scale_view(bs_u8, 2 * n, k)
+    w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
     down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
 
     sf_dtype = cutlass.Float8E4M3FN
@@ -1120,6 +1122,7 @@ def _get_static_kernel(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
+    activation: str = "silu",
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
@@ -1131,7 +1134,7 @@ def _get_static_kernel(
     global _LAST_KERNEL
     cache_key = (
         "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, activation,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1149,7 +1152,13 @@ def _get_static_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel = MoEStaticKernel(
+    if activation == "relu2":
+        from b12x.moe.fused import MoEStaticKernelRelu2
+        _KernelCls = MoEStaticKernelRelu2
+    else:
+        _KernelCls = MoEStaticKernel
+
+    kernel = _KernelCls(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
@@ -1187,8 +1196,9 @@ def _get_static_kernel(
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
+    w1_n = n if activation == "relu2" else 2 * n
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype, (2 * n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
+        ab_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
@@ -1262,6 +1272,7 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
+    activation: str = "silu",
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
@@ -1271,7 +1282,7 @@ def _get_micro_kernel(
     global _LAST_KERNEL
     cache_key = (
         "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, activation,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1288,7 +1299,13 @@ def _get_micro_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel = MoEMicroKernel(
+    if activation == "relu2":
+        from b12x.moe.fused import MoEMicroKernelRelu2
+        _KernelCls = MoEMicroKernelRelu2
+    else:
+        _KernelCls = MoEMicroKernel
+
+    kernel = _KernelCls(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
@@ -1326,8 +1343,9 @@ def _get_micro_kernel(
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
+    w1_n = n if activation == "relu2" else 2 * n
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype, (2 * n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
+        ab_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
@@ -1507,6 +1525,7 @@ def _get_dynamic_kernel(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
+    activation: str = "silu",
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
@@ -1514,7 +1533,7 @@ def _get_dynamic_kernel(
     global _LAST_KERNEL
     cache_key = (
         "dynamic", E, k, n, num_topk, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, activation,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1534,7 +1553,13 @@ def _get_dynamic_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel = MoEDynamicKernel(
+    if activation == "relu2":
+        from b12x.moe.fused import MoEDynamicKernelRelu2
+        _KernelCls = MoEDynamicKernelRelu2
+    else:
+        _KernelCls = MoEDynamicKernel
+
+    kernel = _KernelCls(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
@@ -1585,8 +1610,9 @@ def _get_dynamic_kernel(
     task_slice_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    w1_n = n if activation == "relu2" else 2 * n
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype, (2 * n, k, E), stride_order=(1, 0, 2), assumed_align=16,
+        ab_dtype, (w1_n, k, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
@@ -1662,6 +1688,7 @@ def _launch_dynamic(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     stream,
+    activation: str = "silu",
 ) -> None:
     effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
     if not _dynamic_multicta_enabled():
@@ -1672,6 +1699,7 @@ def _launch_dynamic(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         mac_override=effective_mac,
+        activation=activation,
     )
     _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
     ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
@@ -1729,6 +1757,7 @@ def _launch_compact_static(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     stream,
+    activation: str = "silu",
 ) -> None:
     micro_cutover_pairs = _get_micro_compact_cutover_pairs()
     if (
@@ -1762,6 +1791,7 @@ def _launch_compact_static(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             mac_override=micro_mac,
+            activation=activation,
         )
         launch_ids = compact_ids
     else:
@@ -1771,6 +1801,7 @@ def _launch_compact_static(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             mac_override=static_mac,
+            activation=activation,
         )
         launch_ids = flat_ids
     compiled(
@@ -1807,6 +1838,7 @@ def b12x_moe_fp4(
     input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -1876,6 +1908,7 @@ def b12x_moe_fp4(
                 input_scales_are_reciprocal=input_scales_are_reciprocal,
                 input_scales_static=effective_input_scales_static,
                 fast_math=fast_math,
+                activation=activation,
             )
         return chunk_output
 
@@ -1905,6 +1938,7 @@ def b12x_moe_fp4(
             w2_alphas,
             n,
             k,
+            is_gated=(activation != "relu2"),
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
@@ -1919,6 +1953,7 @@ def b12x_moe_fp4(
             w2_alphas,
             n,
             k,
+            is_gated=(activation != "relu2"),
         )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
@@ -1959,6 +1994,7 @@ def b12x_moe_fp4(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             stream=stream,
+            activation=activation,
         )
     else:
         _launch_compact_static(
@@ -1980,6 +2016,7 @@ def b12x_moe_fp4(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             stream=stream,
+            activation=activation,
         )
     return scatter_output
 

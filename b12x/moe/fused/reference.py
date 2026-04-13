@@ -58,8 +58,11 @@ def moe_reference_f32(
     E: int,
     K: int,
     I_tp: int,
+    *,
+    activation: str = "silu",
 ) -> torch.Tensor:
     del E
+    is_gated = activation != "relu2"
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
 
@@ -114,19 +117,26 @@ def moe_reference_f32(
 
             x_dequant = quantize_vec_to_fp4_dequant(x_f32, gs_fc1)
 
-            w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
             w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
 
-            up_dequant = apply_block_scales(
-                dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
-            )
-            gate_dequant = apply_block_scales(
-                dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
-            )
-
-            gate_out = (gate_dequant @ x_dequant) * alpha_fc1
-            up_out = (up_dequant @ x_dequant) * alpha_fc1
-            intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+            if is_gated:
+                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                up_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
+                )
+                gate_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
+                )
+                gate_out = (gate_dequant @ x_dequant) * alpha_fc1
+                up_out = (up_dequant @ x_dequant) * alpha_fc1
+                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+            else:
+                w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
+                fc1_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w1_sf[:I_tp], I_tp, K,
+                )
+                fc1_out = (fc1_dequant @ x_dequant) * alpha_fc1
+                intermediate = torch.square(torch.relu(fc1_out))
 
             int_dequant = quantize_vec_to_fp4_dequant(intermediate, gs_fc2)
             down_dequant = apply_block_scales(
@@ -153,7 +163,10 @@ def moe_reference_nvfp4(
     E: int,
     K: int,
     I_tp: int,
+    *,
+    activation: str = "silu",
 ) -> torch.Tensor:
+    is_gated = activation != "relu2"
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
 
@@ -207,19 +220,26 @@ def moe_reference_nvfp4(
 
             x_dequant = quantize_vec_to_fp4_dequant(x_f32, gs_fc1)
 
-            w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
             w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
 
-            up_dequant = apply_block_scales(
-                dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
-            )
-            gate_dequant = apply_block_scales(
-                dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
-            )
-
-            gate_out = (gate_dequant @ x_dequant) * alpha_fc1
-            up_out = (up_dequant @ x_dequant) * alpha_fc1
-            intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
+            if is_gated:
+                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                up_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
+                )
+                gate_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
+                )
+                gate_out = (gate_dequant @ x_dequant) * alpha_fc1
+                up_out = (up_dequant @ x_dequant) * alpha_fc1
+                intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
+            else:
+                w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
+                fc1_dequant = apply_block_scales(
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w1_sf[:I_tp], I_tp, K,
+                )
+                fc1_out = (fc1_dequant @ x_dequant) * alpha_fc1
+                intermediate = torch.square(torch.relu(fc1_out)).to(torch.bfloat16).float()
 
             int_dequant = quantize_vec_to_fp4_dequant(intermediate, gs_fc2)
             down_dequant = apply_block_scales(
