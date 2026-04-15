@@ -264,7 +264,7 @@ class TestKernelClassSelection:
         assert compiled is not None
 
     def test_static_kernel_relu2(self):
-        """activation='relu2' selects MoEStaticKernelRelu2."""
+        """activation='relu2' instantiates MoEStaticKernel(is_gated=False)."""
         from b12x.integration.tp_moe import _get_static_kernel, clear_tp_moe_caches
         clear_tp_moe_caches()
 
@@ -300,7 +300,7 @@ class TestKernelClassSelection:
         assert len(_STATIC_KERNEL_CACHE) >= 2
 
     def test_dynamic_kernel_relu2(self):
-        """activation='relu2' selects MoEDynamicKernelRelu2."""
+        """activation='relu2' instantiates MoEDynamicKernel(is_gated=False)."""
         from b12x.integration.tp_moe import _get_dynamic_kernel, clear_tp_moe_caches
         clear_tp_moe_caches()
 
@@ -314,7 +314,7 @@ class TestKernelClassSelection:
         assert compiled is not None
 
     def test_micro_kernel_relu2(self):
-        """activation='relu2' selects MoEMicroKernelRelu2."""
+        """activation='relu2' instantiates MoEMicroKernel(is_gated=False)."""
         from b12x.integration.tp_moe import _get_micro_kernel, clear_tp_moe_caches
         clear_tp_moe_caches()
 
@@ -552,31 +552,36 @@ class TestVllmActivationMapping:
 # ---------------------------------------------------------------------------
 
 class TestKernelExports:
-    """Verify that all kernel classes are properly exported."""
+    """Verify the unified kernel classes accept both activations."""
 
     def test_all_kernel_classes_importable(self):
         from b12x.moe.fused import (
             MoEStaticKernel,
-            MoEStaticKernelRelu2,
             MoEMicroKernel,
-            MoEMicroKernelRelu2,
             MoEDynamicKernel,
-            MoEDynamicKernelRelu2,
         )
         # All should be class objects
-        assert isinstance(MoEStaticKernelRelu2, type)
-        assert isinstance(MoEMicroKernelRelu2, type)
-        assert isinstance(MoEDynamicKernelRelu2, type)
+        assert isinstance(MoEStaticKernel, type)
+        assert isinstance(MoEMicroKernel, type)
+        assert isinstance(MoEDynamicKernel, type)
 
-    def test_relu2_classes_distinct_from_silu(self):
+    def test_is_gated_flag_stored(self):
+        """Each kernel class stores is_gated on the instance."""
         from b12x.moe.fused import (
-            MoEStaticKernel, MoEStaticKernelRelu2,
-            MoEMicroKernel, MoEMicroKernelRelu2,
-            MoEDynamicKernel, MoEDynamicKernelRelu2,
+            MoEStaticKernel, MoEMicroKernel, MoEDynamicKernel,
         )
-        assert MoEStaticKernel is not MoEStaticKernelRelu2
-        assert MoEMicroKernel is not MoEMicroKernelRelu2
-        assert MoEDynamicKernel is not MoEDynamicKernelRelu2
+        for cls in (MoEStaticKernel, MoEMicroKernel):
+            k1 = cls(sf_vec_size=16, mma_tiler_mn=(128, 128), output_tile_count_n=32)
+            k2 = cls(
+                sf_vec_size=16, mma_tiler_mn=(128, 128), output_tile_count_n=32,
+                is_gated=False,
+            )
+            assert k1.is_gated is True
+            assert k2.is_gated is False
+        k1 = MoEDynamicKernel(sf_vec_size=16, mma_tiler_mn=(128, 128))
+        k2 = MoEDynamicKernel(sf_vec_size=16, mma_tiler_mn=(128, 128), is_gated=False)
+        assert k1.is_gated is True
+        assert k2.is_gated is False
 
 
 # ---------------------------------------------------------------------------

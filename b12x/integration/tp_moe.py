@@ -1152,18 +1152,13 @@ def _get_static_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    if activation == "relu2":
-        from b12x.moe.fused import MoEStaticKernelRelu2
-        _KernelCls = MoEStaticKernelRelu2
-    else:
-        _KernelCls = MoEStaticKernel
-
-    kernel = _KernelCls(
+    kernel = MoEStaticKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        is_gated=(activation != "relu2"),
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1299,18 +1294,13 @@ def _get_micro_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    if activation == "relu2":
-        from b12x.moe.fused import MoEMicroKernelRelu2
-        _KernelCls = MoEMicroKernelRelu2
-    else:
-        _KernelCls = MoEMicroKernel
-
-    kernel = _KernelCls(
+    kernel = MoEMicroKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        is_gated=(activation != "relu2"),
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1553,17 +1543,12 @@ def _get_dynamic_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    if activation == "relu2":
-        from b12x.moe.fused import MoEDynamicKernelRelu2
-        _KernelCls = MoEDynamicKernelRelu2
-    else:
-        _KernelCls = MoEDynamicKernel
-
-    kernel = _KernelCls(
+    kernel = MoEDynamicKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        is_gated=(activation != "relu2"),
     )
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 

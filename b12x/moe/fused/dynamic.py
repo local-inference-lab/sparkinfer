@@ -2,9 +2,14 @@
 MoEDynamicKernel — queue-driven routed NVFP4 MoE kernel for SM120.
 
 This is the first dynamic fused control-plane kernel derived from the current
-static implementation. It keeps the proven FC1 / SiLU / quant / FC2 / scatter
-compute body, but replaces the resident-grid route/pack -> compute barrier
-with a global ready-task queue.
+static implementation. It keeps the proven FC1 / activation / quant / FC2 /
+scatter compute body, but replaces the resident-grid route/pack -> compute
+barrier with a global ready-task queue.
+
+Activation is selected at construction time via the ``is_gated`` flag
+(SiLU/SwiGLU when True, ReLU^2 when False). The non-gated path drops the up
+pipeline, the up shared-memory buffers, and the gate->up barrier via
+compile-time ``cutlass.const_expr(self.is_gated)`` branches.
 
 Execution model
   Phase 0: cooperative init / clear scratch state
@@ -17,7 +22,7 @@ Execution model
              as soon as a tile is fully written
   Phase 2: CTAs that finish producing become consumers immediately
            - CTA leader pops one ready task into shared ctrl state
-           - MMA warps run FC1 -> SiLU -> quant -> FC2 -> scatter for that task
+           - MMA warps run FC1 -> activation -> quant -> FC2 -> scatter
            - DMA warp streams the corresponding FC1 / FC2 weights
 
 This is intentionally conservative:
@@ -247,12 +252,14 @@ class MoEDynamicKernel:
         *,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
+        is_gated: bool = True,
     ):
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
+        self.is_gated = is_gated
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.cluster_shape_mnk = (1, 1, 1)
@@ -425,8 +432,8 @@ class MoEDynamicKernel:
         task_slice_count: cute.Tensor,  # [max_tasks] int32
         task_valid_rows: cute.Tensor,   # [max_tasks] int32
         tile_write_count: cute.Tensor,  # [E * max_m_tiles] int32
-        b_w13: cute.Tensor,            # [2*I_tp, K, E] — concatenated gate+up
-        sfb_w13_ptr: cute.Pointer,     # scale factors for concatenated w13
+        b_w13: cute.Tensor,            # gated: [2*I_tp, K, E] ([up, gate] in N); non-gated: [I_tp, K, E]
+        sfb_w13_ptr: cute.Pointer,     # scale factors for w13
         b_down: cute.Tensor,           # [K, I_tp, E]
         sfb_down_ptr: cute.Pointer,
         row_counts: cute.Tensor,       # expert row histogram [E]
@@ -456,7 +463,7 @@ class MoEDynamicKernel:
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(packed_a.shape, self.sf_vec_size)
         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # Single SF tensor for concatenated w13 (gate+up scale factors)
+        # Single SF tensor for w13 (gated: gate+up scale factors; non-gated: single FC1)
         sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(b_w13.shape, self.sf_vec_size)
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
 
@@ -470,8 +477,9 @@ class MoEDynamicKernel:
             (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), 1,
             internal_type=cutlass.Int16,
         )
-        # Single TMA descriptor over concatenated w13 [2*I_tp, K, E].
-        # Gate tiles at N=0..I_tp/tile_N-1, up tiles at N=I_tp/tile_N..2*I_tp/tile_N-1.
+        # Single TMA descriptor over w13.
+        #   Gated:     [2*I_tp, K, E], up tiles at N=0..I_tp/tile_N-1, gate tiles above.
+        #   Non-gated: [I_tp, K, E], single FC1 weight.
         tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
             b_w13, self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), 1,
@@ -494,7 +502,14 @@ class MoEDynamicKernel:
             internal_type=cutlass.Int16,
         )
 
-        gate_tile_cnt = Int32(b_w13.shape[0]) // (Int32(2) * Int32(self.tile_shape_mnk[1]))
+        # gate_tile_cnt is the per-expert FC1 N-tile count (same for gated and
+        # non-gated — gated's w13 first dim is 2*I_tp, non-gated's is I_tp).
+        # The LaunchParams field name retains "gate" for continuity; it drives
+        # the shared task-queue grid sizing.
+        if cutlass.const_expr(self.is_gated):
+            gate_tile_cnt = Int32(b_w13.shape[0]) // (Int32(2) * Int32(self.tile_shape_mnk[1]))
+        else:
+            gate_tile_cnt = Int32(b_w13.shape[0]) // Int32(self.tile_shape_mnk[1])
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
@@ -604,40 +619,56 @@ class MoEDynamicKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        @cute.struct
-        class Storage:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 8]
-            pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
-            up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
-            phase2_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
-            sA: cute.struct.Align[
+        # Storage fields depend on is_gated: the non-gated path does not need
+        # an up_pipeline or the sB_up / sSFB_up buffers. We build the
+        # @cute.struct dynamically so the non-gated kernel does not allocate
+        # (or address) the extra smem.
+        storage_fields = [
+            ("ctrl", cute.struct.MemRange[cutlass.Int32, 8]),
+            ("pipeline_array", cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]),
+        ]
+        if cutlass.const_expr(self.is_gated):
+            storage_fields.append(
+                ("up_pipeline_array", cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2])
+            )
+        storage_fields.extend([
+            ("phase2_pipeline_array", cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]),
+            ("sA", cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
+            ]),
+            ("sB", cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sB_up: cute.struct.Align[
+            ]),
+        ])
+        if cutlass.const_expr(self.is_gated):
+            storage_fields.append(("sB_up", cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sSFA: cute.struct.Align[
+            ]))
+        storage_fields.extend([
+            ("sSFA", cute.struct.Align[
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(sfa_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sSFB: cute.struct.Align[
+            ]),
+            ("sSFB", cute.struct.Align[
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(sfb_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sSFB_up: cute.struct.Align[
+            ]),
+        ])
+        if cutlass.const_expr(self.is_gated):
+            storage_fields.append(("sSFB_up", cute.struct.Align[
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(sfb_smem_staged)],
                 self.buffer_align_bytes,
-            ]
-            sC: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
-                self.buffer_align_bytes,
-            ]
+            ]))
+        storage_fields.append(("sC", cute.struct.Align[
+            cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
+            self.buffer_align_bytes,
+        ]))
+        Storage = cute.struct(
+            type("Storage", (), {"__annotations__": dict(storage_fields)})
+        )
 
         storage = smem.allocate(Storage)
 
@@ -652,14 +683,15 @@ class MoEDynamicKernel:
             barrier_storage=storage.pipeline_array.data_ptr(),
             cta_layout_vmnk=cta_layout_vmnk,
         )
-        up_pipeline = pipeline.PipelineTmaAsync.create(
-            num_stages=self.ab_stage,
-            producer_group=prod_group,
-            consumer_group=cons_group,
-            tx_count=tma_copy_bytes,
-            barrier_storage=storage.up_pipeline_array.data_ptr(),
-            cta_layout_vmnk=cta_layout_vmnk,
-        )
+        if cutlass.const_expr(self.is_gated):
+            up_pipeline = pipeline.PipelineTmaAsync.create(
+                num_stages=self.ab_stage,
+                producer_group=prod_group,
+                consumer_group=cons_group,
+                tx_count=tma_copy_bytes,
+                barrier_storage=storage.up_pipeline_array.data_ptr(),
+                cta_layout_vmnk=cta_layout_vmnk,
+            )
         phase2_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stage,
             producer_group=prod_group,
@@ -673,16 +705,17 @@ class MoEDynamicKernel:
 
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
         sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
-        sB_up = storage.sB_up.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
         sA_in_u8 = cute.recast_tensor(sA, cutlass.Uint8)
         sB_u8 = cute.recast_tensor(sB, cutlass.Uint8)
-        sB_up_u8 = cute.recast_tensor(sB_up, cutlass.Uint8)
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
-        sSFB_up = storage.sSFB_up.get_tensor(sfb_smem_staged)
         sSFA_u8 = cute.recast_tensor(sSFA, cutlass.Uint8)
         sSFB_u8 = cute.recast_tensor(sSFB, cutlass.Uint8)
-        sSFB_up_u8 = cute.recast_tensor(sSFB_up, cutlass.Uint8)
+        if cutlass.const_expr(self.is_gated):
+            sB_up = storage.sB_up.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
+            sB_up_u8 = cute.recast_tensor(sB_up, cutlass.Uint8)
+            sSFB_up = storage.sSFB_up.get_tensor(sfb_smem_staged)
+            sSFB_up_u8 = cute.recast_tensor(sSFB_up, cutlass.Uint8)
         sC = storage.sC.get_tensor(
             epi_smem_staged.outer, swizzle=epi_smem_staged.inner,
         )
@@ -944,10 +977,11 @@ class MoEDynamicKernel:
                 )
 
         gA = cute.local_tile(mA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
-        # Single tiled view over concatenated w13 [2*I_tp, K, E].
-        # W13 is packed as [up, gate] across the concatenated N dimension.
-        # Up tiles: N-indices 0..gate_tile_cnt-1
-        # Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
+        # Single tiled view over w13.
+        #   Gated (is_gated=True):  [2*I_tp, K, E] — packed as [up, gate] in N.
+        #     Up tiles:   N-indices 0..gate_tile_cnt-1
+        #     Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
+        #   Non-gated (is_gated=False): [I_tp, K, E] — single FC1 weight.
         gB_w13_tiled = cute.local_tile(mB_w13, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
         gSFA = cute.local_tile(mSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
         gSFB_w13_tiled = cute.local_tile(mSFB_w13, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
@@ -963,27 +997,28 @@ class MoEDynamicKernel:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # Single w13 TMA partition (gate+up concatenated)
+        # Primary w13 TMA partition (single pass for non-gated; gate pass for gated)
         tBsB_w13, tBgB_w13 = cpasync.tma_partition(
             tma_b_w13, b_cta_crd, b_cta_layout,
             cute.group_modes(sB, 0, 2), cute.group_modes(gB_w13_tiled, 0, 2),
-        )
-        tBsB_w13_up, _ = cpasync.tma_partition(
-            tma_b_w13, b_cta_crd, b_cta_layout,
-            cute.group_modes(sB_up, 0, 2), cute.group_modes(gB_w13_tiled, 0, 2),
         )
         tBsSFB_w13, tBgSFB_w13 = cpasync.tma_partition(
             tma_sfb_w13, b_cta_crd, b_cta_layout,
             cute.group_modes(sSFB, 0, 2), cute.group_modes(gSFB_w13_tiled, 0, 2),
         )
-        tBsSFB_w13_up, _ = cpasync.tma_partition(
-            tma_sfb_w13, b_cta_crd, b_cta_layout,
-            cute.group_modes(sSFB_up, 0, 2), cute.group_modes(gSFB_w13_tiled, 0, 2),
-        )
-        tBsB_w13_up = cute.filter_zeros(tBsB_w13_up)
         tBsSFB_w13 = cute.filter_zeros(tBsSFB_w13)
         tBgSFB_w13 = cute.filter_zeros(tBgSFB_w13)
-        tBsSFB_w13_up = cute.filter_zeros(tBsSFB_w13_up)
+        if cutlass.const_expr(self.is_gated):
+            tBsB_w13_up, _ = cpasync.tma_partition(
+                tma_b_w13, b_cta_crd, b_cta_layout,
+                cute.group_modes(sB_up, 0, 2), cute.group_modes(gB_w13_tiled, 0, 2),
+            )
+            tBsSFB_w13_up, _ = cpasync.tma_partition(
+                tma_sfb_w13, b_cta_crd, b_cta_layout,
+                cute.group_modes(sSFB_up, 0, 2), cute.group_modes(gSFB_w13_tiled, 0, 2),
+            )
+            tBsB_w13_up = cute.filter_zeros(tBsB_w13_up)
+            tBsSFB_w13_up = cute.filter_zeros(tBsSFB_w13_up)
 
         # B_down TMA partitions
         gB_down = cute.local_tile(mB_down, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
@@ -1006,19 +1041,24 @@ class MoEDynamicKernel:
         sub_shape = tCsC_for_shape.shape[:3]
         acc_shape = (sub_shape[0], sub_shape[1] * epi_m_scale, sub_shape[2])
         gate_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
-        up_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+        if cutlass.const_expr(self.is_gated):
+            up_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
         k_tile_cnt = cute.size(gA, mode=[3])
         fc1_k_tile_cnt = k_tile_cnt
-        # w13 has 2*I_tp/tile_N N-tiles. Gate = first half, up = second half.
+        # w13 N-tile count.
+        #   Gated:     2*I_tp/tile_N tiles, packed [up, gate]. gate_tile_cnt = total/2.
+        #   Non-gated: I_tp/tile_N tiles, single FC1 weight.
         intermediate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
-        gate_tile_cnt = intermediate_tile_cnt // Int32(2)
+        if cutlass.const_expr(self.is_gated):
+            gate_tile_cnt = intermediate_tile_cnt // Int32(2)
         output_tile_cnt = cute.size(gB_down, mode=[2])
 
         prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.ab_stage)
         cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
-        up_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.ab_stage)
-        up_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
+        if cutlass.const_expr(self.is_gated):
+            up_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.ab_stage)
+            up_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
         phase2_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.ab_stage)
         phase2_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
 
@@ -1051,16 +1091,18 @@ class MoEDynamicKernel:
         csA = thr_ld_A.partition_S(sA)
         crA = thr_ld_A.retile(tCrA)
         csB = thr_ld_B.partition_S(sB)
-        csB_up = thr_ld_B.partition_S(sB_up)
         crB = thr_ld_B.retile(tCrB)
+        if cutlass.const_expr(self.is_gated):
+            csB_up = thr_ld_B.partition_S(sB_up)
 
         thr_ld_SFA = smem_copy_SFA.get_slice(tidx)
         thr_ld_SFB = smem_copy_SFB.get_slice(tidx)
         csSFA = thr_ld_SFA.partition_S(sSFA)
         crSFA = thr_ld_SFA.retile(tCrSFA)
         csSFB = thr_ld_SFB.partition_S(sSFB)
-        csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
         crSFB = thr_ld_SFB.retile(tCrSFB)
+        if cutlass.const_expr(self.is_gated):
+            csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
 
         # ===================================================================
         # Per-warp setup for the consumer steady state
@@ -1153,7 +1195,8 @@ class MoEDynamicKernel:
                 thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                 tRS_sD = thr_copy_r2s.partition_D(sC)
                 tRS_rGate = tiled_copy_r2s.retile(gate_acc)
-                tRS_rUp = tiled_copy_r2s.retile(up_acc)
+                if cutlass.const_expr(self.is_gated):
+                    tRS_rUp = tiled_copy_r2s.retile(up_acc)
 
                 rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
                 tRS_rD_layout = cute.make_layout(rD_shape[:3])
@@ -1178,10 +1221,12 @@ class MoEDynamicKernel:
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
                     # ============================================================
-                    # PHASE A: FC1 for this slice (gate + up)
+                    # PHASE A: FC1 for this slice (gate [+ up])
                     # ============================================================
 
-                    # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
+                    # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc).
+                    # For non-gated activations this is the entire FC1; the up
+                    # GEMM below is skipped via const_expr(is_gated).
                     fz_crSFA = cute.filter_zeros(crSFA)
                     fz_crSFB = cute.filter_zeros(crSFB)
                     gate_acc.fill(0.0)
@@ -1250,40 +1295,66 @@ class MoEDynamicKernel:
                                     tCrB[None, _nt, k_block_idx],
                                     gate_acc[None, _mt, _nt],
                                 )
-                    # Gate and up share the A/SFA staging buffers. Drain gate
-                    # consumers before the DMA warp starts refilling those stages
-                    # for the up pass.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    if cutlass.const_expr(self.is_gated):
+                        # Gate and up share the A/SFA staging buffers. Drain gate
+                        # consumers before the DMA warp starts refilling those stages
+                        # for the up pass.
+                        self.pass_sync_barrier.arrive_and_wait()
 
-                    # Up GEMM (inlined, same pattern)
-                    up_acc.fill(0.0)
-                    up_cons_state.reset_count()
-                    peek = up_pipeline.consumer_try_wait(up_cons_state)
-                    up_pipeline.consumer_wait(up_cons_state, peek)
-                    csA_p = csA[None, None, None, up_cons_state.index]
-                    csB_p = csB_up[None, None, None, up_cons_state.index]
-                    csSFA_p = csSFA[None, None, None, up_cons_state.index]
-                    csSFB_p = csSFB_up[None, None, None, up_cons_state.index]
-                    cute.copy(smem_copy_A, csA_p[None, None, 0], crA[None, None, 0])
-                    cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
-                    fz_csSFA_p = cute.filter_zeros(csSFA_p)
-                    fz_csSFB_p = cute.filter_zeros(csSFB_p)
-                    cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, 0], fz_crSFA[None, None, 0])
-                    cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, 0], fz_crSFB[None, None, 0])
-                    for _k_tile in range(0, fc1_k_tile_cnt - 1, 1, unroll=4):
+                        # Up GEMM (inlined, same pattern)
+                        up_acc.fill(0.0)
+                        up_cons_state.reset_count()
+                        peek = up_pipeline.consumer_try_wait(up_cons_state)
+                        up_pipeline.consumer_wait(up_cons_state, peek)
+                        csA_p = csA[None, None, None, up_cons_state.index]
+                        csB_p = csB_up[None, None, None, up_cons_state.index]
+                        csSFA_p = csSFA[None, None, None, up_cons_state.index]
+                        csSFB_p = csSFB_up[None, None, None, up_cons_state.index]
+                        cute.copy(smem_copy_A, csA_p[None, None, 0], crA[None, None, 0])
+                        cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
+                        fz_csSFA_p = cute.filter_zeros(csSFA_p)
+                        fz_csSFB_p = cute.filter_zeros(csSFB_p)
+                        cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, 0], fz_crSFA[None, None, 0])
+                        cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, 0], fz_crSFB[None, None, 0])
+                        for _k_tile in range(0, fc1_k_tile_cnt - 1, 1, unroll=4):
+                            for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                                k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
+                                if k_block_idx == num_k_blocks - 1:
+                                    up_pipeline.consumer_release(up_cons_state)
+                                    up_cons_state.advance()
+                                    peek = up_pipeline.consumer_try_wait(up_cons_state)
+                                    csA_p = csA[None, None, None, up_cons_state.index]
+                                    csB_p = csB_up[None, None, None, up_cons_state.index]
+                                    csSFA_p = csSFA[None, None, None, up_cons_state.index]
+                                    csSFB_p = csSFB_up[None, None, None, up_cons_state.index]
+                                    fz_csSFA_p = cute.filter_zeros(csSFA_p)
+                                    fz_csSFB_p = cute.filter_zeros(csSFB_p)
+                                    up_pipeline.consumer_wait(up_cons_state, peek)
+                                for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                    for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                        mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
+                                        mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
+                                        cute.gemm(
+                                            mma_atom,
+                                            up_acc[None, _mt, _nt],
+                                            tCrA[None, _mt, k_block_idx],
+                                            tCrB[None, _nt, k_block_idx],
+                                            up_acc[None, _mt, _nt],
+                                        )
+                                cute.copy(smem_copy_A, csA_p[None, None, k_next], crA[None, None, k_next])
+                                cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
+                                cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
+                                cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
                         for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                             k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                             if k_block_idx == num_k_blocks - 1:
                                 up_pipeline.consumer_release(up_cons_state)
                                 up_cons_state.advance()
-                                peek = up_pipeline.consumer_try_wait(up_cons_state)
-                                csA_p = csA[None, None, None, up_cons_state.index]
-                                csB_p = csB_up[None, None, None, up_cons_state.index]
-                                csSFA_p = csSFA[None, None, None, up_cons_state.index]
-                                csSFB_p = csSFB_up[None, None, None, up_cons_state.index]
-                                fz_csSFA_p = cute.filter_zeros(csSFA_p)
-                                fz_csSFB_p = cute.filter_zeros(csSFB_p)
-                                up_pipeline.consumer_wait(up_cons_state, peek)
+                            if k_next > 0 and fc1_k_tile_cnt > Int32(0):
+                                cute.copy(smem_copy_A, csA_p[None, None, k_next], crA[None, None, k_next])
+                                cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
+                                cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
+                                cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
                             for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                 for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                     mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
@@ -1295,32 +1366,7 @@ class MoEDynamicKernel:
                                         tCrB[None, _nt, k_block_idx],
                                         up_acc[None, _mt, _nt],
                                     )
-                            cute.copy(smem_copy_A, csA_p[None, None, k_next], crA[None, None, k_next])
-                            cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
-                            cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
-                            cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                        if k_block_idx == num_k_blocks - 1:
-                            up_pipeline.consumer_release(up_cons_state)
-                            up_cons_state.advance()
-                        if k_next > 0 and fc1_k_tile_cnt > Int32(0):
-                            cute.copy(smem_copy_A, csA_p[None, None, k_next], crA[None, None, k_next])
-                            cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
-                            cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
-                            cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                        for _mt in cutlass.range_constexpr(fc1_m_tiles):
-                            for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    up_acc[None, _mt, _nt],
-                                    tCrA[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    up_acc[None, _mt, _nt],
-                                )
-                    # SiLU + quant into sA
+                    # Activation + quant into sA (SiLU*up for gated, relu2 otherwise)
                     sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
                     packed_cols = Int32(self.tile_shape_mnk[2] // 2)
                     sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
@@ -1333,7 +1379,7 @@ class MoEDynamicKernel:
 
                     for epi_m in cutlass.range_constexpr(epi_rest_m):
                         epi_m_valid = valid_rows - Int32(epi_m) * Int32(self.epi_tile[0])
-                        silu_epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
+                        act_epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
                         if epi_m_valid > Int32(0):
                             for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
                                 for mma_m_in_epi in cutlass.range_constexpr(MmaMPerEpiM):
@@ -1341,14 +1387,20 @@ class MoEDynamicKernel:
                                     mma_n = mma_n_in_epi
                                     tRS_rD_slice = tRS_rD[(None, mma_m_in_epi, mma_n_in_epi)]
                                     gate_slice = tRS_rGate[(None, mma_m, mma_n)]
-                                    up_slice = tRS_rUp[(None, mma_m, mma_n)]
-                                    for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
-                                        g = alpha_value * gate_slice[elem_idx]
-                                        u = alpha_value * up_slice[elem_idx]
-                                        sigmoid_g = cute.arch.rcp_approx(
-                                            cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math),
-                                        )
-                                        tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                    if cutlass.const_expr(self.is_gated):
+                                        up_slice = tRS_rUp[(None, mma_m, mma_n)]
+                                        for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
+                                            g = alpha_value * gate_slice[elem_idx]
+                                            u = alpha_value * up_slice[elem_idx]
+                                            sigmoid_g = cute.arch.rcp_approx(
+                                                cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math),
+                                            )
+                                            tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                    else:
+                                        for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
+                                            g = alpha_value * gate_slice[elem_idx]
+                                            relu_g = fmax_f32(g, cutlass.Float32(0.0))
+                                            tRS_rD_slice[elem_idx] = relu_g * relu_g
 
                             acc_vec = tRS_rD.load()
                             acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -1356,7 +1408,7 @@ class MoEDynamicKernel:
                             cute.copy(
                                 tiled_copy_r2s,
                                 tRS_rD_out,
-                                tRS_sD[(None, None, None, silu_epi_buffer)],
+                                tRS_sD[(None, None, None, act_epi_buffer)],
                             )
                             cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
@@ -1378,7 +1430,7 @@ class MoEDynamicKernel:
                             block_max = cutlass.Float32(0.0)
                             for elem_idx in cutlass.range_constexpr(16):
                                 value = cutlass.Float32(
-                                    sC[local_row, block_start + elem_idx, silu_epi_buffer]
+                                    sC[local_row, block_start + elem_idx, act_epi_buffer]
                                 )
                                 values[elem_idx] = value
                                 block_max = fmax_f32(block_max, fabs_f32(value))
@@ -1423,11 +1475,13 @@ class MoEDynamicKernel:
 
                     # ============================================================
                     # PHASE B: Sweep ALL FC2 output tiles using cached sA
-                    # No CTA-wide barrier needed here: gate is done with sB/sSFB
-                    # (barrier at line 925 ensured that), up uses sB_up/sSFB_up,
-                    # and DMA's B_down loads into sB/sSFB don't conflict with
-                    # MMA's SiLU+quant on sC/sA/sSFA. The phase2_pipeline
-                    # handles B_down availability for FC2 GEMM.
+                    # No CTA-wide barrier needed here.
+                    #   Gated: gate is done with sB/sSFB (pass_sync barrier drains
+                    #     it), up uses sB_up/sSFB_up.
+                    #   Non-gated: single FC1 done with sB/sSFB.
+                    # DMA's B_down loads into sB/sSFB don't conflict with MMA's
+                    # activation+quant on sC/sA/sSFA. The phase2_pipeline handles
+                    # B_down availability for FC2 GEMM.
                     # ============================================================
                     scatter_N = Int32(scatter_output.shape[1])
                     lane_id = Int32(tidx) & Int32(31)
@@ -1570,45 +1624,55 @@ class MoEDynamicKernel:
                 while slice_idx < task_slice_count_val:
                     intermediate_slice = task_slice_begin_idx + slice_idx
 
-                    # W13 is laid out as [up, gate] across the concatenated N dimension.
-                    tBgB_w13_up_nk = tBgB_w13[(None, intermediate_slice, None, task_expert_idx)]
-                    tBgSFB_w13_up_nk = tBgSFB_w13[(None, intermediate_slice, None, task_expert_idx)]
-                    tBgB_w13_gate_nk = tBgB_w13[(None, intermediate_slice + gate_tile_cnt, None, task_expert_idx)]
-                    tBgSFB_w13_gate_nk = tBgSFB_w13[(None, intermediate_slice + gate_tile_cnt, None, task_expert_idx)]
+                    # Primary FC1 weight source coordinate:
+                    #   Gated:     gate pass at N = intermediate_slice + gate_tile_cnt
+                    #              (w13 is packed [up, gate]; up pass runs later).
+                    #   Non-gated: single FC1 pass at N = intermediate_slice.
+                    if cutlass.const_expr(self.is_gated):
+                        primary_n = intermediate_slice + gate_tile_cnt
+                    else:
+                        primary_n = intermediate_slice
+                    tBgB_w13_primary_nk = tBgB_w13[(None, primary_n, None, task_expert_idx)]
+                    tBgSFB_w13_primary_nk = tBgSFB_w13[(None, primary_n, None, task_expert_idx)]
 
-                    # ---- FC1 gate pass ----
+                    # ---- FC1 primary pass (gate for gated, the only pass for non-gated) ----
                     prod_state.reset_count()
                     for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):
                         ml_pipeline.producer_acquire(prod_state)
                         cute.copy(tma_a, tAgA_mk[(None, k_tile)], tAsA[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
-                        cute.copy(tma_b_w13, tBgB_w13_gate_nk[(None, k_tile)], tBsB_w13[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
+                        cute.copy(tma_b_w13, tBgB_w13_primary_nk[(None, k_tile)], tBsB_w13[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
                         cute.copy(tma_sfa, tAgSFA_mk[(None, k_tile)], tAsSFA[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
-                        cute.copy(tma_sfb_w13, tBgSFB_w13_gate_nk[(None, k_tile)], tBsSFB_w13[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
+                        cute.copy(tma_sfb_w13, tBgSFB_w13_primary_nk[(None, k_tile)], tBsSFB_w13[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
                         ml_pipeline.producer_commit(prod_state)
                         prod_state.advance()
 
-                    # Gate and up share the A/SFA staging buffers. Wait for MMA
-                    # warps to drain the gate pass before refilling those stages.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    if cutlass.const_expr(self.is_gated):
+                        # Up coord (gated path only): w13's up tiles live at N = intermediate_slice.
+                        tBgB_w13_up_nk = tBgB_w13[(None, intermediate_slice, None, task_expert_idx)]
+                        tBgSFB_w13_up_nk = tBgSFB_w13[(None, intermediate_slice, None, task_expert_idx)]
 
-                    # ---- FC1 up pass ----
-                    up_prod_state.reset_count()
-                    for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):
-                        up_pipeline.producer_acquire(up_prod_state)
-                        cute.copy(tma_a, tAgA_mk[(None, k_tile)], tAsA[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
-                        cute.copy(tma_b_w13, tBgB_w13_up_nk[(None, k_tile)], tBsB_w13_up[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
-                        cute.copy(tma_sfa, tAgSFA_mk[(None, k_tile)], tAsSFA[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
-                        cute.copy(tma_sfb_w13, tBgSFB_w13_up_nk[(None, k_tile)], tBsSFB_w13_up[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
-                        up_pipeline.producer_commit(up_prod_state)
-                        up_prod_state.advance()
+                        # Gate and up share the A/SFA staging buffers. Wait for MMA
+                        # warps to drain the gate pass before refilling those stages.
+                        self.pass_sync_barrier.arrive_and_wait()
+
+                        # ---- FC1 up pass ----
+                        up_prod_state.reset_count()
+                        for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):
+                            up_pipeline.producer_acquire(up_prod_state)
+                            cute.copy(tma_a, tAgA_mk[(None, k_tile)], tAsA[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
+                            cute.copy(tma_b_w13, tBgB_w13_up_nk[(None, k_tile)], tBsB_w13_up[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
+                            cute.copy(tma_sfa, tAgSFA_mk[(None, k_tile)], tAsSFA[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
+                            cute.copy(tma_sfb_w13, tBgSFB_w13_up_nk[(None, k_tile)], tBsSFB_w13_up[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
+                            up_pipeline.producer_commit(up_prod_state)
+                            up_prod_state.advance()
 
                     # ---- FC2 B_down loads: continuous pipeline ----
-                    # No barrier needed: sB/sSFB are free (gate done, up uses
-                    # sB_up/sSFB_up). phase2_pipeline handles data availability.
+                    # No barrier needed: sB/sSFB are free after FC1.
+                    #   Gated: gate done (drained via pass_sync), up writes to sB_up/sSFB_up.
+                    #   Non-gated: single FC1 done.
+                    # phase2_pipeline handles data availability.
                     # intermediate_slice selects the K-tile of GEMM2 (FC1 output N-tile
                     # = GEMM2 K-tile since intermediate dim is the reduction dim).
-                    # Load ALL FC2 tiles continuously once stage1 no longer needs
-                    # the gate staging buffers.
                     phase2_prod_state.reset_count()
                     for output_tile_idx in range(0, output_tile_cnt, 1, unroll=4):
                         phase2_pipeline.producer_acquire(phase2_prod_state)
@@ -1626,7 +1690,8 @@ class MoEDynamicKernel:
 
         if warp_idx == self.tma_load_warp_id:
             ml_pipeline.producer_tail(prod_state)
-            up_pipeline.producer_tail(up_prod_state)
+            if cutlass.const_expr(self.is_gated):
+                up_pipeline.producer_tail(up_prod_state)
             phase2_pipeline.producer_tail(phase2_prod_state)
         return
 
