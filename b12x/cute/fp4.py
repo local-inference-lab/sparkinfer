@@ -167,6 +167,17 @@ def silu_mul_quantize_grouped_nvfp4_torch(
     return quantize_grouped_nvfp4_torch(activated, row_counts, global_scale)
 
 
+def relu2_quantize_grouped_nvfp4_torch(
+    input_tensor: torch.Tensor,
+    row_counts: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-Torch grouped NVFP4 quantization for ReLU^2 FC1 outputs."""
+    activated = torch.square(F.relu(input_tensor.float()))
+    activated = activated.to(input_tensor.dtype).to(torch.float32)
+    return quantize_grouped_nvfp4_torch(activated, row_counts, global_scale)
+
+
 # =============================================================================
 # Architecture Detection
 # =============================================================================
@@ -2103,6 +2114,26 @@ def silu_mul_quantize_block_fp4(
     helper for the CompactMoEKernel epilogue.
     """
     activated = silu_mul_16(gate, up)
+    block_max = max_abs_16(activated)
+    return quantize_block_fp4(activated, block_max, global_scale_val)
+
+
+@cute.jit
+def relu2_16(x: cute.Tensor) -> cute.Tensor:
+    """Compute ReLU^2 for 16 float32 values."""
+    out = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        v = fmax_f32(x[i], Float32(0.0))
+        out[i] = v * v
+    return out
+
+
+@cute.jit
+def relu2_quantize_block_fp4(
+    x: cute.Tensor, global_scale_val: Float32,
+) -> Tuple[Uint64, cutlass.Uint8]:
+    """Fuse ReLU^2 and FP4 quantization for 16 float32 values."""
+    activated = relu2_16(x)
     block_max = max_abs_16(activated)
     return quantize_block_fp4(activated, block_max, global_scale_val)
 

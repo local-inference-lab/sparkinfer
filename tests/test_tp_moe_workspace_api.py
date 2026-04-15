@@ -526,27 +526,9 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     [
         33,
         64,
-        pytest.param(
-            65,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason="reverted compact static top-1 path is incorrect beyond m=64",
-            ),
-        ),
-        pytest.param(
-            96,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason="reverted compact static top-1 path is incorrect beyond m=64",
-            ),
-        ),
-        pytest.param(
-            127,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason="reverted compact static top-1 path is incorrect beyond m=64",
-            ),
-        ),
+        65,
+        96,
+        127,
     ],
 )
 def test_static_single_expert_edge_sizes_match_oracle(m: int) -> None:
