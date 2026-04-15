@@ -182,6 +182,62 @@ class _WeightViews:
     sfb_w13_ptr: object = None
     sfb_down_ptr: object = None
 
+
+@dataclass(frozen=True)
+class _ActivationKernelSpec:
+    activation: str
+    is_gated: bool
+    micro_kernel_cls: type
+    static_kernel_cls: type
+    dynamic_kernel_cls: type
+
+    def w1_rows(self, n: int) -> int:
+        return (2 if self.is_gated else 1) * n
+
+    def make_micro_kernel(self, **kernel_kwargs):
+        if self.is_gated:
+            return self.micro_kernel_cls(**kernel_kwargs)
+        return self.micro_kernel_cls(**kernel_kwargs, activation=self.activation)
+
+    def make_static_kernel(self, *, num_topk: int, **kernel_kwargs):
+        if self.is_gated:
+            return self.static_kernel_cls(
+                **kernel_kwargs,
+                exact_mma_m_tiles=(num_topk == 1),
+            )
+        return self.static_kernel_cls(**kernel_kwargs, activation=self.activation)
+
+    def make_dynamic_kernel(self, **kernel_kwargs):
+        if self.is_gated:
+            return self.dynamic_kernel_cls(**kernel_kwargs)
+        return self.dynamic_kernel_cls(**kernel_kwargs, activation=self.activation)
+
+
+_ACTIVATION_KERNEL_SPECS = {
+    "silu": _ActivationKernelSpec(
+        activation="silu",
+        is_gated=True,
+        micro_kernel_cls=MoEMicroKernelSilu,
+        static_kernel_cls=MoEStaticKernelSilu,
+        dynamic_kernel_cls=MoEDynamicKernelSilu,
+    ),
+    "relu2": _ActivationKernelSpec(
+        activation="relu2",
+        is_gated=False,
+        micro_kernel_cls=MoEMicroKernelRelu2,
+        static_kernel_cls=MoEStaticKernelRelu2,
+        dynamic_kernel_cls=MoEDynamicKernelRelu2,
+    ),
+}
+
+
+def _get_activation_kernel_spec(activation: str) -> _ActivationKernelSpec:
+    try:
+        return _ACTIVATION_KERNEL_SPECS[activation]
+    except KeyError as exc:
+        raise ValueError(f"unsupported activation {activation!r}") from exc
+
+
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -652,7 +708,7 @@ def _get_weight_views(
     n: int,
     k: int,
     *,
-    is_gated: bool = True,
+    activation_spec: _ActivationKernelSpec,
 ) -> _WeightViews:
     """Create weight views from the expert-weight layout.
 
@@ -667,7 +723,7 @@ def _get_weight_views(
         w2_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
         w2_alphas.data_ptr(),
-        is_gated,
+        activation_spec.activation,
     )
     last_wkey, last_wval = _LAST_WEIGHTS
     if last_wkey == key:
@@ -682,7 +738,7 @@ def _get_weight_views(
     down = w2_fp4.permute(1, 2, 0)    # [k, n//2, E]
 
     # Compact contiguous scale storage for the FC1 weights.
-    w1_n = 2 * n if is_gated else n
+    w1_n = activation_spec.w1_rows(n)
     bs_u8 = w1_blockscale.view(torch.uint8)
     w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
     down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
@@ -1129,6 +1185,7 @@ def _get_static_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
 ):
+    activation_spec = _get_activation_kernel_spec(activation)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
@@ -1164,13 +1221,10 @@ def _get_static_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
-    if activation == "relu2":
-        kernel = MoEStaticKernelRelu2(**kernel_kwargs, activation="relu2")
-    else:
-        kernel = MoEStaticKernelSilu(
-            **kernel_kwargs,
-            exact_mma_m_tiles=(num_topk == 1),
-        )
+    kernel = activation_spec.make_static_kernel(
+        **kernel_kwargs,
+        num_topk=num_topk,
+    )
 
     rows_pad_k = align_up(max_rows, 128)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
@@ -1202,7 +1256,7 @@ def _get_static_kernel(
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
-    w1_n = n if activation == "relu2" else 2 * n
+    w1_n = activation_spec.w1_rows(n)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
     )
@@ -1280,6 +1334,7 @@ def _get_micro_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
 ):
+    activation_spec = _get_activation_kernel_spec(activation)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     routed_rows = m * num_topk
@@ -1312,10 +1367,7 @@ def _get_micro_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
-    if activation == "relu2":
-        kernel = MoEMicroKernelRelu2(**kernel_kwargs, activation="relu2")
-    else:
-        kernel = MoEMicroKernelSilu(**kernel_kwargs)
+    kernel = activation_spec.make_micro_kernel(**kernel_kwargs)
 
     rows_pad_k = align_up(max_rows, 128)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
@@ -1347,7 +1399,7 @@ def _get_micro_kernel(
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
-    w1_n = n if activation == "relu2" else 2 * n
+    w1_n = activation_spec.w1_rows(n)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
     )
@@ -1531,6 +1583,7 @@ def _get_dynamic_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
 ):
+    activation_spec = _get_activation_kernel_spec(activation)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
 
@@ -1563,10 +1616,7 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
-    if activation == "relu2":
-        kernel = MoEDynamicKernelRelu2(**kernel_kwargs, activation="relu2")
-    else:
-        kernel = MoEDynamicKernelSilu(**kernel_kwargs)
+    kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
     topk_ids_cutlass_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
@@ -1612,7 +1662,7 @@ def _get_dynamic_kernel(
     task_slice_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    w1_n = n if activation == "relu2" else 2 * n
+    w1_n = activation_spec.w1_rows(n)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype, (w1_n, k, E), stride_order=(1, 0, 2), assumed_align=16,
     )
@@ -1848,13 +1898,12 @@ def b12x_moe_fp4(
     workloads use dynamic. Large token batches are chunked only when the chosen
     backend cannot describe the required work buffers in a single launch.
     """
-    if activation not in {"silu", "relu2"}:
-        raise ValueError(f"unsupported activation {activation!r}")
+    activation_spec = _get_activation_kernel_spec(activation)
     m, k = a.shape
     E = w1_fp4.shape[0]
     weight_E = E
     n = w2_fp4.shape[2] * 2  # intermediate_size
-    expected_w1_rows = n if activation == "relu2" else 2 * n
+    expected_w1_rows = activation_spec.w1_rows(n)
     if w1_fp4.shape[1] != expected_w1_rows:
         raise ValueError(
             f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
@@ -1948,7 +1997,7 @@ def b12x_moe_fp4(
             w2_alphas,
             n,
             k,
-            is_gated=(activation == "silu"),
+            activation_spec=activation_spec,
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
@@ -1963,7 +2012,7 @@ def b12x_moe_fp4(
             w2_alphas,
             n,
             k,
-            is_gated=(activation == "silu"),
+            activation_spec=activation_spec,
         )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
