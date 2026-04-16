@@ -286,6 +286,6 @@ def _get_sm_scale_tensor(
         workspace.sm_scale_value = None
     sm_scale_value = float(sm_scale)
     if workspace.sm_scale_value != sm_scale_value:
-        sm_scale_tensor[0] = sm_scale_value
+        sm_scale_tensor.fill_(sm_scale_value)
         workspace.sm_scale_value = sm_scale_value
     return sm_scale_tensor

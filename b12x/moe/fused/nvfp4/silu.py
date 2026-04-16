@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from b12x.moe.fused.dynamic import MoEDynamicKernelBackend
-from b12x.moe.fused.micro import MoEMicroKernelBackend
-from b12x.moe.fused.static import MoEStaticKernelBackend
+from b12x.moe.fused.nvfp4.dynamic import MoEDynamicKernelBackend
+from b12x.moe.fused.nvfp4.micro import MoEMicroKernelBackend
+from b12x.moe.fused.nvfp4.static import MoEStaticKernelBackend
 
 
 class MoEMicroKernelSilu(MoEMicroKernelBackend):

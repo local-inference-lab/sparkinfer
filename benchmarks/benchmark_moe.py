@@ -23,7 +23,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.checkpoint_loader import IndexedSafetensorLoader
-from b12x.moe.fused.reference import (
+from b12x.moe.fused.nvfp4.reference import (
     OracleMetrics,
     compare_to_reference,
     moe_reference_f32,
@@ -244,6 +244,7 @@ class ModelProfile:
     default_layer_idx: int
     tp_size: int
     hf_repo_id: str
+    preferred_local_paths: tuple[str, ...] = ()
 
 
 MODEL_PROFILES = {
@@ -253,6 +254,9 @@ MODEL_PROFILES = {
         default_layer_idx=0,
         tp_size=TP_SIZE,
         hf_repo_id="nvidia/Qwen3.5-397B-A17B-NVFP4",
+        preferred_local_paths=(
+            "/data/models/Qwen3.5-397B-A17B-NVFP4",
+        ),
     ),
     "nemotron-backbone": ModelProfile(
         label="NVIDIA Nemotron Backbone",
@@ -260,6 +264,9 @@ MODEL_PROFILES = {
         default_layer_idx=1,
         tp_size=1,
         hf_repo_id="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+        preferred_local_paths=(
+            "/data/models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+        ),
     ),
 }
 
@@ -307,6 +314,10 @@ def resolve_model_path(
     env_path = os.environ.get("B12X_MODEL_PATH")
     if env_path:
         return pathlib.Path(env_path)
+    for candidate_str in profile.preferred_local_paths:
+        candidate = pathlib.Path(candidate_str)
+        if candidate.is_dir():
+            return candidate
     cached_path = _cached_snapshot_path(profile.hf_repo_id)
     if cached_path is not None:
         return cached_path

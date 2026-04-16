@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.integration.mla import (
@@ -327,6 +328,89 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
 
     assert output.shape == (3, 8, 256)
     assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture coverage")
+def test_sparse_mla_extend_split_graph_capture_uses_capture_safe_scalar_updates(monkeypatch) -> None:
+    workspace = MLAWorkspace.for_fixed_capacity(
+        mode="extend",
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=64,
+        max_total_q=4,
+        max_batch=1,
+        use_cuda_graph=True,
+    )
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=2)
+
+    def fake_run_split_decode(**kwargs):
+        kwargs["output"].zero_()
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fake_run_split_decode,
+    )
+
+    q_all = torch.ones((4, 8, 256), dtype=torch.bfloat16, device="cuda")
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8, device="cuda")
+    page_table_1 = torch.arange(64, dtype=torch.int32, device="cuda").unsqueeze(0).expand(4, -1).clone()
+    cache_seqlens = torch.tensor([64], dtype=torch.int32, device="cuda")
+    nsa_cache_seqlens = torch.tensor([64, 48, 32, 16], dtype=torch.int32, device="cuda")
+    nsa_cu = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    metadata = MLASparseExtendMetadata(
+        selected_token_offsets=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=4,
+        max_seq_len_k=64,
+        mode="extend",
+    )
+
+    captured_out = None
+
+    def run() -> None:
+        nonlocal captured_out
+        captured_out = sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=0.5,
+            v_head_dim=256,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_out is not None
+    assert captured_out.shape == (4, 8, 256)
+    assert workspace.kv_chunk_size_ptr is not None
+    assert workspace.num_chunks_ptr is not None
+    assert int(workspace.kv_chunk_size_ptr[0].item()) == 32
+    assert int(workspace.num_chunks_ptr[0].item()) == 2
+    assert workspace.sm_scale_tensor is not None
+    assert float(workspace.sm_scale_tensor[0].item()) == pytest.approx(0.5)
+    assert torch.count_nonzero(captured_out).item() == 0
 
 
 def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:

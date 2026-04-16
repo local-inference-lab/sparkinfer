@@ -1,23 +1,20 @@
-from b12x.moe.fused.nvfp4 import (
-    MoEDynamicKernel,
-    MoEDynamicKernelBackend,
-    MoEDynamicKernelRelu2,
-    MoEDynamicKernelSilu,
-    MoEMicroKernel,
-    MoEMicroKernelBackend,
-    MoEMicroKernelRelu2,
-    MoEMicroKernelSilu,
+from .dynamic import MoEDynamicKernelBackend
+from .micro import MoEMicroKernelBackend
+from .relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2, MoEStaticKernelRelu2
+from .silu import MoEDynamicKernelSilu, MoEMicroKernelSilu, MoEStaticKernelSilu
+from .static import MoEStaticKernelBackend
+from .reference import (
     MoERouteTrace,
-    MoEStaticKernel,
-    MoEStaticKernelBackend,
-    MoEStaticKernelRelu2,
-    MoEStaticKernelSilu,
     OracleMetrics,
     compare_to_reference,
     moe_reference_f32,
     moe_reference_nvfp4,
     trace_moe_reference_nvfp4_route,
 )
+
+MoEDynamicKernel = MoEDynamicKernelSilu
+MoEMicroKernel = MoEMicroKernelSilu
+MoEStaticKernel = MoEStaticKernelSilu
 
 __all__ = [
     "MoEDynamicKernelBackend",

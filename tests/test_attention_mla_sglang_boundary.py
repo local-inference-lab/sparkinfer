@@ -192,6 +192,59 @@ def _make_extend_metadata(
     )
 
 
+def test_sglang_b12x_forward_accepts_page_table_1_alias(monkeypatch) -> None:
+    nsa_backend_module = _import_sglang_nsa_backend()
+    captured: dict[str, object] = {}
+
+    def fake_decode_forward(**kwargs):
+        captured["metadata"] = kwargs["metadata"]
+        captured["workspace"] = kwargs["workspace"]
+        q_all = kwargs["q_all"]
+        return torch.zeros(
+            (q_all.shape[0], q_all.shape[1], kwargs["v_head_dim"]),
+            dtype=q_all.dtype,
+            device=q_all.device,
+        )
+
+    monkeypatch.setattr("b12x.integration.mla.sparse_mla_decode_forward", fake_decode_forward)
+
+    class _FakeBackend:
+        def _get_b12x_workspace(self, **kwargs):
+            captured["workspace_kwargs"] = kwargs
+            return object()
+
+    q_all = torch.zeros((1, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((4, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    metadata = _make_decode_metadata(
+        nsa_backend_module=nsa_backend_module,
+        cache_len=4,
+        page_table_1=page_table_1,
+    )
+
+    out = nsa_backend_module.NativeSparseAttnBackend._forward_b12x(
+        _FakeBackend(),
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        metadata=metadata,
+        sm_scale=0.5,
+        v_head_dim=256,
+        mode="decode",
+    )
+
+    assert out.shape == (1, 8, 256)
+    assert captured["workspace"] is not None
+    assert captured["workspace_kwargs"] == {
+        "mode": "decode",
+        "total_q": 1,
+        "batch": 1,
+        "v_head_dim": 256,
+    }
+    metadata_arg = captured["metadata"]
+    assert torch.equal(metadata_arg.page_table_1, page_table_1)
+
+
 def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
     device = require_sm120()
     _require_glm_weights()

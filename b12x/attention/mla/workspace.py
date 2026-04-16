@@ -219,10 +219,10 @@ class MLAWorkspace:
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
         if self.kv_chunk_size_value != int(kv_chunk_size):
-            self.kv_chunk_size_ptr[0] = int(kv_chunk_size)
+            self.kv_chunk_size_ptr.fill_(int(kv_chunk_size))
             self.kv_chunk_size_value = int(kv_chunk_size)
         if self.num_chunks_value != int(num_chunks):
-            self.num_chunks_ptr[0] = int(num_chunks)
+            self.num_chunks_ptr.fill_(int(num_chunks))
             self.num_chunks_value = int(num_chunks)
 
     def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:

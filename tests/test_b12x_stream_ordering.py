@@ -10,7 +10,7 @@ import torch
 import b12x.integration.tp_moe as tp_moe
 from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, bench_flashinfer, load_expert_weights
 from b12x.integration.tp_moe import allocate_tp_moe_workspace, b12x_moe_fp4, clear_tp_moe_caches
-from b12x.moe.fused.reference import compare_to_reference
+from b12x.moe.fused.nvfp4.reference import compare_to_reference
 
 from .helpers import require_sm120
 

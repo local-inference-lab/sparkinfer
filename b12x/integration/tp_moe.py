@@ -17,12 +17,12 @@ from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
 from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
 from b12x.integration.triton_route import route_topk as triton_route_topk
-from b12x.moe.fused.relu2 import (
+from b12x.moe.fused.nvfp4.relu2 import (
     MoEDynamicKernelRelu2,
     MoEMicroKernelRelu2,
     MoEStaticKernelRelu2,
 )
-from b12x.moe.fused.silu import (
+from b12x.moe.fused.nvfp4.silu import (
     MoEDynamicKernelSilu,
     MoEMicroKernelSilu,
     MoEStaticKernelSilu,

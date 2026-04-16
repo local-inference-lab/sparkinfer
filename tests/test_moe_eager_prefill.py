@@ -18,7 +18,7 @@ from b12x.integration.tp_moe import (
     b12x_moe_fp4,
     clear_tp_moe_caches,
 )
-from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
+from b12x.moe.fused.nvfp4.reference import compare_to_reference, moe_reference_nvfp4
 
 from .helpers import require_sm120
 

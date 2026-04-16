@@ -6,7 +6,7 @@ import torch
 from b12x.cute.fp4 import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
 from b12x.integration import tp_moe
 from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4, clear_tp_moe_caches
-from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
+from b12x.moe.fused.nvfp4.reference import compare_to_reference, moe_reference_nvfp4
 
 from .helpers import require_sm120
 
