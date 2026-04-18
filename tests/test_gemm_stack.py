@@ -6,19 +6,21 @@ import sys
 import pytest
 import torch
 
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.fp4 import as_grouped_scale_view, quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
+from b12x.gemm import dense_gemm_bf16x_fp4, dense_gemm_packed_fp4
 from b12x.gemm.dense import _select_default_mma_tiler_mn, dense_gemm
+from b12x.gemm.fused_dense import _select_default_mma_tiler_mn as _select_default_fused_mma_tiler_mn
 
 _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
     sys.path.insert(0, str(_FLASHINFER_ROOT))
 
+from flashinfer import fp4_quantize
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import mm_fp4
 
 from .helpers import require_sm120
-
 
 def _require_cudnn_fp4() -> None:
     if not CUDNN_AVAILABLE:
@@ -67,6 +69,19 @@ def _run_dense_gemm(
         c_dtype=c_dtype_str,
         sf_vec_size=16,
     )
+
+
+def _interleaved_scale_to_grouped(
+    scale_storage: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    if scale_storage.dtype == torch.float8_e4m3fn:
+        scale_storage_u8 = scale_storage.view(torch.uint8)
+    else:
+        scale_storage_u8 = scale_storage
+    return as_grouped_scale_view(scale_storage_u8.unsqueeze(0), rows, cols)
 
 
 @pytest.mark.parametrize("M,N,K", [
@@ -188,6 +203,489 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
     torch.testing.assert_close(graph_down, eager_down, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 128), (2, 256, 128), (8, 128, 256), (64, 128, 128)])
+def test_dense_gemm_packed_fp4_matches_dense_path(
+    act_dtype: torch.dtype,
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(17)
+
+    activation = torch.randn((m, k), device="cuda", dtype=act_dtype) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    packed_a, sfa = fp4_quantize(activation, input_quant_scale)
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=act_dtype) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+
+    actual = dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16" if act_dtype == torch.bfloat16 else "float16",
+        sf_vec_size=16,
+    )
+
+    m_phys = 2 if m == 1 else m
+    packed_a_expected = packed_a
+    if m_phys != m:
+        packed_a_expected = torch.zeros(
+            (m_phys, packed_a.shape[1]),
+            dtype=packed_a.dtype,
+            device=packed_a.device,
+        )
+        packed_a_expected[:m] = packed_a
+    expected = dense_gemm(
+        (
+            packed_a_expected.unsqueeze(2),
+            _interleaved_scale_to_grouped(sfa, rows=m_phys, cols=k),
+        ),
+        (
+            packed_b.unsqueeze(2),
+            _interleaved_scale_to_grouped(sfb, rows=n, cols=k),
+        ),
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16" if act_dtype == torch.bfloat16 else "float16",
+        sf_vec_size=16,
+    )[:m, :, 0]
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 128), (2, 256, 128), (8, 128, 256)])
+def test_dense_gemm_packed_fp4_replays_under_cuda_graph(
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(23)
+
+    activation = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    packed_a, sfa = fp4_quantize(activation, input_quant_scale)
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+
+    eager = dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+    )
+    graph_out = torch.empty_like(eager)
+
+    dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dense_gemm_packed_fp4(
+            (packed_a, sfa),
+            (packed_b, sfb),
+            out=graph_out,
+            alpha=alpha,
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 128), (2, 256, 128), (8, 128, 256), (64, 128, 128)])
+def test_dense_gemm_bf16x_fp4_matches_packed_dense_path(
+    act_dtype: torch.dtype,
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(31)
+
+    activation = torch.randn((m, k), device="cuda", dtype=act_dtype) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    packed_a, sfa = fp4_quantize(activation, input_quant_scale)
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=act_dtype) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+    c_dtype = "bfloat16" if act_dtype == torch.bfloat16 else "float16"
+
+    actual = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+    )
+    expected = dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
+def test_dense_gemm_bf16x_fp4_accepts_decode_tuning_overrides(
+    act_dtype: torch.dtype,
+) -> None:
+    require_sm120()
+    torch.manual_seed(91)
+
+    m, n, k = 2, 256, 128
+    activation = torch.randn((m, k), device="cuda", dtype=act_dtype) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    weight_source = torch.randn((n, k), device="cuda", dtype=act_dtype) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+    c_dtype = "bfloat16" if act_dtype == torch.bfloat16 else "float16"
+
+    expected = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+    )
+    actual = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+        mma_tiler_mn=(32, 64),
+        force_regular_a_quant=True,
+        force_regular_c_store=True,
+        ab_stage_override=1,
+        epi_stage_override=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 128), (2, 256, 128)])
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
+def test_dense_gemm_bf16x_fp4_micro_tile_matches_packed_dense_path(
+    m: int,
+    n: int,
+    k: int,
+    act_dtype: torch.dtype,
+) -> None:
+    require_sm120()
+    torch.manual_seed(123)
+
+    activation = torch.randn((m, k), device="cuda", dtype=act_dtype) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    packed_a, sfa = fp4_quantize(activation, input_quant_scale)
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=act_dtype) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+    c_dtype = "bfloat16" if act_dtype == torch.bfloat16 else "float16"
+
+    actual = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+        mma_tiler_mn=(16, 64),
+        force_regular_c_store=True,
+        ab_stage_override=2,
+        epi_stage_override=1,
+    )
+    expected = dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("m", "n", "k", "split_k"), [(1, 256, 256, 2), (4, 256, 512, 4)])
+def test_dense_gemm_bf16x_fp4_split_k_matches_packed_dense_path(
+    m: int,
+    n: int,
+    k: int,
+    split_k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(124)
+
+    activation = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    packed_a, sfa = fp4_quantize(activation, input_quant_scale)
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+    workspace = torch.empty((m, n, split_k), device="cuda", dtype=torch.float32)
+
+    actual = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        workspace=workspace,
+        split_k=split_k,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        mma_tiler_mn=(32, 64),
+    )
+    expected = dense_gemm_packed_fp4(
+        (packed_a, sfa),
+        (packed_b, sfb),
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("m", "n", "k", "split_k"), [(1, 256, 256, 2), (8, 256, 256, 2)])
+def test_dense_gemm_bf16x_fp4_split_k_replays_under_cuda_graph(
+    m: int,
+    n: int,
+    k: int,
+    split_k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(125)
+
+    activation = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+    workspace = torch.empty((m, n, split_k), device="cuda", dtype=torch.float32)
+
+    eager = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        workspace=workspace,
+        split_k=split_k,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        mma_tiler_mn=(32, 64),
+    )
+    graph_out = torch.empty_like(eager)
+
+    dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        out=graph_out,
+        alpha=alpha,
+        workspace=workspace,
+        split_k=split_k,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        mma_tiler_mn=(32, 64),
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dense_gemm_bf16x_fp4(
+            activation,
+            (packed_b, sfb),
+            input_quant_scale,
+            out=graph_out,
+            alpha=alpha,
+            workspace=workspace,
+            split_k=split_k,
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+            mma_tiler_mn=(32, 64),
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 128), (2, 256, 128), (8, 128, 256)])
+def test_dense_gemm_bf16x_fp4_replays_under_cuda_graph(
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    require_sm120()
+    torch.manual_seed(37)
+
+    activation = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 4
+    input_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / activation.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=activation.device,
+    )
+
+    weight_source = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 4
+    weight_quant_scale = torch.tensor(
+        [torch.finfo(torch.float8_e4m3fn).max * 6.0 / weight_source.abs().max().to(torch.float32)],
+        dtype=torch.float32,
+        device=weight_source.device,
+    )
+    packed_b, sfb = fp4_quantize(weight_source, weight_quant_scale)
+    alpha = (1.0 / (input_quant_scale[0] * weight_quant_scale[0])).view(1)
+
+    eager = dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+    )
+    graph_out = torch.empty_like(eager)
+
+    dense_gemm_bf16x_fp4(
+        activation,
+        (packed_b, sfb),
+        input_quant_scale,
+        alpha=alpha,
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dense_gemm_bf16x_fp4(
+            activation,
+            (packed_b, sfb),
+            input_quant_scale,
+            out=graph_out,
+            alpha=alpha,
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("m", "n", "sm_count", "expected"),
     [
@@ -204,3 +702,25 @@ def test_default_dense_tile_selector_handles_small_m_wide_n(
     expected: tuple[int, int],
 ) -> None:
     assert _select_default_mma_tiler_mn(m, n, sm_count) == expected
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "sm_count", "expected"),
+    [
+        (1, 4096, 48, (32, 64)),
+        (2, 4096, 48, (32, 64)),
+        (16, 4096, 48, (32, 64)),
+        (32, 4096, 48, (64, 64)),
+        (64, 4096, 48, (32, 64)),
+        (128, 4096, 48, (32, 128)),
+        (64, 1024, 48, (128, 128)),
+        (384, 4096, 48, (128, 128)),
+    ],
+)
+def test_default_fused_tile_selector_handles_decode_and_large_m(
+    m: int,
+    n: int,
+    sm_count: int,
+    expected: tuple[int, int],
+) -> None:
+    assert _select_default_fused_mma_tiler_mn(m, n, sm_count) == expected

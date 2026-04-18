@@ -45,6 +45,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
+from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import (
     current_cuda_stream,
     cutlass_to_torch_dtype,
@@ -1813,3 +1814,175 @@ def dense_gemm(
         c_tensor_gpu=out,
         alpha_tensor_gpu=alpha,
     )
+
+
+def _pad_packed_fp4_rows(
+    packed: torch.Tensor,
+    rows_padded: int,
+) -> torch.Tensor:
+    if packed.ndim == 2:
+        rows, cols = packed.shape
+        padded = torch.zeros(
+            (rows_padded, cols),
+            dtype=packed.dtype,
+            device=packed.device,
+        )
+        padded[:rows] = packed
+        return padded
+    if packed.ndim == 3 and packed.shape[2] == 1:
+        rows, cols, depth = packed.shape
+        padded = torch.zeros(
+            (rows_padded, cols, depth),
+            dtype=packed.dtype,
+            device=packed.device,
+        )
+        padded[:rows] = packed
+        return padded
+    raise ValueError(
+        f"packed FP4 tensor must be rank-2 or rank-3 with depth 1, got {tuple(packed.shape)}"
+    )
+
+
+def _packed_fp4_tensor_to_rank3(
+    packed: torch.Tensor,
+    *,
+    min_rows: Optional[int] = None,
+) -> torch.Tensor:
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"packed FP4 tensor must have dtype torch.uint8, got {packed.dtype}")
+    if packed.ndim == 2:
+        if min_rows is not None and packed.shape[0] < min_rows:
+            packed = _pad_packed_fp4_rows(packed, min_rows)
+        return packed.unsqueeze(2)
+    if packed.ndim == 3 and packed.shape[2] == 1:
+        if min_rows is not None and packed.shape[0] < min_rows:
+            packed = _pad_packed_fp4_rows(packed, min_rows)
+        return packed
+    raise ValueError(
+        f"packed FP4 tensor must be rank-2 or rank-3 with depth 1, got {tuple(packed.shape)}"
+    )
+
+
+def _interleaved_scale_storage_to_grouped_view(
+    scale_storage: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    if scale_storage.dtype == torch.float8_e4m3fn:
+        if not scale_storage.is_contiguous():
+            scale_storage = scale_storage.contiguous()
+        scale_storage_u8 = scale_storage.view(torch.uint8)
+    elif scale_storage.dtype == torch.uint8:
+        scale_storage_u8 = scale_storage.contiguous() if not scale_storage.is_contiguous() else scale_storage
+    else:
+        raise TypeError(
+            "interleaved FP4 scale storage must have dtype torch.uint8 or "
+            f"torch.float8_e4m3fn, got {scale_storage.dtype}"
+        )
+
+    if scale_storage_u8.ndim == 2:
+        scale_storage_u8 = scale_storage_u8.unsqueeze(0)
+    elif scale_storage_u8.ndim != 3 or scale_storage_u8.shape[0] != 1:
+        raise ValueError(
+            "interleaved FP4 scale storage must be rank-2 or rank-3 with batch 1, "
+            f"got {tuple(scale_storage.shape)}"
+        )
+
+    rows_padded = align_up(rows, 128)
+    cols_padded = align_up(cols // 16, 4)
+    if scale_storage_u8.shape[1] < rows_padded or scale_storage_u8.shape[2] < cols_padded:
+        raise ValueError(
+            "interleaved FP4 scale storage is too small for the requested logical shape: "
+            f"storage={tuple(scale_storage_u8.shape)}, logical_rows={rows}, logical_cols={cols}"
+        )
+    return as_grouped_scale_view(scale_storage_u8, rows, cols)
+
+
+def dense_gemm_packed_fp4(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+    *,
+    sf_dtype: str,
+    c_dtype: str,
+    sf_vec_size: int,
+    sm_count: Optional[int] = None,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Tuple[int, int] = (1, 1),
+    alpha: Optional[torch.Tensor] = None,
+    alpha_dtype: Optional[str] = None,
+) -> torch.Tensor:
+    """Execute dense FP4 GEMM from packed operands plus interleaved scale storage.
+
+    This entrypoint matches the layout produced by ``flashinfer.fp4_quantize`` and
+    used by sglang: packed FP4 ``torch.uint8`` matrices with separate interleaved
+    scale-factor storage. It bypasses the sglang wrapper's blanket M-padding and
+    only pads the true singleton ``M=1`` case to ``M=2`` to avoid the current
+    TMA limitation in the prequantized dense kernel.
+    """
+    packed_a, sfa_storage = lhs
+    packed_b, sfb_storage = rhs
+
+    if packed_a.ndim not in (2, 3) or packed_b.ndim not in (2, 3):
+        raise ValueError(
+            "packed FP4 operands must be rank-2 or rank-3 tensors, got "
+            f"{tuple(packed_a.shape)} and {tuple(packed_b.shape)}"
+        )
+
+    m_orig = packed_a.shape[0]
+    n = packed_b.shape[0]
+    k_half = packed_a.shape[1]
+    if packed_b.shape[1] != k_half:
+        raise ValueError(
+            f"packed FP4 K dimensions must match, got {packed_a.shape[1]} and {packed_b.shape[1]}"
+        )
+    if packed_a.ndim == 3 and packed_a.shape[2] != 1:
+        raise ValueError(f"lhs packed FP4 tensor depth must be 1, got {packed_a.shape[2]}")
+    if packed_b.ndim == 3 and packed_b.shape[2] != 1:
+        raise ValueError(f"rhs packed FP4 tensor depth must be 1, got {packed_b.shape[2]}")
+
+    k = k_half * 2
+    m_phys = 2 if m_orig == 1 else m_orig
+
+    a_rank3 = _packed_fp4_tensor_to_rank3(packed_a, min_rows=m_phys)
+    b_rank3 = _packed_fp4_tensor_to_rank3(packed_b)
+    sfa_grouped = _interleaved_scale_storage_to_grouped_view(
+        sfa_storage,
+        rows=m_phys,
+        cols=k,
+    )
+    sfb_grouped = _interleaved_scale_storage_to_grouped_view(
+        sfb_storage,
+        rows=n,
+        cols=k,
+    )
+
+    out_rank3 = None
+    if out is not None:
+        if out.ndim != 2 or out.shape != (m_orig, n):
+            raise ValueError(
+                f"out must have shape {(m_orig, n)} for dense_gemm_packed_fp4, got {tuple(out.shape)}"
+            )
+        if m_phys == m_orig:
+            out_rank3 = out.unsqueeze(2)
+
+    out_rank3 = dense_gemm(
+        (a_rank3, sfa_grouped),
+        (b_rank3, sfb_grouped),
+        out=out_rank3,
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+        sm_count=sm_count,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        alpha_dtype=alpha_dtype,
+    )
+    result = out_rank3[:m_orig, :, 0]
+    if out is not None and m_phys != m_orig:
+        out.copy_(result)
+        return out
+    return result
