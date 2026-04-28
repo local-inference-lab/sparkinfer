@@ -961,29 +961,57 @@ def _prefill_qk_mma_from_smem_q(
     num_mma_d_qk,
     upcast_stride_k,
 ) -> None:
-    """QK MMA using Q from smem (via raw pointer) instead of global memory."""
+    """QK MMA using Q from smem via ldmatrix (bank-conflict-free)."""
     unit_scale = Uint32(0x7F7F7F7F)
+    upcast_stride_q = Int32(_PREFILL_Q_STAGE_COLS // 16)
     k_offset = _permuted_offset_128b(
         row_base + warp_kv_idx * num_mma_kv * Int32(16) + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
         (lane % Int32(16)) // Int32(8),
         upcast_stride_k,
     )
+    q_offset = _permuted_offset_128b(
+        warp_q_idx * Int32(16) + lane % Int32(16),
+        lane // Int32(16),
+        upcast_stride_q,
+    )
+    mask16 = Uint32(0xFFFF)
+    shift16 = Uint32(16)
     for mma_pair in cutlass.range_constexpr(num_mma_d_qk // 2):
         q_regs = cute.make_rmem_tensor(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
-        group_id = lane // Int32(4)
-        thread_id_in_group = lane % Int32(4)
-        col_base = Int32(mma_pair * 32) + thread_id_in_group * Int32(2)
+        # Load Q via ldmatrix (bank-conflict-free 128-bit vector loads).
+        q_offset_cur = q_offset
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
-            row_local_0 = row_base_q + group_id
-            row_local_8 = row_local_0 + Int32(8)
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base)
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base)
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base + Int32(16))
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base + Int32(16))
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_smem_base, q_offset_cur)
+            )
+            # Repack from BF16-matrix layout to FP8-matrix layout.
+            # ldmatrix returns {row0-7:col0-1, row8-15:col0-1, row0-7:col2-3, row8-15:col2-3}
+            # in BF16 terms. For FP8, each BF16 pair = 2 FP8 values.
+            # We need: q_regs[mma_q, 0] = {row0-7:col0-3 FP8 packed as u32}
+            q_regs[mma_q, 0] = (a0 & mask16) | ((a2 & mask16) << shift16)
+            q_regs[mma_q, 1] = (a1 & mask16) | ((a3 & mask16) << shift16)
+            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, Int32(16), upcast_stride_q)
+
+        # Second column half for this mma_pair.
+        mma_d0 = mma_pair * 2
+        q_offset_mid = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0) - Int32(
+            num_mma_q * Int32(16) * upcast_stride_q
+        )
+        q_offset_cur = q_offset_mid
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_smem_base, q_offset_cur)
+            )
+            q_regs[mma_q, 2] = (a0 & mask16) | ((a2 & mask16) << shift16)
+            q_regs[mma_q, 3] = (a1 & mask16) | ((a3 & mask16) << shift16)
+            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, Int32(16), upcast_stride_q)
+
+        q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0 + Int32(1)) - Int32(
+            num_mma_q * Int32(16) * upcast_stride_q
+        )
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
