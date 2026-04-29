@@ -651,6 +651,48 @@ def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
     )
 
 
+@cute.jit
+def _apply_attention_sink_after_lse_scale(
+    o_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    mAttentionSinkBias: cute.Tensor,
+    mma_q,
+    row_slot,
+    q_head_idx: Int32,
+    row_valid: Int32,
+    causal_k_limit: Int32,
+    chunk_start: Int32,
+    chunk_end: Int32,
+    warp_kv_idx: Int32,
+    num_mma_d_vo,
+    softmax_scale_log2: Float32,
+    has_attention_sink_bias,
+    split_kv,
+):
+    if m_frag[mma_q, row_slot] != -Float32.inf:
+        m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * softmax_scale_log2)
+    if const_expr(has_attention_sink_bias):
+        sink_owner = (row_valid != Int32(0)) and (warp_kv_idx == Int32(0))
+        if const_expr(split_kv):
+            if sink_owner:
+                sink_owner = (chunk_start <= causal_k_limit) and (causal_k_limit < chunk_end)
+        if sink_owner:
+            old_m = m_frag[mma_q, row_slot]
+            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_utils.LOG2_E)
+            new_m = attention_utils.fmax(old_m, sink_m)
+            old_scale = Float32(0.0) if old_m == -Float32.inf else _exp2_approx_ftz_f32(old_m - new_m)
+            sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
+            d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * old_scale + sink_scale)
+            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                reg_base = row_slot * 2
+                o_frag[mma_q, mma_d, reg_base + 0] = Float32(o_frag[mma_q, mma_d, reg_base + 0] * old_scale)
+                o_frag[mma_q, mma_d, reg_base + 1] = Float32(o_frag[mma_q, mma_d, reg_base + 1] * old_scale)
+                o_frag[mma_q, mma_d, reg_base + 4] = Float32(o_frag[mma_q, mma_d, reg_base + 4] * old_scale)
+                o_frag[mma_q, mma_d, reg_base + 5] = Float32(o_frag[mma_q, mma_d, reg_base + 5] * old_scale)
+            m_frag[mma_q, row_slot] = Float32(new_m)
+
+
 @dsl_user_op
 def _exit_thread(
     *,
@@ -2166,6 +2208,8 @@ class PagedForwardKernel:
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
         enable_paged_kv_tma: bool = False,
+        window_left: int = -1,
+        has_attention_sink_bias: bool = False,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -2173,6 +2217,8 @@ class PagedForwardKernel:
         self.dtype_o = dtype_o
         self.traits = traits
         self.split_kv = False
+        self.window_left = int(window_left)
+        self.has_attention_sink_bias = bool(has_attention_sink_bias)
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2669,7 +2715,9 @@ class PagedForwardKernel:
         mKvTileIndices: cute.Tensor,
         mOIndptr: cute.Tensor,
         mKvChunkSizePtr: cute.Tensor,
+        mKvWindowStartTokens: cute.Tensor,
         mBlockValidMask: cute.Tensor,
+        mAttentionSinkBias: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -2688,8 +2736,13 @@ class PagedForwardKernel:
             raise ValueError("mCacheSeqlens and mCuSeqlensQ must be rank-1")
         if const_expr(len(mRequestIndices.shape) != 1 or len(mQoTileIndices.shape) != 1 or len(mKvTileIndices.shape) != 1):
             raise ValueError("worklist tensors must be rank-1")
-        if const_expr(len(mOIndptr.shape) != 1 or len(mKvChunkSizePtr.shape) != 1 or len(mBlockValidMask.shape) != 1):
-            raise ValueError("mOIndptr, mKvChunkSizePtr, and mBlockValidMask must be rank-1")
+        if const_expr(
+            len(mOIndptr.shape) != 1
+            or len(mKvChunkSizePtr.shape) != 1
+            or len(mKvWindowStartTokens.shape) != 1
+            or len(mBlockValidMask.shape) != 1
+        ):
+            raise ValueError("mOIndptr, mKvChunkSizePtr, mKvWindowStartTokens, and mBlockValidMask must be rank-1")
         if const_expr(len(mO.shape) != 3 or len(mLSE.shape) != 2):
             raise ValueError("mO must be rank-3 and mLSE must be rank-2")
         if const_expr(mKDescale is not None and len(mKDescale.shape) not in (1, 2)):
@@ -2795,7 +2848,9 @@ class PagedForwardKernel:
             mKvTileIndices,
             mOIndptr,
             mKvChunkSizePtr,
+            mKvWindowStartTokens,
             mBlockValidMask,
+            mAttentionSinkBias,
             mO,
             mLSE,
             mKDescale,
@@ -2878,7 +2933,9 @@ class PagedForwardKernel:
         mKvTileIndices: cute.Tensor,
         mOIndptr: cute.Tensor,
         mKvChunkSizePtr: cute.Tensor,
+        mKvWindowStartTokens: cute.Tensor,
         mBlockValidMask: cute.Tensor,
+        mAttentionSinkBias: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -2908,11 +2965,12 @@ class PagedForwardKernel:
         packed_tile_end = cutlass.select_(packed_tile_limit < packed_qo_len, packed_tile_limit, packed_qo_len)
         kv_chunk_size = mKvChunkSizePtr[0]
 
-        chunk_start = kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else 0
+        kv_window_start = mKvWindowStartTokens[request_idx] if const_expr(self.window_left >= 0) else Int32(0)
+        chunk_start = kv_window_start + kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else kv_window_start
         chunk_end = (
             cutlass.select_(
-                (kv_tile_idx + 1) * kv_chunk_size < cache_len,
-                (kv_tile_idx + 1) * kv_chunk_size,
+                kv_window_start + (kv_tile_idx + 1) * kv_chunk_size < cache_len,
+                kv_window_start + (kv_tile_idx + 1) * kv_chunk_size,
                 cache_len,
             )
             if const_expr(self.split_kv)
@@ -3965,7 +4023,12 @@ class PagedForwardKernel:
                                 if valid:
                                     valid = valid and key_local < tile_tokens
                                 if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    key_pos = tile_base + key_local
+                                    valid = valid and key_pos <= causal_k_limit[mma_q, row_slot]
+                                    if const_expr(self.window_left >= 0):
+                                        window_start = causal_k_limit[mma_q, row_slot] - Int32(self.window_left)
+                                        window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                        valid = valid and key_pos >= window_start
                                 if valid:
                                     frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                 else:
@@ -4045,7 +4108,12 @@ class PagedForwardKernel:
                                 if valid:
                                     valid = valid and key_local < tile_tokens
                                 if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    key_pos = tile_base + key_local
+                                    valid = valid and key_pos <= causal_k_limit[mma_q, row_slot]
+                                    if const_expr(self.window_left >= 0):
+                                        window_start = causal_k_limit[mma_q, row_slot] - Int32(self.window_left)
+                                        window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                        valid = valid and key_pos >= window_start
                                 if valid:
                                     frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                 else:
@@ -4131,13 +4199,18 @@ class PagedForwardKernel:
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
                                 key_local = (
-                                    literal_key_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                    warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
                                 )
                                 valid = row_valid[mma_q, row_slot] != 0
                                 if valid:
                                     valid = valid and key_local < tile_tokens
                                 if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    key_pos = tile_base + key_local
+                                    valid = valid and key_pos <= causal_k_limit[mma_q, row_slot]
+                                    if const_expr(self.window_left >= 0):
+                                        window_start = causal_k_limit[mma_q, row_slot] - Int32(self.window_left)
+                                        window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                        valid = valid and key_pos >= window_start
                                 if not valid:
                                     frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
 
@@ -4749,10 +4822,32 @@ class PagedForwardKernel:
                     pipeline_v.producer_tail(kv_producer_state)
 
 
-        for mma_q in cutlass.range_constexpr(num_mma_q):
-            for row_slot in cutlass.range_constexpr(2):
-                if m_frag[mma_q, row_slot] != -Float32.inf:
-                    m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
+        if const_expr(not self.has_attention_sink_bias):
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                for row_slot in cutlass.range_constexpr(2):
+                    if m_frag[mma_q, row_slot] != -Float32.inf:
+                        m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
+        else:
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                for row_slot in cutlass.range_constexpr(2):
+                    _apply_attention_sink_after_lse_scale(
+                        o_frag,
+                        m_frag,
+                        d_frag,
+                        mAttentionSinkBias,
+                        mma_q,
+                        row_slot,
+                        q_head_idx_frag[mma_q, row_slot],
+                        row_valid[mma_q, row_slot],
+                        causal_k_limit[mma_q, row_slot],
+                        chunk_start,
+                        chunk_end,
+                        warp_kv_idx,
+                        num_mma_d_vo,
+                        self.softmax_scale_log2,
+                        self.has_attention_sink_bias,
+                        self.split_kv,
+                    )
 
         if const_expr(self.traits.num_warps_kv > 1):
             for mma_q in cutlass.range_constexpr(num_mma_q):
@@ -5739,6 +5834,9 @@ def build_extend_forward_kernel(
     traits: PagedForwardTraits,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    *,
+    window_left: int = -1,
+    has_attention_sink_bias: bool = False,
 ):
     enable_paged_kv_tma = os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
     return PagedExtendForwardKernel(
@@ -5750,4 +5848,6 @@ def build_extend_forward_kernel(
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
         enable_paged_kv_tma=enable_paged_kv_tma,
+        window_left=window_left,
+        has_attention_sink_bias=has_attention_sink_bias,
     )

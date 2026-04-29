@@ -258,6 +258,122 @@ def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> No
 
 
 @torch.inference_mode()
+def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 1, 1],
+        cache_seqlens=[128, 192, 256],
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    window_left = 80
+    attention_sink_bias = torch.linspace(-0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device)
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
+    output, lse_base2 = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        window_left=window_left,
+        attention_sink_bias=attention_sink_bias,
+    )
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert (lse_natural - ref_lse).abs().max().item() <= 0.05
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_window_and_sink() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 1, 1],
+        cache_seqlens=[128, 192, 256],
+        q_heads=64,
+        kv_heads=8,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    window_left = 80
+    attention_sink_bias = torch.linspace(-0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device)
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
+    output, lse_base2 = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty(q.shape[0], q.shape[1], v_cache.shape[3], dtype=q.dtype, device=q.device),
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        window_left=window_left,
+        attention_sink_bias=attention_sink_bias,
+    )
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - ref_out).abs().max().item() <= 0.02
+    assert (lse_natural - ref_lse).abs().max().item() <= 0.03
+    assert _cosine_similarity(output, ref_out) >= 0.9999
+
+
+@torch.inference_mode()
+def test_paged_forward_attention_sink_affects_denominator_only() -> None:
+    require_sm120()
+    q_heads = 8
+    kv_heads = 1
+    head_dim = 256
+    page_size = 64
+    q = torch.zeros((1, q_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.zeros((1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros((1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    v_cache[:, 0, :, :].fill_(1.0)
+    page_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.ones((1,), dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    attention_sink_bias = torch.full((q_heads,), math.log(3.0), dtype=torch.float32, device="cuda")
+
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    output, lse_base2 = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    expected_output = torch.full_like(output, 0.25)
+    expected_lse = torch.full((1, q_heads), math.log(4.0), dtype=torch.float32, device="cuda")
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - expected_output).abs().max().item() <= 0.002
+    assert (lse_natural - expected_lse).abs().max().item() <= 0.002
+
+
+@torch.inference_mode()
 def test_paged_forward_turbo_matches_reference_fp8_decode_short_context_batch8() -> None:
     require_sm120()
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64, b12x_attn_mode="turbo")
@@ -293,6 +409,51 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
+    )
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert (lse_natural - ref_lse).abs().max().item() <= 0.05
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6, 5],
+        cache_seqlens=[320, 384],
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    window_left = 96
+    attention_sink_bias = torch.linspace(0.1, -0.1, q.shape[1], dtype=torch.float32, device=q.device)
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        disable_split_kv=True,
+        window_left=window_left,
+    )
+    output, lse_base2 = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        window_left=window_left,
+        attention_sink_bias=attention_sink_bias,
     )
     lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.03

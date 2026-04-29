@@ -16,6 +16,8 @@ from .planner import (
     infer_paged_mode,
 )
 
+_ARENA_ALIGN_BYTES = 1024
+
 
 def _paged_lse_storage_shape(total_q: int, num_q_heads: int) -> tuple[int, int]:
     return (num_q_heads, total_q)
@@ -30,6 +32,39 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     if device.type == "cuda" and device.index is None:
         return torch.device("cuda", torch.cuda.current_device())
     return device
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError(f"alignment must be positive, got {alignment}")
+    return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _materialize_arena_view(
+    arena: torch.Tensor,
+    *,
+    offset_bytes: int,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, int]:
+    offset_bytes = _align_up(offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
+    if nbytes == 0:
+        return arena.narrow(0, 0, 0).view(dtype).view(shape), offset_bytes
+    view_bytes = arena.narrow(0, offset_bytes, nbytes)
+    typed_view = view_bytes.view(dtype).view(shape)
+    return typed_view, offset_bytes + nbytes
 
 
 def _shape_only_cuda_tensor(
@@ -52,8 +87,336 @@ def _shape_only_cuda_tensor(
     return base.as_strided(shape, (0,) * len(shape))
 
 
+@dataclass(frozen=True, kw_only=True)
+class PagedAttentionArenaCaps:
+    device: torch.device
+    dtype: torch.dtype
+    kv_dtype: torch.dtype
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim_qk: int
+    max_head_dim_vo: int
+    page_size: int
+    max_total_q: int
+    max_batch: int
+    max_page_table_width: int
+    max_work_items: int
+    max_partial_rows: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "device", _canonical_device(self.device))
+        object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
+        object.__setattr__(self, "num_kv_heads", max(int(self.num_kv_heads), 1))
+        object.__setattr__(self, "head_dim_qk", max(int(self.head_dim_qk), 1))
+        object.__setattr__(self, "max_head_dim_vo", max(int(self.max_head_dim_vo), 1))
+        object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        object.__setattr__(self, "max_total_q", max(int(self.max_total_q), 1))
+        object.__setattr__(self, "max_batch", max(int(self.max_batch), 1))
+        object.__setattr__(
+            self,
+            "max_page_table_width",
+            max(int(self.max_page_table_width), 1),
+        )
+        object.__setattr__(self, "max_work_items", max(int(self.max_work_items), 0))
+        object.__setattr__(self, "max_partial_rows", max(int(self.max_partial_rows), 0))
+
+
+@dataclass(frozen=True, kw_only=True)
+class PagedAttentionWorkspaceContract:
+    mode: Literal["decode", "extend", "verify"]
+    max_total_q: int
+    max_batch: int
+    max_page_table_width: int
+    max_work_items: int
+    max_partial_rows: int
+    head_dim_qk: int
+    head_dim_vo: int
+    num_cache_pages: int
+    attn_mode: Literal["default", "turbo"] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_total_q", max(int(self.max_total_q), 1))
+        object.__setattr__(self, "max_batch", max(int(self.max_batch), 1))
+        object.__setattr__(
+            self,
+            "max_page_table_width",
+            max(int(self.max_page_table_width), 1),
+        )
+        object.__setattr__(self, "max_work_items", max(int(self.max_work_items), 0))
+        object.__setattr__(self, "max_partial_rows", max(int(self.max_partial_rows), 0))
+        object.__setattr__(self, "head_dim_qk", max(int(self.head_dim_qk), 1))
+        object.__setattr__(self, "head_dim_vo", max(int(self.head_dim_vo), 1))
+        object.__setattr__(self, "num_cache_pages", max(int(self.num_cache_pages), 1))
+
+
+@dataclass(frozen=True, kw_only=True)
+class _PagedAttentionArenaLayout:
+    arena_nbytes: int
+    request_indices_offset_bytes: int
+    qo_tile_indices_offset_bytes: int
+    kv_tile_indices_offset_bytes: int
+    block_valid_mask_offset_bytes: int
+    page_table_offset_bytes: int
+    cache_seqlens_offset_bytes: int
+    cu_seqlens_q_offset_bytes: int
+    merge_indptr_offset_bytes: int
+    o_indptr_offset_bytes: int
+    kv_chunk_size_ptr_offset_bytes: int
+    kv_window_start_tokens_offset_bytes: int
+    total_num_rows_ptr_offset_bytes: int
+    lse_offset_bytes: int
+    tmp_output_offset_bytes: int
+    tmp_lse_offset_bytes: int
+
+
+@dataclass(kw_only=True)
+class PagedAttentionArena:
+    caps: PagedAttentionArenaCaps
+    shared_arena: torch.Tensor
+    shared_arena_nbytes: int
+    request_indices_offset_bytes: int
+    qo_tile_indices_offset_bytes: int
+    kv_tile_indices_offset_bytes: int
+    block_valid_mask_offset_bytes: int
+    page_table_offset_bytes: int
+    cache_seqlens_offset_bytes: int
+    cu_seqlens_q_offset_bytes: int
+    merge_indptr_offset_bytes: int
+    o_indptr_offset_bytes: int
+    kv_chunk_size_ptr_offset_bytes: int
+    kv_window_start_tokens_offset_bytes: int
+    total_num_rows_ptr_offset_bytes: int
+    lse_offset_bytes: int
+    tmp_output_offset_bytes: int
+    tmp_lse_offset_bytes: int
+
+    @classmethod
+    def _layout(cls, caps: PagedAttentionArenaCaps) -> _PagedAttentionArenaLayout:
+        offset = 0
+
+        def reserve(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+            nonlocal offset
+            offset = _align_up(offset, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+            current = offset
+            offset += _shape_numel(shape) * _dtype_nbytes(dtype)
+            return current
+
+        request_indices_offset_bytes = reserve((caps.max_work_items,), torch.int32)
+        qo_tile_indices_offset_bytes = reserve((caps.max_work_items,), torch.int32)
+        kv_tile_indices_offset_bytes = reserve((caps.max_work_items,), torch.int32)
+        block_valid_mask_offset_bytes = reserve((caps.max_work_items,), torch.int32)
+        page_table_offset_bytes = reserve(
+            (caps.max_batch, caps.max_page_table_width),
+            torch.int32,
+        )
+        cache_seqlens_offset_bytes = reserve((caps.max_batch,), torch.int32)
+        cu_seqlens_q_offset_bytes = reserve((caps.max_batch + 1,), torch.int32)
+        merge_indptr_offset_bytes = reserve((caps.max_total_q + 1,), torch.int32)
+        o_indptr_offset_bytes = reserve((caps.max_batch + 1,), torch.int32)
+        kv_chunk_size_ptr_offset_bytes = reserve((1,), torch.int32)
+        kv_window_start_tokens_offset_bytes = reserve((caps.max_batch,), torch.int32)
+        total_num_rows_ptr_offset_bytes = reserve((1,), torch.int32)
+        lse_offset_bytes = reserve(
+            _paged_lse_storage_shape(caps.max_total_q, caps.num_q_heads),
+            torch.float32,
+        )
+        tmp_output_offset_bytes = reserve(
+            (caps.max_partial_rows, caps.num_q_heads, caps.max_head_dim_vo),
+            caps.dtype,
+        )
+        tmp_lse_offset_bytes = reserve(
+            (caps.max_partial_rows, caps.num_q_heads),
+            torch.float32,
+        )
+        return _PagedAttentionArenaLayout(
+            arena_nbytes=max(int(offset), 1),
+            request_indices_offset_bytes=request_indices_offset_bytes,
+            qo_tile_indices_offset_bytes=qo_tile_indices_offset_bytes,
+            kv_tile_indices_offset_bytes=kv_tile_indices_offset_bytes,
+            block_valid_mask_offset_bytes=block_valid_mask_offset_bytes,
+            page_table_offset_bytes=page_table_offset_bytes,
+            cache_seqlens_offset_bytes=cache_seqlens_offset_bytes,
+            cu_seqlens_q_offset_bytes=cu_seqlens_q_offset_bytes,
+            merge_indptr_offset_bytes=merge_indptr_offset_bytes,
+            o_indptr_offset_bytes=o_indptr_offset_bytes,
+            kv_chunk_size_ptr_offset_bytes=kv_chunk_size_ptr_offset_bytes,
+            kv_window_start_tokens_offset_bytes=kv_window_start_tokens_offset_bytes,
+            total_num_rows_ptr_offset_bytes=total_num_rows_ptr_offset_bytes,
+            lse_offset_bytes=lse_offset_bytes,
+            tmp_output_offset_bytes=tmp_output_offset_bytes,
+            tmp_lse_offset_bytes=tmp_lse_offset_bytes,
+        )
+
+    @classmethod
+    def _build(
+        cls,
+        caps: PagedAttentionArenaCaps,
+        *,
+        shared_arena: torch.Tensor | None,
+    ) -> "PagedAttentionArena":
+        layout = cls._layout(caps)
+        if shared_arena is None:
+            shared_arena = torch.empty(
+                layout.arena_nbytes,
+                dtype=torch.uint8,
+                device=caps.device,
+            )
+        elif shared_arena.dtype != torch.uint8:
+            raise TypeError(f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}")
+        elif shared_arena.device != caps.device:
+            raise ValueError(
+                f"shared_arena device {shared_arena.device} does not match caps device {caps.device}"
+            )
+        elif shared_arena.numel() < layout.arena_nbytes:
+            raise ValueError(
+                f"shared_arena has {shared_arena.numel()} bytes, but paged attention arena requires {layout.arena_nbytes}"
+            )
+        return cls(
+            caps=caps,
+            shared_arena=shared_arena,
+            shared_arena_nbytes=layout.arena_nbytes,
+            request_indices_offset_bytes=layout.request_indices_offset_bytes,
+            qo_tile_indices_offset_bytes=layout.qo_tile_indices_offset_bytes,
+            kv_tile_indices_offset_bytes=layout.kv_tile_indices_offset_bytes,
+            block_valid_mask_offset_bytes=layout.block_valid_mask_offset_bytes,
+            page_table_offset_bytes=layout.page_table_offset_bytes,
+            cache_seqlens_offset_bytes=layout.cache_seqlens_offset_bytes,
+            cu_seqlens_q_offset_bytes=layout.cu_seqlens_q_offset_bytes,
+            merge_indptr_offset_bytes=layout.merge_indptr_offset_bytes,
+            o_indptr_offset_bytes=layout.o_indptr_offset_bytes,
+            kv_chunk_size_ptr_offset_bytes=layout.kv_chunk_size_ptr_offset_bytes,
+            kv_window_start_tokens_offset_bytes=layout.kv_window_start_tokens_offset_bytes,
+            total_num_rows_ptr_offset_bytes=layout.total_num_rows_ptr_offset_bytes,
+            lse_offset_bytes=layout.lse_offset_bytes,
+            tmp_output_offset_bytes=layout.tmp_output_offset_bytes,
+            tmp_lse_offset_bytes=layout.tmp_lse_offset_bytes,
+        )
+
+    @classmethod
+    def allocate(cls, caps: PagedAttentionArenaCaps) -> "PagedAttentionArena":
+        return cls._build(caps, shared_arena=None)
+
+    @classmethod
+    def from_shared_arena(
+        cls,
+        caps: PagedAttentionArenaCaps,
+        shared_arena: torch.Tensor,
+    ) -> "PagedAttentionArena":
+        return cls._build(caps, shared_arena=shared_arena)
+
+    @classmethod
+    def required_nbytes(cls, caps: PagedAttentionArenaCaps) -> int:
+        return cls._layout(caps).arena_nbytes
+
+    def make_workspace(
+        self,
+        contract: PagedAttentionWorkspaceContract,
+        *,
+        use_cuda_graph: bool = False,
+    ) -> "PagedAttentionWorkspace":
+        if contract.max_total_q > self.caps.max_total_q:
+            raise ValueError(
+                f"workspace max_total_q {contract.max_total_q} exceeds arena max_total_q {self.caps.max_total_q}"
+            )
+        if contract.max_batch > self.caps.max_batch:
+            raise ValueError(
+                f"workspace max_batch {contract.max_batch} exceeds arena max_batch {self.caps.max_batch}"
+            )
+        if contract.max_page_table_width > self.caps.max_page_table_width:
+            raise ValueError(
+                "workspace max_page_table_width "
+                f"{contract.max_page_table_width} exceeds arena max_page_table_width {self.caps.max_page_table_width}"
+            )
+        if contract.max_work_items > self.caps.max_work_items:
+            raise ValueError(
+                f"workspace max_work_items {contract.max_work_items} exceeds arena max_work_items {self.caps.max_work_items}"
+            )
+        if contract.max_partial_rows > self.caps.max_partial_rows:
+            raise ValueError(
+                "workspace max_partial_rows "
+                f"{contract.max_partial_rows} exceeds arena max_partial_rows {self.caps.max_partial_rows}"
+            )
+        if contract.head_dim_qk > self.caps.head_dim_qk:
+            raise ValueError(
+                f"workspace head_dim_qk {contract.head_dim_qk} exceeds arena head_dim_qk {self.caps.head_dim_qk}"
+            )
+        if contract.head_dim_vo > self.caps.max_head_dim_vo:
+            raise ValueError(
+                f"workspace head_dim_vo {contract.head_dim_vo} exceeds arena max_head_dim_vo {self.caps.max_head_dim_vo}"
+            )
+
+        plan_q = _shape_only_cuda_tensor(
+            (contract.max_total_q, self.caps.num_q_heads, contract.head_dim_qk),
+            dtype=self.caps.dtype,
+            device=self.caps.device,
+        )
+        plan_output = _shape_only_cuda_tensor(
+            (contract.max_total_q, self.caps.num_q_heads, contract.head_dim_vo),
+            dtype=self.caps.dtype,
+            device=self.caps.device,
+        )
+        plan_k_cache = _shape_only_cuda_tensor(
+            (
+                contract.num_cache_pages,
+                self.caps.page_size,
+                self.caps.num_kv_heads,
+                contract.head_dim_qk,
+            ),
+            dtype=self.caps.kv_dtype,
+            device=self.caps.device,
+        )
+        plan_v_cache = _shape_only_cuda_tensor(
+            (
+                contract.num_cache_pages,
+                self.caps.page_size,
+                self.caps.num_kv_heads,
+                contract.head_dim_vo,
+            ),
+            dtype=self.caps.kv_dtype,
+            device=self.caps.device,
+        )
+        workspace = PagedAttentionWorkspace(
+            arena=self,
+            contract=contract,
+            mode=contract.mode,
+            device=self.caps.device,
+            dtype=self.caps.dtype,
+            kv_dtype=self.caps.kv_dtype,
+            num_q_heads=self.caps.num_q_heads,
+            num_kv_heads=self.caps.num_kv_heads,
+            head_dim_qk=contract.head_dim_qk,
+            head_dim_vo=contract.head_dim_vo,
+            attn_mode=contract.attn_mode,
+            page_size=self.caps.page_size,
+            use_cuda_graph=use_cuda_graph,
+            fixed_capacity=True,
+            _plan_q=plan_q,
+            _plan_output=plan_output,
+            _plan_k_cache=plan_k_cache,
+            _plan_v_cache=plan_v_cache,
+            _planner_budget=PagedPlanBudget(
+                max_total_q=contract.max_total_q,
+                max_batch=contract.max_batch,
+                max_page_table_width=contract.max_page_table_width,
+                max_work_items=contract.max_work_items,
+                max_partial_rows=contract.max_partial_rows,
+            ),
+        )
+        workspace._allocate_runtime_buffers(
+            work_items_capacity=contract.max_work_items,
+            block_valid_capacity=contract.max_work_items,
+            total_q_capacity=contract.max_total_q,
+            batch_capacity=contract.max_batch,
+            page_table_width_capacity=contract.max_page_table_width,
+            partial_rows_capacity=contract.max_partial_rows,
+        )
+        return workspace
+
+
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
+    arena: PagedAttentionArena | None = None
+    contract: PagedAttentionWorkspaceContract | None = None
     mode: Literal["decode", "extend", "verify"]
     device: torch.device
     dtype: torch.dtype
@@ -72,6 +435,7 @@ class PagedAttentionWorkspace:
     merge_indptr: torch.Tensor | None = None
     o_indptr: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
+    kv_window_start_tokens: torch.Tensor | None = None
     total_num_rows_ptr: torch.Tensor | None = None
     block_valid_mask: torch.Tensor | None = None
     page_table: torch.Tensor | None = None
@@ -86,6 +450,8 @@ class PagedAttentionWorkspace:
     _plan_v_cache: torch.Tensor | None = None
     _plan: PagedPlan | None = None
     _planner_budget: PagedPlanBudget | None = None
+    shared_arena: torch.Tensor | None = None
+    shared_arena_nbytes: int = 0
 
     # Pre-compiled kernel state (set by compile_paged_kernels in api.py).
     _compiled_forward: object | None = None
@@ -197,38 +563,36 @@ class PagedAttentionWorkspace:
         use_cuda_graph: bool = False,
         attn_mode: Literal["default", "turbo"] | None = None,
     ) -> PagedAttentionWorkspace:
-        workspace = cls.for_contract(
-            mode=mode,
+        device = _canonical_device(device)
+        caps = PagedAttentionArenaCaps(
             device=device,
             dtype=dtype,
             kv_dtype=kv_dtype,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
+            max_head_dim_vo=head_dim_vo,
             page_size=page_size,
             max_total_q=max_total_q,
-            num_cache_pages=num_cache_pages,
-            use_cuda_graph=use_cuda_graph,
-            attn_mode=attn_mode,
+            max_batch=max_batch,
+            max_page_table_width=max_page_table_width,
+            max_work_items=max_work_items,
+            max_partial_rows=max_partial_rows,
         )
-        workspace.fixed_capacity = True
-        workspace._planner_budget = PagedPlanBudget(
+        arena = PagedAttentionArena.allocate(caps)
+        contract = PagedAttentionWorkspaceContract(
+            mode=mode,
             max_total_q=int(max_total_q),
             max_batch=int(max_batch),
             max_page_table_width=int(max_page_table_width),
             max_work_items=int(max_work_items),
             max_partial_rows=int(max_partial_rows),
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            num_cache_pages=num_cache_pages,
+            attn_mode=attn_mode,
         )
-        workspace._allocate_runtime_buffers(
-            work_items_capacity=int(max_work_items),
-            block_valid_capacity=int(max_work_items),
-            total_q_capacity=int(max_total_q),
-            batch_capacity=int(max_batch),
-            page_table_width_capacity=int(max_page_table_width),
-            partial_rows_capacity=int(max_partial_rows),
-        )
-        return workspace
+        return arena.make_workspace(contract, use_cuda_graph=use_cuda_graph)
 
     @classmethod
     def for_eager_extend_capacity(
@@ -364,12 +728,20 @@ class PagedAttentionWorkspace:
         *,
         fixed_split_size: int | None = None,
         disable_split_kv: bool = False,
+        window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         with record_function(f"paged_workspace.prepare.{self.mode}"):
+            if window_left < -1:
+                raise ValueError("window_left must be -1 for full attention or a non-negative token count")
             if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
                 if self._plan is None:
                     raise RuntimeError(
                         "graph-mode paged workspace must be prepared before CUDA graph capture"
+                    )
+                if int(window_left) != int(self._plan.window_left):
+                    raise ValueError(
+                        f"captured paged attention graph was prepared with window_left={self._plan.window_left}, "
+                        f"got window_left={int(window_left)}"
                     )
                 with record_function("paged_workspace.copy_runtime_metadata.capture"):
                     self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
@@ -381,6 +753,11 @@ class PagedAttentionWorkspace:
                 and self._decode_graph_chunk_pages_lut is not None
                 and self._plan is not None
             ):
+                if int(window_left) != int(self._plan.window_left):
+                    raise ValueError(
+                        f"decode graph replay workspace was prepared with window_left={self._plan.window_left}, "
+                        f"got window_left={int(window_left)}"
+                    )
                 with record_function("paged_workspace.copy_runtime_metadata"):
                     self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 if not self._decode_graph_metadata_captured_in_graph:
@@ -418,6 +795,7 @@ class PagedAttentionWorkspace:
                     mode=self.mode,
                     fixed_split_size=-1 if fixed_split_size is None else int(fixed_split_size),
                     disable_split_kv=disable_split_kv,
+                    window_left=int(window_left),
                     enable_cuda_graph=self.use_cuda_graph,
                     graph_chunk_policy=self.use_cuda_graph,
                     plan_budget=(
@@ -460,8 +838,13 @@ class PagedAttentionWorkspace:
             raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
         if self.block_valid_mask is None:
             raise RuntimeError("decode graph workspace is missing block_valid_mask")
+        if self.kv_window_start_tokens is None:
+            raise RuntimeError("decode graph workspace is missing kv_window_start_tokens")
+        if self._plan is None:
+            raise RuntimeError("decode graph workspace has not been prepared")
 
         self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
+        window_page_span = self._window_page_span_from_plan(self._plan)
 
         if self._use_regular_decode_graph_replay:
             from .graph_replay import update_regular_decode_graph_chunk_metadata
@@ -484,7 +867,10 @@ class PagedAttentionWorkspace:
                 o_indptr=self.o_indptr,
                 kv_chunk_size_ptr=self.kv_chunk_size_ptr,
                 kv_chunk_size=kv_chunk_size,
+                kv_window_start_tokens=self.kv_window_start_tokens,
                 max_chunks_per_req=max_chunks_per_req,
+                page_size=self.page_size,
+                window_page_span=window_page_span,
             )
         else:
             from .graph_replay import update_decode_graph_chunk_metadata
@@ -496,8 +882,10 @@ class PagedAttentionWorkspace:
                 o_indptr=self.o_indptr,
                 block_valid_mask=self.block_valid_mask,
                 kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_window_start_tokens=self.kv_window_start_tokens,
                 decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
+                window_page_span=window_page_span,
             )
         return self
 
@@ -551,6 +939,7 @@ class PagedAttentionWorkspace:
         total_q_capacity: int,
         max_page_table_width: int,
         max_cache_page_count: int,
+        window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
             raise RuntimeError("prepare_decode_graph_replay_state is only valid for graph-mode workspaces")
@@ -558,9 +947,17 @@ class PagedAttentionWorkspace:
             raise RuntimeError("prepare_decode_graph_replay_state is only valid for decode workspaces")
         if max_cache_page_count <= 0:
             raise ValueError("max_cache_page_count must be positive")
+        if window_left < -1:
+            raise ValueError("window_left must be -1 for full attention or a non-negative token count")
 
         from .graph_replay import make_decode_chunk_pages_lut_tensor, summarize_decode_chunk_pages_lut
 
+        max_effective_kv_pages = int(max_cache_page_count)
+        if window_left >= 0:
+            max_effective_kv_pages = min(
+                max_effective_kv_pages,
+                max(1, (int(window_left) + 1 + self.page_size - 1) // self.page_size),
+            )
         try:
             decode_chunk_pages_lut = build_decode_chunk_pages_lut(
                 q_dtype=self.dtype,
@@ -570,7 +967,7 @@ class PagedAttentionWorkspace:
                 head_dim_qk=self.head_dim_qk,
                 head_dim_vo=self.head_dim_vo,
                 gqa_group_size=self.num_q_heads // self.num_kv_heads,
-                max_effective_kv_pages=max_cache_page_count,
+                max_effective_kv_pages=max_effective_kv_pages,
             )
         except KeyError:
             self._decode_graph_chunk_pages_lut = None
@@ -582,6 +979,7 @@ class PagedAttentionWorkspace:
                 total_q_capacity=total_q_capacity,
                 max_page_table_width=max_page_table_width,
                 max_cache_seqlen=max_cache_page_count * self.page_size,
+                window_left=window_left,
             )
             return self
         worst_page_count, max_chunks_per_req = summarize_decode_chunk_pages_lut(decode_chunk_pages_lut)
@@ -596,6 +994,7 @@ class PagedAttentionWorkspace:
             total_q_capacity=total_q_capacity,
             max_page_table_width=max_page_table_width,
             max_cache_seqlen=worst_page_count * self.page_size,
+            window_left=window_left,
         )
         self._validate_decode_graph_replay_capacity(batch=batch)
         return self
@@ -607,6 +1006,7 @@ class PagedAttentionWorkspace:
         total_q_capacity: int,
         max_page_table_width: int,
         max_cache_seqlen: int,
+        window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if batch <= 0:
             raise ValueError("batch must be positive")
@@ -632,7 +1032,12 @@ class PagedAttentionWorkspace:
             batch=batch,
             total_q_capacity=total_q_capacity,
         )
-        return self.prepare(max_page_table, max_cache_seqlens, max_cu_seqlens_q)
+        return self.prepare(
+            max_page_table,
+            max_cache_seqlens,
+            max_cu_seqlens_q,
+            window_left=window_left,
+        )
 
     def _build_capacity_cu_seqlens_q(
         self,
@@ -697,8 +1102,13 @@ class PagedAttentionWorkspace:
             raise RuntimeError("decode graph workspace is missing indptr buffers")
         if self.kv_chunk_size_ptr is None:
             raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
+        if self.kv_window_start_tokens is None:
+            raise RuntimeError("decode graph workspace is missing kv_window_start_tokens")
+        if self._plan is None:
+            raise RuntimeError("decode graph workspace has not been prepared")
 
         self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
+        window_page_span = self._window_page_span_from_plan(self._plan)
 
         if self._use_regular_decode_graph_replay:
             from .graph_replay import update_regular_decode_graph_replay_metadata
@@ -711,8 +1121,10 @@ class PagedAttentionWorkspace:
                 merge_indptr=self.merge_indptr,
                 o_indptr=self.o_indptr,
                 kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_window_start_tokens=self.kv_window_start_tokens,
                 decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
+                window_page_span=window_page_span,
             )
         else:
             from .graph_replay import update_decode_graph_replay_metadata
@@ -727,8 +1139,10 @@ class PagedAttentionWorkspace:
                 o_indptr=self.o_indptr,
                 block_valid_mask=self.block_valid_mask,
                 kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_window_start_tokens=self.kv_window_start_tokens,
                 decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
+                window_page_span=window_page_span,
             )
         return self
 
@@ -742,6 +1156,7 @@ class PagedAttentionWorkspace:
         output: torch.Tensor,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        attention_sink_bias: torch.Tensor | None = None,
         prepare_decode_graph_metadata: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .api import paged_attention_forward
@@ -776,6 +1191,7 @@ class PagedAttentionWorkspace:
             output=output,
             k_descale=k_descale,
             v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
         )
         return out, lse
 
@@ -870,6 +1286,119 @@ class PagedAttentionWorkspace:
         page_table_width_capacity: int,
         partial_rows_capacity: int,
     ) -> None:
+        if self.arena is not None:
+            if work_items_capacity > self.arena.caps.max_work_items:
+                raise ValueError("paged attention arena work-item capacity exceeded")
+            if block_valid_capacity > self.arena.caps.max_work_items:
+                raise ValueError("paged attention arena block-valid capacity exceeded")
+            if total_q_capacity > self.arena.caps.max_total_q:
+                raise ValueError("paged attention arena total-q capacity exceeded")
+            if batch_capacity > self.arena.caps.max_batch:
+                raise ValueError("paged attention arena batch capacity exceeded")
+            if page_table_width_capacity > self.arena.caps.max_page_table_width:
+                raise ValueError("paged attention arena page-table width capacity exceeded")
+            if partial_rows_capacity > self.arena.caps.max_partial_rows:
+                raise ValueError("paged attention arena partial-row capacity exceeded")
+
+            self.shared_arena = self.arena.shared_arena
+            self.shared_arena_nbytes = self.arena.shared_arena_nbytes
+            assert self.shared_arena is not None
+            self.request_indices, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.request_indices_offset_bytes,
+                shape=(work_items_capacity,),
+                dtype=torch.int32,
+            )
+            self.qo_tile_indices, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.qo_tile_indices_offset_bytes,
+                shape=(work_items_capacity,),
+                dtype=torch.int32,
+            )
+            self.kv_tile_indices, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.kv_tile_indices_offset_bytes,
+                shape=(work_items_capacity,),
+                dtype=torch.int32,
+            )
+            self.block_valid_mask, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.block_valid_mask_offset_bytes,
+                shape=(block_valid_capacity,),
+                dtype=torch.int32,
+            )
+            self.page_table, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.page_table_offset_bytes,
+                shape=(batch_capacity, page_table_width_capacity),
+                dtype=torch.int32,
+            )
+            self.cache_seqlens, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.cache_seqlens_offset_bytes,
+                shape=(batch_capacity,),
+                dtype=torch.int32,
+            )
+            self.cu_seqlens_q, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.cu_seqlens_q_offset_bytes,
+                shape=(batch_capacity + 1,),
+                dtype=torch.int32,
+            )
+            self.merge_indptr, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.merge_indptr_offset_bytes,
+                shape=(total_q_capacity + 1,),
+                dtype=torch.int32,
+            )
+            self.o_indptr, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.o_indptr_offset_bytes,
+                shape=(batch_capacity + 1,),
+                dtype=torch.int32,
+            )
+            self.kv_chunk_size_ptr, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.kv_chunk_size_ptr_offset_bytes,
+                shape=(1,),
+                dtype=torch.int32,
+            )
+            self.kv_window_start_tokens, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.kv_window_start_tokens_offset_bytes,
+                shape=(batch_capacity,),
+                dtype=torch.int32,
+            )
+            self.total_num_rows_ptr, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.total_num_rows_ptr_offset_bytes,
+                shape=(1,),
+                dtype=torch.int32,
+            )
+            self.lse, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.lse_offset_bytes,
+                shape=_paged_lse_storage_shape(total_q_capacity, self.num_q_heads),
+                dtype=torch.float32,
+            )
+            if partial_rows_capacity > 0:
+                self.tmp_output, _ = _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.tmp_output_offset_bytes,
+                    shape=(partial_rows_capacity, self.num_q_heads, self.head_dim_vo),
+                    dtype=self.dtype,
+                )
+                self.tmp_lse, _ = _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.tmp_lse_offset_bytes,
+                    shape=(partial_rows_capacity, self.num_q_heads),
+                    dtype=torch.float32,
+                )
+            else:
+                self.tmp_output = None
+                self.tmp_lse = None
+            return
+
         self.request_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.qo_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.kv_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
@@ -882,6 +1411,7 @@ class PagedAttentionWorkspace:
         self.merge_indptr = torch.empty(total_q_capacity + 1, dtype=torch.int32, device=self.device)
         self.o_indptr = torch.empty(batch_capacity + 1, dtype=torch.int32, device=self.device)
         self.kv_chunk_size_ptr = torch.empty(1, dtype=torch.int32, device=self.device)
+        self.kv_window_start_tokens = torch.empty(batch_capacity, dtype=torch.int32, device=self.device)
         self.total_num_rows_ptr = torch.empty(1, dtype=torch.int32, device=self.device)
         self.lse = torch.empty(
             _paged_lse_storage_shape(total_q_capacity, self.num_q_heads),
@@ -958,6 +1488,7 @@ class PagedAttentionWorkspace:
         assert self.merge_indptr is not None
         assert self.o_indptr is not None
         assert self.kv_chunk_size_ptr is not None
+        assert self.kv_window_start_tokens is not None
         assert self.total_num_rows_ptr is not None
         assert self.cache_seqlens is not None
 
@@ -985,9 +1516,18 @@ class PagedAttentionWorkspace:
             o_indptr=self.o_indptr,
             kv_chunk_size_ptr=self.kv_chunk_size_ptr,
             kv_chunk_size=int(plan.kv_chunk_size),
+            kv_window_start_tokens=self.kv_window_start_tokens,
             max_chunks_per_req=capture_max_chunks_per_req,
+            page_size=self.page_size,
+            window_page_span=self._window_page_span_from_plan(plan),
         )
         self.total_num_rows_ptr[0] = int(plan.total_q)
+
+    def _window_page_span_from_plan(self, plan: PagedPlan) -> int:
+        window_left = int(plan.window_left)
+        if window_left < 0:
+            return 0
+        return max((window_left + int(plan.cta_tile_q) + self.page_size - 1) // self.page_size, 1)
 
     def _copy_plan_metadata(self, plan: PagedPlan) -> None:
         assert self.request_indices is not None
@@ -996,6 +1536,7 @@ class PagedAttentionWorkspace:
         assert self.merge_indptr is not None
         assert self.o_indptr is not None
         assert self.kv_chunk_size_ptr is not None
+        assert self.kv_window_start_tokens is not None
         assert self.total_num_rows_ptr is not None
         assert self.block_valid_mask is not None
 
@@ -1031,12 +1572,14 @@ class PagedAttentionWorkspace:
             merge_indptr = _copy_int_metadata(plan.merge_indptr, device=self.device)
             o_indptr = _copy_int_metadata(plan.o_indptr, device=self.device)
             block_valid_mask = torch.tensor(plan.block_valid_mask, dtype=torch.int32, device=self.device)
+            kv_window_start_tokens = _copy_int_metadata(plan.kv_window_start_tokens, device=self.device)
 
         with record_function("paged_workspace.plan_metadata_zero_buffers"):
             self.request_indices.zero_()
             self.qo_tile_indices.zero_()
             self.kv_tile_indices.zero_()
             self.block_valid_mask.zero_()
+            self.kv_window_start_tokens.zero_()
         with record_function("paged_workspace.plan_metadata_copy_buffers"):
             self.request_indices[: request_indices.shape[0]].copy_(request_indices)
             self.qo_tile_indices[: qo_tile_indices.shape[0]].copy_(qo_tile_indices)
@@ -1044,6 +1587,7 @@ class PagedAttentionWorkspace:
             self.merge_indptr[: merge_indptr.shape[0]].copy_(merge_indptr)
             self.o_indptr[: o_indptr.shape[0]].copy_(o_indptr)
             self.block_valid_mask[: block_valid_mask.shape[0]].copy_(block_valid_mask)
+            self.kv_window_start_tokens[: kv_window_start_tokens.shape[0]].copy_(kv_window_start_tokens)
         with record_function("paged_workspace.plan_metadata_scalar_updates"):
             self.kv_chunk_size_ptr[0] = int(plan.kv_chunk_size)
             self.total_num_rows_ptr[0] = int(plan.total_q)

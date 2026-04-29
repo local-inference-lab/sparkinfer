@@ -8,6 +8,11 @@ from b12x.attention.mla.workspace import (
     B12XAttentionArenaCaps,
     B12XAttentionWorkspaceContract,
 )
+from b12x.attention.paged.workspace import (
+    PagedAttentionArena,
+    PagedAttentionArenaCaps,
+    PagedAttentionWorkspaceContract,
+)
 from b12x.integration.arena import (
     B12XExecutionLaneArena,
     B12XJointArenaSpec,
@@ -51,23 +56,45 @@ def _moe_caps(device: torch.device) -> B12XMoEArenaCaps:
     )
 
 
+def _paged_attention_caps(device: torch.device) -> PagedAttentionArenaCaps:
+    return PagedAttentionArenaCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim_qk=128,
+        max_head_dim_vo=128,
+        page_size=64,
+        max_total_q=8,
+        max_batch=2,
+        max_page_table_width=4,
+        max_work_items=16,
+        max_partial_rows=32,
+    )
+
+
 def test_joint_arena_size_is_max_of_attention_and_moe_phases() -> None:
     device = torch.device("cpu")
     attn_caps = _attention_caps(device)
+    paged_caps = _paged_attention_caps(device)
     moe_caps = _moe_caps(device)
     lane = B12XExecutionLaneArena.allocate(
         B12XJointArenaSpec(
             device=device,
             attention_caps=attn_caps,
+            paged_attention_caps=paged_caps,
             moe_caps=moe_caps,
         )
     )
 
     expected_attn = B12XAttentionArena.required_nbytes(attn_caps)
+    expected_paged_attn = PagedAttentionArena.required_nbytes(paged_caps)
     expected_moe = moe_caps.layout().total_nbytes
     assert lane.attention_nbytes == expected_attn
+    assert lane.paged_attention_nbytes == expected_paged_attn
     assert lane.moe_nbytes == expected_moe
-    assert lane.shared_arena_nbytes == max(expected_attn, expected_moe, 1)
+    assert lane.shared_arena_nbytes == max(expected_attn, expected_paged_attn, expected_moe, 1)
 
 
 def test_joint_arena_views_share_one_backing_allocation() -> None:
@@ -76,6 +103,7 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
         B12XJointArenaSpec(
             device=device,
             attention_caps=_attention_caps(device),
+            paged_attention_caps=_paged_attention_caps(device),
             moe_caps=_moe_caps(device),
         )
     )
@@ -95,6 +123,23 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
     )
     assert attn_ws.ragged_kv_cache is not None
     assert _storage_ptr(attn_ws.ragged_kv_cache) == base_ptr
+
+    paged_ws = lane.make_paged_attention_workspace(
+        PagedAttentionWorkspaceContract(
+            mode="extend",
+            max_total_q=8,
+            max_batch=2,
+            max_page_table_width=4,
+            max_work_items=16,
+            max_partial_rows=32,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            num_cache_pages=8,
+        )
+    )
+    assert paged_ws.request_indices is not None
+    assert _storage_ptr(paged_ws.request_indices) == base_ptr
+    assert paged_ws.shared_arena is lane.shared_arena
 
     pool = lane.get_moe_workspace_pool()
     route_ws = tp_moe._get_route_workspace(

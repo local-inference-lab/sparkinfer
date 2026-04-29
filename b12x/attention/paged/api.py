@@ -304,6 +304,8 @@ def _build_forward_kernel(
     enable_mxfp8_pv: bool,
     decode_only: bool,
     decode_mxfp8_runtime_chunk_guard: bool,
+    window_left: int,
+    has_attention_sink_bias: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -319,6 +321,8 @@ def _build_forward_kernel(
         enable_mxfp8_pv=enable_mxfp8_pv,
         decode_only=decode_only,
         decode_mxfp8_runtime_chunk_guard=decode_mxfp8_runtime_chunk_guard,
+        window_left=window_left,
+        has_attention_sink_bias=has_attention_sink_bias,
     )
 
 
@@ -327,8 +331,16 @@ def _build_extend_forward_kernel(
     traits: PagedForwardTraits,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    window_left: int,
+    has_attention_sink_bias: bool,
 ) -> object:
-    return build_extend_forward_kernel(traits, mxfp8_turbo, enable_mxfp8_pv)
+    return build_extend_forward_kernel(
+        traits,
+        mxfp8_turbo,
+        enable_mxfp8_pv,
+        window_left=window_left,
+        has_attention_sink_bias=has_attention_sink_bias,
+    )
 
 
 @lru_cache(maxsize=16)
@@ -345,6 +357,7 @@ def _build_merge_kernel(
         cutlass_dtype,
         cutlass_dtype,
         head_dim=head_dim,
+        vec_size=head_dim // 32,
         bdy=merge_bdy,
         persistent_ctas=persistent_ctas,
         direct_grid=direct_grid,
@@ -361,6 +374,7 @@ def paged_attention_forward(
     output: torch.Tensor,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
+    attention_sink_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     plan = workspace.plan
     page_table = workspace.page_table
@@ -390,6 +404,26 @@ def paged_attention_forward(
         k_descale is None or v_descale is None
     ):
         raise ValueError("fp8 paged caches require k_descale and v_descale")
+    if workspace.kv_window_start_tokens is None:
+        raise RuntimeError("paged workspace is missing kv_window_start_tokens")
+    has_attention_sink_bias = attention_sink_bias is not None
+    if attention_sink_bias is None:
+        attention_sink_bias = torch.empty(0, dtype=torch.float32, device=q.device)
+    else:
+        if attention_sink_bias.ndim != 1:
+            raise ValueError(
+                f"attention_sink_bias must be rank-1 [num_q_heads], got {tuple(attention_sink_bias.shape)}"
+            )
+        if int(attention_sink_bias.shape[0]) != plan.num_q_heads:
+            raise ValueError(
+                f"attention_sink_bias must have {plan.num_q_heads} elements, got {int(attention_sink_bias.shape[0])}"
+            )
+        if attention_sink_bias.device != q.device:
+            raise ValueError("attention_sink_bias must be on the same CUDA device as q")
+        if attention_sink_bias.dtype != torch.float32:
+            attention_sink_bias = attention_sink_bias.to(torch.float32)
+        if not attention_sink_bias.is_contiguous():
+            attention_sink_bias = attention_sink_bias.contiguous()
 
     traits = select_paged_forward_traits_from_plan(plan)
     mxfp8_turbo, enable_mxfp8_pv, decode_mxfp8_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
@@ -403,6 +437,8 @@ def paged_attention_forward(
             traits,
             mxfp8_turbo,
             enable_mxfp8_pv,
+            plan.window_left,
+            has_attention_sink_bias,
         )
     else:
         single_request_decode_graph = (
@@ -430,6 +466,8 @@ def paged_attention_forward(
             enable_mxfp8_pv,
             plan.mode == "decode",
             decode_mxfp8_runtime_chunk_guard,
+            plan.window_left,
+            has_attention_sink_bias,
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
@@ -461,7 +499,9 @@ def paged_attention_forward(
     kv_tile_indices_arg = _to_kernel_tensor(workspace.kv_tile_indices, cutlass.Int32, assumed_align=4)
     o_indptr_arg = _to_kernel_tensor(workspace.o_indptr, cutlass.Int32, assumed_align=4)
     kv_chunk_size_arg = _to_kernel_tensor(workspace.kv_chunk_size_ptr, cutlass.Int32, assumed_align=4)
+    kv_window_start_arg = _to_kernel_tensor(workspace.kv_window_start_tokens, cutlass.Int32, assumed_align=4)
     block_valid_mask_arg = _to_kernel_tensor(workspace.block_valid_mask, cutlass.Int32, assumed_align=4)
+    attention_sink_bias_arg = _to_kernel_tensor(attention_sink_bias, cutlass.Float32, assumed_align=4)
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
     k_tma_desc_ptrs: torch.Tensor | None = None
@@ -538,7 +578,9 @@ def paged_attention_forward(
         _tensor_meta_key(workspace.kv_tile_indices),
         _tensor_meta_key(workspace.o_indptr),
         _tensor_meta_key(workspace.kv_chunk_size_ptr),
+        _tensor_meta_key(workspace.kv_window_start_tokens),
         _tensor_meta_key(workspace.block_valid_mask),
+        _tensor_meta_key(attention_sink_bias),
         _tensor_meta_key(output_cache_tensor),
         _tensor_meta_key(forward_lse),
         _tensor_meta_key(k_descale),
@@ -556,7 +598,9 @@ def paged_attention_forward(
         "kv_tile_indices",
         "o_indptr",
         "kv_chunk_size_ptr",
+        "kv_window_start_tokens",
         "block_valid_mask",
+        "attention_sink_bias",
         "output_contract" if use_capacity_contract else "forward_output",
         "forward_lse",
         "k_descale",
@@ -574,7 +618,9 @@ def paged_attention_forward(
         kv_tile_indices_arg,
         o_indptr_arg,
         kv_chunk_size_arg,
+        kv_window_start_arg,
         block_valid_mask_arg,
+        attention_sink_bias_arg,
         forward_output_arg,
         forward_lse_arg,
         k_descale_arg,

@@ -459,6 +459,7 @@ class PagedPlanKey:
     enable_cuda_graph: bool
     graph_chunk_policy: bool
     graph_ctas_per_sm: int
+    window_left: int
     max_batch_size_if_split: int
     padded_batch_size: int
     new_batch_size: int
@@ -479,6 +480,7 @@ class PagedPlan:
     merge_indptr: tuple[int, ...]
     o_indptr: tuple[int, ...]
     block_valid_mask: tuple[bool, ...]
+    kv_window_start_tokens: tuple[int, ...]
 
     def __getattr__(self, name: str):
         return getattr(self.key, name)
@@ -533,6 +535,8 @@ def create_paged_plan(
         raise TypeError("k_cache and v_cache must have matching dtypes")
     if k_cache.dtype not in (torch.float16, torch.bfloat16, _FP8_KV_DTYPE):
         raise TypeError(f"unsupported kv dtype {k_cache.dtype}")
+    if window_left < -1:
+        raise ValueError("window_left must be -1 for full attention or a non-negative token count")
 
     total_q, num_q_heads, head_dim_qk = [int(dim) for dim in q.shape]
     num_pages, page_size, num_kv_heads, head_dim_k = [int(dim) for dim in k_cache.shape]
@@ -630,6 +634,11 @@ def create_paged_plan(
         min(_ceil_div(window_left + cta_tile_q, page_size), kv_len) if window_left >= 0 else kv_len
         for kv_len in kv_len_arr
     ]
+    kv_window_start_pages = [
+        max(kv_pages - effective_pages, 0)
+        for kv_pages, effective_pages in zip(kv_len_arr, effective_kv_len_arr)
+    ]
+    kv_window_start_tokens = tuple(start_page * page_size for start_page in kv_window_start_pages)
     resolved_graph_ctas_per_sm = 0
     if enable_cuda_graph:
         resolved_graph_ctas_per_sm = _resolve_graph_ctas_per_sm(
@@ -824,6 +833,7 @@ def create_paged_plan(
         enable_cuda_graph=enable_cuda_graph,
         graph_chunk_policy=graph_chunk_policy,
         graph_ctas_per_sm=resolved_graph_ctas_per_sm,
+        window_left=window_left,
         max_batch_size_if_split=max_batch_size_if_split,
         padded_batch_size=padded_batch_size,
         new_batch_size=new_batch_size,
@@ -842,4 +852,5 @@ def create_paged_plan(
         merge_indptr=tuple(merge_indptr),
         o_indptr=tuple(o_indptr),
         block_valid_mask=tuple(block_valid_mask),
+        kv_window_start_tokens=kv_window_start_tokens,
     )

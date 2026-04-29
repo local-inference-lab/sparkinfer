@@ -1,5 +1,8 @@
 from .attention import (
+    PagedAttentionArena,
+    PagedAttentionArenaCaps,
     PagedAttentionWorkspace,
+    PagedAttentionWorkspaceContract,
     clear_attention_caches,
     create_paged_plan,
     infer_paged_attention_mode,
@@ -49,7 +52,10 @@ from .tp_moe import (
 )
 
 __all__ = [
+    "PagedAttentionArena",
+    "PagedAttentionArenaCaps",
     "PagedAttentionWorkspace",
+    "PagedAttentionWorkspaceContract",
     "clear_attention_caches",
     "create_paged_plan",
     "infer_paged_attention_mode",

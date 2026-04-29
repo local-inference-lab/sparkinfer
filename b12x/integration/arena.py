@@ -1,8 +1,9 @@
 """Joint b12x scratch arena APIs.
 
 The execution-lane arena owns one uint8 backing allocation and overlays phase
-scratch for attention and MoE. A lane is the unit of true concurrent scratch
-ownership; internal fork/join streams within the lane share this arena.
+scratch for MLA attention, paged attention, and MoE. A lane is the unit of true
+concurrent scratch ownership; internal fork/join streams within the lane share
+this arena.
 """
 
 from __future__ import annotations
@@ -16,6 +17,12 @@ from b12x.attention.mla.workspace import (
     B12XAttentionArenaCaps,
     B12XAttentionWorkspace,
     B12XAttentionWorkspaceContract,
+)
+from b12x.attention.paged.workspace import (
+    PagedAttentionArena,
+    PagedAttentionArenaCaps,
+    PagedAttentionWorkspace,
+    PagedAttentionWorkspaceContract,
 )
 from b12x.integration.tp_moe import (
     TPMoEArenaLayout,
@@ -87,6 +94,7 @@ class B12XMoEArenaCaps:
 class B12XJointArenaSpec:
     device: torch.device
     attention_caps: B12XAttentionArenaCaps | None = None
+    paged_attention_caps: PagedAttentionArenaCaps | None = None
     moe_caps: B12XMoEArenaCaps | None = None
 
     def __post_init__(self) -> None:
@@ -95,6 +103,11 @@ class B12XJointArenaSpec:
         if self.attention_caps is not None and self.attention_caps.device != device:
             raise ValueError(
                 f"attention caps device {self.attention_caps.device} does not match joint arena device {device}"
+            )
+        if self.paged_attention_caps is not None and self.paged_attention_caps.device != device:
+            raise ValueError(
+                "paged attention caps device "
+                f"{self.paged_attention_caps.device} does not match joint arena device {device}"
             )
         if self.moe_caps is not None and self.moe_caps.device != device:
             raise ValueError(
@@ -108,9 +121,11 @@ class B12XExecutionLaneArena:
     shared_arena: torch.Tensor
     shared_arena_nbytes: int
     attention_nbytes: int = 0
+    paged_attention_nbytes: int = 0
     moe_nbytes: int = 0
     moe_layout: TPMoEArenaLayout | None = None
     attention_arena: B12XAttentionArena | None = None
+    paged_attention_arena: PagedAttentionArena | None = None
     moe_workspace_pool: TPMoEWorkspacePool | None = None
 
     @classmethod
@@ -120,9 +135,14 @@ class B12XExecutionLaneArena:
             if spec.attention_caps is not None
             else 0
         )
+        paged_attention_nbytes = (
+            PagedAttentionArena.required_nbytes(spec.paged_attention_caps)
+            if spec.paged_attention_caps is not None
+            else 0
+        )
         moe_layout = spec.moe_caps.layout() if spec.moe_caps is not None else None
         moe_nbytes = moe_layout.total_nbytes if moe_layout is not None else 0
-        shared_arena_nbytes = max(attention_nbytes, moe_nbytes, 1)
+        shared_arena_nbytes = max(attention_nbytes, paged_attention_nbytes, moe_nbytes, 1)
         shared_arena = torch.empty(
             shared_arena_nbytes,
             dtype=torch.uint8,
@@ -132,6 +152,11 @@ class B12XExecutionLaneArena:
         attention_arena = (
             B12XAttentionArena.from_shared_arena(spec.attention_caps, shared_arena)
             if spec.attention_caps is not None
+            else None
+        )
+        paged_attention_arena = (
+            PagedAttentionArena.from_shared_arena(spec.paged_attention_caps, shared_arena)
+            if spec.paged_attention_caps is not None
             else None
         )
         moe_workspace_pool = None
@@ -148,9 +173,11 @@ class B12XExecutionLaneArena:
             shared_arena=shared_arena,
             shared_arena_nbytes=shared_arena_nbytes,
             attention_nbytes=attention_nbytes,
+            paged_attention_nbytes=paged_attention_nbytes,
             moe_nbytes=moe_nbytes,
             moe_layout=moe_layout,
             attention_arena=attention_arena,
+            paged_attention_arena=paged_attention_arena,
             moe_workspace_pool=moe_workspace_pool,
         )
         return lane
@@ -164,6 +191,19 @@ class B12XExecutionLaneArena:
         if self.attention_arena is None:
             raise RuntimeError("execution lane arena was allocated without attention caps")
         return self.attention_arena.make_workspace(contract, use_cuda_graph=use_cuda_graph)
+
+    def make_paged_attention_workspace(
+        self,
+        contract: PagedAttentionWorkspaceContract,
+        *,
+        use_cuda_graph: bool = False,
+    ) -> PagedAttentionWorkspace:
+        if self.paged_attention_arena is None:
+            raise RuntimeError("execution lane arena was allocated without paged attention caps")
+        return self.paged_attention_arena.make_workspace(
+            contract,
+            use_cuda_graph=use_cuda_graph,
+        )
 
     def get_moe_workspace_pool(self) -> TPMoEWorkspacePool:
         if self.moe_workspace_pool is None:
