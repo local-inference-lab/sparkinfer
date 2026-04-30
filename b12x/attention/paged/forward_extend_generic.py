@@ -2405,8 +2405,8 @@ class PagedForwardKernel:
                 payload_bytes = int(
                     self.num_stages
                     * self.stage_tile_rows
-                    * (self.traits.head_dim_qk + self.traits.head_dim_vo)
-                    * (self.dtype_kv_storage.width // 8)
+                    * (self.traits.upcast_stride_k + self.traits.upcast_stride_v)
+                    * 16
                 )
                 SharedStorage.__annotations__ = {
                     "mbar_ptr_K": cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages],
@@ -2418,17 +2418,20 @@ class PagedForwardKernel:
                     ],
                 }
             else:
+                kv_storage_bytes = self.dtype_kv_storage.width // 8
+                k_smem_row_elems = self.traits.upcast_stride_k * 16 // kv_storage_bytes
+                v_smem_row_elems = self.traits.upcast_stride_v * 16 // kv_storage_bytes
                 k_struct = cute.struct.Align[
                     cute.struct.MemRange[
                         self.dtype_kv_storage,
-                        int(self.num_stages * self.stage_tile_rows * self.traits.head_dim_qk),
+                        int(self.num_stages * self.stage_tile_rows * k_smem_row_elems),
                     ],
                     128,
                 ]
                 v_struct = cute.struct.Align[
                     cute.struct.MemRange[
                         self.dtype_kv_storage,
-                        int(self.num_stages * self.stage_tile_rows * self.traits.head_dim_vo),
+                        int(self.num_stages * self.stage_tile_rows * v_smem_row_elems),
                     ],
                     128,
                 ]
@@ -2545,21 +2548,22 @@ class PagedForwardKernel:
             page_id = mPageTable[request_idx, page_iter]
             row_valid = row_idx < valid_rows
             row_byte_base = (((page_id * page_size + entry_idx) * num_kv_heads) + kv_head_idx) * row_bytes
-            for vec_iter in cutlass.range_constexpr(row_bytes // 128):
+            for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
                 vec_idx = Int32(lane_col + vec_iter * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
                 dst_byte_idx = stage_byte_offset + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
+                vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
                 if const_expr(fill_zero):
                     _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        cutlass.select_(row_valid, Int32(16), Int32(0)),
+                        cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
                 else:
                     _cp_async_load_128b_pred(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        Int32(row_valid),
+                        Int32(vec_valid),
                     )
 
     @cute.jit
@@ -2984,8 +2988,13 @@ class PagedForwardKernel:
         page_size = mKCache.shape[1]
         stage_tile_rows = self.stage_tile_rows
         q_bytes = self.traits.q_smem_bytes
-        k_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_qk * (self.dtype_kv_storage.width // 8)
-        v_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_vo * (self.dtype_kv_storage.width // 8)
+        kv_storage_bytes = self.dtype_kv_storage.width // 8
+        k_smem_row_bytes = self.traits.upcast_stride_k * 16
+        v_smem_row_bytes = self.traits.upcast_stride_v * 16
+        k_smem_row_elems = k_smem_row_bytes // kv_storage_bytes
+        v_smem_row_elems = v_smem_row_bytes // kv_storage_bytes
+        k_bytes = self.num_stages * stage_tile_rows * k_smem_row_bytes
+        v_bytes = self.num_stages * stage_tile_rows * v_smem_row_bytes
         kv_plane_stage_bytes = (
             stage_tile_rows * self.kv_tma_plane_head_dim * (self.dtype_kv_storage.width // 8)
         )
@@ -3035,7 +3044,7 @@ class PagedForwardKernel:
                 q_bytes,
                 cute.make_layout(
                     (stage_tile_rows, self.traits.head_dim_qk, self.num_stages),
-                    stride=(self.traits.head_dim_qk, 1, stage_tile_rows * self.traits.head_dim_qk),
+                    stride=(k_smem_row_elems, 1, stage_tile_rows * k_smem_row_elems),
                 )
             )
             sKStageBytes = _make_payload_tensor(
@@ -3050,7 +3059,7 @@ class PagedForwardKernel:
                 q_bytes + k_bytes,
                 cute.make_layout(
                     (stage_tile_rows, self.traits.head_dim_vo, self.num_stages),
-                    stride=(self.traits.head_dim_vo, 1, stage_tile_rows * self.traits.head_dim_vo),
+                    stride=(v_smem_row_elems, 1, stage_tile_rows * v_smem_row_elems),
                 )
             )
             sVStageBytes = _make_payload_tensor(
@@ -3196,14 +3205,14 @@ class PagedForwardKernel:
                     cute.recast_tensor(sKStageBytes, self.dtype_kv_storage).iterator,
                     cute.make_layout(
                         (stage_tile_rows, self.traits.head_dim_qk, self.num_stages),
-                        stride=(self.traits.head_dim_qk, 1, stage_tile_rows * self.traits.head_dim_qk),
+                        stride=(k_smem_row_elems, 1, stage_tile_rows * k_smem_row_elems),
                     ),
                 )
                 sV = cute.make_tensor(
                     cute.recast_tensor(sVStageBytes, self.dtype_kv_storage).iterator,
                     cute.make_layout(
                         (stage_tile_rows, self.traits.head_dim_vo, self.num_stages),
-                        stride=(self.traits.head_dim_vo, 1, stage_tile_rows * self.traits.head_dim_vo),
+                        stride=(v_smem_row_elems, 1, stage_tile_rows * v_smem_row_elems),
                     ),
                 )
                 sKTma = None
@@ -3264,13 +3273,13 @@ class PagedForwardKernel:
                 sK = storage.sK.get_tensor(
                     cute.make_layout(
                         (stage_tile_rows, self.traits.head_dim_qk, self.num_stages),
-                        stride=(self.traits.head_dim_qk, 1, stage_tile_rows * self.traits.head_dim_qk),
+                        stride=(k_smem_row_elems, 1, stage_tile_rows * k_smem_row_elems),
                     )
                 )
                 sV = storage.sV.get_tensor(
                     cute.make_layout(
                         (stage_tile_rows, self.traits.head_dim_vo, self.num_stages),
-                        stride=(self.traits.head_dim_vo, 1, stage_tile_rows * self.traits.head_dim_vo),
+                        stride=(v_smem_row_elems, 1, stage_tile_rows * v_smem_row_elems),
                     )
                 )
                 sKStageBytes = cute.make_tensor(
@@ -3346,8 +3355,8 @@ class PagedForwardKernel:
             sVTC = None
         k_row_bytes = self.traits.head_dim_qk * (self.dtype_kv_storage.width // 8)
         v_row_bytes = self.traits.head_dim_vo * (self.dtype_kv_storage.width // 8)
-        k_stage_bytes = stage_tile_rows * k_row_bytes
-        v_stage_bytes = stage_tile_rows * v_row_bytes
+        k_stage_bytes = stage_tile_rows * k_smem_row_bytes
+        v_stage_bytes = stage_tile_rows * v_smem_row_bytes
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
         mKBytes = cute.flatten(cute.recast_tensor(mKCache, cutlass.Uint8))
         mVBytes = cute.flatten(cute.recast_tensor(mVCache, cutlass.Uint8))

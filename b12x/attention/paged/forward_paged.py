@@ -2160,8 +2160,11 @@ class PagedForwardKernel:
         )
         fp8_plane_decode_dims_supported = (
             self.kv_is_fp8
-            and traits.head_dim_qk == 256
-            and traits.head_dim_vo == 256
+            and traits.head_dim_qk % 64 == 0
+            and traits.head_dim_vo % 128 == 0
+            and traits.head_dim_qk > 128
+            and traits.head_dim_qk <= 256
+            and traits.head_dim_vo <= 256
         )
         base_use_paged_kv_tma_decode = (
             dtype_q == cutlass.BFloat16
@@ -2236,8 +2239,13 @@ class PagedForwardKernel:
             else 1
         )
         self.kv_tma_plane_count = max(self.k_tma_plane_count, self.v_tma_plane_count)
-        self.kv_tma_copy_bytes_k = self.stage_tile_rows * traits.head_dim_qk * (dtype_kv_storage.width // 8)
-        self.kv_tma_copy_bytes_v = self.stage_tile_rows * traits.head_dim_vo * (dtype_kv_storage.width // 8)
+        kv_storage_bytes = dtype_kv_storage.width // 8
+        self.kv_tma_copy_bytes_k = (
+            self.stage_tile_rows * self.k_tma_plane_count * self.kv_tma_plane_head_dim * kv_storage_bytes
+        )
+        self.kv_tma_copy_bytes_v = (
+            self.stage_tile_rows * self.v_tma_plane_count * self.kv_tma_plane_head_dim * kv_storage_bytes
+        )
         self.use_mxfp8_qk = (
             mxfp8_turbo
             and self.kv_is_fp8
@@ -2363,21 +2371,22 @@ class PagedForwardKernel:
             page_id = mPageTable[request_idx, page_iter]
             row_valid = row_idx < valid_rows
             row_byte_base = (((page_id * page_size + entry_idx) * num_kv_heads) + kv_head_idx) * row_bytes
-            for vec_iter in cutlass.range_constexpr(row_bytes // 128):
+            for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
                 vec_idx = Int32(lane_col + vec_iter * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
                 dst_byte_idx = stage_byte_offset + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
+                vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
                 if const_expr(fill_zero):
                     _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        cutlass.select_(row_valid, Int32(16), Int32(0)),
+                        cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
                 else:
                     _cp_async_load_128b_pred(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        Int32(row_valid),
+                        Int32(vec_valid),
                     )
 
     @cute.jit
@@ -2448,6 +2457,25 @@ class PagedForwardKernel:
         src_idx = page_id
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
+
+    @cute.jit
+    def _issue_paged_kv_tma_copy_1plane(
+        self,
+        load_tma0,
+        pipeline_tma,
+        producer_state,
+        mPageTable: cute.Tensor,
+        request_idx,
+        tile_token_base,
+        page_size,
+        stage_tile_rows,
+    ):
+        page_idx = tile_token_base // page_size
+        del stage_tile_rows
+        page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
+        pipeline_tma.producer_acquire(producer_state)
+        src_idx = page_id
+        load_tma0(src_idx=src_idx, producer_state=producer_state)
 
     @cute.jit
     def _async_copy_q_tile_permuted_128b(
@@ -2820,6 +2848,9 @@ class PagedForwardKernel:
             stage_tile_rows * self.kv_tma_plane_head_dim * (self.dtype_kv_storage.width // 8)
         )
         kv_plane_total_bytes = self.num_stages * kv_plane_stage_bytes
+        k_payload_bytes = max(k_bytes, self.k_tma_plane_count * kv_plane_total_bytes)
+        v_payload_bytes = max(v_bytes, self.v_tma_plane_count * kv_plane_total_bytes)
+        v_payload_offset = q_bytes + k_payload_bytes
         warp_linear_idx = warp_kv_idx * self.traits.num_warps_q + warp_q_idx
         tidx = lane + 32 * (warp_q_idx + self.traits.num_warps_q * warp_kv_idx)
         packed_tile_rows = packed_tile_end - packed_tile_start
@@ -2855,12 +2886,12 @@ class PagedForwardKernel:
             payload_u8,
             cutlass.Uint8,
             q_bytes,
-            cute.make_layout((k_bytes,), stride=(1,)),
+            cute.make_layout((k_payload_bytes,), stride=(1,)),
         )
         sV = _make_payload_tensor(
             payload_u8,
             self.dtype_kv_storage,
-            q_bytes + k_bytes,
+            v_payload_offset,
             cute.make_layout(
                 (stage_tile_rows, self.traits.head_dim_vo, self.num_stages),
                 stride=(self.traits.head_dim_vo, 1, stage_tile_rows * self.traits.head_dim_vo),
@@ -2869,8 +2900,8 @@ class PagedForwardKernel:
         sVStageBytes = _make_payload_tensor(
             payload_u8,
             cutlass.Uint8,
-            q_bytes + k_bytes,
-            cute.make_layout((v_bytes,), stride=(1,)),
+            v_payload_offset,
+            cute.make_layout((v_payload_bytes,), stride=(1,)),
         )
         sKTma = None
         sVTma = None
@@ -2883,14 +2914,18 @@ class PagedForwardKernel:
             ),
             self._get_paged_kv_tma_plane_stage_layout(),
         )
-        sKPlane1 = _get_memrange_tensor(
-            _make_payload_memrange(
-                payload_u8,
-                self.kv_tma_plane_mem_dtype,
-                q_bytes + 1 * kv_plane_total_bytes,
-                self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
-            ),
-            self._get_paged_kv_tma_plane_stage_layout(),
+        sKPlane1 = (
+            _get_memrange_tensor(
+                _make_payload_memrange(
+                    payload_u8,
+                    self.kv_tma_plane_mem_dtype,
+                    q_bytes + 1 * kv_plane_total_bytes,
+                    self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                ),
+                self._get_paged_kv_tma_plane_stage_layout(),
+            )
+            if const_expr(self.k_tma_plane_count > 1)
+            else None
         )
         sKPlane2 = (
             _get_memrange_tensor(
@@ -2922,26 +2957,30 @@ class PagedForwardKernel:
             _make_payload_memrange(
                 payload_u8,
                 self.kv_tma_plane_mem_dtype,
-                q_bytes + k_bytes + 0 * kv_plane_total_bytes,
+                v_payload_offset + 0 * kv_plane_total_bytes,
                 self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
             ),
             self._get_paged_kv_tma_plane_stage_layout(),
         )
-        sVPlane1 = _get_memrange_tensor(
-            _make_payload_memrange(
-                payload_u8,
-                self.kv_tma_plane_mem_dtype,
-                q_bytes + k_bytes + 1 * kv_plane_total_bytes,
-                self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
-            ),
-            self._get_paged_kv_tma_plane_stage_layout(),
+        sVPlane1 = (
+            _get_memrange_tensor(
+                _make_payload_memrange(
+                    payload_u8,
+                    self.kv_tma_plane_mem_dtype,
+                    v_payload_offset + 1 * kv_plane_total_bytes,
+                    self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                ),
+                self._get_paged_kv_tma_plane_stage_layout(),
+            )
+            if const_expr(self.v_tma_plane_count > 1)
+            else None
         )
         sVPlane2 = (
             _get_memrange_tensor(
                 _make_payload_memrange(
                     payload_u8,
                     self.kv_tma_plane_mem_dtype,
-                    q_bytes + k_bytes + 2 * kv_plane_total_bytes,
+                    v_payload_offset + 2 * kv_plane_total_bytes,
                     self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
                 ),
                 self._get_paged_kv_tma_plane_stage_layout(),
@@ -2954,7 +2993,7 @@ class PagedForwardKernel:
                 _make_payload_memrange(
                     payload_u8,
                     self.kv_tma_plane_mem_dtype,
-                    q_bytes + k_bytes + 3 * kv_plane_total_bytes,
+                    v_payload_offset + 3 * kv_plane_total_bytes,
                     self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
                 ),
                 self._get_paged_kv_tma_plane_stage_layout(),
@@ -3008,10 +3047,14 @@ class PagedForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             (0, 0, None),
         )
-        gKTma1 = cute.local_tile(
-            mKCacheTHead,
-            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
-            (0, 1, None),
+        gKTma1 = (
+            cute.local_tile(
+                mKCacheTHead,
+                (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                (0, 1, None),
+            )
+            if const_expr(self.k_tma_plane_count > 1)
+            else None
         )
         gKTma2 = (
             cute.local_tile(
@@ -3034,8 +3077,12 @@ class PagedForwardKernel:
         load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
         )
-        load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
+        load_K_tma1, _, _ = (
+            copy_utils.tma_get_copy_fn(
+                tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
+            )
+            if const_expr(self.k_tma_plane_count > 1)
+            else (None, None, None)
         )
         load_K_tma2, _, _ = (
             copy_utils.tma_get_copy_fn(
@@ -3052,7 +3099,11 @@ class PagedForwardKernel:
             else (None, None, None)
         )
         load_K_tma0 = copy_utils.tma_producer_copy_fn(load_K_tma0, pipeline_k)
-        load_K_tma1 = copy_utils.tma_producer_copy_fn(load_K_tma1, pipeline_k)
+        load_K_tma1 = (
+            copy_utils.tma_producer_copy_fn(load_K_tma1, pipeline_k)
+            if const_expr(self.k_tma_plane_count > 1)
+            else None
+        )
         load_K_tma2 = (
             copy_utils.tma_producer_copy_fn(load_K_tma2, pipeline_k)
             if const_expr(self.k_tma_plane_count > 2)
@@ -3068,10 +3119,14 @@ class PagedForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             (0, 0, None),
         )
-        gVTma1 = cute.local_tile(
-            mVCacheTHead,
-            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
-            (0, 1, None),
+        gVTma1 = (
+            cute.local_tile(
+                mVCacheTHead,
+                (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                (0, 1, None),
+            )
+            if const_expr(self.v_tma_plane_count > 1)
+            else None
         )
         gVTma2 = (
             cute.local_tile(
@@ -3094,8 +3149,12 @@ class PagedForwardKernel:
         load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
         )
-        load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
+        load_V_tma1, _, _ = (
+            copy_utils.tma_get_copy_fn(
+                tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
+            )
+            if const_expr(self.v_tma_plane_count > 1)
+            else (None, None, None)
         )
         load_V_tma2, _, _ = (
             copy_utils.tma_get_copy_fn(
@@ -3112,7 +3171,11 @@ class PagedForwardKernel:
             else (None, None, None)
         )
         load_V_tma0 = copy_utils.tma_producer_copy_fn(load_V_tma0, pipeline_v)
-        load_V_tma1 = copy_utils.tma_producer_copy_fn(load_V_tma1, pipeline_v)
+        load_V_tma1 = (
+            copy_utils.tma_producer_copy_fn(load_V_tma1, pipeline_v)
+            if const_expr(self.v_tma_plane_count > 1)
+            else None
+        )
         load_V_tma2 = (
             copy_utils.tma_producer_copy_fn(load_V_tma2, pipeline_v)
             if const_expr(self.v_tma_plane_count > 2)
@@ -3427,10 +3490,21 @@ class PagedForwardKernel:
                         page_size,
                         stage_tile_rows,
                     )
-                else:
+                elif const_expr(self.k_tma_plane_count > 1):
                     self._issue_paged_kv_tma_copy_2planes(
                         load_K_tma0,
                         load_K_tma1,
+                        pipeline_k,
+                        k_producer_state,
+                        mPageTable,
+                        request_idx,
+                        prefetch_base,
+                        page_size,
+                        stage_tile_rows,
+                    )
+                else:
+                    self._issue_paged_kv_tma_copy_1plane(
+                        load_K_tma0,
                         pipeline_k,
                         k_producer_state,
                         mPageTable,
@@ -3466,10 +3540,21 @@ class PagedForwardKernel:
                         page_size,
                         stage_tile_rows,
                     )
-                else:
+                elif const_expr(self.v_tma_plane_count > 1):
                     self._issue_paged_kv_tma_copy_2planes(
                         load_V_tma0,
                         load_V_tma1,
+                        pipeline_v,
+                        v_producer_state,
+                        mPageTable,
+                        request_idx,
+                        prefetch_base,
+                        page_size,
+                        stage_tile_rows,
+                    )
+                else:
+                    self._issue_paged_kv_tma_copy_1plane(
+                        load_V_tma0,
                         pipeline_v,
                         v_producer_state,
                         mPageTable,
@@ -3603,7 +3688,15 @@ class PagedForwardKernel:
                                             key_local = (
                                                 warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
                                             )
-                                            if key_local < tile_tokens:
+                                            valid = key_local < tile_tokens
+                                            if const_expr(self.window_left >= 0):
+                                                if valid:
+                                                    key_pos = tile_base + key_local
+                                                    row_causal_k_limit = Int32(cache_len - qo_len)
+                                                    window_start = row_causal_k_limit - Int32(self.window_left)
+                                                    window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                                    valid = valid and key_pos >= window_start
+                                            if valid:
                                                 frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                             else:
                                                 frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
@@ -3618,6 +3711,13 @@ class PagedForwardKernel:
                                         valid = row_valid[mma_q, row_slot] != 0
                                         if valid:
                                             valid = valid and key_local < tile_tokens
+                                        if const_expr(self.window_left >= 0):
+                                            if valid:
+                                                key_pos = tile_base + key_local
+                                                row_causal_k_limit = Int32(cache_len - qo_len)
+                                                window_start = row_causal_k_limit - Int32(self.window_left)
+                                                window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                                valid = valid and key_pos >= window_start
                                         if valid:
                                             frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                         else:
@@ -3851,10 +3951,21 @@ class PagedForwardKernel:
                                 page_size,
                                 stage_tile_rows,
                             )
-                        else:
+                        elif const_expr(self.k_tma_plane_count > 1):
                             self._issue_paged_kv_tma_copy_2planes(
                                 load_K_tma0,
                                 load_K_tma1,
+                                pipeline_k,
+                                k_producer_state,
+                                mPageTable,
+                                request_idx,
+                                next_tile_base,
+                                page_size,
+                                stage_tile_rows,
+                            )
+                        else:
+                            self._issue_paged_kv_tma_copy_1plane(
+                                load_K_tma0,
                                 pipeline_k,
                                 k_producer_state,
                                 mPageTable,
@@ -3882,6 +3993,9 @@ class PagedForwardKernel:
                         pv_row_base = Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base
                         if const_expr(self.kv_is_fp8):
                             v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                            v_plane1_total_offset = Int32(
+                                kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                            )
                             _literal_pv_mma_into_ofrag_plane_fp8_raw(
                                 o_frag,
                                 p_frag,
@@ -3889,7 +4003,7 @@ class PagedForwardKernel:
                                     sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                                 ),
                                 lane,
                                 warp_kv_idx,
@@ -3903,6 +4017,9 @@ class PagedForwardKernel:
                             )
                         else:
                             v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                            v_plane1_total_offset = Int32(
+                                kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                            )
                             _literal_pv_mma_into_ofrag_plane_bf16_packed(
                                 o_frag,
                                 p_frag,
@@ -3910,7 +4027,7 @@ class PagedForwardKernel:
                                     sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                                 ),
                                 shared_ptr_to_u32(
                                     sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
@@ -3961,6 +4078,9 @@ class PagedForwardKernel:
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                    v_plane1_total_offset = Int32(
+                        kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                    )
                     if const_expr(self.decode_only and self.traits.num_warps_q == 1 and num_mma_q == 1):
                         if group_size == Int32(8):
                             if const_expr(num_mma_kv == 1):
@@ -3971,7 +4091,7 @@ class PagedForwardKernel:
                                         sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                        sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                                     ),
                                     lane,
                                     warp_kv_idx,
@@ -3988,7 +4108,7 @@ class PagedForwardKernel:
                                         sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                        sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                                     ),
                                     lane,
                                     warp_kv_idx,
@@ -4007,7 +4127,7 @@ class PagedForwardKernel:
                                     sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                                 ),
                                 lane,
                                 warp_kv_idx,
@@ -4026,7 +4146,7 @@ class PagedForwardKernel:
                                 sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                             ),
                             lane,
                             warp_kv_idx,
@@ -4039,6 +4159,9 @@ class PagedForwardKernel:
                         )
                 else:
                     v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                    v_plane1_total_offset = Int32(
+                        kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                    )
                     _literal_pv_mma_into_ofrag_plane_bf16_packed(
                         o_frag,
                         p_frag,
@@ -4046,7 +4169,7 @@ class PagedForwardKernel:
                             sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
                         ),
                         shared_ptr_to_u32(
-                            sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                            sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
                         ),
                         shared_ptr_to_u32(
                             sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
@@ -4095,10 +4218,21 @@ class PagedForwardKernel:
                                 page_size,
                                 stage_tile_rows,
                             )
-                        else:
+                        elif const_expr(self.v_tma_plane_count > 1):
                             self._issue_paged_kv_tma_copy_2planes(
                                 load_V_tma0,
                                 load_V_tma1,
+                                pipeline_v,
+                                v_producer_state,
+                                mPageTable,
+                                request_idx,
+                                next_tile_base,
+                                page_size,
+                                stage_tile_rows,
+                            )
+                        else:
+                            self._issue_paged_kv_tma_copy_1plane(
+                                load_V_tma0,
                                 pipeline_v,
                                 v_producer_state,
                                 mPageTable,

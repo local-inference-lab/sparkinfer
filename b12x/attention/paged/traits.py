@@ -112,6 +112,9 @@ def select_paged_forward_traits(
     if kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 48:
         device_props = torch.cuda.get_device_properties(torch.cuda.current_device() if device is None else device)
         max_smem_per_sm = int(device_props.shared_memory_per_multiprocessor)
+        kv_bytes = _dtype_num_bytes(kv_dtype)
+        upcast_stride_k = _align_up(head_dim_qk // (16 // kv_bytes), 8)
+        upcast_stride_v = _align_up(head_dim_vo // (16 // kv_bytes), 8)
         return PagedForwardTraits(
             cta_tile_q=48,
             cta_tile_kv=32,
@@ -125,8 +128,8 @@ def select_paged_forward_traits(
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             upcast_stride_q=head_dim_qk // 8,
-            upcast_stride_k=head_dim_qk // 16,
-            upcast_stride_v=head_dim_vo // 16,
+            upcast_stride_k=upcast_stride_k,
+            upcast_stride_v=upcast_stride_v,
             upcast_stride_o=head_dim_vo // (16 // _dtype_num_bytes(o_dtype)),
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
@@ -150,13 +153,27 @@ def select_paged_forward_traits(
     q_bytes = _dtype_num_bytes(q_dtype)
     kv_bytes = _dtype_num_bytes(kv_dtype)
     o_bytes = _dtype_num_bytes(o_dtype)
+    upcast_stride_q = head_dim_qk // (16 // q_bytes)
+    upcast_stride_k = head_dim_qk // (16 // kv_bytes)
+    upcast_stride_v = head_dim_vo // (16 // kv_bytes)
+    if kv_dtype == _FP8_KV_DTYPE:
+        upcast_stride_k = _align_up(upcast_stride_k, 8)
+        upcast_stride_v = _align_up(upcast_stride_v, 8)
+    upcast_stride_o = head_dim_vo // (16 // o_bytes)
     q_smem_bytes = cta_tile_q * head_dim_qk * q_bytes
-    kv_bytes_per_mma = (head_dim_qk + head_dim_vo) * 16 * num_warps_kv * kv_bytes
+    kv_bytes_per_mma = (upcast_stride_k + upcast_stride_v) * 16 * 16 * num_warps_kv
     num_ctas_per_sm = 2 if max_smem_per_sm >= 2 * (q_smem_bytes + kv_bytes_per_mma) else 1
     max_smem_per_threadblock = max_smem_per_sm // num_ctas_per_sm
     max_num_mma_kv_reg = 8 // num_mma_q
     max_num_mma_kv_smem = max((max_smem_per_threadblock - q_smem_bytes) // kv_bytes_per_mma, 0)
     num_mma_kv = min(max_num_mma_kv_smem, max_num_mma_kv_reg)
+    if (
+        kv_dtype == _FP8_KV_DTYPE
+        and cta_tile_q == 16
+        and head_dim_qk == 192
+        and head_dim_vo == 128
+    ):
+        num_mma_kv = min(num_mma_kv, 1)
     if num_mma_kv <= 0:
         raise ValueError("no valid NUM_MMA_KV fits the current paged forward trait constraints")
     if _paged_is_invalid(
@@ -169,13 +186,9 @@ def select_paged_forward_traits(
         raise ValueError("selected paged forward traits are invalid under FlashInfer rules")
 
     cta_tile_kv = num_mma_kv * num_warps_kv * 16
-    upcast_stride_q = head_dim_qk // (16 // q_bytes)
-    upcast_stride_k = head_dim_qk // (16 // kv_bytes)
-    upcast_stride_v = head_dim_vo // (16 // kv_bytes)
-    upcast_stride_o = head_dim_vo // (16 // o_bytes)
 
-    k_smem_bytes = cta_tile_kv * head_dim_qk * kv_bytes
-    v_smem_bytes = cta_tile_kv * head_dim_vo * kv_bytes
+    k_smem_bytes = cta_tile_kv * upcast_stride_k * 16
+    v_smem_bytes = cta_tile_kv * upcast_stride_v * 16
     qkv_storage_bytes = q_smem_bytes + k_smem_bytes + v_smem_bytes
     cta_sync_o_bytes = 4 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * head_dim_vo * 4
     cta_sync_md_bytes = 8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8

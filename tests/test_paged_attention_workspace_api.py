@@ -680,6 +680,88 @@ def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape(
 
 @pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("use_sink", [False, True])
+def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape_fp8_kv(
+    window_left: int,
+    use_sink: bool,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 129, 192, 193],
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=317 + max(window_left, 0) + int(use_sink),
+        page_table_width=4,
+        num_pages=32,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    attention_sink_bias = None
+    if use_sink:
+        attention_sink_bias = torch.linspace(
+            -0.3,
+            0.4,
+            steps=q.shape[1],
+            device=q.device,
+            dtype=torch.float32,
+        )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
+
+    assert workspace.plan.mode == "decode"
+    assert workspace.plan.head_dim_qk == 192
+    assert workspace.plan.head_dim_vo == 128
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+    assert workspace.plan.window_left == window_left
+    if window_left >= 0:
+        assert workspace.plan.kv_window_start_tokens == (0, 0, 0, 64)
+
+    output = torch.empty((*q.shape[:-1], v_cache.shape[-1]), device=q.device, dtype=q.dtype)
+    out, lse = workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        window_left=window_left,
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.06
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.06
+    assert _cosine_similarity(out, ref_out) >= 0.9995
+
+
+@pytest.mark.parametrize("window_left", [-1, 128])
+@pytest.mark.parametrize("use_sink", [False, True])
 def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape(
     window_left: int,
     use_sink: bool,
@@ -747,6 +829,155 @@ def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape(
     assert (out - ref_out).abs().max().item() <= 0.02
     assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.03
     assert _cosine_similarity(out, ref_out) >= 0.99999
+
+
+@pytest.mark.parametrize("window_left", [-1, 128])
+@pytest.mark.parametrize("use_sink", [False, True])
+def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape_fp8_kv(
+    window_left: int,
+    use_sink: bool,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[39, 64, 8],
+        cache_seqlens=[39, 192, 320],
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=411 + max(window_left, 0) + int(use_sink),
+        page_table_width=5,
+        num_pages=32,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    attention_sink_bias = None
+    if use_sink:
+        attention_sink_bias = torch.linspace(
+            -0.2,
+            0.5,
+            steps=q.shape[1],
+            device=q.device,
+            dtype=torch.float32,
+        )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.head_dim_qk == 192
+    assert workspace.plan.head_dim_vo == 128
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+    assert workspace.plan.window_left == window_left
+    if window_left >= 0:
+        assert workspace.plan.kv_window_start_tokens == (0, 0, 128)
+
+    output = torch.empty((*q.shape[:-1], v_cache.shape[-1]), device=q.device, dtype=q.dtype)
+    out, lse = workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        window_left=window_left,
+        attention_sink_bias=attention_sink_bias,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.06
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.10
+    assert _cosine_similarity(out, ref_out) >= 0.9985
+
+
+def test_paged_workspace_matches_reference_for_mimo_v25_fp8_long_prefill_padded_k_stride() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[32],
+        cache_seqlens=[4096],
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=419,
+        page_table_width=64,
+        num_pages=30000,
+    )
+    page_ids = (torch.arange(21000, 21064, device=q.device, dtype=torch.int32) * 37 % 29000) + 500
+    page_table[0, :64] = page_ids
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    traits = select_paged_forward_traits_from_plan(workspace.plan)
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.cta_tile_q == 128
+    assert workspace.plan.kv_chunk_size == 4096
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+    assert traits.upcast_stride_k == 16
+    assert traits.upcast_stride_v == 8
+
+    output = torch.empty((*q.shape[:-1], v_cache.shape[-1]), device=q.device, dtype=q.dtype)
+    out, lse = workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.06
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.10
+    assert _cosine_similarity(out, ref_out) >= 0.9985
 
 
 def test_workspace_eager_path_grows_with_larger_shape() -> None:
@@ -1405,6 +1636,92 @@ def test_mimo_v25_decode_cuda_graph_matches_reference_with_swa_and_sink() -> Non
     torch.cuda.synchronize()
 
 
+def test_mimo_v25_decode_cuda_graph_matches_reference_with_swa_and_sink_fp8_kv() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 4,
+        cache_seqlens=[129, 193, 257, 385],
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=427,
+        page_table_width=8,
+        num_pages=128,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    attention_sink_bias = torch.linspace(
+        -0.25,
+        0.35,
+        steps=q.shape[1],
+        device=q.device,
+        dtype=torch.float32,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=128)
+
+    output = torch.empty((*q.shape[:-1], v_cache.shape[-1]), device=q.device, dtype=q.dtype)
+    workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_fp8,
+            v_fp8,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    lse = workspace.current_lse_view()
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        window_left=128,
+        attention_sink_bias=attention_sink_bias,
+    )
+
+    assert torch.allclose(output.to(torch.float32), ref_out.to(torch.float32), atol=6e-2, rtol=6e-2)
+    assert torch.allclose(_lse_base2_to_natural(lse), ref_lse, atol=6e-2, rtol=6e-2)
+    assert _cosine_similarity(output, ref_out) >= 0.9995
+
+    del workspace, output, lse
+    clear_attention_caches()
+    gc.collect()
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize(
     ("cache_seqlens_a", "cache_seqlens_b"),
     [
@@ -1560,6 +1877,181 @@ def test_mimo_v25_decode_cuda_graph_replays_with_updated_metadata(
         atol=3e-2,
         rtol=3e-2,
     )
+
+    del workspace, output
+    clear_attention_caches()
+    gc.collect()
+    torch.cuda.synchronize()
+
+
+def test_mimo_v25_decode_cuda_graph_replays_with_updated_metadata_fp8_kv() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    batch = 4
+    cache_seqlens_a = [129, 193, 257, 385]
+    cache_seqlens_b = [193, 257, 385, 449]
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * batch,
+        cache_seqlens=cache_seqlens_a,
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=429,
+        page_table_width=8,
+        num_pages=128,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=batch,
+        total_q_capacity=batch,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+        window_left=128,
+    )
+    bound_page_table = torch.empty_like(page_table)
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = cu_seqlens_q.clone()
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+    req_pool_indices = torch.arange(0, batch, dtype=torch.int64, device=q.device)
+    workspace.update_decode_graph_replay_metadata(
+        req_to_token=_make_req_to_token(
+            page_table,
+            row_stride=int(page_table.shape[1]) * 64,
+            page_size=64,
+        ),
+        req_pool_indices=req_pool_indices,
+    )
+    attention_sink_bias = torch.linspace(
+        -0.25,
+        0.35,
+        steps=q.shape[1],
+        device=q.device,
+        dtype=torch.float32,
+    )
+    output = torch.empty((*q.shape[:-1], v_cache.shape[-1]), device=q.device, dtype=q.dtype)
+
+    workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+        prepare_decode_graph_metadata=False,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_fp8,
+            v_fp8,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+            prepare_decode_graph_metadata=False,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        window_left=128,
+        attention_sink_bias=attention_sink_bias,
+    )
+    assert torch.allclose(output.to(torch.float32), ref_out.to(torch.float32), atol=6e-2, rtol=6e-2)
+    assert torch.allclose(
+        _lse_base2_to_natural(workspace.current_lse_view()),
+        ref_lse,
+        atol=6e-2,
+        rtol=6e-2,
+    )
+
+    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = _make_paged_inputs(
+        q_seqlens=[1] * batch,
+        cache_seqlens=cache_seqlens_b,
+        page_size=64,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=433,
+        page_table_width=int(page_table.shape[1]),
+        num_pages=int(k_cache.shape[0]),
+    )
+    k_fp8_2, v_fp8_2, k_descale_2, v_descale_2 = _quantize_paged_kv_cache_e4m3(
+        k_cache_2,
+        v_cache_2,
+        page_table_2,
+        cache_seqlens_2,
+    )
+    q.copy_(q_2)
+    k_fp8.copy_(k_fp8_2)
+    v_fp8.copy_(v_fp8_2)
+    k_descale.copy_(k_descale_2)
+    v_descale.copy_(v_descale_2)
+    bound_cache_seqlens.copy_(cache_seqlens_2)
+    bound_cu_seqlens_q.copy_(cu_seqlens_q_2)
+    workspace.update_decode_graph_replay_metadata(
+        req_to_token=_make_req_to_token(
+            page_table_2,
+            row_stride=int(page_table_2.shape[1]) * 64,
+            page_size=64,
+        ),
+        req_pool_indices=req_pool_indices,
+    )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_out_2, ref_lse_2 = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table_2,
+        cache_seqlens_2,
+        cu_seqlens_q_2,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        window_left=128,
+        attention_sink_bias=attention_sink_bias,
+    )
+    assert torch.allclose(output.to(torch.float32), ref_out_2.to(torch.float32), atol=6e-2, rtol=6e-2)
+    assert torch.allclose(
+        _lse_base2_to_natural(workspace.current_lse_view()),
+        ref_lse_2,
+        atol=6e-2,
+        rtol=6e-2,
+    )
+    assert _cosine_similarity(output, ref_out_2) >= 0.9995
 
     del workspace, output
     clear_attention_caches()
@@ -1902,6 +2394,141 @@ def test_mimo_v25_decode_cuda_graph_page_boundary_matches_reference(
             ref_lse,
             atol=3e-2,
             rtol=3e-2,
+        ), cache_len
+
+    del workspace, output
+    clear_attention_caches()
+    gc.collect()
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    ("window_left", "use_sink"),
+    [(-1, False), (128, True)],
+)
+def test_mimo_v25_decode_cuda_graph_page_boundary_matches_reference_fp8_kv(
+    window_left: int,
+    use_sink: bool,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    graph_bs = 8
+    page_size = 64
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * graph_bs,
+        cache_seqlens=[65] + [1] * (graph_bs - 1),
+        page_size=page_size,
+        q_heads=16,
+        kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        seed=463,
+        page_table_width=4,
+        num_pages=64,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=graph_bs,
+        total_q_capacity=graph_bs,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+        window_left=window_left,
+    )
+
+    bound_page_table = page_table.clone()
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = cu_seqlens_q.clone()
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+    output = torch.empty(
+        (graph_bs, q.shape[1], v_cache.shape[-1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    attention_sink_bias = None
+    if use_sink:
+        attention_sink_bias = torch.linspace(
+            -0.2,
+            0.2,
+            q.shape[1],
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+    workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_fp8,
+            v_fp8,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
+
+    row0_cu = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+    for step, cache_len in enumerate((63, 64, 65, 66, 127, 128, 129)):
+        torch.manual_seed(6000 + step)
+        q.copy_(torch.randn_like(q) / 4)
+        bound_cache_seqlens.fill_(1)
+        bound_cache_seqlens[0] = cache_len
+        bound_cu_seqlens_q.copy_(
+            torch.arange(0, graph_bs + 1, dtype=torch.int32, device=q.device)
+        )
+        bound_page_table.copy_(page_table)
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        row0_cache_seqlens = bound_cache_seqlens[:1]
+        ref_out, ref_lse = paged_attention_reference(
+            q[:1],
+            k_fp8,
+            v_fp8,
+            bound_page_table[:1],
+            row0_cache_seqlens,
+            row0_cu,
+            k_descale=k_descale[:1],
+            v_descale=v_descale[:1],
+            causal=True,
+            window_left=window_left,
+            attention_sink_bias=attention_sink_bias,
+        )
+        got = output[:1].to(torch.float32)
+        ref = ref_out.to(torch.float32)
+        assert torch.allclose(got, ref, atol=6e-2, rtol=6e-2), cache_len
+        assert _cosine_similarity(got, ref) >= 0.9995, cache_len
+        assert torch.allclose(
+            _lse_base2_to_natural(workspace.current_lse_view()[:1]),
+            ref_lse,
+            atol=6e-2,
+            rtol=6e-2,
         ), cache_len
 
     del workspace, output

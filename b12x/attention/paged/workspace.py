@@ -1064,7 +1064,7 @@ class PagedAttentionWorkspace:
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
         self._use_regular_decode_graph_replay = (
-            self.kv_dtype == torch.bfloat16 and batch >= 4
+            self.kv_dtype in (torch.bfloat16, torch.float8_e4m3fn) and batch >= 4
         )
         capacity_cache_seqlen = worst_page_count * self.page_size
         if window_left >= 0:
@@ -1727,7 +1727,7 @@ class PagedAttentionWorkspace:
 
         self._use_regular_decode_graph_replay = False
         if (
-            self.kv_dtype == torch.bfloat16
+            self.kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)
             and int(plan.page_table_shape[0]) >= 4
             and self.use_cuda_graph
             and self._decode_graph_chunk_pages_lut is not None
