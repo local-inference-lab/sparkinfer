@@ -93,7 +93,18 @@ def _broadcast_gather_object(local_object: object, group: ProcessGroup) -> list[
     all_objects: list[list[object | None]] = [[None] for _ in range(world_size)]
     all_objects[rank][0] = local_object
     for index, src_rank in enumerate(_group_ranks(group)):
-        dist.broadcast_object_list(all_objects[index], src=src_rank, group=group, device="cpu")
+        try:
+            dist.broadcast_object_list(all_objects[index], src=src_rank, group=group, device="cpu")
+        except RuntimeError as exc:
+            if "No backend type associated with device type cpu" not in str(exc):
+                raise
+            cuda_index = torch.cuda.current_device()
+            dist.broadcast_object_list(
+                all_objects[index],
+                src=src_rank,
+                group=group,
+                device=torch.device("cuda", cuda_index),
+            )
     return [entry[0] for entry in all_objects]
 
 

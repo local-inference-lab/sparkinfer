@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
@@ -17,6 +18,7 @@ from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
 from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
 from b12x.integration.triton_route import route_topk as triton_route_topk
+from b12x.integration._silu_dsv4_decode import is_exact_silu_dsv4_case
 from b12x.moe.fused.relu2 import (
     MoEDynamicKernelRelu2,
     MoEMicroKernelRelu2,
@@ -35,6 +37,9 @@ _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 2
+_LOGGER = logging.getLogger(__name__)
+_DSV4_SILU_DIRECT_HITS = 0
+_DSV4_SILU_DIRECT_LOGGED = False
 
 
 @dataclass(kw_only=True)
@@ -325,6 +330,8 @@ def clear_tp_moe_caches() -> None:
     global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
     global _DYNAMIC_MULTICTA_CACHE
     global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
+    global _DSV4_SILU_DIRECT_HITS
+    global _DSV4_SILU_DIRECT_LOGGED
     _WEIGHT_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -336,6 +343,8 @@ def clear_tp_moe_caches() -> None:
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
     _DYNAMIC_MULTICTA_CACHE = None
     _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
+    _DSV4_SILU_DIRECT_HITS = 0
+    _DSV4_SILU_DIRECT_LOGGED = False
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
     _LAST_EXACT_RELU2_BS1_NEMOTRON = (None, None)
@@ -414,6 +423,15 @@ def _get_relu2_bs1_spark_micro_cap() -> int:
     if cap is None:
         return 42
     return max(1, int(cap))
+
+
+def _dsv4_silu_direct_enabled() -> bool:
+    return os.environ.get("B12X_DSV4_SILU_DIRECT", "1") != "0"
+
+
+def get_tp_moe_debug_counters() -> dict[str, int]:
+    """Return lightweight process-local counters for integration smoke tests."""
+    return {"dsv4_silu_direct_hits": int(_DSV4_SILU_DIRECT_HITS)}
 
 
 def _flatten_routing_ids(topk_ids: torch.Tensor) -> torch.Tensor:
@@ -1103,6 +1121,30 @@ def _make_exact_relu2_bs1_nemotron_plan(
         max_rows=total_pairs,
         k=1024,
         n=2688,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        max_tokens_per_launch=num_tokens,
+    )
+
+
+def _make_exact_silu_dsv4_decode_plan(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_tokens: int,
+    weight_E: int,
+) -> TPMoEPlan:
+    num_topk = 6
+    total_pairs = num_topk * num_tokens
+    return TPMoEPlan(
+        implementation="static",
+        state_E=total_pairs,
+        weight_E=weight_E,
+        routed_rows=total_pairs,
+        max_rows=total_pairs,
+        k=4096,
+        n=2048,
         num_topk=num_topk,
         device=device,
         dtype=dtype,
@@ -2253,6 +2295,130 @@ def _launch_exact_relu2_bs1_nemotron(
     return scatter_output
 
 
+def _launch_exact_silu_dsv4_decode(
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor | None,
+    input_scales_are_reciprocal: bool,
+    input_scales_static: bool,
+    fast_math: bool,
+    flat_ids: torch.Tensor | None = None,
+    flat_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Exact DSv4 SiLU decode dispatch over the compact NVFP4 microkernel.
+
+    This bypasses the generic backend planner for the live DSv4 TP=4 decode
+    buckets. It keeps production on b12x NVFP4 kernels while adopting Sonic's
+    compact token/expert queue idea: the launch sees only the active top-k
+    routed pairs, with optional preflattened routing supplied by the sparse
+    wrapper.
+    """
+    global _DSV4_SILU_DIRECT_HITS
+    global _DSV4_SILU_DIRECT_LOGGED
+
+    m, k = a.shape
+    weight_E = w1_fp4.shape[0]
+    n = w2_fp4.shape[2] * 2
+    num_topk = topk_ids.shape[1]
+    routed_rows = m * num_topk
+    device = a.device
+    plan = _make_exact_silu_dsv4_decode_plan(
+        device=device,
+        dtype=a.dtype,
+        num_tokens=m,
+        weight_E=weight_E,
+    )
+    s = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    assert isinstance(s, TPCompactStaticWorkspace)
+
+    scatter_output = _resolve_scatter_output(
+        a=a,
+        output=output,
+        device=device,
+        m=m,
+        k=k,
+    )
+    activation_spec = _get_activation_kernel_spec("silu")
+    wv = _get_weight_views(
+        w1_fp4,
+        w1_blockscale,
+        w2_fp4,
+        w2_blockscale,
+        w1_alphas,
+        w2_alphas,
+        n,
+        k,
+        activation_spec=activation_spec,
+    )
+    launch_ids = flat_ids if flat_ids is not None else _flatten_routing_ids(topk_ids)
+    launch_weights = flat_weights if flat_weights is not None else _flatten_routing_weights(topk_weights)
+    if launch_ids.dtype not in (torch.int32, torch.int64):
+        launch_ids = launch_ids.to(torch.int32)
+    if not launch_ids.is_contiguous():
+        launch_ids = launch_ids.contiguous()
+    if launch_weights.dtype != torch.float32:
+        launch_weights = launch_weights.to(torch.float32)
+    if not launch_weights.is_contiguous():
+        launch_weights = launch_weights.contiguous()
+
+    input_gs = _prepare_expert_scale(a1_gscale, weight_E)
+    down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
+    _DSV4_SILU_DIRECT_HITS += 1
+    if not _DSV4_SILU_DIRECT_LOGGED:
+        _LOGGER.warning(
+            "b12x DSv4 SiLU direct MoE path active: m=%d topk=%d E=%d K=%d N=%d; "
+            "bypassing generic flashinfer/backend dispatch",
+            m,
+            num_topk,
+            weight_E,
+            k,
+            n,
+        )
+        _DSV4_SILU_DIRECT_LOGGED = True
+
+    _launch_compact_static(
+        workspace=s,
+        weights=wv,
+        a=a,
+        flat_ids=launch_ids,
+        flat_weights=launch_weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        scatter_output=scatter_output,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        routed_rows=routed_rows,
+        topk_ids_dtype=launch_ids.dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        stream=current_cuda_stream(),
+        share_input_across_experts=(a1_gscale.numel() == 1),
+        share_expert_scales=(a1_gscale.numel() == 1 and a2_gscale.numel() == 1),
+        activation="silu",
+    )
+    return scatter_output
+
+
 def _launch_dynamic(
     *,
     workspace: TPDynamicWorkspace,
@@ -2489,6 +2655,37 @@ def b12x_moe_fp4(
         input_scales_static
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
+    if (
+        _dsv4_silu_direct_enabled()
+        and is_exact_silu_dsv4_case(
+            activation=activation,
+            a=a,
+            w1_fp4=w1_fp4,
+            w2_fp4=w2_fp4,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+        )
+    ):
+        return _launch_exact_silu_dsv4_decode(
+            workspace=workspace,
+            a=a,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            input_scales_static=effective_input_scales_static,
+            fast_math=fast_math,
+        )
     if _is_exact_relu2_bs1_nemotron_case(
         activation=activation,
         a=a,
@@ -3054,25 +3251,64 @@ def b12x_sparse_moe_fp4(
 
     _validate_sparse_routing(hidden_states, selected)
 
-    routed_output = b12x_moe_fp4(
-        hidden_states,
-        experts.a1_gscale,
-        experts.w1_fp4,
-        experts.w1_blockscale,
-        experts.w1_alphas,
-        experts.a2_gscale,
-        experts.w2_fp4,
-        experts.w2_blockscale,
-        experts.w2_alphas,
-        selected.topk_weights,
-        selected.topk_ids,
-        workspace=workspace,
-        output=output,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-        input_scales_static=input_scales_static,
-        fast_math=fast_math,
-        activation=activation,
-    )
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    if (
+        _dsv4_silu_direct_enabled()
+        and is_exact_silu_dsv4_case(
+            activation=activation,
+            a=hidden_states,
+            w1_fp4=experts.w1_fp4,
+            w2_fp4=experts.w2_fp4,
+            topk_weights=selected.topk_weights,
+            topk_ids=selected.topk_ids,
+            a1_gscale=experts.a1_gscale,
+            a2_gscale=experts.a2_gscale,
+        )
+    ):
+        routed_output = _launch_exact_silu_dsv4_decode(
+            workspace=workspace,
+            a=hidden_states,
+            a1_gscale=experts.a1_gscale,
+            w1_fp4=experts.w1_fp4,
+            w1_blockscale=experts.w1_blockscale,
+            w1_alphas=experts.w1_alphas,
+            a2_gscale=experts.a2_gscale,
+            w2_fp4=experts.w2_fp4,
+            w2_blockscale=experts.w2_blockscale,
+            w2_alphas=experts.w2_alphas,
+            topk_weights=selected.topk_weights,
+            topk_ids=selected.topk_ids,
+            output=output,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            input_scales_static=(
+                input_scales_static
+                or (experts.a1_gscale.numel() == 1 and experts.a2_gscale.numel() == 1)
+            ),
+            fast_math=fast_math,
+            flat_ids=selected.flat_ids,
+            flat_weights=selected.flat_weights,
+        )
+    else:
+        routed_output = b12x_moe_fp4(
+            hidden_states,
+            experts.a1_gscale,
+            experts.w1_fp4,
+            experts.w1_blockscale,
+            experts.w1_alphas,
+            experts.a2_gscale,
+            experts.w2_fp4,
+            experts.w2_blockscale,
+            experts.w2_alphas,
+            selected.topk_weights,
+            selected.topk_ids,
+            workspace=workspace,
+            output=output,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            input_scales_static=input_scales_static,
+            fast_math=fast_math,
+            activation=activation,
+        )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)
     if return_routing:
