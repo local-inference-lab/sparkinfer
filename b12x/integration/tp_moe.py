@@ -760,11 +760,11 @@ def _plan_core_workspace(
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_candidate = (
         implementation == "static"
-        and n == 256
+        and n % _NVFP4_BLOCK_SIZE == 0
         and k % (32 * _NVFP4_BLOCK_SIZE) == 0
         and k % 128 == 0
-        and (k // (32 * _NVFP4_BLOCK_SIZE)) == 8
-        and 0 < num_topk <= 16
+        and (k // (32 * _NVFP4_BLOCK_SIZE)) in (2, 8)
+        and 0 < num_topk <= 32
         and weight_E > 0
         and routed_rows <= 8 * num_topk
     )
@@ -781,9 +781,10 @@ def _plan_core_workspace(
         static_rows_pad_k = align_up(max_rows, 128)
         micro_intermediate_elements = state_E * n
         if direct_micro_candidate:
+            fc2_n_chunks = (n // 2 + 127) // 128
             micro_intermediate_elements = max(
                 micro_intermediate_elements,
-                direct_micro_tokens * num_topk * k + direct_micro_tokens * num_topk * (n // 2),
+                direct_micro_tokens * num_topk * k + direct_micro_tokens * num_topk * fc2_n_chunks * 128,
             )
         return _TPCoreWorkspacePlan(
             implementation=implementation,
@@ -810,7 +811,7 @@ def _plan_core_workspace(
                 _TensorAllocSpec("weight_expert_ids", (state_E,), torch.int32, init="arange"),
                 _TensorAllocSpec("global_to_local_expert", (weight_E,), torch.int32),
                 _TensorAllocSpec("compact_topk_ids", (state_E,), torch.int32),
-                _TensorAllocSpec("micro_intermediate", (micro_intermediate_elements,), torch.float32),
+                _TensorAllocSpec("micro_intermediate", (micro_intermediate_elements,), torch.float32, init="zeros"),
             ),
         )
 

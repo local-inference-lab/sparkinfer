@@ -418,7 +418,7 @@ def load_expert_weights(
     loader = IndexedSafetensorLoader(model_path)
 
     if checkpoint_family in {"qwen", "glm"}:
-        if activation != "silu":
+        if checkpoint_family == "glm" and activation != "silu":
             raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
         if checkpoint_family == "qwen":
             cfg_num_experts = cfg["num_experts"]
