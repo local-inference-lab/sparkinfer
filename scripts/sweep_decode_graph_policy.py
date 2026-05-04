@@ -38,6 +38,7 @@ from benchmarks.benchmark_paged_attention import (
     _mean_ci,
     _quantize_paged_kv_cache_global_e4m3,
     _resolve_kv_dtype,
+    _resolve_qkv_weight_dtype,
     clear_attention_caches,
     require_sm120,
 )
@@ -481,7 +482,7 @@ def _worker_cache_key(
         str(args.mode),
         int(args.q_seqlen),
         normalize_kv_dtype_key(args.kv_dtype),
-        str(args.b12x_attn_mode),
+        str(args.qkv_weight_dtype),
         int(args.batch),
         int(args.capture_page_count),
         int(args.page_size),
@@ -722,7 +723,7 @@ def _capture_cta_context(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=False,
-        attn_mode=args.b12x_attn_mode,
+        qkv_weight_dtype=_resolve_qkv_weight_dtype(args.qkv_weight_dtype),
     )
     assert workspace._plan_q is not None
     assert workspace._plan_k_cache is not None
@@ -2207,7 +2208,7 @@ def main() -> None:
     parser.add_argument("--chunk-fill-window-relative-pad", type=float, default=0.10)
     parser.add_argument("--chunk-fill-window-absolute-pad", type=int, default=10)
     parser.add_argument("--fixed-cta", type=int, default=0)
-    parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
+    parser.add_argument("--qkv-weight-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
     parser.add_argument("--kv-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
     parser.add_argument("--parallel-workers", type=int, default=0)
     parser.add_argument("--output", type=str, default="")

@@ -337,7 +337,7 @@ class ContiguousAttentionForwardKernel:
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         paged_direct_q_seqlen: int = 0,
-        mxfp8_pv: Optional[bool] = None,
+        use_native_fp8_pv_mma: Optional[bool] = None,
     ):
         self.dtype = dtype
         self.kv_dtype = dtype if kv_dtype is None else kv_dtype
@@ -376,22 +376,17 @@ class ContiguousAttentionForwardKernel:
             "SM120 paged KV cp.async path does not support irregular head dim"
         )
         self.kv_is_fp8 = self.kv_dtype == cutlass.Float8E4M3FN
-        # MXFP8 block-scaled MMA for PV accumulation ("turbo" mode).
-        # Quantizes P (BF16 softmax) to E4M3 and uses SM120's native MXFP8
-        # m16n8k32 MMA for 2x K-throughput. Slight accuracy trade-off
-        # (cos ~0.9978 vs ~0.9999 for the BF16 dequant path).
-        # Requires tile_n divisible by 32.
-        #   mxfp8_pv=None  -> default off (use BF16 dequant path)
-        #   mxfp8_pv=True  -> force enable turbo (asserts requirements)
-        #   mxfp8_pv=False -> force disable (use BF16 dequant path)
-        if mxfp8_pv is None:
-            self.use_mxfp8_pv = False
-        elif mxfp8_pv:
-            assert self.kv_is_fp8, "mxfp8_pv requires FP8 KV cache"
-            assert tile_n % 32 == 0, "mxfp8_pv requires tile_n divisible by 32"
-            self.use_mxfp8_pv = True
+        # Native MXFP8 block-scaled MMA for PV accumulation in FP8-weight regimes.
+        # Default remains the BF16 dequant path because contiguous integration does
+        # not yet carry projection-weight dtype metadata.
+        if use_native_fp8_pv_mma is None:
+            self.use_native_fp8_pv_mma = False
+        elif use_native_fp8_pv_mma:
+            assert self.kv_is_fp8, "native FP8 PV MMA requires FP8 KV cache"
+            assert tile_n % 32 == 0, "native FP8 PV MMA requires tile_n divisible by 32"
+            self.use_native_fp8_pv_mma = True
         else:
-            self.use_mxfp8_pv = False
+            self.use_native_fp8_pv_mma = False
         self.paged_direct_q_seqlen = paged_direct_q_seqlen
 
     def _check_type(
@@ -1550,7 +1545,7 @@ class ContiguousAttentionForwardKernel:
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
-        if const_expr(self.use_mxfp8_pv):
+        if const_expr(self.use_native_fp8_pv_mma):
             warp_mma_gemm_rs_mxfp8(
                 acc_O,
                 tOrP,

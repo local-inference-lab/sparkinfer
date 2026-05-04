@@ -88,7 +88,7 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         capture_fixed_split_pages=policy.capture_fixed_split_pages,
         replay_fixed_split_pages=policy.replay_fixed_split_pages,
         warmup=1,
-        b12x_attn_mode="default",
+        qkv_weight_dtype=torch.bfloat16,
         graph_ctas_per_sm=policy.graph_ctas_per_sm,
     )
     fa2_bucket = _capture_flashinfer_decode_graph_bucket(

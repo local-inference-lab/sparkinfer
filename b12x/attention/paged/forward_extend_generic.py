@@ -2205,8 +2205,8 @@ class PagedForwardKernel:
         dtype_o: Type[cutlass.Numeric],
         *,
         traits: PagedForwardTraits,
-        mxfp8_turbo: bool = False,
-        enable_mxfp8_pv: bool = False,
+        use_native_fp8_qk: bool = False,
+        use_native_fp8_pv: bool = False,
         enable_paged_kv_tma: bool = False,
         window_left: int = -1,
         has_attention_sink_bias: bool = False,
@@ -2353,15 +2353,15 @@ class PagedForwardKernel:
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * traits.head_dim_qk * (dtype_kv_storage.width // 8)
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * traits.head_dim_vo * (dtype_kv_storage.width // 8)
         self.kv_tma_desc_words_per_head = 16
-        self.use_mxfp8_qk = (
-            mxfp8_turbo
+        self.use_native_fp8_qk_mma = (
+            use_native_fp8_qk
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
             and traits.head_dim_qk % 32 == 0
             and traits.num_mma_d_qk % 2 == 0
         )
-        self.use_mxfp8_pv = (
-            enable_mxfp8_pv
+        self.use_native_fp8_pv_mma = (
+            use_native_fp8_pv
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
             and traits.num_warps_kv == 1
@@ -3995,7 +3995,7 @@ class PagedForwardKernel:
             subtile_base = Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             for _ in cutlass.range_constexpr(1):
                 p_frag.fill(Uint32(0))
-                if const_expr(self.use_mxfp8_qk):
+                if const_expr(self.use_native_fp8_qk_mma):
                     k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
                     frag_S = cute.make_rmem_tensor(
                         cute.make_layout(
@@ -4555,7 +4555,7 @@ class PagedForwardKernel:
                         )
                     _exit_thread()
 
-                if const_expr(self.use_mxfp8_pv):
+                if const_expr(self.use_native_fp8_pv_mma):
                     v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
                     _literal_pv_mma_into_ofrag_mxfp8_raw(
                         o_frag,
@@ -5839,8 +5839,8 @@ def _torch_to_cutlass_storage_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]
 
 def build_extend_forward_kernel(
     traits: PagedForwardTraits,
-    mxfp8_turbo: bool,
-    enable_mxfp8_pv: bool,
+    use_native_fp8_qk: bool,
+    use_native_fp8_pv: bool,
     *,
     window_left: int = -1,
     has_attention_sink_bias: bool = False,
@@ -5852,8 +5852,8 @@ def build_extend_forward_kernel(
         _torch_to_cutlass_storage_dtype(traits.kv_dtype),
         _torch_to_cutlass_dtype(traits.o_dtype),
         traits=traits,
-        mxfp8_turbo=mxfp8_turbo,
-        enable_mxfp8_pv=enable_mxfp8_pv,
+        use_native_fp8_qk=use_native_fp8_qk,
+        use_native_fp8_pv=use_native_fp8_pv,
         enable_paged_kv_tma=enable_paged_kv_tma,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,

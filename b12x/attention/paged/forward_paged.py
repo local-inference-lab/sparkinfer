@@ -2103,7 +2103,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
 
 
 class PagedForwardKernel:
-    DECODE_MXFP8_RUNTIME_CHUNK_THRESHOLD = 11 * 64
+    DECODE_NATIVE_FP8_RUNTIME_CHUNK_THRESHOLD = 11 * 64
 
     def __init__(
         self,
@@ -2118,10 +2118,10 @@ class PagedForwardKernel:
         single_request_decode_graph: bool = False,
         single_qtile_decode_graph: bool = False,
         regularized_decode_graph: bool = False,
-        mxfp8_turbo: bool = False,
-        enable_mxfp8_pv: bool = False,
+        use_native_fp8_qk: bool = False,
+        use_native_fp8_pv: bool = False,
         decode_only: bool = False,
-        decode_mxfp8_runtime_chunk_guard: bool = False,
+        decode_native_fp8_runtime_chunk_guard: bool = False,
         window_left: int = -1,
         has_attention_sink_bias: bool = False,
     ):
@@ -2246,21 +2246,23 @@ class PagedForwardKernel:
         self.kv_tma_copy_bytes_v = (
             self.stage_tile_rows * self.v_tma_plane_count * self.kv_tma_plane_head_dim * kv_storage_bytes
         )
-        self.use_mxfp8_qk = (
-            mxfp8_turbo
+        self.use_native_fp8_qk_mma = (
+            use_native_fp8_qk
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
             and traits.head_dim_qk % 32 == 0
             and traits.num_mma_d_qk % 2 == 0
         )
-        self.use_mxfp8_pv = (
-            enable_mxfp8_pv
+        self.use_native_fp8_pv_mma = (
+            use_native_fp8_pv
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
             and traits.num_warps_kv == 1
             and traits.num_mma_kv % 2 == 0
         )
-        self.decode_mxfp8_runtime_chunk_guard = self.use_mxfp8_qk and decode_only and decode_mxfp8_runtime_chunk_guard
+        self.decode_native_fp8_runtime_chunk_guard = (
+            self.use_native_fp8_qk_mma and decode_only and decode_native_fp8_runtime_chunk_guard
+        )
         self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
 
     def _get_shared_storage_cls(self):
@@ -3608,7 +3610,7 @@ class PagedForwardKernel:
                         sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     )
                     k_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
-                    if const_expr(self.use_mxfp8_qk and not self.decode_mxfp8_runtime_chunk_guard):
+                    if const_expr(self.use_native_fp8_qk_mma and not self.decode_native_fp8_runtime_chunk_guard):
                         _literal_qk_mma_into_sfrag_mxfp8_raw(
                             frag_S,
                             q_smem_base_addr,
@@ -3623,8 +3625,8 @@ class PagedForwardKernel:
                             tc_upcast_stride_qk,
                             self.traits.upcast_stride_k,
                         )
-                    elif const_expr(self.use_mxfp8_qk and self.decode_mxfp8_runtime_chunk_guard):
-                        if kv_chunk_size >= Int32(self.DECODE_MXFP8_RUNTIME_CHUNK_THRESHOLD):
+                    elif const_expr(self.use_native_fp8_qk_mma and self.decode_native_fp8_runtime_chunk_guard):
+                        if kv_chunk_size >= Int32(self.DECODE_NATIVE_FP8_RUNTIME_CHUNK_THRESHOLD):
                             _literal_qk_mma_into_sfrag_mxfp8_raw(
                                 frag_S,
                                 q_smem_base_addr,
@@ -4061,7 +4063,7 @@ class PagedForwardKernel:
                         )
                     _exit_thread()
 
-                if const_expr(self.use_mxfp8_pv):
+                if const_expr(self.use_native_fp8_pv_mma):
                     v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
                     _literal_pv_mma_into_ofrag_mxfp8_raw(
                         o_frag,

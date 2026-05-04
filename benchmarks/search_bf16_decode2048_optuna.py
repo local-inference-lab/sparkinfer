@@ -271,7 +271,6 @@ def _materialize_current_plan(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=True,
-        attn_mode="default",
     )
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     return workspace.plan
@@ -316,7 +315,6 @@ def _capture_b12x_graph(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=True,
-        attn_mode="default",
     )
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 

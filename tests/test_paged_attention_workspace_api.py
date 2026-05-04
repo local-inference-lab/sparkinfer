@@ -7,7 +7,7 @@ import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
-from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_mxfp8_turbo_flags
+from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_native_fp8_attention_mma_flags
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
@@ -134,7 +134,7 @@ def _make_workspace(
     v_cache: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     use_cuda_graph: bool = False,
-    attn_mode: str | None = None,
+    qkv_weight_dtype: torch.dtype | None = None,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
         mode=infer_paged_attention_mode(cu_seqlens_q),
@@ -142,7 +142,7 @@ def _make_workspace(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=use_cuda_graph,
-        attn_mode=attn_mode,
+        qkv_weight_dtype=qkv_weight_dtype,
     )
 
 
@@ -235,7 +235,7 @@ def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     assert plan.page_table_shape == tuple(page_table.shape)
 
 
-def test_paged_workspace_preserves_opt_in_attention_mode() -> None:
+def test_paged_workspace_preserves_qkv_weight_dtype() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -251,24 +251,27 @@ def test_paged_workspace_preserves_opt_in_attention_mode() -> None:
         v_cache=v_cache,
         cu_seqlens_q=cu_seqlens_q,
         use_cuda_graph=True,
-        attn_mode="turbo",
+        qkv_weight_dtype=torch.float8_e4m3fn,
     )
 
-    assert workspace.attn_mode == "turbo"
+    assert workspace.qkv_weight_dtype == torch.float8_e4m3fn
     assert workspace.use_cuda_graph is True
 
 
 @pytest.mark.parametrize(
-    ("batch", "cache_len", "expect_turbo"),
+    ("qkv_weight_dtype", "batch", "cache_len", "expect_native_fp8_qk"),
     [
-        (2, 16384, True),
-        (4, 16384, False),
+        (torch.float8_e4m3fn, 2, 16384, True),
+        (torch.float8_e4m3fn, 4, 16384, False),
+        (torch.bfloat16, 2, 16384, False),
+        (None, 2, 16384, False),
     ],
 )
-def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime_eager(
+def test_decode_native_fp8_attention_dispatch_tracks_weight_dtype_batch_and_chunk_regime_eager(
+    qkv_weight_dtype: torch.dtype | None,
     batch: int,
     cache_len: int,
-    expect_turbo: bool,
+    expect_native_fp8_qk: bool,
 ) -> None:
     require_sm120()
     clear_attention_caches()
@@ -292,21 +295,23 @@ def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime_eager(
         v_cache=v_fp8,
         cu_seqlens_q=cu_seqlens_q,
         use_cuda_graph=False,
-        attn_mode="turbo",
+        qkv_weight_dtype=qkv_weight_dtype,
     )
     workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
 
-    mxfp8_turbo, enable_mxfp8_pv, decode_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
-        attn_mode=workspace.attn_mode,
+    use_native_fp8_qk, use_native_fp8_pv, decode_runtime_chunk_guard = _resolve_native_fp8_attention_mma_flags(
+        qkv_weight_dtype=workspace.qkv_weight_dtype,
         plan=workspace.plan,
     )
 
     assert workspace.plan.mode == "decode"
     assert workspace.plan.kv_dtype == torch.float8_e4m3fn
     assert (workspace.plan.kv_chunk_size < 11 * workspace.plan.page_size) == (cache_len == 16384)
-    assert mxfp8_turbo is expect_turbo
-    assert enable_mxfp8_pv is (expect_turbo and workspace.plan.kv_chunk_size <= 384)
+    assert use_native_fp8_qk is expect_native_fp8_qk
+    assert use_native_fp8_pv is (expect_native_fp8_qk and workspace.plan.kv_chunk_size <= 384)
     assert decode_runtime_chunk_guard is False
+
+
 def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
     require_sm120()
     clear_attention_caches()

@@ -6,7 +6,6 @@ from collections import OrderedDict
 from functools import lru_cache
 import os
 import warnings
-from typing import Literal
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -25,8 +24,8 @@ from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
-_DECODE_MXFP8_TURBO_MAX_SMALL_BATCH = 2
-_DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES = 11
+_DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
+_DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -67,33 +66,36 @@ def _as_int32_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.dtype == torch.int32 else tensor.to(torch.int32)
 
 
-def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
-    if attn_mode == "turbo":
-        return True
-    if attn_mode == "default":
-        return False
-    return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
-
-
-def _resolve_mxfp8_turbo_flags(
+def _uses_native_fp8_attention_mma(
     *,
-    attn_mode: Literal["default", "turbo"] | None,
+    qkv_weight_dtype: torch.dtype | None,
+    plan,
+) -> bool:
+    return qkv_weight_dtype == torch.float8_e4m3fn and plan.kv_dtype == torch.float8_e4m3fn
+
+
+def _resolve_native_fp8_attention_mma_flags(
+    *,
+    qkv_weight_dtype: torch.dtype | None,
     plan,
 ) -> tuple[bool, bool, bool]:
-    mxfp8_turbo = _attn_turbo_enabled(attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
+    use_native_fp8_qk = _uses_native_fp8_attention_mma(
+        qkv_weight_dtype=qkv_weight_dtype,
+        plan=plan,
+    )
     decode_runtime_chunk_guard = False
     if (
-        mxfp8_turbo
+        use_native_fp8_qk
         and plan.mode in ("decode", "verify")
     ):
         if (
-            plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH
-            and plan.kv_chunk_size < _DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES * plan.page_size
+            plan.total_q > _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH
+            and plan.kv_chunk_size < _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES * plan.page_size
         ):
-            # Mid-batch short-chunk decode picks up most of turbo's numeric loss for negligible replay gain.
-            mxfp8_turbo = False
-    enable_mxfp8_pv = mxfp8_turbo and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
-    return mxfp8_turbo, enable_mxfp8_pv, decode_runtime_chunk_guard
+            # Mid-batch short-chunk decode sees the native FP8 QK loss without enough replay gain.
+            use_native_fp8_qk = False
+    use_native_fp8_pv = use_native_fp8_qk and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
+    return use_native_fp8_qk, use_native_fp8_pv, decode_runtime_chunk_guard
 
 
 @lru_cache(maxsize=16)
@@ -298,10 +300,10 @@ def _build_forward_kernel(
     single_request_decode_graph: bool,
     single_qtile_decode_graph: bool,
     regularized_decode_graph: bool,
-    mxfp8_turbo: bool,
-    enable_mxfp8_pv: bool,
+    use_native_fp8_qk: bool,
+    use_native_fp8_pv: bool,
     decode_only: bool,
-    decode_mxfp8_runtime_chunk_guard: bool,
+    decode_native_fp8_runtime_chunk_guard: bool,
     window_left: int,
     has_attention_sink_bias: bool,
 ) -> PagedForwardKernel:
@@ -316,10 +318,10 @@ def _build_forward_kernel(
         single_request_decode_graph=single_request_decode_graph,
         single_qtile_decode_graph=single_qtile_decode_graph,
         regularized_decode_graph=regularized_decode_graph,
-        mxfp8_turbo=mxfp8_turbo,
-        enable_mxfp8_pv=enable_mxfp8_pv,
+        use_native_fp8_qk=use_native_fp8_qk,
+        use_native_fp8_pv=use_native_fp8_pv,
         decode_only=decode_only,
-        decode_mxfp8_runtime_chunk_guard=decode_mxfp8_runtime_chunk_guard,
+        decode_native_fp8_runtime_chunk_guard=decode_native_fp8_runtime_chunk_guard,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
     )
@@ -328,15 +330,15 @@ def _build_forward_kernel(
 @lru_cache(maxsize=32)
 def _build_extend_forward_kernel(
     traits: PagedForwardTraits,
-    mxfp8_turbo: bool,
-    enable_mxfp8_pv: bool,
+    use_native_fp8_qk: bool,
+    use_native_fp8_pv: bool,
     window_left: int,
     has_attention_sink_bias: bool,
 ) -> object:
     return build_extend_forward_kernel(
         traits,
-        mxfp8_turbo,
-        enable_mxfp8_pv,
+        use_native_fp8_qk,
+        use_native_fp8_pv,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
     )
@@ -425,17 +427,19 @@ def paged_attention_forward(
             attention_sink_bias = attention_sink_bias.contiguous()
 
     traits = select_paged_forward_traits_from_plan(plan)
-    mxfp8_turbo, enable_mxfp8_pv, decode_mxfp8_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
-        attn_mode=workspace.attn_mode,
-        plan=plan,
+    use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard = (
+        _resolve_native_fp8_attention_mma_flags(
+            qkv_weight_dtype=workspace.qkv_weight_dtype,
+            plan=plan,
+        )
     )
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
         forward_kernel = _build_extend_forward_kernel(
             traits,
-            mxfp8_turbo,
-            enable_mxfp8_pv,
+            use_native_fp8_qk,
+            use_native_fp8_pv,
             plan.window_left,
             has_attention_sink_bias,
         )
@@ -470,10 +474,10 @@ def paged_attention_forward(
             single_request_decode_graph,
             single_qtile_decode_graph,
             regularized_decode_graph,
-            mxfp8_turbo,
-            enable_mxfp8_pv,
+            use_native_fp8_qk,
+            use_native_fp8_pv,
             plan.mode == "decode",
-            decode_mxfp8_runtime_chunk_guard,
+            decode_native_fp8_runtime_chunk_guard,
             plan.window_left,
             has_attention_sink_bias,
         )
