@@ -847,7 +847,6 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
-        active_width_hint=graph_pages * PAGE_SIZE,
     )
 
     def prepare(real_page_table: torch.Tensor, seqlens: torch.Tensor) -> None:
@@ -1493,7 +1492,6 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
-        active_width_hint=graph_pages * PAGE_SIZE,
     )
 
     def prepare(
@@ -2204,7 +2202,6 @@ def _run_sglang_paged_graph(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
-        active_width_hint=graph_pages * PAGE_SIZE,
     )
     indexer_metadata = _make_sglang_paged_metadata(
         sglang=sglang,

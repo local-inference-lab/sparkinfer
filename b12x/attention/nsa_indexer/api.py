@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -38,18 +39,11 @@ from .tiled_topk import (
 
 
 _INDEX_HEAD_DIM = 128
+_VALIDATE_PAGE_IDS = bool(int(os.getenv("B12X_NSA_VALIDATE_PAGE_IDS", "0")))
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-
-
-def _infer_active_width_hint(cache_seqlens_int32: torch.Tensor) -> int | None:
-    if cache_seqlens_int32.numel() == 0:
-        return 0
-    if _is_cuda_graph_capture_active(cache_seqlens_int32.device):
-        return None
-    return max(int(cache_seqlens_int32.amax().item()), 0)
 
 
 @dataclass(frozen=True)
@@ -57,15 +51,6 @@ class NSAIndexerPagedDecodeMetadata:
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     paged_mqa_schedule_metadata: torch.Tensor | None = None
-    active_width_hint: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.active_width_hint is None:
-            object.__setattr__(
-                self,
-                "active_width_hint",
-                _infer_active_width_hint(self.cache_seqlens_int32),
-            )
 
 
 @dataclass(frozen=True)
@@ -361,11 +346,14 @@ def sparse_nsa_index_decode_logits_paged(
     else:
         seqlens_valid = metadata.cache_seqlens_int32.contiguous()
     active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
-    max_page_capacity = index_k_cache.shape[0]
 
-    if not _is_cuda_graph_capture_active(q_fp8.device):
+    validate_page_ids = q_fp8.device.type != "cuda" or (
+        _VALIDATE_PAGE_IDS and not _is_cuda_graph_capture_active(q_fp8.device)
+    )
+    if validate_page_ids:
         active_width_host = min(width_tokens, int(active_width.item()))
         if active_width_host > 0:
+            max_page_capacity = index_k_cache.shape[0]
             positions = torch.arange(
                 active_width_host,
                 dtype=torch.int32,
@@ -423,7 +411,6 @@ def sparse_nsa_index_decode_logits_paged(
         seqlens_per_query=seqlens_valid,
         schedule_metadata=schedule_metadata,
         active_width=active_width,
-        active_width_hint=metadata.active_width_hint,
         page_size=page_size,
         contract_phantoms=contract_phantoms,
         workspace=workspace,

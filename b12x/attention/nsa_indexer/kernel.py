@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from functools import lru_cache
-import os
 import warnings
 
 import cuda.bindings.driver as cuda
@@ -207,26 +206,11 @@ def _resolve_sparse_nsa_persistent_ctas(
     *,
     device_index: int,
     q_rows: int,
-    num_heads: int,
-    width_tokens: int,
-    active_width_hint: int | None,
 ) -> int:
     persistent_ctas = _default_sparse_nsa_persistent_ctas(device_index)
-    live_width = None
-    live_pages = None
-    if active_width_hint is not None:
-        live_width = min(max(int(active_width_hint), 0), int(width_tokens))
-        live_pages = (live_width + _PAGE_SIZE - 1) // _PAGE_SIZE
-    if q_rows > 1 and live_pages is not None and live_pages >= 512:
-        persistent_ctas = max(persistent_ctas // q_rows, 1)
-    elif q_rows >= 4:
+    if q_rows >= 4:
         persistent_ctas = max(persistent_ctas // 2, 1)
-    if active_width_hint is None:
-        return persistent_ctas
-    assert live_pages is not None
-    del num_heads
-    max_work = max(live_pages, 1)
-    return min(persistent_ctas, max_work)
+    return persistent_ctas
 
 
 def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
@@ -1503,7 +1487,6 @@ def run_sparse_nsa_paged_logits_kernel(
     seqlens_per_query: torch.Tensor,
     schedule_metadata: torch.Tensor | None,
     active_width: torch.Tensor | None = None,
-    active_width_hint: int | None = None,
     page_size: int = _PAGE_SIZE,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
@@ -1662,9 +1645,6 @@ def run_sparse_nsa_paged_logits_kernel(
         persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
             device_index=device_index,
             q_rows=rows,
-            num_heads=q_fp8.shape[1],
-            width_tokens=width_tokens,
-            active_width_hint=active_width_hint,
         )
         kernel = _build_sparse_nsa_paged_kernel(persistent_ctas, q_fp8.shape[1])
         args = (
