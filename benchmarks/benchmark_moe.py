@@ -1030,7 +1030,7 @@ def allocate_layer_chain_workspace(
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     *,
-    quant_mode: str,
+    quant_mode: str = "nvfp4",
 ):
     from b12x.integration.tp_moe import allocate_tp_moe_workspace
 
@@ -1057,7 +1057,7 @@ def run_moe_layer_chain(
     *,
     activation: str,
     fast_math: bool,
-    quant_mode: str,
+    quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
@@ -1111,7 +1111,7 @@ def capture_moe_layer_chain(
     *,
     activation: str,
     fast_math: bool,
-    quant_mode: str,
+    quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor],
     workspace,
 ) -> torch.cuda.CUDAGraph:
