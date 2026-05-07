@@ -402,6 +402,83 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
     assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
 
+def test_sparse_mla_large_bs1_extend_prefers_single_pass(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    q_rows = 2048
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=2048,
+        max_total_q=q_rows,
+        max_batch=1,
+    )
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=64)
+
+    def fail_run_split_decode(**kwargs):
+        del kwargs
+        raise AssertionError("large bs=1 extend should prefer the single-pass kernel")
+
+    def fake_run_sparse_mla_kernel(**kwargs):
+        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
+        kwargs["output"].zero_()
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.supports_sparse_mla_kernel",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fail_run_split_decode,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_kernel",
+        fake_run_sparse_mla_kernel,
+    )
+
+    q_all = torch.ones((q_rows, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.zeros((q_rows, 2048), dtype=torch.int32)
+    cache_seqlens = torch.full((1,), 2048, dtype=torch.int32)
+    nsa_cache_seqlens = torch.full((q_rows,), 2048, dtype=torch.int32)
+    nsa_cu = torch.tensor([0, q_rows], dtype=torch.int32)
+    metadata = MLASparseExtendMetadata(
+        selected_token_offsets=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=q_rows,
+        max_seq_len_k=2048,
+        mode="extend",
+    )
+
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=1.0,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (q_rows, 8, 256)
+    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
+
+
 def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> None:
     workspace = _make_workspace(mode="extend", topk=6)
     captured: dict[str, object] = {}

@@ -26,6 +26,8 @@ from .workspace import B12XAttentionWorkspace
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
+_MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
+_MLA_SINGLE_PASS_TARGET_TOPK = 2048
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,13 @@ def _apply_mla_prefill_strategy(
         return None
     if strategy == "split":
         return split_cfg
+    if (
+        workspace.mode in ("extend", "verify", "draft_extend")
+        and int(workspace.max_batch) == 1
+        and int(q_rows) >= _MLA_SINGLE_PASS_TARGET_Q_ROWS
+        and int(topk_width) >= _MLA_SINGLE_PASS_TARGET_TOPK
+    ):
+        return None
 
     return split_cfg
 
