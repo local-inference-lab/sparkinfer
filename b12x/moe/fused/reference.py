@@ -34,6 +34,7 @@ class MoERouteTrace:
     int_dequant: torch.Tensor
     down_out: torch.Tensor
     routed_out: torch.Tensor
+    routed_out_accum: torch.Tensor
 
 
 def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> OracleMetrics:
@@ -215,8 +216,10 @@ def _trace_nvfp4_route(
         I_tp,
         block_size=block_size,
     )
-    down_out = ((down_dequant @ int_dequant) * alpha_fc2).to(torch.bfloat16)
+    down_out_f32 = (down_dequant @ int_dequant) * alpha_fc2
+    down_out = down_out_f32.to(torch.bfloat16)
     routed_out = (router_weight * down_out.float()).to(torch.bfloat16)
+    routed_out_accum = down_out_f32 * router_weight
     return MoERouteTrace(
         token_idx=token_idx,
         route_idx=route_idx,
@@ -235,6 +238,7 @@ def _trace_nvfp4_route(
         int_dequant=int_dequant,
         down_out=down_out,
         routed_out=routed_out,
+        routed_out_accum=routed_out_accum,
     )
 
 
@@ -419,8 +423,7 @@ def moe_reference_nvfp4(
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     m = x.shape[0]
     top_k = topk_ids.shape[1]
-    output = torch.zeros(m, K, dtype=torch.bfloat16, device=x.device)
-    contribs: list[list[tuple[int, torch.Tensor]]] = [[] for _ in range(E)]
+    output = torch.zeros(m, K, dtype=torch.float32, device=x.device)
 
     for t in range(m):
         for k_idx in range(top_k):
@@ -445,10 +448,6 @@ def moe_reference_nvfp4(
                 activation=activation,
             )
             assert trace.expert_idx == eid
-            contribs[eid].append((t, trace.routed_out))
+            output[t] += trace.routed_out_accum
 
-    for eid in range(E):
-        for t, contrib in contribs[eid]:
-            output[t] = (output[t].float() + contrib.float()).to(torch.bfloat16)
-
-    return output
+    return output.to(torch.bfloat16)

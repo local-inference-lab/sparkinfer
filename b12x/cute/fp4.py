@@ -1852,6 +1852,37 @@ def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def nvfp4_raw_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute block_amax / (6 * global_scale) with CUDA tensor-scalar semantics."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(block_amax).ir_value(loc=loc, ip=ip),
+                Float32(global_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .f64 amax_d, gs_d, denom_d, q_d, six_d;
+                cvt.f64.f32 amax_d, $1;
+                cvt.f64.f32 gs_d, $2;
+                mov.f64 six_d, 0d4018000000000000;
+                mul.rn.f64 denom_d, gs_d, six_d;
+                div.rn.f64 q_d, amax_d, denom_d;
+                cvt.rn.f32.f64 $0, q_d;
+            }
+            """,
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert FP8 E4M3 to float32."""
     return Float32(
@@ -2124,10 +2155,10 @@ def cvt_fp32x2_to_e2m1x2(v0: Float32, v1: Float32, *, loc=None, ip=None) -> Uint
 
 @cute.jit
 def quant_dequant_2(
-    v0: Float32, v1: Float32, sf_f32: Float32, inv_scale: Float32
+    v0: Float32, v1: Float32, sf_f32: Float32, eff_scale: Float32
 ) -> Tuple[Float32, Float32]:
     """Quantize-dequantize pair roundtrip through FP4."""
-    fp4_byte = cvt_fp32x2_to_e2m1x2(v0 * inv_scale, v1 * inv_scale)
+    fp4_byte = cvt_fp32x2_to_e2m1x2(v0 / eff_scale, v1 / eff_scale)
     h2 = fp4_decode_2(fp4_byte)
     f0, f1 = f16x2_to_f32x2(h2)
     return f0 * sf_f32, f1 * sf_f32
@@ -2470,6 +2501,59 @@ def fp4_dot8_sum(
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@cute.jit
+def _f16x2_dot_sum_f32acc(a_h2: Uint32, b_h2: Uint32) -> Float32:
+    a0, a1 = f16x2_to_f32x2(a_h2)
+    b0, b1 = f16x2_to_f32x2(b_h2)
+    return a0 * b0 + a1 * b1
+
+
+@cute.jit
+def fp4_dot4_sum_f32acc(
+    u_packed: Uint32,
+    x0: Uint32,
+    x1: Uint32,
+    x2: Uint32,
+    x3: Uint32,
+) -> Float32:
+    """FP4 dot product using f32 accumulation after FP4 decode."""
+    h0, h1, h2, h3 = fp4_decode_4bytes(u_packed)
+    return (
+        _f16x2_dot_sum_f32acc(h0, x0)
+        + _f16x2_dot_sum_f32acc(h1, x1)
+        + _f16x2_dot_sum_f32acc(h2, x2)
+        + _f16x2_dot_sum_f32acc(h3, x3)
+    )
+
+
+@cute.jit
+def fp4_dot8_sum_f32acc(
+    u_a: Uint32,
+    u_b: Uint32,
+    x0: Uint32,
+    x1: Uint32,
+    x2: Uint32,
+    x3: Uint32,
+    x4: Uint32,
+    x5: Uint32,
+    x6: Uint32,
+    x7: Uint32,
+) -> Float32:
+    """FP4 dot product using f32 accumulation after FP4 decode."""
+    h0, h1, h2, h3 = fp4_decode_4bytes(u_a)
+    h4, h5, h6, h7 = fp4_decode_4bytes(u_b)
+    return (
+        _f16x2_dot_sum_f32acc(h0, x0)
+        + _f16x2_dot_sum_f32acc(h1, x1)
+        + _f16x2_dot_sum_f32acc(h2, x2)
+        + _f16x2_dot_sum_f32acc(h3, x3)
+        + _f16x2_dot_sum_f32acc(h4, x4)
+        + _f16x2_dot_sum_f32acc(h5, x5)
+        + _f16x2_dot_sum_f32acc(h6, x6)
+        + _f16x2_dot_sum_f32acc(h7, x7)
     )
 
 
