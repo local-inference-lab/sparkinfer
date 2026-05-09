@@ -123,19 +123,26 @@ def test_w4a16_workspace_plan_uses_bf16_activation_scratch() -> None:
     )
     dynamic_specs = {spec.name: spec for spec in dynamic_plan.tensor_specs}
     assert dynamic_plan.quant_mode == "w4a16"
-    assert dynamic_specs["packed_input"].shape == (1, 256, 16)
+    assert dynamic_specs["packed_input"].shape == (
+        1,
+        2 * tp_moe._dynamic_tile_m("w4a16"),
+        16,
+    )
     assert dynamic_specs["packed_input"].dtype == torch.bfloat16
 
 
 def test_w4a16_dynamic_geometry_uses_bf16_tile_contract() -> None:
+    tile_m = tp_moe._dynamic_tile_m("w4a16")
     tile_n = tp_moe._dynamic_tile_n("w4a16")
     max_tiles, gate_tile_cnt, max_tasks = tp_moe._dynamic_task_geometry(
         8,
         256,
         641,
+        tile_m=tile_m,
         tile_n=tile_n,
     )
 
+    assert tile_m == 32
     assert tile_n == 64
     assert gate_tile_cnt == 4
     assert max_tasks == max_tiles * 4

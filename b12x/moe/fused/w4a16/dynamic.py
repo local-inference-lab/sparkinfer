@@ -280,7 +280,7 @@ class MoEDynamicKernelBackend:
         # tile that phase 2 consumes.
         tile_k = mma_tiler_mn[1]
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
-        self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
+        self.sa_tile_shape_mk = (mma_tiler_mn[0], tile_k)
         self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
         self.cluster_shape_mnk = (1, 1, 1)
         self.cluster_shape_mn = (1, 1)

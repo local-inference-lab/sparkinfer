@@ -49,7 +49,8 @@ _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
-_W4A16_LEVEL_TILE_N = 32
+_W4A16_LEVEL_TILE_M = 32
+_W4A16_LEVEL_TILE_N = 64
 _DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 
@@ -403,6 +404,10 @@ def _dynamic_tile_n(quant_mode: str = "nvfp4") -> int:
     return _W4A16_LEVEL_TILE_N if _normalize_quant_mode(quant_mode) == "w4a16" else _LEVEL_TILE_N
 
 
+def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
+    return _W4A16_LEVEL_TILE_M if _normalize_quant_mode(quant_mode) == "w4a16" else _LEVEL_TILE_M
+
+
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -677,22 +682,24 @@ def _safe_dynamic_max_rows_per_launch(
     active-expert envelope, so it reserves `E - 1` extra 128-row tiles in that
     large-row regime.
     """
+    tile_m = _dynamic_tile_m(quant_mode)
     rows_padded_limit = _dynamic_rows_padded_limit(k, quant_mode=quant_mode)
-    extra_rows = max(0, E - 1) * _LEVEL_TILE_M
+    extra_rows = max(0, E - 1) * tile_m
     safe_rows = rows_padded_limit - extra_rows
     if safe_rows <= 0:
-        return _LEVEL_TILE_M
-    return max(_LEVEL_TILE_M, safe_rows - (safe_rows % _LEVEL_TILE_M))
+        return tile_m
+    return max(tile_m, safe_rows - (safe_rows % tile_m))
 
 
 def _dynamic_rows_padded_limit(k: int, *, quant_mode: str = "nvfp4") -> int:
+    tile_m = _dynamic_tile_m(quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     input_cols = k if _normalize_quant_mode(quant_mode) == "w4a16" else k // 2
     rows_padded_limit = min(
         _RUNTIME_MEMREF_LIMIT // max(1, input_cols),
         _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
     )
-    return rows_padded_limit - (rows_padded_limit % _LEVEL_TILE_M)
+    return rows_padded_limit - (rows_padded_limit % tile_m)
 
 
 def _safe_dynamic_token_chunk(
@@ -703,9 +710,10 @@ def _safe_dynamic_token_chunk(
     quant_mode: str = "nvfp4",
 ) -> int:
     """Largest token chunk that fits the compact dynamic launch ABI."""
+    tile_m = _dynamic_tile_m(quant_mode)
     safe_rows = _safe_dynamic_max_rows_per_launch(E, k, n, quant_mode)
     max_tokens = max(1, safe_rows // max(1, num_topk))
-    while max_tokens > 1 and align_up(max_tokens * num_topk, _LEVEL_TILE_M) > safe_rows:
+    while max_tokens > 1 and align_up(max_tokens * num_topk, tile_m) > safe_rows:
         max_tokens -= 1
     return max_tokens
 
@@ -736,6 +744,7 @@ def _eager_dynamic_token_chunk_limit(
     quant_mode: str = "nvfp4",
 ) -> int:
     """Largest eager token chunk whose exact routed tile pool fits in one launch."""
+    tile_m = _dynamic_tile_m(quant_mode)
     rows_padded_limit = _dynamic_rows_padded_limit(k, quant_mode=quant_mode)
     tile_n = _dynamic_tile_n(quant_mode)
     total_tokens = topk_ids.shape[0]
@@ -743,9 +752,10 @@ def _eager_dynamic_token_chunk_limit(
         topk_ids,
         weight_E=weight_E,
         n=n,
+        tile_m=tile_m,
         tile_n=tile_n,
     )
-    if exact_tiles * _LEVEL_TILE_M <= rows_padded_limit:
+    if exact_tiles * tile_m <= rows_padded_limit:
         exact_limit = total_tokens
     else:
         lo = 1
@@ -757,9 +767,10 @@ def _eager_dynamic_token_chunk_limit(
                 topk_ids[:mid],
                 weight_E=weight_E,
                 n=n,
+                tile_m=tile_m,
                 tile_n=tile_n,
             )
-            if prefix_tiles * _LEVEL_TILE_M <= rows_padded_limit:
+            if prefix_tiles * tile_m <= rows_padded_limit:
                 exact_limit = mid
                 lo = mid + 1
             else:
@@ -799,10 +810,11 @@ def _dynamic_task_geometry(
     E: int,
     n: int,
     routed_rows: int,
+    tile_m: int = _LEVEL_TILE_M,
     tile_n: int = _LEVEL_TILE_N,
 ) -> tuple[int, int, int]:
     routed_rows = max(1, routed_rows)
-    base_m_tiles = align_up(routed_rows, _LEVEL_TILE_M) // _LEVEL_TILE_M
+    base_m_tiles = align_up(routed_rows, tile_m) // tile_m
     # At most one new physical tile is introduced per active expert beyond the
     # first, and the routed workload cannot touch more experts than routed rows.
     active_expert_upper_bound = min(E, routed_rows)
@@ -818,13 +830,14 @@ def _dynamic_task_geometry_from_routing(
     *,
     weight_E: int,
     n: int,
+    tile_m: int = _LEVEL_TILE_M,
     tile_n: int = _LEVEL_TILE_N,
 ) -> tuple[int, int, int]:
     flat_ids = topk_ids.reshape(-1)
     if flat_ids.dtype != torch.int64:
         flat_ids = flat_ids.to(torch.int64)
     counts = torch.bincount(flat_ids, minlength=weight_E)
-    tiles_per_expert = (counts + (_LEVEL_TILE_M - 1)) // _LEVEL_TILE_M
+    tiles_per_expert = (counts + (tile_m - 1)) // tile_m
     exact_tiles = max(1, int(tiles_per_expert.sum().item()))
     gate_tile_cnt = max(1, (n + tile_n - 1) // tile_n)
     slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
@@ -997,16 +1010,19 @@ def _plan_core_workspace(
         )
 
     if dynamic_physical_tiles is None or dynamic_task_capacity is None:
+        dynamic_tile_m = _dynamic_tile_m(quant_mode)
         dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(
             state_E,
             n,
             routed_rows,
+            tile_m=dynamic_tile_m,
             tile_n=_dynamic_tile_n(quant_mode),
         )
     else:
         dynamic_tiles = dynamic_physical_tiles
         dynamic_max_tasks = dynamic_task_capacity
-    dynamic_rows_padded = dynamic_tiles * _LEVEL_TILE_M
+        dynamic_tile_m = _dynamic_tile_m(quant_mode)
+    dynamic_rows_padded = dynamic_tiles * dynamic_tile_m
     packed_input_shape = (1, dynamic_rows_padded, k // 2)
     packed_input_dtype = torch.uint8
     if quant_mode == "w4a16":
@@ -1377,7 +1393,7 @@ def _resolve_workspace_layout(
     )
     if implementation == "static":
         return implementation, max(1, routed_rows), max(1, routed_rows)
-    return implementation, weight_E, ((routed_rows + 127) // 128) * 128
+    return implementation, weight_E, align_up(routed_rows, _dynamic_tile_m(quant_mode))
 
 
 def _make_workspace_plan(
@@ -1405,6 +1421,7 @@ def _make_workspace_plan(
     dynamic_task_capacity = None
     max_tokens_per_launch = num_tokens
     if implementation == "dynamic":
+        dynamic_tile_m = _dynamic_tile_m(quant_mode)
         dynamic_tile_n = _dynamic_tile_n(quant_mode)
         if eager_exact_dynamic:
             if topk_ids is None:
@@ -1413,6 +1430,7 @@ def _make_workspace_plan(
                 topk_ids,
                 weight_E=weight_E,
                 n=n,
+                tile_m=dynamic_tile_m,
                 tile_n=dynamic_tile_n,
             )
             max_tokens_per_launch = _eager_dynamic_token_chunk_limit(
@@ -1428,6 +1446,7 @@ def _make_workspace_plan(
                 state_E,
                 n,
                 routed_rows,
+                tile_m=dynamic_tile_m,
                 tile_n=dynamic_tile_n,
             )
             max_tokens_per_launch = _dynamic_token_chunk_limit(
@@ -2579,7 +2598,7 @@ def _get_dynamic_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
     mma_tiler_mn = (
-        _LEVEL_TILE_M,
+        _dynamic_tile_m(quant_mode),
         _dynamic_tile_n(quant_mode),
     )
 
@@ -2994,7 +3013,7 @@ def _launch_dynamic(
         _gptr(cutlass.Int32, workspace.token_map, 4),
         _gptr(cutlass.Float32, workspace.token_weights, 4),
         m, max_rows,
-        workspace.physical_tiles_capacity * _LEVEL_TILE_M,
+        workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
         mac, stream,
