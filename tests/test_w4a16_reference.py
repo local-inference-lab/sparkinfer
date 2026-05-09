@@ -152,6 +152,20 @@ def test_w4a16_dynamic_geometry_uses_bf16_tile_contract() -> None:
     ) < tp_moe._dynamic_rows_padded_limit(4096)
 
 
+def test_w4a16_backend_cutover_uses_dynamic_after_small_static_window() -> None:
+    tp_moe.clear_tp_moe_caches()
+    assert tp_moe._get_static_compact_cutover_pairs("w4a16") == 128
+    assert tp_moe._get_static_compact_cutover_pairs("nvfp4") == 640
+    assert (
+        tp_moe.select_tp_moe_backend(num_tokens=16, num_topk=8, quant_mode="w4a16")
+        == "static"
+    )
+    assert (
+        tp_moe.select_tp_moe_backend(num_tokens=17, num_topk=8, quant_mode="w4a16")
+        == "dynamic"
+    )
+
+
 def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
     for k_segments in range(1, 13):
         assert MoEMicroKernelBackend.is_supported(

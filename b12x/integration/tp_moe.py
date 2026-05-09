@@ -418,7 +418,7 @@ _W4A16_ALPHA_CACHE: Dict[Tuple, torch.Tensor] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
-_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 1024
+_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 128
 _MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
@@ -491,11 +491,14 @@ def _get_static_compact_cutover_pairs(quant_mode: str = "nvfp4") -> int:
     quant_mode = _normalize_quant_mode(quant_mode)
     cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(quant_mode)
     if cached is None:
-        cutover = _first_env(
+        cutover_names = (
             "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
             "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
             "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
         )
+        if quant_mode == "w4a16":
+            cutover_names = ("B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", *cutover_names)
+        cutover = _first_env(*cutover_names)
         if cutover is None:
             cached = (
                 _W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
