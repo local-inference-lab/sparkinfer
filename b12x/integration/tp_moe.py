@@ -413,8 +413,9 @@ _W4A16_ALPHA_CACHE: Dict[Tuple, torch.Tensor] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
+_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 1024
 _MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
-_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
+_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _DYNAMIC_DOWN_SCALE_CACHE: bool | None = None
@@ -461,7 +462,7 @@ def clear_tp_moe_caches() -> None:
     _PLAIN_PARAM_CACHE.clear()
     _W4A16_ALPHA_CACHE.clear()
     _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
-    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
+    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     _DYNAMIC_MULTICTA_CACHE = None
     _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
     _DYNAMIC_DOWN_SCALE_CACHE = None
@@ -481,19 +482,25 @@ def _first_env(*names: str) -> str | None:
     return None
 
 
-def _get_static_compact_cutover_pairs() -> int:
-    global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
-    if _STATIC_COMPACT_CUTOVER_PAIRS_CACHE is None:
+def _get_static_compact_cutover_pairs(quant_mode: str = "nvfp4") -> int:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(quant_mode)
+    if cached is None:
         cutover = _first_env(
             "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
             "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
             "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
         )
         if cutover is None:
-            _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+            cached = (
+                _W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+                if quant_mode == "w4a16"
+                else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+            )
         else:
-            _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = max(0, int(cutover))
-    return _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
+            cached = max(0, int(cutover))
+        _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[quant_mode] = cached
+    return cached
 
 
 def _get_micro_compact_cutover_pairs() -> int:
@@ -779,10 +786,11 @@ def select_tp_moe_backend(
     *,
     num_tokens: int,
     num_topk: int,
+    quant_mode: str = "nvfp4",
 ) -> str:
     """Pick the fused MoE backend from the intrinsic routed workload shape."""
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _get_static_compact_cutover_pairs():
+    if routed_rows <= _get_static_compact_cutover_pairs(quant_mode):
         return "static"
     return "dynamic"
 
@@ -1359,11 +1367,13 @@ def _resolve_workspace_layout(
     num_tokens: int,
     weight_E: int,
     num_topk: int,
+    quant_mode: str = "nvfp4",
 ) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
     implementation = select_tp_moe_backend(
         num_tokens=num_tokens,
         num_topk=num_topk,
+        quant_mode=quant_mode,
     )
     if implementation == "static":
         return implementation, max(1, routed_rows), max(1, routed_rows)
@@ -1389,6 +1399,7 @@ def _make_workspace_plan(
         num_tokens=num_tokens,
         weight_E=weight_E,
         num_topk=num_topk,
+        quant_mode=quant_mode,
     )
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
@@ -1819,7 +1830,7 @@ def plan_tp_moe_arena_layout(
         core_token_counts = tuple(max(int(token_count), 1) for token_count in core_token_counts)
         if max_tokens not in core_token_counts:
             core_token_counts = (max_tokens, *core_token_counts)
-    static_cutover_pairs = _get_static_compact_cutover_pairs()
+    static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
     max_static_tokens = static_cutover_pairs // num_topk
     if max_static_tokens >= 1:
         static_boundary_tokens = min(max_tokens, max_static_tokens)
