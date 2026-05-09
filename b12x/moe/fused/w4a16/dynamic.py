@@ -1219,6 +1219,13 @@ class MoEDynamicKernelBackend:
         # Phase 2: warp-private route/pack producers into compact physical tiles.
         lane_id = Int32(tidx) & Int32(31)
         num_cta_warps = Int32(self.num_mma_warps + self.num_load_warps)
+        pair_idx = Int32(0)
+        expert_id = Int32(0)
+        token_idx = Int32(0)
+        weight = cutlass.Float32(0.0)
+        row = Int32(0)
+        phys_tile = Int32(0)
+        phys_row = Int32(0)
         produce_active = Int32(1)
         while produce_active > Int32(0):
             batch_base = Int32(0)
@@ -1234,13 +1241,16 @@ class MoEDynamicKernelBackend:
                 produce_active = Int32(0)
             else:
                 pair_idx = batch_base + warp_idx
+                expert_id = Int32(0)
+                token_idx = Int32(0)
+                weight = cutlass.Float32(0.0)
+                row = Int32(0)
+                phys_tile = Int32(0)
                 if pair_idx < total_pairs:
                     expert_id = topk_ids[pair_idx].to(Int32)
                     token_idx = pair_idx // num_topk
                     weight = topk_weights[pair_idx].to(cutlass.Float32)
 
-                    row = Int32(0)
-                    phys_tile = Int32(0)
                     if lane_id == Int32(0):
                         row = atomic_add_global_i32(
                             get_ptr_as_int64(expert_write_rows, expert_id),

@@ -124,11 +124,11 @@ def _run_activation_case(
         activation=activation,
     )
 
-    prev_static_cutover = tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE
+    prev_static_cutover = dict(tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE)
     prev_micro_cutover = tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE
     try:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = static_cutover
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = static_cutover
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = micro_cutover
 
         output = b12x_moe_fp4(
@@ -151,7 +151,7 @@ def _run_activation_case(
         torch.cuda.synchronize()
     finally:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = prev_static_cutover
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.update(prev_static_cutover)
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = prev_micro_cutover
 
     return output, reference
@@ -199,11 +199,11 @@ def _run_single_token_multi_expert_micro_case(
         activation=activation,
     )
 
-    prev_static_cutover = tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE
+    prev_static_cutover = dict(tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE)
     prev_micro_cutover = tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE
     try:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = 128
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = 128
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = 10_000
 
         output = b12x_moe_fp4(
@@ -226,7 +226,7 @@ def _run_single_token_multi_expert_micro_case(
         torch.cuda.synchronize()
     finally:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = prev_static_cutover
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.update(prev_static_cutover)
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = prev_micro_cutover
 
     return output, reference
