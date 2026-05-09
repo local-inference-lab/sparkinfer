@@ -474,11 +474,18 @@ class MoEMicroKernelBackend:
     ):
         cfg = _make_shape_config(m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated)
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        if self.w4a16_mode and m > 1:
+            # Keep one FC1 row per warp for W4A16 multi-token decode so the
+            # direct kernel stays within the 512-thread launch register limit.
+            num_fc1_chunks = max(num_fc1_chunks, n // _BLOCK_SIZE)
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
+        w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
         if m == 1:
             fc2_tasks = cfg.k_dim // (_K_PER_CTA * 2)
+        elif w4a16_rowpair_fc2:
+            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
         else:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
         if max_active_ctas is None:
@@ -778,6 +785,81 @@ class MoEMicroKernelBackend:
             scatter_output[out_base + k_row1] = BFloat16(sum_warp1)
             scatter_output[out_base + k_row2] = BFloat16(sum_warp2)
             scatter_output[out_base + k_row3] = BFloat16(sum_warp3)
+
+    @cute.jit
+    def _m2_fc2_rowpair_narrow(
+        self,
+        fc2_task: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        w2_base_addr: Int64,
+        w2s_base_addr: Int64,
+        intermediate: cute.Tensor,
+        w2_alphas: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+    ):
+        cfg = self._cfg
+        rows_per_cta = Int32(_K_PER_CTA * 2)
+        linear_row_base = fc2_task * rows_per_cta
+        t = linear_row_base // Int32(cfg.k_dim)
+        k_chunk_off = linear_row_base - t * Int32(cfg.k_dim)
+        k_row0 = k_chunk_off + warp_id * Int32(2)
+        k_row1 = k_row0 + Int32(1)
+
+        lane_byte_off = Int64(lane) * Int64(4)
+        token_inter_base = t * Int32(cfg.inter_u32)
+        sf_cols = Int32(cfg.w2_sf_cols)
+        lane_cb = lane >> Int32(3)
+        lane_mode_c = (lane >> Int32(1)) & Int32(3)
+        bsf_byte_shift = lane_mode_c * Int32(8)
+        out_acc0 = Float32(0.0)
+        out_acc1 = Float32(0.0)
+
+        row_rb0 = k_row0 >> Int32(7)
+        row_mode_a0 = (k_row0 >> Int32(5)) & Int32(3)
+        row_mode_32_0 = k_row0 & Int32(31)
+        row_rb1 = k_row1 >> Int32(7)
+        row_mode_a1 = (k_row1 >> Int32(5)) & Int32(3)
+        row_mode_32_1 = k_row1 & Int32(31)
+
+        for kk in cutlass.range_constexpr(cfg.num_topk):
+            eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
+            eid = Int32(topk_ids[eid_addr])
+            router_w = topk_weights[eid_addr]
+            alpha_fc2 = w2_alphas[eid]
+            scale_lane = alpha_fc2 * router_w
+
+            ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
+            ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
+
+            kk_off = token_inter_base + Int32(kk) * Int32(128)
+            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+
+            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off)
+            bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
+            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0)
+            bsf_byte0 = (sf_word0 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
+            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0)
+            out_acc0 = out_acc0 + bsf_f0 * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3) * scale_lane
+
+            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off)
+            bsf_off1 = Int64(row_rb1) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_1) * Int64(16) + Int64(row_mode_a1) * Int64(4)
+            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1)
+            bsf_byte1 = (sf_word1 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
+            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1)
+            out_acc1 = out_acc1 + bsf_f1 * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3) * scale_lane
+
+        sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
+        sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
+        if lane == Int32(0):
+            out_base = t * Int32(cfg.k_dim)
+            scatter_output[out_base + k_row0] = BFloat16(sum_warp0)
+            scatter_output[out_base + k_row1] = BFloat16(sum_warp1)
 
     @cute.jit
     def _m2_fc2_rowquad_wide(
@@ -1609,10 +1691,18 @@ class MoEMicroKernelBackend:
 
         # ---- m>=2 FC2 rowquad ----
         else:
-            fc2_task_count = Int32((self.m_const * cfg.k_dim) // (_K_PER_CTA * 4))
+            if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
+                fc2_task_count = Int32((self.m_const * cfg.k_dim) // (_K_PER_CTA * 2))
+            else:
+                fc2_task_count = Int32((self.m_const * cfg.k_dim) // (_K_PER_CTA * 4))
             fc2_task = Int32(bidx_x)
             while fc2_task < fc2_task_count:
-                if cutlass.const_expr(cfg.fc2_n_chunks > 1):
+                if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
+                    self._m2_fc2_rowpair_narrow(
+                        fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
+                        intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
+                    )
+                elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
                     self._m2_fc2_rowquad_wide(
                         fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
                         intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
