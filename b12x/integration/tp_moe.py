@@ -479,6 +479,17 @@ def clear_tp_moe_caches() -> None:
 _FAST_MATH_DEFAULT = _env_flag("B12X_FAST_MATH", default=True)
 
 
+def _tensor_version(t: torch.Tensor) -> int:
+    try:
+        return int(t._version)
+    except RuntimeError:
+        # vLLM runs model weights under torch.inference_mode(); inference
+        # tensors intentionally do not track a version counter. These tensors
+        # are immutable for the lifetime of the serving process, so a stable
+        # sentinel is a valid cache-key component.
+        return 0
+
+
 def _first_env(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
@@ -603,7 +614,7 @@ def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None)
             tuple(t.stride()),
             t.dtype,
             target_dtype,
-            int(t._version),
+            _tensor_version(t),
         )
         cached = _PLAIN_PARAM_CACHE.get(key)
         if cached is not None:
@@ -621,7 +632,7 @@ def _tensor_cache_key(t: torch.Tensor) -> Tuple[int, Tuple[int, ...], Tuple[int,
         tuple(t.shape),
         tuple(t.stride()),
         t.dtype,
-        int(t._version),
+        _tensor_version(t),
     )
 
 
@@ -790,9 +801,14 @@ def _workspace_policy(
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
 ) -> _TPMoEWorkspacePolicy:
     is_pool = isinstance(workspace, TPMoEWorkspacePool)
+    eager_exact_dynamic = _env_flag("B12X_MOE_EAGER_EXACT_DYNAMIC", default=False)
     return _TPMoEWorkspacePolicy(
         can_chunk=is_pool,
-        eager_exact_dynamic=is_pool and not torch.cuda.is_current_stream_capturing(),
+        eager_exact_dynamic=(
+            is_pool
+            and eager_exact_dynamic
+            and not torch.cuda.is_current_stream_capturing()
+        ),
     )
 
 
@@ -2810,9 +2826,9 @@ def _get_exact_relu2_bs1_nemotron_launcher(
         w2_blockscale.data_ptr(),
         w2_alphas.data_ptr(),
         a1_gscale.data_ptr(),
-        int(a1_gscale._version),
+        _tensor_version(a1_gscale),
         a2_gscale.data_ptr(),
-        int(a2_gscale._version),
+        _tensor_version(a2_gscale),
     )
     last_key, last_launcher = _LAST_EXACT_RELU2_BS1_NEMOTRON
     if last_key == cache_key:
