@@ -71,6 +71,13 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _workspace_requires_lse(workspace: B12XAttentionWorkspace) -> bool:
+    return bool(
+        getattr(workspace, "requires_lse", False)
+        or getattr(workspace, "_vllm_requires_lse", False)
+    )
+
+
 def _resolve_mla_prefill_strategy() -> Literal["auto", "single", "split"]:
     if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
         return "single"
@@ -105,6 +112,8 @@ def _apply_mla_prefill_strategy(
     if strategy == "single":
         return None
     if strategy == "split":
+        return split_cfg
+    if _workspace_requires_lse(workspace):
         return split_cfg
     if (
         workspace.mode in ("extend", "verify", "draft_extend")
@@ -286,16 +295,20 @@ def _run_sparse_mla(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale
     )
     split_cfg = None
-    force_split = return_lse or workspace.mode in ("extend", "verify", "draft_extend")
+    requires_lse = return_lse or _workspace_requires_lse(workspace)
+    force_split = requires_lse or workspace.mode in ("extend", "verify", "draft_extend")
     graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
+    static_split_width = graph_stable_split or requires_lse
+    selector_active_token_counts = None if static_split_width else active_token_counts
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=selected_indices,
-        active_token_counts=active_token_counts,
+        active_token_counts=selector_active_token_counts,
         output_dtype=q_all.dtype,
         v_head_dim=v_head_dim,
         max_chunks=workspace.max_chunks_per_row,
+        allow_cuda_sync_width_shrink=not static_split_width,
     )
     if (
         force_split
@@ -309,10 +322,17 @@ def _run_sparse_mla(
         )
     ):
         forced_width = int(selected_indices.shape[1])
-        if active_token_counts is not None and active_token_counts.numel() > 0:
-            if not graph_stable_split and (
-                active_token_counts.device.type != "cuda"
-                or not torch.cuda.is_current_stream_capturing()
+        if (
+            not requires_lse
+            and active_token_counts is not None
+            and active_token_counts.numel() > 0
+        ):
+            if (
+                not graph_stable_split
+                and (
+                    active_token_counts.device.type != "cuda"
+                    or not torch.cuda.is_current_stream_capturing()
+                )
             ):
                 forced_width = min(
                     forced_width,
