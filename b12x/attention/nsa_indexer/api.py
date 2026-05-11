@@ -52,6 +52,10 @@ class NSAIndexerPagedDecodeMetadata:
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     paged_mqa_schedule_metadata: torch.Tensor | None = None
+    # vLLM's b12x sparse indexer adapter passes this keyword to keep the live
+    # width dynamic inside the kernel. Upstream b12x 0.13 uses
+    # active_width_override instead, so keep this as a compatibility no-op.
+    active_width_hint: int | None = None
 
 
 @dataclass(frozen=True)

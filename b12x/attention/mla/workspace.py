@@ -13,6 +13,7 @@ from .reference import _MLA_PACKED_DIM
 
 _INDEX_HEAD_DIM = 128
 _NSA_INDEXER_BLOCK_K = 64
+_NSA_INDEXER_PREFILL_BLOCK_K = 256
 _NSA_INDEXER_TILE_BLOCK_Q = 32
 _ARENA_ALIGN_BYTES = 1024
 
@@ -75,6 +76,52 @@ def _materialize_arena_view(
     view_bytes = arena.narrow(0, offset_bytes, nbytes)
     typed_view = view_bytes.view(dtype).view(shape)
     return typed_view, offset_bytes + nbytes
+
+
+def _encode_indexer_k_tma_descriptor(
+    k_quant_bytes: torch.Tensor,
+    *,
+    block_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode a stable TMA descriptor for the fixed NSA indexer K workspace."""
+    if k_quant_bytes.ndim != 2 or k_quant_bytes.shape[1] != _INDEX_HEAD_DIM:
+        raise ValueError(
+            f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
+        )
+    if k_quant_bytes.dtype != torch.uint8:
+        raise TypeError(f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}")
+
+    import cuda.bindings.driver as cuda
+
+    U64 = cuda.cuuint64_t
+    U32 = cuda.cuuint32_t
+    row_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
+    base_ptr = int(k_quant_bytes.data_ptr())
+    total_rows = int(k_quant_bytes.shape[0])
+
+    result, tensor_map = cuda.cuTensorMapEncodeTiled(
+        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2,
+        base_ptr,
+        [U64(_INDEX_HEAD_DIM), U64(total_rows)],
+        [U64(row_bytes)],
+        [U32(_INDEX_HEAD_DIM), U32(int(block_k))],
+        [U32(1), U32(1)],
+        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuTensorMapEncodeTiled failed for NSA indexer K workspace: {result}")
+
+    desc = torch.tensor(
+        [int(word) for word in tensor_map.opaque],
+        dtype=torch.uint64,
+        device=k_quant_bytes.device,
+    )
+    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    return desc, desc_ptrs
 
 
 B12XWorkspaceMode = Literal["decode", "extend", "verify", "draft_extend"]
@@ -698,6 +745,10 @@ class B12XAttentionWorkspace:
     indexer_extend_lengths: torch.Tensor | None = None
     indexer_extend_mapped_indices: torch.Tensor | None = None
     indexer_paged_logits: torch.Tensor | None = None
+    indexer_k_tma_desc: torch.Tensor | None = None
+    indexer_k_tma_desc_ptrs: torch.Tensor | None = None
+    indexer_k_tma_prefill_desc: torch.Tensor | None = None
+    indexer_k_tma_prefill_desc_ptrs: torch.Tensor | None = None
     # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
     _contract_q: torch.Tensor | None = None
     _contract_kv_rows: torch.Tensor | None = None
@@ -992,6 +1043,16 @@ class B12XAttentionWorkspace:
             offset_bytes=self.arena.indexer_k_scale_offset_bytes,
             shape=(indexer_k_rows,),
             dtype=torch.float32,
+        )
+        self.indexer_k_tma_desc, self.indexer_k_tma_desc_ptrs = _encode_indexer_k_tma_descriptor(
+            self.indexer_k_quant_bytes,
+            block_k=_NSA_INDEXER_BLOCK_K,
+        )
+        self.indexer_k_tma_prefill_desc, self.indexer_k_tma_prefill_desc_ptrs = (
+            _encode_indexer_k_tma_descriptor(
+                self.indexer_k_quant_bytes,
+                block_k=_NSA_INDEXER_PREFILL_BLOCK_K,
+            )
         )
         if self.indexer_extend_logits_nbytes:
             self.indexer_extend_logits, _ = _materialize_arena_view(
@@ -1733,6 +1794,10 @@ class B12XAttentionWorkspace:
             "k_end": k_end,
             "logits": logits_view,
             "logits_view": logits_view,
+            "k_tma_desc_ptrs": self.indexer_k_tma_desc_ptrs if k_quant_aliases_workspace else None,
+            "k_tma_prefill_desc_ptrs": (
+                self.indexer_k_tma_prefill_desc_ptrs if k_quant_aliases_workspace else None
+            ),
         }
 
     def stage_nsa_indexer_paged_decode(

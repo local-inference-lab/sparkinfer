@@ -2138,6 +2138,8 @@ def run_sparse_nsa_extend_logits_kernel(
         k_end_kernel = staged["k_end"]
         out_kernel = staged["logits"]
         out_view = staged["logits_view"]
+        workspace_k_tma_desc_ptrs = staged.get("k_tma_desc_ptrs")
+        workspace_k_tma_prefill_desc_ptrs = staged.get("k_tma_prefill_desc_ptrs")
         if contract_phantoms is None:
             contract_phantoms = workspace.get_indexer_contract_phantoms()
     else:
@@ -2171,16 +2173,27 @@ def run_sparse_nsa_extend_logits_kernel(
         k_scale_kernel = k_scale_padded.contiguous()
         k_start_kernel = k_start.contiguous()
         k_end_kernel = k_end.contiguous()
+        workspace_k_tma_desc_ptrs = None
+        workspace_k_tma_prefill_desc_ptrs = None
 
     if valid_q_rows == 0 or k_rows == 0:
         return out_view
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
-        _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill512(k_quant_bytes)
+        if workspace_k_tma_prefill_desc_ptrs is not None:
+            k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
+        else:
+            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill512(k_quant_bytes)
     elif _use_prefill:
-        _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(k_quant_bytes)
+        if workspace_k_tma_prefill_desc_ptrs is not None:
+            k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
+        else:
+            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(k_quant_bytes)
     else:
-        _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
+        if workspace_k_tma_desc_ptrs is not None:
+            k_tma_desc_ptrs = workspace_k_tma_desc_ptrs
+        else:
+            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
         kernel = _build_sparse_nsa_extend_prefill512_kernel(
