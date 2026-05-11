@@ -180,6 +180,11 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
   }
+  // Cross-NUMA PCIe topologies can have enough peer-read skew that the next
+  // eager-buffer reuse races with a slower rank still reading the previous
+  // slot. Keep the oneshot start barrier, but add a completion barrier before
+  // the slot can be reused by a later allreduce.
+  multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
