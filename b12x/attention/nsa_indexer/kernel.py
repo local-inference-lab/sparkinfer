@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from functools import lru_cache
+import os
 import warnings
 
 import cuda.bindings.driver as cuda
@@ -41,8 +42,8 @@ _PAGED_WARPS_PER_CTA = 4
 _PAGED_THREADS_PER_CTA = _WARP_THREADS * _PAGED_WARPS_PER_CTA
 _PAGED_TOKENS_PER_GROUP = 8
 PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT = 4
-_SCHEDULE_MIN_PAGES = 1024
-_ENABLE_MULTI_ROW_SCHEDULE = True
+_SCHEDULE_MIN_PAGES = int(os.getenv("B12X_NSA_SCHEDULE_MIN_PAGES", "1000000000"))
+_ENABLE_MULTI_ROW_SCHEDULE = os.getenv("B12X_NSA_ENABLE_MULTI_ROW_SCHEDULE", "0") != "0"
 _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
