@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib.metadata
 import inspect
@@ -537,12 +538,14 @@ def apply_cutlass_runtime_patches() -> None:
     try:
         from cutlass.base_dsl.compiler import CompileCallable
         from cutlass.base_dsl.dsl import BaseDSL
+        from cutlass.base_dsl.jit_executor import JitExecutor
     except Exception:
         return
 
     original_print_warning = BaseDSL.print_warning
     original_print_warning_once = BaseDSL.print_warning_once
     original_compile = CompileCallable._compile
+    original_get_invoke_packed_args = JitExecutor._get_invoke_packed_args
 
     @wraps(original_print_warning)
     def patched_print_warning(self, message):
@@ -573,8 +576,46 @@ def apply_cutlass_runtime_patches() -> None:
             pass
         return compiled
 
+    @wraps(original_get_invoke_packed_args)
+    def patched_get_invoke_packed_args(self, exe_args):
+        num_base_args = len(exe_args)
+        total_args = num_base_args + self._num_extra_args
+
+        tls = self._tls
+        packed_args = getattr(tls, "packed_args", None)
+        capacity = getattr(tls, "capacity", 0)
+
+        if packed_args is None or capacity < total_args:
+            packed_args = (ctypes.c_void_p * total_args)()
+            tls.packed_args = packed_args
+            tls.capacity = total_args
+
+            idx = num_base_args
+            if self._has_cuda_result:
+                packed_args[idx] = self._cuda_result_addr
+                idx += 1
+            if self._kernel_ptrs is not None:
+                for ptr in self._kernel_ptrs:
+                    packed_args[idx] = ptr
+                    idx += 1
+
+        for i, arg in enumerate(exe_args):
+            if type(arg) is ctypes.c_void_p:
+                packed_args[i] = arg
+                continue
+            try:
+                packed_args[i] = ctypes.c_void_p(arg).value
+            except TypeError:
+                if hasattr(arg, "__int__"):
+                    packed_args[i] = ctypes.c_void_p(int(arg)).value
+                else:
+                    raise
+
+        return packed_args
+
     BaseDSL.print_warning = patched_print_warning
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
+    JitExecutor._get_invoke_packed_args = patched_get_invoke_packed_args
     _patch_cutlass_sm120_blockscaled_arch_check()
     _PATCHED = True
