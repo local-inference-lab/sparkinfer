@@ -23,7 +23,9 @@ from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 
@@ -278,7 +280,10 @@ def _run_cached_host_launcher(
 ) -> None:
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
-        if os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1":
+        if (
+            os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1"
+            or os.environ.get("B12X_LOG_HOST_LAUNCHER_CACHE", "0") == "1"
+        ):
             _debug_print_compile_cache_miss(kernel, cache_key, cache_key_labels)
         raise_if_kernel_resolution_frozen(
             "eager host launcher compile",

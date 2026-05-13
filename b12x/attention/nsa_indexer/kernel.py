@@ -48,7 +48,54 @@ _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
+_HOST_LAUNCHER_LOG_COUNT = 0
+
+
+def _host_launcher_log_limit() -> int:
+    return int(os.getenv("B12X_HOST_LAUNCHER_LOG_LIMIT", "256"))
+
+
+def _summarize_cache_key(cache_key: tuple[object, ...]) -> str:
+    parts: list[str] = []
+    for item in cache_key:
+        if (
+            isinstance(item, tuple)
+            and len(item) == 4
+            and isinstance(item[0], tuple)
+            and isinstance(item[1], tuple)
+        ):
+            parts.append(f"shape={item[0]} stride={item[1]} dtype={item[2]} dev={item[3]}")
+        else:
+            parts.append(repr(item))
+    return " | ".join(parts)
+
+
+def _log_host_launcher_cache_event(
+    event: str,
+    kernel: object,
+    cache_key: tuple[object, ...],
+    cache_len: int,
+) -> None:
+    global _HOST_LAUNCHER_LOG_COUNT
+    if os.getenv("B12X_LOG_HOST_LAUNCHER_CACHE", "0") != "1":
+        return
+    limit = _host_launcher_log_limit()
+    if limit >= 0 and _HOST_LAUNCHER_LOG_COUNT >= limit:
+        return
+    _HOST_LAUNCHER_LOG_COUNT += 1
+    log_path = os.getenv(
+        "B12X_HOST_LAUNCHER_CACHE_LOG",
+        "/tmp/b12x_host_launcher_cache.log",
+    )
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(
+            f"{event} module={__name__} kernel={type(kernel).__name__} "
+            f"cache_len={cache_len} cache_limit={_EAGER_HOST_LAUNCHER_CACHE_SIZE} "
+            f"key={_summarize_cache_key(cache_key)}\n"
+        )
 _PAGED_Q_HEAD_TILE = 16
 _PAGED_K_TMA_DESC_CACHE_SIZE = 32
 _BLACKWELL_TMA_DESC_WORDS = 16
@@ -162,6 +209,7 @@ def _run_cached_host_launcher(
 ) -> None:
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
+        _log_host_launcher_cache_event("MISS", kernel, cache_key, len(cache))
         raise_if_kernel_resolution_frozen(
             "eager host launcher compile",
             target=kernel,
@@ -176,7 +224,8 @@ def _run_cached_host_launcher(
             compiled = kernel(*args, compile_only=True)
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
+            evicted_key, _ = cache.popitem(last=False)
+            _log_host_launcher_cache_event("EVICT", kernel, evicted_key, len(cache))
     exe_args, _ = compiled.generate_execution_args(*args)
     compiled.run_compiled_program(exe_args)
 
