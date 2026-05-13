@@ -479,6 +479,81 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
     os.replace(tmp_path, object_path)
 
 
+def _patch_cutlass_sm120_blockscaled_arch_check() -> None:
+    try:
+        from cutlass.cute.nvgpu.warp import mma as mma_mod
+    except Exception:
+        return
+
+    blockscaled_op = getattr(mma_mod, "MmaSM120BlockScaledOp", None)
+    if blockscaled_op is None:
+        return
+    if getattr(blockscaled_op, "_b12x_sm120a_patch", False):
+        return
+
+    original_post_init = blockscaled_op.__post_init__
+    Arch = mma_mod.Arch
+    dsl_base = getattr(mma_mod, "CuTeDSL", None)
+    if dsl_base is None:
+        dsl_base = getattr(mma_mod, "BaseDSL", None)
+    if dsl_base is None:
+        return
+    OpError = mma_mod.OpError
+    Float4E2M1FN = mma_mod.Float4E2M1FN
+    Float32 = mma_mod.Float32
+    Float8E4M3FN = mma_mod.Float8E4M3FN
+    Float8E8M0FNU = mma_mod.Float8E8M0FNU
+
+    @wraps(original_post_init)
+    def patched_post_init(self) -> None:
+        arch = dsl_base._get_dsl().get_arch_enum()
+        allowed_archs = {Arch.sm_120a}
+        sm_121a = getattr(Arch, "sm_121a", None)
+        if sm_121a is not None:
+            allowed_archs.add(sm_121a)
+        if arch not in allowed_archs:
+            raise OpError(
+                self,
+                f"expects arch to be one of {self.admissible_archs}, but got {arch}",
+                suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
+            )
+        if self.ab_dtype != Float4E2M1FN:
+            raise OpError(
+                self,
+                "expects the 'ab_dtype' Op parameter to be Float4E2M1FN",
+            )
+        if self.acc_dtype != Float32:
+            raise OpError(
+                self,
+                "expects the 'acc_dtype' Op parameter to be Float32",
+            )
+        if self.shape_mnk != (16, 8, 64):
+            raise OpError(
+                self,
+                "expects the 'shape_mnk' Op parameter to be (16,8,64)",
+            )
+        if self.sf_vec_size == 16:
+            if self.sf_type != Float8E4M3FN:
+                raise OpError(
+                    self,
+                    "expects the 'sf_type' Op parameter to be Float8E4M3FN",
+                )
+        elif self.sf_vec_size == 32:
+            if self.sf_type != Float8E8M0FNU:
+                raise OpError(
+                    self,
+                    "expects the 'sf_type' Op parameter to be Float8E8M0FNU",
+                )
+        else:
+            raise OpError(
+                self,
+                "expects the 'sf_vec_size' Op parameter to be 16 or 32",
+            )
+
+    blockscaled_op.__post_init__ = patched_post_init
+    blockscaled_op._b12x_sm120a_patch = True
+
+
 def apply_cutlass_runtime_patches() -> None:
     global _PATCHED
     if _PATCHED:
@@ -564,4 +639,5 @@ def apply_cutlass_runtime_patches() -> None:
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
     JitExecutor._get_invoke_packed_args = patched_get_invoke_packed_args
+    _patch_cutlass_sm120_blockscaled_arch_check()
     _PATCHED = True
