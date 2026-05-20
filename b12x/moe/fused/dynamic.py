@@ -282,8 +282,11 @@ class MoEDynamicKernelBackend:
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_mma_warps * self.num_threads_per_warp,
         )
-        self.pass_sync_barrier = pipeline.NamedBarrier(
+        self.pass_gate_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
+        )
+        self.pass_final_barrier = pipeline.NamedBarrier(
+            barrier_id=3, num_threads=self.threads_per_cta,
         )
         self.load_register_requirement = 32
         self.mma_register_requirement = 232
@@ -1499,9 +1502,9 @@ class MoEDynamicKernelBackend:
                                     tCrB[None, _nt, k_block_idx],
                                     gate_acc[None, _mt, _nt],
                                 )
-                    # Drain the FC1 gate/only pass before the DMA warp reuses
-                    # those staging buffers, either for the up pass or FC2 loads.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    # Signal FC1 gate/only completion before the DMA warp
+                    # reuses the shared A/gate buffers for the next pass.
+                    self.pass_gate_barrier.arrive_unaligned()
 
                     if self.is_gated:
                         # Up GEMM (inlined, same pattern)
@@ -1863,9 +1866,9 @@ class MoEDynamicKernelBackend:
                             # (pipeline consumer is collective across all MMA warps).
                             self.epilog_sync_barrier.arrive_and_wait()
 
-                    # Final pass_sync: protect sA from next task's FC1 loads.
-                    # DMA warp waits here too after finishing all B_down loads.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    # Signal that FC2/scatter no longer needs sA, so the DMA
+                    # warp may start the next slice/task's FC1 loads.
+                    self.pass_final_barrier.arrive_unaligned()
                     slice_idx += Int32(1)
 
             elif warp_idx == self.tma_load_warp_id:
@@ -1902,8 +1905,8 @@ class MoEDynamicKernelBackend:
                         prod_state.advance()
 
                     # Wait for the MMA warps to finish the FC1 gate/only pass
-                    # before reusing the gate staging buffers.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    # before reusing sA/sB/sSFA/sSFB for up/FC2 staging.
+                    self.pass_gate_barrier.wait_unaligned()
 
                     if self.is_gated:
                         # ---- FC1 up pass ----
@@ -1932,9 +1935,9 @@ class MoEDynamicKernelBackend:
                         phase2_pipeline.producer_commit(phase2_prod_state)
                         phase2_prod_state.advance()
 
-                    # Final pass_sync: match MMA warps' barrier after FC2 sweep.
-                    # Ensures MMA warps finish scatter before DMA starts next task's FC1.
-                    self.pass_sync_barrier.arrive_and_wait()
+                    # Ensure MMA warps finish FC2/scatter before DMA starts the
+                    # next slice/task's FC1 loads into shared A buffers.
+                    self.pass_final_barrier.wait_unaligned()
                     slice_idx += Int32(1)
 
 
