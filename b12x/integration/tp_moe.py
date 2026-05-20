@@ -305,7 +305,6 @@ class TPMoEPlan:
 @dataclass(frozen=True, kw_only=True)
 class _TPMoEWorkspacePolicy:
     can_chunk: bool
-    eager_exact_dynamic: bool
 
 
 @dataclass
@@ -488,6 +487,15 @@ _CURRENT_DISPATCH_STAGE: str | None = None
 _DIRECT_MICRO_SHAPE_ATTR = "_b12x_direct_micro_shape"
 
 
+def _tensor_version(t: torch.Tensor) -> int:
+    try:
+        return int(t._version)
+    except RuntimeError:
+        # Inference tensors intentionally do not track a version counter.
+        # Model weights/scales are expected to be immutable during serving.
+        return 0
+
+
 @contextmanager
 def b12x_moe_dispatch_context(stage: str | None):
     global _CURRENT_DISPATCH_STAGE
@@ -664,7 +672,7 @@ def _get_plain_cuda_tensor(
             tuple(t.stride()),
             t.dtype,
             target_dtype,
-            int(t._version),
+            _tensor_version(t),
         )
         cached = _PLAIN_PARAM_CACHE.get(key)
         if cached is not None:
@@ -684,7 +692,7 @@ def _tensor_cache_key(
         tuple(t.shape),
         tuple(t.stride()),
         t.dtype,
-        int(t._version),
+        _tensor_version(t),
     )
 
 
@@ -802,64 +810,12 @@ def _dynamic_token_chunk_limit(
     return min(compact_limit, legacy_limit)
 
 
-def _eager_dynamic_token_chunk_limit(
-    topk_ids: torch.Tensor,
-    *,
-    weight_E: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    quant_mode: str = "nvfp4",
-) -> int:
-    """Largest eager token chunk whose exact routed tile pool fits in one launch."""
-    tile_m = _dynamic_tile_m(quant_mode)
-    rows_padded_limit = _dynamic_rows_padded_limit(k, quant_mode=quant_mode)
-    tile_n = _dynamic_tile_n(quant_mode)
-    total_tokens = topk_ids.shape[0]
-    exact_tiles, _, _ = _dynamic_task_geometry_from_routing(
-        topk_ids,
-        weight_E=weight_E,
-        n=n,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-    if exact_tiles * tile_m <= rows_padded_limit:
-        exact_limit = total_tokens
-    else:
-        lo = 1
-        hi = total_tokens
-        exact_limit = 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            prefix_tiles, _, _ = _dynamic_task_geometry_from_routing(
-                topk_ids[:mid],
-                weight_E=weight_E,
-                n=n,
-                tile_m=tile_m,
-                tile_n=tile_n,
-            )
-            if prefix_tiles * tile_m <= rows_padded_limit:
-                exact_limit = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
-    legacy_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER")
-    if legacy_env is None:
-        return exact_limit
-    legacy_limit = (
-        _safe_token_chunk(weight_E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
-    )
-    return min(exact_limit, legacy_limit)
-
-
 def _workspace_policy(
     workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
 ) -> _TPMoEWorkspacePolicy:
     is_pool = isinstance(workspace, TPMoEWorkspacePool)
     return _TPMoEWorkspacePolicy(
         can_chunk=is_pool,
-        eager_exact_dynamic=is_pool and not torch.cuda.is_current_stream_capturing(),
     )
 
 
@@ -895,28 +851,6 @@ def _dynamic_task_geometry(
     )
     max_tasks = max_m_tiles * slice_groups
     return max_m_tiles, gate_tile_cnt, max_tasks
-
-
-def _dynamic_task_geometry_from_routing(
-    topk_ids: torch.Tensor,
-    *,
-    weight_E: int,
-    n: int,
-    tile_m: int = _LEVEL_TILE_M,
-    tile_n: int = _LEVEL_TILE_N,
-) -> tuple[int, int, int]:
-    flat_ids = topk_ids.reshape(-1)
-    if flat_ids.dtype != torch.int64:
-        flat_ids = flat_ids.to(torch.int64)
-    counts = torch.bincount(flat_ids, minlength=weight_E)
-    tiles_per_expert = (counts + (tile_m - 1)) // tile_m
-    exact_tiles = max(1, int(tiles_per_expert.sum().item()))
-    gate_tile_cnt = max(1, (n + tile_n - 1) // tile_n)
-    slice_groups = max(
-        1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK
-    )
-    max_tasks = exact_tiles * slice_groups
-    return exact_tiles, gate_tile_cnt, max_tasks
 
 
 def _refresh_dynamic_workspace_scales(
@@ -1667,8 +1601,6 @@ def _make_workspace_plan(
     dtype: torch.dtype,
     quant_mode: str = "nvfp4",
     activation: str = "silu",
-    topk_ids: torch.Tensor | None = None,
-    eager_exact_dynamic: bool = False,
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
     activation = _get_activation_kernel_spec(
@@ -1687,41 +1619,20 @@ def _make_workspace_plan(
     if implementation == "dynamic":
         dynamic_tile_m = _dynamic_tile_m(quant_mode)
         dynamic_tile_n = _dynamic_tile_n(quant_mode)
-        if eager_exact_dynamic:
-            if topk_ids is None:
-                raise ValueError("routing-aware dynamic planning requires topk_ids")
-            dynamic_physical_tiles, _, dynamic_task_capacity = (
-                _dynamic_task_geometry_from_routing(
-                    topk_ids,
-                    weight_E=weight_E,
-                    n=n,
-                    tile_m=dynamic_tile_m,
-                    tile_n=dynamic_tile_n,
-                )
-            )
-            max_tokens_per_launch = _eager_dynamic_token_chunk_limit(
-                topk_ids,
-                weight_E=weight_E,
-                k=k,
-                n=n,
-                num_topk=num_topk,
-                quant_mode=quant_mode,
-            )
-        else:
-            dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry(
-                state_E,
-                n,
-                routed_rows,
-                tile_m=dynamic_tile_m,
-                tile_n=dynamic_tile_n,
-            )
-            max_tokens_per_launch = _dynamic_token_chunk_limit(
-                weight_E,
-                k,
-                n,
-                num_topk,
-                quant_mode,
-            )
+        dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry(
+            state_E,
+            n,
+            routed_rows,
+            tile_m=dynamic_tile_m,
+            tile_n=dynamic_tile_n,
+        )
+        max_tokens_per_launch = _dynamic_token_chunk_limit(
+            weight_E,
+            k,
+            n,
+            num_topk,
+            quant_mode,
+        )
     return TPMoEPlan(
         implementation=implementation,
         quant_mode=quant_mode,
@@ -2210,7 +2121,6 @@ def plan_tp_moe_arena_layout(
             dtype=dtype,
             quant_mode=quant_mode,
             activation=activation,
-            eager_exact_dynamic=False,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -3237,9 +3147,9 @@ def _get_exact_relu2_bs1_nemotron_launcher(
         w2_blockscale.data_ptr(),
         w2_alphas.data_ptr(),
         a1_gscale.data_ptr(),
-        int(a1_gscale._version),
+        _tensor_version(a1_gscale),
         a2_gscale.data_ptr(),
-        int(a2_gscale._version),
+        _tensor_version(a2_gscale),
     )
     last_key, last_launcher = _LAST_EXACT_RELU2_BS1_NEMOTRON
     if last_key == cache_key:
@@ -3840,8 +3750,6 @@ def b12x_moe_fp4(
         dtype=a.dtype,
         quant_mode=quant_mode,
         activation=activation,
-        topk_ids=topk_ids,
-        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
     )
 
     impl = plan.implementation
