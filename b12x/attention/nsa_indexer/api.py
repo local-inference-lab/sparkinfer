@@ -1,4 +1,4 @@
-"""NSA indexer API aligned with the DeepGEMM-style logits contracts."""
+"""NSA indexer API for paged and extend logits contracts."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def get_paged_mqa_logits_metadata(
     num_sms: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build DeepGEMM-style paged-MQA schedule metadata on the input device."""
+    """Build paged-MQA schedule metadata on the input device."""
 
     if context_lens.ndim not in (1, 2):
         raise ValueError(

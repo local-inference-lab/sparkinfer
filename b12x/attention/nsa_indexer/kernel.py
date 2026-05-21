@@ -1,4 +1,4 @@
-"""CuTeDSL paged decode score kernel for the DeepGEMM-style NSA contract."""
+"""CuTeDSL paged decode score kernel for the paged NSA contract."""
 
 from __future__ import annotations
 

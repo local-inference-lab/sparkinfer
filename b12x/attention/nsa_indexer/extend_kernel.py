@@ -1,4 +1,4 @@
-"""CuTeDSL extend logits kernel for the DeepGEMM-style non-paged NSA contract."""
+"""CuTeDSL extend logits kernel for the non-paged NSA contract."""
 
 from __future__ import annotations
 
