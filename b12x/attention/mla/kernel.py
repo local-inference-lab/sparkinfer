@@ -289,13 +289,21 @@ def _stage_token_indices(
     token_base: Int32,
     token_end: Int32,
     lane: Int32,
+    identity_page_table: cutlass.Constexpr[bool],
 ):
     token_local = lane
     while token_local < Int32(_MLA_TOKEN_TILE):
         token_pos = token_base + token_local
-        sTokenIdx[token_local] = (
-            Int32(page_table_1[q_idx, token_pos]) if token_pos < token_end else Int32(-1)
-        )
+        if cutlass.const_expr(identity_page_table):
+            sTokenIdx[token_local] = (
+                q_idx * Int32(page_table_1.shape[1]) + token_pos
+                if token_pos < token_end
+                else Int32(-1)
+            )
+        else:
+            sTokenIdx[token_local] = (
+                Int32(page_table_1[q_idx, token_pos]) if token_pos < token_end else Int32(-1)
+            )
         token_local += Int32(_MLA_WARP_THREADS)
 
 
@@ -808,6 +816,7 @@ def _compute_score_tile_scaled(
     token_end: Int32,
     sm_scale_log2: Float32,
     lane: Int32,
+    identity_page_table: cutlass.Constexpr[bool],
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -815,7 +824,15 @@ def _compute_score_tile_scaled(
     num_kv = Int32(kv_rows_u32.shape[0])
     tile_tokens = token_end - token_base
 
-    _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
+    _stage_token_indices(
+        page_table_1,
+        sTokenIdx,
+        q_idx,
+        token_base,
+        token_end,
+        lane,
+        identity_page_table,
+    )
     cute.arch.sync_threads()
 
     _zero_score_frag(score_frag)
@@ -1915,6 +1932,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     token_end: Int32,
     sm_scale_log2: Float32,
     lane: Int32,
+    identity_page_table: cutlass.Constexpr[bool],
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -1922,7 +1940,15 @@ def _compute_score_tile_scaled_from_staged_nope(
     num_kv = Int32(kv_rows_u32.shape[0])
     tile_tokens = token_end - token_base
 
-    _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
+    _stage_token_indices(
+        page_table_1,
+        sTokenIdx,
+        q_idx,
+        token_base,
+        token_end,
+        lane,
+        identity_page_table,
+    )
     cute.arch.sync_threads()
     _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
 
@@ -2298,6 +2324,7 @@ def _run_one_pass_sparse_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    identity_page_table: cutlass.Constexpr[bool],
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -2348,6 +2375,7 @@ def _run_one_pass_sparse_mla_tile(
                 token_end,
                 sm_scale_log2,
                 lane,
+                identity_page_table,
             )
         else:
             _compute_score_tile_scaled_from_staged_nope(
@@ -2366,6 +2394,7 @@ def _run_one_pass_sparse_mla_tile(
                 token_end,
                 sm_scale_log2,
                 lane,
+                identity_page_table,
             )
         if has_second_head_slot:
             _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
@@ -2436,6 +2465,7 @@ def _run_one_pass_sparse_mla_tile(
                     tile_end,
                     sm_scale_log2,
                     lane,
+                    identity_page_table,
                 )
             else:
                 _compute_score_tile_scaled_from_staged_nope(
@@ -2454,6 +2484,7 @@ def _run_one_pass_sparse_mla_tile(
                     tile_end,
                     sm_scale_log2,
                     lane,
+                    identity_page_table,
                 )
 
             # Fused softmax-stats + O-rescale + P-norm
@@ -2565,8 +2596,9 @@ def get_sparse_mla_shared_storage_cls():
 class SparseMLAKernel:
     """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
-    def __init__(self, head_tiles: int):
+    def __init__(self, head_tiles: int, identity_page_table: bool = False):
         self.head_tiles = int(head_tiles)
+        self.identity_page_table = bool(identity_page_table)
 
     @cute.jit
     def __call__(
@@ -2639,15 +2671,17 @@ class SparseMLAKernel:
             q_idx,
             Int32(0),
             None,
+            self.identity_page_table,
         )
 
 @lru_cache(maxsize=16)
 def _build_sparse_mla_kernel_for_shape(
     traits: SparseMLATraits,
     head_tiles: int,
+    identity_page_table: bool,
 ) -> SparseMLAKernel:
     del traits
-    return SparseMLAKernel(head_tiles)
+    return SparseMLAKernel(head_tiles, identity_page_table)
 
 
 def clear_sparse_mla_kernel_cache() -> None:
@@ -2692,6 +2726,7 @@ def run_sparse_mla_kernel(
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
     workspace: object | None = None,
+    identity_page_table: bool = False,
 ) -> None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -2726,7 +2761,7 @@ def run_sparse_mla_kernel(
         raise ValueError("sm_scale tensor must be on the same device as q_all")
 
     head_tiles = (int(output.shape[1]) + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
-    kernel = _build_sparse_mla_kernel_for_shape(traits, head_tiles)
+    kernel = _build_sparse_mla_kernel_for_shape(traits, head_tiles, bool(identity_page_table))
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
@@ -2753,5 +2788,6 @@ def run_sparse_mla_kernel(
         traits,
         head_tiles,
         str(output.dtype),
+        bool(identity_page_table),
     )
     _run_cached_host_launcher(kernel, cache_key, args)

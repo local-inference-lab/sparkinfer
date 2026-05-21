@@ -935,7 +935,6 @@ def _plan_core_workspace(
     dynamic_task_capacity: int | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if implementation == "w4a16":
         from b12x.moe.fused.w4a16.host import (
             _W4A16_ALLOWED_ROUTED_SIZES,
@@ -944,7 +943,7 @@ def _plan_core_workspace(
         )
 
         routed_capacity = max(int(routed_rows), 1)
-        fc1_cols = activation_spec.w1_rows(int(n))
+        fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
         route_blocks_capacity = 1
         fc1_c_tmp_elements = 1
@@ -980,7 +979,7 @@ def _plan_core_workspace(
         return _TPCoreWorkspacePlan(
             implementation=implementation,
             quant_mode=quant_mode,
-            activation=activation_spec.activation,
+            activation=activation,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_capacity,
@@ -1013,6 +1012,8 @@ def _plan_core_workspace(
                 _TensorAllocSpec("expert_offsets", (int(weight_E) + 1,), torch.int32),
             ),
         )
+
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
 
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
@@ -1603,9 +1604,12 @@ def _make_workspace_plan(
     activation: str = "silu",
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation = _get_activation_kernel_spec(
-        activation, quant_mode=quant_mode
-    ).activation
+    if quant_mode == "w4a16":
+        _activation_w1_rows(activation, 1)
+    else:
+        activation = _get_activation_kernel_spec(
+            activation, quant_mode=quant_mode
+        ).activation
     routed_rows = num_tokens * num_topk
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
@@ -3567,6 +3571,8 @@ def b12x_moe_fp4(
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt",
+    prepared_w4a16: object | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -3582,26 +3588,43 @@ def b12x_moe_fp4(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    m, k = a.shape
-    E = w1_fp4.shape[0]
-    weight_E = E
-    n = w2_fp4.shape[2] * 2  # intermediate_size
-    expected_w1_rows = _activation_w1_rows(activation, n)
-    if w1_fp4.shape[1] != expected_w1_rows:
-        raise ValueError(
-            f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
-            f"{activation!r}, got {w1_fp4.shape[1]}"
-        )
     num_topk = topk_ids.shape[1]
-    routed_rows = m * num_topk
+    m, k = a.shape
     device = a.device
+    if prepared_w4a16 is not None:
+        if quant_mode != "w4a16":
+            raise ValueError("prepared_w4a16 requires quant_mode='w4a16'")
+        prepared_hidden = int(getattr(prepared_w4a16, "hidden_size"))
+        if prepared_hidden != k:
+            raise ValueError(
+                f"prepared_w4a16 hidden_size mismatch: expected {k}, got {prepared_hidden}"
+            )
+        prepared_dtype = getattr(prepared_w4a16, "params_dtype", a.dtype)
+        if prepared_dtype != a.dtype:
+            raise TypeError(
+                f"prepared_w4a16 was built for {prepared_dtype}, but a has dtype {a.dtype}"
+            )
+        weight_E = int(getattr(prepared_w4a16, "num_experts"))
+        n = int(getattr(prepared_w4a16, "intermediate_size"))
+    else:
+        weight_E = w1_fp4.shape[0]
+        n = w2_fp4.shape[2] * 2  # intermediate_size
+        expected_w1_rows = _activation_w1_rows(activation, n)
+        if w1_fp4.shape[1] != expected_w1_rows:
+            raise ValueError(
+                f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
+                f"{activation!r}, got {w1_fp4.shape[1]}"
+            )
+    routed_rows = m * num_topk
     if apply_router_weight_on_input and quant_mode != "w4a16":
         raise NotImplementedError(
             "apply_router_weight_on_input is not implemented in b12x_moe_fp4"
         )
+    if swiglu_limit is not None and quant_mode != "w4a16":
+        raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
-    if quant_mode_arg is None and quant_mode == "w4a16":
+    if prepared_w4a16 is None and quant_mode_arg is None and quant_mode == "w4a16":
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
             a1_gscale,
@@ -3643,17 +3666,19 @@ def b12x_moe_fp4(
         if not scatter_output.is_contiguous():
             raise ValueError("output must be contiguous")
 
-        prepared = _get_w4a16_packed_weights(
-            w1_fp4,
-            w1_blockscale,
-            w1_alphas,
-            w2_fp4,
-            w2_blockscale,
-            w2_alphas,
-            activation=activation,
-            params_dtype=a.dtype,
-            source_format=source_format,
-        )
+        prepared = prepared_w4a16
+        if prepared is None:
+            prepared = _get_w4a16_packed_weights(
+                w1_fp4,
+                w1_blockscale,
+                w1_alphas,
+                w2_fp4,
+                w2_blockscale,
+                w2_alphas,
+                activation=activation,
+                params_dtype=a.dtype,
+                source_format=source_format,
+            )
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -3703,6 +3728,7 @@ def b12x_moe_fp4(
             block_expert_ids=w4a16_workspace.block_expert_ids,
             packed_route_count=w4a16_workspace.packed_route_count,
             expert_offsets=w4a16_workspace.expert_offsets,
+            swiglu_limit=swiglu_limit,
         )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if quant_mode == "nvfp4" and _is_exact_relu2_bs1_nemotron_case(
@@ -3785,6 +3811,7 @@ def b12x_moe_fp4(
                 activation=activation,
                 quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
+                swiglu_limit=swiglu_limit,
             )
         return chunk_output
 

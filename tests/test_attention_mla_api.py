@@ -16,18 +16,123 @@ from b12x.attention.mla import kernel as mla_kernel
 from b12x.attention.mla import split as mla_split
 
 
-def _make_workspace(*, mode: str, topk: int = 4) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
+class _FakeMLAWorkspace:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        topk: int = 4,
+        max_total_q: int = 8,
+        max_batch: int = 4,
+        max_kv_rows: int = 0,
+        use_cuda_graph: bool = False,
+    ) -> None:
+        self.mode = mode
+        self.device = torch.device("cpu")
+        self.dtype = torch.bfloat16
+        self.kv_dtype = torch.uint8
+        self.num_q_heads = 8
+        self.head_dim = 256
+        self.v_head_dim = 256
+        self.topk = int(topk)
+        self.max_total_q = int(max_total_q)
+        self.max_batch = int(max_batch)
+        self.max_kv_rows = int(max_kv_rows)
+        self.fixed_capacity = True
+        self.use_cuda_graph = bool(use_cuda_graph)
+        self.max_chunks_per_row = 64
+        self.sm_scale_tensor = None
+        self.sm_scale_value = None
+        self.kv_chunk_size_value = 1
+        self.num_chunks_value = 1
+        self.kv_chunk_size_ptr = torch.empty((1,), dtype=torch.int32)
+        self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32)
+        self.tmp_output = torch.empty(
+            (
+                self.max_total_q,
+                self.num_q_heads,
+                self.max_chunks_per_row,
+                self.v_head_dim,
+            ),
+            dtype=self.dtype,
+        )
+        self.tmp_lse = torch.empty(
+            (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
+            dtype=torch.float32,
+        )
+        self.ragged_kv_cache = None
+        self._contract_kv_rows = None
+        self._contract_kv_scales = None
+
+    def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
+        if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
+            raise ValueError(
+                f"num_chunks must be in [1, {self.max_chunks_per_row}], got {num_chunks}"
+            )
+        if kv_chunk_size <= 0:
+            raise ValueError(f"kv_chunk_size must be positive, got {kv_chunk_size}")
+        self.kv_chunk_size_ptr[0] = int(kv_chunk_size)
+        self.num_chunks_ptr[0] = int(num_chunks)
+        self.kv_chunk_size_value = int(kv_chunk_size)
+        self.num_chunks_value = int(num_chunks)
+
+    def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
+        self.set_split_chunk_config(
+            kv_chunk_size=kv_chunk_size,
+            num_chunks=num_chunks,
+        )
+
+    def gather_ragged_kv_rows(
+        self,
+        *,
+        kv_cache: torch.Tensor,
+        row_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        row_count = int(row_ids.shape[0])
+        capacity = max(int(self.max_kv_rows), row_count, 1)
+        if self.ragged_kv_cache is None:
+            self.ragged_kv_cache = torch.empty(
+                (capacity, *kv_cache.shape[1:]),
+                dtype=kv_cache.dtype,
+                device=kv_cache.device,
+            )
+            self.max_kv_rows = capacity
+            self._refresh_ragged_kv_contracts()
+        if row_count:
+            self.ragged_kv_cache[:row_count].copy_(kv_cache[row_ids.to(torch.long)])
+        return self.ragged_kv_cache
+
+    def contract_kv_tensors_for(
+        self,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.ragged_kv_cache is None:
+            return None, None
+        if kv_cache.data_ptr() != self.ragged_kv_cache.data_ptr():
+            return None, None
+        return self._contract_kv_rows, self._contract_kv_scales
+
+    def _refresh_ragged_kv_contracts(self) -> None:
+        assert self.ragged_kv_cache is not None
+        self._contract_kv_rows, self._contract_kv_scales = (
+            mla_kernel._extract_packed_kv_runtime_views(self.ragged_kv_cache)
+        )
+
+
+def _make_workspace(
+    *,
+    mode: str,
+    topk: int = 4,
+    max_total_q: int = 8,
+    max_batch: int = 4,
+    max_kv_rows: int = 0,
+) -> _FakeMLAWorkspace:
+    return _FakeMLAWorkspace(
         mode=mode,
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=8,
-        head_dim=256,
-        v_head_dim=256,
         topk=topk,
-        max_total_q=8,
-        max_batch=4,
+        max_total_q=max_total_q,
+        max_batch=max_batch,
+        max_kv_rows=max_kv_rows,
     )
 
 
@@ -279,14 +384,8 @@ def test_mla_verify_workspace_allocates_split_buffers() -> None:
 
 
 def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+    workspace = _make_workspace(
         mode="extend",
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=8,
-        head_dim=256,
-        v_head_dim=256,
         topk=6,
         max_total_q=8,
         max_batch=4,
@@ -319,14 +418,8 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
 
 
 def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+    workspace = _make_workspace(
         mode="extend",
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=8,
-        head_dim=256,
-        v_head_dim=256,
         topk=2048,
         max_total_q=8,
         max_batch=4,
@@ -356,9 +449,9 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
         return tensor
 
     def fake_build_sparse_mla_split_forward_kernel(
-        traits, launch_num_chunks, head_tiles
+        traits, launch_num_chunks, head_tiles, identity_page_table
     ):
-        del traits, launch_num_chunks, head_tiles
+        del traits, launch_num_chunks, head_tiles, identity_page_table
         return object()
 
     monkeypatch = pytest.MonkeyPatch()
@@ -554,14 +647,8 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
 def test_sparse_mla_large_bs1_extend_prefers_single_pass(monkeypatch) -> None:
     captured: dict[str, object] = {}
     q_rows = 2048
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+    workspace = _make_workspace(
         mode="extend",
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=8,
-        head_dim=256,
-        v_head_dim=256,
         topk=2048,
         max_total_q=q_rows,
         max_batch=1,
@@ -712,14 +799,8 @@ def test_mla_workspace_graph_mode_does_not_own_runtime_metadata() -> None:
 
 
 def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> None:
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+    workspace = _make_workspace(
         mode="decode",
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=8,
-        head_dim=256,
-        v_head_dim=256,
         topk=2048,
         max_total_q=8,
         max_batch=4,
@@ -734,6 +815,15 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     assert workspace.num_chunks_ptr is not None
     assert int(workspace.kv_chunk_size_ptr[0].item()) == 256
     assert int(workspace.num_chunks_ptr[0].item()) == 8
+
+
+def test_sparse_mla_split_config_supports_wide_compressed_contexts() -> None:
+    cfg = mla_split.default_sparse_mla_split_decode_config_for_width(36224)
+
+    assert cfg is not None
+    assert cfg.chunk_size == 1024
+    assert cfg.num_chunks == math.ceil(36224 / 1024)
+    assert cfg.num_chunks <= 64
 
 
 def test_mla_workspace_enforces_capacity_limits() -> None:

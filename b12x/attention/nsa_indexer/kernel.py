@@ -48,6 +48,8 @@ _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
+_PAGED_TILED_BLOCK_Q = 32
+_PAGED_TILED_BLOCK_K = 512
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
     os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
 )
@@ -546,9 +548,25 @@ def _issue_index_k_tma_copy(
 class SparseNSAPagedLogitsKernel:
     """One CTA reuses a query row across a small tile of paged candidate positions."""
 
-    def __init__(self, persistent_ctas: int, num_heads_static: int):
+    def __init__(
+        self,
+        persistent_ctas: int,
+        num_heads_static: int,
+        *,
+        tiled_output: bool = False,
+        tile_block_q: int = _PAGED_TILED_BLOCK_Q,
+        tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    ):
         self.persistent_ctas = int(persistent_ctas)
         self.num_heads_static = int(num_heads_static)
+        self.tiled_output = bool(tiled_output)
+        self.tile_block_q = int(tile_block_q)
+        self.tile_block_k = int(tile_block_k)
+        if self.tiled_output and self.tile_block_k != _PAGED_TILED_BLOCK_K:
+            raise ValueError(
+                f"paged tiled logits currently require block_k={_PAGED_TILED_BLOCK_K}, "
+                f"got {self.tile_block_k}"
+            )
         self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
         if self.num_q_head_tiles not in (1, 2, 4):
             raise ValueError(
@@ -778,9 +796,27 @@ class SparseNSAPagedLogitsKernel:
                                             logit + s_partial_logits[partial_row, head_tile_idx]
                                         )
                                         head_tile_idx += Int32(1)
-                                    logits_out[q_idx, page_base + slot_idx] = Float32(
-                                        logit * s_scale[slot_idx]
-                                    )
+                                    value = Float32(logit * s_scale[slot_idx])
+                                    if cutlass.const_expr(self.tiled_output):
+                                        tile_block_q = Int32(self.tile_block_q)
+                                        tile_block_k = Int32(self.tile_block_k)
+                                        tile_size = Int32(self.tile_block_q * self.tile_block_k)
+                                        num_k_tiles = (
+                                            width_tokens + tile_block_k - Int32(1)
+                                        ) // tile_block_k
+                                        q_tile_idx = q_idx // tile_block_q
+                                        q_local = q_idx - q_tile_idx * tile_block_q
+                                        k_tile_idx = page_base // tile_block_k
+                                        k_local = page_base - k_tile_idx * tile_block_k + slot_idx
+                                        flat_offset = (
+                                            q_tile_idx * num_k_tiles * tile_size
+                                            + k_tile_idx * tile_size
+                                            + q_local * tile_block_k
+                                            + k_local
+                                        )
+                                        logits_out[flat_offset] = value
+                                    else:
+                                        logits_out[q_idx, page_base + slot_idx] = value
                             cute.arch.sync_threads()
                             split_idx += Int32(1)
                         producer_state.advance()
@@ -1388,6 +1424,22 @@ def _build_sparse_nsa_paged_kernel(
     return SparseNSAPagedLogitsKernel(persistent_ctas, num_heads_static)
 
 
+@lru_cache(maxsize=32)
+def _build_sparse_nsa_paged_tiled_kernel(
+    persistent_ctas: int,
+    num_heads_static: int,
+    tile_block_q: int,
+    tile_block_k: int,
+) -> SparseNSAPagedLogitsKernel:
+    return SparseNSAPagedLogitsKernel(
+        persistent_ctas,
+        num_heads_static,
+        tiled_output=True,
+        tile_block_q=tile_block_q,
+        tile_block_k=tile_block_k,
+    )
+
+
 @lru_cache(maxsize=16)
 def _build_sparse_nsa_schedule_single_row_kernel(
     parallel_ctas: int,
@@ -1423,6 +1475,7 @@ def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[tor
 
 def clear_sparse_nsa_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_kernel.cache_clear()
+    _build_sparse_nsa_paged_tiled_kernel.cache_clear()
     _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
     _build_sparse_nsa_schedule_multi_row_kernel.cache_clear()
     cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
@@ -1545,6 +1598,7 @@ def run_sparse_nsa_paged_logits_kernel(
             active_width=active_width,
             schedule_metadata=schedule_metadata,
             width_tokens=width_tokens,
+            preinitialize_invalid_logits=preinitialize_invalid_logits,
         )
         q_bytes = staged["q_bytes"]
         weights_kernel = staged["weights"]
@@ -1666,4 +1720,168 @@ def run_sparse_nsa_paged_logits_kernel(
             *common_cache_key,
         )
     _run_cached_host_launcher(kernel, cache_key, args)
+    return logits_view
+
+
+def run_sparse_nsa_paged_tiled_logits_kernel(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    active_width: torch.Tensor,
+    tile_logits: torch.Tensor,
+    page_size: int = _PAGE_SIZE,
+    tile_block_q: int = _PAGED_TILED_BLOCK_Q,
+    tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
+    preinitialize_tile_logits: bool = True,
+) -> torch.Tensor:
+    if page_size != _PAGE_SIZE:
+        raise ValueError(f"paged tiled logits kernel requires page_size={_PAGE_SIZE}, got {page_size}")
+    if int(tile_block_k) != _PAGED_TILED_BLOCK_K:
+        raise ValueError(
+            f"paged tiled logits kernel requires tile_block_k={_PAGED_TILED_BLOCK_K}, got {tile_block_k}"
+        )
+    if not supports_sparse_nsa_paged_logits_kernel(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        page_size=page_size,
+    ):
+        raise ValueError(
+            "sparse NSA paged tiled logits kernel only supports the exact CUDA page_size=64 FP8 contract"
+        )
+    if active_width.shape != (1,):
+        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+    if active_width.dtype != torch.int32:
+        raise ValueError(f"active_width must have dtype torch.int32, got {active_width.dtype}")
+    if active_width.device != q_fp8.device:
+        raise ValueError(
+            f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
+        )
+    if tile_logits.dtype != torch.float32 or tile_logits.device != q_fp8.device:
+        raise ValueError("tile_logits must be a CUDA torch.float32 tensor on the q_fp8 device")
+    if not tile_logits.is_contiguous():
+        raise ValueError("tile_logits must be contiguous")
+
+    rows = int(q_fp8.shape[0])
+    width_tokens = int(real_page_table.shape[1]) * int(page_size)
+    if rows == 0 or width_tokens == 0:
+        return tile_logits
+    if width_tokens % int(tile_block_k) != 0:
+        raise ValueError(
+            f"paged tiled logits width {width_tokens} must be divisible by tile_block_k={tile_block_k}"
+        )
+    num_q_tiles = (rows + int(tile_block_q) - 1) // int(tile_block_q)
+    num_k_tiles = width_tokens // int(tile_block_k)
+    required_elements = num_q_tiles * num_k_tiles * int(tile_block_q) * int(tile_block_k)
+    if int(tile_logits.numel()) < required_elements:
+        raise ValueError(
+            f"tile_logits has {int(tile_logits.numel())} elements, expected at least {required_elements}"
+        )
+
+    k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
+    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+        index_k_cache,
+        k_quant_bytes,
+    )
+    device_index = q_fp8.device.index or 0
+    if use_patched_k_tma_desc:
+        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
+    else:
+        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
+        int(use_patched_k_tma_desc),
+        device_index,
+    )
+    if workspace is not None:
+        staged = workspace.stage_nsa_indexer_paged_tiled_decode(
+            q_fp8=q_fp8,
+            weights=weights,
+            real_page_table=real_page_table,
+            seqlens_per_query=seqlens_per_query,
+            active_width=active_width,
+            width_tokens=width_tokens,
+            tile_logits=tile_logits,
+            tile_block_q=int(tile_block_q),
+            tile_block_k=int(tile_block_k),
+            preinitialize_tile_logits=bool(preinitialize_tile_logits),
+        )
+        q_bytes = staged["q_bytes"]
+        weights_kernel = staged["weights"]
+        real_page_table_kernel = staged["real_page_table"]
+        seqlens_per_query_kernel = staged["seqlens_per_query"]
+        active_width_kernel = staged["active_width"]
+        logits = staged["tile_logits"]
+        logits_view = staged["tile_logits_view"]
+        if contract_phantoms is None:
+            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
+    else:
+        q_bytes = q_fp8.contiguous().view(torch.uint8)
+        weights_kernel = weights.contiguous()
+        real_page_table_kernel = real_page_table.contiguous()
+        seqlens_per_query_kernel = seqlens_per_query.contiguous()
+        active_width_kernel = active_width.contiguous()
+        logits = tile_logits
+        logits_view = tile_logits[:required_elements]
+        if preinitialize_tile_logits:
+            logits_view.fill_(float("-inf"))
+
+    _cp = contract_phantoms or {}
+    common_args = (
+        _to_kernel_tensor(q_bytes, cutlass.Uint8),
+        _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
+        _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
+        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
+    )
+    common_cache_key = (
+        q_fp8.shape[1],
+        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
+        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_meta_key(k_quant_bytes),
+        _tensor_meta_key(k_tma_desc_ptrs),
+        _tensor_meta_key(use_patched_k_tma_desc_tensor),
+        _tensor_meta_key(k_scales),
+        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
+        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_meta_key(active_width_kernel),
+        _tensor_meta_key(_cp.get("tile_logits", _cp.get("logits", logits))),
+    )
+    persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
+        device_index=device_index,
+        q_rows=rows,
+    )
+    kernel = _build_sparse_nsa_paged_tiled_kernel(
+        persistent_ctas,
+        q_fp8.shape[1],
+        int(tile_block_q),
+        int(tile_block_k),
+    )
+    args = (
+        *common_args,
+        _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+        current_cuda_stream(),
+    )
+    cache_key = (
+        "persistent_tiled",
+        persistent_ctas,
+        int(tile_block_q),
+        int(tile_block_k),
+        *common_cache_key,
+    )
+    _run_cached_host_launcher(kernel, cache_key, args)
+    logits_view._b12x_num_q_tiles = num_q_tiles
+    logits_view._b12x_num_k_tiles = num_k_tiles
+    logits_view._b12x_block_q = int(tile_block_q)
+    logits_view._b12x_block_k = int(tile_block_k)
     return logits_view

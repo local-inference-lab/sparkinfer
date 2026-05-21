@@ -399,15 +399,17 @@ def sparse_nsa_index_decode_logits_paged(
         seqlens_per_query=seqlens_valid,
         page_size=page_size,
     ):
-        query_row_to_batch = torch.arange(valid_q_rows, dtype=torch.int32, device=q_fp8.device)
-        return sparse_nsa_paged_logits_reference(
-            q_fp8=q_fp8,
-            weights=weights_f,
-            index_k_cache=index_k_cache,
-            real_page_table=metadata.real_page_table,
-            query_row_to_batch=query_row_to_batch,
-            seqlens_per_query=seqlens_valid,
-            page_size=page_size,
+        raise NotImplementedError(
+            "B12X sparse NSA paged logits requires the production CUDA FP8 "
+            "kernel contract; refusing to run the reference fallback. "
+            f"q_fp8 shape={tuple(q_fp8.shape)} dtype={q_fp8.dtype} "
+            f"device={q_fp8.device}, weights shape={tuple(weights_f.shape)} "
+            f"dtype={weights_f.dtype}, index_k_cache shape={tuple(index_k_cache.shape)} "
+            f"dtype={index_k_cache.dtype}, real_page_table shape="
+            f"{tuple(metadata.real_page_table.shape)} dtype="
+            f"{metadata.real_page_table.dtype}, cache_seqlens shape="
+            f"{tuple(seqlens_valid.shape)} dtype={seqlens_valid.dtype}, "
+            f"page_size={page_size}"
         )
 
     schedule_metadata = None

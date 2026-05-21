@@ -124,6 +124,8 @@ def sparse_mla_decode_forward(
     v_head_dim: int,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
+    attn_sink: torch.Tensor | None = None,
+    identity_page_table: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _run_sparse_mla(
         q_all=q_all,
@@ -136,6 +138,8 @@ def sparse_mla_decode_forward(
         v_head_dim=v_head_dim,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        attn_sink=attn_sink,
+        identity_page_table=identity_page_table,
     )
 
 
@@ -151,6 +155,7 @@ def sparse_mla_extend_forward(
     v_head_dim: int,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
+    identity_page_table: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _run_sparse_mla(
         q_all=q_all,
@@ -163,6 +168,7 @@ def sparse_mla_extend_forward(
         v_head_dim=v_head_dim,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        identity_page_table=identity_page_table,
     )
 
 
@@ -178,6 +184,8 @@ def _run_sparse_mla(
     v_head_dim: int,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
+    attn_sink: torch.Tensor | None = None,
+    identity_page_table: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -246,6 +254,22 @@ def _run_sparse_mla(
         raise ValueError(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
+    if attn_sink is not None:
+        attn_sink = attn_sink.detach()
+        if return_lse:
+            raise ValueError("fused sparse MLA attn_sink currently supports output-only calls")
+        if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(q_all.shape[1]):
+            raise ValueError(
+                f"attn_sink must have shape ({int(q_all.shape[1])},), got {tuple(attn_sink.shape)}"
+            )
+        if attn_sink.device != workspace.device:
+            raise ValueError(
+                f"attn_sink device {attn_sink.device} does not match workspace device {workspace.device}"
+            )
+        if attn_sink.dtype != torch.float32:
+            raise ValueError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+        if not attn_sink.is_contiguous():
+            raise ValueError("attn_sink must be contiguous for fused sparse MLA")
     if q_all.shape[0] > workspace.max_total_q:
         raise ValueError(
             f"q_all rows {q_all.shape[0]} exceed workspace capacity {workspace.max_total_q}"
@@ -282,7 +306,7 @@ def _run_sparse_mla(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale
     )
     split_cfg = None
-    force_split = return_lse or workspace.mode in ("extend", "verify", "draft_extend")
+    force_split = return_lse or attn_sink is not None or workspace.mode in ("extend", "verify", "draft_extend")
     graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
@@ -356,7 +380,9 @@ def _run_sparse_mla(
             tmp_lse=workspace.tmp_lse,
             output=output,
             launch_num_chunks=launch_num_chunks,
+            attn_sink=attn_sink,
             workspace=workspace,
+            identity_page_table=identity_page_table,
         )
         if return_lse:
             lse = _final_lse_from_split_workspace(
@@ -377,6 +403,11 @@ def _run_sparse_mla(
                 "B12X sparse MLA LSE output requires the split path, but no split "
                 "configuration was available for this contract."
             )
+        if attn_sink is not None:
+            raise RuntimeError(
+                "B12X sparse MLA attn_sink output requires the split path, but no split "
+                "configuration was available for this contract."
+            )
         output = torch.empty(
             (q_all.shape[0], q_all.shape[1], v_head_dim),
             dtype=q_all.dtype,
@@ -390,6 +421,7 @@ def _run_sparse_mla(
             sm_scale=sm_scale_tensor,
             output=output,
             workspace=workspace,
+            identity_page_table=identity_page_table,
         )
     else:
         if _is_cuda_graph_capture_active(q_all.device):
@@ -397,6 +429,8 @@ def _run_sparse_mla(
                 "b12x MLA fell back to the PyTorch reference during CUDA graph capture; "
                 "the current q/kv/page-table contract is not supported by the compiled kernel path"
             )
+        if identity_page_table:
+            raise RuntimeError("identity page-table sparse MLA requires the compiled CUDA kernel path")
         reference_kwargs = dict(
             q_all=q_all,
             kv_cache=kv_cache,

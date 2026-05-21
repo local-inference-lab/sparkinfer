@@ -209,7 +209,7 @@ def test_sparse_nsa_extend_prefill_block_k_env_overrides(monkeypatch) -> None:
         )
 
 
-def test_sparse_nsa_index_decode_logits_paged_matches_reference_cpu() -> None:
+def test_sparse_nsa_index_decode_logits_paged_cpu_hard_fails_without_fallback() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(72_100)
@@ -234,27 +234,17 @@ def test_sparse_nsa_index_decode_logits_paged_matches_reference_cpu() -> None:
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 3
     )
 
-    actual = sparse_nsa_index_decode_logits_paged(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=NSAIndexerPagedDecodeMetadata(
-            real_page_table=real_page_table,
-            cache_seqlens_int32=seqlens,
-            paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(seqlens, 64, 8),
-        ),
-    )
-    expected = sparse_nsa_paged_logits_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=real_page_table,
-        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
-        seqlens_per_query=seqlens,
-    )
-
-    _assert_logits_close(actual, expected)
-    assert torch.isneginf(actual[-1]).all()
+    with pytest.raises(NotImplementedError, match="refusing to run the reference fallback"):
+        sparse_nsa_index_decode_logits_paged(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            metadata=NSAIndexerPagedDecodeMetadata(
+                real_page_table=real_page_table,
+                cache_seqlens_int32=seqlens,
+                paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(seqlens, 64, 8),
+            ),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for paged kernel coverage")

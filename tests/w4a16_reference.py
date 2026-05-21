@@ -261,6 +261,7 @@ def _trace_w4a16_route(
     expert_idx: int,
     router_weight: float,
     activation: str,
+    swiglu_limit: float | None = None,
 ) -> MoERouteTrace:
     block_size = 16
     fp4_lut = _make_fp4_lut(x_f32.device)
@@ -290,6 +291,9 @@ def _trace_w4a16_route(
         ).to(torch.bfloat16).float()
         gate_out = (gate_dequant @ x_bf16) * alpha_fc1
         up_out = (up_dequant @ x_bf16) * alpha_fc1
+        if swiglu_limit is not None:
+            gate_out = torch.clamp(gate_out, max=swiglu_limit)
+            up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
         intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
@@ -404,6 +408,7 @@ def trace_moe_reference_w4a16_route(
     token_idx: int,
     route_idx: int,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> MoERouteTrace:
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
@@ -428,6 +433,7 @@ def trace_moe_reference_w4a16_route(
         expert_idx=expert_idx,
         router_weight=float(topk_weights[token_idx, route_idx].item()),
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -552,6 +558,7 @@ def moe_reference_w4a16(
     I_tp: int,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     m = x.shape[0]
@@ -578,6 +585,7 @@ def moe_reference_w4a16(
                 token_idx=t,
                 route_idx=k_idx,
                 activation=activation,
+                swiglu_limit=swiglu_limit,
             )
             assert trace.expert_idx == eid
             contribs[eid].append((t, trace.routed_out))

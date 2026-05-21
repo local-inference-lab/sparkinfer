@@ -305,7 +305,9 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     indexed_indices = torch.arange(16, dtype=torch.int32, device=device).unsqueeze(0)
     swa_lengths = torch.tensor([11], dtype=torch.int32, device=device)
     indexed_lengths = torch.tensor([7], dtype=torch.int32, device=device)
-    attn_sink = torch.linspace(-0.1, 0.1, _LOCAL_Q_HEADS, dtype=torch.float32, device=device)
+    attn_sink = torch.nn.Parameter(
+        torch.linspace(-0.1, 0.1, _LOCAL_Q_HEADS, dtype=torch.float32, device=device)
+    )
     workspace = _make_workspace(
         device=device,
         rows=q.shape[0],
@@ -351,6 +353,131 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
         extra_indices=indexed_indices,
         extra_topk_lengths=indexed_lengths,
         extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs = (captured_out.float() - expected.float()).abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(captured_out.float().reshape(-1), expected.float().reshape(-1), dim=0)
+    assert max_abs <= 0.10
+    assert cos.item() >= 0.9995
+
+
+@torch.inference_mode()
+def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    swa_page_size = 256
+    q = _make_q(rows=1, seed=91, device=device)
+    swa_cache = _make_cache(tokens=300, page_size=swa_page_size, seed=92, device=device)
+    swa_indices = torch.tensor(
+        [[126, 127, 128, 129, 130, 255, 256, 257]],
+        dtype=torch.int32,
+        device=device,
+    )
+    swa_lengths = torch.tensor([8], dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(-0.08, 0.12, _LOCAL_Q_HEADS, dtype=torch.float32, device=device)
+    workspace = _make_workspace(
+        device=device,
+        rows=q.shape[0],
+        topk=swa_indices.shape[1],
+        max_kv_rows=q.shape[0] * swa_indices.shape[1],
+        use_cuda_graph=True,
+    )
+
+    captured_out: torch.Tensor | None = None
+
+    def run() -> torch.Tensor:
+        nonlocal captured_out
+        captured_out = compressed_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_lengths,
+            swa_page_size=swa_page_size,
+            attn_sink=attn_sink,
+            workspace=workspace,
+            sm_scale=_SM_SCALE,
+        )
+        return captured_out
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert captured_out is not None
+
+    expected = compressed_sparse_mla_reference(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lengths,
+        swa_page_size=swa_page_size,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs = (captured_out.float() - expected.float()).abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(captured_out.float().reshape(-1), expected.float().reshape(-1), dim=0)
+    assert max_abs <= 0.10
+    assert cos.item() >= 0.9995
+
+
+@torch.inference_mode()
+def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows = 8
+    width = 8
+    q = _make_q(rows=rows, seed=81, device=device)
+    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=82, device=device)
+    swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+    for row in range(rows):
+        length = min(width, row + 1)
+        swa_indices[row, :length] = torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
+        swa_lengths[row] = length
+    attn_sink = torch.linspace(-0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device)
+    workspace = _make_workspace(
+        device=device,
+        rows=rows,
+        topk=width,
+        max_kv_rows=rows * width,
+        use_cuda_graph=True,
+    )
+
+    captured_out: torch.Tensor | None = None
+
+    def run() -> torch.Tensor:
+        nonlocal captured_out
+        captured_out = compressed_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_lengths,
+            attn_sink=attn_sink,
+            workspace=workspace,
+            sm_scale=_SM_SCALE,
+        )
+        return captured_out
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert captured_out is not None
+
+    expected = compressed_sparse_mla_reference(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lengths,
         attn_sink=attn_sink,
         sm_scale=_SM_SCALE,
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -107,6 +108,15 @@ _LARGE_BATCH_TILE_CONFIGS = (
 
 def _covering_count(total: int, quantum: int) -> int:
     return (total + quantum - 1) // quantum
+
+
+def _normalize_swiglu_limit(swiglu_limit: float | None) -> float | None:
+    if swiglu_limit is None:
+        return None
+    limit = float(swiglu_limit)
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError(f"swiglu_limit must be positive and finite, got {limit}")
+    return limit
 
 
 def _w4a16_num_regs(
@@ -295,6 +305,7 @@ class W4A16ActivationCompileResult:
     rows: int
     intermediate_size: int
     activation: str
+    swiglu_limit: float | None
 
 
 @dataclass(frozen=True)
@@ -2657,8 +2668,12 @@ class W4A16FusedMoeKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
+        swiglu_limit: float | None = None,
     ):
         is_gated = validate_activation(activation)
+        swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None and not is_gated:
+            raise ValueError("swiglu_limit requires a gated W4A16 activation")
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -2669,6 +2684,8 @@ class W4A16FusedMoeKernel:
         self.top_k = int(top_k)
         self.activation = activation
         self.activation_is_gated = is_gated
+        self.has_swiglu_limit = swiglu_limit is not None
+        self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
@@ -2716,6 +2733,23 @@ class W4A16FusedMoeKernel:
         if cutlass.const_expr(self.is_fp16):
             return cutlass.Float16(x)
         return cutlass.BFloat16(x)
+
+    @cute.jit
+    def _clamp_swiglu_inputs(
+        self,
+        gate: cutlass.Float32,
+        up: cutlass.Float32,
+    ):
+        if cutlass.const_expr(self.has_swiglu_limit):
+            limit = cutlass.Float32(self.swiglu_limit)
+            neg_limit = cutlass.Float32(-self.swiglu_limit)
+            if gate > limit:
+                gate = limit
+            if up > limit:
+                up = limit
+            if up < neg_limit:
+                up = neg_limit
+        return gate, up
 
     @cute.jit
     def __call__(
@@ -2931,6 +2965,7 @@ class W4A16FusedMoeKernel:
                 up = fc1_bf16_flat[base + Int32(self.intermediate_size) + col].to(
                     cutlass.Float32
                 )
+                gate, up = self._clamp_swiglu_inputs(gate, up)
                 silu = gate / (
                     cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
                 )
@@ -2954,8 +2989,12 @@ class W4A16ActivationKernel:
         activation: str,
         element_dtype: str = "bf16",
         fast_math: bool = True,
+        swiglu_limit: float | None = None,
     ):
         is_gated = validate_activation(activation)
+        swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None and not is_gated:
+            raise ValueError("swiglu_limit requires a gated W4A16 activation")
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if rows <= 0 or intermediate_size <= 0:
@@ -2964,6 +3003,8 @@ class W4A16ActivationKernel:
         self.intermediate_size = int(intermediate_size)
         self.activation = activation
         self.is_gated = is_gated
+        self.has_swiglu_limit = swiglu_limit is not None
+        self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
@@ -2974,6 +3015,23 @@ class W4A16ActivationKernel:
         if cutlass.const_expr(self.is_fp16):
             return cutlass.Float16(x)
         return cutlass.BFloat16(x)
+
+    @cute.jit
+    def _clamp_swiglu_inputs(
+        self,
+        gate: cutlass.Float32,
+        up: cutlass.Float32,
+    ):
+        if cutlass.const_expr(self.has_swiglu_limit):
+            limit = cutlass.Float32(self.swiglu_limit)
+            neg_limit = cutlass.Float32(-self.swiglu_limit)
+            if gate > limit:
+                gate = limit
+            if up > limit:
+                up = limit
+            if up < neg_limit:
+                up = neg_limit
+        return gate, up
 
     @cute.jit
     def __call__(
@@ -3005,6 +3063,7 @@ class W4A16ActivationKernel:
                 up = fc1_flat[base + Int32(self.intermediate_size) + col].to(
                     cutlass.Float32
                 )
+                gate, up = self._clamp_swiglu_inputs(gate, up)
                 silu = gate / (
                     cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
                 )
@@ -3258,10 +3317,14 @@ def compile_w4a16_fused_moe(
     element_dtype: str = "bf16",
     sms: int,
     max_shared_mem: int,
+    swiglu_limit: float | None = None,
 ) -> W4A16FusedMoeCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
     is_gated = validate_activation(activation)
+    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
+    if swiglu_limit is not None and not is_gated:
+        raise ValueError("swiglu_limit requires a gated W4A16 activation")
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
@@ -3323,6 +3386,7 @@ def compile_w4a16_fused_moe(
         activation,
         bool(apply_router_weight_on_input),
         bool(zero_fc2_output),
+        swiglu_limit,
         fc1_tile_n,
         fc1_tile_k,
         fc2_tile_n,
@@ -3446,6 +3510,7 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        swiglu_limit=swiglu_limit,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3499,9 +3564,13 @@ def compile_w4a16_activation(
     activation: str,
     element_dtype: str = "bf16",
     fast_math: bool = True,
+    swiglu_limit: float | None = None,
 ) -> W4A16ActivationCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     is_gated = validate_activation(activation)
+    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
+    if swiglu_limit is not None and not is_gated:
+        raise ValueError("swiglu_limit requires a gated W4A16 activation")
     cache_key = (
         "w4a16_activation",
         element_dtype,
@@ -3509,6 +3578,7 @@ def compile_w4a16_activation(
         intermediate_size,
         activation,
         fast_math,
+        swiglu_limit,
     )
     cached = _ACTIVATION_CACHE.get(cache_key)
     if cached is not None:
@@ -3531,6 +3601,7 @@ def compile_w4a16_activation(
         activation=activation,
         element_dtype=element_dtype,
         fast_math=fast_math,
+        swiglu_limit=swiglu_limit,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3546,6 +3617,7 @@ def compile_w4a16_activation(
         rows=rows,
         intermediate_size=intermediate_size,
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
     _ACTIVATION_CACHE[cache_key] = result
     return result
@@ -3766,9 +3838,13 @@ def run_w4a16_moe(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
+    swiglu_limit: float | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     is_gated = validate_activation(activation)
+    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
+    if swiglu_limit is not None and not is_gated:
+        raise ValueError("swiglu_limit requires a gated W4A16 activation")
     element_dtype = _normalize_element_dtype(a_input.dtype)
     if output.dtype != a_input.dtype:
         raise TypeError(f"output must have dtype {a_input.dtype}, got {output.dtype}")
@@ -3893,6 +3969,7 @@ def run_w4a16_moe(
         element_dtype=element_dtype,
         sms=sms,
         max_shared_mem=max_shared_mem,
+        swiglu_limit=swiglu_limit,
     )
     fc1_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(

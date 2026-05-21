@@ -176,7 +176,6 @@ def _attention_caps_cover(
             "kv_dtype",
             "num_q_heads",
             "head_dim",
-            "topk",
             "page_size",
             "padded_heads",
         ),
@@ -184,20 +183,37 @@ def _attention_caps_cover(
         return False
     if requested.reserve_extend_indexer_logits and not existing.reserve_extend_indexer_logits:
         return False
+    if requested.reserve_paged_indexer_logits and not existing.reserve_paged_indexer_logits:
+        return False
+    if requested.reserve_compressed_mla_prep and not existing.reserve_compressed_mla_prep:
+        return False
+    if getattr(requested, "reserve_mhc", False) and not getattr(existing, "reserve_mhc", False):
+        return False
+    if getattr(requested, "reserve_mhc", False) and (
+        getattr(existing, "mhc_hidden_size", 0) != getattr(requested, "mhc_hidden_size", 0)
+        or getattr(existing, "mhc_split_k", 0) != getattr(requested, "mhc_split_k", 0)
+    ):
+        return False
     return _fields_cover(
         existing,
         requested,
         (
             "indexer_num_q_heads",
             "max_v_head_dim",
+            "topk",
             "max_page_table_width",
             "extend_max_total_q",
             "extend_max_batch",
             "extend_max_kv_rows",
+            "indexer_max_k_rows",
             "paged_max_q_rows",
             "paged_max_batch",
+            "mla_max_total_q",
             "max_chunks_per_row",
             "extend_indexer_tile_logits_k_rows",
+            "paged_indexer_logits_k_rows",
+            "paged_indexer_tile_logits_k_rows",
+            "mhc_max_tokens",
         ),
     )
 
@@ -317,6 +333,25 @@ class B12XExecutionLaneArena:
             1,
         )
         allocated_before, reserved_before = _cuda_memory_stats(spec.device)
+        logger.warning(
+            "B12X joint arena request: device=%s shared=%s (%d bytes), "
+            "attention_required=%s, paged_attention_required=%s, moe_required=%s, "
+            "moe_route=%s, moe_core=%s, cuda_allocated_before=%s, cuda_reserved_before=%s",
+            spec.device,
+            _format_nbytes(shared_arena_nbytes),
+            shared_arena_nbytes,
+            _format_nbytes(attention_nbytes),
+            _format_nbytes(paged_attention_nbytes),
+            _format_nbytes(moe_nbytes),
+            _format_nbytes(moe_layout.route_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(moe_layout.core_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(allocated_before) if allocated_before is not None else "n/a",
+            _format_nbytes(reserved_before) if reserved_before is not None else "n/a",
+        )
         shared_arena = torch.empty(
             shared_arena_nbytes,
             dtype=torch.uint8,

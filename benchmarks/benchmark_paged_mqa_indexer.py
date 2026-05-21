@@ -14,7 +14,7 @@ from b12x.integration import (
     pack_paged_mqa_index_k_cache_reference,
     paged_mqa_index_decode_logits_fp8,
     prepare_paged_mqa_indexer_metadata,
-    resolve_local_num_q_heads,
+    resolve_replicated_num_q_heads,
 )
 
 
@@ -94,7 +94,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
-    local_heads = resolve_local_num_q_heads(
+    num_heads = resolve_replicated_num_q_heads(
         global_num_q_heads=args.global_heads,
         tensor_parallel_size=args.tp_size,
     )
@@ -106,9 +106,9 @@ def main() -> None:
     seq_len = int(args.seq_len)
     max_pages_needed = rows * page_table_width
     q_fp8 = (
-        torch.randn((rows, local_heads, 128), generator=gen, dtype=torch.float32).to(device) / 2
+        torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device) / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((rows, local_heads), generator=gen, dtype=torch.float32).to(device)
+    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(device)
     index_k_cache = pack_paged_mqa_index_k_cache_reference(
         torch.randn((max_pages_needed * 64, 128), generator=gen, dtype=torch.float32).to(device)
         / 3
@@ -125,8 +125,8 @@ def main() -> None:
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=local_heads,
-        indexer_num_q_heads=local_heads,
+        num_q_heads=num_heads,
+        indexer_num_q_heads=num_heads,
         head_dim=576,
         v_head_dim=512,
         topk=512,
@@ -144,7 +144,7 @@ def main() -> None:
     metadata = prepare_paged_mqa_indexer_metadata(
         real_page_table=page_table,
         cache_seqlens_int32=seqlens,
-        expected_num_q_heads=local_heads,
+        expected_num_q_heads=num_heads,
         schedule_out=schedule_out,
     )
 
@@ -171,7 +171,7 @@ def main() -> None:
 
     print(
         "paged_mqa_indexer "
-        f"mode={mode} rows={rows} local_heads={local_heads} "
+        f"mode={mode} rows={rows} indexer_heads={num_heads} "
         f"page_table_width={page_table_width} seq_len={seq_len} "
         f"logits_shape={tuple(out.shape)} median_us={median_us:.2f} min_us={min_us:.2f}"
     )

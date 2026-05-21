@@ -150,3 +150,50 @@ def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
         "w2_global_scale",
     ):
         assert torch.equal(getattr(modelopt, name), getattr(compressed_tensors, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_packed_weight_preparation_can_reuse_input_storage(activation: str) -> None:
+    torch.manual_seed(20260521)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+
+    expected = prepare_w4a16_weights(
+        w13.clone(),
+        w13_blockscale,
+        w13_global_scale,
+        w2.clone(),
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+    )
+    actual = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+        reuse_input_storage=True,
+    )
+
+    assert actual.w13.data_ptr() == w13.data_ptr()
+    assert actual.w2.data_ptr() == w2.data_ptr()
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name

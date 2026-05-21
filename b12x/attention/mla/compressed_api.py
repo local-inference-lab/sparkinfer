@@ -50,6 +50,7 @@ def prepare_compressed_mla_core_inputs(
     indexed_indices: torch.Tensor | None = None,
     indexed_topk_lengths: torch.Tensor | None = None,
     indexed_page_size: int | None = None,
+    indexed_page_table: torch.Tensor | None = None,
     expected_num_q_heads: int | None = COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
 ) -> CompressedMLACoreInputs:
     """Prepare compressed sparse MLA data for the existing 576-d MLA core.
@@ -82,8 +83,15 @@ def prepare_compressed_mla_core_inputs(
         if indexed_indices_2d.shape[0] != rows:
             raise ValueError("indexed_indices row count must match q_all")
         _validate_lengths(indexed_topk_lengths, rows=rows, name="indexed_topk_lengths")
+        if indexed_page_table is not None:
+            indexed_page_table_2d = _normalize_index_matrix(indexed_page_table, name="indexed_page_table")
+            if indexed_page_table_2d.shape[0] != rows:
+                raise ValueError("indexed_page_table row count must match q_all")
+        else:
+            indexed_page_table_2d = None
     else:
         indexed_indices_2d = None
+        indexed_page_table_2d = None
 
     swa_width = int(swa_indices_2d.shape[1])
     indexed_width = int(indexed_indices_2d.shape[1]) if indexed_indices_2d is not None else 0
@@ -122,9 +130,18 @@ def prepare_compressed_mla_core_inputs(
             if indexed_len:
                 assert indexed_k_cache is not None
                 assert indexed_page_size is not None
+                gather_indices = indexed_indices_2d[row, :indexed_len]
+                if indexed_page_table_2d is not None:
+                    page_cols = gather_indices // int(indexed_page_size)
+                    page_offsets = gather_indices - page_cols * int(indexed_page_size)
+                    gather_indices = (
+                        indexed_page_table_2d[row, page_cols.long()].to(gather_indices.dtype)
+                        * int(indexed_page_size)
+                        + page_offsets
+                    )
                 k_indexed, _ = gather_compressed_mla_kv_cache_reference(
                     indexed_k_cache,
-                    indexed_indices_2d[row, :indexed_len],
+                    gather_indices,
                     page_size=indexed_page_size,
                 )
                 _write_core_rows(
@@ -160,6 +177,7 @@ def compressed_mla_decode_forward(
     indexed_indices: torch.Tensor | None = None,
     indexed_topk_lengths: torch.Tensor | None = None,
     indexed_page_size: int | None = None,
+    indexed_page_table: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
     expected_num_q_heads: int | None = COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
     return_lse: bool = False,
@@ -198,8 +216,17 @@ def compressed_mla_decode_forward(
         if indexed_indices_2d.shape[0] != rows:
             raise ValueError("indexed_indices row count must match q_all")
         _validate_lengths(indexed_topk_lengths, rows=rows, name="indexed_topk_lengths")
+        if indexed_page_table is not None:
+            indexed_page_table_2d = _normalize_index_matrix(indexed_page_table, name="indexed_page_table")
+            if indexed_page_table_2d.shape[0] != rows:
+                raise ValueError("indexed_page_table row count must match q_all")
+        else:
+            indexed_page_table_2d = None
     else:
         indexed_indices_2d = None
+        indexed_page_table_2d = None
+        if indexed_page_table is not None:
+            raise ValueError("indexed_page_table requires indexed_k_cache/indices/lengths")
 
     if q3.device.type == "cuda":
         core = prepare_compressed_mla_core_inputs_cuda(
@@ -213,6 +240,7 @@ def compressed_mla_decode_forward(
             indexed_indices=indexed_indices_2d,
             indexed_topk_lengths=indexed_topk_lengths,
             indexed_page_size=indexed_page_size,
+            indexed_page_table=indexed_page_table_2d,
         )
     else:
         core = prepare_compressed_mla_core_inputs(
@@ -225,10 +253,12 @@ def compressed_mla_decode_forward(
             indexed_indices=indexed_indices_2d,
             indexed_topk_lengths=indexed_topk_lengths,
             indexed_page_size=indexed_page_size,
+            indexed_page_table=indexed_page_table_2d,
             expected_num_q_heads=None,
         )
 
-    needs_lse = return_lse or attn_sink is not None
+    fused_sink_output = attn_sink is not None and q3.device.type == "cuda" and not return_lse
+    needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
     result = sparse_mla_decode_forward(
         q_all=core.q_all,
         kv_cache=core.kv_cache,
@@ -240,6 +270,8 @@ def compressed_mla_decode_forward(
         v_head_dim=core.v_head_dim,
         return_lse=needs_lse,
         lse_scale="natural" if needs_lse else lse_scale,
+        attn_sink=attn_sink if fused_sink_output else None,
+        identity_page_table=getattr(core, "identity_page_table", False),
     )
     if not needs_lse:
         return result

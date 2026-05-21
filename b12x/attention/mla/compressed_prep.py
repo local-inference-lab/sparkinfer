@@ -25,6 +25,7 @@ class CompressedMLAPrepScratch:
     page_table_1: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     nsa_cache_seqlens_int32: torch.Tensor
+    identity_page_table: bool = False
 
     @property
     def v_head_dim(self) -> int:
@@ -32,25 +33,63 @@ class CompressedMLAPrepScratch:
 
 
 @triton.jit
-def _prepare_compressed_mla_q_kernel(
+def _prepare_compressed_mla_pre_kernel(
     q_ptr,
     q_core_ptr,
+    swa_indices_ptr,
+    swa_lengths_ptr,
+    indexed_indices_ptr,
+    indexed_lengths_ptr,
+    swa_valid_lengths_ptr,
+    indexed_valid_lengths_ptr,
+    page_table_ptr,
+    active_counts_ptr,
     HEADS: tl.constexpr,
+    SWA_WIDTH: tl.constexpr,
+    INDEXED_WIDTH: tl.constexpr,
+    TOTAL_WIDTH: tl.constexpr,
+    HAS_INDEXED: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_SWA: tl.constexpr,
+    BLOCK_INDEXED: tl.constexpr,
+    BLOCK_TABLE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    head = tl.program_id(1)
-    dims = tl.arange(0, BLOCK_D)
-    core_mask = dims < 576
-    src_dims = tl.where(dims < 448, dims, dims - 64)
-    copy_mask = (dims < 448) | (dims >= 512)
-    vals = tl.load(
-        q_ptr + (row * HEADS + head) * 512 + src_dims,
-        mask=core_mask & copy_mask,
-        other=0.0,
-    )
-    vals = tl.where(copy_mask, vals, tl.zeros((BLOCK_D,), tl.bfloat16))
-    tl.store(q_core_ptr + (row * HEADS + head) * 576 + dims, vals, mask=core_mask)
+    item = tl.program_id(1)
+
+    if item < HEADS:
+        head = item
+        dims = tl.arange(0, BLOCK_D)
+        core_mask = dims < 576
+        src_dims = tl.where(dims < 448, dims, dims - 64)
+        copy_mask = (dims < 448) | (dims >= 512)
+        vals = tl.load(
+            q_ptr + (row * HEADS + head) * 512 + src_dims,
+            mask=core_mask & copy_mask,
+            other=0.0,
+        )
+        vals = tl.where(copy_mask, vals, tl.zeros((BLOCK_D,), tl.bfloat16))
+        tl.store(q_core_ptr + (row * HEADS + head) * 576 + dims, vals, mask=core_mask)
+    else:
+        swa_len = _compute_valid_prefix_length(
+            swa_indices_ptr,
+            swa_lengths_ptr,
+            row,
+            SWA_WIDTH,
+            BLOCK_SWA,
+        )
+        indexed_len = tl.full((), 0, tl.int32)
+        if HAS_INDEXED:
+            indexed_len = _compute_valid_prefix_length(
+                indexed_indices_ptr,
+                indexed_lengths_ptr,
+                row,
+                INDEXED_WIDTH,
+                BLOCK_INDEXED,
+            )
+        tl.store(swa_valid_lengths_ptr + row, swa_len)
+        tl.store(indexed_valid_lengths_ptr + row, indexed_len)
+        tl.store(active_counts_ptr + row, swa_len + indexed_len)
 
 
 @triton.jit
@@ -73,41 +112,6 @@ def _compute_valid_prefix_length(indices_ptr, lengths_ptr, row, width: tl.conste
 
 
 @triton.jit
-def _sanitize_compressed_mla_lengths_kernel(
-    swa_indices_ptr,
-    swa_lengths_ptr,
-    indexed_indices_ptr,
-    indexed_lengths_ptr,
-    swa_valid_lengths_ptr,
-    indexed_valid_lengths_ptr,
-    SWA_WIDTH: tl.constexpr,
-    INDEXED_WIDTH: tl.constexpr,
-    HAS_INDEXED: tl.constexpr,
-    BLOCK_SWA: tl.constexpr,
-    BLOCK_INDEXED: tl.constexpr,
-):
-    row = tl.program_id(0)
-    swa_len = _compute_valid_prefix_length(
-        swa_indices_ptr,
-        swa_lengths_ptr,
-        row,
-        SWA_WIDTH,
-        BLOCK_SWA,
-    )
-    tl.store(swa_valid_lengths_ptr + row, swa_len)
-    indexed_len = tl.full((), 0, tl.int32)
-    if HAS_INDEXED:
-        indexed_len = _compute_valid_prefix_length(
-            indexed_indices_ptr,
-            indexed_lengths_ptr,
-            row,
-            INDEXED_WIDTH,
-            BLOCK_INDEXED,
-        )
-    tl.store(indexed_valid_lengths_ptr + row, indexed_len)
-
-
-@triton.jit
 def _prepare_compressed_mla_kv_kernel(
     swa_fp8_ptr,
     swa_u8_ptr,
@@ -119,11 +123,10 @@ def _prepare_compressed_mla_kv_kernel(
     indexed_bf16_ptr,
     indexed_indices_ptr,
     indexed_lengths_ptr,
+    indexed_page_table_ptr,
     kv_fp8_ptr,
     kv_f32_ptr,
     kv_bf16_ptr,
-    page_table_ptr,
-    active_counts_ptr,
     SWA_WIDTH: tl.constexpr,
     INDEXED_WIDTH: tl.constexpr,
     TOTAL_WIDTH: tl.constexpr,
@@ -132,6 +135,8 @@ def _prepare_compressed_mla_kv_kernel(
     INDEXED_PAGE_SIZE: tl.constexpr,
     INDEXED_PAGE_NBYTES: tl.constexpr,
     HAS_INDEXED: tl.constexpr,
+    MAP_INDEXED_PAGE_TABLE: tl.constexpr,
+    INDEXED_PAGE_TABLE_WIDTH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -145,11 +150,6 @@ def _prepare_compressed_mla_kv_kernel(
         indexed_len = tl.load(indexed_lengths_ptr + row).to(tl.int32)
 
     core_row = row * TOTAL_WIDTH + slot
-    if group == 0:
-        tl.store(page_table_ptr + row * TOTAL_WIDTH + slot, core_row)
-        if slot == 0:
-            tl.store(active_counts_ptr + row, swa_len + indexed_len)
-
     use_swa = slot < swa_len
     extra_slot = slot - swa_len
     active_swa = use_swa
@@ -166,6 +166,17 @@ def _prepare_compressed_mla_kv_kernel(
         mask=active_indexed,
         other=0,
     ).to(tl.int64)
+    if MAP_INDEXED_PAGE_TABLE:
+        indexed_page_col = indexed_index // INDEXED_PAGE_SIZE
+        indexed_page_off = indexed_index - indexed_page_col * INDEXED_PAGE_SIZE
+        valid_page_col = (indexed_index >= 0) & (indexed_page_col < INDEXED_PAGE_TABLE_WIDTH)
+        indexed_page = tl.load(
+            indexed_page_table_ptr + row * INDEXED_PAGE_TABLE_WIDTH + indexed_page_col,
+            mask=active_indexed & valid_page_col,
+            other=-1,
+        ).to(tl.int64)
+        active_indexed = active_indexed & valid_page_col & (indexed_page >= 0)
+        indexed_index = indexed_page * INDEXED_PAGE_SIZE + indexed_page_off
     token_index = tl.where(active_swa, swa_index, indexed_index)
 
     page_size = tl.where(use_swa, SWA_PAGE_SIZE, INDEXED_PAGE_SIZE)
@@ -236,6 +247,7 @@ def prepare_compressed_mla_core_inputs_cuda(
     indexed_indices: torch.Tensor | None = None,
     indexed_topk_lengths: torch.Tensor | None = None,
     indexed_page_size: int | None = None,
+    indexed_page_table: torch.Tensor | None = None,
 ) -> CompressedMLAPrepScratch:
     """Prepare compressed MLA pages for the current shared sparse-MLA CUDA core."""
 
@@ -248,6 +260,7 @@ def prepare_compressed_mla_core_inputs_cuda(
         indexed_indices=indexed_indices,
         indexed_topk_lengths=indexed_topk_lengths,
         indexed_page_size=indexed_page_size,
+        indexed_page_table=indexed_page_table,
     )
     rows = int(q_all.shape[0])
     heads = int(q_all.shape[1])
@@ -290,40 +303,49 @@ def prepare_compressed_mla_core_inputs_cuda(
     swa_valid_lengths_live = swa_valid_lengths[:rows]
     indexed_valid_lengths_live = indexed_valid_lengths[:rows]
 
-    _prepare_compressed_mla_q_kernel[(rows, heads)](
+    has_indexed = indexed_k_cache is not None
+    indexed_indices_for_pre = indexed_indices if has_indexed else swa_indices
+    indexed_lengths_for_pre = indexed_topk_lengths if has_indexed else swa_topk_lengths
+    assert indexed_indices_for_pre is not None
+    assert indexed_lengths_for_pre is not None
+
+    _prepare_compressed_mla_pre_kernel[(rows, heads + 1)](
         q_all,
         q_live,
+        swa_indices,
+        swa_topk_lengths,
+        indexed_indices_for_pre,
+        indexed_lengths_for_pre,
+        swa_valid_lengths_live,
+        indexed_valid_lengths_live,
+        page_table_live,
+        active_counts_live,
         HEADS=heads,
+        SWA_WIDTH=swa_width,
+        INDEXED_WIDTH=indexed_width if has_indexed else 0,
+        TOTAL_WIDTH=width_capacity,
+        HAS_INDEXED=has_indexed,
         BLOCK_D=triton.next_power_of_2(_CORE_HEAD_DIM),
+        BLOCK_SWA=triton.next_power_of_2(max(swa_width, 1)),
+        BLOCK_INDEXED=triton.next_power_of_2(max(indexed_width, 1)),
+        BLOCK_TABLE=triton.next_power_of_2(max(width_capacity, 1)),
         num_warps=8,
     )
 
-    has_indexed = indexed_k_cache is not None
     if not has_indexed:
         indexed_k_cache = swa_k_cache
         indexed_indices = swa_indices
         indexed_topk_lengths = swa_topk_lengths
         indexed_page_size = swa_page_size
+        indexed_page_table = None
 
     assert indexed_k_cache is not None
     assert indexed_indices is not None
     assert indexed_topk_lengths is not None
     assert indexed_page_size is not None
-
-    _sanitize_compressed_mla_lengths_kernel[(rows,)](
-        swa_indices,
-        swa_topk_lengths,
-        indexed_indices,
-        indexed_topk_lengths,
-        swa_valid_lengths_live,
-        indexed_valid_lengths_live,
-        SWA_WIDTH=swa_width,
-        INDEXED_WIDTH=indexed_width,
-        HAS_INDEXED=has_indexed,
-        BLOCK_SWA=triton.next_power_of_2(max(swa_width, 1)),
-        BLOCK_INDEXED=triton.next_power_of_2(max(indexed_width, 1)),
-        num_warps=8,
-    )
+    map_indexed_page_table = indexed_page_table is not None
+    indexed_page_table_for_kernel = indexed_page_table if map_indexed_page_table else indexed_indices
+    indexed_page_table_width = int(indexed_page_table.shape[1]) if map_indexed_page_table else 1
 
     _prepare_compressed_mla_kv_kernel[(rows, width_capacity, 4)](
         swa_k_cache.view(torch.float8_e4m3fn),
@@ -336,11 +358,10 @@ def prepare_compressed_mla_core_inputs_cuda(
         indexed_k_cache.view(torch.bfloat16),
         indexed_indices,
         indexed_valid_lengths_live,
+        indexed_page_table_for_kernel,
         kv_live.view(torch.float8_e4m3fn),
         kv_live.view(torch.float32),
         kv_live.view(torch.bfloat16),
-        page_table_live,
-        active_counts_live,
         SWA_WIDTH=swa_width,
         INDEXED_WIDTH=indexed_width,
         TOTAL_WIDTH=width_capacity,
@@ -349,6 +370,8 @@ def prepare_compressed_mla_core_inputs_cuda(
         INDEXED_PAGE_SIZE=int(indexed_page_size),
         INDEXED_PAGE_NBYTES=compressed_mla_page_nbytes(int(indexed_page_size)),
         HAS_INDEXED=has_indexed,
+        MAP_INDEXED_PAGE_TABLE=map_indexed_page_table,
+        INDEXED_PAGE_TABLE_WIDTH=indexed_page_table_width,
         BLOCK_D=128,
         num_warps=4,
     )
@@ -359,6 +382,7 @@ def prepare_compressed_mla_core_inputs_cuda(
         page_table_1=page_table_live,
         cache_seqlens_int32=active_counts_live,
         nsa_cache_seqlens_int32=active_counts_live,
+        identity_page_table=True,
     )
 
 
@@ -372,6 +396,7 @@ def _validate_cuda_inputs(
     indexed_indices: torch.Tensor | None,
     indexed_topk_lengths: torch.Tensor | None,
     indexed_page_size: int | None,
+    indexed_page_table: torch.Tensor | None,
 ) -> None:
     if q_all.device.type != "cuda":
         raise ValueError("compressed MLA CUDA prep requires CUDA q_all")
@@ -387,6 +412,8 @@ def _validate_cuda_inputs(
 
     has_indexed = indexed_k_cache is not None or indexed_indices is not None or indexed_topk_lengths is not None
     if not has_indexed:
+        if indexed_page_table is not None:
+            raise ValueError("indexed_page_table requires indexed_k_cache/indices/lengths")
         return
     if indexed_k_cache is None or indexed_indices is None or indexed_topk_lengths is None:
         raise ValueError("indexed_k_cache, indexed_indices, and indexed_topk_lengths must be provided together")
@@ -395,6 +422,8 @@ def _validate_cuda_inputs(
     _validate_cache(indexed_k_cache, "indexed_k_cache")
     _validate_indices(indexed_indices, "indexed_indices", rows=int(q_all.shape[0]))
     _validate_lengths(indexed_topk_lengths, "indexed_topk_lengths", rows=int(q_all.shape[0]))
+    if indexed_page_table is not None:
+        _validate_indices(indexed_page_table, "indexed_page_table", rows=int(q_all.shape[0]))
 
 
 def _validate_cache(cache: torch.Tensor, name: str) -> None:
@@ -438,7 +467,7 @@ def _get_or_alloc_prep_buffers(
     heads: int,
     width_capacity: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_shape = (q_capacity, heads, _CORE_HEAD_DIM)
     kv_shape = (q_capacity * width_capacity, 1, _MLA_PACKED_DIM)
     page_table_shape = (q_capacity, width_capacity)

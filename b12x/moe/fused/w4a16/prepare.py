@@ -87,13 +87,14 @@ def _nvfp4_compute_scale_factor(
 ) -> float:
     if a_dtype == torch.float16:
         return 1.0
-    ws_float = packed_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if bool(nonzero_mask.any().item()):
-        max_val = ws_float[nonzero_mask].max()
-        max_scalar = float(max_val.item())
-        if max_scalar < 448 * (2**7):
-            return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
+    max_scalar = 0.0
+    for expert in range(int(packed_scales.shape[0])):
+        ws_float = packed_scales[expert].float() * (2**7)
+        nonzero_mask = ws_float > 0
+        if bool(nonzero_mask.any().item()):
+            max_scalar = max(max_scalar, float(ws_float[nonzero_mask].max().item()))
+    if max_scalar > 0.0 and max_scalar < 448 * (2**7):
+        return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
     return 1.0
 
 
@@ -208,12 +209,49 @@ def _repack_4bit_no_perm(
     return result.to(torch.int32).reshape(k_tiles, n_tiles * 128).contiguous()
 
 
-def _repack_weight(weight: torch.Tensor, *, size_k: int, size_n: int) -> torch.Tensor:
-    pieces = []
-    for expert in range(weight.shape[0]):
-        qweight = weight[expert].view(torch.int32).T.contiguous()
-        pieces.append(_repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n))
-    return torch.stack(pieces, dim=0).contiguous()
+def _repack_weight(
+    weight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    row_rotation: int | None = None,
+    reuse_input_storage: bool = False,
+) -> torch.Tensor:
+    num_experts = int(weight.shape[0])
+    if tuple(weight.shape[1:]) != (size_n, size_k // 2):
+        raise ValueError(
+            f"expected packed weight shape {(num_experts, size_n, size_k // 2)}, "
+            f"got {tuple(weight.shape)}"
+        )
+    if size_k % _PACKED_TILE_SIZE != 0 or size_n % _PACKED_TILE_N_SIZE != 0:
+        raise ValueError(
+            f"W4A16 repack requires K,N multiples of 16,64; got {size_k},{size_n}"
+        )
+
+    packed_shape = (
+        num_experts,
+        size_k // _PACKED_TILE_SIZE,
+        (size_n // _PACKED_TILE_N_SIZE) * 128,
+    )
+    if reuse_input_storage:
+        if not weight.is_contiguous():
+            raise ValueError("reuse_input_storage requires contiguous packed weights")
+        packed = weight.view(torch.int32).reshape(packed_shape)
+    else:
+        packed = torch.empty(packed_shape, device=weight.device, dtype=torch.int32)
+    for expert in range(num_experts):
+        expert_weight = weight[expert].view(torch.int32)
+        if row_rotation is not None:
+            qweight = torch.cat(
+                [expert_weight[row_rotation:], expert_weight[:row_rotation]],
+                dim=0,
+            ).T.contiguous()
+        else:
+            qweight = expert_weight.T.contiguous()
+        packed[expert].copy_(
+            _repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n)
+        )
+    return packed
 
 
 def _permute_nvfp4_scales(
@@ -223,24 +261,40 @@ def _permute_nvfp4_scales(
     size_k: int,
     size_n: int,
     a_dtype: torch.dtype,
+    row_rotation: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    scales = scales.to(a_dtype)
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
-    pieces = []
+    packed_scales: torch.Tensor | None = None
     for expert in range(scales.shape[0]):
-        packed_scales = _permute_packed_scales(
-            scales[expert].T,
+        expert_source = scales[expert].to(a_dtype)
+        if row_rotation is not None:
+            expert_source = torch.cat(
+                [expert_source[row_rotation:], expert_source[:row_rotation]],
+                dim=0,
+            )
+        expert_scales = _permute_packed_scales(
+            expert_source.T,
             size_k=size_k,
             size_n=size_n,
             group_size=16,
         )
-        pieces.append(
-            _process_nvfp4_packed_scales(
-                packed_scales,
-                scale_factor=combined_scale_factor,
-            )
+        expert_packed = _process_nvfp4_packed_scales(
+            expert_scales,
+            scale_factor=combined_scale_factor,
         )
-    packed_scales = torch.stack(pieces, dim=0).contiguous()
+        if packed_scales is None:
+            packed_scales = torch.empty(
+                (int(scales.shape[0]), *expert_packed.shape),
+                dtype=expert_packed.dtype,
+                device=expert_packed.device,
+            )
+        packed_scales[expert].copy_(expert_packed)
+    if packed_scales is None:
+        packed_scales = torch.empty(
+            (0, size_k // _PACKED_TILE_SIZE, size_n // 2),
+            dtype=torch.float8_e4m3fn,
+            device=scales.device,
+        )
     packed_global = _process_nvfp4_packed_global_scale(
         global_scales,
         a_dtype=a_dtype,
@@ -260,6 +314,7 @@ def prepare_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
     shape = validate_w4a16_packed_inputs(
@@ -281,12 +336,16 @@ def prepare_w4a16_packed_weights(
         rows=w13_rows,
         cols=hidden_size,
     )
+    w13_row_rotation = None
     if is_gated:
-        w13, w13_scale = reorder_w13_to_gate_up(
-            w13,
-            w13_scale,
-            intermediate_size=intermediate_size,
-        )
+        if reuse_input_storage:
+            w13_row_rotation = intermediate_size
+        else:
+            w13, w13_scale = reorder_w13_to_gate_up(
+                w13,
+                w13_scale,
+                intermediate_size=intermediate_size,
+            )
 
     w2_scale = unswizzle_expert_scales(
         w2_blockscale,
@@ -294,9 +353,18 @@ def prepare_w4a16_packed_weights(
         cols=intermediate_size,
     )
 
-    packed_w13 = _repack_weight(w13.contiguous(), size_k=hidden_size, size_n=w13_rows)
+    packed_w13 = _repack_weight(
+        w13.contiguous(),
+        size_k=hidden_size,
+        size_n=w13_rows,
+        row_rotation=w13_row_rotation,
+        reuse_input_storage=reuse_input_storage,
+    )
     packed_w2 = _repack_weight(
-        w2_fp4.contiguous(), size_k=intermediate_size, size_n=hidden_size
+        w2_fp4.contiguous(),
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        reuse_input_storage=reuse_input_storage,
     )
     w13_global_scale = _source_global_scale(
         w13_global_scale,
@@ -312,6 +380,7 @@ def prepare_w4a16_packed_weights(
         size_k=hidden_size,
         size_n=w13_rows,
         a_dtype=params_dtype,
+        row_rotation=w13_row_rotation,
     )
     packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
         w2_scale,
