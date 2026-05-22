@@ -235,7 +235,7 @@ def _prepare_compressed_mla_kv_kernel(
     tl.store(kv_f32_ptr + (core_row * 656 + 512) // 4 + group, scale)
 
 
-def prepare_compressed_mla_core_inputs_cuda(
+def prepare_compressed_mla_core_inputs(
     *,
     q_all: torch.Tensor,
     swa_k_cache: torch.Tensor,
@@ -249,9 +249,9 @@ def prepare_compressed_mla_core_inputs_cuda(
     indexed_page_size: int | None = None,
     indexed_page_table: torch.Tensor | None = None,
 ) -> CompressedMLAPrepScratch:
-    """Prepare compressed MLA pages for the current shared sparse-MLA CUDA core."""
+    """Prepare compressed MLA pages for the current shared sparse-MLA core."""
 
-    _validate_cuda_inputs(
+    _validate_gpu_inputs(
         q_all=q_all,
         swa_k_cache=swa_k_cache,
         swa_indices=swa_indices,
@@ -386,7 +386,7 @@ def prepare_compressed_mla_core_inputs_cuda(
     )
 
 
-def _validate_cuda_inputs(
+def _validate_gpu_inputs(
     *,
     q_all: torch.Tensor,
     swa_k_cache: torch.Tensor,
@@ -398,8 +398,8 @@ def _validate_cuda_inputs(
     indexed_page_size: int | None,
     indexed_page_table: torch.Tensor | None,
 ) -> None:
-    if q_all.device.type != "cuda":
-        raise ValueError("compressed MLA CUDA prep requires CUDA q_all")
+    if not q_all.is_cuda:
+        raise ValueError("compressed MLA prep requires GPU q_all")
     if q_all.dtype != torch.bfloat16:
         raise TypeError(f"q_all must have dtype torch.bfloat16, got {q_all.dtype}")
     if q_all.ndim != 3 or q_all.shape[-1] != COMPRESSED_MLA_HEAD_DIM:
@@ -427,8 +427,8 @@ def _validate_cuda_inputs(
 
 
 def _validate_cache(cache: torch.Tensor, name: str) -> None:
-    if cache.device.type != "cuda":
-        raise ValueError(f"{name} must be on CUDA")
+    if not cache.is_cuda:
+        raise ValueError(f"{name} must be on GPU")
     if cache.dtype != torch.uint8:
         raise TypeError(f"{name} must have dtype torch.uint8, got {cache.dtype}")
     if cache.ndim != 2:
@@ -438,10 +438,10 @@ def _validate_cache(cache: torch.Tensor, name: str) -> None:
 
 
 def _validate_indices(indices: torch.Tensor, name: str, *, rows: int) -> None:
-    if indices.device.type != "cuda":
-        raise ValueError(f"{name} must be on CUDA")
+    if not indices.is_cuda:
+        raise ValueError(f"{name} must be on GPU")
     if indices.dtype != torch.int32:
-        raise TypeError(f"{name} must have dtype torch.int32 for CUDA prep, got {indices.dtype}")
+        raise TypeError(f"{name} must have dtype torch.int32 for compressed MLA prep, got {indices.dtype}")
     if indices.ndim != 2 or indices.shape[0] != rows:
         raise ValueError(f"{name} must have shape [{rows}, width], got {tuple(indices.shape)}")
     if not indices.is_contiguous():
@@ -449,10 +449,10 @@ def _validate_indices(indices: torch.Tensor, name: str, *, rows: int) -> None:
 
 
 def _validate_lengths(lengths: torch.Tensor, name: str, *, rows: int) -> None:
-    if lengths.device.type != "cuda":
-        raise ValueError(f"{name} must be on CUDA")
+    if not lengths.is_cuda:
+        raise ValueError(f"{name} must be on GPU")
     if lengths.dtype != torch.int32:
-        raise TypeError(f"{name} must have dtype torch.int32 for CUDA prep, got {lengths.dtype}")
+        raise TypeError(f"{name} must have dtype torch.int32 for compressed MLA prep, got {lengths.dtype}")
     if lengths.shape != (rows,):
         raise ValueError(f"{name} must have shape [{rows}], got {tuple(lengths.shape)}")
     if not lengths.is_contiguous():

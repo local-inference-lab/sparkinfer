@@ -153,14 +153,15 @@ def _parse_cases(raw: str, rows: list[int]) -> list[BenchmarkCase]:
 
 
 def _make_q(*, rows: int, seed: int, device: torch.device) -> torch.Tensor:
-    gen = torch.Generator(device="cpu")
+    gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q = torch.randn(
         (rows, COMPRESSED_MLA_LOCAL_Q_HEADS_TP2, COMPRESSED_MLA_HEAD_DIM),
         generator=gen,
         dtype=torch.float32,
+        device=device,
     )
-    return (q * 0.04).to(dtype=torch.bfloat16, device=device)
+    return (q * 0.04).to(dtype=torch.bfloat16)
 
 
 def _make_compressed_cache(
@@ -170,13 +171,29 @@ def _make_compressed_cache(
     seed: int,
     device: torch.device,
 ) -> torch.Tensor:
-    gen = torch.Generator(device="cpu")
+    gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    k_nope = torch.randn((tokens, COMPRESSED_MLA_NOPE_DIM), generator=gen, dtype=torch.float32) * 0.05
-    k_rope = torch.randn((tokens, COMPRESSED_MLA_ROPE_DIM), generator=gen, dtype=torch.float32) * 0.05
+    k_nope = (
+        torch.randn(
+            (tokens, COMPRESSED_MLA_NOPE_DIM),
+            generator=gen,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.05
+    )
+    k_rope = (
+        torch.randn(
+            (tokens, COMPRESSED_MLA_ROPE_DIM),
+            generator=gen,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.05
+    )
     return pack_compressed_mla_kv_cache_reference(
-        k_nope.to(device=device),
-        k_rope.to(dtype=torch.bfloat16, device=device),
+        k_nope,
+        k_rope.to(dtype=torch.bfloat16),
         page_size=page_size,
     )
 
@@ -319,6 +336,7 @@ def _benchmark_case(
             swa_k_cache=swa_cache,
             swa_indices=swa_indices,
             swa_topk_lengths=swa_lengths,
+            workspace=workspace,
             indexed_k_cache=indexed_cache,
             indexed_indices=indexed_indices,
             indexed_topk_lengths=indexed_lengths,

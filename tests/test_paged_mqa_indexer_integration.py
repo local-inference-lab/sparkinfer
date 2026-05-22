@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x.attention.mla.workspace import (
+    B12XAttentionArena,
+    B12XAttentionArenaCaps,
+    B12XAttentionWorkspaceContract,
+)
 from b12x.integration import (
     B12XAttentionWorkspace,
     clear_nsa_indexer_caches,
@@ -652,6 +657,56 @@ def test_paged_mqa_index_decode_supertile_topk_fp8_graph_matches_reference(
         torch.sort(actual, dim=1).values,
         torch.sort(expected_raw1, dim=1).values,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
+def test_paged_mqa_supertile_workspace_sizes_candidate_chunks() -> None:
+    device = torch.device("cuda")
+    page_size = 256
+    page_table_width = 1056
+    supertile_k = 8192
+    expected_chunks = (page_table_width * page_size + supertile_k - 1) // supertile_k
+
+    arena = B12XAttentionArena.allocate(
+        B12XAttentionArenaCaps(
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            num_q_heads=32,
+            indexer_num_q_heads=64,
+            head_dim=576,
+            max_v_head_dim=512,
+            topk=512,
+            max_page_table_width=page_table_width,
+            extend_max_total_q=16,
+            extend_max_batch=4,
+            extend_max_kv_rows=0,
+            paged_max_q_rows=16,
+            paged_max_batch=4,
+            page_size=page_size,
+            max_chunks_per_row=20,
+            reserve_paged_indexer_logits=False,
+            paged_indexer_tile_logits_k_rows=supertile_k,
+        )
+    )
+    workspace = arena.make_workspace(
+        B12XAttentionWorkspaceContract(
+            mode="decode",
+            max_total_q=16,
+            max_batch=4,
+            max_paged_q_rows=16,
+            max_kv_rows=0,
+            v_head_dim=512,
+            indexer_num_q_heads=64,
+            max_page_table_width=page_table_width,
+            topk=512,
+        ),
+        use_cuda_graph=True,
+    )
+
+    candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
+    assert candidate_values.shape[0] >= expected_chunks
+    assert candidate_indices.shape[0] >= expected_chunks
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")

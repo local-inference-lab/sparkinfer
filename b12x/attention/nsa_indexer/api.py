@@ -695,6 +695,7 @@ def sparse_nsa_index_extend_tiled_topk(
             output_values=output_values,
             output_indices=output_indices,
             num_k_tiles=num_k_tiles,
+            contract_phantoms=contract_phantoms,
         )
         return topk_indices
 
@@ -776,6 +777,7 @@ def sparse_nsa_index_extend_tiled_topk(
             input_index_offset=chunk_start,
             input_extent=chunk_rows,
             output_index_offset=chunk_start,
+            contract_phantoms=contract_phantoms,
         )
     _, topk_indices = merge_tiled_topk_candidates(
         candidate_values=candidate_values,

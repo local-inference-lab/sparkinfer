@@ -592,6 +592,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
         raise RuntimeError(
             "paged MQA index supertile top-k requires the workspace tiled-logits buffer"
         )
+    contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
 
     final_values, workspace_raw_indices = workspace.get_indexer_extend_topk_buffers(
         row_count=q_rows,
@@ -671,6 +672,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             tile_block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
             workspace=workspace,
             preinitialize_tile_logits=False,
+            contract_phantoms=contract_phantoms,
         )
         if not logits.is_contiguous():
             raise RuntimeError("C4 supertile scorer returned non-contiguous tiled logits")
@@ -681,7 +683,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             out_values = candidate_values[chunk_idx]
             out_indices = candidate_indices[chunk_idx]
         run_tiled_topk(
-            tile_logits=logits,
+            tile_logits=tile_logits,
             k_start=None,
             lengths=chunk_lengths,
             topk=topk,
@@ -694,6 +696,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             input_extent=chunk_width_tokens,
             output_index_offset=chunk_start_token,
             zero_row_start=True,
+            contract_phantoms=contract_phantoms,
         )
 
     if candidate_values is not None and candidate_indices is not None:
@@ -787,6 +790,7 @@ def paged_mqa_index_decode_dense_topk_fp8(
         preinitialize_invalid_logits=False,
         active_width_override=active_width,
     )
+    contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
     final_values, workspace_raw_indices = workspace.get_indexer_extend_topk_buffers(
         row_count=q_rows,
     )
@@ -803,6 +807,7 @@ def paged_mqa_index_decode_dense_topk_fp8(
         topk=topk,
         output_values=final_values,
         output_indices=final_raw_indices,
+        contract_phantoms=contract_phantoms,
     )
 
     return final_raw_indices

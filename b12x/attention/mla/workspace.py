@@ -644,8 +644,12 @@ class B12XAttentionArena:
             else 0
         )
         if paged_tile_logits_k_rows:
+            paged_tile_candidate_chunks = (
+                paged_width_tokens + paged_tile_logits_k_rows - 1
+            ) // paged_tile_logits_k_rows
             paged_candidate_chunks = max(
                 paged_candidate_chunks,
+                paged_tile_candidate_chunks,
                 int(caps.max_chunks_per_row),
             )
         candidate_chunks = max(extend_candidate_chunks, paged_candidate_chunks)
@@ -1181,13 +1185,18 @@ class B12XAttentionWorkspace:
     _contract_indexer_k_end: torch.Tensor | None = None
     _contract_indexer_logits: torch.Tensor | None = None
     _contract_indexer_tile_logits: torch.Tensor | None = None
+    _contract_indexer_topk_values: torch.Tensor | None = None
+    _contract_indexer_topk_indices: torch.Tensor | None = None
     _contract_paged_indexer_q_bytes: torch.Tensor | None = None
     _contract_paged_indexer_weights: torch.Tensor | None = None
     _contract_paged_real_page_table: torch.Tensor | None = None
     _contract_paged_nsa_cache_seqlens: torch.Tensor | None = None
     _contract_paged_indexer_logits: torch.Tensor | None = None
     _contract_paged_indexer_tile_logits: torch.Tensor | None = None
+    _contract_paged_indexer_topk_values: torch.Tensor | None = None
+    _contract_paged_indexer_topk_indices: torch.Tensor | None = None
     _nsa_extend_tiled_topk_prewarmed: bool = False
+    _paged_indexer_tiled_topk_prewarmed: bool = False
 
     def __post_init__(self) -> None:
         self.device = _canonical_device(self.device)
@@ -1785,6 +1794,12 @@ class B12XAttentionWorkspace:
             phantoms["extend_logits"] = self._contract_indexer_logits
         if self._contract_indexer_tile_logits is not None:
             phantoms["extend_tile_logits"] = self._contract_indexer_tile_logits
+        if self._contract_indexer_topk_values is not None:
+            phantoms["extend_topk_values"] = self._contract_indexer_topk_values
+            phantoms["topk_values"] = self._contract_indexer_topk_values
+        if self._contract_indexer_topk_indices is not None:
+            phantoms["extend_topk_indices"] = self._contract_indexer_topk_indices
+            phantoms["topk_indices"] = self._contract_indexer_topk_indices
         return phantoms
 
     def get_indexer_extend_tile_logits(self) -> torch.Tensor | None:
@@ -2003,6 +2018,70 @@ class B12XAttentionWorkspace:
 
         self._nsa_extend_tiled_topk_prewarmed = True
 
+    def prewarm_paged_indexer_tiled_topk(self) -> None:
+        """Compile the fixed-capacity paged C4 tiled top-k launcher."""
+
+        if self._paged_indexer_tiled_topk_prewarmed:
+            return
+        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            return
+        if (
+            self.indexer_extend_tile_logits is None
+            or self.indexer_extend_topk_values is None
+            or self.indexer_extend_topk_indices is None
+            or self.max_paged_q_rows <= 0
+            or self.topk <= 0
+        ):
+            return
+
+        from b12x.attention.nsa_indexer.tiled_topk import run_tiled_topk
+
+        block_q = _NSA_INDEXER_TILE_BLOCK_Q
+        block_k = _PAGED_INDEXER_TILE_BLOCK_K
+        topk = int(self.topk)
+        q_rows = min(
+            max(int(self.max_paged_q_rows), 1),
+            int(self.indexer_extend_topk_values.shape[0]),
+            block_q,
+        )
+        num_q_tiles = (q_rows + block_q - 1) // block_q
+        max_num_k_tiles = int(self.indexer_extend_tile_logits.numel()) // (
+            max(num_q_tiles, 1) * block_q * block_k
+        )
+        min_num_k_tiles = (topk + block_k - 1) // block_k
+        num_k_tiles = max(min_num_k_tiles, 1)
+        if max_num_k_tiles < num_k_tiles:
+            return
+
+        self._allocate_paged_indexer_runtime_metadata()
+        if self.paged_indexer_seqlens_per_query_runtime is None:
+            return
+
+        with torch.cuda.device(self.device):
+            tile_elements = num_q_tiles * block_q * num_k_tiles * block_k
+            self.indexer_extend_tile_logits[:tile_elements].zero_()
+            lengths = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
+            lengths.fill_(num_k_tiles * block_k)
+            output_values = self.indexer_extend_topk_values[:q_rows, :topk]
+            output_indices = self.indexer_extend_topk_indices[:q_rows, :topk]
+            run_tiled_topk(
+                tile_logits=self.indexer_extend_tile_logits,
+                k_start=None,
+                lengths=lengths,
+                topk=topk,
+                block_q=block_q,
+                block_k=block_k,
+                output_values=output_values,
+                output_indices=output_indices,
+                num_k_tiles=num_k_tiles,
+                input_extent=num_k_tiles * block_k,
+                zero_row_start=True,
+                contract_phantoms=self.get_paged_indexer_contract_phantoms(),
+            )
+            torch.cuda.synchronize(self.device)
+
+        self._paged_indexer_tiled_topk_prewarmed = True
+
     def get_paged_indexer_contract_phantoms(self) -> dict[str, torch.Tensor]:
         if (
             self._contract_paged_indexer_q_bytes is None
@@ -2021,6 +2100,10 @@ class B12XAttentionWorkspace:
             phantoms["logits"] = self._contract_paged_indexer_logits
         if self._contract_paged_indexer_tile_logits is not None:
             phantoms["tile_logits"] = self._contract_paged_indexer_tile_logits
+        if self._contract_paged_indexer_topk_values is not None:
+            phantoms["topk_values"] = self._contract_paged_indexer_topk_values
+        if self._contract_paged_indexer_topk_indices is not None:
+            phantoms["topk_indices"] = self._contract_paged_indexer_topk_indices
         if "logits" not in phantoms and "tile_logits" not in phantoms:
             raise RuntimeError("fixed-capacity workspace is missing paged NSA indexer output phantoms")
         return phantoms
@@ -2700,6 +2783,18 @@ class B12XAttentionWorkspace:
                 dtype=torch.float32,
                 device=self.device,
             )
+        if self.indexer_extend_topk_values is not None:
+            self._contract_indexer_topk_values = _shape_only_cuda_tensor(
+                tuple(int(dim) for dim in self.indexer_extend_topk_values.shape),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if self.indexer_extend_topk_indices is not None:
+            self._contract_indexer_topk_indices = _shape_only_cuda_tensor(
+                tuple(int(dim) for dim in self.indexer_extend_topk_indices.shape),
+                dtype=torch.int32,
+                device=self.device,
+            )
         if self.indexer_paged_logits is not None or self.indexer_extend_tile_logits is not None:
             paged_width_tokens = max(
                 int(self.indexer_paged_logits.numel())
@@ -2738,5 +2833,17 @@ class B12XAttentionWorkspace:
                 self._contract_paged_indexer_tile_logits = _shape_only_cuda_tensor(
                     tuple(int(dim) for dim in self.indexer_extend_tile_logits.shape),
                     dtype=torch.float32,
+                    device=self.device,
+                )
+            if self.indexer_extend_topk_values is not None:
+                self._contract_paged_indexer_topk_values = _shape_only_cuda_tensor(
+                    tuple(int(dim) for dim in self.indexer_extend_topk_values.shape),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            if self.indexer_extend_topk_indices is not None:
+                self._contract_paged_indexer_topk_indices = _shape_only_cuda_tensor(
+                    tuple(int(dim) for dim in self.indexer_extend_topk_indices.shape),
+                    dtype=torch.int32,
                     device=self.device,
                 )
