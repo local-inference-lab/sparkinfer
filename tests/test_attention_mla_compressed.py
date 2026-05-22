@@ -15,6 +15,7 @@ from b12x.integration.mla import (
     compressed_sparse_mla_reference,
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
+    prepare_compressed_mla_core_inputs,
 )
 
 from .helpers import require_sm120
@@ -370,3 +371,99 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
     cos = torch.nn.functional.cosine_similarity(captured_out.float().reshape(-1), expected.float().reshape(-1), dim=0)
     assert max_abs <= 0.10
     assert cos.item() >= 0.9995
+
+
+@torch.inference_mode()
+def test_compressed_mla_cute_kv_prep_matches_triton_under_cuda_graph() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows = 2
+    swa_width = 8
+    indexed_width = 16
+    q = _make_q(rows=rows, seed=121, device=device)
+    swa_cache = _make_cache(tokens=64, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=122, device=device)
+    indexed_cache = _make_cache(tokens=128, page_size=COMPRESSED_MLA_C4_PAGE_SIZE, seed=123, device=device)
+    swa_indices = torch.stack(
+        [
+            torch.arange(0, swa_width, dtype=torch.int32, device=device),
+            torch.arange(7, 7 + swa_width, dtype=torch.int32, device=device),
+        ]
+    )
+    indexed_indices = torch.stack(
+        [
+            torch.arange(0, indexed_width, dtype=torch.int32, device=device),
+            torch.arange(17, 17 + indexed_width, dtype=torch.int32, device=device),
+        ]
+    )
+    swa_lengths = torch.tensor([swa_width, swa_width - 2], dtype=torch.int32, device=device)
+    indexed_lengths = torch.tensor([indexed_width, indexed_width - 3], dtype=torch.int32, device=device)
+    topk = swa_width + indexed_width
+    workspace_triton = _make_workspace(
+        device=device,
+        rows=rows,
+        topk=topk,
+        max_kv_rows=rows * topk,
+        use_cuda_graph=True,
+    )
+    workspace_cute = _make_workspace(
+        device=device,
+        rows=rows,
+        topk=topk,
+        max_kv_rows=rows * topk,
+        use_cuda_graph=True,
+    )
+
+    triton_core = prepare_compressed_mla_core_inputs(
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=swa_indices,
+        swa_topk_lengths=swa_lengths,
+        swa_page_size=COMPRESSED_MLA_SWA_PAGE_SIZE,
+        indexed_k_cache=indexed_cache,
+        indexed_indices=indexed_indices,
+        indexed_topk_lengths=indexed_lengths,
+        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+        workspace=workspace_triton,
+        kv_kernel_impl="triton",
+    )
+
+    cute_core = None
+
+    def run_cute():
+        nonlocal cute_core
+        cute_core = prepare_compressed_mla_core_inputs(
+            q_all=q,
+            swa_k_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_lengths,
+            swa_page_size=COMPRESSED_MLA_SWA_PAGE_SIZE,
+            indexed_k_cache=indexed_cache,
+            indexed_indices=indexed_indices,
+            indexed_topk_lengths=indexed_lengths,
+            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            workspace=workspace_cute,
+            kv_kernel_impl="cute",
+        )
+
+    run_cute()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_cute()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert cute_core is not None
+    torch.testing.assert_close(cute_core.q_all, triton_core.q_all, atol=0, rtol=0)
+    torch.testing.assert_close(cute_core.cache_seqlens_int32, triton_core.cache_seqlens_int32, atol=0, rtol=0)
+    cute_rows = cute_core.kv_cache.view(-1, 656)
+    triton_rows = triton_core.kv_cache.view(-1, 656)
+    torch.testing.assert_close(cute_rows[:, :512], triton_rows[:, :512], atol=0, rtol=0)
+    torch.testing.assert_close(cute_rows[:, 528:], triton_rows[:, 528:], atol=0, rtol=0)
+    torch.testing.assert_close(
+        cute_rows[:, 512:528].view(torch.float32),
+        triton_rows[:, 512:528].view(torch.float32),
+        atol=1e-7,
+        rtol=1e-5,
+    )

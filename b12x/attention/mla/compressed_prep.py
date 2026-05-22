@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 import triton
@@ -248,6 +249,7 @@ def prepare_compressed_mla_core_inputs(
     indexed_topk_lengths: torch.Tensor | None = None,
     indexed_page_size: int | None = None,
     indexed_page_table: torch.Tensor | None = None,
+    kv_kernel_impl: str | None = None,
 ) -> CompressedMLAPrepScratch:
     """Prepare compressed MLA pages for the current shared sparse-MLA core."""
 
@@ -346,35 +348,62 @@ def prepare_compressed_mla_core_inputs(
     map_indexed_page_table = indexed_page_table is not None
     indexed_page_table_for_kernel = indexed_page_table if map_indexed_page_table else indexed_indices
     indexed_page_table_width = int(indexed_page_table.shape[1]) if map_indexed_page_table else 1
+    impl = _resolve_kv_kernel_impl(kv_kernel_impl)
+    if impl == "triton":
+        _prepare_compressed_mla_kv_kernel[(rows, width_capacity, 4)](
+            swa_k_cache.view(torch.float8_e4m3fn),
+            swa_k_cache,
+            swa_k_cache.view(torch.bfloat16),
+            swa_indices,
+            swa_valid_lengths_live,
+            indexed_k_cache.view(torch.float8_e4m3fn),
+            indexed_k_cache,
+            indexed_k_cache.view(torch.bfloat16),
+            indexed_indices,
+            indexed_valid_lengths_live,
+            indexed_page_table_for_kernel,
+            kv_live.view(torch.float8_e4m3fn),
+            kv_live.view(torch.float32),
+            kv_live.view(torch.bfloat16),
+            SWA_WIDTH=swa_width,
+            INDEXED_WIDTH=indexed_width,
+            TOTAL_WIDTH=width_capacity,
+            SWA_PAGE_SIZE=int(swa_page_size),
+            SWA_PAGE_NBYTES=compressed_mla_page_nbytes(int(swa_page_size)),
+            INDEXED_PAGE_SIZE=int(indexed_page_size),
+            INDEXED_PAGE_NBYTES=compressed_mla_page_nbytes(int(indexed_page_size)),
+            HAS_INDEXED=has_indexed,
+            MAP_INDEXED_PAGE_TABLE=map_indexed_page_table,
+            INDEXED_PAGE_TABLE_WIDTH=indexed_page_table_width,
+            BLOCK_D=128,
+            num_warps=4,
+        )
+    elif impl == "cute":
+        from .compressed_prep_cute import run_prepare_compressed_mla_kv_cute
 
-    _prepare_compressed_mla_kv_kernel[(rows, width_capacity, 4)](
-        swa_k_cache.view(torch.float8_e4m3fn),
-        swa_k_cache,
-        swa_k_cache.view(torch.bfloat16),
-        swa_indices,
-        swa_valid_lengths_live,
-        indexed_k_cache.view(torch.float8_e4m3fn),
-        indexed_k_cache,
-        indexed_k_cache.view(torch.bfloat16),
-        indexed_indices,
-        indexed_valid_lengths_live,
-        indexed_page_table_for_kernel,
-        kv_live.view(torch.float8_e4m3fn),
-        kv_live.view(torch.float32),
-        kv_live.view(torch.bfloat16),
-        SWA_WIDTH=swa_width,
-        INDEXED_WIDTH=indexed_width,
-        TOTAL_WIDTH=width_capacity,
-        SWA_PAGE_SIZE=int(swa_page_size),
-        SWA_PAGE_NBYTES=compressed_mla_page_nbytes(int(swa_page_size)),
-        INDEXED_PAGE_SIZE=int(indexed_page_size),
-        INDEXED_PAGE_NBYTES=compressed_mla_page_nbytes(int(indexed_page_size)),
-        HAS_INDEXED=has_indexed,
-        MAP_INDEXED_PAGE_TABLE=map_indexed_page_table,
-        INDEXED_PAGE_TABLE_WIDTH=indexed_page_table_width,
-        BLOCK_D=128,
-        num_warps=4,
-    )
+        run_prepare_compressed_mla_kv_cute(
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_valid_lengths=swa_valid_lengths_live,
+            indexed_k_cache=indexed_k_cache,
+            indexed_indices=indexed_indices,
+            indexed_valid_lengths=indexed_valid_lengths_live,
+            indexed_page_table=indexed_page_table_for_kernel,
+            kv_cache=kv_live,
+            rows=rows,
+            swa_width=swa_width,
+            indexed_width=indexed_width,
+            total_width=width_capacity,
+            swa_page_size=int(swa_page_size),
+            swa_page_nbytes=compressed_mla_page_nbytes(int(swa_page_size)),
+            indexed_page_size=int(indexed_page_size),
+            indexed_page_nbytes=compressed_mla_page_nbytes(int(indexed_page_size)),
+            has_indexed=has_indexed,
+            map_indexed_page_table=map_indexed_page_table,
+            indexed_page_table_width=indexed_page_table_width,
+        )
+    else:
+        raise AssertionError(f"unreachable compressed MLA KV prep impl {impl!r}")
 
     return CompressedMLAPrepScratch(
         q_all=q_live,
@@ -384,6 +413,14 @@ def prepare_compressed_mla_core_inputs(
         nsa_cache_seqlens_int32=active_counts_live,
         identity_page_table=True,
     )
+
+
+def _resolve_kv_kernel_impl(explicit: str | None) -> str:
+    raw = explicit if explicit is not None else os.getenv("B12X_COMPRESSED_MLA_KV_PREP", "triton")
+    impl = raw.strip().lower()
+    if impl not in {"triton", "cute"}:
+        raise ValueError(f"B12X compressed MLA KV prep impl must be triton or cute, got {raw!r}")
+    return impl
 
 
 def _validate_gpu_inputs(
