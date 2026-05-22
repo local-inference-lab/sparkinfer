@@ -187,6 +187,71 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
+def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    width = 32
+    q = torch.zeros((1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM), dtype=torch.bfloat16, device=device)
+    k_nope = torch.zeros((width, 448), dtype=torch.bfloat16, device=device)
+    k_nope[20, 0] = 1
+    k_rope = torch.zeros((width, 64), dtype=torch.bfloat16, device=device)
+    swa_cache = torch.empty(
+        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    indexed_cache = pack_compressed_mla_kv_cache_reference(
+        k_nope,
+        k_rope,
+        page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+    )
+    swa_indices = torch.empty((1, 0), dtype=torch.int32, device=device)
+    indexed_indices = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+    swa_lengths = torch.zeros((1,), dtype=torch.int32, device=device)
+    indexed_lengths = torch.tensor([width], dtype=torch.int32, device=device)
+    workspace = _make_workspace(
+        device=device,
+        rows=1,
+        topk=width,
+        max_kv_rows=width,
+        use_cuda_graph=True,
+    )
+
+    captured_out: torch.Tensor | None = None
+
+    def run() -> torch.Tensor:
+        nonlocal captured_out
+        captured_out = compressed_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_lengths,
+            indexed_k_cache=indexed_cache,
+            indexed_indices=indexed_indices,
+            indexed_topk_lengths=indexed_lengths,
+            indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+            workspace=workspace,
+            sm_scale=1.0,
+        )
+        return captured_out
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert captured_out is not None
+
+    expected = torch.zeros_like(captured_out.float())
+    expected[:, :, 0] = 1.0 / width
+    max_abs = (captured_out.float() - expected).abs().max().item()
+    assert max_abs <= 1e-4
+
+
+@torch.inference_mode()
 def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
     device = require_sm120()
     clear_mla_caches()

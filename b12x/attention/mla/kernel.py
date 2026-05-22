@@ -2031,6 +2031,10 @@ def _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
             16,
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
         ) - Int32(_COMPRESSED_MLA_GROUP_SIZE // 16)
+        # The 64-wide compressed group is staged in an 8-vector swizzled row.
+        # Rows whose swizzle sets bit 2 need to advance back to logical vec0.
+        if lane % Int32(8) >= Int32(4):
+            v_offset += Int32(8)
 
 
 @cute.jit
