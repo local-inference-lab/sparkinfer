@@ -657,6 +657,7 @@ def _stage_all_compressed_token_scales(
     indexed_u8: cute.Tensor,
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
+    tile_tokens: Int32,
     lane: Int32,
     has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
@@ -665,8 +666,12 @@ def _stage_all_compressed_token_scales(
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_nbytes: cutlass.Constexpr[int],
 ):
+    active_tokens = tile_tokens
+    if active_tokens > Int32(_MLA_TOKEN_TILE):
+        active_tokens = Int32(_MLA_TOKEN_TILE)
+
     token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
+    while token_local < active_tokens:
         encoded = Int32(sTokenIdx[token_local])
         src_u8, _, scale_base, valid = _compressed_token_base(
             swa_u8,
@@ -698,6 +703,13 @@ def _stage_all_compressed_token_scales(
         sScale[_compressed_scale_smem_idx(token_local, Int32(4))] = scale4
         sScale[_compressed_scale_smem_idx(token_local, Int32(5))] = scale5
         sScale[_compressed_scale_smem_idx(token_local, Int32(6))] = scale6
+        token_local += Int32(_MLA_WARP_THREADS)
+
+    token_local = active_tokens + lane
+    while token_local < Int32(_MLA_TOKEN_TILE):
+        for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
+            group_idx = Int32(block_offset)
+            sScale[_compressed_scale_smem_idx(token_local, group_idx)] = Float32(0.0)
         token_local += Int32(_MLA_WARP_THREADS)
 
 
@@ -869,6 +881,7 @@ def _stage_compressed_kv_u32_block(
     vecs_per_row: Int32,
     row_stride_128b: Int32,
     kv_base_addr: Int32,
+    tile_tokens: Int32,
     lane: Int32,
     has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
@@ -877,16 +890,24 @@ def _stage_compressed_kv_u32_block(
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_nbytes: cutlass.Constexpr[int],
 ):
-    linear = lane
     total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    while linear < total:
+    active_total = tile_tokens * vecs_per_row
+    if active_total > total:
+        active_total = total
+
+    linear = lane
+    while linear < active_total:
         row = linear // vecs_per_row
         vec_idx = linear - row * vecs_per_row
-        encoded = Int32(sTokenIdx[row])
         dst_addr = _smem_addr_from_b128_offset(
             kv_base_addr,
             _permuted_offset_128b(row, vec_idx, row_stride_128b),
         )
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        encoded = Int32(sTokenIdx[row])
         src_u8, payload_base, _, valid = _compressed_token_base(
             swa_u8,
             indexed_u8,
@@ -898,16 +919,27 @@ def _stage_compressed_kv_u32_block(
             indexed_page_size,
             indexed_page_nbytes,
         )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
         if valid != Int64(0):
             src_byte = payload_base + Int64(base_byte) + Int64(vec_idx) * Int64(16)
             v0 = ld_global_nc_u32(src_u8 + src_byte + Int64(0))
             v1 = ld_global_nc_u32(src_u8 + src_byte + Int64(4))
             v2 = ld_global_nc_u32(src_u8 + src_byte + Int64(8))
             v3 = ld_global_nc_u32(src_u8 + src_byte + Int64(12))
+        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(_MLA_WARP_THREADS)
+
+    linear = active_total + lane
+    while linear < total:
+        row = linear // vecs_per_row
+        vec_idx = linear - row * vecs_per_row
+        dst_addr = _smem_addr_from_b128_offset(
+            kv_base_addr,
+            _permuted_offset_128b(row, vec_idx, row_stride_128b),
+        )
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
         st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
         linear += Int32(_MLA_WARP_THREADS)
 
@@ -2788,6 +2820,7 @@ def _compute_compressed_score_tile_scaled(
         indexed_u8,
         sTokenIdx,
         sScale,
+        tile_tokens,
         lane,
         has_swa,
         has_indexed,
@@ -2819,6 +2852,7 @@ def _compute_compressed_score_tile_scaled(
             Int32(_COMPRESSED_MLA_GROUP_KV_VECS),
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
             kv_base_addr,
+            tile_tokens,
             lane,
             has_swa,
             has_indexed,
@@ -2870,6 +2904,7 @@ def _compute_compressed_score_tile_scaled(
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         kv_base_addr,
+        tile_tokens,
         lane,
         has_swa,
         has_indexed,
@@ -3051,6 +3086,7 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
     kv_base_addr: Int32,
+    tile_tokens: Int32,
     lane: Int32,
     has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
@@ -3069,6 +3105,7 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
             Int32(_COMPRESSED_MLA_GROUP_KV_VECS),
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
             kv_base_addr,
+            tile_tokens,
             lane,
             has_swa,
             has_indexed,
@@ -3118,6 +3155,7 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         kv_base_addr,
+        tile_tokens,
         lane,
         has_swa,
         has_indexed,
@@ -3639,6 +3677,7 @@ def _run_one_pass_compressed_mla_tile(
             sTokenIdx,
             sScale,
             kv_base_addr,
+            tile_end - token_base,
             lane,
             has_swa,
             has_indexed,
