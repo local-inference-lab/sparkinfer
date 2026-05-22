@@ -3293,6 +3293,7 @@ def _run_one_pass_compressed_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    write_lse: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -3437,15 +3438,16 @@ def _run_one_pass_compressed_mla_tile(
             head_tile_start,
             lane,
         )
-        _store_partial_lse_chunked(
-            lse_tensor,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            m_frag,
-            d_frag,
-            lane,
-        )
+        if cutlass.const_expr(write_lse):
+            _store_partial_lse_chunked(
+                lse_tensor,
+                out_row_idx,
+                out_chunk_idx,
+                head_tile_start,
+                m_frag,
+                d_frag,
+                lane,
+            )
 
 
 def get_sparse_mla_shared_storage_cls():

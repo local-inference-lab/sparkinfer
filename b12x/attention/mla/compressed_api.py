@@ -196,6 +196,7 @@ def compressed_mla_decode_forward(
     )
     forward_tmp_output = output.unsqueeze(2) if single_chunk_direct_output else workspace.tmp_output
     forward_workspace = None if single_chunk_direct_output else workspace
+    write_lse = not single_chunk_direct_output
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace,
         device=q3.device,
@@ -226,6 +227,7 @@ def compressed_mla_decode_forward(
         map_indexed_page_table=map_indexed_page_table,
         indexed_page_table_width=indexed_page_table_width,
         workspace=forward_workspace,
+        write_lse=write_lse,
     )
 
     if single_chunk_direct_output:

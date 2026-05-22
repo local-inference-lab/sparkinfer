@@ -343,6 +343,7 @@ class CompressedMLASplitDecodeForwardKernel:
         has_indexed: bool,
         map_indexed_page_table: bool,
         indexed_page_table_width: int,
+        write_lse: bool = True,
     ):
         self.launch_num_chunks = int(launch_num_chunks)
         self.head_tiles = int(head_tiles)
@@ -353,6 +354,7 @@ class CompressedMLASplitDecodeForwardKernel:
         self.has_indexed = bool(has_indexed)
         self.map_indexed_page_table = bool(map_indexed_page_table)
         self.indexed_page_table_width = int(indexed_page_table_width)
+        self.write_lse = bool(write_lse)
 
     @cute.jit
     def __call__(
@@ -474,6 +476,7 @@ class CompressedMLASplitDecodeForwardKernel:
                 q_idx,
                 chunk_idx,
                 tmp_lse,
+                self.write_lse,
                 self.swa_page_size,
                 self.swa_page_nbytes,
                 self.indexed_page_size,
@@ -712,6 +715,7 @@ def _build_compressed_mla_split_forward_kernel(
     has_indexed: bool,
     map_indexed_page_table: bool,
     indexed_page_table_width: int,
+    write_lse: bool,
 ) -> CompressedMLASplitDecodeForwardKernel:
     return CompressedMLASplitDecodeForwardKernel(
         launch_num_chunks=launch_num_chunks,
@@ -723,6 +727,7 @@ def _build_compressed_mla_split_forward_kernel(
         has_indexed=has_indexed,
         map_indexed_page_table=map_indexed_page_table,
         indexed_page_table_width=indexed_page_table_width,
+        write_lse=write_lse,
     )
 
 
@@ -857,6 +862,7 @@ def run_compressed_mla_split_decode_forward(
     map_indexed_page_table: bool,
     indexed_page_table_width: int,
     workspace: object | None = None,
+    write_lse: bool = True,
 ) -> None:
     if q_all.device.type != "cuda":
         raise ValueError("compressed MLA split decode requires CUDA q_all")
@@ -924,6 +930,7 @@ def run_compressed_mla_split_decode_forward(
         bool(has_indexed),
         bool(map_indexed_page_table),
         int(indexed_page_table_width),
+        bool(write_lse),
     )
     forward_args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
@@ -967,6 +974,7 @@ def run_compressed_mla_split_decode_forward(
         bool(has_indexed),
         bool(map_indexed_page_table),
         int(indexed_page_table_width),
+        bool(write_lse),
         str(tmp_output.dtype),
     )
     _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
