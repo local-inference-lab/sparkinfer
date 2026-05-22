@@ -183,6 +183,13 @@ def compressed_mla_decode_forward(
         dtype=q3.dtype,
         device=q3.device,
     )
+    direct_single_chunk_output = (
+        split_cfg.num_chunks == 1
+        and int(launch_num_chunks) == 1
+        and attn_sink is None
+        and not return_lse
+    )
+    split_output = output.unsqueeze(2) if direct_single_chunk_output else workspace.tmp_output
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace,
         device=q3.device,
@@ -202,7 +209,7 @@ def compressed_mla_decode_forward(
         sm_scale=sm_scale_tensor,
         kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
         num_chunks_ptr=workspace.num_chunks_ptr,
-        tmp_output=workspace.tmp_output,
+        tmp_output=split_output,
         tmp_lse=workspace.tmp_lse,
         launch_num_chunks=launch_num_chunks,
         swa_page_size=int(swa_page_size),
@@ -212,8 +219,11 @@ def compressed_mla_decode_forward(
         has_indexed=has_indexed,
         map_indexed_page_table=map_indexed_page_table,
         indexed_page_table_width=indexed_page_table_width,
-        workspace=workspace,
+        workspace=None if direct_single_chunk_output else workspace,
     )
+
+    if direct_single_chunk_output:
+        return output
 
     fused_sink_output = attn_sink is not None and not return_lse
     needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
