@@ -2442,12 +2442,15 @@ class B12XAttentionWorkspace:
                         f"{schedule_rows} exceed workspace schedule capacity "
                         f"{self.paged_indexer_schedule_metadata_runtime.shape[0]}"
                     )
-                self.paged_indexer_schedule_metadata_runtime[
-                    :schedule_rows, :
-                ].copy_(schedule_metadata)
-                schedule_metadata_kernel = self.paged_indexer_schedule_metadata_runtime[
+                schedule_target = self.paged_indexer_schedule_metadata_runtime[
                     :schedule_rows, :
                 ]
+                if (
+                    schedule_target.data_ptr() != schedule_metadata.data_ptr()
+                    or schedule_target.storage_offset() != schedule_metadata.storage_offset()
+                ):
+                    schedule_target.copy_(schedule_metadata)
+                schedule_metadata_kernel = schedule_target
         return {
             "q_bytes": q_bytes,
             "weights": weights,
