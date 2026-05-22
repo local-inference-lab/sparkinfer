@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark compressed sparse MLA layouts through the shared MLA core."""
+"""Benchmark native compressed sparse MLA layouts."""
 
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ from b12x.integration.mla import (
     compressed_mla_decode_forward,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
-    prepare_compressed_mla_core_inputs,
-    sparse_mla_reference,
 )
 
 from benchmarks.common import (
@@ -43,8 +41,6 @@ from benchmarks.common import (
 )
 
 
-_SHARED_CORE_HEAD_DIM = 576
-_SHARED_CORE_V_HEAD_DIM = 512
 _SM_SCALE = 1.0 / math.sqrt(COMPRESSED_MLA_HEAD_DIM)
 
 
@@ -73,7 +69,6 @@ class CaseReport:
     case: BenchmarkCase
     replay_us: float
     p90_replay_us: float
-    sanity_core: Sanity | None
     sanity_algorithm: Sanity | None
 
 
@@ -227,13 +222,14 @@ def _make_workspace(
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
         num_q_heads=COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
-        head_dim=_SHARED_CORE_HEAD_DIM,
-        v_head_dim=_SHARED_CORE_V_HEAD_DIM,
+        head_dim=COMPRESSED_MLA_HEAD_DIM,
+        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
         topk=max(1, case.topk),
         max_total_q=case.rows,
         max_batch=case.rows,
         max_kv_rows=max_kv_rows,
         use_cuda_graph=True,
+        reserve_compressed_mla_metadata=True,
     )
 
 
@@ -257,7 +253,6 @@ def _benchmark_case(
     replays: int,
     l2_flush,
     verify: bool,
-    verify_algorithm: bool,
 ) -> CaseReport:
     clear_mla_caches()
     q = _make_q(rows=case.rows, seed=seed, device=device)
@@ -328,30 +323,8 @@ def _benchmark_case(
     if output is None:
         raise RuntimeError("benchmark graph did not produce an output tensor")
 
-    sanity_core: Sanity | None = None
     sanity_algorithm: Sanity | None = None
     if verify:
-        core = prepare_compressed_mla_core_inputs(
-            q_all=q,
-            swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
-            workspace=workspace,
-            indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_lengths,
-            indexed_page_size=case.indexed_page_size,
-        )
-        expected_core = sparse_mla_reference(
-            q_all=core.q_all,
-            kv_cache=core.kv_cache,
-            page_table_1=core.page_table_1,
-            active_token_counts=core.nsa_cache_seqlens_int32,
-            sm_scale=_SM_SCALE,
-            v_head_dim=core.v_head_dim,
-        )
-        sanity_core = _sanity(output, expected_core)
-    if verify_algorithm:
         expected_algorithm = compressed_sparse_mla_reference(
             q,
             swa_cache,
@@ -370,7 +343,6 @@ def _benchmark_case(
         case=case,
         replay_us=statistics.median(replay_us),
         p90_replay_us=statistics.quantiles(replay_us, n=10)[8] if len(replay_us) >= 10 else max(replay_us),
-        sanity_core=sanity_core,
         sanity_algorithm=sanity_algorithm,
     )
 
@@ -378,7 +350,7 @@ def _benchmark_case(
 def _render_report(report: CaseReport) -> str:
     indexed_page = report.case.indexed_page_size if report.case.indexed_page_size is not None else 0
     parts = [
-        f"compressed-mla-shared-core case={report.case.name:8s}",
+        f"compressed-mla-native case={report.case.name:8s}",
         f"rows={report.case.rows:2d}",
         f"swa={report.case.swa_width:3d}",
         f"indexed={report.case.indexed_width:3d}",
@@ -387,13 +359,6 @@ def _render_report(report: CaseReport) -> str:
         f"replay={report.replay_us:8.2f} us",
         f"p90={report.p90_replay_us:8.2f} us",
     ]
-    if report.sanity_core is not None:
-        parts.append(
-            "core="
-            f"max_abs:{report.sanity_core.max_abs:.4f},"
-            f"rmse:{report.sanity_core.rmse:.5f},"
-            f"cos:{report.sanity_core.cos:.6f}"
-        )
     if report.sanity_algorithm is not None:
         parts.append(
             "algorithm="
@@ -427,7 +392,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--verify-algorithm",
         action="store_true",
-        help="also compare against the compressed-layout algorithm reference",
+        help="deprecated; compressed-layout algorithm verification is the default unless --skip-verify is set",
     )
     return parser.parse_args(argv)
 
@@ -453,7 +418,6 @@ def main(argv: list[str] | None = None) -> int:
             replays=args.replays,
             l2_flush=l2_flush,
             verify=not args.skip_verify,
-            verify_algorithm=args.verify_algorithm,
         )
         reports.append(report)
         print(_render_report(report))
