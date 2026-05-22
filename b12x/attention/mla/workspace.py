@@ -162,6 +162,7 @@ class B12XAttentionArenaCaps:
     reserve_extend_indexer_logits: bool = True
     reserve_paged_indexer_logits: bool = True
     reserve_compressed_mla_prep: bool = False
+    reserve_compressed_mla_metadata: bool = False
     reserve_mhc: bool = False
     mhc_max_tokens: int = 0
     mhc_hidden_size: int = 0
@@ -242,6 +243,12 @@ class B12XAttentionArenaCaps:
             self,
             "reserve_compressed_mla_prep",
             bool(self.reserve_compressed_mla_prep),
+        )
+        object.__setattr__(
+            self,
+            "reserve_compressed_mla_metadata",
+            bool(self.reserve_compressed_mla_metadata)
+            or bool(self.reserve_compressed_mla_prep),
         )
         object.__setattr__(
             self,
@@ -508,7 +515,7 @@ class B12XAttentionArena:
         compressed_mla_active_counts_offset_bytes = mla_offset
         compressed_mla_active_counts_nbytes = (
             mla_max_total_q * _dtype_nbytes(torch.int32)
-            if caps.reserve_compressed_mla_prep
+            if caps.reserve_compressed_mla_metadata
             else 0
         )
         mla_offset += compressed_mla_active_counts_nbytes
@@ -517,7 +524,7 @@ class B12XAttentionArena:
         compressed_mla_swa_valid_lengths_offset_bytes = mla_offset
         compressed_mla_swa_valid_lengths_nbytes = (
             mla_max_total_q * _dtype_nbytes(torch.int32)
-            if caps.reserve_compressed_mla_prep
+            if caps.reserve_compressed_mla_metadata
             else 0
         )
         mla_offset += compressed_mla_swa_valid_lengths_nbytes
@@ -526,7 +533,7 @@ class B12XAttentionArena:
         compressed_mla_indexed_valid_lengths_offset_bytes = mla_offset
         compressed_mla_indexed_valid_lengths_nbytes = (
             mla_max_total_q * _dtype_nbytes(torch.int32)
-            if caps.reserve_compressed_mla_prep
+            if caps.reserve_compressed_mla_metadata
             else 0
         )
         mla_offset += compressed_mla_indexed_valid_lengths_nbytes
@@ -1317,6 +1324,7 @@ class B12XAttentionWorkspace:
         use_cuda_graph: bool = False,
         padded_heads: int = 128,
         reserve_compressed_mla_prep: bool = False,
+        reserve_compressed_mla_metadata: bool = False,
         reserve_paged_indexer_logits: bool = True,
         paged_indexer_logits_q_rows: int = 0,
         paged_indexer_logits_k_rows: int = 0,
@@ -1353,6 +1361,7 @@ class B12XAttentionWorkspace:
             page_size=page_size,
             padded_heads=padded_heads,
             reserve_compressed_mla_prep=reserve_compressed_mla_prep,
+            reserve_compressed_mla_metadata=reserve_compressed_mla_metadata,
             reserve_paged_indexer_logits=reserve_paged_indexer_logits,
             paged_indexer_logits_q_rows=int(paged_indexer_logits_q_rows),
             paged_indexer_logits_k_rows=int(paged_indexer_logits_k_rows),

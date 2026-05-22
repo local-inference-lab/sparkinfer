@@ -187,6 +187,10 @@ def _attention_caps_cover(
         return False
     if requested.reserve_compressed_mla_prep and not existing.reserve_compressed_mla_prep:
         return False
+    if getattr(requested, "reserve_compressed_mla_metadata", False) and not getattr(
+        existing, "reserve_compressed_mla_metadata", False
+    ):
+        return False
     if getattr(requested, "reserve_mhc", False) and not getattr(existing, "reserve_mhc", False):
         return False
     if getattr(requested, "reserve_mhc", False) and (

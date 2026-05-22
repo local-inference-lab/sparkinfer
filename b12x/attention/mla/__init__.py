@@ -6,8 +6,10 @@ from .api import (
     sparse_mla_extend_forward,
 )
 from .compressed_api import (
-    CompressedMLACoreInputs,
     compressed_mla_decode_forward,
+)
+from .compressed_prep import (
+    CompressedMLAPrepScratch as CompressedMLACoreInputs,
     prepare_compressed_mla_core_inputs,
 )
 from .compressed_reference import (

@@ -35,6 +35,8 @@ def _make_workspace(
     topk: int,
     max_kv_rows: int,
     use_cuda_graph: bool = False,
+    head_dim: int = _COMPRESSED_HEAD_DIM,
+    v_head_dim: int = _COMPRESSED_HEAD_DIM,
 ) -> B12XAttentionWorkspace:
     return B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
@@ -42,8 +44,8 @@ def _make_workspace(
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
         num_q_heads=_LOCAL_Q_HEADS,
-        head_dim=_SHARED_CORE_HEAD_DIM,
-        v_head_dim=_SHARED_CORE_V_HEAD_DIM,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
         topk=topk,
         max_total_q=rows,
         max_batch=rows,
@@ -405,6 +407,8 @@ def test_compressed_mla_cute_kv_prep_matches_triton_under_cuda_graph() -> None:
         topk=topk,
         max_kv_rows=rows * topk,
         use_cuda_graph=True,
+        head_dim=_SHARED_CORE_HEAD_DIM,
+        v_head_dim=_SHARED_CORE_V_HEAD_DIM,
     )
     workspace_cute = _make_workspace(
         device=device,
@@ -412,6 +416,8 @@ def test_compressed_mla_cute_kv_prep_matches_triton_under_cuda_graph() -> None:
         topk=topk,
         max_kv_rows=rows * topk,
         use_cuda_graph=True,
+        head_dim=_SHARED_CORE_HEAD_DIM,
+        v_head_dim=_SHARED_CORE_V_HEAD_DIM,
     )
 
     triton_core = prepare_compressed_mla_core_inputs(

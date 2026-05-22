@@ -33,6 +33,13 @@ class CompressedMLAPrepScratch:
         return _MLA_NOPE_DIM
 
 
+@dataclass(frozen=True)
+class CompressedMLANativeMetadata:
+    active_counts: torch.Tensor
+    swa_valid_lengths: torch.Tensor
+    indexed_valid_lengths: torch.Tensor
+
+
 @triton.jit
 def _prepare_compressed_mla_pre_kernel(
     q_ptr,
@@ -91,6 +98,43 @@ def _prepare_compressed_mla_pre_kernel(
         tl.store(swa_valid_lengths_ptr + row, swa_len)
         tl.store(indexed_valid_lengths_ptr + row, indexed_len)
         tl.store(active_counts_ptr + row, swa_len + indexed_len)
+
+
+@triton.jit
+def _prepare_compressed_mla_metadata_kernel(
+    swa_indices_ptr,
+    swa_lengths_ptr,
+    indexed_indices_ptr,
+    indexed_lengths_ptr,
+    swa_valid_lengths_ptr,
+    indexed_valid_lengths_ptr,
+    active_counts_ptr,
+    SWA_WIDTH: tl.constexpr,
+    INDEXED_WIDTH: tl.constexpr,
+    HAS_INDEXED: tl.constexpr,
+    BLOCK_SWA: tl.constexpr,
+    BLOCK_INDEXED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    swa_len = _compute_valid_prefix_length(
+        swa_indices_ptr,
+        swa_lengths_ptr,
+        row,
+        SWA_WIDTH,
+        BLOCK_SWA,
+    )
+    indexed_len = tl.full((), 0, tl.int32)
+    if HAS_INDEXED:
+        indexed_len = _compute_valid_prefix_length(
+            indexed_indices_ptr,
+            indexed_lengths_ptr,
+            row,
+            INDEXED_WIDTH,
+            BLOCK_INDEXED,
+        )
+    tl.store(swa_valid_lengths_ptr + row, swa_len)
+    tl.store(indexed_valid_lengths_ptr + row, indexed_len)
+    tl.store(active_counts_ptr + row, swa_len + indexed_len)
 
 
 @triton.jit
@@ -234,6 +278,99 @@ def _prepare_compressed_mla_kv_kernel(
 
     tl.store(kv_fp8_ptr + core_row * 656 + group * 128 + offs, quant, mask=offs < 128)
     tl.store(kv_f32_ptr + (core_row * 656 + 512) // 4 + group, scale)
+
+
+def prepare_compressed_mla_native_metadata(
+    *,
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    workspace: object,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None = None,
+    indexed_indices: torch.Tensor | None = None,
+    indexed_topk_lengths: torch.Tensor | None = None,
+    indexed_page_size: int | None = None,
+    indexed_page_table: torch.Tensor | None = None,
+) -> CompressedMLANativeMetadata:
+    """Prepare only graph-stable row length metadata for native compressed MLA."""
+
+    _validate_gpu_inputs(
+        q_all=q_all,
+        swa_k_cache=swa_k_cache,
+        swa_indices=swa_indices,
+        swa_topk_lengths=swa_topk_lengths,
+        indexed_k_cache=indexed_k_cache,
+        indexed_indices=indexed_indices,
+        indexed_topk_lengths=indexed_topk_lengths,
+        indexed_page_size=indexed_page_size,
+        indexed_page_table=indexed_page_table,
+    )
+    del swa_page_size, indexed_page_size, indexed_page_table
+
+    rows = int(q_all.shape[0])
+    swa_width = int(swa_indices.shape[1])
+    indexed_width = int(indexed_indices.shape[1]) if indexed_indices is not None else 0
+    live_width = swa_width + indexed_width
+    if live_width <= 0:
+        raise ValueError("compressed MLA requires at least one SWA or indexed slot")
+
+    graph_capacity = bool(
+        getattr(workspace, "fixed_capacity", False) or getattr(workspace, "use_cuda_graph", False)
+    )
+    q_capacity = int(getattr(workspace, "max_total_q", rows)) if graph_capacity else rows
+    width_capacity = int(getattr(workspace, "topk", live_width)) if graph_capacity else live_width
+    if rows > q_capacity:
+        raise ValueError(f"q rows {rows} exceed compressed metadata capacity {q_capacity}")
+    if live_width > width_capacity:
+        raise ValueError(f"compressed MLA width {live_width} exceeds workspace topk {width_capacity}")
+
+    counts_shape = (q_capacity,)
+    active_counts = _workspace_buffer(
+        workspace,
+        "_compressed_mla_active_counts",
+        counts_shape,
+        torch.int32,
+        q_all.device,
+    )
+    swa_valid_lengths = _workspace_buffer(
+        workspace,
+        "_compressed_mla_swa_valid_lengths",
+        counts_shape,
+        torch.int32,
+        q_all.device,
+    )
+    indexed_valid_lengths = _workspace_buffer(
+        workspace,
+        "_compressed_mla_indexed_valid_lengths",
+        counts_shape,
+        torch.int32,
+        q_all.device,
+    )
+
+    indexed_indices_for_kernel = indexed_indices if indexed_indices is not None else swa_indices
+    indexed_lengths_for_kernel = indexed_topk_lengths if indexed_topk_lengths is not None else swa_topk_lengths
+    _prepare_compressed_mla_metadata_kernel[(rows,)](
+        swa_indices,
+        swa_topk_lengths,
+        indexed_indices_for_kernel,
+        indexed_lengths_for_kernel,
+        swa_valid_lengths[:rows],
+        indexed_valid_lengths[:rows],
+        active_counts[:rows],
+        SWA_WIDTH=swa_width,
+        INDEXED_WIDTH=indexed_width if indexed_indices is not None else 0,
+        HAS_INDEXED=indexed_indices is not None,
+        BLOCK_SWA=triton.next_power_of_2(max(swa_width, 1)),
+        BLOCK_INDEXED=triton.next_power_of_2(max(indexed_width, 1)),
+        num_warps=8,
+    )
+    return CompressedMLANativeMetadata(
+        active_counts=active_counts[:rows],
+        swa_valid_lengths=swa_valid_lengths[:rows],
+        indexed_valid_lengths=indexed_valid_lengths[:rows],
+    )
 
 
 def prepare_compressed_mla_core_inputs(
