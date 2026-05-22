@@ -147,7 +147,7 @@ def compressed_mla_decode_forward(
     if rows <= 1:
         min_effective_chunk = 32
     elif swa_width > 0:
-        min_effective_chunk = 128
+        min_effective_chunk = 256
     else:
         min_effective_chunk = 256
     compressed_max_chunks = min(
