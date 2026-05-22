@@ -1,4 +1,4 @@
-"""NSA indexer API aligned with the DeepGEMM-style logits contracts."""
+"""NSA indexer API for paged and extend logits contracts."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def get_paged_mqa_logits_metadata(
     num_sms: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build DeepGEMM-style paged-MQA schedule metadata on the input device."""
+    """Build paged-MQA schedule metadata on the input device."""
 
     if context_lens.ndim not in (1, 2):
         raise ValueError(
@@ -399,15 +399,17 @@ def sparse_nsa_index_decode_logits_paged(
         seqlens_per_query=seqlens_valid,
         page_size=page_size,
     ):
-        query_row_to_batch = torch.arange(valid_q_rows, dtype=torch.int32, device=q_fp8.device)
-        return sparse_nsa_paged_logits_reference(
-            q_fp8=q_fp8,
-            weights=weights_f,
-            index_k_cache=index_k_cache,
-            real_page_table=metadata.real_page_table,
-            query_row_to_batch=query_row_to_batch,
-            seqlens_per_query=seqlens_valid,
-            page_size=page_size,
+        raise NotImplementedError(
+            "B12X sparse NSA paged logits requires the production CUDA FP8 "
+            "kernel contract; refusing to run the reference fallback. "
+            f"q_fp8 shape={tuple(q_fp8.shape)} dtype={q_fp8.dtype} "
+            f"device={q_fp8.device}, weights shape={tuple(weights_f.shape)} "
+            f"dtype={weights_f.dtype}, index_k_cache shape={tuple(index_k_cache.shape)} "
+            f"dtype={index_k_cache.dtype}, real_page_table shape="
+            f"{tuple(metadata.real_page_table.shape)} dtype="
+            f"{metadata.real_page_table.dtype}, cache_seqlens shape="
+            f"{tuple(seqlens_valid.shape)} dtype={seqlens_valid.dtype}, "
+            f"page_size={page_size}"
         )
 
     schedule_metadata = None
@@ -693,6 +695,7 @@ def sparse_nsa_index_extend_tiled_topk(
             output_values=output_values,
             output_indices=output_indices,
             num_k_tiles=num_k_tiles,
+            contract_phantoms=contract_phantoms,
         )
         return topk_indices
 
@@ -774,6 +777,7 @@ def sparse_nsa_index_extend_tiled_topk(
             input_index_offset=chunk_start,
             input_extent=chunk_rows,
             output_index_offset=chunk_start,
+            contract_phantoms=contract_phantoms,
         )
     _, topk_indices = merge_tiled_topk_candidates(
         candidate_values=candidate_values,

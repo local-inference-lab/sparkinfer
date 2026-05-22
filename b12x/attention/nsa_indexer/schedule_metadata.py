@@ -1,4 +1,4 @@
-"""DeepGEMM-style paged-MQA schedule metadata helpers."""
+"""Paged-MQA schedule metadata helpers."""
 
 from __future__ import annotations
 

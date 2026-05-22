@@ -1,4 +1,4 @@
-"""PyTorch references for the remaining DeepGEMM-style NSA indexer contracts."""
+"""PyTorch references for NSA indexer logits contracts."""
 
 from __future__ import annotations
 
@@ -240,7 +240,7 @@ def sparse_nsa_extend_logits_reference(
     k_start: torch.Tensor,
     k_end: torch.Tensor,
 ) -> torch.Tensor:
-    """Return dense ragged logits from the DeepGEMM-style extend contract."""
+    """Return dense ragged logits from the non-paged extend contract."""
 
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
