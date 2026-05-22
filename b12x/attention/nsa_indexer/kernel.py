@@ -1358,17 +1358,6 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                                         split_idx * Int32(self.tokens_per_work)
                                         + token_group * Int32(_PAGED_TOKENS_PER_GROUP)
                                     )
-                                    zero_idx = tx
-                                    while zero_idx < Int32(
-                                        self.tokens_per_work * self.num_q_head_tiles
-                                    ):
-                                        token_idx = zero_idx // Int32(self.num_q_head_tiles)
-                                        head_tile_idx = (
-                                            zero_idx - token_idx * Int32(self.num_q_head_tiles)
-                                        )
-                                        s_partial_logits[token_idx, head_tile_idx] = Float32(0.0)
-                                        zero_idx += Int32(_PAGED_THREADS_PER_CTA)
-                                    cute.arch.sync_threads()
                                     if token_base < valid_slots:
                                         head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
                                         _compute_mxfp8_tile_partials(
