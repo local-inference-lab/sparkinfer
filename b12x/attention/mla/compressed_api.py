@@ -18,6 +18,7 @@ from .compressed_reference import (
     compressed_mla_page_nbytes,
 )
 from .split import (
+    SparseMLASplitDecodeConfig,
     forced_sparse_mla_split_decode_config_for_width,
     run_compressed_mla_split_decode_forward,
     run_sparse_mla_split_decode_merge,
@@ -26,6 +27,8 @@ from .workspace import B12XAttentionWorkspace
 
 
 _LN2 = math.log(2.0)
+_COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE = 12
+_COMPRESSED_MLA_BATCHED_SPLIT_CHUNK_SIZE = 1024
 
 
 def compressed_mla_decode_forward(
@@ -141,23 +144,31 @@ def compressed_mla_decode_forward(
         )
         indexed_page_table_width = int(indexed_page_table_for_kernel.shape[1]) if map_indexed_page_table else 1
 
-    swa_width = int(swa_indices_2d.shape[1])
-    indexed_width = int(indexed_indices_2d.shape[1]) if has_indexed else 0
-    total_width = swa_width + indexed_width
-    if rows <= 1:
-        min_effective_chunk = 32
-    elif swa_width > 0:
-        min_effective_chunk = 512
+    total_width = int(swa_indices_2d.shape[1]) + (
+        int(indexed_indices_2d.shape[1]) if has_indexed else 0
+    )
+    decode_chunk_capacity = _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE * int(
+        workspace.max_chunks_per_row
+    )
+    if rows <= 1 and 0 < total_width <= decode_chunk_capacity:
+        split_cfg = SparseMLASplitDecodeConfig(
+            chunk_size=_COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE,
+            num_chunks=(total_width + _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE - 1)
+            // _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE,
+        )
     else:
-        min_effective_chunk = 256
-    compressed_max_chunks = min(
-        workspace.max_chunks_per_row,
-        max(1, (total_width + min_effective_chunk - 1) // min_effective_chunk),
-    )
-    split_cfg = forced_sparse_mla_split_decode_config_for_width(
-        total_width,
-        max_chunks=compressed_max_chunks,
-    )
+        min_split_chunk_size = _COMPRESSED_MLA_BATCHED_SPLIT_CHUNK_SIZE
+        max_split_chunks = max(
+            1,
+            min(
+                int(workspace.max_chunks_per_row),
+                (total_width + min_split_chunk_size - 1) // min_split_chunk_size,
+            ),
+        )
+        split_cfg = forced_sparse_mla_split_decode_config_for_width(
+            total_width,
+            max_chunks=max_split_chunks,
+        )
     if split_cfg is None:
         raise RuntimeError(
             f"compressed MLA width {total_width} has no supported split configuration"
@@ -174,22 +185,17 @@ def compressed_mla_decode_forward(
             kv_chunk_size=split_cfg.chunk_size,
             num_chunks=split_cfg.num_chunks,
         )
-    launch_num_chunks = (
-        workspace.max_chunks_per_row if graph_stable_split and rows <= 1 else split_cfg.num_chunks
-    )
+    launch_num_chunks = split_cfg.num_chunks
+
+    single_chunk_direct_output = int(launch_num_chunks) == 1 and attn_sink is None and not return_lse
 
     output = torch.empty(
         (rows, heads, COMPRESSED_MLA_HEAD_DIM),
         dtype=q3.dtype,
         device=q3.device,
     )
-    direct_single_chunk_output = (
-        split_cfg.num_chunks == 1
-        and int(launch_num_chunks) == 1
-        and attn_sink is None
-        and not return_lse
-    )
-    split_output = output.unsqueeze(2) if direct_single_chunk_output else workspace.tmp_output
+    forward_tmp_output = output.unsqueeze(2) if single_chunk_direct_output else workspace.tmp_output
+    forward_workspace = None if single_chunk_direct_output else workspace
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace,
         device=q3.device,
@@ -209,7 +215,7 @@ def compressed_mla_decode_forward(
         sm_scale=sm_scale_tensor,
         kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
         num_chunks_ptr=workspace.num_chunks_ptr,
-        tmp_output=split_output,
+        tmp_output=forward_tmp_output,
         tmp_lse=workspace.tmp_lse,
         launch_num_chunks=launch_num_chunks,
         swa_page_size=int(swa_page_size),
@@ -219,10 +225,10 @@ def compressed_mla_decode_forward(
         has_indexed=has_indexed,
         map_indexed_page_table=map_indexed_page_table,
         indexed_page_table_width=indexed_page_table_width,
-        workspace=None if direct_single_chunk_output else workspace,
+        workspace=forward_workspace,
     )
 
-    if direct_single_chunk_output:
+    if single_chunk_direct_output:
         return output
 
     fused_sink_output = attn_sink is not None and not return_lse
