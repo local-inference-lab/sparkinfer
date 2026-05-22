@@ -42,6 +42,9 @@ from benchmarks.common import (
 
 
 _SM_SCALE = 1.0 / math.sqrt(COMPRESSED_MLA_HEAD_DIM)
+_ALGORITHM_COS_TOL = 0.995
+_DECODE_TARGET_US = 25.0
+_PREFILL4096_TARGET_US = 2_000.0
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,19 @@ class CaseReport:
     replay_us: float
     p90_replay_us: float
     sanity_algorithm: Sanity | None
+
+
+@dataclass(frozen=True)
+class TargetSummary:
+    rows1_geo_us: float
+    rows4096_geo_us: float
+    rows1_target_ratio: float
+    rows4096_target_ratio: float
+    avg_target_ratio: float
+
+
+class BenchmarkFailure(RuntimeError):
+    pass
 
 
 def _parse_csv_ints(raw: str) -> list[int]:
@@ -244,6 +260,49 @@ def _sanity(actual: torch.Tensor, expected: torch.Tensor) -> Sanity:
     )
 
 
+def _check_algorithm_sanity(case: BenchmarkCase, sanity: Sanity) -> None:
+    if not math.isfinite(sanity.cos) or sanity.cos < _ALGORITHM_COS_TOL:
+        raise BenchmarkFailure(
+            "compressed MLA algorithm cosine below threshold for "
+            f"case={case.name} rows={case.rows}: "
+            f"max_abs={sanity.max_abs:.6f} rmse={sanity.rmse:.6f} "
+            f"cos={sanity.cos:.6f} threshold={_ALGORITHM_COS_TOL:.6f}"
+        )
+
+
+def _geomean(values: list[float]) -> float:
+    if not values:
+        raise ValueError("geomean requires at least one value")
+    if any(value <= 0.0 for value in values):
+        raise ValueError(f"geomean values must be positive, got {values}")
+    return math.exp(statistics.mean(math.log(value) for value in values))
+
+
+def _compute_target_summary(reports: list[CaseReport]) -> TargetSummary:
+    by_rows: dict[int, list[float]] = {}
+    for report in reports:
+        by_rows.setdefault(report.case.rows, []).append(report.replay_us)
+
+    missing = [rows for rows in (1, 4096) if rows not in by_rows]
+    if missing:
+        raise BenchmarkFailure(
+            "compressed MLA target scoring requires rows=1 and rows=4096; "
+            f"missing rows={','.join(str(row) for row in missing)}"
+        )
+
+    rows1_geo = _geomean(by_rows[1])
+    rows4096_geo = _geomean(by_rows[4096])
+    rows1_ratio = rows1_geo / _DECODE_TARGET_US
+    rows4096_ratio = rows4096_geo / _PREFILL4096_TARGET_US
+    return TargetSummary(
+        rows1_geo_us=rows1_geo,
+        rows4096_geo_us=rows4096_geo,
+        rows1_target_ratio=rows1_ratio,
+        rows4096_target_ratio=rows4096_ratio,
+        avg_target_ratio=(rows1_ratio + rows4096_ratio) / 2.0,
+    )
+
+
 def _benchmark_case(
     case: BenchmarkCase,
     *,
@@ -337,6 +396,7 @@ def _benchmark_case(
             extra_page_size=case.indexed_page_size,
         )
         sanity_algorithm = _sanity(output, expected_algorithm)
+        _check_algorithm_sanity(case, sanity_algorithm)
 
     replay_us = stats["replay_us"]
     return CaseReport(
@@ -345,6 +405,28 @@ def _benchmark_case(
         p90_replay_us=statistics.quantiles(replay_us, n=10)[8] if len(replay_us) >= 10 else max(replay_us),
         sanity_algorithm=sanity_algorithm,
     )
+
+
+def collect_case_reports(args: argparse.Namespace, *, device: torch.device | None = None) -> list[CaseReport]:
+    if device is None:
+        device = require_sm120()
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(args.flush_l2, l2_flush_bytes)
+
+    reports: list[CaseReport] = []
+    for case_idx, case in enumerate(_parse_cases(args.cases, args.rows)):
+        reports.append(
+            _benchmark_case(
+                case,
+                device=device,
+                seed=args.seed + case_idx * 17,
+                warmup=args.warmup,
+                replays=args.replays,
+                l2_flush=l2_flush,
+                verify=not args.skip_verify,
+            )
+        )
+    return reports
 
 
 def _render_report(report: CaseReport) -> str:
@@ -369,6 +451,19 @@ def _render_report(report: CaseReport) -> str:
     return " | ".join(parts)
 
 
+def _render_summary(reports: list[CaseReport], summary: TargetSummary) -> str:
+    return " | ".join(
+        [
+            f"Summary | cases={len(reports)}",
+            f"rows1_geo={summary.rows1_geo_us:.2f} us",
+            f"rows1_target_ratio={summary.rows1_target_ratio:.4f}",
+            f"rows4096_geo={summary.rows4096_geo_us:.2f} us",
+            f"rows4096_target_ratio={summary.rows4096_target_ratio:.4f}",
+            f"avg_target_ratio={summary.avg_target_ratio:.4f}",
+        ]
+    )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -376,7 +471,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="all",
         help="comma-separated cases: all,swa,c4,c128,swa-c4,swa-c128",
     )
-    parser.add_argument("--rows", type=_parse_csv_ints, default=_parse_csv_ints("1,2,4"))
+    parser.add_argument("--rows", type=_parse_csv_ints, default=_parse_csv_ints("1,4096"))
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--seed", type=int, default=91_000)
@@ -402,28 +497,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.warmup <= 0 or args.replays <= 0:
         raise SystemExit("--warmup and --replays must be positive")
 
-    device = require_sm120()
+    try:
+        reports = collect_case_reports(args)
+        summary = _compute_target_summary(reports)
+    except BenchmarkFailure as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
-    l2_flush = make_l2_flush_fn(args.flush_l2, l2_flush_bytes)
     flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per replay)" if args.flush_l2 else "off"
     print(f"L2 flush: {flush_desc}")
-
-    reports: list[CaseReport] = []
-    for case_idx, case in enumerate(_parse_cases(args.cases, args.rows)):
-        report = _benchmark_case(
-            case,
-            device=device,
-            seed=args.seed + case_idx * 17,
-            warmup=args.warmup,
-            replays=args.replays,
-            l2_flush=l2_flush,
-            verify=not args.skip_verify,
-        )
-        reports.append(report)
+    for report in reports:
         print(_render_report(report))
-
-    replay_geo = math.exp(statistics.mean(math.log(report.replay_us) for report in reports))
-    print(f"Summary | cases={len(reports)} | replay_geo={replay_geo:.2f} us")
+    print(_render_summary(reports, summary))
     return 0
 
 
