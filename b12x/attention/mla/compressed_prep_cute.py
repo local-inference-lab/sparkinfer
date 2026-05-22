@@ -255,14 +255,12 @@ class CompressedMLAPrepKVKernel:
 
         @cute.struct
         class SharedStorage:
-            vals: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, _THREADS], 128]
-            maxes: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, _THREADS], 128]
+            warp_maxes: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4], 128]
             scale: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 1], 128]
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        s_vals = storage.vals.get_tensor(cute.make_layout((_THREADS,), stride=(1,)))
-        s_maxes = storage.maxes.get_tensor(cute.make_layout((_THREADS,), stride=(1,)))
+        s_warp_maxes = storage.warp_maxes.get_tensor(cute.make_layout((4,), stride=(1,)))
         s_scale = storage.scale.get_tensor(cute.make_layout((1,), stride=(1,)))
 
         swa_len = Int32(swa_lengths[row])
@@ -337,29 +335,33 @@ class CompressedMLAPrepKVKernel:
                     kv_base = get_ptr_as_int64(kv_u8, Int64(0))
                     _st_global_u32(kv_base + core_row * Int64(_MLA_PACKED_DIM) + Int64(_MLA_ROPE_OFFSET_BYTES) + Int64(tx) * Int64(4), rope_word)
 
-        s_vals[tx] = val
-        s_maxes[tx] = fabs_f32(val)
+        lane = tx & Int32(31)
+        warp = tx >> Int32(5)
+        local_max = fabs_f32(val)
+        for step in cutlass.range_constexpr(5):
+            local_max = fmax_f32(local_max, cute.arch.shuffle_sync_bfly(local_max, offset=1 << step))
+        if lane == Int32(0):
+            s_warp_maxes[warp] = local_max
         cute.arch.sync_threads()
-        for step in cutlass.range_constexpr(7):
-            stride = Int32(64 >> step)
-            if tx < stride:
-                s_maxes[tx] = fmax_f32(Float32(s_maxes[tx]), Float32(s_maxes[tx + stride]))
-            cute.arch.sync_threads()
 
-        max_abs = Float32(0.0)
         scale = Float32(1.0)
-        if tx == Int32(0):
-            max_abs = Float32(s_maxes[Int32(0)])
-            if max_abs > Float32(0.0):
-                scale = max_abs * Float32(_FP8_MAX_RECIP)
-            s_scale[Int32(0)] = scale
-            core_row = Int64(row) * Int64(self.total_width) + Int64(slot)
-            kv_base = get_ptr_as_int64(kv_u8, Int64(0))
-            st_global_f32(kv_base + core_row * Int64(_MLA_PACKED_DIM) + Int64(_MLA_SCALE_OFFSET_BYTES) + Int64(group) * Int64(4), scale)
+        if warp == Int32(0):
+            max_abs = Float32(0.0)
+            if lane < Int32(4):
+                max_abs = Float32(s_warp_maxes[lane])
+            max_abs = fmax_f32(max_abs, cute.arch.shuffle_sync_bfly(max_abs, offset=1))
+            max_abs = fmax_f32(max_abs, cute.arch.shuffle_sync_bfly(max_abs, offset=2))
+            if lane == Int32(0):
+                if max_abs > Float32(0.0):
+                    scale = max_abs * Float32(_FP8_MAX_RECIP)
+                s_scale[Int32(0)] = scale
+                core_row = Int64(row) * Int64(self.total_width) + Int64(slot)
+                kv_base = get_ptr_as_int64(kv_u8, Int64(0))
+                st_global_f32(kv_base + core_row * Int64(_MLA_PACKED_DIM) + Int64(_MLA_SCALE_OFFSET_BYTES) + Int64(group) * Int64(4), scale)
         cute.arch.sync_threads()
 
         out_scale = Float32(s_scale[Int32(0)])
-        quant = cvt_f32_to_e4m3(Float32(s_vals[tx]) / out_scale)
+        quant = cvt_f32_to_e4m3(val / out_scale)
         core_row = Int64(row) * Int64(self.total_width) + Int64(slot)
         kv_base = get_ptr_as_int64(kv_u8, Int64(0))
         st_global_u8(
