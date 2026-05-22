@@ -101,6 +101,14 @@ _COMPRESSED_MLA_GROUP_KV_VECS = _COMPRESSED_MLA_GROUP_SIZE // 16
 _COMPRESSED_MLA_GROUP_KV_STAGE_VECS = _MLA_NOPE_GROUP_KV_VECS
 _COMPRESSED_MLA_GROUP_KV_BF16_VECS = (_COMPRESSED_MLA_GROUP_SIZE * 2) // 16
 _COMPRESSED_MLA_QK_NUM_MMA_D = _COMPRESSED_MLA_GROUP_SIZE // 16
+_COMPRESSED_MLA_SCALE_STAGE_STRIDE = _MLA_TOKEN_TILE + _MLA_TOKEN_TILE // 8
+_COMPRESSED_MLA_SCALE_STAGE_ELEMS = (
+    _COMPRESSED_MLA_SCALE_STAGE_STRIDE * _COMPRESSED_MLA_SCALE_GROUPS
+)
+_MLA_SHARED_SCALE_STAGE_ELEMS = max(
+    _MLA_SCALE_STAGE_ELEMS,
+    _COMPRESSED_MLA_SCALE_STAGE_ELEMS,
+)
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
     os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
 )
@@ -548,6 +556,15 @@ def _compressed_token_base(
 
 
 @cute.jit
+def _compressed_scale_smem_idx(token_local: Int32, group_idx: Int32):
+    return (
+        group_idx * Int32(_COMPRESSED_MLA_SCALE_STAGE_STRIDE)
+        + token_local
+        + token_local // Int32(8)
+    )
+
+
+@cute.jit
 def _stage_compressed_token_scales(
     swa_u8: cute.Tensor,
     indexed_u8: cute.Tensor,
@@ -579,7 +596,53 @@ def _stage_compressed_token_scales(
         scale = Float32(0.0)
         if valid != Int64(0):
             scale = _ue8m0_to_input_scale(_ld_global_u8(src_u8 + scale_base + Int64(group_idx)))
-        sScale[token_local] = scale
+        sScale[_compressed_scale_smem_idx(token_local, group_idx)] = scale
+        token_local += Int32(_MLA_WARP_THREADS)
+
+
+@cute.jit
+def _stage_all_compressed_token_scales(
+    swa_u8: cute.Tensor,
+    indexed_u8: cute.Tensor,
+    sTokenIdx: cute.Tensor,
+    sScale: cute.Tensor,
+    lane: Int32,
+    has_swa: cutlass.Constexpr[bool],
+    has_indexed: cutlass.Constexpr[bool],
+    swa_page_size: cutlass.Constexpr[int],
+    swa_page_nbytes: cutlass.Constexpr[int],
+    indexed_page_size: cutlass.Constexpr[int],
+    indexed_page_nbytes: cutlass.Constexpr[int],
+):
+    token_local = lane
+    while token_local < Int32(_MLA_TOKEN_TILE):
+        encoded = Int32(sTokenIdx[token_local])
+        src_u8, _, scale_base, valid = _compressed_token_base(
+            swa_u8,
+            indexed_u8,
+            encoded,
+            has_swa,
+            has_indexed,
+            swa_page_size,
+            swa_page_nbytes,
+            indexed_page_size,
+            indexed_page_nbytes,
+        )
+        scale_word0 = Uint32(0)
+        scale_word1 = Uint32(0)
+        if valid != Int64(0):
+            scale_word0 = ld_global_nc_u32(src_u8 + scale_base)
+            scale_word1 = ld_global_nc_u32(src_u8 + scale_base + Int64(4))
+        for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
+            group_idx = Int32(block_offset)
+            scale_word = scale_word0
+            if cutlass.const_expr(block_offset >= 4):
+                scale_word = scale_word1
+            scale_shift = Uint32((block_offset % 4) * 8)
+            scale = Float32(0.0)
+            if valid != Int64(0):
+                scale = _ue8m0_to_input_scale((scale_word >> scale_shift) & Uint32(0xFF))
+            sScale[_compressed_scale_smem_idx(token_local, group_idx)] = scale
         token_local += Int32(_MLA_WARP_THREADS)
 
 
@@ -1104,6 +1167,30 @@ def _accumulate_scaled_score_frag(
             dst_frag[0, mma_kv, reg_id] = Float32(
                 dst_frag[0, mma_kv, reg_id]
                 + src_frag[0, mma_kv, reg_id] * Float32(sScale[scale_base + token_local])
+            )
+
+
+@cute.jit
+def _accumulate_compressed_scaled_score_frag(
+    dst_frag: cute.Tensor,
+    src_frag: cute.Tensor,
+    sScale: cute.Tensor,
+    group_idx: Int32,
+    lane: Int32,
+):
+    lane_pair_base = Int32(2) * (lane % Int32(4))
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        for reg_id in cutlass.range_constexpr(8):
+            token_local = (
+                mma_kv * 16
+                + lane_pair_base
+                + Int32(8) * (reg_id // 4)
+                + Int32(reg_id % 2)
+            )
+            dst_frag[0, mma_kv, reg_id] = Float32(
+                dst_frag[0, mma_kv, reg_id]
+                + src_frag[0, mma_kv, reg_id]
+                * Float32(sScale[_compressed_scale_smem_idx(token_local, group_idx)])
             )
 
 
@@ -1981,42 +2068,43 @@ def _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
     p_frag: cute.Tensor,
     v_base_addr: Int32,
     sScale: cute.Tensor,
+    scale_base: Int32,
     lane: Int32,
     mma_d_offset: cutlass.Constexpr[int],
 ):
     lane_pair_base = Int32(2) * (lane % Int32(4))
 
     scale01_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(0)]),
-        Float32(sScale[lane_pair_base + Int32(1)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
     )
     scale89_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(8)]),
-        Float32(sScale[lane_pair_base + Int32(9)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(10)]),
     )
     scale01_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(16)]),
-        Float32(sScale[lane_pair_base + Int32(17)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(18)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(19)]),
     )
     scale89_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(24)]),
-        Float32(sScale[lane_pair_base + Int32(25)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(27)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(28)]),
     )
     scale01_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(32)]),
-        Float32(sScale[lane_pair_base + Int32(33)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(36)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(37)]),
     )
     scale89_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(40)]),
-        Float32(sScale[lane_pair_base + Int32(41)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(45)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(46)]),
     )
     scale01_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(48)]),
-        Float32(sScale[lane_pair_base + Int32(49)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(54)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(55)]),
     )
     scale89_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(56)]),
-        Float32(sScale[lane_pair_base + Int32(57)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(63)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(64)]),
     )
 
     v_offset = _permuted_offset_128b(
@@ -2640,6 +2728,19 @@ def _compute_compressed_score_tile_scaled(
     )
     cute.arch.sync_threads()
 
+    _stage_all_compressed_token_scales(
+        swa_u8,
+        indexed_u8,
+        sTokenIdx,
+        sScale,
+        lane,
+        has_swa,
+        has_indexed,
+        swa_page_size,
+        swa_page_nbytes,
+        indexed_page_size,
+        indexed_page_nbytes,
+    )
     _zero_score_frag(score_frag)
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
 
@@ -2654,20 +2755,6 @@ def _compute_compressed_score_tile_scaled(
             Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
             q_base_addr,
             lane,
-        )
-        _stage_compressed_token_scales(
-            swa_u8,
-            indexed_u8,
-            sTokenIdx,
-            sScale,
-            group_idx,
-            lane,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
         )
         _stage_compressed_kv_u32_block(
             swa_u8,
@@ -2701,7 +2788,13 @@ def _compute_compressed_score_tile_scaled(
             Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
         )
-        _accumulate_scaled_score_frag(score_frag, frag_tmp, sScale, Int32(0), lane)
+        _accumulate_compressed_scaled_score_frag(
+            score_frag,
+            frag_tmp,
+            sScale,
+            group_idx,
+            lane,
+        )
         cute.arch.sync_threads()
 
     _stage_q_u32_block(
@@ -2913,20 +3006,6 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
 ):
     for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
-        _stage_compressed_token_scales(
-            swa_u8,
-            indexed_u8,
-            sTokenIdx,
-            sScale,
-            group_idx,
-            lane,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
         _stage_compressed_kv_u32_block(
             swa_u8,
             indexed_u8,
@@ -2945,20 +3024,35 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
         )
         cute.arch.sync_threads()
 
+        scale_base = group_idx * Int32(_COMPRESSED_MLA_SCALE_STAGE_STRIDE)
         if cutlass.const_expr(block_offset == 0):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag0, p_frag, kv_base_addr, sScale, lane, 0)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag0, p_frag, kv_base_addr, sScale, scale_base, lane, 0
+            )
         elif cutlass.const_expr(block_offset == 1):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag0, p_frag, kv_base_addr, sScale, lane, 4)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag0, p_frag, kv_base_addr, sScale, scale_base, lane, 4
+            )
         elif cutlass.const_expr(block_offset == 2):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag1, p_frag, kv_base_addr, sScale, lane, 0)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag1, p_frag, kv_base_addr, sScale, scale_base, lane, 0
+            )
         elif cutlass.const_expr(block_offset == 3):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag1, p_frag, kv_base_addr, sScale, lane, 4)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag1, p_frag, kv_base_addr, sScale, scale_base, lane, 4
+            )
         elif cutlass.const_expr(block_offset == 4):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag2, p_frag, kv_base_addr, sScale, lane, 0)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag2, p_frag, kv_base_addr, sScale, scale_base, lane, 0
+            )
         elif cutlass.const_expr(block_offset == 5):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag2, p_frag, kv_base_addr, sScale, lane, 4)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag2, p_frag, kv_base_addr, sScale, scale_base, lane, 4
+            )
         else:
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag3, p_frag, kv_base_addr, sScale, lane, 0)
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
+                o_frag3, p_frag, kv_base_addr, sScale, scale_base, lane, 0
+            )
         cute.arch.sync_threads()
 
     _stage_compressed_kv_u32_block(
@@ -3555,7 +3649,7 @@ def get_sparse_mla_shared_storage_cls():
             16,
         ],
         "token_scale_a": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
+            cute.struct.MemRange[cutlass.Float32, _MLA_SHARED_SCALE_STAGE_ELEMS],
             16,
         ],
     }
@@ -3617,7 +3711,7 @@ class SparseMLAKernel:
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
         sScale = storage.token_scale_a.get_tensor(
-            cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,)))
+            cute.make_layout((_MLA_SHARED_SCALE_STAGE_ELEMS,), stride=(1,)))
         q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
         kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 

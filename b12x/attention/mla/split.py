@@ -26,7 +26,7 @@ from .kernel import (
     _MLA_Q_STAGE_BYTES,
     _MLA_Q_GROUP_STAGE_BYTES,
     _MLA_SCALE_GROUPS,
-    _MLA_SCALE_STAGE_ELEMS,
+    _MLA_SHARED_SCALE_STAGE_ELEMS,
     _MLA_TOKEN_TILE,
     _MLA_WARP_THREADS,
     _extract_packed_kv_runtime_views,
@@ -74,7 +74,7 @@ def get_sparse_mla_split_shared_storage_cls():
             16,
         ],
         "token_scale_a": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
+            cute.struct.MemRange[cutlass.Float32, _MLA_SHARED_SCALE_STAGE_ELEMS],
             16,
         ],
     }
@@ -299,7 +299,7 @@ class SparseMLASplitDecodeForwardKernel:
             storage = smem.allocate(SharedStorage)
             sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
             sScale = storage.token_scale_a.get_tensor(
-                cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
+                cute.make_layout((_MLA_SHARED_SCALE_STAGE_ELEMS,), stride=(1,))
             )
 
             q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
@@ -451,7 +451,7 @@ class CompressedMLASplitDecodeForwardKernel:
             storage = smem.allocate(SharedStorage)
             sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
             sScale = storage.token_scale_a.get_tensor(
-                cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,))
+                cute.make_layout((_MLA_SHARED_SCALE_STAGE_ELEMS,), stride=(1,))
             )
 
             q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
