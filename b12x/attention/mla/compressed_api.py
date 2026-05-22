@@ -174,7 +174,7 @@ def compressed_mla_decode_forward(
             kv_chunk_size=split_cfg.chunk_size,
             num_chunks=split_cfg.num_chunks,
         )
-    launch_num_chunks = workspace.max_chunks_per_row if graph_stable_split else split_cfg.num_chunks
+    launch_num_chunks = split_cfg.num_chunks
 
     output = torch.empty(
         (rows, heads, COMPRESSED_MLA_HEAD_DIM),
