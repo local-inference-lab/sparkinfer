@@ -494,6 +494,14 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
             num_k_tiles=supertile_k_tiles,
         )
+    require_scorer_plan = getattr(workspace, "require_paged_indexer_tiled_scorer_plan", None)
+    if require_scorer_plan is not None and bool(getattr(workspace, "fixed_capacity", False)):
+        require_scorer_plan(
+            block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
+            block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+            width_tokens=supertile_tokens,
+            source_page_width=page_table_width,
+        )
     tile_logits = workspace.get_indexer_extend_tile_logits()
     if tile_logits is None:
         raise RuntimeError(
@@ -526,36 +534,6 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     active_width = workspace.get_paged_indexer_active_width_cap()
     page_table_for_kernel = metadata.real_page_table
     lengths_for_kernel = metadata.cache_seqlens_int32
-    if bool(getattr(workspace, "use_cuda_graph", False)):
-        workspace._allocate_paged_indexer_runtime_metadata()
-        real_page_table_runtime = workspace.paged_indexer_real_page_table_runtime
-        lengths_runtime = workspace.paged_indexer_seqlens_per_query_runtime
-        if real_page_table_runtime is None or lengths_runtime is None:
-            raise RuntimeError("workspace did not allocate paged indexer runtime metadata")
-        if (
-            real_page_table_runtime.shape[0] < q_rows
-            or real_page_table_runtime.shape[1] < page_table_width
-        ):
-            raise RuntimeError(
-                "workspace paged indexer page-table buffer is too small for C4 "
-                "full-table indexing: "
-                f"need={(q_rows, page_table_width)}, "
-                f"have={tuple(real_page_table_runtime.shape)}"
-            )
-        page_table_for_kernel = real_page_table_runtime[:q_rows, :page_table_width]
-        lengths_for_kernel = lengths_runtime[:q_rows]
-        if (
-            page_table_for_kernel.data_ptr() != metadata.real_page_table.data_ptr()
-            or page_table_for_kernel.storage_offset()
-            != metadata.real_page_table.storage_offset()
-        ):
-            page_table_for_kernel.copy_(metadata.real_page_table)
-        if (
-            lengths_for_kernel.data_ptr() != metadata.cache_seqlens_int32.data_ptr()
-            or lengths_for_kernel.storage_offset()
-            != metadata.cache_seqlens_int32.storage_offset()
-        ):
-            lengths_for_kernel.copy_(metadata.cache_seqlens_int32)
 
     for chunk_idx in range(num_chunks):
         page_begin = chunk_idx * supertile_pages
@@ -586,6 +564,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             workspace=workspace,
             preinitialize_tile_logits=False,
             contract_phantoms=contract_phantoms,
+            stage_runtime_metadata=False,
         )
         if not logits.is_contiguous():
             raise RuntimeError("C4 supertile scorer returned non-contiguous tiled logits")

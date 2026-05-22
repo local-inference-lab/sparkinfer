@@ -601,6 +601,16 @@ def test_paged_mqa_index_decode_supertile_topk_fp8_graph_matches_reference(
 
     clear_nsa_indexer_caches()
     workspace.prewarm_paged_indexer_tiled_topk()
+    workspace.prewarm_paged_indexer_tiled_scorer(
+        index_k_cache=index_k_cache,
+        width_tokens=512,
+    )
+
+    def fail_runtime_staging(**_kwargs):
+        raise AssertionError("C4 supertile path must not stage workspace metadata at runtime")
+
+    monkeypatch.setattr(workspace, "stage_nsa_indexer_paged_tiled_decode", fail_runtime_staging)
+
     metadata = prepare([2, 40], [900, 960])
     paged_mqa_index_decode_supertile_topk_fp8(
         q_fp8=q_fp8,
@@ -743,6 +753,25 @@ def test_paged_mqa_supertile_workspace_requires_prewarmed_launch_contract() -> N
         )
 
     workspace.prewarm_paged_indexer_tiled_topk()
+    with pytest.raises(RuntimeError, match="not prewarmed"):
+        workspace.require_paged_indexer_tiled_scorer_plan(
+            block_q=32,
+            block_k=512,
+            width_tokens=512,
+            source_page_width=16,
+        )
+    index_k_cache = torch.empty((16, 64 * (128 + 4)), dtype=torch.uint8, device=device)
+    workspace.prewarm_paged_indexer_tiled_scorer(
+        index_k_cache=index_k_cache,
+        width_tokens=512,
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        workspace.require_paged_indexer_tiled_scorer_plan(
+            block_q=32,
+            block_k=512,
+            width_tokens=1024,
+            source_page_width=16,
+        )
     with pytest.raises(RuntimeError, match="does not match"):
         workspace.require_paged_indexer_tiled_topk_plan(
             topk=512,
@@ -823,6 +852,10 @@ def test_paged_mqa_index_decode_supertile_topk_fp8_graph_unaligned_single_chunk(
 
     clear_nsa_indexer_caches()
     workspace.prewarm_paged_indexer_tiled_topk()
+    workspace.prewarm_paged_indexer_tiled_scorer(
+        index_k_cache=index_k_cache,
+        width_tokens=1536,
+    )
     metadata = prepare([2, 48], [960, 1024])
     paged_mqa_index_decode_supertile_topk_fp8(
         q_fp8=q_fp8,

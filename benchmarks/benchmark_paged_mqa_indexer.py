@@ -8,11 +8,14 @@ import statistics
 
 import torch
 
+from b12x.attention.nsa_indexer import uses_paged_mqa_schedule_metadata
 from b12x.integration import (
     B12XAttentionWorkspace,
     clear_nsa_indexer_caches,
     pack_paged_mqa_index_k_cache_reference,
+    paged_mqa_index_decode_dense_topk_fp8,
     paged_mqa_index_decode_logits_fp8,
+    paged_mqa_index_decode_supertile_topk_fp8,
     prepare_paged_mqa_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
@@ -23,12 +26,13 @@ def _make_page_table(
     rows: int,
     page_table_width: int,
     seq_len: int,
+    page_stride: int,
     device: torch.device,
 ) -> torch.Tensor:
     table = torch.full((rows, page_table_width), -1, dtype=torch.int32, device=device)
     pages_per_row = min((int(seq_len) + 63) // 64, int(page_table_width))
     for row in range(rows):
-        start = row * int(page_table_width)
+        start = row * int(page_stride)
         table[row, :pages_per_row] = torch.arange(
             start,
             start + pages_per_row,
@@ -38,7 +42,7 @@ def _make_page_table(
     return table.contiguous()
 
 
-def _cuda_time_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
+def _event_time_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -85,6 +89,19 @@ def main() -> None:
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--page-table-width", type=int, default=1024)
     parser.add_argument("--seq-len", type=int, default=2304)
+    parser.add_argument(
+        "--page-stride",
+        type=int,
+        default=0,
+        help="physical page-id stride between rows; 0 shares pages across rows",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("logits", "dense-topk", "supertile-topk"),
+        default="supertile-topk",
+    )
+    parser.add_argument("--topk", type=int, default=512)
+    parser.add_argument("--supertile-k", type=int, default=32768)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--eager", action="store_true", help="time eager launches instead of graph replay")
@@ -104,7 +121,13 @@ def main() -> None:
     rows = int(args.rows)
     page_table_width = int(args.page_table_width)
     seq_len = int(args.seq_len)
-    max_pages_needed = rows * page_table_width
+    page_stride = int(args.page_stride)
+    if page_stride < 0:
+        raise ValueError(f"page_stride must be non-negative, got {page_stride}")
+    if page_stride == 0:
+        max_pages_needed = page_table_width
+    else:
+        max_pages_needed = (rows - 1) * page_stride + page_table_width
     q_fp8 = (
         torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device) / 2
     ).to(torch.float8_e4m3fn)
@@ -117,9 +140,14 @@ def main() -> None:
         rows=rows,
         page_table_width=page_table_width,
         seq_len=seq_len,
+        page_stride=page_stride,
         device=device,
     )
     seqlens = torch.full((rows,), min(seq_len, page_table_width * 64), dtype=torch.int32, device=device)
+    bench_mode = str(args.mode)
+    topk = int(args.topk)
+    supertile_k = int(args.supertile_k)
+    reserve_dense_logits = bench_mode in {"logits", "dense-topk"}
     workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
@@ -129,7 +157,7 @@ def main() -> None:
         indexer_num_q_heads=num_heads,
         head_dim=576,
         v_head_dim=512,
-        topk=512,
+        topk=topk,
         max_page_table_width=page_table_width,
         max_total_q=rows,
         max_batch=rows,
@@ -137,42 +165,83 @@ def main() -> None:
         max_kv_rows=index_k_cache.shape[0] * 64,
         page_size=64,
         use_cuda_graph=not args.eager,
+        reserve_paged_indexer_logits=reserve_dense_logits,
+        paged_indexer_logits_q_rows=rows if reserve_dense_logits else 0,
+        paged_indexer_logits_k_rows=page_table_width * 64 if reserve_dense_logits else 0,
+        paged_indexer_tile_logits_k_rows=supertile_k if bench_mode == "supertile-topk" else 0,
     )
     schedule_out = None
-    if workspace.paged_indexer_schedule_metadata_runtime is not None:
+    build_schedule = None
+    if bench_mode == "supertile-topk":
+        build_schedule = False
+    else:
+        build_schedule = uses_paged_mqa_schedule_metadata(
+            q_rows=rows,
+            max_pages=page_table_width,
+        )
+    if build_schedule and workspace.paged_indexer_schedule_metadata_runtime is not None:
         schedule_out = workspace.paged_indexer_schedule_metadata_runtime
     metadata = prepare_paged_mqa_indexer_metadata(
         real_page_table=page_table,
         cache_seqlens_int32=seqlens,
         expected_num_q_heads=num_heads,
         schedule_out=schedule_out,
+        build_schedule=build_schedule,
     )
 
     clear_nsa_indexer_caches()
+    if bench_mode == "supertile-topk":
+        workspace.prewarm_paged_indexer_tiled_topk()
+        workspace.prewarm_paged_indexer_tiled_scorer(
+            index_k_cache=index_k_cache,
+            width_tokens=supertile_k,
+        )
 
     def run() -> torch.Tensor:
-        return paged_mqa_index_decode_logits_fp8(
+        if bench_mode == "logits":
+            return paged_mqa_index_decode_logits_fp8(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=metadata,
+                workspace=workspace,
+            )
+        if bench_mode == "dense-topk":
+            return paged_mqa_index_decode_dense_topk_fp8(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=metadata,
+                topk=topk,
+                expected_num_q_heads=num_heads,
+                workspace=workspace,
+            )
+        return paged_mqa_index_decode_supertile_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
             metadata=metadata,
+            topk=topk,
+            expected_num_q_heads=num_heads,
             workspace=workspace,
+            supertile_k=supertile_k,
         )
 
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
     if args.eager:
-        median_us, min_us = _cuda_time_us(run, warmup=args.warmup, iters=args.iters)
-        mode = "eager"
+        median_us, min_us = _event_time_us(run, warmup=args.warmup, iters=args.iters)
+        timing_mode = "eager"
     else:
         median_us, min_us = _graph_time_us(run, warmup=args.warmup, iters=args.iters)
-        mode = "graph"
+        timing_mode = "graph"
 
     print(
         "paged_mqa_indexer "
-        f"mode={mode} rows={rows} indexer_heads={num_heads} "
+        f"mode={bench_mode} timing={timing_mode} rows={rows} indexer_heads={num_heads} "
         f"page_table_width={page_table_width} seq_len={seq_len} "
+        f"page_stride={page_stride} topk={topk} supertile_k={supertile_k} "
         f"logits_shape={tuple(out.shape)} median_us={median_us:.2f} min_us={min_us:.2f}"
     )
 

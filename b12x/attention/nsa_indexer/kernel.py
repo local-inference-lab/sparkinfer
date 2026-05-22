@@ -1880,6 +1880,7 @@ def run_sparse_nsa_paged_windowed_tiled_logits_kernel(
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     preinitialize_tile_logits: bool = True,
+    stage_runtime_metadata: bool = True,
 ) -> torch.Tensor:
     return _run_sparse_nsa_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
@@ -1898,6 +1899,7 @@ def run_sparse_nsa_paged_windowed_tiled_logits_kernel(
         source_page_offset=source_page_offset,
         output_width_tokens=output_width_tokens,
         windowed=True,
+        stage_runtime_metadata=stage_runtime_metadata,
     )
 
 
@@ -1919,6 +1921,7 @@ def _run_sparse_nsa_paged_tiled_logits_kernel_common(
     source_page_offset: int = 0,
     output_width_tokens: int | None = None,
     windowed: bool,
+    stage_runtime_metadata: bool = True,
 ) -> torch.Tensor:
     if page_size != _PAGE_SIZE:
         raise ValueError(f"paged tiled logits kernel requires page_size={_PAGE_SIZE}, got {page_size}")
@@ -1996,7 +1999,7 @@ def _run_sparse_nsa_paged_tiled_logits_kernel_common(
         int(use_patched_k_tma_desc),
         device_index,
     )
-    if workspace is not None:
+    if workspace is not None and stage_runtime_metadata:
         staged = workspace.stage_nsa_indexer_paged_tiled_decode(
             q_fp8=q_fp8,
             weights=weights,
@@ -2019,15 +2022,27 @@ def _run_sparse_nsa_paged_tiled_logits_kernel_common(
         if contract_phantoms is None:
             contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
     else:
-        q_bytes = q_fp8.contiguous().view(torch.uint8)
-        weights_kernel = weights.contiguous()
-        real_page_table_kernel = real_page_table.contiguous()
-        seqlens_per_query_kernel = seqlens_per_query.contiguous()
-        active_width_kernel = active_width.contiguous()
+        if not q_fp8.is_contiguous():
+            raise ValueError("paged tiled logits requires contiguous q_fp8")
+        if not weights.is_contiguous():
+            raise ValueError("paged tiled logits requires contiguous weights")
+        if not real_page_table.is_contiguous():
+            raise ValueError("paged tiled logits requires contiguous real_page_table")
+        if not seqlens_per_query.is_contiguous():
+            raise ValueError("paged tiled logits requires contiguous seqlens_per_query")
+        if not active_width.is_contiguous():
+            raise ValueError("paged tiled logits requires contiguous active_width")
+        q_bytes = q_fp8.view(torch.uint8)
+        weights_kernel = weights
+        real_page_table_kernel = real_page_table
+        seqlens_per_query_kernel = seqlens_per_query
+        active_width_kernel = active_width
         logits = tile_logits
         logits_view = tile_logits[:required_elements]
         if preinitialize_tile_logits:
             logits_view.fill_(float("-inf"))
+        if workspace is not None and contract_phantoms is None:
+            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
 
     _cp = contract_phantoms or {}
     common_args = (

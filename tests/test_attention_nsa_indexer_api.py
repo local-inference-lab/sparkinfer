@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
 from b12x.attention.nsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
+    run_sparse_nsa_paged_tiled_logits_kernel,
+    run_sparse_nsa_paged_windowed_tiled_logits_kernel,
 )
 from b12x.attention.nsa_indexer.reference import (
     sparse_nsa_extend_logits_reference,
@@ -112,6 +116,16 @@ def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
     assert scales.untyped_storage().data_ptr() == index_k_cache.untyped_storage().data_ptr()
     scale_bytes = scales.view(torch.uint8).view(page_count, 64, 4)
     assert scale_bytes[1, 2, 0].item() == index_k_cache[1, data_bytes + 2 * 4].item()
+
+
+def test_paged_nsa_glm_front_door_does_not_expose_c4_window_contract() -> None:
+    glm_params = inspect.signature(run_sparse_nsa_paged_tiled_logits_kernel).parameters
+    c4_params = inspect.signature(run_sparse_nsa_paged_windowed_tiled_logits_kernel).parameters
+
+    assert "source_page_offset" not in glm_params
+    assert "output_width_tokens" not in glm_params
+    assert "source_page_offset" in c4_params
+    assert "output_width_tokens" in c4_params
 
 
 def test_get_paged_mqa_logits_metadata_matches_deepgemm_partitioning() -> None:
