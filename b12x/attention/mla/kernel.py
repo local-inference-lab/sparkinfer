@@ -337,6 +337,57 @@ def _ue8m0_to_input_scale(scale_u8: Uint32, *, loc=None, ip=None) -> Float32:
     )
 
 
+@dsl_user_op
+def _ue8m0x4_to_input_scales(
+    scale_u32: Uint32, *, loc=None, ip=None
+) -> tuple[Float32, Float32, Float32, Float32]:
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Uint32(scale_u32).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p0, p1, p2, p3;
+            .reg .b32 b0, b1, b2, b3;
+            .reg .b32 s0, s1, s2, s3;
+            and.b32 b0, $4, 0x000000ff;
+            shr.u32 b1, $4, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $4, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $4, 24;
+            setp.eq.u32 p0, b0, 0;
+            setp.eq.u32 p1, b1, 0;
+            setp.eq.u32 p2, b2, 0;
+            setp.eq.u32 p3, b3, 0;
+            shl.b32 s0, b0, 23;
+            shl.b32 s1, b1, 23;
+            shl.b32 s2, b2, 23;
+            shl.b32 s3, b3, 23;
+            selp.b32 s0, 0x00400000, s0, p0;
+            selp.b32 s1, 0x00400000, s1, p1;
+            selp.b32 s2, 0x00400000, s2, p2;
+            selp.b32 s3, 0x00400000, s3, p3;
+            mov.b32 $0, s0;
+            mov.b32 $1, s1;
+            mov.b32 $2, s2;
+            mov.b32 $3, s3;
+        }
+        """,
+        "=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
 @cute.jit
 def _advance_offset_by_row_128b(offset_128b, step_size, row_stride_128b):
     return offset_128b + step_size * row_stride_128b
@@ -628,21 +679,25 @@ def _stage_all_compressed_token_scales(
             indexed_page_size,
             indexed_page_nbytes,
         )
-        scale_word0 = Uint32(0)
-        scale_word1 = Uint32(0)
+        scale0 = Float32(0.0)
+        scale1 = Float32(0.0)
+        scale2 = Float32(0.0)
+        scale3 = Float32(0.0)
+        scale4 = Float32(0.0)
+        scale5 = Float32(0.0)
+        scale6 = Float32(0.0)
         if valid != Int64(0):
-            scale_word0 = ld_global_nc_u32(src_u8 + scale_base)
-            scale_word1 = ld_global_nc_u32(src_u8 + scale_base + Int64(4))
-        for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
-            group_idx = Int32(block_offset)
-            scale_word = scale_word0
-            if cutlass.const_expr(block_offset >= 4):
-                scale_word = scale_word1
-            scale_shift = Uint32((block_offset % 4) * 8)
-            scale = Float32(0.0)
-            if valid != Int64(0):
-                scale = _ue8m0_to_input_scale((scale_word >> scale_shift) & Uint32(0xFF))
-            sScale[_compressed_scale_smem_idx(token_local, group_idx)] = scale
+            word0 = ld_global_nc_u32(src_u8 + scale_base)
+            scale0, scale1, scale2, scale3 = _ue8m0x4_to_input_scales(word0)
+            word1 = ld_global_nc_u32(src_u8 + scale_base + Int64(4))
+            scale4, scale5, scale6, _ = _ue8m0x4_to_input_scales(word1)
+        sScale[_compressed_scale_smem_idx(token_local, Int32(0))] = scale0
+        sScale[_compressed_scale_smem_idx(token_local, Int32(1))] = scale1
+        sScale[_compressed_scale_smem_idx(token_local, Int32(2))] = scale2
+        sScale[_compressed_scale_smem_idx(token_local, Int32(3))] = scale3
+        sScale[_compressed_scale_smem_idx(token_local, Int32(4))] = scale4
+        sScale[_compressed_scale_smem_idx(token_local, Int32(5))] = scale5
+        sScale[_compressed_scale_smem_idx(token_local, Int32(6))] = scale6
         token_local += Int32(_MLA_WARP_THREADS)
 
 
