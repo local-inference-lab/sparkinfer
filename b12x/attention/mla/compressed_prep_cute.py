@@ -31,7 +31,7 @@ from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = int(os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512"))
-_THREADS = 128
+_THREADS = 64
 _MLA_PACKED_DIM = 656
 _MLA_SCALE_OFFSET_BYTES = 512
 _MLA_ROPE_OFFSET_BYTES = 528
@@ -255,7 +255,7 @@ class CompressedMLAPrepKVKernel:
 
         @cute.struct
         class SharedStorage:
-            warp_maxes: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4], 128]
+            warp_maxes: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2], 128]
             scale: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 1], 128]
 
         smem = cutlass.utils.SmemAllocator()
@@ -310,24 +310,27 @@ class CompressedMLAPrepKVKernel:
         payload_base = page * page_nbytes + token_offset * Int64(_COMPRESSED_PAYLOAD_BYTES)
         scale_base = page * page_nbytes + page_size * Int64(_COMPRESSED_PAYLOAD_BYTES) + token_offset * Int64(8)
 
-        dim = group * Int32(128) + tx
-        val = Float32(0.0)
+        dim0 = group * Int32(128) + tx
+        dim1 = dim0 + Int32(64)
+        val0 = Float32(0.0)
+        val1 = Float32(0.0)
         if active:
             if group < Int32(3):
-                raw_byte = _ld_global_u8(src_u8 + payload_base + Int64(dim))
-                scale_id = dim // Int32(64)
-                scale_byte = _ld_global_u8(src_u8 + scale_base + Int64(scale_id))
-                val = cvt_e4m3_to_f32_via_f16(raw_byte) * _ue8m0_to_input_scale(scale_byte)
+                raw_byte0 = _ld_global_u8(src_u8 + payload_base + Int64(dim0))
+                scale_id0 = dim0 // Int32(64)
+                scale_byte0 = _ld_global_u8(src_u8 + scale_base + Int64(scale_id0))
+                val0 = cvt_e4m3_to_f32_via_f16(raw_byte0) * _ue8m0_to_input_scale(scale_byte0)
+                raw_byte1 = _ld_global_u8(src_u8 + payload_base + Int64(dim1))
+                scale_id1 = dim1 // Int32(64)
+                scale_byte1 = _ld_global_u8(src_u8 + scale_base + Int64(scale_id1))
+                val1 = cvt_e4m3_to_f32_via_f16(raw_byte1) * _ue8m0_to_input_scale(scale_byte1)
             else:
-                if tx < Int32(64):
-                    raw_byte = _ld_global_u8(src_u8 + payload_base + Int64(384) + Int64(tx))
-                    scale_byte = _ld_global_u8(src_u8 + scale_base + Int64(6))
-                    val = cvt_e4m3_to_f32_via_f16(raw_byte) * _ue8m0_to_input_scale(scale_byte)
-                else:
-                    rope_idx = tx - Int32(64)
-                    val = _ld_global_bf16_to_f32(
-                        src_u8 + payload_base + Int64(_COMPRESSED_NOPE_BYTES) + Int64(rope_idx) * Int64(2)
-                    )
+                raw_byte0 = _ld_global_u8(src_u8 + payload_base + Int64(384) + Int64(tx))
+                scale_byte0 = _ld_global_u8(src_u8 + scale_base + Int64(6))
+                val0 = cvt_e4m3_to_f32_via_f16(raw_byte0) * _ue8m0_to_input_scale(scale_byte0)
+                val1 = _ld_global_bf16_to_f32(
+                    src_u8 + payload_base + Int64(_COMPRESSED_NOPE_BYTES) + Int64(tx) * Int64(2)
+                )
 
                 if tx < Int32(32):
                     rope_word = ld_global_nc_u32(src_u8 + payload_base + Int64(_COMPRESSED_NOPE_BYTES) + Int64(tx) * Int64(4))
@@ -337,7 +340,7 @@ class CompressedMLAPrepKVKernel:
 
         lane = tx & Int32(31)
         warp = tx >> Int32(5)
-        local_max = fabs_f32(val)
+        local_max = fmax_f32(fabs_f32(val0), fabs_f32(val1))
         for step in cutlass.range_constexpr(5):
             local_max = fmax_f32(local_max, cute.arch.shuffle_sync_bfly(local_max, offset=1 << step))
         if lane == Int32(0):
@@ -347,10 +350,9 @@ class CompressedMLAPrepKVKernel:
         scale = Float32(1.0)
         if warp == Int32(0):
             max_abs = Float32(0.0)
-            if lane < Int32(4):
+            if lane < Int32(2):
                 max_abs = Float32(s_warp_maxes[lane])
             max_abs = fmax_f32(max_abs, cute.arch.shuffle_sync_bfly(max_abs, offset=1))
-            max_abs = fmax_f32(max_abs, cute.arch.shuffle_sync_bfly(max_abs, offset=2))
             if lane == Int32(0):
                 if max_abs > Float32(0.0):
                     scale = max_abs * Float32(_FP8_MAX_RECIP)
@@ -361,12 +363,17 @@ class CompressedMLAPrepKVKernel:
         cute.arch.sync_threads()
 
         out_scale = Float32(s_scale[Int32(0)])
-        quant = cvt_f32_to_e4m3(val / out_scale)
+        quant0 = cvt_f32_to_e4m3(val0 / out_scale)
+        quant1 = cvt_f32_to_e4m3(val1 / out_scale)
         core_row = Int64(row) * Int64(self.total_width) + Int64(slot)
         kv_base = get_ptr_as_int64(kv_u8, Int64(0))
         st_global_u8(
             kv_base + core_row * Int64(_MLA_PACKED_DIM) + Int64(group) * Int64(128) + Int64(tx),
-            Uint8(quant & Uint32(0xFF)),
+            Uint8(quant0 & Uint32(0xFF)),
+        )
+        st_global_u8(
+            kv_base + core_row * Int64(_MLA_PACKED_DIM) + Int64(group) * Int64(128) + Int64(64) + Int64(tx),
+            Uint8(quant1 & Uint32(0xFF)),
         )
 
 
