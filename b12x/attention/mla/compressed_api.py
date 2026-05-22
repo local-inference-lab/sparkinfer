@@ -144,9 +144,14 @@ def compressed_mla_decode_forward(
     total_width = int(swa_indices_2d.shape[1]) + (
         int(indexed_indices_2d.shape[1]) if has_indexed else 0
     )
+    min_effective_chunk = 64
+    compressed_max_chunks = min(
+        workspace.max_chunks_per_row,
+        max(1, (total_width + min_effective_chunk - 1) // min_effective_chunk),
+    )
     split_cfg = forced_sparse_mla_split_decode_config_for_width(
         total_width,
-        max_chunks=workspace.max_chunks_per_row,
+        max_chunks=compressed_max_chunks,
     )
     if split_cfg is None:
         raise RuntimeError(
