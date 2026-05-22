@@ -340,6 +340,7 @@ class CompressedMLASplitDecodeForwardKernel:
         swa_page_nbytes: int,
         indexed_page_size: int,
         indexed_page_nbytes: int,
+        has_swa: bool,
         has_indexed: bool,
         map_indexed_page_table: bool,
         indexed_page_table_width: int,
@@ -351,6 +352,7 @@ class CompressedMLASplitDecodeForwardKernel:
         self.swa_page_nbytes = int(swa_page_nbytes)
         self.indexed_page_size = int(indexed_page_size)
         self.indexed_page_nbytes = int(indexed_page_nbytes)
+        self.has_swa = bool(has_swa)
         self.has_indexed = bool(has_indexed)
         self.map_indexed_page_table = bool(map_indexed_page_table)
         self.indexed_page_table_width = int(indexed_page_table_width)
@@ -424,7 +426,9 @@ class CompressedMLASplitDecodeForwardKernel:
         active_num_chunks = Int32(num_chunks_ptr[Int32(0)])
         if active_num_chunks > Int32(_SPLIT_MAX_CHUNKS):
             active_num_chunks = Int32(_SPLIT_MAX_CHUNKS)
-        swa_len = _clamp_active_token_count(swa_lengths, q_idx, Int32(swa_indices.shape[1]))
+        swa_len = Int32(0)
+        if cutlass.const_expr(self.has_swa):
+            swa_len = _clamp_active_token_count(swa_lengths, q_idx, Int32(swa_indices.shape[1]))
         indexed_len = Int32(0)
         if cutlass.const_expr(self.has_indexed):
             indexed_len = _clamp_active_token_count(
@@ -481,6 +485,7 @@ class CompressedMLASplitDecodeForwardKernel:
                 self.swa_page_nbytes,
                 self.indexed_page_size,
                 self.indexed_page_nbytes,
+                self.has_swa,
                 self.has_indexed,
                 self.map_indexed_page_table,
                 self.indexed_page_table_width,
@@ -712,6 +717,7 @@ def _build_compressed_mla_split_forward_kernel(
     swa_page_nbytes: int,
     indexed_page_size: int,
     indexed_page_nbytes: int,
+    has_swa: bool,
     has_indexed: bool,
     map_indexed_page_table: bool,
     indexed_page_table_width: int,
@@ -724,6 +730,7 @@ def _build_compressed_mla_split_forward_kernel(
         swa_page_nbytes=swa_page_nbytes,
         indexed_page_size=indexed_page_size,
         indexed_page_nbytes=indexed_page_nbytes,
+        has_swa=has_swa,
         has_indexed=has_indexed,
         map_indexed_page_table=map_indexed_page_table,
         indexed_page_table_width=indexed_page_table_width,
@@ -919,6 +926,7 @@ def run_compressed_mla_split_decode_forward(
     q_u32 = _view_last_dim_as_u32(q_all)
     swa_u8 = swa_k_cache.reshape(-1)
     indexed_u8 = indexed_k_cache.reshape(-1)
+    has_swa = int(swa_indices.shape[1]) > 0
 
     forward_kernel = _build_compressed_mla_split_forward_kernel(
         int(launch_num_chunks),
@@ -927,6 +935,7 @@ def run_compressed_mla_split_decode_forward(
         int(swa_page_nbytes),
         int(indexed_page_size),
         int(indexed_page_nbytes),
+        bool(has_swa),
         bool(has_indexed),
         bool(map_indexed_page_table),
         int(indexed_page_table_width),
@@ -971,6 +980,7 @@ def run_compressed_mla_split_decode_forward(
         int(swa_page_nbytes),
         int(indexed_page_size),
         int(indexed_page_nbytes),
+        bool(has_swa),
         bool(has_indexed),
         bool(map_indexed_page_table),
         int(indexed_page_table_width),

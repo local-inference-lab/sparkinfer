@@ -379,39 +379,29 @@ def _stage_compressed_token_indices(
     token_base: Int32,
     token_end: Int32,
     lane: Int32,
+    has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
     map_indexed_page_table: cutlass.Constexpr[bool],
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_table_width: cutlass.Constexpr[int],
 ):
-    swa_len = Int32(swa_lengths[q_idx])
-    if swa_len < Int32(0):
-        swa_len = Int32(0)
-    if swa_len > Int32(swa_indices.shape[1]):
-        swa_len = Int32(swa_indices.shape[1])
+    if cutlass.const_expr(not has_swa):
+        indexed_len = Int32(0)
+        if cutlass.const_expr(has_indexed):
+            indexed_len = Int32(indexed_lengths[q_idx])
+            if indexed_len < Int32(0):
+                indexed_len = Int32(0)
+            if indexed_len > Int32(indexed_indices.shape[1]):
+                indexed_len = Int32(indexed_indices.shape[1])
 
-    indexed_len = Int32(0)
-    if cutlass.const_expr(has_indexed):
-        indexed_len = Int32(indexed_lengths[q_idx])
-        if indexed_len < Int32(0):
-            indexed_len = Int32(0)
-        if indexed_len > Int32(indexed_indices.shape[1]):
-            indexed_len = Int32(indexed_indices.shape[1])
-
-    token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
-        token_pos = token_base + token_local
-        encoded = Int32(-1)
-        if token_pos < token_end:
-            if token_pos < swa_len:
-                raw_swa = Int32(swa_indices[q_idx, token_pos])
-                if raw_swa >= Int32(0):
-                    encoded = raw_swa
-            else:
-                extra_slot = token_pos - swa_len
+        token_local = lane
+        while token_local < Int32(_MLA_TOKEN_TILE):
+            token_pos = token_base + token_local
+            encoded = Int32(-1)
+            if token_pos < token_end:
                 if cutlass.const_expr(has_indexed):
-                    if extra_slot < indexed_len:
-                        raw_indexed = Int32(indexed_indices[q_idx, extra_slot])
+                    if token_pos < indexed_len:
+                        raw_indexed = Int32(indexed_indices[q_idx, token_pos])
                         if cutlass.const_expr(map_indexed_page_table):
                             page_col = raw_indexed // Int32(indexed_page_size)
                             page_off = raw_indexed - page_col * Int32(indexed_page_size)
@@ -429,8 +419,56 @@ def _stage_compressed_token_indices(
                         else:
                             if raw_indexed >= Int32(0):
                                 encoded = Int32(0) - raw_indexed - Int32(2)
-        sTokenIdx[token_local] = encoded
-        token_local += Int32(_MLA_WARP_THREADS)
+            sTokenIdx[token_local] = encoded
+            token_local += Int32(_MLA_WARP_THREADS)
+    else:
+        swa_len = Int32(swa_lengths[q_idx])
+        if swa_len < Int32(0):
+            swa_len = Int32(0)
+        if swa_len > Int32(swa_indices.shape[1]):
+            swa_len = Int32(swa_indices.shape[1])
+
+        indexed_len = Int32(0)
+        if cutlass.const_expr(has_indexed):
+            indexed_len = Int32(indexed_lengths[q_idx])
+            if indexed_len < Int32(0):
+                indexed_len = Int32(0)
+            if indexed_len > Int32(indexed_indices.shape[1]):
+                indexed_len = Int32(indexed_indices.shape[1])
+
+        token_local = lane
+        while token_local < Int32(_MLA_TOKEN_TILE):
+            token_pos = token_base + token_local
+            encoded = Int32(-1)
+            if token_pos < token_end:
+                if token_pos < swa_len:
+                    raw_swa = Int32(swa_indices[q_idx, token_pos])
+                    if raw_swa >= Int32(0):
+                        encoded = raw_swa
+                else:
+                    extra_slot = token_pos - swa_len
+                    if cutlass.const_expr(has_indexed):
+                        if extra_slot < indexed_len:
+                            raw_indexed = Int32(indexed_indices[q_idx, extra_slot])
+                            if cutlass.const_expr(map_indexed_page_table):
+                                page_col = raw_indexed // Int32(indexed_page_size)
+                                page_off = raw_indexed - page_col * Int32(indexed_page_size)
+                                valid_page_col = raw_indexed >= Int32(0)
+                                if valid_page_col:
+                                    valid_page_col = page_col >= Int32(0)
+                                if valid_page_col:
+                                    valid_page_col = page_col < Int32(indexed_page_table_width)
+                                page_id = Int32(-1)
+                                if valid_page_col:
+                                    page_id = Int32(indexed_page_table[q_idx, page_col])
+                                if page_id >= Int32(0):
+                                    token_idx = page_id * Int32(indexed_page_size) + page_off
+                                    encoded = Int32(0) - token_idx - Int32(2)
+                            else:
+                                if raw_indexed >= Int32(0):
+                                    encoded = Int32(0) - raw_indexed - Int32(2)
+            sTokenIdx[token_local] = encoded
+            token_local += Int32(_MLA_WARP_THREADS)
 
 
 @cute.jit
@@ -458,25 +496,46 @@ def _compressed_token_base(
     swa_u8: cute.Tensor,
     indexed_u8: cute.Tensor,
     encoded_token: Int32,
+    has_swa: cutlass.Constexpr[bool],
+    has_indexed: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_nbytes: cutlass.Constexpr[int],
 ) -> tuple[Int64, Int64, Int64, Int64]:
-    src_u8 = get_ptr_as_int64(swa_u8, Int64(0))
-    page_size = Int64(swa_page_size)
-    page_nbytes = Int64(swa_page_nbytes)
-    token_idx = Int64(0)
-    valid = Int64(0)
-    if encoded_token >= Int32(0):
-        token_idx = Int64(encoded_token)
-        valid = Int64(1)
-    elif encoded_token <= Int32(-2):
-        token_idx = Int64(Int32(0) - encoded_token - Int32(2))
+    if cutlass.const_expr(not has_swa):
         src_u8 = get_ptr_as_int64(indexed_u8, Int64(0))
         page_size = Int64(indexed_page_size)
         page_nbytes = Int64(indexed_page_nbytes)
-        valid = Int64(1)
+        token_idx = Int64(0)
+        valid = Int64(0)
+        if encoded_token <= Int32(-2):
+            token_idx = Int64(Int32(0) - encoded_token - Int32(2))
+            valid = Int64(1)
+    elif cutlass.const_expr(not has_indexed):
+        src_u8 = get_ptr_as_int64(swa_u8, Int64(0))
+        page_size = Int64(swa_page_size)
+        page_nbytes = Int64(swa_page_nbytes)
+        token_idx = Int64(0)
+        valid = Int64(0)
+        if encoded_token >= Int32(0):
+            token_idx = Int64(encoded_token)
+            valid = Int64(1)
+    else:
+        src_u8 = get_ptr_as_int64(swa_u8, Int64(0))
+        page_size = Int64(swa_page_size)
+        page_nbytes = Int64(swa_page_nbytes)
+        token_idx = Int64(0)
+        valid = Int64(0)
+        if encoded_token >= Int32(0):
+            token_idx = Int64(encoded_token)
+            valid = Int64(1)
+        elif encoded_token <= Int32(-2):
+            token_idx = Int64(Int32(0) - encoded_token - Int32(2))
+            src_u8 = get_ptr_as_int64(indexed_u8, Int64(0))
+            page_size = Int64(indexed_page_size)
+            page_nbytes = Int64(indexed_page_nbytes)
+            valid = Int64(1)
     page = token_idx // page_size
     token_offset = token_idx - page * page_size
     payload_base = page * page_nbytes + token_offset * Int64(_COMPRESSED_MLA_PAYLOAD_BYTES)
@@ -496,6 +555,8 @@ def _stage_compressed_token_scales(
     sScale: cute.Tensor,
     group_idx: Int32,
     lane: Int32,
+    has_swa: cutlass.Constexpr[bool],
+    has_indexed: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -508,6 +569,8 @@ def _stage_compressed_token_scales(
             swa_u8,
             indexed_u8,
             encoded,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -689,6 +752,8 @@ def _stage_compressed_kv_u32_block(
     row_stride_128b: Int32,
     kv_base_addr: Int32,
     lane: Int32,
+    has_swa: cutlass.Constexpr[bool],
+    has_indexed: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -708,6 +773,8 @@ def _stage_compressed_kv_u32_block(
             swa_u8,
             indexed_u8,
             encoded,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -2544,6 +2611,7 @@ def _compute_compressed_score_tile_scaled(
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_nbytes: cutlass.Constexpr[int],
+    has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
     map_indexed_page_table: cutlass.Constexpr[bool],
     indexed_page_table_width: cutlass.Constexpr[int],
@@ -2564,6 +2632,7 @@ def _compute_compressed_score_tile_scaled(
         token_base,
         token_end,
         lane,
+        has_swa,
         has_indexed,
         map_indexed_page_table,
         indexed_page_size,
@@ -2593,6 +2662,8 @@ def _compute_compressed_score_tile_scaled(
             sScale,
             group_idx,
             lane,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -2607,6 +2678,8 @@ def _compute_compressed_score_tile_scaled(
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
             kv_base_addr,
             lane,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -2650,6 +2723,8 @@ def _compute_compressed_score_tile_scaled(
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         kv_base_addr,
         lane,
+        has_swa,
+        has_indexed,
         swa_page_size,
         swa_page_nbytes,
         indexed_page_size,
@@ -2829,6 +2904,8 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
     sScale: cute.Tensor,
     kv_base_addr: Int32,
     lane: Int32,
+    has_swa: cutlass.Constexpr[bool],
+    has_indexed: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -2843,6 +2920,8 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
             sScale,
             group_idx,
             lane,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -2857,6 +2936,8 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
             Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
             kv_base_addr,
             lane,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
@@ -2889,6 +2970,8 @@ def _accumulate_compressed_pv_groups_from_p_frag_staged(
         Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
         kv_base_addr,
         lane,
+        has_swa,
+        has_indexed,
         swa_page_size,
         swa_page_nbytes,
         indexed_page_size,
@@ -3298,6 +3381,7 @@ def _run_one_pass_compressed_mla_tile(
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
     indexed_page_nbytes: cutlass.Constexpr[int],
+    has_swa: cutlass.Constexpr[bool],
     has_indexed: cutlass.Constexpr[bool],
     map_indexed_page_table: cutlass.Constexpr[bool],
     indexed_page_table_width: cutlass.Constexpr[int],
@@ -3365,6 +3449,7 @@ def _run_one_pass_compressed_mla_tile(
             swa_page_nbytes,
             indexed_page_size,
             indexed_page_nbytes,
+            has_swa,
             has_indexed,
             map_indexed_page_table,
             indexed_page_table_width,
@@ -3406,6 +3491,8 @@ def _run_one_pass_compressed_mla_tile(
             sScale,
             kv_base_addr,
             lane,
+            has_swa,
+            has_indexed,
             swa_page_size,
             swa_page_nbytes,
             indexed_page_size,
