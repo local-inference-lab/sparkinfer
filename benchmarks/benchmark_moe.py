@@ -1868,6 +1868,10 @@ def bench_e2e() -> None:
             output=warmup_buffers.output,
             fc1_c_tmp=warmup_buffers.fc1_c_tmp,
             fc2_c_tmp=warmup_buffers.fc2_c_tmp,
+            packed_route_indices=warmup_buffers.packed_route_indices,
+            block_expert_ids=warmup_buffers.block_expert_ids,
+            packed_route_count=warmup_buffers.packed_route_count,
+            expert_offsets=warmup_buffers.expert_offsets,
         )
     else:
         warmup_workspace = allocate_tp_moe_workspace_pool()
@@ -1972,6 +1976,10 @@ def bench_e2e() -> None:
                         output=backend_output,
                         fc1_c_tmp=backend_w4a16_buffers.fc1_c_tmp,
                         fc2_c_tmp=backend_w4a16_buffers.fc2_c_tmp,
+                        packed_route_indices=backend_w4a16_buffers.packed_route_indices,
+                        block_expert_ids=backend_w4a16_buffers.block_expert_ids,
+                        packed_route_count=backend_w4a16_buffers.packed_route_count,
+                        expert_offsets=backend_w4a16_buffers.expert_offsets,
                     )
                 return b12x_moe_fp4(
                     x,
