@@ -9,6 +9,9 @@ import statistics
 import torch
 
 from b12x.attention.nsa_indexer import uses_paged_mqa_schedule_metadata
+from b12x.attention.nsa_indexer.kernel import (
+    run_sparse_nsa_paged_windowed_tiled_logits_kernel,
+)
 from b12x.integration import (
     B12XAttentionWorkspace,
     clear_nsa_indexer_caches,
@@ -97,11 +100,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("logits", "dense-topk", "supertile-topk"),
+        choices=("logits", "dense-topk", "supertile-logits", "supertile-topk"),
         default="supertile-topk",
     )
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument("--supertile-k", type=int, default=32768)
+    parser.add_argument(
+        "--persistent-ctas",
+        type=int,
+        default=0,
+        help="benchmark-only override for paged scorer persistent CTAs",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--eager", action="store_true", help="time eager launches instead of graph replay")
@@ -168,8 +177,17 @@ def main() -> None:
         reserve_paged_indexer_logits=reserve_dense_logits,
         paged_indexer_logits_q_rows=rows if reserve_dense_logits else 0,
         paged_indexer_logits_k_rows=page_table_width * 64 if reserve_dense_logits else 0,
-        paged_indexer_tile_logits_k_rows=supertile_k if bench_mode == "supertile-topk" else 0,
+        paged_indexer_tile_logits_k_rows=(
+            supertile_k if bench_mode in {"supertile-logits", "supertile-topk"} else 0
+        ),
     )
+    if int(args.persistent_ctas) > 0:
+        persistent_ctas = int(args.persistent_ctas)
+
+        def _benchmark_paged_indexer_persistent_ctas() -> int:
+            return persistent_ctas
+
+        workspace.get_paged_indexer_persistent_ctas = _benchmark_paged_indexer_persistent_ctas  # type: ignore[method-assign]
     schedule_out = None
     build_schedule = None
     if bench_mode == "supertile-topk":
@@ -190,7 +208,7 @@ def main() -> None:
     )
 
     clear_nsa_indexer_caches()
-    if bench_mode == "supertile-topk":
+    if bench_mode in {"supertile-logits", "supertile-topk"}:
         workspace.prewarm_paged_indexer_tiled_topk()
         workspace.prewarm_paged_indexer_tiled_scorer(
             index_k_cache=index_k_cache,
@@ -215,6 +233,25 @@ def main() -> None:
                 topk=topk,
                 expected_num_q_heads=num_heads,
                 workspace=workspace,
+            )
+        if bench_mode == "supertile-logits":
+            tile_logits = workspace.get_indexer_extend_tile_logits()
+            if tile_logits is None:
+                raise RuntimeError("supertile-logits requires tiled-logits workspace")
+            return run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                real_page_table=metadata.real_page_table,
+                seqlens_per_query=metadata.cache_seqlens_int32,
+                active_width=workspace.get_paged_indexer_active_width_cap(),
+                tile_logits=tile_logits,
+                source_page_offset=0,
+                output_width_tokens=supertile_k,
+                workspace=workspace,
+                preinitialize_tile_logits=False,
+                contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
+                stage_runtime_metadata=False,
             )
         return paged_mqa_index_decode_supertile_topk_fp8(
             q_fp8=q_fp8,
