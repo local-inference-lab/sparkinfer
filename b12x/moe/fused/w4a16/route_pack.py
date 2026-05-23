@@ -10,6 +10,9 @@ import torch
 _COUNT_BLOCK_T = 256
 _SORT_BLOCK_T = 256
 _POST_PREFIX_BLOCK_T = 256
+_SMALL_PREFIX_MAX_PACKED_ROUTES = 4096
+_SMALL_PREFIX_MAX_ROUTE_BLOCKS = 128
+_SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT = 65536
 
 
 def _next_power_of_2(x: int) -> int:
@@ -81,6 +84,80 @@ def _pack_topk_routes_post_prefix_kernel(
         active = valid_blocks & (block_rows >= start) & (block_rows < end)
         block_experts = tl.where(active, expert, block_experts)
     tl.store(block_expert_ids + offsets, block_experts, mask=valid_blocks)
+
+
+@triton.jit
+def _pack_topk_routes_small_prefix_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    block_expert_ids,
+    packed_route_count,
+    expert_offsets,
+    NUMEL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    MAX_PACKED_ROUTES: tl.constexpr,
+    MAX_ROUTE_BLOCKS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_ROUTE_INIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    experts = tl.arange(0, BLOCK_E)
+    expert_mask = experts < NUM_EXPERTS
+    counts = tl.zeros((BLOCK_E,), dtype=tl.int32)
+
+    route_offsets = tl.arange(0, BLOCK_T)
+    for start in tl.range(0, NUMEL, BLOCK_T):
+        offsets = start + route_offsets
+        raw_ids = tl.load(topk_ids + offsets, mask=offsets < NUMEL, other=-1).to(
+            tl.int32
+        )
+        valid = (offsets < NUMEL) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+        ids = raw_ids
+        if HAS_EXPERT_MAP:
+            safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+            ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+
+        matches = (
+            (experts[:, None] == ids[None, :]) & expert_mask[:, None] & valid[None, :]
+        )
+        counts += tl.sum(matches.to(tl.int32), axis=1)
+
+    padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    padded = tl.where(expert_mask, padded, 0)
+    inclusive = tl.cumsum(padded, axis=0)
+    prefix = inclusive - padded
+    total = tl.sum(padded, axis=0)
+
+    tl.store(expert_offsets + experts, prefix, mask=expert_mask)
+    tl.store(expert_offsets + NUM_EXPERTS, total)
+    tl.store(packed_route_count, total)
+
+    route_init_offsets = tl.arange(0, BLOCK_ROUTE_INIT)
+    tl.store(
+        packed_route_indices + route_init_offsets,
+        NUMEL,
+        mask=route_init_offsets < MAX_PACKED_ROUTES,
+    )
+
+    block_offsets = tl.arange(0, BLOCK_M)
+    block_rows = block_offsets * BLOCK_SIZE
+    active = (
+        (block_offsets[None, :] < MAX_ROUTE_BLOCKS)
+        & expert_mask[:, None]
+        & (block_rows[None, :] >= prefix[:, None])
+        & (block_rows[None, :] < inclusive[:, None])
+    )
+    block_experts = tl.max(tl.where(active, experts[:, None], -1), axis=0)
+    tl.store(
+        block_expert_ids + block_offsets,
+        block_experts,
+        mask=block_offsets < MAX_ROUTE_BLOCKS,
+    )
 
 
 @triton.jit
@@ -208,39 +285,70 @@ def pack_topk_routes_by_expert(
 
     block_e = _next_power_of_2(num_experts)
     sort_grid = (triton.cdiv(numel, _SORT_BLOCK_T),)
-    post_prefix_grid = (
-        max(
-            triton.cdiv(max_packed_routes, _POST_PREFIX_BLOCK_T),
-            triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
-        ),
-    )
     expert_map_tensor = expert_map if expert_map is not None else topk_ids
 
-    _pack_topk_routes_prefix_kernel[(1,)](
-        topk_ids,
-        expert_map_tensor,
-        packed_route_count,
-        expert_offsets,
-        NUMEL=numel,
-        BLOCK_SIZE=int(block_size),
-        NUM_EXPERTS=int(num_experts),
-        HAS_EXPERT_MAP=expert_map is not None,
-        BLOCK_E=block_e,
-        BLOCK_T=_COUNT_BLOCK_T,
-        num_warps=8,
+    block_route_init = _next_power_of_2(max(max_packed_routes, 1))
+    block_m = _next_power_of_2(max(max_route_blocks, 1))
+    use_small_prefix = (
+        block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
+        and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
+        and block_e * block_m <= _SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT
     )
-    _pack_topk_routes_post_prefix_kernel[post_prefix_grid](
-        packed_route_indices,
-        block_expert_ids,
-        expert_offsets,
-        NUMEL=numel,
-        BLOCK_SIZE=int(block_size),
-        NUM_EXPERTS=int(num_experts),
-        MAX_PACKED_ROUTES=max_packed_routes,
-        MAX_ROUTE_BLOCKS=max_route_blocks,
-        BLOCK_T=_POST_PREFIX_BLOCK_T,
-        num_warps=4,
-    )
+    if use_small_prefix:
+        # Decode-sized W4A16 MoE calls are launch-overhead sensitive. Keep the
+        # large-shape split kernel below, but fold prefix/post-prefix work into
+        # one launch when the vector sizes are safely bounded.
+        _pack_topk_routes_small_prefix_kernel[(1,)](
+            topk_ids,
+            expert_map_tensor,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            expert_offsets,
+            NUMEL=numel,
+            BLOCK_SIZE=int(block_size),
+            NUM_EXPERTS=int(num_experts),
+            MAX_PACKED_ROUTES=max_packed_routes,
+            MAX_ROUTE_BLOCKS=max_route_blocks,
+            HAS_EXPERT_MAP=expert_map is not None,
+            BLOCK_E=block_e,
+            BLOCK_T=_COUNT_BLOCK_T,
+            BLOCK_ROUTE_INIT=block_route_init,
+            BLOCK_M=block_m,
+            num_warps=8,
+        )
+    else:
+        post_prefix_grid = (
+            max(
+                triton.cdiv(max_packed_routes, _POST_PREFIX_BLOCK_T),
+                triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
+            ),
+        )
+        _pack_topk_routes_prefix_kernel[(1,)](
+            topk_ids,
+            expert_map_tensor,
+            packed_route_count,
+            expert_offsets,
+            NUMEL=numel,
+            BLOCK_SIZE=int(block_size),
+            NUM_EXPERTS=int(num_experts),
+            HAS_EXPERT_MAP=expert_map is not None,
+            BLOCK_E=block_e,
+            BLOCK_T=_COUNT_BLOCK_T,
+            num_warps=8,
+        )
+        _pack_topk_routes_post_prefix_kernel[post_prefix_grid](
+            packed_route_indices,
+            block_expert_ids,
+            expert_offsets,
+            NUMEL=numel,
+            BLOCK_SIZE=int(block_size),
+            NUM_EXPERTS=int(num_experts),
+            MAX_PACKED_ROUTES=max_packed_routes,
+            MAX_ROUTE_BLOCKS=max_route_blocks,
+            BLOCK_T=_POST_PREFIX_BLOCK_T,
+            num_warps=4,
+        )
     _pack_topk_routes_sort_kernel[sort_grid](
         topk_ids,
         expert_map_tensor,
