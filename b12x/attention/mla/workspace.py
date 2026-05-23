@@ -2532,9 +2532,14 @@ class B12XAttentionWorkspace:
                 f"got q_rows={q_rows_total} and valid_q_rows={valid_q_rows}"
             )
 
-        if q_rows_total > self.max_total_q:
+        q_row_capacity = (
+            max(int(self.max_total_q), int(self.max_paged_q_rows))
+            if not requires_full_logits
+            else int(self.max_total_q)
+        )
+        if q_rows_total > q_row_capacity:
             raise ValueError(
-                f"q rows {q_rows_total} exceed workspace NSA indexer capacity {self.max_total_q}"
+                f"q rows {q_rows_total} exceed workspace NSA indexer capacity {q_row_capacity}"
             )
         if padded_k_rows > self.indexer_k_quant_bytes.shape[0]:
             raise ValueError(
@@ -3064,18 +3069,19 @@ class B12XAttentionWorkspace:
             )
         if self.ragged_kv_cache is not None:
             self._refresh_ragged_kv_contracts()
+        indexer_q_rows = max(int(self.max_total_q), int(self.max_paged_q_rows), 1)
         self._contract_indexer_q_u32 = _shape_only_cuda_tensor(
-            (self.max_total_q, self.indexer_num_q_heads, _INDEX_HEAD_DIM // 4),
+            (indexer_q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM // 4),
             dtype=torch.uint32,
             device=self.device,
         )
         self._contract_indexer_q_bytes = _shape_only_cuda_tensor(
-            (self.max_total_q, self.indexer_num_q_heads, _INDEX_HEAD_DIM),
+            (indexer_q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM),
             dtype=torch.uint8,
             device=self.device,
         )
         self._contract_indexer_weights = _shape_only_cuda_tensor(
-            (self.max_total_q, self.indexer_num_q_heads),
+            (indexer_q_rows, self.indexer_num_q_heads),
             dtype=torch.float32,
             device=self.device,
         )
@@ -3092,12 +3098,12 @@ class B12XAttentionWorkspace:
                 device=self.device,
             )
         self._contract_indexer_k_start = _shape_only_cuda_tensor(
-            (self.max_total_q,),
+            (indexer_q_rows,),
             dtype=torch.int32,
             device=self.device,
         )
         self._contract_indexer_k_end = _shape_only_cuda_tensor(
-            (self.max_total_q,),
+            (indexer_q_rows,),
             dtype=torch.int32,
             device=self.device,
         )

@@ -704,10 +704,16 @@ def paged_mqa_index_decode_supertile_topk_fp8(
                 "shared paged-MQA prefill scorer requires a supertile width "
                 f"that is divisible by {_PAGED_MQA_INDEX_TILE_BLOCK_K}, got {supertile_tokens}"
             )
-        if int(getattr(workspace, "max_total_q", 0)) < q_rows:
+        indexer_q_capacity = max(
+            int(getattr(workspace, "max_total_q", 0)),
+            int(getattr(workspace, "max_paged_q_rows", 0)),
+        )
+        if indexer_q_capacity < q_rows:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires an extend-capable workspace: "
-                f"q_rows={q_rows}, max_total_q={getattr(workspace, 'max_total_q', None)}"
+                "shared paged-MQA prefill scorer requires an indexer-capable workspace: "
+                f"q_rows={q_rows}, indexer_q_capacity={indexer_q_capacity}, "
+                f"max_total_q={getattr(workspace, 'max_total_q', None)}, "
+                f"max_paged_q_rows={getattr(workspace, 'max_paged_q_rows', None)}"
             )
         if int(getattr(workspace, "max_paged_q_rows", 0)) < q_rows:
             raise RuntimeError(
