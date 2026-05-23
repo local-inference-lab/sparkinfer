@@ -67,6 +67,7 @@ def cutlass_to_torch_dtype(cutlass_dtype):
         cutlass.BFloat16: torch.bfloat16,
         cutlass.Float8E5M2: torch.float8_e5m2,
         cutlass.Float8E4M3FN: torch.float8_e4m3fn,
+        cutlass.Float8E8M0FNU: torch.float8_e8m0fnu,
         cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
         cutlass.Float4E2M1FN: torch.float4_e2m1fn_x2,  # FP4 packed (2 values per byte)
     }

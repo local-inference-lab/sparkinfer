@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark: b12x dense_gemm vs FlashInfer-CUTLASS with CUDA graph replay.
 
-Compares block-scaled FP4 dense GEMM performance on the Nemotron 3 Super
-shared-expert down-projection shape `[M, 5376] x [5376, 4096]` across small
-decode-style batch sizes.
+Compares block-scaled FP4 and MXFP8 dense GEMM performance on the Nemotron 3
+Super shared-expert down-projection shape `[M, 5376] x [5376, 4096]` across
+small decode-style batch sizes.
 """
 
 from __future__ import annotations
@@ -21,10 +21,16 @@ import torch
 import torch.nn.functional as F
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
-from b12x.cute.utils import convert_sf_from_mma_layout, get_hardware_info
+from b12x.cute.utils import (
+    convert_sf_from_mma_layout,
+    convert_sf_to_mma_layout,
+    get_hardware_info,
+)
 from b12x.gemm.dense import dense_gemm
 
-from flashinfer.gemm import mm_fp4
+from flashinfer import mxfp8_quantize
+from flashinfer.gemm import mm_fp4, mm_mxfp8
+from flashinfer.tllm_enums import SfLayout
 
 
 # Nemotron 3 Super shared expert down projection from the released NVFP4
@@ -43,9 +49,11 @@ GEMM_SPECS = [
     ),
 ]
 
-BATCH_SIZES = [2, 4, 8]
+FP4_BATCH_SIZES = [2, 4, 8]
+FP8_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 REFERENCE_BACKEND = "cutlass"
-REFERENCE_LABEL = "FlashInfer CUTLASS"
+FP4_REFERENCE_LABEL = "FlashInfer CUTLASS FP4"
+FP8_REFERENCE_LABEL = "FlashInfer CUTLASS MXFP8"
 COSINE_THRESHOLD = 0.999999
 _L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 _AUTO_L2_FLUSH_MULTIPLIER = 2
@@ -193,7 +201,30 @@ def make_quantized_operand(M: int, K: int):
     return packed, scales, global_scale
 
 
-def bench_one(
+def quantize_mxfp8_source(source: torch.Tensor):
+    M, K = source.shape
+    quantized, scale = mxfp8_quantize(
+        input=source,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        sf_swizzle_layout=SfLayout.layout_128x4,
+    )
+    scale_mma = convert_sf_to_mma_layout(
+        scale.view(torch.float8_e8m0fnu),
+        m=M,
+        k=K,
+        num_groups=1,
+        sf_vec_size=32,
+    )
+    return quantized.contiguous(), scale.contiguous(), scale_mma
+
+
+def make_mxfp8_operand(M: int, K: int):
+    source = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / 4).contiguous()
+    return (*quantize_mxfp8_source(source), source)
+
+
+def bench_one_fp4(
     M: int,
     N: int,
     K: int,
@@ -216,7 +247,7 @@ def bench_one(
 
     results = {}
 
-    # b12x
+    # b12x FP4.
     try:
         b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
 
@@ -239,7 +270,7 @@ def bench_one(
         results["b12x"] = None
         print(f"      b12x FAILED: {exc}")
 
-    # FlashInfer CUTLASS reference
+    # FlashInfer CUTLASS FP4 reference.
     try:
         ref_out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 
@@ -252,15 +283,15 @@ def bench_one(
         ref_replay = capture_graph_replay(cutlass_launch)
         results["ref_replay"] = ref_replay
         results["ref_out"] = ref_out
-        results[REFERENCE_LABEL] = bench_events(
+        results[FP4_REFERENCE_LABEL] = bench_events(
             ref_replay,
             warmup=warmup,
             iters=iters,
             l2_flush=l2_flush,
         )
     except Exception as exc:
-        results[REFERENCE_LABEL] = None
-        print(f"      {REFERENCE_LABEL} FAILED: {exc}")
+        results[FP4_REFERENCE_LABEL] = None
+        print(f"      {FP4_REFERENCE_LABEL} FAILED: {exc}")
 
     if check:
         if results.get("b12x_replay") is None or results.get("ref_replay") is None:
@@ -273,7 +304,130 @@ def bench_one(
         check_outputs(
             results["b12x_out"][:, :, 0],
             results["ref_out"],
-            label=REFERENCE_LABEL,
+            label=FP4_REFERENCE_LABEL,
+            cosine_threshold=COSINE_THRESHOLD,
+        )
+
+    return results
+
+
+def bench_one_fp8(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    warmup: int,
+    iters: int,
+    check: bool,
+    l2_flush: Callable[[], None] | None,
+):
+    """Benchmark one MXFP8 (M,N,K) problem with CUDA graph replay timing."""
+    torch.manual_seed(42)
+    a_quantized, a_scale, a_scale_mma, a_source = make_mxfp8_operand(M, K)
+    b_quantized, b_scale, b_scale_mma, _ = make_mxfp8_operand(N, K)
+
+    results = {}
+
+    # b12x MXFP8.
+    try:
+        b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
+
+        def b12x_launch():
+            dense_gemm(
+                (a_quantized.view(M, K, 1), a_scale_mma),
+                (b_quantized.view(N, K, 1), b_scale_mma),
+                ab_dtype="float8_e4m3fn",
+                sf_dtype="float8_e8m0fnu",
+                c_dtype="bfloat16",
+                sf_vec_size=32,
+                out=b12x_out,
+            )
+
+        b12x_replay = capture_graph_replay(b12x_launch)
+        results["b12x_replay"] = b12x_replay
+        results["b12x_out"] = b12x_out
+        results["b12x"] = bench_events(
+            b12x_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
+    except Exception as exc:
+        results["b12x"] = None
+        print(f"      b12x FAILED: {exc}")
+
+    # FlashInfer CUTLASS MXFP8 reference. FlashInfer currently rejects the
+    # direct M=1 SM120 MXFP8 case, so keep it out of timed comparisons for that
+    # shape. A padded M=2 launch still gives a graph-safe GPU correctness
+    # reference for the first row without benchmarking a fake M=1 FlashInfer
+    # path.
+    if M == 1:
+        try:
+            ref_out_padded = torch.empty((2, N), device="cuda", dtype=torch.bfloat16)
+            a_source_padded = torch.cat([a_source, torch.zeros_like(a_source)], dim=0)
+            a_quantized_padded, a_scale_padded, _ = quantize_mxfp8_source(
+                a_source_padded.contiguous()
+            )
+
+            def cutlass_launch():
+                mm_mxfp8(
+                    a_quantized_padded,
+                    b_quantized.t(),
+                    a_scale_padded,
+                    b_scale,
+                    out=ref_out_padded,
+                    out_dtype=torch.bfloat16,
+                    backend=REFERENCE_BACKEND,
+                )
+
+            ref_replay = capture_graph_replay(cutlass_launch)
+            results["ref_replay"] = ref_replay
+            results["ref_out"] = ref_out_padded[:1]
+            results[FP8_REFERENCE_LABEL] = None
+            print(f"      {FP8_REFERENCE_LABEL} skipped for direct M=1")
+        except Exception as exc:
+            results[FP8_REFERENCE_LABEL] = None
+            print(f"      padded {FP8_REFERENCE_LABEL} correctness reference FAILED: {exc}")
+    else:
+        try:
+            ref_out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+
+            def cutlass_launch():
+                mm_mxfp8(
+                    a_quantized,
+                    b_quantized.t(),
+                    a_scale,
+                    b_scale,
+                    out=ref_out,
+                    out_dtype=torch.bfloat16,
+                    backend=REFERENCE_BACKEND,
+                )
+
+            ref_replay = capture_graph_replay(cutlass_launch)
+            results["ref_replay"] = ref_replay
+            results["ref_out"] = ref_out
+            results[FP8_REFERENCE_LABEL] = bench_events(
+                ref_replay,
+                warmup=warmup,
+                iters=iters,
+                l2_flush=l2_flush,
+            )
+        except Exception as exc:
+            results[FP8_REFERENCE_LABEL] = None
+            print(f"      {FP8_REFERENCE_LABEL} FAILED: {exc}")
+
+    if check:
+        if results.get("b12x_replay") is None or results.get("ref_replay") is None:
+            raise BenchmarkAbort(
+                "correctness check requires both b12x and reference replays"
+            )
+        results["b12x_replay"]()
+        results["ref_replay"]()
+        torch.cuda.synchronize()
+        check_outputs(
+            results["b12x_out"][:, :, 0],
+            results["ref_out"],
+            label=FP8_REFERENCE_LABEL,
             cosine_threshold=COSINE_THRESHOLD,
         )
 
@@ -284,7 +438,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=BATCH_SIZES)
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "M values to benchmark. Defaults to 2/4/8 for FP4 and "
+            "1/2/4/8/16/32/64/128/256 for FP8."
+        ),
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("fp4", "fp8", "all"),
+        default="fp4",
+        help="Benchmark the existing NVFP4 path, the MXFP8 path, or both.",
+    )
     parser.add_argument(
         "--flush-l2",
         action=argparse.BooleanOptionalAction,
@@ -319,7 +488,24 @@ def main():
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
-    print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")
+    if args.dtype == "all":
+        benchmark_modes = (
+            ("fp4", FP4_REFERENCE_LABEL, bench_one_fp4),
+            ("fp8", FP8_REFERENCE_LABEL, bench_one_fp8),
+        )
+    elif args.dtype == "fp4":
+        benchmark_modes = (("fp4", FP4_REFERENCE_LABEL, bench_one_fp4),)
+    else:
+        benchmark_modes = (("fp8", FP8_REFERENCE_LABEL, bench_one_fp8),)
+    if args.batch_sizes is not None:
+        batch_sizes = args.batch_sizes
+    elif args.dtype == "fp4":
+        batch_sizes = FP4_BATCH_SIZES
+    else:
+        batch_sizes = FP8_BATCH_SIZES
+
+    mode_desc = ", ".join(mode.upper() for mode, _, _ in benchmark_modes)
+    print(f"Dense GEMM ({mode_desc}): b12x vs FlashInfer CUTLASS")
     print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     print("Timing mode: CUDA graph replay")
     if args.flush_l2:
@@ -331,77 +517,92 @@ def main():
     else:
         print("Correctness check: off")
     print(f"warmup={args.warmup}, iters={args.iters}")
+    print(f"M values: {batch_sizes}")
     print()
 
     # Collect all results for summary
-    all_results = []  # (name, bs, M, N, K, b12x_med, ref_med)
+    all_results = []  # (mode, name, bs, M, N, K, b12x_med, ref_med)
 
-    for name, K, N, note in GEMM_SPECS:
+    for mode, reference_label, bench_fn in benchmark_modes:
         print(f"{'=' * 75}")
-        print(f"  {name}  K={K} N={N}  [{note}]")
+        print(f"  {mode.upper()} dense GEMM vs {reference_label}")
         print(f"{'=' * 75}")
 
-        for bs in args.batch_sizes:
-            M = bs
-            try:
-                results = bench_one(
-                    M,
-                    N,
-                    K,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    check=args.check,
-                    l2_flush=l2_flush,
+        for name, K, N, note in GEMM_SPECS:
+            print(f"  {name}  K={K} N={N}  [{note}]")
+
+            for bs in batch_sizes:
+                M = bs
+                try:
+                    results = bench_fn(
+                        M,
+                        N,
+                        K,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        check=args.check,
+                        l2_flush=l2_flush,
+                    )
+                except BenchmarkAbort as exc:
+                    print(
+                        f"ERROR: benchmark aborted for {mode} {name} "
+                        f"(bs={bs}, M={M}, N={N}, K={K}): {exc}",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
+
+                b12x_med = (
+                    statistics.median(results["b12x"]) * 1000
+                    if results.get("b12x")
+                    else None
                 )
-            except BenchmarkAbort as exc:
-                print(
-                    f"ERROR: benchmark aborted for {name} "
-                    f"(bs={bs}, M={M}, N={N}, K={K}): {exc}",
-                    file=sys.stderr,
+                ref_med = (
+                    statistics.median(results[reference_label]) * 1000
+                    if results.get(reference_label)
+                    else None
                 )
-                raise SystemExit(1)
 
-            b12x_med = statistics.median(results["b12x"]) * 1000 if results.get("b12x") else None
-            ref_med = statistics.median(results[REFERENCE_LABEL]) * 1000 if results.get(REFERENCE_LABEL) else None
+                parts = [f"  {mode:<3} bs={bs:<3} (M={M:>2})"]
+                if b12x_med is not None:
+                    parts.append(f"b12x={b12x_med:6.1f}")
+                if ref_med is not None:
+                    parts.append(f"FlashInfer={ref_med:6.1f}")
 
-            parts = [f"  bs={bs:<3} (M={M:>2})"]
-            if b12x_med is not None:
-                parts.append(f"b12x={b12x_med:6.1f}")
-            if ref_med is not None:
-                parts.append(f"CUTLASS={ref_med:6.1f}")
+                ratios = []
+                if b12x_med and ref_med:
+                    r = b12x_med / ref_med
+                    ratios.append(f"b12x/flashinfer-cutlass={r:.2f}x")
 
-            ratios = []
-            if b12x_med and ref_med:
-                r = b12x_med / ref_med
-                ratios.append(f"b12x/flashinfer-cutlass={r:.2f}x")
+                print("  ".join(parts) + "  " + "  ".join(ratios) + "  (graph us)")
 
-            print("  ".join(parts) + "  " + "  ".join(ratios) + "  (graph us)")
+                all_results.append((mode, name, bs, M, N, K, b12x_med, ref_med))
 
-            all_results.append((name, bs, M, N, K, b12x_med, ref_med))
+            print()
 
         print()
 
     print(f"\n{'=' * 75}")
-    print(f"  SUMMARY: b12x / {REFERENCE_LABEL} (CUDA graph replay, lower = b12x faster)")
+    print("  SUMMARY: b12x / FlashInfer CUTLASS (CUDA graph replay, lower = b12x faster)")
     print(f"{'=' * 75}")
-    header = f"  {'GEMM':<30}"
-    for bs in args.batch_sizes:
+    header = f"  {'MODE':<5} {'GEMM':<30}"
+    for bs in batch_sizes:
         header += f"  M={bs:<5}"
     print(header)
     print("  " + "-" * 70)
 
     ref_ratios = []
-    for name, K, N, note in GEMM_SPECS:
-        row = f"  {name:<30}"
-        for bs in args.batch_sizes:
-            match = [r for r in all_results if r[0] == name and r[1] == bs]
-            if match and match[0][5] and match[0][6]:
-                ratio = match[0][5] / match[0][6]
-                row += f"  {ratio:.2f}x "
-                ref_ratios.append(ratio)
-            else:
-                row += f"  {'n/a':>6}"
-        print(row)
+    for mode, _, _ in benchmark_modes:
+        for name, K, N, note in GEMM_SPECS:
+            row = f"  {mode:<5} {name:<30}"
+            for bs in batch_sizes:
+                match = [r for r in all_results if r[0] == mode and r[1] == name and r[2] == bs]
+                if match and match[0][6] and match[0][7]:
+                    ratio = match[0][6] / match[0][7]
+                    row += f"  {ratio:.2f}x "
+                    ref_ratios.append(ratio)
+                else:
+                    row += f"  {'n/a':>6}"
+            print(row)
 
     if ref_ratios:
         geo = 1.0
