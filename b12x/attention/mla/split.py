@@ -55,6 +55,19 @@ from .kernel import (
 from .traits import SparseMLATraits, select_sparse_mla_traits
 
 
+def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
+    if cache.dtype == torch.uint8:
+        byte_cache = cache
+    elif cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        byte_cache = cache.detach().view(torch.uint8)
+    else:
+        raise TypeError(f"{name} must have dtype torch.uint8 or FP8 byte view, got {cache.dtype}")
+
+    if byte_cache.ndim != 2 or not byte_cache.is_contiguous():
+        raise ValueError(f"{name} must be contiguous with shape [pages, page_nbytes]")
+    return byte_cache
+
+
 def get_sparse_mla_split_shared_storage_cls():
     """SharedStorage for split kernel: no kv_stage_b (single-tile path only)."""
     class SharedStorage:
@@ -970,10 +983,8 @@ def run_compressed_mla_split_decode_forward(
     for name, cache in (("swa_k_cache", swa_k_cache), ("indexed_k_cache", indexed_k_cache)):
         if cache.device != q_all.device:
             raise ValueError(f"{name} must be on the same device as q_all")
-        if cache.dtype != torch.uint8:
-            raise TypeError(f"{name} must have dtype torch.uint8, got {cache.dtype}")
-        if cache.ndim != 2 or not cache.is_contiguous():
-            raise ValueError(f"{name} must be contiguous with shape [pages, page_nbytes]")
+    swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
+    indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
     rows = int(q_all.shape[0])
     for name, tensor in (
         ("swa_indices", swa_indices),

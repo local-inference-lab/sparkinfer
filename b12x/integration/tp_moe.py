@@ -52,6 +52,10 @@ _FP4_SOURCE_FORMATS = {
     "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
 }
+_W13_LAYOUTS = {
+    "w13": "w13",
+    "w31": "w31",
+}
 
 
 @dataclass(kw_only=True)
@@ -215,6 +219,7 @@ class B12XFP4ExpertWeights:
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
     source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -222,6 +227,7 @@ class B12XFP4ExpertWeights:
             "source_format",
             _normalize_fp4_source_format(self.source_format),
         )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -229,6 +235,7 @@ class B12XPreparedFP4MoEWeights:
     """Derived FP4 MoE weight representations prepared from a source contract."""
 
     source_format: str
+    w13_layout: str = "w13"
     w1_runtime_alphas: torch.Tensor | None = None
     w2_runtime_alphas: torch.Tensor | None = None
     w4a16: Any | None = None
@@ -239,6 +246,7 @@ class B12XPreparedFP4MoEWeights:
             "source_format",
             _normalize_fp4_source_format(self.source_format),
         )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -336,8 +344,8 @@ class _WeightViews:
     down: torch.Tensor  # [k, n//2, E] uint8 (permuted view, no copy)
     w13_sf: torch.Tensor  # 6D MMA view for concatenated w13 scale factors
     down_sf: torch.Tensor  # [E, down_sf_rows, sf_cols] uint8 (view)
-    w1_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
-    w2_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
+    w1_alpha: torch.Tensor  # [E] float32 contiguous tensor
+    w2_alpha: torch.Tensor  # [E] float32 contiguous tensor
     w1_storage: torch.Tensor  # original [E, w1_n, k//2] tensor for direct micro
     w1_scale_storage: torch.Tensor
     w2_storage: torch.Tensor  # original [E, k, n//2] tensor for direct micro
@@ -431,6 +439,16 @@ def _normalize_fp4_source_format(source_format: str) -> str:
         ) from exc
 
 
+def _normalize_w13_layout(w13_layout: str) -> str:
+    try:
+        return _W13_LAYOUTS[w13_layout.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "w13_layout must be one of 'w13' or 'w31', "
+            f"got {w13_layout!r}"
+        ) from exc
+
+
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
@@ -487,10 +505,6 @@ _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
-_PLAIN_PARAM_CACHE: Dict[
-    Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
-    torch.Tensor,
-] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
@@ -553,7 +567,6 @@ def clear_tp_moe_caches() -> None:
     _MAC_CACHE.clear()
     _MICRO_DIRECT_LAUNCH_CAP_CACHE.clear()
     _EXACT_RELU2_BS1_NEMOTRON_CACHE.clear()
-    _PLAIN_PARAM_CACHE.clear()
     _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     _DYNAMIC_MULTICTA_CACHE = None
@@ -696,14 +709,12 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     with record_function("tp_moe.prepare_expert_scale"):
         if scale.numel() == 1:
             with record_function("tp_moe.prepare_expert_scale.expand_scalar"):
-                return _get_plain_cuda_tensor(
-                    scale.expand(weight_E), dtype=torch.float32
-                )
+                return scale.reshape(()).expand(weight_E).to(torch.float32).contiguous()
         if scale.numel() != weight_E:
             raise ValueError(
                 f"expected expert scale with {weight_E} elements, got {scale.numel()}"
             )
-        return _get_plain_cuda_tensor(scale, dtype=torch.float32)
+        return scale.reshape(weight_E).to(torch.float32).contiguous()
 
 
 def _prepare_expert_scale_vector(
@@ -726,29 +737,6 @@ def _prepare_expert_scale_vector(
                 f"expected {name} with {weight_E} elements, got {scale.numel()}"
             )
         return scale.reshape(weight_E).to(torch.float32).contiguous()
-
-
-def _get_plain_cuda_tensor(
-    t: torch.Tensor, *, dtype: torch.dtype | None = None
-) -> torch.Tensor:
-    with record_function("tp_moe.get_plain_cuda_tensor"):
-        target_dtype = t.dtype if dtype is None else dtype
-        key = (
-            t.data_ptr(),
-            tuple(t.shape),
-            tuple(t.stride()),
-            t.dtype,
-            target_dtype,
-            _tensor_version(t),
-        )
-        cached = _PLAIN_PARAM_CACHE.get(key)
-        if cached is not None:
-            return cached
-        plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
-        with record_function("tp_moe.get_plain_cuda_tensor.copy"):
-            plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
-        _PLAIN_PARAM_CACHE[key] = plain
-        return plain
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
@@ -1531,6 +1519,8 @@ def _get_weight_views(
     bs_u8 = w1_blockscale.view(torch.uint8)
     w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
     down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
+    if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
+        raise ValueError("w1_alphas and w2_alphas must be contiguous")
 
     sf_dtype = cutlass.Float8E4M3FN
     views = _WeightViews(
@@ -1538,8 +1528,8 @@ def _get_weight_views(
         down=down,
         w13_sf=w13_sf,
         down_sf=down_sf,
-        w1_alpha=_get_plain_cuda_tensor(w1_alphas),
-        w2_alpha=_get_plain_cuda_tensor(w2_alphas),
+        w1_alpha=w1_alphas,
+        w2_alpha=w2_alphas,
         w1_storage=w1_fp4,
         w1_scale_storage=w1_blockscale,
         w2_storage=w2_fp4,
@@ -1573,15 +1563,15 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import (
-        prepare_w4a16_compressed_tensors_weights,
-        prepare_w4a16_modelopt_nvfp4_weights,
-        prepare_w4a16_mxfp4_native_weights,
+        prepare_w4a16_packed_weights,
     )
 
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -1592,20 +1582,13 @@ def _get_w4a16_packed_weights(
         activation,
         params_dtype,
         source_format,
+        w13_layout,
         reuse_input_storage,
     )
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    if source_format == "modelopt_nvfp4":
-        prepare_weights = prepare_w4a16_modelopt_nvfp4_weights
-    elif source_format == "compressed_tensors":
-        prepare_weights = prepare_w4a16_compressed_tensors_weights
-    elif source_format == "mxfp4_native":
-        prepare_weights = prepare_w4a16_mxfp4_native_weights
-    else:
-        raise AssertionError(f"unhandled W4A16 source_format {source_format!r}")
-    prepared = prepare_weights(
+    prepared = prepare_w4a16_packed_weights(
         w1_fp4,
         w1_blockscale,
         w1_alphas,
@@ -1614,6 +1597,8 @@ def _get_w4a16_packed_weights(
         w2_alphas,
         activation=activation,
         params_dtype=params_dtype,
+        source_format=source_format,
+        w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
@@ -1660,6 +1645,7 @@ def _prepare_modelopt_nvfp4_runtime_alphas(
 def prepare_b12x_fp4_moe_weights(
     *,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     w1_global_scale: torch.Tensor,
     w2_global_scale: torch.Tensor,
     a1_gscale: torch.Tensor | None = None,
@@ -1676,6 +1662,7 @@ def prepare_b12x_fp4_moe_weights(
 ) -> B12XPreparedFP4MoEWeights:
     """Prepare B12X FP4 MoE runtime representations from a source contract."""
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     if not prepare_runtime_alphas and not prepare_w4a16:
         raise ValueError(
             "prepare_b12x_fp4_moe_weights requires at least one requested "
@@ -1734,11 +1721,13 @@ def prepare_b12x_fp4_moe_weights(
             activation=activation,
             params_dtype=params_dtype,
             source_format=source_format,
+            w13_layout=w13_layout,
             reuse_input_storage=reuse_input_storage,
         )
 
     return B12XPreparedFP4MoEWeights(
         source_format=source_format,
+        w13_layout=w13_layout,
         w1_runtime_alphas=w1_runtime_alphas,
         w2_runtime_alphas=w2_runtime_alphas,
         w4a16=w4a16,
@@ -4151,6 +4140,7 @@ def b12x_moe_fp4(
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
@@ -4164,6 +4154,7 @@ def b12x_moe_fp4(
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -4247,6 +4238,7 @@ def b12x_moe_fp4(
                 activation=activation,
                 params_dtype=a.dtype,
                 source_format=source_format,
+                w13_layout=w13_layout,
             )
         weight_layout = getattr(prepared, "weight_layout", "packed")
         plan = _make_workspace_plan(
@@ -5083,6 +5075,7 @@ def b12x_sparse_moe_fp4(
         activation=activation,
         quant_mode=quant_mode_arg,
         source_format=experts.source_format,
+        w13_layout=experts.w13_layout,
     )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)

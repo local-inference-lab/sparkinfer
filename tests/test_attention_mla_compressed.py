@@ -47,6 +47,7 @@ def _make_workspace(
     head_dim: int = _COMPRESSED_HEAD_DIM,
     v_head_dim: int = _COMPRESSED_HEAD_DIM,
     max_chunks_per_row: int = 64,
+    max_page_table_width: int | None = None,
 ) -> B12XAttentionWorkspace:
     return B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
@@ -57,11 +58,13 @@ def _make_workspace(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         topk=topk,
+        max_page_table_width=max_page_table_width,
         max_total_q=rows,
         max_batch=rows,
         max_kv_rows=max_kv_rows,
         use_cuda_graph=use_cuda_graph,
         max_chunks_per_row=max_chunks_per_row,
+        reserve_compressed_mla_staging=True,
     )
 
 
@@ -149,6 +152,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
         max_chunks_per_row=max_chunks_per_row,
         reserve_extend_indexer_logits=False,
         reserve_paged_indexer_logits=True,
+        reserve_compressed_mla_staging=True,
         reserve_mhc=True,
         mhc_max_tokens=4096,
         mhc_hidden_size=4096,
@@ -175,8 +179,10 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
     assert max_chunks_per_row == 240
     assert layout.ragged_kv_nbytes <= 1024
     assert layout.output_buffer_nbytes == 0
+    assert layout.compressed_q_stage_nbytes > 0
+    assert layout.compressed_index_stage_nbytes > 0
     assert legacy_ragged > capped * 3
-    assert capped < int(1.5 * (1 << 30))
+    assert capped < int(2.25 * (1 << 30))
 
 
 def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
@@ -213,6 +219,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     contract_width = 2304
     live_rows = 1
     live_width = 512
+    page_table_width = 4097
     max_chunks_per_row = compressed_mla_split_chunks_for_contract(
         rows=live_rows,
         width=contract_width,
@@ -224,6 +231,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         max_kv_rows=1,
         use_cuda_graph=True,
         max_chunks_per_row=max_chunks_per_row,
+        max_page_table_width=page_table_width,
     )
 
     q = _make_q(rows=live_rows, seed=121, device=device)
@@ -234,14 +242,35 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     )
     swa_indices = torch.zeros((live_rows, live_width), dtype=torch.int32, device=device)
     swa_lengths = torch.zeros((live_rows,), dtype=torch.int32, device=device)
+    indexed_cache = torch.empty(
+        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_C4_PAGE_SIZE)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    indexed_indices = torch.full((live_rows, live_width), -1, dtype=torch.int32, device=device)
+    indexed_lengths = torch.zeros((live_rows,), dtype=torch.int32, device=device)
+    indexed_page_table = torch.full(
+        (live_rows, page_table_width),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
 
     calls: dict[str, int | bool] = {}
 
     def fake_forward(**kwargs) -> None:
         calls["launch_num_chunks"] = int(kwargs["launch_num_chunks"])
         calls["direct_output"] = bool(kwargs["direct_output"])
+        calls["swa_cache_is_u8"] = kwargs["swa_k_cache"].dtype == torch.uint8
+        assert kwargs["q_all"].shape[0] == contract_rows
+        assert kwargs["swa_indices"].shape[0] == contract_rows
+        assert kwargs["swa_lengths"].shape == (contract_rows,)
+        assert kwargs["indexed_indices"].shape == (contract_rows, live_width)
+        assert kwargs["indexed_lengths"].shape == (contract_rows,)
+        assert kwargs["indexed_page_table"].shape == (contract_rows, page_table_width)
 
     def fake_merge(**kwargs) -> None:
+        assert kwargs["output"].shape[0] == contract_rows
         kwargs["output"].zero_()
         calls["merge"] = True
 
@@ -256,11 +285,16 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         fake_merge,
     )
 
-    compressed_api_impl.compressed_mla_decode_forward(
+    actual = compressed_api_impl.compressed_mla_decode_forward(
         q_all=q,
-        swa_k_cache=swa_cache,
+        swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
         swa_indices=swa_indices,
         swa_topk_lengths=swa_lengths,
+        indexed_k_cache=indexed_cache,
+        indexed_indices=indexed_indices,
+        indexed_topk_lengths=indexed_lengths,
+        indexed_page_table=indexed_page_table,
+        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
         workspace=workspace,
         sm_scale=_SM_SCALE,
     )
@@ -269,7 +303,9 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     assert workspace.num_chunks_value == 3
     assert calls["launch_num_chunks"] == max_chunks_per_row
     assert calls["direct_output"] is False
+    assert calls["swa_cache_is_u8"] is True
     assert calls["merge"] is True
+    assert actual.shape == (live_rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM)
 
 
 @torch.inference_mode()
@@ -278,8 +314,10 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=21, device=device)
-    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=22, device=device)
-    indexed_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=23, device=device)
+    swa_cache_bytes = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=22, device=device)
+    indexed_cache_bytes = _make_cache(tokens=32, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=23, device=device)
+    swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
+    indexed_cache = indexed_cache_bytes.view(torch.float8_e4m3fn)
     swa_indices = torch.arange(16, dtype=torch.int32, device=device).unsqueeze(0)
     indexed_indices = torch.arange(16, dtype=torch.int32, device=device).unsqueeze(0)
     swa_lengths = torch.tensor([11], dtype=torch.int32, device=device)
@@ -325,10 +363,10 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
     expected = compressed_sparse_mla_reference(
         q,
-        swa_cache,
+        swa_cache_bytes,
         swa_indices,
         swa_lengths,
-        extra_k_cache=indexed_cache,
+        extra_k_cache=indexed_cache_bytes,
         extra_indices=indexed_indices,
         extra_topk_lengths=indexed_lengths,
         extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,

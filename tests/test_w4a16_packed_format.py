@@ -5,6 +5,10 @@ import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
 from b12x.integration.tp_moe import prepare_b12x_fp4_moe_weights
+from b12x.moe.fused.w4a16.host import (
+    reorder_w13_to_gate_up,
+    unswizzle_expert_scales,
+)
 from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_compressed_tensors_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
@@ -17,7 +21,10 @@ def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 1.75 + 0.03125).to(torch.float8_e4m3fn)
 
 
-def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_fuses_input_scales() -> None:
+@pytest.mark.parametrize("w13_layout", ["w13", "w31"])
+def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_accepts_w13_layout(
+    w13_layout: str,
+) -> None:
     w1_global_scale = torch.tensor([[2.0], [4.0]], dtype=torch.float32)
     w2_global_scale = torch.tensor([3.0, 5.0], dtype=torch.float32)
     a1_gscale = torch.tensor([0.5, 0.25], dtype=torch.float32)
@@ -25,6 +32,7 @@ def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_fuses_input_scales() ->
 
     prepared = prepare_b12x_fp4_moe_weights(
         source_format="modelopt_nvfp4",
+        w13_layout=w13_layout,
         w1_global_scale=w1_global_scale,
         a1_gscale=a1_gscale,
         w2_global_scale=w2_global_scale,
@@ -38,8 +46,29 @@ def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_fuses_input_scales() ->
     w2_runtime = prepared.w2_runtime_alphas
     assert w1_runtime.shape == (2,)
     assert w2_runtime.shape == (2,)
+    assert prepared.w13_layout == w13_layout
     torch.testing.assert_close(w1_runtime, torch.tensor([4.0, 16.0]))
     torch.testing.assert_close(w2_runtime, torch.tensor([9.0, 25.0]))
+
+
+def _reorder_swizzled_w13_to_gate_up(
+    w13: torch.Tensor,
+    w13_blockscale: torch.Tensor,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    w13_scale = unswizzle_expert_scales(
+        w13_blockscale,
+        rows=intermediate_size * 2,
+        cols=hidden_size,
+    )
+    w13_reordered, w13_scale_reordered = reorder_w13_to_gate_up(
+        w13,
+        w13_scale,
+        intermediate_size=intermediate_size,
+    )
+    return w13_reordered, swizzle_block_scale(w13_scale_reordered)
 
 
 def _make_case(
@@ -166,6 +195,68 @@ def test_modelopt_nvfp4_preparation_packs_runtime_weights(
     assert actual.w2.shape != w2.shape
     assert actual.w13_scale.dtype == torch.float8_e4m3fn
     assert actual.w2_scale.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("reuse_input_storage", [False, True])
+def test_modelopt_nvfp4_w31_layout_skips_second_gated_w13_reorder(
+    reuse_input_storage: bool,
+) -> None:
+    torch.manual_seed(20260524)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+    )
+    w13_w31, w13_w31_blockscale = _reorder_swizzled_w13_to_gate_up(
+        w13,
+        w13_blockscale,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+    )
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+
+    expected = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+    )
+    actual = prepare_w4a16_weights(
+        w13_w31,
+        w13_w31_blockscale,
+        w13_global_scale,
+        w2.clone() if reuse_input_storage else w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+        w13_layout="w31",
+        reuse_input_storage=reuse_input_storage,
+    )
+
+    assert actual.source_format == "modelopt_nvfp4"
+    assert actual.w13_layout == "w31"
+    if reuse_input_storage:
+        assert actual.w13.data_ptr() == w13_w31.data_ptr()
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

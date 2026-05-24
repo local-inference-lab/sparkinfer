@@ -19,6 +19,7 @@ from .compressed_reference import (
 )
 from .split import (
     SparseMLASplitDecodeConfig,
+    _compressed_mla_cache_byte_view,
     run_compressed_mla_split_decode_forward,
     run_sparse_mla_split_decode_merge,
 )
@@ -118,6 +119,8 @@ def compressed_mla_decode_forward(
 
     q3 = _normalize_compressed_q(q_all)
     rows, heads, _ = q3.shape
+    live_rows = rows
+    swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     if expected_num_q_heads is not None and heads != int(expected_num_q_heads):
         raise ValueError(
             f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
@@ -145,6 +148,7 @@ def compressed_mla_decode_forward(
             raise ValueError("indexed_k_cache, indexed_indices, and indexed_topk_lengths must be provided together")
         if indexed_page_size is None:
             raise ValueError("indexed_page_size is required when indexed_k_cache is provided")
+        indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
         indexed_indices_2d = _normalize_index_matrix(indexed_indices, name="indexed_indices")
         if indexed_indices_2d.shape[0] != rows:
             raise ValueError("indexed_indices row count must match q_all")
@@ -238,6 +242,37 @@ def compressed_mla_decode_forward(
         q_all=q3,
         v_head_dim=COMPRESSED_MLA_HEAD_DIM,
     )
+    q_kernel = q3
+    swa_indices_kernel = swa_indices_2d
+    swa_lengths_kernel = swa_topk_lengths
+    indexed_indices_kernel = indexed_indices_for_kernel
+    indexed_lengths_kernel = indexed_lengths_for_kernel
+    indexed_page_table_kernel = indexed_page_table_for_kernel
+    output_kernel = output
+    if graph_stable_split:
+        (
+            q_kernel,
+            swa_indices_kernel,
+            swa_lengths_kernel,
+            indexed_indices_kernel,
+            indexed_lengths_kernel,
+            indexed_page_table_kernel,
+        ) = _stage_fixed_compressed_mla_inputs(
+            workspace=workspace,
+            q_all=q3,
+            swa_indices=swa_indices_2d,
+            swa_lengths=swa_topk_lengths,
+            indexed_indices=indexed_indices_for_kernel,
+            indexed_lengths=indexed_lengths_for_kernel,
+            indexed_page_table=indexed_page_table_for_kernel,
+        )
+        if workspace.output_buffer is None:
+            raise RuntimeError("fixed compressed MLA workspace is missing output buffer")
+        output_kernel = workspace.output_buffer[
+            : workspace.max_total_q,
+            :heads,
+            :COMPRESSED_MLA_HEAD_DIM,
+        ]
     fused_sink_output = attn_sink is not None and not return_lse
     needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
     direct_single_chunk_output = (
@@ -251,18 +286,18 @@ def compressed_mla_decode_forward(
         sm_scale=sm_scale,
     )
     run_compressed_mla_split_decode_forward(
-        q_all=q3,
+        q_all=q_kernel,
         swa_k_cache=swa_k_cache,
-        swa_indices=swa_indices_2d,
-        swa_lengths=swa_topk_lengths,
+        swa_indices=swa_indices_kernel,
+        swa_lengths=swa_lengths_kernel,
         indexed_k_cache=indexed_k_cache_for_kernel,
-        indexed_indices=indexed_indices_for_kernel,
-        indexed_lengths=indexed_lengths_for_kernel,
-        indexed_page_table=indexed_page_table_for_kernel,
+        indexed_indices=indexed_indices_kernel,
+        indexed_lengths=indexed_lengths_kernel,
+        indexed_page_table=indexed_page_table_kernel,
         sm_scale=sm_scale_tensor,
         kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
         num_chunks_ptr=workspace.num_chunks_ptr,
-        tmp_output=output if direct_single_chunk_output else workspace.tmp_output,
+        tmp_output=output_kernel if direct_single_chunk_output else workspace.tmp_output,
         tmp_lse=workspace.tmp_lse,
         launch_num_chunks=1 if direct_single_chunk_output else launch_num_chunks,
         swa_page_size=int(swa_page_size),
@@ -279,13 +314,20 @@ def compressed_mla_decode_forward(
     if direct_single_chunk_output:
         pass
     elif split_cfg.num_chunks == 1 and attn_sink is None:
-        output.copy_(workspace.tmp_output[:rows, :heads, 0, :COMPRESSED_MLA_HEAD_DIM])
+        output_kernel.copy_(
+            workspace.tmp_output[
+                : int(q_kernel.shape[0]),
+                :heads,
+                0,
+                :COMPRESSED_MLA_HEAD_DIM,
+            ]
+        )
     else:
         run_sparse_mla_split_decode_merge(
             tmp_output=workspace.tmp_output,
             tmp_lse=workspace.tmp_lse,
             num_chunks_ptr=workspace.num_chunks_ptr,
-            output=output,
+            output=output_kernel,
             attn_sink=attn_sink if fused_sink_output else None,
             workspace=workspace,
         )
@@ -294,7 +336,7 @@ def compressed_mla_decode_forward(
 
     lse_natural = _final_lse_from_split_workspace(
         workspace=workspace,
-        q_rows=rows,
+        q_rows=live_rows,
         num_heads=heads,
         launch_num_chunks=int(launch_num_chunks),
         scale="natural",
@@ -302,7 +344,7 @@ def compressed_mla_decode_forward(
     if attn_sink is not None:
         sink = attn_sink.float().view(1, heads)
         lse_with_sink = torch.logaddexp(lse_natural.float(), sink)
-        scale = torch.exp(lse_natural.float() - lse_with_sink).view(rows, heads, 1)
+        scale = torch.exp(lse_natural.float() - lse_with_sink).view(live_rows, heads, 1)
         output = (output.float() * scale).to(output.dtype)
         lse_natural = lse_with_sink
 
@@ -312,6 +354,106 @@ def compressed_mla_decode_forward(
         lse_natural.div_(_LN2)
         return output, lse_natural
     return output, lse_natural
+
+
+def _stage_fixed_compressed_mla_inputs(
+    *,
+    workspace: B12XAttentionWorkspace,
+    q_all: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_indices: torch.Tensor,
+    indexed_lengths: torch.Tensor,
+    indexed_page_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_stage = workspace.compressed_mla_q_stage
+    swa_indices_stage = workspace.compressed_mla_swa_indices_stage
+    swa_lengths_stage = workspace.compressed_mla_swa_lengths_stage
+    indexed_indices_stage = workspace.compressed_mla_indexed_indices_stage
+    indexed_lengths_stage = workspace.compressed_mla_indexed_lengths_stage
+    indexed_page_table_stage = workspace.compressed_mla_indexed_page_table_stage
+    if (
+        q_stage is None
+        or swa_indices_stage is None
+        or swa_lengths_stage is None
+        or indexed_indices_stage is None
+        or indexed_lengths_stage is None
+        or indexed_page_table_stage is None
+    ):
+        raise RuntimeError(
+            "fixed compressed MLA workspace is missing capacity staging buffers; "
+            "set reserve_compressed_mla_staging=True when building the attention arena"
+        )
+
+    rows = int(q_all.shape[0])
+    cap_rows = int(workspace.max_total_q)
+    if rows > cap_rows:
+        raise ValueError(f"q rows {rows} exceed fixed compressed MLA staging capacity {cap_rows}")
+    if q_stage.shape != (cap_rows, int(workspace.num_q_heads), COMPRESSED_MLA_HEAD_DIM):
+        raise ValueError(
+            "compressed MLA q staging buffer shape mismatch: "
+            f"got {tuple(q_stage.shape)}, expected "
+            f"({cap_rows}, {int(workspace.num_q_heads)}, {COMPRESSED_MLA_HEAD_DIM})"
+        )
+    q_stage[:rows].copy_(q_all.detach())
+
+    swa_indices_view = _stage_fixed_int_matrix(
+        swa_indices_stage,
+        swa_indices,
+        rows=rows,
+        cap_rows=cap_rows,
+        name="swa_indices",
+    )
+    indexed_indices_view = _stage_fixed_int_matrix(
+        indexed_indices_stage,
+        indexed_indices,
+        rows=rows,
+        cap_rows=cap_rows,
+        name="indexed_indices",
+    )
+    indexed_page_table_view = _stage_fixed_int_matrix(
+        indexed_page_table_stage,
+        indexed_page_table,
+        rows=rows,
+        cap_rows=cap_rows,
+        name="indexed_page_table",
+    )
+    swa_lengths_view = swa_lengths_stage[:cap_rows]
+    indexed_lengths_view = indexed_lengths_stage[:cap_rows]
+    swa_lengths_view[:rows].copy_(swa_lengths.detach())
+    indexed_lengths_view[:rows].copy_(indexed_lengths.detach())
+    if rows < cap_rows:
+        swa_lengths_view[rows:].zero_()
+        indexed_lengths_view[rows:].zero_()
+
+    return (
+        q_stage,
+        swa_indices_view,
+        swa_lengths_view,
+        indexed_indices_view,
+        indexed_lengths_view,
+        indexed_page_table_view,
+    )
+
+
+def _stage_fixed_int_matrix(
+    stage: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    rows: int,
+    cap_rows: int,
+    name: str,
+) -> torch.Tensor:
+    width = int(source.shape[1])
+    if int(stage.shape[0]) < cap_rows or int(stage.shape[1]) < width:
+        raise ValueError(
+            f"{name} staging buffer is too small: stage={tuple(stage.shape)} "
+            f"required=({cap_rows}, {width})"
+        )
+    view = stage.reshape(-1)[: cap_rows * width].view(cap_rows, width)
+    if rows:
+        view[:rows].copy_(source.detach())
+    return view
 
 
 def _normalize_compressed_q(q: torch.Tensor) -> torch.Tensor:

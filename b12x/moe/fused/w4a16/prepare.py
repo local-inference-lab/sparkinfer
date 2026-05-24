@@ -24,6 +24,10 @@ _SOURCE_FORMATS = {
     "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
 }
+_W13_LAYOUTS = {
+    "w13": "w13",
+    "w31": "w31",
+}
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,7 @@ class W4A16PackedWeights:
     is_gated: bool
     params_dtype: torch.dtype
     source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
     weight_layout: str = "packed"
 
 
@@ -141,6 +146,16 @@ def _normalize_source_format(source_format: str) -> str:
             "source_format must be one of 'modelopt_nvfp4', "
             "'mxfp4_native', or 'compressed_tensors', "
             f"got {source_format!r}"
+        ) from exc
+
+
+def _normalize_w13_layout(w13_layout: str) -> str:
+    try:
+        return _W13_LAYOUTS[w13_layout.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "w13_layout must be one of 'w13' or 'w31', "
+            f"got {w13_layout!r}"
         ) from exc
 
 
@@ -385,9 +400,11 @@ def _prepare_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str,
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     shape = validate_w4a16_packed_inputs(
         w13_fp4,
         w13_global_scale,
@@ -408,7 +425,7 @@ def _prepare_w4a16_packed_weights(
         cols=hidden_size,
     )
     w13_row_rotation = None
-    if is_gated:
+    if is_gated and w13_layout != "w31":
         if reuse_input_storage:
             w13_row_rotation = intermediate_size
         else:
@@ -475,6 +492,7 @@ def _prepare_w4a16_packed_weights(
         is_gated=is_gated,
         params_dtype=params_dtype,
         source_format=source_format,
+        w13_layout=w13_layout,
     )
 
 
@@ -488,13 +506,16 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     *,
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     """Prepare ModelOpt NVFP4 tensors into the W4A16 packed runtime layout.
 
     The per-block scales are the normal NVFP4 K/16 scale grid in b12x swizzled
     storage. The global scales are raw ModelOpt weight global scales; activation
-    input scales are not folded into W4A16 weight preparation.
+    input scales are not folded into W4A16 weight preparation. For gated
+    activations, ``w13_layout`` describes whether fused W13 rows arrive in
+    checkpoint/logical W13 order or already swapped W31 order.
     """
     return _prepare_w4a16_packed_weights(
         w13_fp4,
@@ -506,6 +527,7 @@ def prepare_w4a16_modelopt_nvfp4_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format="modelopt_nvfp4",
+        w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
     )
 
@@ -520,6 +542,7 @@ def prepare_w4a16_compressed_tensors_weights(
     *,
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     """Prepare CompressedTensors NVFP4 tensors into the W4A16 packed runtime layout.
@@ -538,6 +561,7 @@ def prepare_w4a16_compressed_tensors_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format="compressed_tensors",
+        w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
     )
 
@@ -552,6 +576,7 @@ def prepare_w4a16_mxfp4_native_weights(
     *,
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     """Prepare native MXFP4 tensors into the W4A16 packed runtime layout.
@@ -592,6 +617,7 @@ def prepare_w4a16_mxfp4_native_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format="mxfp4_native",
+        w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
     )
 
@@ -599,15 +625,23 @@ def prepare_w4a16_mxfp4_native_weights(
 def prepare_w4a16_packed_weights(
     *args,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     **kwargs,
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     if source_format == "modelopt_nvfp4":
-        return prepare_w4a16_modelopt_nvfp4_weights(*args, **kwargs)
+        return prepare_w4a16_modelopt_nvfp4_weights(
+            *args, w13_layout=w13_layout, **kwargs
+        )
     if source_format == "compressed_tensors":
-        return prepare_w4a16_compressed_tensors_weights(*args, **kwargs)
+        return prepare_w4a16_compressed_tensors_weights(
+            *args, w13_layout=w13_layout, **kwargs
+        )
     if source_format == "mxfp4_native":
-        return prepare_w4a16_mxfp4_native_weights(*args, **kwargs)
+        return prepare_w4a16_mxfp4_native_weights(
+            *args, w13_layout=w13_layout, **kwargs
+        )
     raise AssertionError(f"unhandled W4A16 source_format {source_format!r}")
 
 
