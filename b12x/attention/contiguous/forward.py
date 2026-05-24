@@ -24,10 +24,10 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils as utils_basic
 
-from b12x.attention.contiguous import copy_utils
+from b12x.attention import copy_utils
 from b12x.attention.contiguous import layout_utils
 from b12x.attention.contiguous.cute_dsl_utils import assume_tensor_aligned
-from b12x.attention.contiguous import pipeline
+from b12x.attention import pipeline
 from b12x.attention import utils
 from b12x.attention.contiguous.mask import AttentionMask
 from b12x.attention.contiguous.softmax import Softmax
@@ -779,8 +779,8 @@ class ContiguousAttentionForwardKernel:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        pipeline_k: pipeline.PipelineAsync,
-        pipeline_v: pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineTmaAsync,
+        pipeline_v: pipeline.PipelineTmaAsync,
         mbar_ptr_Q: cutlass.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
