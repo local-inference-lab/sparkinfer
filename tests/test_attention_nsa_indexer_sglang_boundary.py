@@ -7,14 +7,14 @@ import sys
 import pytest
 import torch
 
-from b12x.integration.nsa_indexer import (
-    NSAIndexerExtendLogitsMetadata,
-    NSAIndexerPagedDecodeMetadata,
-    clear_nsa_indexer_caches,
-    get_paged_mqa_logits_metadata,
-    pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_logits_paged,
-    sparse_nsa_index_extend_logits,
+from b12x.attention.indexer.reference import pack_index_k_cache_reference
+from b12x.integration.indexer import (
+    IndexerExtendMetadata,
+    IndexerPagedDecodeMetadata,
+    clear_indexer_caches,
+    build_paged_mqa_schedule_metadata,
+    paged_decode_logits,
+    extend_logits,
 )
 
 
@@ -137,7 +137,7 @@ class _FakeAttnBackend:
         self._workspaces: dict[tuple[str, torch.device], object] = {}
 
     def _get_b12x_workspace(self, *, mode: str, v_head_dim: int):
-        from b12x.integration.mla import B12XAttentionWorkspace
+        from b12x.attention.workspace import B12XAttentionWorkspace
 
         normalized_mode = "verify" if mode == "target_verify" else mode
         key = (normalized_mode, self.device)
@@ -389,7 +389,7 @@ def _make_paged_candidate_tables(
     return page_table_1, real_page_table
 
 
-def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None:
+def test_sglang_b12x_indexer_paged_boundary_matches_b12x_reference() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_100)
@@ -402,7 +402,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
     topk = 4
     q_rows = len(page_starts)
 
-    index_k_cache = pack_nsa_index_k_cache_reference(
+    index_k_cache = pack_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32) / 3
     )
     q_fp8 = (
@@ -448,11 +448,11 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
         weights,
         metadata,
     )
-    expected_logits = sparse_nsa_index_decode_logits_paged(
+    expected_logits = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerPagedDecodeMetadata(
+        metadata=IndexerPagedDecodeMetadata(
             real_page_table=real_page_table,
             cache_seqlens_int32=seqlens,
         ),
@@ -462,7 +462,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
     assert torch.equal(actual, expected)
 
 
-def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() -> None:
+def test_sglang_b12x_indexer_paged_boundary_respects_active_decode_rows() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_102)
@@ -476,7 +476,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
     q_rows = len(page_starts)
     active_rows = 3
 
-    index_k_cache = pack_nsa_index_k_cache_reference(
+    index_k_cache = pack_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32) / 3
     )
     q_fp8 = (
@@ -522,11 +522,11 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
         weights,
         metadata,
     )
-    expected_logits = sparse_nsa_index_decode_logits_paged(
+    expected_logits = paged_decode_logits(
         q_fp8=q_fp8[:active_rows],
         weights=weights[:active_rows],
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerPagedDecodeMetadata(
+        metadata=IndexerPagedDecodeMetadata(
             real_page_table=real_page_table[:active_rows],
             cache_seqlens_int32=seqlens[:active_rows],
         ),
@@ -537,7 +537,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
     assert torch.equal(actual, torch.cat([expected, padding], dim=0))
 
 
-def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> None:
+def test_sglang_b12x_indexer_ragged_boundary_matches_b12x_reference() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_101)
@@ -552,7 +552,7 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
     num_tokens = (2 + 3) * 64
     num_heads = 2
 
-    index_k_cache = pack_nsa_index_k_cache_reference(
+    index_k_cache = pack_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32) / 3
     )
     q_fp8 = (
@@ -615,11 +615,11 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         k_fp8_bytes.view(torch.float8_e4m3fn),
         k_scale_bytes.view(torch.float32).squeeze(-1),
     )
-    expected_logits = sparse_nsa_index_extend_logits(
+    expected_logits = extend_logits(
         q_fp8=q_fp8[: k_start.numel()],
         weights=weights[: k_start.numel()],
         kv_fp8=kv_fp8,
-        metadata=NSAIndexerExtendLogitsMetadata(
+        metadata=IndexerExtendMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
@@ -634,7 +634,7 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for graph capture coverage"
 )
-def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
+def test_sglang_b12x_indexer_paged_boundary_cuda_graph_capture() -> None:
     module = _import_sglang_nsa_indexer()
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -649,7 +649,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     q_rows = len(page_starts)
     active_rows = 3
 
-    index_k_cache = pack_nsa_index_k_cache_reference(
+    index_k_cache = pack_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32).to(
             device=device
         )
@@ -694,12 +694,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         seqlens_expanded=seqlens,
         extend_lens=[1, 1, 1, 0],
     )
-    metadata.paged_mqa_schedule_metadata = get_paged_mqa_logits_metadata(
+    metadata.paged_mqa_schedule_metadata = build_paged_mqa_schedule_metadata(
         seqlens[:active_rows].contiguous(),
         64,
     )
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     captured_out = None
 
     def run() -> None:
@@ -723,11 +723,11 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     graph.replay()
     torch.cuda.synchronize(device)
 
-    expected_logits = sparse_nsa_index_decode_logits_paged(
+    expected_logits = paged_decode_logits(
         q_fp8=q_fp8[:active_rows],
         weights=weights[:active_rows],
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerPagedDecodeMetadata(
+        metadata=IndexerPagedDecodeMetadata(
             real_page_table=real_page_table[:active_rows],
             cache_seqlens_int32=seqlens[:active_rows],
             paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,

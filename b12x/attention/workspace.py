@@ -1,4 +1,4 @@
-"""Workspace state for sparse MLA execution."""
+"""Workspace state shared by sparse attention and indexer execution."""
 
 from __future__ import annotations
 
@@ -7,19 +7,25 @@ from typing import Literal
 
 import torch
 
-from .split import default_sparse_mla_split_decode_config_for_width
-from .reference import _MLA_PACKED_DIM
-
-
+_MLA_PACKED_DIM = 656
 _INDEX_HEAD_DIM = 128
-_NSA_INDEXER_BLOCK_K = 64
-_NSA_INDEXER_PREFILL_BLOCK_K = 256
-_NSA_INDEXER_TILE_BLOCK_Q = 32
+_INDEXER_BLOCK_K = 64
+_INDEXER_PREFILL_BLOCK_K = 256
+_INDEXER_TILE_BLOCK_Q = 32
 _PAGED_INDEXER_TILE_BLOCK_K = 512
 _ARENA_ALIGN_BYTES = 1024
 _MHC_MULT = 4
 _MHC_PARTIALS = 25
 _MHC_DEFAULT_SPLIT_K = 64
+_SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
+_SPLIT_MAX_CHUNKS = 256
+_SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
+
+
+@dataclass(frozen=True)
+class SparseMLASplitDecodeConfig:
+    chunk_size: int
+    num_chunks: int
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,48 @@ def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + alignment - 1) // alignment) * alignment
 
 
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def default_sparse_mla_split_decode_config_for_width(
+    width: int,
+    *,
+    max_chunks: int = _SPLIT_MAX_CHUNKS,
+) -> SparseMLASplitDecodeConfig | None:
+    if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
+        return None
+
+    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
+    for chunk_size in _SPLIT_CHUNK_LADDER:
+        num_chunks = _ceil_div(width, chunk_size)
+        if num_chunks <= max_chunks:
+            return SparseMLASplitDecodeConfig(
+                chunk_size=chunk_size,
+                num_chunks=num_chunks,
+            )
+    return None
+
+
+def forced_sparse_mla_split_decode_config_for_width(
+    width: int,
+    *,
+    max_chunks: int = _SPLIT_MAX_CHUNKS,
+) -> SparseMLASplitDecodeConfig | None:
+    if width <= 0 or width > _SPLIT_MAX_WIDTH:
+        return None
+
+    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
+    for chunk_size in _SPLIT_CHUNK_LADDER:
+        num_chunks = _ceil_div(width, chunk_size)
+        if num_chunks <= max_chunks:
+            return SparseMLASplitDecodeConfig(
+                chunk_size=chunk_size,
+                num_chunks=num_chunks,
+            )
+    return None
+
+
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -76,7 +124,7 @@ def _resolve_extend_topk_supertile_k(value: int) -> int:
     value = int(value)
     if value <= 0:
         return 0
-    return _align_up(value, _NSA_INDEXER_BLOCK_K)
+    return _align_up(value, _INDEXER_BLOCK_K)
 
 
 def _resolve_paged_topk_supertile_k(value: int) -> int:
@@ -193,7 +241,7 @@ def _encode_indexer_k_tma_descriptor(
     *,
     block_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encode a stable TMA descriptor for the fixed NSA indexer K workspace."""
+    """Encode a stable TMA descriptor for the fixed indexer K workspace."""
     if k_quant_bytes.ndim != 2 or k_quant_bytes.shape[1] != _INDEX_HEAD_DIM:
         raise ValueError(
             f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
@@ -223,7 +271,7 @@ def _encode_indexer_k_tma_descriptor(
         cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
     )
     if result != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed for NSA indexer K workspace: {result}")
+        raise RuntimeError(f"cuTensorMapEncodeTiled failed for indexer K workspace: {result}")
 
     desc = torch.tensor(
         [int(word) for word in tensor_map.opaque],
@@ -557,7 +605,7 @@ class B12XAttentionArena:
         max_kv_rows = max(int(caps.extend_max_kv_rows), 1)
         indexer_k_rows = _align_up(
             max(int(caps.indexer_max_k_rows or 0), 1),
-            _NSA_INDEXER_BLOCK_K,
+            _INDEXER_BLOCK_K,
         )
         default_mla_tmp_q_chunks = mla_max_total_q * int(caps.max_chunks_per_row)
         mla_tmp_q_chunks = (
@@ -644,11 +692,11 @@ class B12XAttentionArena:
         paged_tile_logits_k_rows = int(paged_tile_logits_width_tokens)
         extend_tile_logits_q_rows = _align_up(
             int(caps.extend_max_total_q),
-            _NSA_INDEXER_TILE_BLOCK_Q,
+            _INDEXER_TILE_BLOCK_Q,
         )
         paged_tile_logits_q_rows = _align_up(
             max_paged_q_rows,
-            _NSA_INDEXER_TILE_BLOCK_Q,
+            _INDEXER_TILE_BLOCK_Q,
         )
         extend_tile_logits_nbytes = 0
         if extend_tile_logits_k_rows:
@@ -1232,7 +1280,7 @@ class B12XAttentionWorkspace:
     _contract_kv_rows: torch.Tensor | None = None
     _contract_kv_scales: torch.Tensor | None = None
     _contract_page_table: torch.Tensor | None = None
-    _contract_nsa_cache_seqlens: torch.Tensor | None = None
+    _contract_indexer_cache_seqlens: torch.Tensor | None = None
     _contract_output: torch.Tensor | None = None
     _contract_tmp_output: torch.Tensor | None = None
     _contract_tmp_lse: torch.Tensor | None = None
@@ -1250,12 +1298,12 @@ class B12XAttentionWorkspace:
     _contract_paged_indexer_q_bytes: torch.Tensor | None = None
     _contract_paged_indexer_weights: torch.Tensor | None = None
     _contract_paged_real_page_table: torch.Tensor | None = None
-    _contract_paged_nsa_cache_seqlens: torch.Tensor | None = None
+    _contract_paged_indexer_cache_seqlens: torch.Tensor | None = None
     _contract_paged_indexer_logits: torch.Tensor | None = None
     _contract_paged_indexer_tile_logits: torch.Tensor | None = None
     _contract_paged_indexer_topk_values: torch.Tensor | None = None
     _contract_paged_indexer_topk_indices: torch.Tensor | None = None
-    _nsa_extend_tiled_topk_prewarmed: bool = False
+    _indexer_extend_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_plan: _PagedIndexerTiledTopKPlan | None = None
     _paged_indexer_tiled_scorer_prewarmed: bool = False
@@ -1491,7 +1539,7 @@ class B12XAttentionWorkspace:
         indexer_k_rows = (
             max(int(self.arena.indexer_k_rows), 1)
             if self.arena is not None
-            else _align_up(max_kv_rows, _NSA_INDEXER_BLOCK_K)
+            else _align_up(max_kv_rows, _INDEXER_BLOCK_K)
         )
         paged_width_tokens = (
             max(int(self.arena.paged_logits_width_tokens), 1)
@@ -1571,12 +1619,12 @@ class B12XAttentionWorkspace:
         )
         self.indexer_k_tma_desc, self.indexer_k_tma_desc_ptrs = _encode_indexer_k_tma_descriptor(
             self.indexer_k_quant_bytes,
-            block_k=_NSA_INDEXER_BLOCK_K,
+            block_k=_INDEXER_BLOCK_K,
         )
         self.indexer_k_tma_prefill_desc, self.indexer_k_tma_prefill_desc_ptrs = (
             _encode_indexer_k_tma_descriptor(
                 self.indexer_k_quant_bytes,
-                block_k=_NSA_INDEXER_PREFILL_BLOCK_K,
+                block_k=_INDEXER_PREFILL_BLOCK_K,
             )
         )
         if self.indexer_extend_logits_nbytes:
@@ -1830,7 +1878,7 @@ class B12XAttentionWorkspace:
             or self._contract_indexer_k_start is None
             or self._contract_indexer_k_end is None
         ):
-            raise RuntimeError("fixed-capacity workspace is missing NSA indexer phantoms")
+            raise RuntimeError("fixed-capacity workspace is missing indexer phantoms")
         phantoms = {
             "extend_q_u32": self._contract_indexer_q_u32,
             "extend_q_bytes": self._contract_indexer_q_bytes,
@@ -1861,7 +1909,7 @@ class B12XAttentionWorkspace:
         row_count: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.indexer_extend_topk_values is None or self.indexer_extend_topk_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing NSA extend top-k buffers")
+            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k buffers")
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -1884,7 +1932,7 @@ class B12XAttentionWorkspace:
             self.indexer_extend_topk_scratch_values is None
             or self.indexer_extend_topk_scratch_indices is None
         ):
-            raise RuntimeError("fixed-capacity workspace is missing NSA extend top-k scratch buffers")
+            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k scratch buffers")
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -1904,12 +1952,12 @@ class B12XAttentionWorkspace:
             self.indexer_extend_candidate_values is None
             or self.indexer_extend_candidate_indices is None
         ):
-            raise RuntimeError("fixed-capacity workspace is missing NSA extend candidate buffers")
+            raise RuntimeError("fixed-capacity workspace is missing indexer extend candidate buffers")
         return self.indexer_extend_candidate_values, self.indexer_extend_candidate_indices
 
     def get_indexer_extend_lengths(self, *, row_count: int) -> torch.Tensor:
         if self.indexer_extend_lengths is None:
-            raise RuntimeError("fixed-capacity workspace is missing NSA extend length buffer")
+            raise RuntimeError("fixed-capacity workspace is missing indexer extend length buffer")
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -1936,7 +1984,7 @@ class B12XAttentionWorkspace:
 
     def get_indexer_extend_topk_result(self, *, row_count: int) -> torch.Tensor:
         if self.indexer_extend_topk_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing NSA extend top-k result buffer")
+            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k result buffer")
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -2124,7 +2172,7 @@ class B12XAttentionWorkspace:
 
     def get_indexer_extend_mapped_indices(self, *, row_count: int, width: int) -> torch.Tensor:
         if self.indexer_extend_mapped_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing NSA mapped-index buffer")
+            raise RuntimeError("fixed-capacity workspace is missing indexer mapped-index buffer")
         row_count = int(row_count)
         width = int(width)
         if row_count < 0 or width < 0:
@@ -2140,7 +2188,7 @@ class B12XAttentionWorkspace:
             )
         return self.indexer_extend_mapped_indices[:row_count, :width]
 
-    def prewarm_nsa_extend_tiled_topk(self) -> None:
+    def prewarm_indexer_extend_tiled_topk(self) -> None:
         """Compile the arena-backed extend scorer/topk variants before serving.
 
         The production extend path uses fixed-capacity phantom tensors so live
@@ -2151,7 +2199,7 @@ class B12XAttentionWorkspace:
         compile cost at the first request that reaches each variant.
         """
 
-        if self._nsa_extend_tiled_topk_prewarmed:
+        if self._indexer_extend_tiled_topk_prewarmed:
             return
         if self.mode != "extend":
             return
@@ -2170,15 +2218,15 @@ class B12XAttentionWorkspace:
         if fp8_dtype is None:
             return
 
-        from b12x.attention.nsa_indexer.api import (
-            NSAIndexerExtendLogitsMetadata,
-            sparse_nsa_index_extend_tiled_topk,
+        from b12x.attention.indexer.api import (
+            IndexerExtendMetadata,
+            extend_tiled_topk,
         )
-        from b12x.attention.nsa_indexer.extend_kernel import (
+        from b12x.attention.indexer.extend_kernel import (
             _PREFILL512_BLOCK_K,
             _PREFILL512_BLOCK_Q,
             _PREFILL_BLOCK_Q,
-            resolve_sparse_nsa_extend_prefill_block_k,
+            resolve_extend_prefill_block_k,
         )
 
         q_rows = min(int(self.max_total_q), 4096)
@@ -2189,7 +2237,7 @@ class B12XAttentionWorkspace:
                 continue
             if requested_k_rows < int(self.topk):
                 continue
-            block_k = resolve_sparse_nsa_extend_prefill_block_k(
+            block_k = resolve_extend_prefill_block_k(
                 valid_q_rows=q_rows,
                 k_rows=requested_k_rows,
                 num_heads=heads,
@@ -2235,14 +2283,14 @@ class B12XAttentionWorkspace:
                 self.indexer_k_scales[:k_rows].fill_(1.0)
                 k_start.zero_()
                 k_end.fill_(k_rows)
-                sparse_nsa_index_extend_tiled_topk(
+                extend_tiled_topk(
                     q_fp8=q_fp8,
                     weights=weights,
                     kv_fp8=(
                         self.indexer_k_quant_bytes[:k_rows].view(fp8_dtype),
                         self.indexer_k_scales[:k_rows],
                     ),
-                    metadata=NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end),
+                    metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
                     topk=int(self.topk),
                     contract_phantoms=phantoms,
                     tile_logits=tile_logits,
@@ -2250,7 +2298,7 @@ class B12XAttentionWorkspace:
                 )
             torch.cuda.synchronize(self.device)
 
-        self._nsa_extend_tiled_topk_prewarmed = True
+        self._indexer_extend_tiled_topk_prewarmed = True
 
     def prewarm_paged_indexer_tiled_topk(self) -> None:
         """Compile the fixed-capacity paged C4 tiled top-k launcher."""
@@ -2268,9 +2316,9 @@ class B12XAttentionWorkspace:
         ):
             return
 
-        from b12x.attention.nsa_indexer.tiled_topk import run_tiled_topk
+        from b12x.attention.indexer.tiled_topk import run_tiled_topk
 
-        block_q = _NSA_INDEXER_TILE_BLOCK_Q
+        block_q = _INDEXER_TILE_BLOCK_Q
         block_k = _PAGED_INDEXER_TILE_BLOCK_K
         topk = int(self.indexer_topk)
         plan = self._make_paged_indexer_tiled_topk_plan(
@@ -2342,18 +2390,18 @@ class B12XAttentionWorkspace:
         if fp8_dtype is None:
             return
 
-        from b12x.attention.nsa_indexer.kernel import (
-            run_sparse_nsa_paged_windowed_tiled_logits_kernel,
+        from b12x.attention.indexer.kernel import (
+            run_paged_windowed_tiled_logits_kernel,
         )
-        from b12x.attention.nsa_indexer.extend_kernel import (
-            resolve_sparse_nsa_extend_prefill_block_k,
-            run_sparse_nsa_extend_logits_kernel,
+        from b12x.attention.indexer.extend_kernel import (
+            resolve_extend_prefill_block_k,
+            run_extend_logits_kernel,
         )
-        from b12x.integration.paged_mqa_indexer import (
-            _prepare_shared_paged_mqa_supertile,
+        from b12x.integration.compressed_indexer import (
+            _prepare_shared_compressed_supertile,
         )
 
-        block_q = _NSA_INDEXER_TILE_BLOCK_Q
+        block_q = _INDEXER_TILE_BLOCK_Q
         block_k = _PAGED_INDEXER_TILE_BLOCK_K
         plan = self._make_paged_indexer_tiled_scorer_plan(
             block_q=block_q,
@@ -2388,7 +2436,7 @@ class B12XAttentionWorkspace:
             page_table.fill_(-1)
             lengths.fill_(plan.width_tokens)
 
-            run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+            run_paged_windowed_tiled_logits_kernel(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -2409,7 +2457,7 @@ class B12XAttentionWorkspace:
                 self.indexer_k_quant_bytes is not None
                 and plan.q_rows >= 1024
                 and plan.width_tokens <= int(self.indexer_k_quant_bytes.shape[0])
-                and resolve_sparse_nsa_extend_prefill_block_k(
+                and resolve_extend_prefill_block_k(
                     valid_q_rows=plan.q_rows,
                     k_rows=plan.width_tokens,
                     num_heads=self.indexer_num_q_heads,
@@ -2418,7 +2466,7 @@ class B12XAttentionWorkspace:
             ):
                 page_table.fill_(0)
                 lengths.fill_(plan.width_tokens)
-                k_quant, k_scale, k_start, k_end = _prepare_shared_paged_mqa_supertile(
+                k_quant, k_scale, k_start, k_end = _prepare_shared_compressed_supertile(
                     index_k_cache=index_k_cache,
                     real_page_table=page_table,
                     seqlens_per_query=lengths,
@@ -2428,7 +2476,7 @@ class B12XAttentionWorkspace:
                     page_begin=0,
                     supertile_tokens=plan.width_tokens,
                 )
-                run_sparse_nsa_extend_logits_kernel(
+                run_extend_logits_kernel(
                     q_fp8=q_fp8,
                     weights=weights,
                     k_quant=k_quant,
@@ -2451,14 +2499,14 @@ class B12XAttentionWorkspace:
             self._contract_paged_indexer_q_bytes is None
             or self._contract_paged_indexer_weights is None
             or self._contract_paged_real_page_table is None
-            or self._contract_paged_nsa_cache_seqlens is None
+            or self._contract_paged_indexer_cache_seqlens is None
         ):
-            raise RuntimeError("fixed-capacity workspace is missing paged NSA indexer phantoms")
+            raise RuntimeError("fixed-capacity workspace is missing paged indexer phantoms")
         phantoms = {
             "q_bytes": self._contract_paged_indexer_q_bytes,
             "weights": self._contract_paged_indexer_weights,
             "real_page_table": self._contract_paged_real_page_table,
-            "seqlens_per_query": self._contract_paged_nsa_cache_seqlens,
+            "seqlens_per_query": self._contract_paged_indexer_cache_seqlens,
         }
         if self._contract_paged_indexer_logits is not None:
             phantoms["logits"] = self._contract_paged_indexer_logits
@@ -2469,7 +2517,7 @@ class B12XAttentionWorkspace:
         if self._contract_paged_indexer_topk_indices is not None:
             phantoms["topk_indices"] = self._contract_paged_indexer_topk_indices
         if "logits" not in phantoms and "tile_logits" not in phantoms:
-            raise RuntimeError("fixed-capacity workspace is missing paged NSA indexer output phantoms")
+            raise RuntimeError("fixed-capacity workspace is missing paged indexer output phantoms")
         return phantoms
 
     def get_indexer_gather_outputs(
@@ -2478,7 +2526,7 @@ class B12XAttentionWorkspace:
         row_count: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.indexer_k_quant_bytes is None or self.indexer_k_scales is None:
-            raise RuntimeError("fixed-capacity workspace is missing NSA gather buffers")
+            raise RuntimeError("fixed-capacity workspace is missing indexer gather buffers")
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -2491,7 +2539,7 @@ class B12XAttentionWorkspace:
         )
         return self.indexer_k_quant_bytes[:row_count], k_scale_bytes[:row_count]
 
-    def stage_nsa_indexer_extend(
+    def stage_indexer_extend(
         self,
         *,
         q_fp8: torch.Tensor,
@@ -2508,24 +2556,24 @@ class B12XAttentionWorkspace:
             or self.indexer_k_scales is None
             or (requires_full_logits and self.indexer_extend_logits is None)
         ):
-            raise RuntimeError("fixed-capacity workspace is missing NSA indexer buffers")
+            raise RuntimeError("fixed-capacity workspace is missing indexer buffers")
         if not q_fp8.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous q_fp8")
+            raise ValueError("workspace-backed indexer extend requires contiguous q_fp8")
         if not weights.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous weights")
+            raise ValueError("workspace-backed indexer extend requires contiguous weights")
         if not k_quant.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous k_quant")
+            raise ValueError("workspace-backed indexer extend requires contiguous k_quant")
         if not k_scale.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous k_scale")
+            raise ValueError("workspace-backed indexer extend requires contiguous k_scale")
         if not k_start.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous k_start")
+            raise ValueError("workspace-backed indexer extend requires contiguous k_start")
         if not k_end.is_contiguous():
-            raise ValueError("workspace-backed NSA indexer extend requires contiguous k_end")
+            raise ValueError("workspace-backed indexer extend requires contiguous k_end")
 
         q_rows_total = int(q_fp8.shape[0])
         valid_q_rows = int(k_start.shape[0])
         k_rows = int(k_quant.shape[0])
-        padded_k_rows = _align_up(max(k_rows, 1), _NSA_INDEXER_BLOCK_K)
+        padded_k_rows = _align_up(max(k_rows, 1), _INDEXER_BLOCK_K)
         if not preinitialize_invalid_logits and valid_q_rows != q_rows_total:
             raise ValueError(
                 "preinitialize_invalid_logits=False requires all q rows to be valid; "
@@ -2539,11 +2587,11 @@ class B12XAttentionWorkspace:
         )
         if q_rows_total > q_row_capacity:
             raise ValueError(
-                f"q rows {q_rows_total} exceed workspace NSA indexer capacity {q_row_capacity}"
+                f"q rows {q_rows_total} exceed workspace indexer capacity {q_row_capacity}"
             )
         if padded_k_rows > self.indexer_k_quant_bytes.shape[0]:
             raise ValueError(
-                f"k rows {k_rows} exceed workspace NSA indexer capacity {self.indexer_k_quant_bytes.shape[0]}"
+                f"k rows {k_rows} exceed workspace indexer capacity {self.indexer_k_quant_bytes.shape[0]}"
             )
         if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
             raise ValueError(
@@ -2585,14 +2633,14 @@ class B12XAttentionWorkspace:
         else:
             if padded_k_rows != k_rows:
                 raise ValueError(
-                    "workspace-backed NSA indexer extend requires pre-padded K/scale rows "
+                    "workspace-backed indexer extend requires pre-padded K/scale rows "
                     "or workspace gather outputs; refusing an implicit pad copy"
                 )
             k_quant_kernel = k_quant_bytes
             k_scale_kernel = k_scale
         if k_quant_aliases_workspace != k_scale_aliases_workspace:
             raise ValueError(
-                "workspace-backed NSA indexer extend requires k_quant and k_scale to either "
+                "workspace-backed indexer extend requires k_quant and k_scale to either "
                 "both alias the workspace gather buffers or both use live storage"
             )
 
@@ -2605,7 +2653,7 @@ class B12XAttentionWorkspace:
                 logits_view.fill_(float("-inf"))
         else:
             if self.indexer_extend_tile_logits is None:
-                raise RuntimeError("fixed-capacity workspace is missing NSA tiled-logits buffer")
+                raise RuntimeError("fixed-capacity workspace is missing indexer tiled-logits buffer")
             logits_view = self.indexer_extend_tile_logits.narrow(0, 0, 1).view(1, 1)
         return {
             "q_u32": q_u32,
@@ -2622,7 +2670,7 @@ class B12XAttentionWorkspace:
             ),
         }
 
-    def stage_nsa_indexer_paged_decode(
+    def stage_indexer_paged_decode(
         self,
         *,
         q_fp8: torch.Tensor,
@@ -2635,7 +2683,7 @@ class B12XAttentionWorkspace:
         preinitialize_invalid_logits: bool = True,
     ) -> dict[str, torch.Tensor]:
         if self.indexer_paged_logits is None:
-            raise RuntimeError("fixed-capacity workspace is missing paged NSA indexer buffers")
+            raise RuntimeError("fixed-capacity workspace is missing paged indexer buffers")
         if q_fp8.device != self.device:
             raise ValueError(f"q_fp8 device {q_fp8.device} does not match workspace device {self.device}")
         if weights.device != self.device:
@@ -2673,7 +2721,7 @@ class B12XAttentionWorkspace:
         width_tokens = int(width_tokens)
         if q_rows > self.max_paged_q_rows:
             raise ValueError(
-                f"q rows {q_rows} exceed workspace NSA paged capacity {self.max_paged_q_rows}"
+                f"q rows {q_rows} exceed workspace indexer paged capacity {self.max_paged_q_rows}"
             )
         if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
             raise ValueError(
@@ -2783,7 +2831,7 @@ class B12XAttentionWorkspace:
             "logits_view": logits_view,
         }
 
-    def stage_nsa_indexer_paged_tiled_decode(
+    def stage_indexer_paged_tiled_decode(
         self,
         *,
         q_fp8: torch.Tensor,
@@ -2856,7 +2904,7 @@ class B12XAttentionWorkspace:
             )
         if q_rows > self.max_paged_q_rows:
             raise ValueError(
-                f"q rows {q_rows} exceed workspace NSA paged capacity {self.max_paged_q_rows}"
+                f"q rows {q_rows} exceed workspace indexer paged capacity {self.max_paged_q_rows}"
             )
         if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
             raise ValueError(
@@ -3019,7 +3067,7 @@ class B12XAttentionWorkspace:
             self._contract_kv_scales = None
             return
 
-        from .kernel import _extract_packed_kv_runtime_views
+        from b12x.attention.mla.kernel import _extract_packed_kv_runtime_views
 
         kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(self.ragged_kv_cache)
         self._contract_kv_rows = _shape_only_cuda_tensor(
@@ -3046,7 +3094,7 @@ class B12XAttentionWorkspace:
             dtype=torch.int32,
             device=self.device,
         )
-        self._contract_nsa_cache_seqlens = _shape_only_cuda_tensor(
+        self._contract_indexer_cache_seqlens = _shape_only_cuda_tensor(
             (self.max_total_q,),
             dtype=torch.int32,
             device=self.device,
@@ -3154,7 +3202,7 @@ class B12XAttentionWorkspace:
                 dtype=torch.int32,
                 device=self.device,
             )
-            self._contract_paged_nsa_cache_seqlens = _shape_only_cuda_tensor(
+            self._contract_paged_indexer_cache_seqlens = _shape_only_cuda_tensor(
                 (self.max_paged_q_rows,),
                 dtype=torch.int32,
                 device=self.device,

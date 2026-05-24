@@ -22,9 +22,9 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
-from b12x.attention import copy_utils
-from b12x.attention import pipeline
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import copy as cute_copy
+from b12x.attention._cute import pipeline as cute_pipeline
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
@@ -795,8 +795,8 @@ def _apply_attention_sink_after_lse_scale(
                 sink_owner = (chunk_start <= causal_k_limit) and (causal_k_limit < chunk_end)
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
-            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_utils.LOG2_E)
-            new_m = attention_utils.fmax(old_m, sink_m)
+            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
+            new_m = attention_ops.fmax(old_m, sink_m)
             old_scale = Float32(0.0) if old_m == -Float32.inf else _exp2_approx_ftz_f32(old_m - new_m)
             sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * old_scale + sink_scale)
@@ -2125,19 +2125,19 @@ def _literal_update_mdo_states_fp32_pack_p(
             m_prev = Float32(m_frag[mma_q, row_slot])
             m_new = Float32(m_prev)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                m_local = attention_utils.fmax(
-                    attention_utils.fmax(
+                m_local = attention_ops.fmax(
+                    attention_ops.fmax(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_utils.fmax(
+                    attention_ops.fmax(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_utils.fmax(m_new, m_local)
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+                m_new = attention_ops.fmax(m_new, m_local)
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
             scale_term = (
                 Float32(1.0)
@@ -2203,19 +2203,19 @@ def _literal_update_mdo_states_fp32_pack_p_row0(
         m_prev = Float32(m_frag[mma_q, 0])
         m_new = Float32(m_prev)
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            m_local = attention_utils.fmax(
-                attention_utils.fmax(
+            m_local = attention_ops.fmax(
+                attention_ops.fmax(
                     s_frag[mma_q, mma_kv, 0],
                     s_frag[mma_q, mma_kv, 1],
                 ),
-                attention_utils.fmax(
+                attention_ops.fmax(
                     s_frag[mma_q, mma_kv, 4],
                     s_frag[mma_q, mma_kv, 5],
                 ),
             )
-            m_new = attention_utils.fmax(m_new, m_local)
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+            m_new = attention_ops.fmax(m_new, m_local)
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
         scale_term = (
             Float32(1.0)
@@ -2278,13 +2278,13 @@ def _literal_update_mdo_states_fp32_pack_p_row0_1x1(
     num_mma_d_vo,
 ):
     m_prev = Float32(m_frag[0, 0])
-    m_new = attention_utils.fmax(
-        attention_utils.fmax(s_frag[0, 0, 0], s_frag[0, 0, 1]),
-        attention_utils.fmax(s_frag[0, 0, 4], s_frag[0, 0, 5]),
+    m_new = attention_ops.fmax(
+        attention_ops.fmax(s_frag[0, 0, 0], s_frag[0, 0, 1]),
+        attention_ops.fmax(s_frag[0, 0, 4], s_frag[0, 0, 5]),
     )
-    m_new = attention_utils.fmax(m_prev, m_new)
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+    m_new = attention_ops.fmax(m_prev, m_new)
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
     scale_term = (
         Float32(1.0)
@@ -2345,29 +2345,29 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
             m_prev = Float32(m_frag[mma_q, row_slot])
             m_new = Float32(m_prev)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                m_local0 = attention_utils.fmax(
-                    attention_utils.fmax(
+                m_local0 = attention_ops.fmax(
+                    attention_ops.fmax(
                         s_frag0[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag0[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_utils.fmax(
+                    attention_ops.fmax(
                         s_frag0[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag0[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_local1 = attention_utils.fmax(
-                    attention_utils.fmax(
+                m_local1 = attention_ops.fmax(
+                    attention_ops.fmax(
                         s_frag1[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag1[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_utils.fmax(
+                    attention_ops.fmax(
                         s_frag1[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag1[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_utils.fmax(m_new, attention_utils.fmax(m_local0, m_local1))
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+                m_new = attention_ops.fmax(m_new, attention_ops.fmax(m_local0, m_local1))
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
             scale_term = (
                 Float32(1.0)
@@ -2638,7 +2638,7 @@ class PagedForwardKernel:
         self.decode_native_fp8_runtime_chunk_guard = (
             self.use_native_fp8_qk_mma and decode_only and decode_native_fp8_runtime_chunk_guard
         )
-        self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -3384,7 +3384,7 @@ class PagedForwardKernel:
         pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread
         )
-        pipeline_k = pipeline.PipelineTmaAsync.create(
+        pipeline_k = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=mbar_ptr_K,
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
@@ -3392,7 +3392,7 @@ class PagedForwardKernel:
             tx_count=self.kv_tma_copy_bytes_k,
             defer_sync=True,
         )
-        pipeline_v = pipeline.PipelineTmaAsync.create(
+        pipeline_v = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=mbar_ptr_V,
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
@@ -3451,43 +3451,43 @@ class PagedForwardKernel:
             if const_expr(self.k_tma_plane_count > 3)
             else None
         )
-        load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
         )
         load_K_tma1, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
             )
             if const_expr(self.k_tma_plane_count > 1)
             else (None, None, None)
         )
         load_K_tma2, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2
             )
             if const_expr(self.k_tma_plane_count > 2)
             else (None, None, None)
         )
         load_K_tma3, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3
             )
             if const_expr(self.k_tma_plane_count > 3)
             else (None, None, None)
         )
-        load_K_tma0 = copy_utils.tma_producer_copy_fn(load_K_tma0, pipeline_k)
+        load_K_tma0 = cute_copy.tma_producer_copy_fn(load_K_tma0, pipeline_k)
         load_K_tma1 = (
-            copy_utils.tma_producer_copy_fn(load_K_tma1, pipeline_k)
+            cute_copy.tma_producer_copy_fn(load_K_tma1, pipeline_k)
             if const_expr(self.k_tma_plane_count > 1)
             else None
         )
         load_K_tma2 = (
-            copy_utils.tma_producer_copy_fn(load_K_tma2, pipeline_k)
+            cute_copy.tma_producer_copy_fn(load_K_tma2, pipeline_k)
             if const_expr(self.k_tma_plane_count > 2)
             else None
         )
         load_K_tma3 = (
-            copy_utils.tma_producer_copy_fn(load_K_tma3, pipeline_k)
+            cute_copy.tma_producer_copy_fn(load_K_tma3, pipeline_k)
             if const_expr(self.k_tma_plane_count > 3)
             else None
         )
@@ -3523,43 +3523,43 @@ class PagedForwardKernel:
             if const_expr(self.v_tma_plane_count > 3)
             else None
         )
-        load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
         )
         load_V_tma1, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
             )
             if const_expr(self.v_tma_plane_count > 1)
             else (None, None, None)
         )
         load_V_tma2, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2
             )
             if const_expr(self.v_tma_plane_count > 2)
             else (None, None, None)
         )
         load_V_tma3, _, _ = (
-            copy_utils.tma_get_copy_fn(
+            cute_copy.tma_get_copy_fn(
                 tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3
             )
             if const_expr(self.v_tma_plane_count > 3)
             else (None, None, None)
         )
-        load_V_tma0 = copy_utils.tma_producer_copy_fn(load_V_tma0, pipeline_v)
+        load_V_tma0 = cute_copy.tma_producer_copy_fn(load_V_tma0, pipeline_v)
         load_V_tma1 = (
-            copy_utils.tma_producer_copy_fn(load_V_tma1, pipeline_v)
+            cute_copy.tma_producer_copy_fn(load_V_tma1, pipeline_v)
             if const_expr(self.v_tma_plane_count > 1)
             else None
         )
         load_V_tma2 = (
-            copy_utils.tma_producer_copy_fn(load_V_tma2, pipeline_v)
+            cute_copy.tma_producer_copy_fn(load_V_tma2, pipeline_v)
             if const_expr(self.v_tma_plane_count > 2)
             else None
         )
         load_V_tma3 = (
-            copy_utils.tma_producer_copy_fn(load_V_tma3, pipeline_v)
+            cute_copy.tma_producer_copy_fn(load_V_tma3, pipeline_v)
             if const_expr(self.v_tma_plane_count > 3)
             else None
         )
@@ -3698,10 +3698,10 @@ class PagedForwardKernel:
         if const_expr(self.bf16_minimax_role_specialized_decode):
             if warp_kv_idx == Int32(self.traits.num_warps_kv):
                 cute.arch.setmaxregister_decrease(80)
-                role_k_producer_state = pipeline.make_pipeline_state(
+                role_k_producer_state = cute_pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, self.num_stages
                 )
-                role_v_producer_state = pipeline.make_pipeline_state(
+                role_v_producer_state = cute_pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, self.num_stages
                 )
                 role_prefetch_base = chunk_start
@@ -3900,16 +3900,16 @@ class PagedForwardKernel:
                 d_frag[mma_q, row_slot] = Float32(1.0)
 
         prefetch_base = chunk_start
-        k_producer_state = pipeline.make_pipeline_state(
+        k_producer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.num_stages
         )
-        k_consumer_state = pipeline.make_pipeline_state(
+        k_consumer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
         )
-        v_producer_state = pipeline.make_pipeline_state(
+        v_producer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.num_stages
         )
-        v_consumer_state = pipeline.make_pipeline_state(
+        v_consumer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
         )
         initial_prefetch_stages = (
@@ -5084,9 +5084,9 @@ class PagedForwardKernel:
                         part_d2 = sSyncMD[2, packed_row_local, 1]
                         part_m3 = sSyncMD[3, packed_row_local, 0]
                         part_d3 = sSyncMD[3, packed_row_local, 1]
-                        merged_m = attention_utils.fmax(
-                            attention_utils.fmax(part_m0, part_m1),
-                            attention_utils.fmax(part_m2, part_m3),
+                        merged_m = attention_ops.fmax(
+                            attention_ops.fmax(part_m0, part_m1),
+                            attention_ops.fmax(part_m2, part_m3),
                         )
                         if merged_m != -Float32.inf:
                             scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
@@ -5210,9 +5210,9 @@ class PagedForwardKernel:
                         part_d2 = sSyncMD[2, packed_row_local, 1]
                         part_m3 = sSyncMD[3, packed_row_local, 0]
                         part_d3 = sSyncMD[3, packed_row_local, 1]
-                        merged_m = attention_utils.fmax(
-                            attention_utils.fmax(part_m0, part_m1),
-                            attention_utils.fmax(part_m2, part_m3),
+                        merged_m = attention_ops.fmax(
+                            attention_ops.fmax(part_m0, part_m1),
+                            attention_ops.fmax(part_m2, part_m3),
                         )
                         if merged_m != -Float32.inf:
                             scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
@@ -5325,7 +5325,7 @@ class PagedForwardKernel:
                                     merged_m = part_m
                                     merged_d = part_d
                                 elif part_m != -Float32.inf:
-                                    new_m = attention_utils.fmax(merged_m, part_m)
+                                    new_m = attention_ops.fmax(merged_m, part_m)
                                     merged_d = Float32(
                                         merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
                                         + part_d * _exp2_approx_ftz_f32(part_m - new_m)
@@ -5440,7 +5440,7 @@ class PagedForwardKernel:
                                         merged_m = part_m
                                         merged_d = part_d
                                     elif part_m != -Float32.inf:
-                                        new_m = attention_utils.fmax(merged_m, part_m)
+                                        new_m = attention_ops.fmax(merged_m, part_m)
                                         merged_d = Float32(
                                             merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
                                             + part_d * _exp2_approx_ftz_f32(part_m - new_m)
@@ -5743,7 +5743,7 @@ class PagedFp8DecodeRawForwardKernel:
         self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim
         self.kv_tma_copy_bytes_k = self.k_bytes
         self.kv_tma_copy_bytes_v = self.v_bytes
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -5945,16 +5945,16 @@ class PagedFp8DecodeRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             (0, 1, None),
         )
-        load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
         )
-        load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(
+        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
         )
-        load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
         )
-        load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(
+        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
         )
         if warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
@@ -6028,8 +6028,8 @@ class PagedFp8DecodeRawForwardKernel:
             m_frag[0, row_slot] = Float32(-Float32.inf)
             d_frag[0, row_slot] = Float32(1.0)
 
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
         tile_base = Int32(0)
         if warp_linear_idx == Int32(0):
             _issue_paged_kv_tma_copy_2planes_tma_single_stage(
@@ -6270,7 +6270,7 @@ class PagedFp8DecodeRawForwardKernel:
                             merged_m = part_m
                             merged_d = part_d
                         elif part_m != -Float32.inf:
-                            new_m = attention_utils.fmax(merged_m, part_m)
+                            new_m = attention_ops.fmax(merged_m, part_m)
                             merged_d = Float32(
                                 merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
                                 + part_d * _exp2_approx_ftz_f32(part_m - new_m)
@@ -6372,7 +6372,7 @@ class PagedBf16ExtendRawForwardKernel:
         self.kv_plane_total_bytes = self.num_stages * self.kv_plane_stage_bytes
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * self.head_dim_qk * 2
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * self.head_dim_vo * 2
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -6609,14 +6609,14 @@ class PagedBf16ExtendRawForwardKernel:
         gVTma1 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
         gVTma2 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 2, None))
         gVTma3 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 3, None))
-        load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
-        load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
-        load_K_tma2, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2)
-        load_K_tma3, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3)
-        load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
-        load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
-        load_V_tma2, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2)
-        load_V_tma3, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3)
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
+        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
+        load_K_tma2, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2)
+        load_K_tma3, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3)
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
+        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
+        load_V_tma2, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2)
+        load_V_tma3, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3)
         if warp_q_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
@@ -6693,8 +6693,8 @@ class PagedBf16ExtendRawForwardKernel:
                 m_frag[mma_q, row_slot] = Float32(-Float32.inf)
                 d_frag[mma_q, row_slot] = Float32(1.0)
 
-        producer_state = pipeline.PipelineStateSimple(self.num_stages, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(self.num_stages, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
         tile_base = chunk_start
         if tile_base < chunk_end and warp_q_idx == Int32(0):
             _issue_paged_kv_tma_copy_4planes_tma_manual(
@@ -7091,7 +7091,7 @@ class PagedFp8ExtendRawForwardKernel:
         self.kv_plane_total_bytes = self.num_stages * self.kv_plane_stage_bytes
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * self.head_dim_qk
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * self.head_dim_vo
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -7307,10 +7307,10 @@ class PagedFp8ExtendRawForwardKernel:
         gKTma1 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
         gVTma0 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 0, None))
         gVTma1 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
-        load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
-        load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
-        load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
-        load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
+        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
+        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
         if warp_q_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
@@ -7391,8 +7391,8 @@ class PagedFp8ExtendRawForwardKernel:
             if const_expr(mVDescale is not None and len(mVDescale.shape) == 1)
             else (mVDescale[request_idx, kv_head_idx] if const_expr(mVDescale is not None) else Float32(1.0))
         )
-        producer_state = pipeline.PipelineStateSimple(self.num_stages, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(self.num_stages, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
         tile_base = chunk_start
         if tile_base < chunk_end and warp_q_idx == Int32(0):
             _issue_paged_kv_tma_copy_2planes_tma_manual(

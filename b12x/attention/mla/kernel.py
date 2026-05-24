@@ -16,7 +16,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -221,7 +221,7 @@ def _warp_allreduce_sum(value: Float32) -> Float32:
 @cute.jit
 def _warp_allreduce_max(value: Float32) -> Float32:
     for shift in cutlass.range_constexpr(5):
-        value = attention_utils.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift))
+        value = attention_ops.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift))
     return value
 
 
@@ -1570,19 +1570,19 @@ def _update_softmax_stats_b2(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_utils.fmax(
-                attention_utils.fmax(
+            m_local = attention_ops.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 0],
                     score_frag[0, mma_kv, row_slot * 2 + 1],
                 ),
-                attention_utils.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 4],
                     score_frag[0, mma_kv, row_slot * 2 + 5],
                 ),
             )
-            m_new = attention_utils.fmax(m_new, m_local)
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+            m_new = attention_ops.fmax(m_new, m_local)
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
         scale_term = (
             Float32(1.0)
@@ -1631,19 +1631,19 @@ def _update_softmax_stats_b1(
     m_prev = Float32(m_frag[0, 0])
     m_new = Float32(m_prev)
     for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_utils.fmax(
-            attention_utils.fmax(
+        m_local = attention_ops.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 0],
                 score_frag[0, mma_kv, 1],
             ),
-            attention_utils.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 4],
                 score_frag[0, mma_kv, 5],
             ),
         )
-        m_new = attention_utils.fmax(m_new, m_local)
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+        m_new = attention_ops.fmax(m_new, m_local)
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
     scale_term = (
         Float32(1.0)
@@ -1767,19 +1767,19 @@ def _update_softmax_rescale_and_p_b1(
     m_prev = Float32(m_frag[0, 0])
     m_new = Float32(m_prev)
     for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_utils.fmax(
-            attention_utils.fmax(
+        m_local = attention_ops.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 0],
                 score_frag[0, mma_kv, 1],
             ),
-            attention_utils.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 4],
                 score_frag[0, mma_kv, 5],
             ),
         )
-        m_new = attention_utils.fmax(m_new, m_local)
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+        m_new = attention_ops.fmax(m_new, m_local)
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
     scale_term = (
         Float32(1.0)
@@ -1856,19 +1856,19 @@ def _update_softmax_rescale_and_p_b2(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_utils.fmax(
-                attention_utils.fmax(
+            m_local = attention_ops.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 0],
                     score_frag[0, mma_kv, row_slot * 2 + 1],
                 ),
-                attention_utils.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 4],
                     score_frag[0, mma_kv, row_slot * 2 + 5],
                 ),
             )
-            m_new = attention_utils.fmax(m_new, m_local)
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+            m_new = attention_ops.fmax(m_new, m_local)
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
         scale_term = (
             Float32(1.0)
@@ -1958,19 +1958,19 @@ def _update_softmax_and_p_b1(
     m_prev = Float32(m_frag[0, 0])
     m_new = Float32(m_prev)
     for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_utils.fmax(
-            attention_utils.fmax(
+        m_local = attention_ops.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 0],
                 score_frag[0, mma_kv, 1],
             ),
-            attention_utils.fmax(
+            attention_ops.fmax(
                 score_frag[0, mma_kv, 4],
                 score_frag[0, mma_kv, 5],
             ),
         )
-        m_new = attention_utils.fmax(m_new, m_local)
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+        m_new = attention_ops.fmax(m_new, m_local)
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
     scale_term = (
         Float32(1.0)
@@ -2022,19 +2022,19 @@ def _update_softmax_and_p_b2(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_utils.fmax(
-                attention_utils.fmax(
+            m_local = attention_ops.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 0],
                     score_frag[0, mma_kv, row_slot * 2 + 1],
                 ),
-                attention_utils.fmax(
+                attention_ops.fmax(
                     score_frag[0, mma_kv, row_slot * 2 + 4],
                     score_frag[0, mma_kv, row_slot * 2 + 5],
                 ),
             )
-            m_new = attention_utils.fmax(m_new, m_local)
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+            m_new = attention_ops.fmax(m_new, m_local)
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
         scale_term = (
             Float32(1.0)
@@ -4399,7 +4399,7 @@ class SparseMLAKernel:
             head_tile_start,
             Int32(0),
             token_end,
-            Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+            Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
             output,
             q_idx,
@@ -4510,7 +4510,7 @@ def run_sparse_mla_kernel(
     _cq = getattr(workspace, "_contract_q", None)
     _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
     _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
+    _cnt = getattr(workspace, "_contract_indexer_cache_seqlens", None)
     _co = getattr(workspace, "_contract_output", None)
     cache_key = (
         _tensor_meta_key(_cq if _cq is not None else q_u32),

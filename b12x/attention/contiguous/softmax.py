@@ -7,7 +7,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 from b12x.attention.contiguous import layout_utils
-from b12x.attention import utils
+from b12x.attention._cute import ops as cute_ops
 from b12x.attention.contiguous.cute_dsl_utils import ParamsBase
 
 
@@ -41,12 +41,12 @@ class Softmax(ParamsBase):
     def _compute_row_max(
         self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None
     ) -> Float32:
-        return utils.fmax_reduce(acc_S_row, init_val, arch=self.arch)
+        return cute_ops.fmax_reduce(acc_S_row, init_val, arch=self.arch)
 
     def _compute_row_sum(
         self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 | None = None
     ) -> Float32:
-        return utils.fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
+        return cute_ops.fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
 
     def online_softmax(
         self,
@@ -59,7 +59,7 @@ class Softmax(ParamsBase):
 
         for r in range(int(self.num_rows)):
             acc_S_row = acc_S_mn[r, None].load()
-            row_max_cur = utils.fmax_reduce(
+            row_max_cur = cute_ops.fmax_reduce(
                 acc_S_row,
                 init_val=self.row_max[r] if cutlass.const_expr(not is_first) else None,
                 arch=self.arch,
@@ -77,14 +77,14 @@ class Softmax(ParamsBase):
                 fastmath=True,
             )
             if cutlass.const_expr(is_first):
-                acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=self.arch)
+                acc_S_row_sum = cute_ops.fadd_reduce(acc_S_row_exp, init_val=None, arch=self.arch)
                 row_scale[r] = 1.0
             else:
                 row_scale[r] = cute.math.exp2(
                     (row_max_prev - row_max_cur) * self.scale_log2,
                     fastmath=True,
                 )
-                acc_S_row_sum = utils.fadd_reduce(
+                acc_S_row_sum = cute_ops.fadd_reduce(
                     acc_S_row_exp,
                     init_val=self.row_sum[r] * row_scale[r],
                     arch=self.arch,
@@ -100,7 +100,7 @@ class Softmax(ParamsBase):
     ) -> cute.Tensor:
         if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
             assert cute.size(sink_val) == self.num_rows
-        self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
+        self.row_sum.store(cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment(self._row_layout(), Float32)
 
         for r in range(int(self.num_rows)):

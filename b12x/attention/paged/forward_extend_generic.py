@@ -23,9 +23,9 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
-from b12x.attention import copy_utils
-from b12x.attention import pipeline
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import copy as cute_copy
+from b12x.attention._cute import pipeline as cute_pipeline
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
@@ -679,8 +679,8 @@ def _apply_attention_sink_after_lse_scale(
                 sink_owner = (chunk_start <= causal_k_limit) and (causal_k_limit < chunk_end)
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
-            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_utils.LOG2_E)
-            new_m = attention_utils.fmax(old_m, sink_m)
+            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
+            new_m = attention_ops.fmax(old_m, sink_m)
             old_scale = Float32(0.0) if old_m == -Float32.inf else _exp2_approx_ftz_f32(old_m - new_m)
             sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * old_scale + sink_scale)
@@ -863,7 +863,7 @@ def _donor_update_mdo_states_fp32_pack_p(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
-            m_new = attention_utils.fmax(m_new, acc_S_mn[row_slot, c])
+            m_new = attention_ops.fmax(m_new, acc_S_mn[row_slot, c])
         m_new = cute.arch.warp_reduction_max(m_new, threads_in_group=4)
 
         scale_term = (
@@ -2129,19 +2129,19 @@ def _literal_update_mdo_states_fp32_pack_p(
             m_prev = Float32(m_frag[mma_q, row_slot])
             m_new = Float32(m_prev)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                m_local = attention_utils.fmax(
-                    attention_utils.fmax(
+                m_local = attention_ops.fmax(
+                    attention_ops.fmax(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_utils.fmax(
+                    attention_ops.fmax(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_utils.fmax(m_new, m_local)
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+                m_new = attention_ops.fmax(m_new, m_local)
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
             scale_term = (
                 Float32(1.0)
@@ -2367,7 +2367,7 @@ class PagedForwardKernel:
             and traits.num_warps_kv == 1
             and traits.num_mma_kv % 2 == 0
         )
-        self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -2887,8 +2887,8 @@ class PagedForwardKernel:
             cute.arch.mbarrier_init(mbar_ptr_V, Int32(1))
         cute.arch.sync_threads()
 
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
         self._issue_paged_kv_tma_copy_2planes_fp8_raw(
             cute.flatten(mVTmaDescPtrs),
             Int32(0),
@@ -3308,7 +3308,7 @@ class PagedForwardKernel:
                 cutlass.pipeline.Agent.Thread
             )
             pipeline_k = (
-                pipeline.PipelineTmaAsync.create(
+                cute_pipeline.PipelineTmaAsync.create(
                     barrier_storage=mbar_ptr_K,
                     num_stages=self.num_stages,
                     producer_group=pipeline_kv_producer_group,
@@ -3320,7 +3320,7 @@ class PagedForwardKernel:
                 else None
             )
             pipeline_v = (
-                pipeline.PipelineTmaAsync.create(
+                cute_pipeline.PipelineTmaAsync.create(
                     barrier_storage=mbar_ptr_V,
                     num_stages=self.num_stages,
                     producer_group=pipeline_kv_producer_group,
@@ -3402,35 +3402,35 @@ class PagedForwardKernel:
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
-                load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(
+                load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(
                     tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
                 )
-                load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(
+                load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(
                     tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
                 )
                 load_K_tma2, _, _ = (
-                    copy_utils.tma_get_copy_fn(
+                    cute_copy.tma_get_copy_fn(
                         tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2
                     )
                     if const_expr(self.kv_tma_plane_count > 2)
                     else (None, None, None)
                 )
                 load_K_tma3, _, _ = (
-                    copy_utils.tma_get_copy_fn(
+                    cute_copy.tma_get_copy_fn(
                         tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3
                     )
                     if const_expr(self.kv_tma_plane_count > 2)
                     else (None, None, None)
                 )
-                load_K_tma0 = copy_utils.tma_producer_copy_fn(load_K_tma0, pipeline_k)
-                load_K_tma1 = copy_utils.tma_producer_copy_fn(load_K_tma1, pipeline_k)
+                load_K_tma0 = cute_copy.tma_producer_copy_fn(load_K_tma0, pipeline_k)
+                load_K_tma1 = cute_copy.tma_producer_copy_fn(load_K_tma1, pipeline_k)
                 load_K_tma2 = (
-                    copy_utils.tma_producer_copy_fn(load_K_tma2, pipeline_k)
+                    cute_copy.tma_producer_copy_fn(load_K_tma2, pipeline_k)
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
                 load_K_tma3 = (
-                    copy_utils.tma_producer_copy_fn(load_K_tma3, pipeline_k)
+                    cute_copy.tma_producer_copy_fn(load_K_tma3, pipeline_k)
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
@@ -3470,35 +3470,35 @@ class PagedForwardKernel:
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
-                load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(
+                load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(
                     tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
                 )
-                load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(
+                load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(
                     tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
                 )
                 load_V_tma2, _, _ = (
-                    copy_utils.tma_get_copy_fn(
+                    cute_copy.tma_get_copy_fn(
                         tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2
                     )
                     if const_expr(self.kv_tma_plane_count > 2)
                     else (None, None, None)
                 )
                 load_V_tma3, _, _ = (
-                    copy_utils.tma_get_copy_fn(
+                    cute_copy.tma_get_copy_fn(
                         tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3
                     )
                     if const_expr(self.kv_tma_plane_count > 2)
                     else (None, None, None)
                 )
-                load_V_tma0 = copy_utils.tma_producer_copy_fn(load_V_tma0, pipeline_v)
-                load_V_tma1 = copy_utils.tma_producer_copy_fn(load_V_tma1, pipeline_v)
+                load_V_tma0 = cute_copy.tma_producer_copy_fn(load_V_tma0, pipeline_v)
+                load_V_tma1 = cute_copy.tma_producer_copy_fn(load_V_tma1, pipeline_v)
                 load_V_tma2 = (
-                    copy_utils.tma_producer_copy_fn(load_V_tma2, pipeline_v)
+                    cute_copy.tma_producer_copy_fn(load_V_tma2, pipeline_v)
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
                 load_V_tma3 = (
-                    copy_utils.tma_producer_copy_fn(load_V_tma3, pipeline_v)
+                    cute_copy.tma_producer_copy_fn(load_V_tma3, pipeline_v)
                     if const_expr(self.kv_tma_plane_count > 2)
                     else None
                 )
@@ -3728,10 +3728,10 @@ class PagedForwardKernel:
         preload_count = 0
         preload_stage_idx = Int32(0)
         if const_expr(self.use_paged_k_tma or self.use_paged_v_tma):
-            kv_producer_state = pipeline.make_pipeline_state(
+            kv_producer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Producer, self.num_stages
             )
-            kv_consumer_state = pipeline.make_pipeline_state(
+            kv_consumer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
             )
         else:
@@ -4933,7 +4933,7 @@ class PagedForwardKernel:
                                     merged_m = part_m
                                     merged_d = part_d
                                 elif part_m != -Float32.inf:
-                                    new_m = attention_utils.fmax(merged_m, part_m)
+                                    new_m = attention_ops.fmax(merged_m, part_m)
                                     merged_d = Float32(
                                         merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
                                         + part_d * _exp2_approx_ftz_f32(part_m - new_m)
@@ -5263,8 +5263,8 @@ class PagedFp8RawPlaneDumpKernel:
             cute.arch.mbarrier_init(mbar_ptr_V, Int32(1))
         cute.arch.sync_threads()
 
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
         _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
             cute.flatten(mVTmaDescPtrs),
             Int32(0),
@@ -5329,7 +5329,7 @@ class PagedFp8ExtendRawForwardKernel:
         self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim
         self.kv_tma_copy_bytes_k = self.k_bytes
         self.kv_tma_copy_bytes_v = self.v_bytes
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
+        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -5600,8 +5600,8 @@ class PagedFp8ExtendRawForwardKernel:
             if const_expr(mVDescale is not None and len(mVDescale.shape) == 1)
             else (mVDescale[request_idx, kv_head_idx] if const_expr(mVDescale is not None) else Float32(1.0))
         )
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
         tile_base = chunk_start
         if tile_base < chunk_end and warp_q_idx == Int32(0):
             self._issue_paged_kv_tma_copy_2planes_fp8_raw(

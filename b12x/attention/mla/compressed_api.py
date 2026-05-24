@@ -22,7 +22,7 @@ from .split import (
     run_compressed_mla_split_decode_forward,
     run_sparse_mla_split_decode_merge,
 )
-from .workspace import B12XAttentionWorkspace
+from b12x.attention.workspace import B12XAttentionWorkspace
 
 
 _LN2 = math.log(2.0)

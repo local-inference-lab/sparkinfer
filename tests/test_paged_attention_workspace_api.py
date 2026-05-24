@@ -9,11 +9,11 @@ import torch
 
 from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_native_fp8_attention_mma_flags
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
-from b12x.attention.reference import paged_attention_reference
+from b12x.attention.paged.reference import paged_attention_reference
 from b12x.integration.attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,
-    infer_paged_attention_mode,
+    infer_paged_mode,
 )
 
 from .helpers import require_sm120
@@ -136,7 +136,7 @@ def _make_workspace(
     use_cuda_graph: bool = False,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
-        mode=infer_paged_attention_mode(cu_seqlens_q),
+        mode=infer_paged_mode(cu_seqlens_q),
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -651,7 +651,13 @@ def test_paged_fixed_capacity_extend_reuses_larger_eager_launcher() -> None:
     workspace.run(q_large, k_cache, v_cache, output=output_large)
 
     traits = select_paged_forward_traits_from_plan(workspace.plan)
-    forward_kernel = _build_extend_forward_kernel(traits, False, False)
+    forward_kernel = _build_extend_forward_kernel(
+        traits,
+        False,
+        False,
+        workspace.plan.window_left,
+        False,
+    )
     first_launcher_count = len(getattr(forward_kernel, "_eager_host_launchers", {}))
     assert first_launcher_count == 1
 
@@ -745,8 +751,8 @@ def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
         seed=35,
     )
 
-    assert infer_paged_attention_mode(cu_seqlens_decode) == "decode"
-    assert infer_paged_attention_mode(cu_seqlens_extend) == "extend"
+    assert infer_paged_mode(cu_seqlens_decode) == "decode"
+    assert infer_paged_mode(cu_seqlens_extend) == "extend"
 
 
 def test_decode_prepare_uses_small_q_tile() -> None:
@@ -3000,7 +3006,13 @@ def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_sha
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
     traits = select_paged_forward_traits_from_plan(workspace.plan)
-    kernel = _build_extend_forward_kernel(traits, False, False)
+    kernel = _build_extend_forward_kernel(
+        traits,
+        False,
+        False,
+        workspace.plan.window_left,
+        False,
+    )
     cache = getattr(kernel, "_eager_host_launchers", None)
     assert cache is not None
     assert len(cache) == 1

@@ -6,7 +6,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass._mlir import ir
 
-from b12x.attention import utils
+from b12x.attention._cute import ops as cute_ops
 from b12x.attention.contiguous.cute_dsl_utils import ParamsBase
 
 
@@ -198,7 +198,7 @@ class SingleTileVarlenScheduler:
         params = self.params
         lane_idx = cute.arch.lane_idx()
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
-        num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
+        num_m_blocks_cumulative = cute_ops.warp_prefix_sum(num_m_blocks, lane_idx)
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         group_end_tile = m_blocks_in_group * params.num_head
         block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
@@ -210,7 +210,7 @@ class SingleTileVarlenScheduler:
                 group_end_tile = next_tile_idx + 1
             else:
                 num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-                num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
+                num_m_blocks_cumulative = cute_ops.warp_prefix_sum(num_m_blocks, lane_idx)
                 m_blocks_in_group = cute.arch.shuffle_sync(
                     num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
                 )

@@ -17,9 +17,9 @@ from cutlass.cutlass_dsl import Int64, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention import copy_utils
-from b12x.attention import pipeline
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import copy as cute_copy
+from b12x.attention._cute import pipeline as cute_pipeline
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
@@ -507,10 +507,10 @@ def _compute_mxfp8_tile_partials(
         w1 = Float32(s_w[head1])
     col0 = col_pair_base
     col1 = col_pair_base + Int32(1)
-    partial0 = Float32(attention_utils.fmax(q0_acc, Float32(0.0)) * w0)
-    partial0 = Float32(partial0 + attention_utils.fmax(q2_acc, Float32(0.0)) * w1)
-    partial1 = Float32(attention_utils.fmax(q1_acc, Float32(0.0)) * w0)
-    partial1 = Float32(partial1 + attention_utils.fmax(q3_acc, Float32(0.0)) * w1)
+    partial0 = Float32(attention_ops.fmax(q0_acc, Float32(0.0)) * w0)
+    partial0 = Float32(partial0 + attention_ops.fmax(q2_acc, Float32(0.0)) * w1)
+    partial1 = Float32(attention_ops.fmax(q1_acc, Float32(0.0)) * w0)
+    partial1 = Float32(partial1 + attention_ops.fmax(q3_acc, Float32(0.0)) * w1)
     partial0 = _reduce_column_pair_sum(partial0)
     partial1 = _reduce_column_pair_sum(partial1)
     if group_id == Int32(0):
@@ -711,7 +711,7 @@ class SparseNSAPagedLogitsKernel:
                 stride=(self.num_q_head_tiles, 1),
             )
         )
-        load_k_tma, _, _ = copy_utils.tma_get_copy_fn(
+        load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_k,
             0,
             cute.make_layout(1),
@@ -747,8 +747,8 @@ class SparseNSAPagedLogitsKernel:
                 w_linear += Int32(_PAGED_THREADS_PER_CTA)
             cute.arch.sync_threads()
 
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
             token_group = warp_idx // Int32(self.num_q_head_tiles)
             work_idx = cta_idx
@@ -1083,7 +1083,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 stride=(self.num_q_head_tiles, 1),
             )
         )
-        load_k_tma, _, _ = copy_utils.tma_get_copy_fn(
+        load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_k,
             0,
             cute.make_layout(1),
@@ -1124,8 +1124,8 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 w_linear += Int32(_PAGED_THREADS_PER_CTA)
             cute.arch.sync_threads()
 
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
             token_group = warp_idx // Int32(self.num_q_head_tiles)
             page_col = interval_page_start + cta_lane_idx
@@ -1340,7 +1340,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                 stride=(self.num_q_head_tiles, 1),
             )
         )
-        load_k_tma, _, _ = copy_utils.tma_get_copy_fn(
+        load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_k,
             0,
             cute.make_layout(1),
@@ -1357,8 +1357,8 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
             token_group = warp_idx // Int32(self.num_q_head_tiles)
             current_q_idx = start_q_idx
@@ -1577,7 +1577,7 @@ def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[tor
     return k_quant_bytes, k_scales
 
 
-def clear_sparse_nsa_indexer_kernel_cache() -> None:
+def clear_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_kernel.cache_clear()
     _build_sparse_nsa_paged_tiled_kernel.cache_clear()
     _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
@@ -1587,7 +1587,7 @@ def clear_sparse_nsa_indexer_kernel_cache() -> None:
         cache.clear()
 
 
-def supports_sparse_nsa_paged_logits_kernel(
+def supports_paged_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1638,7 +1638,7 @@ def supports_sparse_nsa_paged_logits_kernel(
     return True
 
 
-def run_sparse_nsa_paged_logits_kernel(
+def run_paged_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1652,7 +1652,7 @@ def run_sparse_nsa_paged_logits_kernel(
     workspace=None,
     preinitialize_invalid_logits: bool = True,
 ) -> torch.Tensor:
-    if not supports_sparse_nsa_paged_logits_kernel(
+    if not supports_paged_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1694,7 +1694,7 @@ def run_sparse_nsa_paged_logits_kernel(
         device_index,
     )
     if workspace is not None:
-        staged = workspace.stage_nsa_indexer_paged_decode(
+        staged = workspace.stage_indexer_paged_decode(
             q_fp8=q_fp8,
             weights=weights,
             real_page_table=real_page_table,
@@ -1827,7 +1827,7 @@ def run_sparse_nsa_paged_logits_kernel(
     return logits_view
 
 
-def run_sparse_nsa_paged_tiled_logits_kernel(
+def run_paged_tiled_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1843,7 +1843,7 @@ def run_sparse_nsa_paged_tiled_logits_kernel(
     workspace=None,
     preinitialize_tile_logits: bool = True,
 ) -> torch.Tensor:
-    return _run_sparse_nsa_paged_tiled_logits_kernel_common(
+    return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1863,7 +1863,7 @@ def run_sparse_nsa_paged_tiled_logits_kernel(
     )
 
 
-def run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+def run_paged_windowed_tiled_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1882,7 +1882,7 @@ def run_sparse_nsa_paged_windowed_tiled_logits_kernel(
     preinitialize_tile_logits: bool = True,
     stage_runtime_metadata: bool = True,
 ) -> torch.Tensor:
-    return _run_sparse_nsa_paged_tiled_logits_kernel_common(
+    return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1903,7 +1903,7 @@ def run_sparse_nsa_paged_windowed_tiled_logits_kernel(
     )
 
 
-def _run_sparse_nsa_paged_tiled_logits_kernel_common(
+def _run_paged_tiled_logits_kernel_common(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1929,7 +1929,7 @@ def _run_sparse_nsa_paged_tiled_logits_kernel_common(
         raise ValueError(
             f"paged tiled logits kernel requires tile_block_k={_PAGED_TILED_BLOCK_K}, got {tile_block_k}"
         )
-    if not supports_sparse_nsa_paged_logits_kernel(
+    if not supports_paged_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -2000,7 +2000,7 @@ def _run_sparse_nsa_paged_tiled_logits_kernel_common(
         device_index,
     )
     if workspace is not None and stage_runtime_metadata:
-        staged = workspace.stage_nsa_indexer_paged_tiled_decode(
+        staged = workspace.stage_indexer_paged_tiled_decode(
             q_fp8=q_fp8,
             weights=weights,
             real_page_table=real_page_table,

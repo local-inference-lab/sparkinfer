@@ -11,7 +11,7 @@ from benchmarks.benchmark_paged_attention import (
     _make_uniform_paged_inputs,
     _quantize_paged_kv_cache_global_e4m3,
 )
-from b12x.attention.reference import paged_attention_reference
+from b12x.attention.paged.reference import paged_attention_reference
 from b12x.integration.attention import PagedAttentionWorkspace
 
 from .helpers import require_sm120

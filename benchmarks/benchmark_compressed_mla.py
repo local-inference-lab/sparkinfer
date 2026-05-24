@@ -16,8 +16,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.integration.mla import (
-    B12XAttentionWorkspace,
+from b12x.attention.workspace import B12XAttentionWorkspace
+from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
@@ -25,11 +25,13 @@ from b12x.integration.mla import (
     COMPRESSED_MLA_ROPE_DIM,
     COMPRESSED_MLA_SWA_PAGE_SIZE,
     COMPRESSED_MLA_SWA_TOKENS,
+    compressed_sparse_mla_reference,
+    pack_compressed_mla_kv_cache_reference,
+)
+from b12x.integration.mla import (
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
-    compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
 )
 
 from benchmarks.common import (

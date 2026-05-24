@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from b12x.attention.reference import paged_attention_reference
+from b12x.attention.paged.reference import paged_attention_reference
 from b12x.integration.attention import PagedAttentionWorkspace, clear_attention_caches
 
 from .helpers import require_sm120

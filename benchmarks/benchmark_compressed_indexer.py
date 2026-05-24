@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the generic paged-MQA FP8 indexer logits path."""
+"""Benchmark the compressed-indexer FP8 logits path."""
 
 from __future__ import annotations
 
@@ -8,18 +8,18 @@ import statistics
 
 import torch
 
-from b12x.attention.nsa_indexer import uses_paged_mqa_schedule_metadata
-from b12x.attention.nsa_indexer.kernel import (
-    run_sparse_nsa_paged_windowed_tiled_logits_kernel,
+from b12x.attention.indexer import uses_paged_mqa_schedule
+from b12x.attention.indexer.kernel import (
+    run_paged_windowed_tiled_logits_kernel,
 )
 from b12x.integration import (
     B12XAttentionWorkspace,
-    clear_nsa_indexer_caches,
-    pack_paged_mqa_index_k_cache_reference,
-    paged_mqa_index_decode_dense_topk_fp8,
-    paged_mqa_index_decode_logits_fp8,
-    paged_mqa_index_decode_supertile_topk_fp8,
-    prepare_paged_mqa_indexer_metadata,
+    clear_indexer_caches,
+    pack_compressed_index_k_cache_reference,
+    compressed_index_decode_dense_topk_fp8,
+    compressed_index_decode_logits_fp8,
+    compressed_index_decode_supertile_topk_fp8,
+    prepare_compressed_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
 
@@ -141,7 +141,7 @@ def main() -> None:
         torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(device)
-    index_k_cache = pack_paged_mqa_index_k_cache_reference(
+    index_k_cache = pack_compressed_index_k_cache_reference(
         torch.randn((max_pages_needed * 64, 128), generator=gen, dtype=torch.float32).to(device)
         / 3
     )
@@ -193,13 +193,13 @@ def main() -> None:
     if bench_mode == "supertile-topk":
         build_schedule = False
     else:
-        build_schedule = uses_paged_mqa_schedule_metadata(
+        build_schedule = uses_paged_mqa_schedule(
             q_rows=rows,
             max_pages=page_table_width,
         )
     if build_schedule and workspace.paged_indexer_schedule_metadata_runtime is not None:
         schedule_out = workspace.paged_indexer_schedule_metadata_runtime
-    metadata = prepare_paged_mqa_indexer_metadata(
+    metadata = prepare_compressed_indexer_metadata(
         real_page_table=page_table,
         cache_seqlens_int32=seqlens,
         expected_num_q_heads=num_heads,
@@ -208,7 +208,7 @@ def main() -> None:
         shared_page_table=page_stride == 0,
     )
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     if bench_mode in {"supertile-logits", "supertile-topk"}:
         workspace.prewarm_paged_indexer_tiled_topk()
         workspace.prewarm_paged_indexer_tiled_scorer(
@@ -218,7 +218,7 @@ def main() -> None:
 
     def run() -> torch.Tensor:
         if bench_mode == "logits":
-            return paged_mqa_index_decode_logits_fp8(
+            return compressed_index_decode_logits_fp8(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -226,7 +226,7 @@ def main() -> None:
                 workspace=workspace,
             )
         if bench_mode == "dense-topk":
-            return paged_mqa_index_decode_dense_topk_fp8(
+            return compressed_index_decode_dense_topk_fp8(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -239,7 +239,7 @@ def main() -> None:
             tile_logits = workspace.get_indexer_extend_tile_logits()
             if tile_logits is None:
                 raise RuntimeError("supertile-logits requires tiled-logits workspace")
-            return run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+            return run_paged_windowed_tiled_logits_kernel(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -254,7 +254,7 @@ def main() -> None:
                 contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
                 stage_runtime_metadata=False,
             )
-        return paged_mqa_index_decode_supertile_topk_fp8(
+        return compressed_index_decode_supertile_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -276,7 +276,7 @@ def main() -> None:
         timing_mode = "graph"
 
     print(
-        "paged_mqa_indexer "
+        "compressed_indexer "
         f"mode={bench_mode} timing={timing_mode} rows={rows} indexer_heads={num_heads} "
         f"page_table_width={page_table_width} seq_len={seq_len} "
         f"page_stride={page_stride} topk={topk} supertile_k={supertile_k} "

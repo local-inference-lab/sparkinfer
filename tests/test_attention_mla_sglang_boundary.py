@@ -152,7 +152,7 @@ def _make_fake_backend(
             batch: int | None = None,
             max_kv_rows: int | None = None,
         ):
-            from b12x.integration.mla import B12XAttentionWorkspace
+            from b12x.attention.workspace import B12XAttentionWorkspace
 
             normalized_mode = "verify" if mode == "target_verify" else mode
             if normalized_mode not in ("decode", "extend", "verify", "draft_extend"):

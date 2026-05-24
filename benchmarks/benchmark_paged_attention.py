@@ -15,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.attention.reference import paged_attention_reference
+from b12x.attention.paged.reference import paged_attention_reference
 from b12x.integration.attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,

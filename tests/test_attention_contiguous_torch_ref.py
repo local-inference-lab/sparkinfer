@@ -277,7 +277,7 @@ def test_contiguous_attention_matches_sglang_torch_ref(
     window_size: Tuple[int, int],
 ) -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous.integration import (
+    from b12x.attention.contiguous import (
         allocate_attention_workspace_for_plan,
         b12x_attention_forward,
         clear_attention_caches,
@@ -319,7 +319,7 @@ def test_contiguous_attention_matches_sglang_torch_ref(
 @torch.inference_mode()
 def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous.integration import (
+    from b12x.attention.contiguous import (
         allocate_attention_workspace_for_plan,
         b12x_attention_forward,
         clear_attention_caches,
@@ -378,7 +378,7 @@ def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sink
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous.integration import (
+    from b12x.attention.contiguous import (
         allocate_varlen_attention_workspace_for_plan,
         b12x_varlen_attention_forward,
         clear_attention_caches,
@@ -449,7 +449,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous.integration import (
+    from b12x.attention.contiguous import (
         allocate_varlen_attention_workspace_for_plan,
         b12x_varlen_attention_forward,
         clear_attention_caches,
@@ -520,7 +520,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_a
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous.integration import (
+    from b12x.attention.contiguous import (
         allocate_varlen_attention_workspace_for_plan,
         b12x_varlen_attention_forward,
         clear_attention_caches,

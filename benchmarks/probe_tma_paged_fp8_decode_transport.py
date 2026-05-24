@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention import pipeline
+from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention.paged.forward_paged import (
     _async_copy_q_tile_permuted_128b_fp8_decode_impl,
     _issue_paged_kv_tma_copy_2planes_fp8_raw_impl,
@@ -159,8 +159,8 @@ class RawPtxPagedFp8DecodeTransportProbe:
                 cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+        producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+        consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
         tile_base = page_index * Int32(_ROWS)
 
         if warp_kv_idx == Int32(0):

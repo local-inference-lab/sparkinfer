@@ -21,7 +21,7 @@ from .split import (
     run_sparse_mla_split_decode,
     select_sparse_mla_split_decode_config,
 )
-from .workspace import B12XAttentionWorkspace
+from b12x.attention.workspace import B12XAttentionWorkspace
 
 
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"

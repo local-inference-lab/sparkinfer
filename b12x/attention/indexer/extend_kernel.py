@@ -16,8 +16,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
-from b12x.attention import pipeline
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import pipeline as cute_pipeline
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
@@ -730,8 +730,8 @@ class SparseNSAExtendLogitsKernel:
                 s_tile_live[Int32(0)] = ballot
         cute.arch.sync_threads()
         if s_tile_live[Int32(0)] != Int32(0):
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
                 full_mbar_ptr = mbar_ptr_k + producer_state.index
                 with cute.arch.elect_one():
@@ -789,7 +789,7 @@ class SparseNSAExtendLogitsKernel:
                     if q_local < Int32(_BLOCK_Q):
                         acc_frag[0, 0, reg_id] = Float32(
                             acc_frag[0, 0, reg_id]
-                            + attention_utils.fmax(score_frag[0, 0, reg_id], Float32(0.0))
+                            + attention_ops.fmax(score_frag[0, 0, reg_id], Float32(0.0))
                             * (
                         Float32(weights[q_tile_base + q_local, head_idx])
                         if q_tile_base + q_local < valid_q_rows
@@ -1237,8 +1237,8 @@ class SparseNSAExtendLogitsPrefillKernel:
             q_smem_base = k_perm_base_addr + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM)
             w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * _PREFILL_Q_HEADS_BATCH)
             # TMA load K-tile (256 rows x 128 bytes = 32 KB)
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
                 full_mbar_ptr = mbar_ptr_k + producer_state.index
                 with cute.arch.elect_one():
@@ -1364,7 +1364,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                                 w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                 acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                     acc_frag[Int32(0), mma_kv, reg_id]
-                                    + attention_utils.fmax(
+                                    + attention_ops.fmax(
                                         score_frag[Int32(0), mma_kv, reg_id],
                                         Float32(0.0),
                                     )
@@ -1601,8 +1601,8 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
         if s_tile_live[Int32(0)] != Int32(0):
             q_smem_base = k_perm_base_addr + Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM)
-            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
                 full_mbar_ptr = mbar_ptr_k + producer_state.index
                 with cute.arch.elect_one():
@@ -1717,7 +1717,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                 acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                     acc_frag[Int32(0), mma_kv, reg_id]
-                                    + attention_utils.fmax(
+                                    + attention_ops.fmax(
                                         score_frag[Int32(0), mma_kv, reg_id],
                                         Float32(0.0),
                                     )
@@ -1929,7 +1929,7 @@ def _prefill512_unsupported_reasons(
     return reasons
 
 
-def resolve_sparse_nsa_extend_prefill_block_k(
+def resolve_extend_prefill_block_k(
     *,
     valid_q_rows: int,
     k_rows: int,
@@ -1979,7 +1979,7 @@ def resolve_sparse_nsa_extend_prefill_block_k(
     )
 
 
-def supports_sparse_nsa_extend_logits_kernel(
+def supports_extend_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -2026,7 +2026,7 @@ def supports_sparse_nsa_extend_logits_kernel(
     return True
 
 
-def run_sparse_nsa_extend_logits_kernel(
+def run_extend_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -2041,7 +2041,7 @@ def run_sparse_nsa_extend_logits_kernel(
     tile_k_offset: int = 0,
     tile_num_k_tiles: int | None = None,
 ) -> torch.Tensor:
-    if not supports_sparse_nsa_extend_logits_kernel(
+    if not supports_extend_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,
         k_quant=k_quant,
@@ -2063,7 +2063,7 @@ def run_sparse_nsa_extend_logits_kernel(
     # Dispatch: use prefill kernels for large q_len, decode kernel otherwise.
     # BK=512 is deliberately limited to target-ish long-prefill shapes; other
     # shapes keep the validated BK=256 prefill tile.
-    _prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+    _prefill_block_k = resolve_extend_prefill_block_k(
         valid_q_rows=valid_q_rows,
         k_rows=k_rows,
         num_heads=int(q_fp8.shape[1]),
@@ -2122,7 +2122,7 @@ def run_sparse_nsa_extend_logits_kernel(
         preinitialize_invalid_logits = True
 
     if workspace is not None:
-        staged = workspace.stage_nsa_indexer_extend(
+        staged = workspace.stage_indexer_extend(
             q_fp8=q_fp8,
             weights=weights,
             k_quant=k_quant,

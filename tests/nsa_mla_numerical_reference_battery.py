@@ -24,26 +24,30 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from b12x.attention.workspace import B12XAttentionWorkspace  # noqa: E402
+from b12x.attention.mla.reference import (  # noqa: E402
+    pack_mla_kv_cache_reference,
+    sparse_mla_reference,
+)
+from b12x.attention.indexer.reference import (  # noqa: E402
+    extend_logits_reference,
+    pack_index_k_cache_reference,
+    paged_decode_logits_reference,
+)
 from b12x.integration.mla import (  # noqa: E402
-    B12XAttentionWorkspace,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
-    pack_mla_kv_cache_reference,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
-    sparse_mla_reference,
 )
-from b12x.integration.nsa_indexer import (  # noqa: E402
-    NSAIndexerExtendLogitsMetadata,
-    NSAIndexerPagedDecodeMetadata,
-    clear_nsa_indexer_caches,
-    get_paged_mqa_logits_metadata,
-    pack_nsa_index_k_cache_reference,
-    sparse_nsa_extend_logits_reference,
-    sparse_nsa_index_decode_logits_paged,
-    sparse_nsa_index_extend_logits,
-    sparse_nsa_paged_logits_reference,
+from b12x.integration.indexer import (  # noqa: E402
+    IndexerExtendMetadata,
+    IndexerPagedDecodeMetadata,
+    clear_indexer_caches,
+    build_paged_mqa_schedule_metadata,
+    paged_decode_logits,
+    extend_logits,
 )
 
 
@@ -372,7 +376,7 @@ def _make_random_index_cache(
         generator=_cpu_generator(seed),
         dtype=torch.float32,
     ) / 3.0
-    return pack_nsa_index_k_cache_reference(k_cpu).to(device=device)
+    return pack_index_k_cache_reference(k_cpu).to(device=device)
 
 
 def _make_structured_index_cache(
@@ -393,7 +397,7 @@ def _make_structured_index_cache(
             page = int(real_page_table_cpu[row, pos // PAGE_SIZE].item())
             physical = page * PAGE_SIZE + (pos % PAGE_SIZE)
             k_cpu[physical].fill_(float(values[pos].item()))
-    return pack_nsa_index_k_cache_reference(k_cpu).to(device=device)
+    return pack_index_k_cache_reference(k_cpu).to(device=device)
 
 
 def _make_structured_index_rows(
@@ -760,12 +764,12 @@ def _run_indexer_paged_eager(case: IndexerPagedCase, device: torch.device) -> di
         mla_heads=1,
         index_heads=case.index_heads,
     )
-    metadata = NSAIndexerPagedDecodeMetadata(
+    metadata = IndexerPagedDecodeMetadata(
         real_page_table=real_page_table,
         cache_seqlens_int32=seqlens,
-        paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(seqlens.contiguous(), PAGE_SIZE),
+        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE),
     )
-    actual = sparse_nsa_index_decode_logits_paged(
+    actual = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -774,7 +778,7 @@ def _run_indexer_paged_eager(case: IndexerPagedCase, device: torch.device) -> di
         contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
         workspace=workspace,
     )
-    expected = sparse_nsa_paged_logits_reference(
+    expected = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -843,7 +847,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
         index_heads=case.index_heads,
         use_cuda_graph=True,
     )
-    metadata = NSAIndexerPagedDecodeMetadata(
+    metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
@@ -853,7 +857,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
         graph_real.fill_(-1)
         graph_real[:, : real_page_table.shape[1]].copy_(real_page_table)
         graph_seqlens.copy_(seqlens)
-        get_paged_mqa_logits_metadata(
+        build_paged_mqa_schedule_metadata(
             graph_seqlens.contiguous(),
             PAGE_SIZE,
             num_sms,
@@ -864,7 +868,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = sparse_nsa_index_decode_logits_paged(
+        captured_out = paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -875,7 +879,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
         )
         return captured_out
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     prepare(real_a, seqlens_a)
     run()
     torch.cuda.synchronize(device)
@@ -887,7 +891,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
     if captured_out is None:
         raise BatteryFailure("graph did not produce indexer output")
     actual_a = captured_out.clone()
-    expected_a = sparse_nsa_paged_logits_reference(
+    expected_a = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -906,7 +910,7 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
     graph.replay()
     torch.cuda.synchronize(device)
     actual_b = captured_out.clone()
-    expected_b = sparse_nsa_paged_logits_reference(
+    expected_b = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1010,11 +1014,11 @@ def _run_indexer_extend_eager(case: IndexerExtendCase, device: torch.device) -> 
         mla_heads=1,
         index_heads=case.index_heads,
     )
-    metadata = NSAIndexerExtendLogitsMetadata(
+    metadata = IndexerExtendMetadata(
         k_start=layout["k_start"],
         k_end=layout["k_end"],
     )
-    actual = sparse_nsa_index_extend_logits(
+    actual = extend_logits(
         q_fp8=layout["q_fp8"],
         weights=layout["weights"],
         kv_fp8=(layout["k_quant"], layout["k_scale"]),
@@ -1023,7 +1027,7 @@ def _run_indexer_extend_eager(case: IndexerExtendCase, device: torch.device) -> 
         workspace=workspace,
         preinitialize_invalid_logits=case.preinitialize_invalid_logits,
     )
-    expected = sparse_nsa_extend_logits_reference(
+    expected = extend_logits_reference(
         q_fp8=layout["q_fp8"],
         weights=layout["weights"],
         kv_fp8=(layout["k_quant"], layout["k_scale"]),
@@ -1327,12 +1331,12 @@ def _run_e2e_decode_eager(case: E2EDecodeCase, device: torch.device) -> dict[str
         mla_heads=case.mla_heads,
         index_heads=case.index_heads,
     )
-    metadata = NSAIndexerPagedDecodeMetadata(
+    metadata = IndexerPagedDecodeMetadata(
         real_page_table=real_page_table,
         cache_seqlens_int32=seqlens,
-        paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(seqlens.contiguous(), PAGE_SIZE),
+        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE),
     )
-    logits = sparse_nsa_index_decode_logits_paged(
+    logits = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1341,7 +1345,7 @@ def _run_e2e_decode_eager(case: E2EDecodeCase, device: torch.device) -> dict[str
         contract_phantoms=indexer_workspace.get_paged_indexer_contract_phantoms(),
         workspace=indexer_workspace,
     )
-    expected_logits = sparse_nsa_paged_logits_reference(
+    expected_logits = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1496,7 +1500,7 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         index_heads=case.index_heads,
         use_cuda_graph=True,
     )
-    indexer_metadata = NSAIndexerPagedDecodeMetadata(
+    indexer_metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
@@ -1515,7 +1519,7 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         graph_page_table_1[:, : page_table_1.shape[1]].copy_(page_table_1)
         graph_seqlens.copy_(seqlens)
         index_k_cache.copy_(cache)
-        get_paged_mqa_logits_metadata(
+        build_paged_mqa_schedule_metadata(
             graph_seqlens.contiguous(),
             PAGE_SIZE,
             num_sms,
@@ -1528,7 +1532,7 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
 
     def run() -> torch.Tensor:
         nonlocal captured_logits, captured_selected, captured_mla
-        captured_logits = sparse_nsa_index_decode_logits_paged(
+        captured_logits = paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -1561,7 +1565,7 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         )
         return captured_mla
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     clear_mla_caches()
     page_table_a = _page_table_1_from_real(real_page_table=real_a, seqlens=seqlens_a)
     page_table_b = _page_table_1_from_real(real_page_table=real_b, seqlens=seqlens_b)
@@ -1585,7 +1589,7 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         actual_logits = captured_logits.clone()
         actual_selected = captured_selected.clone()
         actual_mla = captured_mla.clone()
-        expected_logits = sparse_nsa_paged_logits_reference(
+        expected_logits = paged_decode_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -1673,8 +1677,8 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         mla_heads=case.mla_heads,
         index_heads=case.index_heads,
     )
-    metadata = NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end)
-    logits = sparse_nsa_index_extend_logits(
+    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
+    logits = extend_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
@@ -1683,7 +1687,7 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         workspace=indexer_workspace,
         preinitialize_invalid_logits=False,
     )
-    expected_logits = sparse_nsa_extend_logits_reference(
+    expected_logits = extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
@@ -1901,7 +1905,7 @@ def _make_sglang_paged_metadata(
         nsa_cu_seqlens_k=nsa_cu_k,
         nsa_extend_seq_lens_list=list(extend_lens),
         nsa_seqlens_expanded=seqlens_expanded,
-        paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(
+        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
             seqlens_expanded.contiguous(),
             PAGE_SIZE,
         ),
@@ -1960,15 +1964,15 @@ def _run_sglang_paged_eager(
         mla_heads=case.mla_heads,
         index_heads=case.index_heads,
     )
-    b12x_metadata = NSAIndexerPagedDecodeMetadata(
+    b12x_metadata = IndexerPagedDecodeMetadata(
         real_page_table=shape["real_expanded"],
         cache_seqlens_int32=shape["seqlens_expanded"],
-        paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(
+        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
             shape["seqlens_expanded"].contiguous(),
             PAGE_SIZE,
         ),
     )
-    logits = sparse_nsa_index_decode_logits_paged(
+    logits = paged_decode_logits(
         q_fp8=q_fp8[:q_offset],
         weights=weights[:q_offset],
         index_k_cache=index_k_cache,
@@ -1977,7 +1981,7 @@ def _run_sglang_paged_eager(
         contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
         workspace=workspace,
     )
-    expected_logits = sparse_nsa_paged_logits_reference(
+    expected_logits = paged_decode_logits_reference(
         q_fp8=q_fp8[:q_offset],
         weights=weights[:q_offset],
         index_k_cache=index_k_cache,
@@ -2212,7 +2216,7 @@ def _run_sglang_paged_graph(
         index_heads=case.index_heads,
         use_cuda_graph=True,
     )
-    b12x_metadata = NSAIndexerPagedDecodeMetadata(
+    b12x_metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
@@ -2237,7 +2241,7 @@ def _run_sglang_paged_graph(
         )
         graph_seqlens.copy_(shape["seqlens_expanded"])
         graph_base_seqlens.copy_(shape["seqlens_expanded"])
-        get_paged_mqa_logits_metadata(
+        build_paged_mqa_schedule_metadata(
             graph_seqlens.contiguous(),
             PAGE_SIZE,
             num_sms,
@@ -2251,7 +2255,7 @@ def _run_sglang_paged_graph(
 
     def run() -> torch.Tensor:
         nonlocal captured_logits, captured_selected, captured_mla
-        captured_logits = sparse_nsa_index_decode_logits_paged(
+        captured_logits = paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -2280,7 +2284,7 @@ def _run_sglang_paged_graph(
         )
         return captured_mla
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     clear_mla_caches()
     prepare(shape_a, k_rows_a)
     run()
@@ -2299,7 +2303,7 @@ def _run_sglang_paged_graph(
         actual_logits = captured_logits.clone()
         actual_selected = captured_selected.clone()
         actual_mla = captured_mla.clone()
-        expected_logits = sparse_nsa_paged_logits_reference(
+        expected_logits = paged_decode_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -2450,16 +2454,16 @@ def _run_sglang_ragged_eager(
         device=device,
         structured=True,
     )
-    logits = sparse_nsa_index_extend_logits(
+    logits = extend_logits(
         q_fp8=q_fp8[:q_rows],
         weights=weights[:q_rows],
         kv_fp8=(k_gather, s_gather),
-        metadata=NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end),
+        metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
         contract_phantoms=workspace.get_indexer_contract_phantoms(),
         workspace=workspace,
         preinitialize_invalid_logits=False,
     )
-    expected_logits = sparse_nsa_extend_logits_reference(
+    expected_logits = extend_logits_reference(
         q_fp8=q_fp8[:q_rows],
         weights=weights[:q_rows],
         kv_fp8=(k_gather, s_gather),

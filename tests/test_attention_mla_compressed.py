@@ -7,20 +7,24 @@ import torch
 
 import b12x.attention.mla.compressed_api as compressed_api_impl
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.integration.mla import (
+from b12x.attention.workspace import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
     B12XAttentionWorkspace,
+)
+from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_SWA_PAGE_SIZE,
-    clear_mla_caches,
-    compressed_mla_decode_forward,
     compressed_mla_page_nbytes,
-    compressed_mla_split_chunks_for_contract,
     compressed_sparse_mla_reference,
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
+)
+from b12x.integration.mla import (
+    clear_mla_caches,
+    compressed_mla_decode_forward,
+    compressed_mla_split_chunks_for_contract,
 )
 
 from .helpers import require_sm120

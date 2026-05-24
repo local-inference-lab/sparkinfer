@@ -26,7 +26,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import get_ptr_as_int64, pack_f32x2_to_bfloat2, shared_ptr_to_u32
 
 
@@ -163,7 +163,7 @@ def _state_merge(
         state_m = Float32(prev_m)
         state_d = Float32(prev_d)
     else:
-        state_m = attention_utils.fmax(prev_m, other_m)
+        state_m = attention_ops.fmax(prev_m, other_m)
         prev_scale = _exp2_approx_ftz_f32(prev_m - state_m)
         other_scale = _exp2_approx_ftz_f32(other_m - state_m)
         state_d = Float32(prev_d * prev_scale + other_d * other_scale)

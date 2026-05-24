@@ -24,11 +24,11 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils as utils_basic
 
-from b12x.attention import copy_utils
+from b12x.attention._cute import copy as cute_copy
+from b12x.attention._cute import ops as cute_ops
+from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention.contiguous import layout_utils
 from b12x.attention.contiguous.cute_dsl_utils import assume_tensor_aligned
-from b12x.attention import pipeline
-from b12x.attention import utils
 from b12x.attention.contiguous.mask import AttentionMask
 from b12x.attention.contiguous.softmax import Softmax
 from b12x.attention.contiguous.seqlen_info import SeqlenInfoQK
@@ -409,7 +409,7 @@ class ContiguousAttentionForwardKernel:
             tOgO = gmem_thr_copy_O.partition_D(gO)
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-            tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+            tOpO = cute_ops.predicate_k(tOcO, limit=mO.shape[1])
             for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
                 if (
                     t0OcO[0, rest_m, 0][0]
@@ -552,7 +552,7 @@ class ContiguousAttentionForwardKernel:
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
+        softmax_scale_log2, softmax_scale = cute_ops.compute_softmax_scale_log2(softmax_scale)
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
             tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
@@ -674,7 +674,7 @@ class ContiguousAttentionForwardKernel:
         pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread
         )
-        pipeline_k = pipeline.PipelineTmaAsync.create(
+        pipeline_k = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_K.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
@@ -682,7 +682,7 @@ class ContiguousAttentionForwardKernel:
             tx_count=self.tma_copy_bytes["K"],
             defer_sync=True,
         )
-        pipeline_v = pipeline.PipelineTmaAsync.create(
+        pipeline_v = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_V.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
@@ -779,14 +779,14 @@ class ContiguousAttentionForwardKernel:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        pipeline_k: pipeline.PipelineTmaAsync,
-        pipeline_v: pipeline.PipelineTmaAsync,
+        pipeline_k: cute_pipeline.PipelineTmaAsync,
+        pipeline_v: cute_pipeline.PipelineTmaAsync,
         mbar_ptr_Q: cutlass.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        kv_producer_state = pipeline.make_pipeline_state(
+        kv_producer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.num_stages
         )
         tile_scheduler = TileSchedulerCls()
@@ -803,7 +803,7 @@ class ContiguousAttentionForwardKernel:
                 mQ_batch = mQ
             mQ_cur = mQ_batch[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+            load_Q, _, _ = cute_copy.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
             )
             head_idx_kv = (
@@ -820,22 +820,22 @@ class ContiguousAttentionForwardKernel:
                 mV_cur = mV[None, None, head_idx_kv]
             gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
             gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
-            load_K, _, _ = copy_utils.tma_get_copy_fn(
+            load_K, _, _ = cute_copy.tma_get_copy_fn(
                 tma_atom_K,
                 0,
                 cute.make_layout(1),
                 gK,
                 sK,
             )
-            load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
-            load_V, _, _ = copy_utils.tma_get_copy_fn(
+            load_K = cute_copy.tma_producer_copy_fn(load_K, pipeline_k)
+            load_V, _, _ = cute_copy.tma_get_copy_fn(
                 tma_atom_V,
                 0,
                 cute.make_layout(1),
                 gV,
                 sV,
             )
-            load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
+            load_V = cute_copy.tma_producer_copy_fn(load_V, pipeline_v)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             with cute.arch.elect_one():
@@ -977,9 +977,9 @@ class ContiguousAttentionForwardKernel:
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             self.dtype,
         )
-        smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
+        smem_thr_copy_Q = cute_ops.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
+        smem_thr_copy_K = cute_ops.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
+        smem_thr_copy_V = cute_ops.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSsK = smem_thr_copy_K.partition_S(sK)
         tOsVt = smem_thr_copy_V.partition_S(sVt)
@@ -1002,7 +1002,7 @@ class ContiguousAttentionForwardKernel:
 
             softmax.reset()
             acc_O.fill(0.0)
-            kv_consumer_state = pipeline.make_pipeline_state(
+            kv_consumer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
             )
 

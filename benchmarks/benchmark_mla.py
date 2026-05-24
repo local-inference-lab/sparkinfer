@@ -21,41 +21,43 @@ from b12x.attention.mla.split import (
     run_sparse_mla_split_decode_merge,
     select_sparse_mla_split_decode_config,
 )
-from b12x.attention.nsa_indexer.reference import (
-    sparse_nsa_extend_logits_reference,
-    sparse_nsa_paged_logits_reference,
+from b12x.attention.indexer.reference import (
+    extend_logits_reference,
+    pack_index_k_cache_reference,
+    paged_decode_logits_reference,
+)
+from b12x.attention.workspace import B12XAttentionWorkspace
+from b12x.attention.mla.reference import (
+    dense_mla_reference,
+    pack_mla_kv_cache_reference,
 )
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    B12XAttentionWorkspace,
     clear_mla_caches,
-    dense_mla_reference,
-    pack_mla_kv_cache_reference,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.attention.nsa_indexer.extend_kernel import (
+from b12x.attention.indexer.extend_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_Q,
 )
-from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
-from b12x.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.indexer.tiled_topk import run_tiled_supertile_topk
+from b12x.attention.indexer.persistent_topk import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
-from b12x.integration.nsa_indexer import (
-    NSAIndexerExtendLogitsMetadata,
-    NSAIndexerPagedDecodeMetadata,
-    clear_nsa_indexer_caches,
-    get_paged_mqa_logits_metadata,
-    pack_nsa_index_k_cache_reference,
-    resolve_sparse_nsa_extend_prefill_block_k,
-    sparse_nsa_index_decode_logits_paged,
-    sparse_nsa_index_extend_logits,
-    sparse_nsa_index_extend_tiled_topk,
-    uses_paged_mqa_schedule_metadata,
+from b12x.integration.indexer import (
+    IndexerExtendMetadata,
+    IndexerPagedDecodeMetadata,
+    clear_indexer_caches,
+    build_paged_mqa_schedule_metadata,
+    resolve_extend_prefill_block_k,
+    paged_decode_logits,
+    extend_logits,
+    extend_tiled_topk,
+    uses_paged_mqa_schedule,
 )
 
 from benchmarks.common import (
@@ -702,7 +704,7 @@ def _make_decode_graph_prepare(
         if graph_paged_mqa_schedule_metadata is not None:
             if schedule_block_kv is None:
                 raise ValueError("schedule_block_kv must be provided when graph schedule metadata is set")
-            get_paged_mqa_logits_metadata(
+            build_paged_mqa_schedule_metadata(
                 graph_cache_seqlens_int32,
                 schedule_block_kv,
                 out=graph_paged_mqa_schedule_metadata,
@@ -742,7 +744,7 @@ def _make_indexer_inputs(
     )
     k = token_scores.unsqueeze(1).expand(-1, cfg.index_head_dim).contiguous()
     k_pool = scatter_rows_into_pool(k, pool_locs=pool_locs, pool_tokens=pool_tokens)
-    return q_fp8, weights, pack_nsa_index_k_cache_reference(k_pool, page_size=cfg.page_size)
+    return q_fp8, weights, pack_index_k_cache_reference(k_pool, page_size=cfg.page_size)
 
 
 def _make_mla_inputs(
@@ -942,7 +944,7 @@ def _run_decode_case(
             dtype=torch.int32,
             device=device,
         )
-    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+    use_graph_schedule_metadata = uses_paged_mqa_schedule(
         q_rows=case.batch_size,
         max_pages=graph_real_page_table.shape[1],
     )
@@ -968,7 +970,7 @@ def _run_decode_case(
         schedule_block_kv=cfg.page_size,
     )
     prepare_decode_graph()
-    indexer_metadata = NSAIndexerPagedDecodeMetadata(
+    indexer_metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_cache_seqlens,
         paged_mqa_schedule_metadata=graph_schedule_metadata,
@@ -981,7 +983,7 @@ def _run_decode_case(
     )
 
     def run_indexer():
-        logits = sparse_nsa_index_decode_logits_paged(
+        logits = paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -999,7 +1001,7 @@ def _run_decode_case(
         )
 
     def run_indexer_logits():
-        return sparse_nsa_index_decode_logits_paged(
+        return paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -1009,10 +1011,10 @@ def _run_decode_case(
             active_width_override=graph_active_width_override,
         )
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     actual_topk = run_indexer()
     logits_for_topk = run_indexer_logits()
-    expected_logits = sparse_nsa_paged_logits_reference(
+    expected_logits = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -1076,7 +1078,7 @@ def _run_decode_case(
 
     def run_step():
         topk_indices = _select_paged_topk_from_logits(
-            logits=sparse_nsa_index_decode_logits_paged(
+            logits=paged_decode_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -1131,7 +1133,7 @@ def _run_decode_case(
     del actual_output
     del expected_output
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     indexer_stats = _capture_and_bench_cuda_graph(
         run_indexer,
         warmup=warmup,
@@ -1141,7 +1143,7 @@ def _run_decode_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     indexer_logits_stats = _capture_and_bench_cuda_graph(
         run_indexer_logits,
         warmup=warmup,
@@ -1179,7 +1181,7 @@ def _run_decode_case(
     )
     mla_us = statistics.median(mla_stats["replay_us"])
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     clear_mla_caches()
     step_stats = _capture_and_bench_cuda_graph(
         run_step,
@@ -1303,7 +1305,7 @@ def _run_prefill_or_verify_case(
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
-    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+    use_graph_schedule_metadata = uses_paged_mqa_schedule(
         q_rows=case.total_q,
         max_pages=graph_real_page_table.shape[1],
     )
@@ -1335,7 +1337,7 @@ def _run_prefill_or_verify_case(
         graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
         graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
         if graph_schedule_metadata is not None:
-            get_paged_mqa_logits_metadata(
+            build_paged_mqa_schedule_metadata(
                 graph_expanded_cache_seqlens,
                 cfg.page_size,
                 out=graph_schedule_metadata,
@@ -1366,14 +1368,14 @@ def _run_prefill_or_verify_case(
             width=case.cache_len,
             fill_value=-1,
         )
-        indexer_metadata = NSAIndexerPagedDecodeMetadata(
+        indexer_metadata = IndexerPagedDecodeMetadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_expanded_cache_seqlens,
             paged_mqa_schedule_metadata=graph_schedule_metadata,
         )
 
         def run_indexer_logits():
-            return sparse_nsa_index_decode_logits_paged(
+            return paged_decode_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -1392,10 +1394,10 @@ def _run_prefill_or_verify_case(
                 query_row_to_batch=query_row_to_batch,
             )
 
-        clear_nsa_indexer_caches()
+        clear_indexer_caches()
         actual_topk = run_indexer()
         logits_for_topk = run_indexer_logits()
-        expected_logits = sparse_nsa_paged_logits_reference(
+        expected_logits = paged_decode_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -1430,13 +1432,13 @@ def _run_prefill_or_verify_case(
         mla_metadata_mode = "target_verify"
         mla_workspace_mode = "verify"
     else:
-        extend_indexer_metadata = NSAIndexerExtendLogitsMetadata(
+        extend_indexer_metadata = IndexerExtendMetadata(
             k_start=graph_extend_k_start,
             k_end=graph_extend_k_start + graph_extend_lengths,
         )
         preinitialize_indexer_logits = not skip_indexer_logits_fill
 
-        _prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+        _prefill_block_k = resolve_extend_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
             num_heads=cfg.index_n_heads,
@@ -1458,7 +1460,7 @@ def _run_prefill_or_verify_case(
             )
 
         def run_indexer_logits():
-            result = sparse_nsa_index_extend_logits(
+            result = extend_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
@@ -1496,7 +1498,7 @@ def _run_prefill_or_verify_case(
 
         def run_indexer():
             if _use_tiled_output:
-                return sparse_nsa_index_extend_tiled_topk(
+                return extend_tiled_topk(
                     q_fp8=q_fp8,
                     weights=weights,
                     kv_fp8=extend_kv_fp8,
@@ -1511,7 +1513,7 @@ def _run_prefill_or_verify_case(
                 topk=case.topk,
             )
 
-        clear_nsa_indexer_caches()
+        clear_indexer_caches()
         actual_topk = run_indexer()
         logits_for_topk = run_indexer_logits()
         if skip_indexer_logits_fill and not _use_tiled_output:
@@ -1528,7 +1530,7 @@ def _run_prefill_or_verify_case(
                 ).all():
                     raise BenchmarkFailure(case, f"no-fill logits suffix was not -inf for row {sample_row}")
         if not use_runtime_ragged_topk:
-            expected_logits = sparse_nsa_extend_logits_reference(
+            expected_logits = extend_logits_reference(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
@@ -1649,7 +1651,7 @@ def _run_prefill_or_verify_case(
     del actual_output
     del expected_output
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     indexer_stats = _capture_and_bench_cuda_graph(
         run_indexer,
         warmup=warmup,
@@ -1659,7 +1661,7 @@ def _run_prefill_or_verify_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     indexer_logits_stats = _capture_and_bench_cuda_graph(
         run_indexer_logits,
         warmup=warmup,
@@ -1783,7 +1785,7 @@ def _run_prefill_or_verify_case(
         )
         mla_merge_us = statistics.median(mla_merge_stats["replay_us"])
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     clear_mla_caches()
     step_stats = _capture_and_bench_cuda_graph(
         run_step,
@@ -1794,7 +1796,7 @@ def _run_prefill_or_verify_case(
     )
     indexer_prefill_block_k = None
     if case.mode == "prefill":
-        indexer_prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+        indexer_prefill_block_k = resolve_extend_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
             num_heads=cfg.index_n_heads,

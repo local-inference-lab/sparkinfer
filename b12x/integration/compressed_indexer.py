@@ -1,8 +1,7 @@
-"""Generic paged-MQA indexer integration surface.
+"""Compressed sparse-indexer integration surface.
 
-This module exposes the paged FP8 MQA scorer behind algorithmic names.  The
-implementation is shared with the NSA indexer path, but callers should use this
-surface when they only need paged indexer logits.
+This module adapts the generic indexer scorer/top-k kernels to the DS4/C4
+compressed page layout.
 """
 
 from __future__ import annotations
@@ -14,42 +13,44 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.nsa_indexer import (
-    NSAIndexerPagedDecodeMetadata,
-    get_paged_mqa_logits_metadata,
-    make_nsa_indexer_contract_phantoms,
-    pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_logits_paged,
-    sparse_nsa_paged_logits_reference,
-    unpack_nsa_index_k_cache_reference,
-    uses_paged_mqa_schedule_metadata,
+from b12x.attention.indexer import (
+    IndexerPagedDecodeMetadata,
+    build_paged_mqa_schedule_metadata,
+    make_indexer_contract_phantoms,
+    paged_decode_logits,
+    uses_paged_mqa_schedule,
 )
-from b12x.attention.nsa_indexer.extend_kernel import (
-    resolve_sparse_nsa_extend_prefill_block_k,
-    run_sparse_nsa_extend_logits_kernel,
+from b12x.attention.indexer.extend_kernel import (
+    resolve_extend_prefill_block_k,
+    run_extend_logits_kernel,
 )
-from b12x.attention.nsa_indexer.kernel import (
-    run_sparse_nsa_paged_windowed_tiled_logits_kernel,
+from b12x.attention.indexer.kernel import (
+    run_paged_windowed_tiled_logits_kernel,
 )
-from b12x.attention.nsa_indexer.tiled_topk import (
+from b12x.attention.indexer.tiled_topk import (
     merge_tiled_topk_candidates,
     run_row_topk,
     run_tiled_topk,
 )
+from b12x.attention.indexer.reference import (
+    pack_index_k_cache_reference,
+    paged_decode_logits_reference,
+    unpack_index_k_cache_reference,
+)
 
 
 INDEX_HEAD_DIM = 128
-PAGED_MQA_INDEX_PAGE_SIZE = 64
-_PAGED_MQA_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_MQA_INDEX_SUPERTILE_K"
-_PAGED_MQA_INDEX_SUPERTILE_K_DEFAULT = 32768
-_PAGED_MQA_INDEX_TILE_BLOCK_Q = 32
-_PAGED_MQA_INDEX_TILE_BLOCK_K = 512
-_PAGED_MQA_INDEX_CACHE_ROW_BYTES = PAGED_MQA_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
-_PAGED_MQA_INDEX_CACHE_DATA_BYTES = PAGED_MQA_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
+COMPRESSED_INDEX_PAGE_SIZE = 64
+_COMPRESSED_INDEX_SUPERTILE_K_ENV = "B12X_COMPRESSED_INDEX_SUPERTILE_K"
+_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_COMPRESSED_INDEX_TILE_BLOCK_Q = 32
+_COMPRESSED_INDEX_TILE_BLOCK_K = 512
+_COMPRESSED_INDEX_CACHE_ROW_BYTES = COMPRESSED_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
+_COMPRESSED_INDEX_CACHE_DATA_BYTES = COMPRESSED_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
 
 
 @triton.jit
-def _gather_shared_paged_mqa_supertile_kernel(
+def _gather_shared_compressed_supertile_kernel(
     index_k_cache,
     real_page_table,
     seqlens_per_query,
@@ -121,7 +122,7 @@ def _gather_shared_paged_mqa_supertile_kernel(
 
 
 @dataclass(frozen=True)
-class PagedMQAIndexerMetadata:
+class CompressedIndexerMetadata:
     """Metadata for paged FP8 MQA indexer logits.
 
     ``expected_num_q_heads`` is optional for the generic path, but integrations
@@ -132,7 +133,7 @@ class PagedMQAIndexerMetadata:
 
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
-    paged_mqa_schedule_metadata: torch.Tensor | None = None
+    schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
     shared_page_table: bool = False
 
@@ -177,7 +178,7 @@ def resolve_local_num_q_heads(
     return global_num_q_heads // tensor_parallel_size
 
 
-def make_paged_mqa_indexer_contract_phantoms(
+def make_compressed_indexer_contract_phantoms(
     *,
     max_q_rows: int,
     num_heads: int,
@@ -185,9 +186,9 @@ def make_paged_mqa_indexer_contract_phantoms(
     page_size: int,
     device: torch.device | str,
 ) -> dict[str, torch.Tensor]:
-    """Create fixed-shape phantoms for the paged-MQA indexer launcher cache."""
+    """Create fixed-shape phantoms for the compressed indexer launcher cache."""
 
-    return make_nsa_indexer_contract_phantoms(
+    return make_indexer_contract_phantoms(
         max_q_rows=max_q_rows,
         num_heads=num_heads,
         max_pages=max_pages,
@@ -223,9 +224,9 @@ def _validate_raw_page_lengths(
     """Reject positive lengths whose active page-table entries are missing."""
 
     if _is_cuda_graph_capture_active(real_page_table.device):
-        raise RuntimeError("paged-MQA metadata prep must run outside CUDA graph capture")
+        raise RuntimeError("compressed-index metadata prep must run outside CUDA graph capture")
     if real_page_table.device.type == "cuda" and os.getenv(
-        "B12X_VALIDATE_PAGED_MQA_INDEXER_CUDA_VALUES", "0"
+        "B12X_VALIDATE_COMPRESSED_INDEXER_CUDA_VALUES", "0"
     ) != "1":
         return
     if cache_seqlens_int32.numel() == 0:
@@ -268,44 +269,44 @@ def _validate_schedule_metadata(
 ) -> None:
     _validate_i32_contiguous(
         schedule_metadata,
-        name="paged_mqa_schedule_metadata",
+        name="schedule_metadata",
         ndim=2,
     )
     if schedule_metadata.shape[1] != 2:
         raise ValueError(
-            "paged_mqa_schedule_metadata must have trailing dimension 2, got "
+            "schedule_metadata must have trailing dimension 2, got "
             f"{tuple(schedule_metadata.shape)}"
         )
     if schedule_metadata.device != device:
         raise ValueError(
-            "paged_mqa_schedule_metadata device "
+            "schedule_metadata device "
             f"{schedule_metadata.device} does not match real_page_table device {device}"
         )
 
 
-def prepare_paged_mqa_indexer_metadata(
+def prepare_compressed_indexer_metadata(
     *,
     real_page_table: torch.Tensor,
     cache_seqlens_int32: torch.Tensor,
-    page_size: int = PAGED_MQA_INDEX_PAGE_SIZE,
+    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
     expected_num_q_heads: int | None = None,
-    paged_mqa_schedule_metadata: torch.Tensor | None = None,
+    schedule_metadata: torch.Tensor | None = None,
     schedule_out: torch.Tensor | None = None,
     schedule_num_sms: int | None = None,
     build_schedule: bool | None = None,
     validate_raw_lengths: bool = True,
     shared_page_table: bool = False,
-) -> PagedMQAIndexerMetadata:
-    """Validate and optionally build metadata for paged-MQA indexer logits.
+) -> CompressedIndexerMetadata:
+    """Validate and optionally build metadata for compressed indexer logits.
 
     ``cache_seqlens_int32`` must be the raw compressed-token length for this
     indexer layout.  Do not pass attention-kernel clamp-to-1 lengths here.
     """
 
     page_size = int(page_size)
-    if page_size != PAGED_MQA_INDEX_PAGE_SIZE:
+    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
         raise ValueError(
-            f"paged-MQA indexer currently supports page_size={PAGED_MQA_INDEX_PAGE_SIZE}, "
+            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
     _validate_i32_contiguous(real_page_table, name="real_page_table", ndim=2)
@@ -334,21 +335,21 @@ def prepare_paged_mqa_indexer_metadata(
         )
 
     if build_schedule is None:
-        build_schedule = uses_paged_mqa_schedule_metadata(
+        build_schedule = uses_paged_mqa_schedule(
             q_rows=int(real_page_table.shape[0]),
             max_pages=int(real_page_table.shape[1]),
         )
     if build_schedule:
-        if paged_mqa_schedule_metadata is not None and schedule_out is not None:
+        if schedule_metadata is not None and schedule_out is not None:
             raise ValueError(
-                "pass only one of paged_mqa_schedule_metadata or schedule_out"
+                "pass only one of schedule_metadata or schedule_out"
             )
-        if paged_mqa_schedule_metadata is None:
+        if schedule_metadata is None:
             if _is_cuda_graph_capture_active(real_page_table.device):
                 raise RuntimeError(
-                    "paged-MQA schedule metadata must be built before CUDA graph capture"
+                    "compressed-indexer schedule metadata must be built before CUDA graph capture"
                 )
-            paged_mqa_schedule_metadata = get_paged_mqa_logits_metadata(
+            schedule_metadata = build_paged_mqa_schedule_metadata(
                 cache_seqlens_int32,
                 page_size,
                 schedule_num_sms,
@@ -356,35 +357,35 @@ def prepare_paged_mqa_indexer_metadata(
             )
         else:
             _validate_schedule_metadata(
-                paged_mqa_schedule_metadata,
+                schedule_metadata,
                 device=real_page_table.device,
             )
-    elif paged_mqa_schedule_metadata is not None:
+    elif schedule_metadata is not None:
         _validate_schedule_metadata(
-            paged_mqa_schedule_metadata,
+            schedule_metadata,
             device=real_page_table.device,
         )
     elif schedule_out is not None:
         raise ValueError("schedule_out was provided, but build_schedule is false")
 
-    return PagedMQAIndexerMetadata(
+    return CompressedIndexerMetadata(
         real_page_table=real_page_table,
         cache_seqlens_int32=cache_seqlens_int32,
-        paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+        schedule_metadata=schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
         shared_page_table=bool(shared_page_table),
     )
 
 
-def _metadata_to_nsa(metadata: PagedMQAIndexerMetadata) -> NSAIndexerPagedDecodeMetadata:
-    return NSAIndexerPagedDecodeMetadata(
+def _metadata_to_indexer(metadata: CompressedIndexerMetadata) -> IndexerPagedDecodeMetadata:
+    return IndexerPagedDecodeMetadata(
         real_page_table=metadata.real_page_table,
         cache_seqlens_int32=metadata.cache_seqlens_int32,
-        paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
+        paged_mqa_schedule_metadata=metadata.schedule_metadata,
     )
 
 
-def _prepare_shared_paged_mqa_supertile(
+def _prepare_shared_compressed_supertile(
     *,
     index_k_cache: torch.Tensor,
     real_page_table: torch.Tensor,
@@ -397,12 +398,12 @@ def _prepare_shared_paged_mqa_supertile(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if index_k_cache.ndim != 2 or index_k_cache.dtype != torch.uint8:
         raise ValueError(
-            "shared paged-MQA supertile gather requires uint8 index_k_cache with "
+            "shared compressed-index supertile gather requires uint8 index_k_cache with "
             f"rank 2, got shape={tuple(index_k_cache.shape)} dtype={index_k_cache.dtype}"
         )
     if not index_k_cache.is_contiguous():
-        raise ValueError("shared paged-MQA supertile gather requires contiguous index_k_cache")
-    expected_width = PAGED_MQA_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
+        raise ValueError("shared compressed-index supertile gather requires contiguous index_k_cache")
+    expected_width = COMPRESSED_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
     if int(index_k_cache.shape[1]) != expected_width:
         raise ValueError(
             f"index_k_cache width must be {expected_width}, got {int(index_k_cache.shape[1])}"
@@ -420,7 +421,7 @@ def _prepare_shared_paged_mqa_supertile(
     block_tokens = 128
     grid_elems = max(int(supertile_tokens), int(q_rows))
     grid = (triton.cdiv(grid_elems, block_tokens),)
-    _gather_shared_paged_mqa_supertile_kernel[grid](
+    _gather_shared_compressed_supertile_kernel[grid](
         index_k_cache,
         real_page_table,
         seqlens_per_query,
@@ -433,16 +434,16 @@ def _prepare_shared_paged_mqa_supertile(
         int(page_begin),
         int(supertile_tokens),
         block_tokens,
-        PAGED_MQA_INDEX_PAGE_SIZE,
+        COMPRESSED_INDEX_PAGE_SIZE,
         INDEX_HEAD_DIM,
-        _PAGED_MQA_INDEX_CACHE_ROW_BYTES,
-        _PAGED_MQA_INDEX_CACHE_DATA_BYTES,
+        _COMPRESSED_INDEX_CACHE_ROW_BYTES,
+        _COMPRESSED_INDEX_CACHE_DATA_BYTES,
         num_warps=4,
     )
 
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     if fp8_dtype is None:
-        raise RuntimeError("torch.float8_e4m3fn is required for shared paged-MQA scoring")
+        raise RuntimeError("torch.float8_e4m3fn is required for shared compressed-index scoring")
     return (
         k_quant_bytes.view(fp8_dtype),
         k_scale_bytes.view(torch.float32).view(-1),
@@ -455,7 +456,7 @@ def _validate_q_head_contract(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
-    metadata: PagedMQAIndexerMetadata,
+    metadata: CompressedIndexerMetadata,
     expected_num_q_heads: int | None,
     allow_partial_rows: bool,
 ) -> int:
@@ -513,13 +514,13 @@ def _weights_as_2d(weights: torch.Tensor) -> torch.Tensor:
     return weights
 
 
-def paged_mqa_index_decode_logits_fp8(
+def compressed_index_decode_logits_fp8(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
-    metadata: PagedMQAIndexerMetadata,
-    page_size: int = PAGED_MQA_INDEX_PAGE_SIZE,
+    metadata: CompressedIndexerMetadata,
+    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
     expected_num_q_heads: int | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
@@ -530,9 +531,9 @@ def paged_mqa_index_decode_logits_fp8(
     """Compute paged FP8 MQA indexer logits with an explicit head contract."""
 
     page_size = int(page_size)
-    if page_size != PAGED_MQA_INDEX_PAGE_SIZE:
+    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
         raise ValueError(
-            f"paged-MQA indexer currently supports page_size={PAGED_MQA_INDEX_PAGE_SIZE}, "
+            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
     _validate_q_head_contract(
@@ -543,11 +544,11 @@ def paged_mqa_index_decode_logits_fp8(
         allow_partial_rows=allow_partial_rows,
     )
     weights = _weights_as_2d(weights)
-    return sparse_nsa_index_decode_logits_paged(
+    return paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=_metadata_to_nsa(metadata),
+        metadata=_metadata_to_indexer(metadata),
         page_size=page_size,
         contract_phantoms=contract_phantoms,
         workspace=workspace,
@@ -558,17 +559,17 @@ def paged_mqa_index_decode_logits_fp8(
 
 def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:
     if supertile_k is None:
-        raw = os.environ.get(_PAGED_MQA_INDEX_SUPERTILE_K_ENV)
+        raw = os.environ.get(_COMPRESSED_INDEX_SUPERTILE_K_ENV)
         if raw is None:
-            supertile_k = _PAGED_MQA_INDEX_SUPERTILE_K_DEFAULT
+            supertile_k = _COMPRESSED_INDEX_SUPERTILE_K_DEFAULT
         else:
             try:
                 supertile_k = int(raw)
             except ValueError as exc:
                 raise ValueError(
-                    f"{_PAGED_MQA_INDEX_SUPERTILE_K_ENV} must be an integer, got {raw!r}"
+                    f"{_COMPRESSED_INDEX_SUPERTILE_K_ENV} must be an integer, got {raw!r}"
                 ) from exc
-    alignment = _PAGED_MQA_INDEX_TILE_BLOCK_K
+    alignment = _COMPRESSED_INDEX_TILE_BLOCK_K
     if alignment % int(page_size) != 0:
         raise ValueError(
             f"internal C4 supertile alignment {alignment} must be divisible by page_size={page_size}"
@@ -577,25 +578,25 @@ def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:
     return ((supertile_k + alignment - 1) // alignment) * alignment
 
 
-def paged_mqa_index_decode_supertile_topk_fp8(
+def compressed_index_decode_supertile_topk_fp8(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
-    metadata: PagedMQAIndexerMetadata,
-    page_size: int = PAGED_MQA_INDEX_PAGE_SIZE,
+    metadata: CompressedIndexerMetadata,
+    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
     topk: int = 512,
     expected_num_q_heads: int | None = None,
     workspace=None,
     out_indices: torch.Tensor | None = None,
     supertile_k: int | None = None,
 ) -> torch.Tensor:
-    """Score paged C4 supertiles and select top-k with the shared NSA top-k core."""
+    """Score paged C4 supertiles and select top-k with the shared indexer top-k core."""
 
     page_size = int(page_size)
-    if page_size != PAGED_MQA_INDEX_PAGE_SIZE:
+    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
         raise ValueError(
-            f"paged-MQA indexer currently supports page_size={PAGED_MQA_INDEX_PAGE_SIZE}, "
+            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
     topk = int(topk)
@@ -608,9 +609,9 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     )
     weights = _weights_as_2d(weights)
     if q_fp8.device.type != "cuda":
-        raise NotImplementedError("paged MQA index supertile top-k requires CUDA")
+        raise NotImplementedError("compressed index supertile top-k requires CUDA")
     if workspace is None:
-        raise RuntimeError("paged MQA index supertile top-k requires a b12x workspace")
+        raise RuntimeError("compressed index supertile top-k requires a b12x workspace")
     if metadata.real_page_table.device != q_fp8.device:
         raise ValueError("real_page_table must be on the same device as q_fp8")
     if not metadata.real_page_table.is_contiguous():
@@ -629,33 +630,33 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     page_table_width = int(metadata.real_page_table.shape[1])
     supertile_tokens = _resolve_supertile_k(supertile_k, page_size=page_size)
     supertile_pages = max(1, supertile_tokens // page_size)
-    supertile_k_tiles = supertile_tokens // _PAGED_MQA_INDEX_TILE_BLOCK_K
+    supertile_k_tiles = supertile_tokens // _COMPRESSED_INDEX_TILE_BLOCK_K
     num_chunks = max(1, (page_table_width + supertile_pages - 1) // supertile_pages)
     if int(getattr(workspace, "max_page_table_width", 0)) < page_table_width:
         raise RuntimeError(
-            "paged MQA index supertile top-k workspace page-table capacity is too small: "
+            "compressed index supertile top-k workspace page-table capacity is too small: "
             f"need={page_table_width}, have={getattr(workspace, 'max_page_table_width', None)}"
         )
     require_topk_plan = getattr(workspace, "require_paged_indexer_tiled_topk_plan", None)
     if require_topk_plan is not None and bool(getattr(workspace, "fixed_capacity", False)):
         require_topk_plan(
             topk=topk,
-            block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
-            block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+            block_q=_COMPRESSED_INDEX_TILE_BLOCK_Q,
+            block_k=_COMPRESSED_INDEX_TILE_BLOCK_K,
             num_k_tiles=supertile_k_tiles,
         )
     require_scorer_plan = getattr(workspace, "require_paged_indexer_tiled_scorer_plan", None)
     if require_scorer_plan is not None and bool(getattr(workspace, "fixed_capacity", False)):
         require_scorer_plan(
-            block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
-            block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+            block_q=_COMPRESSED_INDEX_TILE_BLOCK_Q,
+            block_k=_COMPRESSED_INDEX_TILE_BLOCK_K,
             width_tokens=supertile_tokens,
             source_page_width=page_table_width,
         )
     tile_logits = workspace.get_indexer_extend_tile_logits()
     if tile_logits is None:
         raise RuntimeError(
-            "paged MQA index supertile top-k requires the workspace tiled-logits buffer"
+            "compressed index supertile top-k requires the workspace tiled-logits buffer"
         )
     contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
 
@@ -686,23 +687,23 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     lengths_for_kernel = metadata.cache_seqlens_int32
     shared_prefill_candidate = bool(metadata.shared_page_table) and q_rows >= 1024
     if shared_prefill_candidate:
-        shared_prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+        shared_prefill_block_k = resolve_extend_prefill_block_k(
             valid_q_rows=q_rows,
             k_rows=supertile_tokens,
             num_heads=int(q_fp8.shape[1]),
         )
-        if shared_prefill_block_k != _PAGED_MQA_INDEX_TILE_BLOCK_K:
+        if shared_prefill_block_k != _COMPRESSED_INDEX_TILE_BLOCK_K:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires the 512-wide NSA prefill "
+                "shared compressed-index prefill scorer requires the 512-wide indexer prefill "
                 "scorer to match the C4 tiled top-k contract: "
                 f"resolved_block_k={shared_prefill_block_k}, "
                 f"q_rows={q_rows}, k_rows={supertile_tokens}, "
                 f"num_heads={int(q_fp8.shape[1])}"
             )
-        if supertile_tokens % _PAGED_MQA_INDEX_TILE_BLOCK_K != 0:
+        if supertile_tokens % _COMPRESSED_INDEX_TILE_BLOCK_K != 0:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires a supertile width "
-                f"that is divisible by {_PAGED_MQA_INDEX_TILE_BLOCK_K}, got {supertile_tokens}"
+                "shared compressed-index prefill scorer requires a supertile width "
+                f"that is divisible by {_COMPRESSED_INDEX_TILE_BLOCK_K}, got {supertile_tokens}"
             )
         indexer_q_capacity = max(
             int(getattr(workspace, "max_total_q", 0)),
@@ -710,19 +711,19 @@ def paged_mqa_index_decode_supertile_topk_fp8(
         )
         if indexer_q_capacity < q_rows:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires an indexer-capable workspace: "
+                "shared compressed-index prefill scorer requires an indexer-capable workspace: "
                 f"q_rows={q_rows}, indexer_q_capacity={indexer_q_capacity}, "
                 f"max_total_q={getattr(workspace, 'max_total_q', None)}, "
                 f"max_paged_q_rows={getattr(workspace, 'max_paged_q_rows', None)}"
             )
         if int(getattr(workspace, "max_paged_q_rows", 0)) < q_rows:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires paged metadata capacity: "
+                "shared compressed-index prefill scorer requires paged metadata capacity: "
                 f"q_rows={q_rows}, max_paged_q_rows={getattr(workspace, 'max_paged_q_rows', None)}"
             )
         if getattr(workspace, "indexer_k_quant_bytes", None) is None:
             raise RuntimeError(
-                "shared paged-MQA prefill scorer requires workspace-backed indexer gather buffers"
+                "shared compressed-index prefill scorer requires workspace-backed indexer gather buffers"
             )
     use_shared_prefill_scorer = shared_prefill_candidate
     paged_contract_phantoms = contract_phantoms
@@ -736,15 +737,15 @@ def paged_mqa_index_decode_supertile_topk_fp8(
         chunk_pages = page_end - page_begin
         chunk_width_tokens = chunk_pages * page_size
         chunk_start_token = page_begin * page_size
-        if uses_paged_mqa_schedule_metadata(q_rows=q_rows, max_pages=chunk_pages):
+        if uses_paged_mqa_schedule(q_rows=q_rows, max_pages=chunk_pages):
             raise RuntimeError(
                 "C4 supertile top-k requires an unscheduled paged scorer tile; "
-                f"reduce {_PAGED_MQA_INDEX_SUPERTILE_K_ENV} below "
+                f"reduce {_COMPRESSED_INDEX_SUPERTILE_K_ENV} below "
                 f"{chunk_width_tokens} tokens"
             )
 
         if use_shared_prefill_scorer:
-            k_quant, k_scale, k_start, k_end = _prepare_shared_paged_mqa_supertile(
+            k_quant, k_scale, k_start, k_end = _prepare_shared_compressed_supertile(
                 index_k_cache=index_k_cache,
                 real_page_table=page_table_for_kernel,
                 seqlens_per_query=lengths_for_kernel,
@@ -754,7 +755,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
                 page_begin=page_begin,
                 supertile_tokens=supertile_tokens,
             )
-            logits = run_sparse_nsa_extend_logits_kernel(
+            logits = run_extend_logits_kernel(
                 q_fp8=q_fp8,
                 weights=weights,
                 k_quant=k_quant,
@@ -769,7 +770,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             )
             topk_lengths = k_end
         else:
-            logits = run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+            logits = run_paged_windowed_tiled_logits_kernel(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
@@ -780,8 +781,8 @@ def paged_mqa_index_decode_supertile_topk_fp8(
                 source_page_offset=page_begin,
                 output_width_tokens=supertile_tokens,
                 page_size=page_size,
-                tile_block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
-                tile_block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+                tile_block_q=_COMPRESSED_INDEX_TILE_BLOCK_Q,
+                tile_block_k=_COMPRESSED_INDEX_TILE_BLOCK_K,
                 workspace=workspace,
                 preinitialize_tile_logits=False,
                 contract_phantoms=contract_phantoms,
@@ -801,8 +802,8 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             k_start=None,
             lengths=topk_lengths,
             topk=topk,
-            block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
-            block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+            block_q=_COMPRESSED_INDEX_TILE_BLOCK_Q,
+            block_k=_COMPRESSED_INDEX_TILE_BLOCK_K,
             output_values=out_values,
             output_indices=out_indices,
             num_k_tiles=supertile_k_tiles,
@@ -825,13 +826,13 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     return final_raw_indices
 
 
-def paged_mqa_index_decode_dense_topk_fp8(
+def compressed_index_decode_dense_topk_fp8(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
-    metadata: PagedMQAIndexerMetadata,
-    page_size: int = PAGED_MQA_INDEX_PAGE_SIZE,
+    metadata: CompressedIndexerMetadata,
+    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
     topk: int = 512,
     expected_num_q_heads: int | None = None,
     workspace=None,
@@ -840,9 +841,9 @@ def paged_mqa_index_decode_dense_topk_fp8(
     """Score the full paged C4 row and select top-k with the dense top-k core."""
 
     page_size = int(page_size)
-    if page_size != PAGED_MQA_INDEX_PAGE_SIZE:
+    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
         raise ValueError(
-            f"paged-MQA indexer currently supports page_size={PAGED_MQA_INDEX_PAGE_SIZE}, "
+            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
     topk = int(topk)
@@ -855,9 +856,9 @@ def paged_mqa_index_decode_dense_topk_fp8(
     )
     weights = _weights_as_2d(weights)
     if q_fp8.device.type != "cuda":
-        raise NotImplementedError("paged MQA index dense top-k requires CUDA")
+        raise NotImplementedError("compressed index dense top-k requires CUDA")
     if workspace is None:
-        raise RuntimeError("paged MQA index dense top-k requires a b12x workspace")
+        raise RuntimeError("compressed index dense top-k requires a b12x workspace")
     if metadata.real_page_table.device != q_fp8.device:
         raise ValueError("real_page_table must be on the same device as q_fp8")
     if not metadata.real_page_table.is_contiguous():
@@ -879,13 +880,13 @@ def paged_mqa_index_decode_dense_topk_fp8(
         compact_page_table = metadata.real_page_table[:, :workspace_page_width]
         if not bool(getattr(workspace, "use_cuda_graph", False)) and not compact_page_table.is_contiguous():
             raise RuntimeError(
-                "paged MQA index dense top-k requires a CUDA-graph workspace when "
+                "compressed index dense top-k requires a CUDA-graph workspace when "
                 "scoring a compact view of a padded page table"
             )
-        scorer_metadata = PagedMQAIndexerMetadata(
+        scorer_metadata = CompressedIndexerMetadata(
             real_page_table=compact_page_table,
             cache_seqlens_int32=metadata.cache_seqlens_int32,
-            paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
+            schedule_metadata=metadata.schedule_metadata,
             expected_num_q_heads=metadata.expected_num_q_heads,
         )
 
@@ -893,7 +894,7 @@ def paged_mqa_index_decode_dense_topk_fp8(
     if workspace is not None and hasattr(workspace, "get_paged_indexer_active_width_cap"):
         active_width = workspace.get_paged_indexer_active_width_cap()
 
-    logits = paged_mqa_index_decode_logits_fp8(
+    logits = compressed_index_decode_logits_fp8(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -927,25 +928,23 @@ def paged_mqa_index_decode_dense_topk_fp8(
     return final_raw_indices
 
 
-pack_paged_mqa_index_k_cache_reference = pack_nsa_index_k_cache_reference
-unpack_paged_mqa_index_k_cache_reference = unpack_nsa_index_k_cache_reference
-paged_mqa_index_logits_reference = sparse_nsa_paged_logits_reference
+pack_compressed_index_k_cache_reference = pack_index_k_cache_reference
+unpack_compressed_index_k_cache_reference = unpack_index_k_cache_reference
+compressed_index_logits_reference = paged_decode_logits_reference
 
 
 __all__ = [
     "INDEX_HEAD_DIM",
-    "PAGED_MQA_INDEX_PAGE_SIZE",
-    "PagedMQAIndexerMetadata",
-    "get_paged_mqa_logits_metadata",
-    "make_paged_mqa_indexer_contract_phantoms",
-    "pack_paged_mqa_index_k_cache_reference",
-    "paged_mqa_index_decode_dense_topk_fp8",
-    "paged_mqa_index_decode_logits_fp8",
-    "paged_mqa_index_decode_supertile_topk_fp8",
-    "paged_mqa_index_logits_reference",
-    "prepare_paged_mqa_indexer_metadata",
+    "COMPRESSED_INDEX_PAGE_SIZE",
+    "CompressedIndexerMetadata",
+    "make_compressed_indexer_contract_phantoms",
+    "pack_compressed_index_k_cache_reference",
+    "compressed_index_decode_dense_topk_fp8",
+    "compressed_index_decode_logits_fp8",
+    "compressed_index_decode_supertile_topk_fp8",
+    "compressed_index_logits_reference",
+    "prepare_compressed_indexer_metadata",
     "resolve_local_num_q_heads",
     "resolve_replicated_num_q_heads",
-    "unpack_paged_mqa_index_k_cache_reference",
-    "uses_paged_mqa_schedule_metadata",
+    "unpack_compressed_index_k_cache_reference",
 ]

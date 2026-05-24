@@ -19,7 +19,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
-from b12x.attention import copy_utils, pipeline
+from b12x.attention._cute import copy as cute_copy
+from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
 
 
@@ -172,7 +173,7 @@ class CutePlaneProbe:
             cutlass.pipeline.Agent.Thread, 1
         )
         producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
-        pipe = pipeline.PipelineTmaAsync.create(
+        pipe = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=mbar_ptr,
             num_stages=1,
             producer_group=producer_group,
@@ -180,17 +181,17 @@ class CutePlaneProbe:
             tx_count=self.plane_bytes,
             defer_sync=False,
         )
-        producer_state = pipeline.make_pipeline_state(
+        producer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, 1
         )
-        consumer_state = pipeline.make_pipeline_state(
+        consumer_state = cute_pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
 
-        load, _, _ = copy_utils.tma_get_copy_fn(
+        load, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom, 0, cute.make_layout(1), gPlane, sPlane
         )
-        load = copy_utils.tma_producer_copy_fn(load, pipe)
+        load = cute_copy.tma_producer_copy_fn(load, pipe)
 
         if lane == 0:
             pipe.producer_acquire(producer_state)

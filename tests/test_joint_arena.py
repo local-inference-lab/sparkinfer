@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import b12x.integration.tp_moe as tp_moe
-from b12x.attention.mla.workspace import (
+from b12x.attention.workspace import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
     B12XAttentionWorkspaceContract,

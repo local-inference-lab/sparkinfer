@@ -11,21 +11,21 @@ import torch
 from .kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _should_use_schedule_multi_row_kernel,
-    clear_sparse_nsa_indexer_kernel_cache,
+    clear_indexer_kernel_cache,
     _should_use_schedule_single_row_kernel,
-    run_sparse_nsa_paged_logits_kernel,
-    supports_sparse_nsa_paged_logits_kernel,
+    run_paged_logits_kernel,
+    supports_paged_logits_kernel,
 )
 from .extend_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_K,
     _PREFILL_BLOCK_Q,
-    resolve_sparse_nsa_extend_prefill_block_k,
-    run_sparse_nsa_extend_logits_kernel,
-    supports_sparse_nsa_extend_logits_kernel,
+    resolve_extend_prefill_block_k,
+    run_extend_logits_kernel,
+    supports_extend_logits_kernel,
 )
-from .reference import sparse_nsa_extend_logits_reference, sparse_nsa_paged_logits_reference
+from .reference import extend_logits_reference, paged_decode_logits_reference
 from .schedule_metadata import (
     build_paged_mqa_schedule_metadata_torch,
     build_paged_mqa_schedule_metadata_triton,
@@ -48,19 +48,19 @@ def _is_cuda_graph_capture_active(device: torch.device) -> bool:
 
 
 @dataclass(frozen=True)
-class NSAIndexerPagedDecodeMetadata:
+class IndexerPagedDecodeMetadata:
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     paged_mqa_schedule_metadata: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
-class NSAIndexerExtendLogitsMetadata:
+class IndexerExtendMetadata:
     k_start: torch.Tensor
     k_end: torch.Tensor
 
 
-def get_paged_mqa_logits_metadata(
+def build_paged_mqa_schedule_metadata(
     context_lens: torch.Tensor,
     block_kv: int,
     num_sms: int | None = None,
@@ -128,15 +128,15 @@ def get_paged_mqa_logits_metadata(
     )
 
 
-def clear_nsa_indexer_caches() -> None:
+def clear_indexer_caches() -> None:
     """Clear any cached NSA indexer runtime state."""
-    clear_sparse_nsa_indexer_kernel_cache()
+    clear_indexer_kernel_cache()
     clear_tiled_topk_kernel_cache()
     clear_persistent_topk2048_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
 
 
-def uses_paged_mqa_schedule_metadata(
+def uses_paged_mqa_schedule(
     *,
     q_rows: int,
     max_pages: int,
@@ -151,7 +151,7 @@ def uses_paged_mqa_schedule_metadata(
     )
 
 
-def make_nsa_indexer_contract_phantoms(
+def make_indexer_contract_phantoms(
     *,
     max_q_rows: int,
     num_heads: int,
@@ -162,7 +162,7 @@ def make_nsa_indexer_contract_phantoms(
     """Create phantom tensors for stable NSA indexer host-launcher cache keys.
 
     Pass the returned dict as ``contract_phantoms`` to
-    ``sparse_nsa_index_decode_logits_paged`` to avoid CUTLASS recompilation
+    ``paged_decode_logits`` to avoid CUTLASS recompilation
     when batch size varies in eager mode.
     """
     device = torch.device(device)
@@ -305,12 +305,12 @@ def _validate_paged_decode_inputs(
     return _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
 
 
-def sparse_nsa_index_decode_logits_paged(
+def paged_decode_logits(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
-    metadata: NSAIndexerPagedDecodeMetadata,
+    metadata: IndexerPagedDecodeMetadata,
     page_size: int = 64,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
@@ -391,7 +391,7 @@ def sparse_nsa_index_decode_logits_paged(
                     f"real_page_table page id {bad} exceeds index_k_cache page capacity {max_page_capacity}"
                 )
 
-    if not supports_sparse_nsa_paged_logits_kernel(
+    if not supports_paged_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],
         index_k_cache=index_k_cache,
@@ -413,7 +413,7 @@ def sparse_nsa_index_decode_logits_paged(
         )
 
     schedule_metadata = None
-    if uses_paged_mqa_schedule_metadata(
+    if uses_paged_mqa_schedule(
         q_rows=valid_q_rows,
         max_pages=int(metadata.real_page_table.shape[1]),
     ):
@@ -424,9 +424,9 @@ def sparse_nsa_index_decode_logits_paged(
                     "paged_mqa_schedule_metadata must be precomputed before CUDA graph capture "
                     "for the scheduled decode path"
                 )
-            schedule_metadata = get_paged_mqa_logits_metadata(seqlens_valid, page_size)
+            schedule_metadata = build_paged_mqa_schedule_metadata(seqlens_valid, page_size)
 
-    logits_valid = run_sparse_nsa_paged_logits_kernel(
+    logits_valid = run_paged_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],
         index_k_cache=index_k_cache,
@@ -452,12 +452,12 @@ def sparse_nsa_index_decode_logits_paged(
     return logits
 
 
-def sparse_nsa_index_extend_logits(
+def extend_logits(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: NSAIndexerExtendLogitsMetadata,
+    metadata: IndexerExtendMetadata,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     preinitialize_invalid_logits: bool = True,
@@ -483,7 +483,7 @@ def sparse_nsa_index_extend_logits(
 
     weights_f = _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
     k_quant, k_scale = kv_fp8
-    if supports_sparse_nsa_extend_logits_kernel(
+    if supports_extend_logits_kernel(
         q_fp8=q_fp8,
         weights=weights_f,
         k_quant=k_quant,
@@ -491,7 +491,7 @@ def sparse_nsa_index_extend_logits(
         k_start=k_start,
         k_end=k_end,
     ):
-        result = run_sparse_nsa_extend_logits_kernel(
+        result = run_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,
@@ -505,7 +505,7 @@ def sparse_nsa_index_extend_logits(
         )
         return result
 
-    return sparse_nsa_extend_logits_reference(
+    return extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights_f,
         kv_fp8=kv_fp8,
@@ -564,12 +564,12 @@ def _reference_topk_indices_from_logits(
     return result
 
 
-def sparse_nsa_index_extend_tiled_topk(
+def extend_tiled_topk(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: NSAIndexerExtendLogitsMetadata,
+    metadata: IndexerExtendMetadata,
     topk: int,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
@@ -591,7 +591,7 @@ def sparse_nsa_index_extend_tiled_topk(
         raise ValueError("tiled topk requires matching rank-1 k_start and k_end tensors")
     weights_f = _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
     k_quant, k_scale = kv_fp8
-    if not supports_sparse_nsa_extend_logits_kernel(
+    if not supports_extend_logits_kernel(
         q_fp8=q_fp8,
         weights=weights_f,
         k_quant=k_quant,
@@ -609,7 +609,7 @@ def sparse_nsa_index_extend_tiled_topk(
             if lengths.device != q_fp8.device:
                 raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
             torch.sub(k_end, k_start, out=lengths[: int(k_start.shape[0])])
-        logits = sparse_nsa_extend_logits_reference(
+        logits = extend_logits_reference(
             q_fp8=q_fp8,
             weights=weights_f,
             kv_fp8=kv_fp8,
@@ -622,7 +622,7 @@ def sparse_nsa_index_extend_tiled_topk(
             output_values=output_values,
             output_indices=output_indices,
         )
-    prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+    prefill_block_k = resolve_extend_prefill_block_k(
         valid_q_rows=int(k_start.shape[0]),
         k_rows=int(k_quant.shape[0]),
         num_heads=int(q_fp8.shape[1]),
@@ -671,7 +671,7 @@ def sparse_nsa_index_extend_tiled_topk(
         global_lengths = lengths[:num_q_rows]
         torch.sub(k_end, k_start, out=global_lengths)
     if num_chunks <= 1:
-        run_sparse_nsa_extend_logits_kernel(
+        run_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,
@@ -750,7 +750,7 @@ def sparse_nsa_index_extend_tiled_topk(
         chunk_tiles = chunk_tile_end - chunk_tile_begin
         chunk_start = chunk_tile_begin * prefill_block_k
         chunk_rows = chunk_tiles * prefill_block_k
-        run_sparse_nsa_extend_logits_kernel(
+        run_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,

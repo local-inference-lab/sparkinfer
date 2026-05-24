@@ -78,7 +78,7 @@ def _split_index_k_cache_reference(
     return k_quant, k_scale
 
 
-def pack_nsa_index_k_cache_reference(
+def pack_index_k_cache_reference(
     k: torch.Tensor,
     *,
     page_size: int = 64,
@@ -115,7 +115,7 @@ def pack_nsa_index_k_cache_reference(
     return cache.contiguous()
 
 
-def unpack_nsa_index_k_cache_reference(
+def unpack_index_k_cache_reference(
     index_k_cache: torch.Tensor,
     *,
     num_tokens: int,
@@ -137,7 +137,7 @@ def unpack_nsa_index_k_cache_reference(
     return k_quant[page_idx, slot_idx] * k_scale[page_idx, slot_idx].unsqueeze(1)
 
 
-def sparse_nsa_paged_logits_reference(
+def paged_decode_logits_reference(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -232,7 +232,7 @@ def sparse_nsa_paged_logits_reference(
     return logits_out
 
 
-def sparse_nsa_extend_logits_reference(
+def extend_logits_reference(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,

@@ -2,7 +2,7 @@ import cutlass
 import cutlass.cute as cute
 
 from b12x.attention.contiguous import layout_utils
-from b12x.attention import utils
+from b12x.attention._cute import ops as cute_ops
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
@@ -52,7 +52,7 @@ class PackGQA:
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
+            tPrPtr[i] = cute_ops.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
         return tPrPtr
 
     @cute.jit
@@ -73,7 +73,7 @@ class PackGQA:
         num_threads = tiled_mma.size
         tPrLSEPtr = self.compute_ptr(mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tLSErLSE)):
-            lse_ptr_i64 = utils.shuffle_sync(
+            lse_ptr_i64 = cute_ops.shuffle_sync(
                 tPrLSEPtr[m // threads_per_row],
                 m % threads_per_row,
                 width=threads_per_row,
@@ -103,13 +103,13 @@ class PackGQA:
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tOcO = gmem_thr_copy.partition_S(cO)
         t0OcO = gmem_thr_copy.get_slice(0).partition_S(cO)
-        tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+        tOpO = cute_ops.predicate_k(tOcO, limit=mO.shape[1])
         tOcO_row = tOcO[0, None, 0]
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         num_threads = gmem_tiled_copy.size
         tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-            o_ptr_i64 = utils.shuffle_sync(
+            o_ptr_i64 = cute_ops.shuffle_sync(
                 tPrOPtr[m // threads_per_row],
                 m % threads_per_row,
                 width=threads_per_row,

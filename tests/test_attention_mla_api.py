@@ -5,10 +5,10 @@ import math
 import pytest
 import torch
 
+from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    B12XAttentionWorkspace,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )

@@ -1,2 +1,41 @@
-"""Contiguous attention kernels and integration helpers."""
+"""Public contiguous-attention API."""
 
+from .api import (
+    AttentionPlan,
+    AttentionPlanKey,
+    AttentionWorkspace,
+    AttentionWorkspacePool,
+    VarlenAttentionPlan,
+    VarlenAttentionPlanKey,
+    VarlenAttentionWorkspace,
+    allocate_attention_workspace,
+    allocate_attention_workspace_for_plan,
+    allocate_attention_workspace_pool,
+    allocate_varlen_attention_workspace,
+    allocate_varlen_attention_workspace_for_plan,
+    b12x_attention_forward,
+    b12x_varlen_attention_forward,
+    clear_attention_caches,
+    create_attention_plan,
+    create_varlen_attention_plan,
+)
+
+__all__ = [
+    "AttentionPlan",
+    "AttentionPlanKey",
+    "AttentionWorkspace",
+    "AttentionWorkspacePool",
+    "VarlenAttentionPlan",
+    "VarlenAttentionPlanKey",
+    "VarlenAttentionWorkspace",
+    "allocate_attention_workspace",
+    "allocate_attention_workspace_for_plan",
+    "allocate_attention_workspace_pool",
+    "allocate_varlen_attention_workspace",
+    "allocate_varlen_attention_workspace_for_plan",
+    "b12x_attention_forward",
+    "b12x_varlen_attention_forward",
+    "clear_attention_caches",
+    "create_attention_plan",
+    "create_varlen_attention_plan",
+]

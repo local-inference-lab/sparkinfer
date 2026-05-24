@@ -8,7 +8,7 @@ import torch
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import ops as attention_ops
 from b12x.attention.mla.reference import _MLA_GROUP_SIZE, dense_mla_reference, pack_mla_kv_cache_reference
 from b12x.attention.mla.kernel import (
     _MLA_HEADS_PER_TILE,
@@ -246,16 +246,16 @@ def _literal_pv_mma_into_ofrag_mxfp8_probe_interleave_b(
     scale01_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)]))
     scale89_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)]))
     sfa01_k0 = cvt_f32_to_ue8m0(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(0)]), Float32(sScale[lane_pair_base + Int32(1)]))
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(0)]), Float32(sScale[lane_pair_base + Int32(1)]))
     )
     sfa89_k0 = cvt_f32_to_ue8m0(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)]))
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)]))
     )
     sfa01_k1 = cvt_f32_to_ue8m0(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)]))
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)]))
     )
     sfa89_k1 = cvt_f32_to_ue8m0(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)]))
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)]))
     )
     inv_sfa01_k0 = broadcast_f32_to_bfloat2(ue8m0_to_output_scale(sfa01_k0))
     inv_sfa89_k0 = broadcast_f32_to_bfloat2(ue8m0_to_output_scale(sfa89_k0))
@@ -982,7 +982,7 @@ class LiveMlaPvProbeKernel:
             Int32(0),
             Int32(0),
             Int32(page_table_1.shape[1]),
-            Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+            Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
         )
 
@@ -1096,13 +1096,13 @@ def _pack_live_mxfp8_a_regs_for_dump(
     scale89_k0 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)]))
     scale01_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)]))
     scale89_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)]))
-    scale01_max = attention_utils.fmax(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(0)]), Float32(sScale[lane_pair_base + Int32(1)])),
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)])),
+    scale01_max = attention_ops.fmax(
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(0)]), Float32(sScale[lane_pair_base + Int32(1)])),
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)])),
     )
-    scale89_max = attention_utils.fmax(
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)])),
-        attention_utils.fmax(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)])),
+    scale89_max = attention_ops.fmax(
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)])),
+        attention_ops.fmax(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)])),
     )
     sfa01 = cvt_f32_to_ue8m0(scale01_max)
     sfa89 = cvt_f32_to_ue8m0(scale89_max)
@@ -1234,7 +1234,7 @@ class LiveMlaPvRegisterDumpKernel:
             Int32(0),
             Int32(0),
             Int32(page_table_1.shape[1]),
-            Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+            Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
         )
 
@@ -2169,7 +2169,7 @@ class ScoreTileProbeKernel:
             Int32(0),
             Int32(token_base[Int32(0)]),
             Int32(token_end[Int32(0)]),
-            Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+            Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
         )
         for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):

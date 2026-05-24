@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import (
-    pack_nsa_index_k_cache_reference,
-    sparse_nsa_extend_logits_reference,
-    sparse_nsa_paged_logits_reference,
-    unpack_nsa_index_k_cache_reference,
+from b12x.attention.indexer.reference import (
+    pack_index_k_cache_reference,
+    extend_logits_reference,
+    paged_decode_logits_reference,
+    unpack_index_k_cache_reference,
 )
 
 
@@ -169,8 +169,8 @@ def test_pack_nsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> Non
         gen = torch.Generator(device="cpu")
         gen.manual_seed(70_000 + num_tokens)
         k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 4
-        packed = pack_nsa_index_k_cache_reference(k)
-        unpacked = unpack_nsa_index_k_cache_reference(packed, num_tokens=num_tokens)
+        packed = pack_index_k_cache_reference(k)
+        unpacked = unpack_index_k_cache_reference(packed, num_tokens=num_tokens)
         max_abs = (unpacked - k).abs().max().item()
         rmse = torch.sqrt(((unpacked - k) ** 2).mean()).item()
         assert packed.shape == (((num_tokens + 63) // 64), 64 * (128 + 4))
@@ -178,7 +178,7 @@ def test_pack_nsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> Non
         assert rmse <= 0.008, f"num_tokens={num_tokens}: rmse={rmse:.6f}"
 
 
-def test_sparse_nsa_paged_logits_reference_matches_manual() -> None:
+def test_paged_decode_logits_reference_matches_manual() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_001)
@@ -196,14 +196,14 @@ def test_sparse_nsa_paged_logits_reference_matches_manual() -> None:
         device=device,
     )
     k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 3
-    index_k_cache = pack_nsa_index_k_cache_reference(k)
-    unpacked = unpack_nsa_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
+    index_k_cache = pack_index_k_cache_reference(k)
+    unpacked = unpack_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
     q_fp8 = (
         torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
 
-    actual = sparse_nsa_paged_logits_reference(
+    actual = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -223,7 +223,7 @@ def test_sparse_nsa_paged_logits_reference_matches_manual() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_nsa_extend_logits_reference_matches_manual() -> None:
+def test_extend_logits_reference_matches_manual() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_002)
@@ -240,7 +240,7 @@ def test_sparse_nsa_extend_logits_reference_matches_manual() -> None:
     k_start = torch.tensor([0, 4, 12, 40, 40], dtype=torch.int32, device=device)
     k_end = torch.tensor([8, 20, 20, 56, 40], dtype=torch.int32, device=device)
 
-    actual = sparse_nsa_extend_logits_reference(
+    actual = extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -258,7 +258,7 @@ def test_sparse_nsa_extend_logits_reference_matches_manual() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_nsa_paged_logits_reference_matches_scalar_oracle_for_expanded_queries() -> None:
+def test_paged_decode_logits_reference_matches_scalar_oracle_for_expanded_queries() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_003)
@@ -275,8 +275,8 @@ def test_sparse_nsa_paged_logits_reference_matches_scalar_oracle_for_expanded_qu
     num_heads = 5
     num_tokens = 8 * 64
     k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 5
-    index_k_cache = pack_nsa_index_k_cache_reference(k)
-    k_dequant = unpack_nsa_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
+    index_k_cache = pack_index_k_cache_reference(k)
+    k_dequant = unpack_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
     q_fp8 = (
         torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 3
     ).to(torch.float8_e4m3fn)
@@ -284,7 +284,7 @@ def test_sparse_nsa_paged_logits_reference_matches_scalar_oracle_for_expanded_qu
     query_row_to_batch = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device=device)
     seqlens_per_query = torch.tensor([65, 9, 130, 0], dtype=torch.int32, device=device)
 
-    actual = sparse_nsa_paged_logits_reference(
+    actual = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -304,7 +304,7 @@ def test_sparse_nsa_paged_logits_reference_matches_scalar_oracle_for_expanded_qu
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_nsa_extend_logits_reference_matches_scalar_oracle_for_clamped_ranges() -> None:
+def test_extend_logits_reference_matches_scalar_oracle_for_clamped_ranges() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_004)
@@ -322,7 +322,7 @@ def test_sparse_nsa_extend_logits_reference_matches_scalar_oracle_for_clamped_ra
     k_start = torch.tensor([-3, 0, 7, 18], dtype=torch.int32, device=device)
     k_end = torch.tensor([2, 0, 99, 18], dtype=torch.int32, device=device)
 
-    actual = sparse_nsa_extend_logits_reference(
+    actual = extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,

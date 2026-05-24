@@ -9,13 +9,13 @@ import cutlass
 import torch
 from cutlass import Int32
 
-from b12x.attention.nsa_indexer.tiled_topk import (
+from b12x.attention.indexer.tiled_topk import (
     SparseNSATiledTopkKernel,
     _run_cached_host_launcher,
     _tensor_meta_key,
     _to_kernel_tensor,
 )
-from b12x.attention.nsa_indexer.persistent_topk import run_persistent_topk2048
+from b12x.attention.indexer.persistent_topk import run_persistent_topk2048
 from b12x.cute.utils import current_cuda_stream
 
 

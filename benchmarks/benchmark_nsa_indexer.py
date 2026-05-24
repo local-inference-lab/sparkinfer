@@ -15,19 +15,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import (
-    sparse_nsa_extend_logits_reference,
-    sparse_nsa_paged_logits_reference,
+from b12x.attention.indexer.reference import (
+    extend_logits_reference,
+    pack_index_k_cache_reference,
+    paged_decode_logits_reference,
 )
-from b12x.integration.nsa_indexer import (
-    NSAIndexerExtendLogitsMetadata,
-    NSAIndexerPagedDecodeMetadata,
-    clear_nsa_indexer_caches,
-    get_paged_mqa_logits_metadata,
-    pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_logits_paged,
-    sparse_nsa_index_extend_logits,
-    uses_paged_mqa_schedule_metadata,
+from b12x.integration.indexer import (
+    IndexerExtendMetadata,
+    IndexerPagedDecodeMetadata,
+    clear_indexer_caches,
+    build_paged_mqa_schedule_metadata,
+    paged_decode_logits,
+    extend_logits,
+    uses_paged_mqa_schedule,
 )
 
 from benchmarks.common import (
@@ -110,7 +110,7 @@ def _make_index_k_cache(
     )
     k = token_scores.unsqueeze(1).expand(-1, 128).contiguous()
     k_pool = scatter_rows_into_pool(k, pool_locs=pool_locs, pool_tokens=pool_tokens)
-    return pack_nsa_index_k_cache_reference(k_pool)
+    return pack_index_k_cache_reference(k_pool)
 
 
 def _make_page_table(
@@ -288,7 +288,7 @@ def _run_decode_case(
         device=device,
     )
     graph_seqlens = torch.empty_like(seqlens)
-    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+    use_graph_schedule_metadata = uses_paged_mqa_schedule(
         q_rows=q_rows,
         max_pages=graph_real_page_table.shape[1],
     )
@@ -307,21 +307,21 @@ def _run_decode_case(
         graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
         graph_seqlens.copy_(seqlens)
         if graph_schedule_metadata is not None:
-            get_paged_mqa_logits_metadata(
+            build_paged_mqa_schedule_metadata(
                 graph_seqlens,
                 cfg.page_size,
                 out=graph_schedule_metadata,
             )
 
     prepare_decode_graph()
-    metadata = NSAIndexerPagedDecodeMetadata(
+    metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
 
     def run():
-        logits = sparse_nsa_index_decode_logits_paged(
+        logits = paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -335,9 +335,9 @@ def _run_decode_case(
             topk=topk,
         )
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     actual = run()
-    expected_logits = sparse_nsa_paged_logits_reference(
+    expected_logits = paged_decode_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -454,13 +454,13 @@ def _run_extend_case(
         device=device,
     )
     seqlens_expanded = per_request_ke.repeat(batch)
-    metadata = NSAIndexerExtendLogitsMetadata(
+    metadata = IndexerExtendMetadata(
         k_start=k_start,
         k_end=k_start + seqlens_expanded,
     )
 
     def run():
-        logits = sparse_nsa_index_extend_logits(
+        logits = extend_logits(
             q_fp8=q_fp8,
             weights=weights,
             kv_fp8=kv_fp8,
@@ -473,9 +473,9 @@ def _run_extend_case(
             topk=topk,
         )
 
-    clear_nsa_indexer_caches()
+    clear_indexer_caches()
     actual = run()
-    expected_logits = sparse_nsa_extend_logits_reference(
+    expected_logits = extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,

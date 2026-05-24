@@ -17,10 +17,10 @@ from b12x.attention.mla.reference import (
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
+from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    B12XAttentionWorkspace,
     clear_mla_caches,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 
 import cuda.bindings.driver as cuda
@@ -12,7 +11,16 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from b12x.attention import utils as attention_utils
+from b12x.attention._cute import ops as attention_ops
+from b12x.attention.workspace import (
+    SparseMLASplitDecodeConfig,
+    _SPLIT_CHUNK_LADDER,
+    _SPLIT_MAX_CHUNKS,
+    _SPLIT_MAX_WIDTH,
+    _ceil_div,
+    default_sparse_mla_split_decode_config_for_width,
+    forced_sparse_mla_split_decode_config_for_width,
+)
 from b12x.cute.fp4 import shared_ptr_to_u32
 from b12x.cute.utils import current_cuda_stream
 
@@ -47,15 +55,6 @@ from .kernel import (
 from .traits import SparseMLATraits, select_sparse_mla_traits
 
 
-_SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
-_SPLIT_MAX_CHUNKS = 256
-_SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
-
-
-def _ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
 def get_sparse_mla_split_shared_storage_cls():
     """SharedStorage for split kernel: no kv_stage_b (single-tile path only)."""
     class SharedStorage:
@@ -81,45 +80,6 @@ def get_sparse_mla_split_shared_storage_cls():
     }
     return cute.struct(SharedStorage)
 
-
-@dataclass(frozen=True)
-class SparseMLASplitDecodeConfig:
-    chunk_size: int
-    num_chunks: int
-
-
-def default_sparse_mla_split_decode_config_for_width(
-    width: int,
-    *,
-    max_chunks: int = _SPLIT_MAX_CHUNKS,
-) -> SparseMLASplitDecodeConfig | None:
-    if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
-        return None
-
-    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
-    for chunk_size in _SPLIT_CHUNK_LADDER:
-        num_chunks = _ceil_div(width, chunk_size)
-        if num_chunks <= max_chunks:
-            return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
-    return None
-
-
-def forced_sparse_mla_split_decode_config_for_width(
-    width: int,
-    *,
-    max_chunks: int = _SPLIT_MAX_CHUNKS,
-) -> SparseMLASplitDecodeConfig | None:
-    if width <= 0 or width > _SPLIT_MAX_WIDTH:
-        return None
-
-    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
-    for chunk_size in _SPLIT_CHUNK_LADDER:
-        num_chunks = _ceil_div(width, chunk_size)
-        if num_chunks <= max_chunks:
-            return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
-    return None
-
-
 @cute.jit
 def _split_output_lane_view(
     tmp_output: cute.Tensor,
@@ -128,7 +88,7 @@ def _split_output_lane_view(
     out_base: Int32,
 ) -> cute.Tensor:
     return cute.make_tensor(
-        attention_utils.elem_pointer(tmp_output, (q_idx, head_idx, Int32(0), out_base)),
+        attention_ops.elem_pointer(tmp_output, (q_idx, head_idx, Int32(0), out_base)),
         cute.make_layout(
             (tmp_output.shape[2], 4),
             stride=(tmp_output.stride[2], 1),
@@ -143,7 +103,7 @@ def _split_lse_head_view(
     head_idx: Int32,
 ) -> cute.Tensor:
     return cute.make_tensor(
-        attention_utils.elem_pointer(tmp_lse, (q_idx, head_idx, Int32(0))),
+        attention_ops.elem_pointer(tmp_lse, (q_idx, head_idx, Int32(0))),
         cute.make_layout(
             (tmp_lse.shape[2],),
             stride=(tmp_lse.stride[2],),
@@ -319,7 +279,7 @@ class SparseMLASplitDecodeForwardKernel:
                 head_tile_start,
                 token_start,
                 token_end,
-                Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
                 lane,
                 tmp_output,
                 q_idx,
@@ -467,7 +427,7 @@ class CompressedMLASplitDecodeForwardKernel:
                     head_tile_start,
                     Int32(0),
                     row_token_end,
-                    Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                    Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
                     lane,
                     tmp_output,
                     q_idx,
@@ -500,7 +460,7 @@ class CompressedMLASplitDecodeForwardKernel:
                     head_tile_start,
                     Int32(0),
                     row_token_end,
-                    Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                    Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
                     lane,
                     tmp_output,
                     q_idx,
@@ -568,7 +528,7 @@ class CompressedMLASplitDecodeForwardKernel:
                         head_tile_start,
                         token_start,
                         token_end,
-                        Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                        Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
                         lane,
                         tmp_output,
                         q_idx,
@@ -601,7 +561,7 @@ class CompressedMLASplitDecodeForwardKernel:
                         head_tile_start,
                         token_start,
                         token_end,
-                        Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                        Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
                         lane,
                         tmp_output,
                         q_idx,
@@ -683,7 +643,7 @@ class SparseMLASplitDecodeMergeKernel:
         while chunk_idx < num_chunks:
             part_lse = Float32(tmp_lse_head[chunk_idx])
             if part_lse != Float32(-Float32.inf):
-                new_m = attention_utils.fmax(merged_m, part_lse)
+                new_m = attention_ops.fmax(merged_m, part_lse)
                 prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
                 part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
                 merged_d = Float32(merged_d * prev_scale + part_scale)
@@ -783,7 +743,7 @@ class SparseMLASplitDecodeSinkMergeKernel:
         while chunk_idx < num_chunks:
             part_lse = Float32(tmp_lse_head[chunk_idx])
             if part_lse != Float32(-Float32.inf):
-                new_m = attention_utils.fmax(merged_m, part_lse)
+                new_m = attention_ops.fmax(merged_m, part_lse)
                 prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
                 part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
                 merged_d = Float32(merged_d * prev_scale + part_scale)
@@ -808,8 +768,8 @@ class SparseMLASplitDecodeSinkMergeKernel:
             output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
             output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
         else:
-            sink_m = Float32(attn_sink[head_idx] * attention_utils.LOG2_E)
-            new_m = attention_utils.fmax(merged_m, sink_m)
+            sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
+            new_m = attention_ops.fmax(merged_m, sink_m)
             prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
             sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
             merged_d = Float32(merged_d * prev_scale + sink_scale)
@@ -949,7 +909,7 @@ def run_sparse_mla_split_decode_forward(
     _cq = getattr(workspace, "_contract_q", None)
     _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
     _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
+    _cnt = getattr(workspace, "_contract_indexer_cache_seqlens", None)
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
@@ -1091,7 +1051,7 @@ def run_compressed_mla_split_decode_forward(
     )
     _cq = getattr(workspace, "_contract_q", None)
     _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
+    _cnt = getattr(workspace, "_contract_indexer_cache_seqlens", None)
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     _co = getattr(workspace, "_contract_output", None)

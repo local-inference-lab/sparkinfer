@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x.attention.mla.workspace import (
+from b12x.attention.workspace import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
     B12XAttentionWorkspace,

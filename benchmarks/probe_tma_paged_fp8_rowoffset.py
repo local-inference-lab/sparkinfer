@@ -18,7 +18,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, dsl_user_op
 
-from b12x.attention import pipeline
+from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.cute.fp4 import shared_ptr_to_u32
 
 _ROWS = 64
@@ -128,7 +128,7 @@ class RawPtxPagedFp8Probe:
                 cutlass.pipeline.Agent.Thread, 1
             )
             producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
-            pipe = pipeline.PipelineTmaAsync.create(
+            pipe = cute_pipeline.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr,
                 num_stages=1,
                 producer_group=producer_group,
@@ -136,10 +136,10 @@ class RawPtxPagedFp8Probe:
                 tx_count=_ROWS * _HEAD_DIM,
                 defer_sync=False,
             )
-            producer_state = pipeline.make_pipeline_state(
+            producer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Producer, 1
             )
-            consumer_state = pipeline.make_pipeline_state(
+            consumer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer, 1
             )
             if lane == 0:
@@ -166,8 +166,8 @@ class RawPtxPagedFp8Probe:
             pipe.consumer_wait(consumer_state, pipe.consumer_try_wait(consumer_state))
             cute.arch.sync_threads()
         elif const_expr(self.mode == "state"):
-            producer_state = pipeline.PipelineStateSimple(self.stages, Int32(0))
-            consumer_state = pipeline.PipelineStateSimple(self.stages, Int32(0))
+            producer_state = cute_pipeline.PipelineStateSimple(self.stages, Int32(0))
+            consumer_state = cute_pipeline.PipelineStateSimple(self.stages, Int32(0))
             if lane < self.stages:
                 cute.arch.mbarrier_init(mbar_ptr + lane, Int32(1))
             cute.arch.sync_threads()
