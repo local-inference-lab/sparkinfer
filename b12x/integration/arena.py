@@ -140,8 +140,6 @@ class B12XMoEArenaCaps:
             route_logits_dtype=self.route_logits_dtype,
             quant_mode=self.quant_mode,
             activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            swiglu_limit=self.swiglu_limit,
         )
 
 
