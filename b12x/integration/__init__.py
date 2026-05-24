@@ -80,6 +80,7 @@ from .residual import (
 )
 from .tp_moe import (
     B12XFP4ExpertWeights,
+    B12XPreparedFP4MoEWeights,
     B12XTopKRouting,
     TPMoEArenaLayout,
     TPMoEWorkspacePool,
@@ -88,8 +89,7 @@ from .tp_moe import (
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
     plan_tp_moe_arena_layout,
-    prepare_b12x_w4a16_modelopt_nvfp4_weights,
-    prepare_b12x_w4a16_packed_weights,
+    prepare_b12x_fp4_moe_weights,
 )
 
 __all__ = [
@@ -160,6 +160,7 @@ __all__ = [
     "empty_mhc_pre_workspace",
     "mhc_workspace_nbytes",
     "B12XFP4ExpertWeights",
+    "B12XPreparedFP4MoEWeights",
     "B12XTopKRouting",
     "TPMoEArenaLayout",
     "TPMoEWorkspacePool",
@@ -168,6 +169,5 @@ __all__ = [
     "b12x_route_experts_fast",
     "b12x_sparse_moe_fp4",
     "plan_tp_moe_arena_layout",
-    "prepare_b12x_w4a16_modelopt_nvfp4_weights",
-    "prepare_b12x_w4a16_packed_weights",
+    "prepare_b12x_fp4_moe_weights",
 ]

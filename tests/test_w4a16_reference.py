@@ -4,6 +4,7 @@ import torch
 
 import b12x.integration.tp_moe as tp_moe
 from b12x.cute.fp4 import pack_grouped_fp4_values, swizzle_block_scale
+from b12x.moe.fused.reference import moe_reference_w4a16_f32
 from b12x.moe.fused.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
 from tests.w4a16_reference import moe_reference_w4a16
 
@@ -84,6 +85,60 @@ def test_w4a16_reference_uses_bf16_activation_and_intermediate_without_activatio
     torch.testing.assert_close(
         actual.float(),
         torch.full((1, hidden), 256.0, dtype=torch.float32),
+    )
+
+
+def test_w4a16_f32_oracle_uses_weight_only_scales_without_activation_quant() -> None:
+    experts, hidden, intermediate, topk = 1, 16, 16, 1
+    x = torch.full((1, hidden), 0.25, dtype=torch.bfloat16)
+    topk_ids = torch.zeros(1, topk, dtype=torch.int32)
+    topk_weights = torch.ones(1, topk, dtype=torch.float32)
+
+    w1_fp4 = _packed_fp4_constant(
+        1.0,
+        groups=experts,
+        rows=intermediate,
+        cols=hidden,
+    )
+    w2_fp4 = _packed_fp4_constant(
+        1.0,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+    w1_blockscale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=intermediate,
+        cols=hidden,
+    )
+    w2_blockscale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+
+    actual = moe_reference_w4a16_f32(
+        x,
+        w1_fp4,
+        w1_blockscale,
+        torch.full((experts,), 2.0, dtype=torch.float32),
+        w2_fp4,
+        w2_blockscale,
+        torch.full((experts,), 3.0, dtype=torch.float32),
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden,
+        intermediate,
+        activation="relu2",
+    )
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(
+        actual,
+        torch.full((1, hidden), 3072.0, dtype=torch.float32),
     )
 
 

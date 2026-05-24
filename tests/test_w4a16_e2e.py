@@ -3,8 +3,18 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.fp4 import swizzle_block_scale
-from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4
+from b12x.cute.fp4 import (
+    FLOAT4_E2M1_MAX,
+    fp4_quantize_values_torch,
+    pack_grouped_fp4_values,
+    swizzle_block_scale,
+)
+from b12x.integration.tp_moe import (
+    allocate_tp_moe_workspace_pool,
+    b12x_moe_fp4,
+    prepare_b12x_fp4_moe_weights,
+)
+from b12x.moe.fused.reference import moe_reference_nvfp4, moe_reference_w4a16_f32
 from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
 from b12x.moe.fused.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
@@ -21,6 +31,45 @@ from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 0.25 + 0.03125).to(torch.float8_e4m3fn)
+
+
+def _quantize_dense_moe_weight_storage(
+    input_tensor: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_groups, rows, cols = input_tensor.shape
+    quantized = torch.zeros(
+        (num_groups, rows, cols),
+        dtype=torch.float32,
+        device=input_tensor.device,
+    )
+    scales = torch.zeros(
+        (num_groups, rows, cols // 16),
+        dtype=torch.float32,
+        device=input_tensor.device,
+    )
+    for group_idx in range(num_groups):
+        x = input_tensor[group_idx].float()
+        sliced = x.view(rows, cols // 16, 16)
+        block_max = sliced.abs().amax(dim=-1, keepdim=True)
+        scale = (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX)).to(
+            torch.float8_e4m3fn
+        )
+        scale = scale.to(torch.float32)
+        output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx])).clamp(
+            min=1e-30
+        )
+        clipped = torch.clamp(
+            sliced * output_scale,
+            -FLOAT4_E2M1_MAX,
+            FLOAT4_E2M1_MAX,
+        ).view(rows, cols)
+        quantized[group_idx] = fp4_quantize_values_torch(clipped)
+        scales[group_idx] = scale.squeeze(-1)
+
+    packed = pack_grouped_fp4_values(quantized).permute(2, 0, 1).contiguous()
+    swizzled = swizzle_block_scale(scales.to(torch.float8_e4m3fn))
+    return packed, swizzled
 
 
 def _make_weights(
@@ -157,6 +206,139 @@ def _assert_matches_oracle(
     metrics = compare_to_reference(actual, expected)
     min_cos = 0.9975 if activation == "silu" else 0.9900
     assert metrics.cos >= min_cos, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
+    activation: str,
+) -> None:
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    cases = [
+        (1, 3, 2, torch.int32, 0.50),
+        (5, 7, 3, torch.int64, 0.75),
+    ]
+    for batch_size, seq_len, topk, ids_dtype, input_scale in cases:
+        m = batch_size * seq_len
+        torch.manual_seed(
+            20260525
+            + m * 31
+            + topk
+            + (1000 if activation == "silu" else 0)
+        )
+        rows = intermediate_size * (2 if activation == "silu" else 1)
+        w13_dense = (
+            torch.randn(experts, rows, hidden_size, device="cuda")
+            * (0.18 if activation == "silu" else 0.08)
+        )
+        w2_dense = (
+            torch.randn(experts, hidden_size, intermediate_size, device="cuda")
+            * (0.18 if activation == "silu" else 0.08)
+        )
+        w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+        w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+        w13, w13_blockscale = _quantize_dense_moe_weight_storage(
+            w13_dense,
+            w13_global_scale,
+        )
+        w2, w2_blockscale = _quantize_dense_moe_weight_storage(
+            w2_dense,
+            w2_global_scale,
+        )
+
+        x = (torch.randn(m, hidden_size, device="cuda") * input_scale).to(
+            torch.bfloat16
+        )
+        topk_ids = torch.randint(
+            0,
+            experts,
+            (m, topk),
+            device="cuda",
+            dtype=ids_dtype,
+        )
+        topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+        a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+
+        nvfp4 = b12x_moe_fp4(
+            x,
+            a_gscale,
+            w13,
+            w13_blockscale,
+            w13_global_scale,
+            a_gscale,
+            w2,
+            w2_blockscale,
+            w2_global_scale,
+            topk_weights,
+            topk_ids,
+            workspace=allocate_tp_moe_workspace_pool(),
+            activation=activation,
+            quant_mode="nvfp4",
+        )
+        w4a16 = b12x_moe_fp4(
+            x,
+            a_gscale,
+            w13,
+            w13_blockscale,
+            w13_global_scale,
+            a_gscale,
+            w2,
+            w2_blockscale,
+            w2_global_scale,
+            topk_weights,
+            topk_ids,
+            workspace=allocate_tp_moe_workspace_pool(),
+            activation=activation,
+            quant_mode="w4a16",
+            source_format="modelopt_nvfp4",
+        )
+        nvfp4_reference = moe_reference_nvfp4(
+            x,
+            w13,
+            w13_blockscale,
+            w13_global_scale,
+            w2,
+            w2_blockscale,
+            w2_global_scale,
+            a_gscale,
+            a_gscale,
+            topk_ids,
+            topk_weights,
+            experts,
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+        )
+        true_fp32 = moe_reference_w4a16_f32(
+            x,
+            w13,
+            w13_blockscale,
+            w13_global_scale,
+            w2,
+            w2_blockscale,
+            w2_global_scale,
+            topk_ids,
+            topk_weights,
+            experts,
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+        )
+        torch.cuda.synchronize()
+
+        nvfp4_reference_metrics = compare_to_reference(nvfp4, nvfp4_reference)
+        nvfp4_true_metrics = compare_to_reference(nvfp4, true_fp32)
+        w4a16_true_metrics = compare_to_reference(w4a16, true_fp32)
+        assert nvfp4_reference_metrics.cos > 0.98, nvfp4_reference_metrics
+        assert w4a16_true_metrics.cos > 0.999, w4a16_true_metrics
+        assert w4a16_true_metrics.cos > nvfp4_true_metrics.cos + 0.003, (
+            nvfp4_true_metrics,
+            w4a16_true_metrics,
+            batch_size,
+            seq_len,
+            topk,
+            ids_dtype,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -319,8 +501,6 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
     w2_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(torch.float32)
     a1_gscale = (1.0 / w13_input_scale).contiguous()
     a2_gscale = (1.0 / w2_input_scale).contiguous()
-    fused_w13_global_scale = (w13_global_scale * w13_input_scale).contiguous()
-    fused_w2_global_scale = (w2_global_scale * w2_input_scale).contiguous()
 
     x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
     topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
@@ -331,11 +511,11 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
         a1_gscale,
         w13,
         w13_blockscale,
-        fused_w13_global_scale,
+        w13_global_scale,
         a2_gscale,
         w2,
         w2_blockscale,
-        fused_w2_global_scale,
+        w2_global_scale,
         topk_weights,
         topk_ids,
         workspace=allocate_tp_moe_workspace_pool(),
@@ -355,6 +535,118 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
 
     assert actual is output
     _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stress(
+) -> None:
+    torch.manual_seed(20260526)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    activation = "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    reference_weights = tuple(t.clone() for t in weights)
+    w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = (
+        weights
+    )
+    a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_global_scale=w13_global_scale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_global_scale=w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        prepare_w4a16=True,
+        reuse_input_storage=True,
+    )
+    assert prepared.w4a16 is not None
+
+    workspace = allocate_tp_moe_workspace_pool()
+    cases = [
+        (1, 1, 1, torch.int32, 0.25),
+        (3, 5, 2, torch.int32, 0.50),
+        (5, 7, 3, torch.int64, 0.75),
+        (9, 11, 4, torch.int32, 1.00),
+    ]
+    for case_idx, (batch_size, seq_len, topk, ids_dtype, input_scale) in enumerate(
+        cases
+    ):
+        m = batch_size * seq_len
+        torch.manual_seed(2026052600 + case_idx)
+        x = (torch.randn(m, hidden_size, device="cuda") * input_scale).to(
+            torch.bfloat16
+        )
+        topk_ids = torch.randint(
+            0,
+            experts,
+            (m, topk),
+            device="cuda",
+            dtype=ids_dtype,
+        )
+        topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+        expected = moe_reference_w4a16_f32(
+            x,
+            *reference_weights,
+            topk_ids,
+            topk_weights,
+            experts,
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+        )
+
+        baseline = None
+        for repeat in range(6):
+            output = torch.empty_like(x)
+            actual = b12x_moe_fp4(
+                x,
+                a_gscale,
+                w13,
+                w13_blockscale,
+                w13_global_scale,
+                a_gscale,
+                w2,
+                w2_blockscale,
+                w2_global_scale,
+                topk_weights,
+                topk_ids,
+                workspace=workspace,
+                output=output,
+                activation=activation,
+                quant_mode="w4a16",
+                source_format="modelopt_nvfp4",
+                prepared_w4a16=prepared.w4a16,
+            )
+            torch.cuda.synchronize()
+            assert actual is output
+            if baseline is None:
+                baseline = output.detach().clone()
+                continue
+            if not torch.equal(output, baseline):
+                max_abs = (output.float() - baseline.float()).abs().max().item()
+                raise AssertionError(
+                    "W4A16 prepared reuse path changed output for "
+                    f"case={case_idx}, repeat={repeat}, m={m}, topk={topk}, "
+                    f"ids_dtype={ids_dtype}, max_abs={max_abs}"
+                )
+
+        assert baseline is not None
+        metrics = compare_to_reference(baseline, expected)
+        assert metrics.cos > 0.999, (
+            metrics,
+            batch_size,
+            seq_len,
+            topk,
+            ids_dtype,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

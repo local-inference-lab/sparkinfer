@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -215,6 +215,23 @@ class B12XFP4ExpertWeights:
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
     source_format: str = "modelopt_nvfp4"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp4_source_format(self.source_format),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XPreparedFP4MoEWeights:
+    """Derived FP4 MoE weight representations prepared from a source contract."""
+
+    source_format: str
+    w1_runtime_alphas: torch.Tensor | None = None
+    w2_runtime_alphas: torch.Tensor | None = None
+    w4a16: Any | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -474,7 +491,6 @@ _PLAIN_PARAM_CACHE: Dict[
     Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
     torch.Tensor,
 ] = {}
-_W4A16_ALPHA_CACHE: Dict[Tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
@@ -538,7 +554,6 @@ def clear_tp_moe_caches() -> None:
     _MICRO_DIRECT_LAUNCH_CAP_CACHE.clear()
     _EXACT_RELU2_BS1_NEMOTRON_CACHE.clear()
     _PLAIN_PARAM_CACHE.clear()
-    _W4A16_ALPHA_CACHE.clear()
     _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     _DYNAMIC_MULTICTA_CACHE = None
@@ -691,6 +706,28 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
         return _get_plain_cuda_tensor(scale, dtype=torch.float32)
 
 
+def _prepare_expert_scale_vector(
+    scale: torch.Tensor,
+    weight_E: int,
+    *,
+    name: str,
+) -> torch.Tensor:
+    with record_function("tp_moe.prepare_expert_scale_vector"):
+        if scale.numel() == 1:
+            with record_function("tp_moe.prepare_expert_scale_vector.expand_scalar"):
+                return (
+                    scale.reshape(())
+                    .expand(weight_E)
+                    .to(torch.float32)
+                    .contiguous()
+                )
+        if scale.numel() != weight_E:
+            raise ValueError(
+                f"expected {name} with {weight_E} elements, got {scale.numel()}"
+            )
+        return scale.reshape(weight_E).to(torch.float32).contiguous()
+
+
 def _get_plain_cuda_tensor(
     t: torch.Tensor, *, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
@@ -712,42 +749,6 @@ def _get_plain_cuda_tensor(
             plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
         _PLAIN_PARAM_CACHE[key] = plain
         return plain
-
-
-def _tensor_cache_key(
-    t: torch.Tensor,
-) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, int]:
-    return (
-        t.data_ptr(),
-        tuple(t.shape),
-        tuple(t.stride()),
-        t.dtype,
-        _tensor_version(t),
-    )
-
-
-def _w4a16_default_alpha(
-    alpha: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_E: int,
-) -> torch.Tensor:
-    key = (
-        _tensor_cache_key(alpha),
-        _tensor_cache_key(input_scale),
-        weight_E,
-    )
-    cached = _W4A16_ALPHA_CACHE.get(key)
-    if cached is not None:
-        cached_alpha, cached_input_scale, cached_adjusted = cached
-        if cached_alpha is alpha and cached_input_scale is input_scale:
-            return cached_adjusted
-
-    alpha_plain = _get_plain_cuda_tensor(alpha, dtype=torch.float32)
-    scale_plain = _prepare_expert_scale(input_scale, weight_E)
-    adjusted = torch.empty_like(alpha_plain)
-    torch.mul(alpha_plain, scale_plain, out=adjusted)
-    _W4A16_ALPHA_CACHE[key] = (alpha, input_scale, adjusted)
-    return adjusted
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
@@ -1619,103 +1620,128 @@ def _get_w4a16_packed_weights(
     return prepared
 
 
-def prepare_b12x_w4a16_packed_weights(
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
+def _prepare_modelopt_nvfp4_runtime_alphas(
+    w1_global_scale: torch.Tensor,
     a1_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
+    w2_global_scale: torch.Tensor,
     a2_gscale: torch.Tensor,
     *,
-    activation: str,
-    params_dtype: torch.dtype,
-    quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt_nvfp4",
-    reuse_input_storage: bool = False,
-) -> object:
-    """Prepare W4A16 packed weights using the same contract as b12x_moe_fp4."""
-    quant_mode_arg = quant_mode
-    quant_mode = _normalize_quant_mode(quant_mode_arg)
-    if quant_mode != "w4a16":
-        raise ValueError("W4A16 packed weights require quant_mode='w4a16'")
-    source_format = _normalize_fp4_source_format(source_format)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=source_format,
-        quant_mode=quant_mode,
-    )
+    weight_E: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare W4A4 runtime alphas from raw ModelOpt NVFP4 scales.
 
-    weight_E = int(w1_fp4.shape[0])
-    if quant_mode_arg is None:
-        w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
-        w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
-
-    return _get_w4a16_packed_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
-        source_format=source_format,
-        reuse_input_storage=reuse_input_storage,
-    )
-
-
-def prepare_b12x_w4a16_modelopt_nvfp4_weights(
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype,
-    quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt_nvfp4",
-    reuse_input_storage: bool = False,
-) -> object:
-    """Prepare ModelOpt NVFP4 W4A16 weights from the normal NVFP4 scale contract.
-
-    The ModelOpt/vLLM tensors use the same fused ``w*_alphas`` consumed by
-    W4A4: activation input scale multiplied by weight global scale. W4A16 uses
-    BF16 activations directly, so recover the weight global scale by applying
-    the reciprocal input scales before the W4A16 weight preparation step.
+    ModelOpt stores per-expert weight global scales separately from activation
+    input scales. The existing NVFP4 W4A4 kernels consume
+    ``weight_global_scale * input_scale`` while vLLM exposes reciprocal input
+    scales in ``a*_gscale``. Keep that conversion in B12X preparation so
+    integrations do not mutate checkpoint-owned scale tensors in-place.
     """
-    quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode != "w4a16":
-        raise ValueError("W4A16 ModelOpt NVFP4 weights require quant_mode='w4a16'")
-    source_format = _normalize_fp4_source_format(source_format)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=source_format,
-        quant_mode=quant_mode,
+    if weight_E is None:
+        weight_E = int(w1_global_scale.numel())
+    w1_scale = _prepare_expert_scale_vector(
+        w1_global_scale,
+        weight_E,
+        name="w1_global_scale",
     )
-    if source_format != "modelopt_nvfp4":
+    w2_scale = _prepare_expert_scale_vector(
+        w2_global_scale,
+        weight_E,
+        name="w2_global_scale",
+    )
+    a1_recip = _prepare_expert_scale_vector(a1_gscale, weight_E, name="a1_gscale")
+    a2_recip = _prepare_expert_scale_vector(a2_gscale, weight_E, name="a2_gscale")
+    w1_runtime = torch.empty_like(w1_scale)
+    w2_runtime = torch.empty_like(w2_scale)
+    torch.div(w1_scale, a1_recip, out=w1_runtime)
+    torch.div(w2_scale, a2_recip, out=w2_runtime)
+    return w1_runtime.contiguous(), w2_runtime.contiguous()
+
+
+def prepare_b12x_fp4_moe_weights(
+    *,
+    source_format: str = "modelopt_nvfp4",
+    w1_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
+    w1_fp4: torch.Tensor | None = None,
+    w1_blockscale: torch.Tensor | None = None,
+    w2_fp4: torch.Tensor | None = None,
+    w2_blockscale: torch.Tensor | None = None,
+    activation: str | None = None,
+    params_dtype: torch.dtype | None = None,
+    prepare_runtime_alphas: bool = False,
+    prepare_w4a16: bool = False,
+    reuse_input_storage: bool = False,
+) -> B12XPreparedFP4MoEWeights:
+    """Prepare B12X FP4 MoE runtime representations from a source contract."""
+    source_format = _normalize_fp4_source_format(source_format)
+    if not prepare_runtime_alphas and not prepare_w4a16:
         raise ValueError(
-            "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4'"
+            "prepare_b12x_fp4_moe_weights requires at least one requested "
+            "representation"
         )
 
-    weight_E = int(w1_fp4.shape[0])
-    w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
-    w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
+    w1_runtime_alphas = None
+    w2_runtime_alphas = None
+    if prepare_runtime_alphas:
+        if source_format != "modelopt_nvfp4":
+            raise ValueError(
+                "runtime alpha preparation is only defined for "
+                "source_format='modelopt_nvfp4'"
+            )
+        if a1_gscale is None or a2_gscale is None:
+            raise ValueError(
+                "a1_gscale and a2_gscale are required to prepare runtime alphas"
+            )
+        weight_E = (
+            int(w1_fp4.shape[0])
+            if w1_fp4 is not None
+            else int(w1_global_scale.numel())
+        )
+        w1_runtime_alphas, w2_runtime_alphas = _prepare_modelopt_nvfp4_runtime_alphas(
+            w1_global_scale,
+            a1_gscale,
+            w2_global_scale,
+            a2_gscale,
+            weight_E=weight_E,
+        )
 
-    return _get_w4a16_packed_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
+    w4a16 = None
+    if prepare_w4a16:
+        if (
+            w1_fp4 is None
+            or w1_blockscale is None
+            or w2_fp4 is None
+            or w2_blockscale is None
+        ):
+            raise ValueError(
+                "w1/w2 FP4 tensors and block scales are required to prepare W4A16"
+            )
+        if activation is None or params_dtype is None:
+            raise ValueError("activation and params_dtype are required for W4A16")
+        _validate_fp4_source_format_for_quant_mode(
+            source_format=source_format,
+            quant_mode="w4a16",
+        )
+        w4a16 = _get_w4a16_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=activation,
+            params_dtype=params_dtype,
+            source_format=source_format,
+            reuse_input_storage=reuse_input_storage,
+        )
+
+    return B12XPreparedFP4MoEWeights(
         source_format=source_format,
-        reuse_input_storage=reuse_input_storage,
+        w1_runtime_alphas=w1_runtime_alphas,
+        w2_runtime_alphas=w2_runtime_alphas,
+        w4a16=w4a16,
     )
 
 
@@ -4178,22 +4204,6 @@ def b12x_moe_fp4(
         raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
-    if (
-        prepared_w4a16 is None
-        and quant_mode_arg is None
-        and quant_mode == "w4a16"
-        and source_format != "modelopt_nvfp4"
-    ):
-        w1_alphas = _w4a16_default_alpha(
-            w1_alphas,
-            a1_gscale,
-            weight_E,
-        )
-        w2_alphas = _w4a16_default_alpha(
-            w2_alphas,
-            a2_gscale,
-            weight_E,
-        )
     # Shared scalar input scales are weight-side constants in the benchmarked
     # path, so treat them as static and avoid re-expanding them every launch.
     effective_input_scales_static = input_scales_static or (
@@ -4227,27 +4237,13 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            if source_format == "modelopt_nvfp4":
-                w1_prepare_alphas = _w4a16_default_alpha(
-                    w1_alphas,
-                    a1_gscale,
-                    weight_E,
-                )
-                w2_prepare_alphas = _w4a16_default_alpha(
-                    w2_alphas,
-                    a2_gscale,
-                    weight_E,
-                )
-            else:
-                w1_prepare_alphas = w1_alphas
-                w2_prepare_alphas = w2_alphas
             prepared = _get_w4a16_packed_weights(
                 w1_fp4,
                 w1_blockscale,
-                w1_prepare_alphas,
+                w1_alphas,
                 w2_fp4,
                 w2_blockscale,
-                w2_prepare_alphas,
+                w2_alphas,
                 activation=activation,
                 params_dtype=a.dtype,
                 source_format=source_format,

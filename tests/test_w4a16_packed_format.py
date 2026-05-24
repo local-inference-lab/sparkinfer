@@ -4,10 +4,7 @@ import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
-from b12x.integration.tp_moe import (
-    prepare_b12x_w4a16_modelopt_nvfp4_weights,
-    prepare_b12x_w4a16_packed_weights,
-)
+from b12x.integration.tp_moe import prepare_b12x_fp4_moe_weights
 from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_compressed_tensors_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
@@ -18,6 +15,31 @@ from b12x.moe.fused.w4a16.prepare import (
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 1.75 + 0.03125).to(torch.float8_e4m3fn)
+
+
+def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_fuses_input_scales() -> None:
+    w1_global_scale = torch.tensor([[2.0], [4.0]], dtype=torch.float32)
+    w2_global_scale = torch.tensor([3.0, 5.0], dtype=torch.float32)
+    a1_gscale = torch.tensor([0.5, 0.25], dtype=torch.float32)
+    a2_gscale = torch.tensor([1.0 / 3.0, 0.2], dtype=torch.float32)
+
+    prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_global_scale=w1_global_scale,
+        a1_gscale=a1_gscale,
+        w2_global_scale=w2_global_scale,
+        a2_gscale=a2_gscale,
+        prepare_runtime_alphas=True,
+    )
+
+    assert prepared.w1_runtime_alphas is not None
+    assert prepared.w2_runtime_alphas is not None
+    w1_runtime = prepared.w1_runtime_alphas
+    w2_runtime = prepared.w2_runtime_alphas
+    assert w1_runtime.shape == (2,)
+    assert w2_runtime.shape == (2,)
+    torch.testing.assert_close(w1_runtime, torch.tensor([4.0, 16.0]))
+    torch.testing.assert_close(w2_runtime, torch.tensor([9.0, 25.0]))
 
 
 def _make_case(
@@ -328,7 +350,7 @@ def test_packed_weight_preparation_can_reuse_input_storage(activation: str) -> N
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
-def test_integration_packed_preparation_uses_default_a16_alpha_contract(
+def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
     monkeypatch: pytest.MonkeyPatch,
     activation: str,
 ) -> None:
@@ -349,27 +371,30 @@ def test_integration_packed_preparation_uses_default_a16_alpha_contract(
     expected = prepare_w4a16_weights(
         w13.clone(),
         w13_blockscale,
-        w13_alphas * a1_gscale,
+        w13_alphas,
         w2.clone(),
         w2_blockscale,
-        w2_alphas * a2_gscale,
+        w2_alphas,
         activation=activation,
     )
-    actual = prepare_b12x_w4a16_packed_weights(
-        w13,
-        w13_blockscale,
-        w13_alphas,
-        a1_gscale,
-        w2,
-        w2_blockscale,
-        w2_alphas,
-        a2_gscale,
+    prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_global_scale=w13_alphas,
+        a1_gscale=a1_gscale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_global_scale=w2_alphas,
+        a2_gscale=a2_gscale,
         activation=activation,
         params_dtype=torch.bfloat16,
-        quant_mode=None,
+        prepare_w4a16=True,
         reuse_input_storage=True,
     )
+    actual = prepared.w4a16
 
+    assert actual is not None
     assert actual.w13.data_ptr() == w13.data_ptr()
     assert actual.w2.data_ptr() == w2.data_ptr()
     for name in (
@@ -385,7 +410,7 @@ def test_integration_packed_preparation_uses_default_a16_alpha_contract(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
-def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
+def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
     activation: str,
 ) -> None:
     torch.manual_seed(20260523)
@@ -396,10 +421,10 @@ def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    fused_w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
         torch.float32
     )
-    fused_w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
         torch.float32
     )
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
@@ -408,25 +433,34 @@ def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
     expected = prepare_w4a16_weights(
         w13,
         w13_blockscale,
-        fused_w13_alphas * a1_gscale,
+        w13_alphas,
         w2,
         w2_blockscale,
-        fused_w2_alphas * a2_gscale,
+        w2_alphas,
         activation=activation,
     )
-    actual = prepare_b12x_w4a16_modelopt_nvfp4_weights(
-        w13,
-        w13_blockscale,
-        fused_w13_alphas,
-        a1_gscale,
-        w2,
-        w2_blockscale,
-        fused_w2_alphas,
-        a2_gscale,
+    prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_global_scale=w13_alphas,
+        a1_gscale=a1_gscale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_global_scale=w2_alphas,
+        a2_gscale=a2_gscale,
         activation=activation,
         params_dtype=torch.bfloat16,
+        prepare_runtime_alphas=True,
+        prepare_w4a16=True,
     )
+    actual = prepared.w4a16
 
+    assert actual is not None
+    assert prepared.w1_runtime_alphas is not None
+    assert prepared.w2_runtime_alphas is not None
+    torch.testing.assert_close(prepared.w1_runtime_alphas, w13_alphas / a1_gscale)
+    torch.testing.assert_close(prepared.w2_runtime_alphas, w2_alphas / a2_gscale)
     assert actual.weight_layout == "packed"
     assert actual.source_format == "modelopt_nvfp4"
     for name in (
@@ -453,41 +487,49 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    fused_w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
         torch.float32
     )
-    fused_w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
         torch.float32
     )
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
-    expected = prepare_b12x_w4a16_modelopt_nvfp4_weights(
-        w13.clone(),
-        w13_blockscale,
-        fused_w13_alphas,
-        a1_gscale,
-        w2.clone(),
-        w2_blockscale,
-        fused_w2_alphas,
-        a2_gscale,
+    expected_prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_fp4=w13.clone(),
+        w1_blockscale=w13_blockscale,
+        w1_global_scale=w13_alphas,
+        a1_gscale=a1_gscale,
+        w2_fp4=w2.clone(),
+        w2_blockscale=w2_blockscale,
+        w2_global_scale=w2_alphas,
+        a2_gscale=a2_gscale,
         activation=activation,
         params_dtype=torch.bfloat16,
+        prepare_w4a16=True,
     )
-    actual = prepare_b12x_w4a16_modelopt_nvfp4_weights(
-        w13,
-        w13_blockscale,
-        fused_w13_alphas,
-        a1_gscale,
-        w2,
-        w2_blockscale,
-        fused_w2_alphas,
-        a2_gscale,
+    actual_prepared = prepare_b12x_fp4_moe_weights(
+        source_format="modelopt_nvfp4",
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_global_scale=w13_alphas,
+        a1_gscale=a1_gscale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_global_scale=w2_alphas,
+        a2_gscale=a2_gscale,
         activation=activation,
         params_dtype=torch.bfloat16,
+        prepare_w4a16=True,
         reuse_input_storage=True,
     )
+    expected = expected_prepared.w4a16
+    actual = actual_prepared.w4a16
 
+    assert expected is not None
+    assert actual is not None
     assert actual.w13.data_ptr() == w13.data_ptr()
     assert actual.w2.data_ptr() == w2.data_ptr()
     for name in (

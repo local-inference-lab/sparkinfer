@@ -28,6 +28,7 @@ from b12x.moe.fused.reference import (
     compare_to_reference,
     moe_reference_f32,
     moe_reference_nvfp4,
+    moe_reference_w4a16_f32,
 )
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 from b12x.cute.utils import get_hardware_info
@@ -1112,6 +1113,7 @@ def bench_flashinfer(
 
 def make_oracle_reference(
     oracle_mode: str,
+    quant_mode: str,
     x: torch.Tensor,
     weights: ExpertWeights,
     params: ScaleContractParams,
@@ -1121,8 +1123,29 @@ def make_oracle_reference(
     activation: str,
 ) -> torch.Tensor:
     spec = weights.spec
-    if oracle_mode == "w4a16":
+    quant_mode = quant_mode.lower()
+    if quant_mode == "w4a16":
+        if oracle_mode == "nvfp4":
+            raise ValueError("--oracle-mode nvfp4 is not valid with --quant-mode w4a16")
         params = get_w4a16_oracle_params(weights, params)
+        if oracle_mode == "f32":
+            return moe_reference_w4a16_f32(
+                x,
+                weights.w13_weight,
+                weights.w13_blockscale_swizzled,
+                params.g1_alphas,
+                weights.w2_weight,
+                weights.w2_blockscale_swizzled,
+                params.g2_alphas,
+                topk_ids,
+                topk_weights,
+                spec.num_experts,
+                spec.hidden_size,
+                spec.I_tp,
+                activation=activation,
+            )
+        if oracle_mode != "w4a16":
+            raise ValueError(f"unsupported W4A16 oracle mode {oracle_mode!r}")
         return moe_reference_w4a16(
             x,
             weights.w13_weight,
@@ -1138,6 +1161,8 @@ def make_oracle_reference(
             spec.I_tp,
             activation=activation,
         )
+    if oracle_mode == "w4a16":
+        raise ValueError("--oracle-mode w4a16 requires --quant-mode w4a16")
     oracle_fn = moe_reference_nvfp4 if oracle_mode == "nvfp4" else moe_reference_f32
     return oracle_fn(
         x,
@@ -2077,6 +2102,7 @@ def bench_e2e() -> None:
         if args.validate == "oracle":
             oracle_ref = make_oracle_reference(
                 args.oracle_mode,
+                args.quant_mode,
                 x,
                 weights,
                 params,

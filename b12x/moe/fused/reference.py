@@ -406,7 +406,94 @@ def moe_reference_f32(
             down_out = (down_dequant @ int_dequant) * alpha_fc2
             output[t] += router_w * down_out
 
-    return output.to(torch.bfloat16)
+    return output
+
+
+def moe_reference_w4a16_f32(
+    x: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    E: int,
+    K: int,
+    I_tp: int,
+    *,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    _validate_reference_inputs(w1_fp4, I_tp, activation)
+    del E
+    is_gated = activation == "silu"
+    if swiglu_limit is not None and not is_gated:
+        raise ValueError("swiglu_limit requires a gated W4A16 activation")
+
+    block_size = 16
+    fp4_lut = _make_fp4_lut(x.device)
+    device = x.device
+    m = x.shape[0]
+    top_k = topk_ids.shape[1]
+    output = torch.zeros(m, K, dtype=torch.float32, device=device)
+
+    for t in range(m):
+        x_f32 = x[t].float()
+        for k_idx in range(top_k):
+            eid = int(topk_ids[t, k_idx].item())
+            router_w = float(topk_weights[t, k_idx].item())
+            alpha_fc1 = float(w1_alphas[eid].item())
+            alpha_fc2 = float(w2_alphas[eid].item())
+
+            w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
+
+            if is_gated:
+                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                up_dequant = _apply_block_scales(
+                    _dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K, fp4_lut),
+                    w13_sf[:I_tp],
+                    I_tp,
+                    K,
+                    block_size=block_size,
+                )
+                gate_dequant = _apply_block_scales(
+                    _dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K, fp4_lut),
+                    w13_sf[I_tp:],
+                    I_tp,
+                    K,
+                    block_size=block_size,
+                )
+                gate_out = (gate_dequant @ x_f32) * alpha_fc1
+                up_out = (up_dequant @ x_f32) * alpha_fc1
+                if swiglu_limit is not None:
+                    gate_out = torch.clamp(gate_out, max=swiglu_limit)
+                    up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
+                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+            else:
+                w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
+                fc1_dequant = _apply_block_scales(
+                    _dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K, fp4_lut),
+                    w1_sf[:I_tp],
+                    I_tp,
+                    K,
+                    block_size=block_size,
+                )
+                fc1_out = (fc1_dequant @ x_f32) * alpha_fc1
+                intermediate = torch.square(torch.relu(fc1_out))
+
+            down_dequant = _apply_block_scales(
+                _dequant_fp4(w2_fp4[eid], K, I_tp, fp4_lut),
+                w2_sf,
+                K,
+                I_tp,
+                block_size=block_size,
+            )
+            down_out = (down_dequant @ intermediate) * alpha_fc2
+            output[t] += router_w * down_out
+
+    return output
 
 
 def moe_reference_nvfp4(

@@ -768,7 +768,9 @@ def compressed_index_decode_supertile_topk_fp8(
                 tile_k_offset=0,
                 tile_num_k_tiles=supertile_k_tiles,
             )
-            topk_lengths = k_end
+            # The shared scorer consumes local supertile K bounds, but tiled
+            # top-k clips against global raw-token offsets below.
+            topk_lengths = lengths_for_kernel
         else:
             logits = run_paged_windowed_tiled_logits_kernel(
                 q_fp8=q_fp8,

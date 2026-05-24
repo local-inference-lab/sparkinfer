@@ -540,7 +540,7 @@ def moe_reference_f32(
             down_out = (down_dequant @ int_dequant) * alpha_fc2
             output[t] += router_w * down_out
 
-    return output.to(torch.bfloat16)
+    return output
 
 
 def moe_reference_w4a16(

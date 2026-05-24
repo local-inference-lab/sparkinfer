@@ -493,8 +493,8 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     """Prepare ModelOpt NVFP4 tensors into the W4A16 packed runtime layout.
 
     The per-block scales are the normal NVFP4 K/16 scale grid in b12x swizzled
-    storage. The global scales use the reciprocal convention consumed by the
-    existing NVFP4 path.
+    storage. The global scales are raw ModelOpt weight global scales; activation
+    input scales are not folded into W4A16 weight preparation.
     """
     return _prepare_w4a16_packed_weights(
         w13_fp4,
@@ -525,8 +525,8 @@ def prepare_w4a16_compressed_tensors_weights(
     """Prepare CompressedTensors NVFP4 tensors into the W4A16 packed runtime layout.
 
     The per-block scales are the normal NVFP4 K/16 scale grid in b12x swizzled
-    storage. The CT global scales are the inverse of the reciprocal convention,
-    so they are inverted before packing.
+    storage. The CT global scales are stored inverted relative to the ModelOpt
+    weight global scale convention, so they are inverted before packing.
     """
     return _prepare_w4a16_packed_weights(
         w13_fp4,
