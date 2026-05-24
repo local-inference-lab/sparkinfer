@@ -303,6 +303,22 @@ MODEL_PROFILES = {
             top_k=6,
         ),
     ),
+    "dsv4f": ModelProfile(
+        label="DSV4F W4A16 (shape)",
+        checkpoint_family="dsv4f_shape",
+        default_layer_idx=0,
+        tp_size=2,
+        hf_repo_id=None,
+        default_activation="silu",
+        default_quant_mode="w4a16",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=6144,
+            intermediate_size=2048,
+            num_experts=256,
+            top_k=8,
+        ),
+    ),
     "glm51": ModelProfile(
         label="GLM-5.1",
         checkpoint_family="glm",
@@ -492,8 +508,8 @@ def make_shape_only_expert_weights(
     layer_idx: int,
     activation: str,
 ) -> ExpertWeights:
-    if activation != "relu2":
-        raise ValueError("Nano3.5 W4A16 shape profile expects relu2 experts")
+    if activation not in {"relu2", "silu"}:
+        raise ValueError("shape-only W4A16 profile expects relu2 or silu experts")
     if spec.hidden_size % 16 != 0 or spec.I_tp % 16 != 0:
         raise ValueError(
             f"shape-only W4A16 profile requires K and I_tp divisible by 16, got K={spec.hidden_size}, I_tp={spec.I_tp}"
@@ -503,20 +519,25 @@ def make_shape_only_expert_weights(
     E = spec.num_experts
     K = spec.hidden_size
     I_tp = spec.I_tp
+    w13_rows = I_tp * (2 if activation == "silu" else 1)
 
-    print(f"  Creating synthetic shape-only experts (E={E}, K={K}, I_tp={I_tp})...", end="", flush=True)
-    w13_weight = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
+    print(
+        f"  Creating synthetic shape-only experts (E={E}, K={K}, I_tp={I_tp}, activation={activation})...",
+        end="",
+        flush=True,
+    )
+    w13_weight = torch.empty(E, w13_rows, K // 2, dtype=torch.uint8, device=device)
     w13_weight.fill_(0x11)
     w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
     w2_weight.fill_(0x11)
 
-    w13_sf = torch.ones(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
+    w13_sf = torch.ones(E, w13_rows, K // 16, dtype=torch.float8_e4m3fn, device=device)
     down_sf = torch.ones(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
     w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
     w2_blockscale_swizzled = swizzle_block_scale(down_sf)
 
     w13_permuted = w13_weight.permute(1, 2, 0)
-    w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), I_tp, K)
+    w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), w13_rows, K)
     down_permuted = w2_weight.permute(1, 2, 0)
     down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
 
@@ -578,7 +599,7 @@ def load_expert_weights(
     source_format = "modelopt"
     w4a16_w13_global_scale = None
     w4a16_w2_global_scale = None
-    if checkpoint_family == "nano35_w4a16_shape":
+    if checkpoint_family in {"nano35_w4a16_shape", "dsv4f_shape"}:
         return make_shape_only_expert_weights(spec, layer_idx=layer_idx, activation=activation)
 
     cfg = _load_config(model_path)
