@@ -53,6 +53,8 @@ _FP4_SOURCE_FORMATS = {
     "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
 }
+_MODEL_OPT_NVFP4_SOURCE_FORMATS = {"modelopt_nvfp4"}
+_MODEL_OPT_W13_LAYOUTS = {"up_gate", "gate_up"}
 
 
 @dataclass(kw_only=True)
@@ -418,12 +420,22 @@ def _normalize_fp4_source_format(source_format: str) -> str:
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
-    if source_format != "modelopt_nvfp4" and quant_mode != "w4a16":
+    if source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS and quant_mode != "w4a16":
         raise ValueError(
             f"source_format={source_format!r} is only supported with "
             "quant_mode='w4a16'; the NVFP4 kernels currently support only "
             "source_format='modelopt_nvfp4'"
         )
+
+
+def _normalize_w13_layout(w13_layout: str) -> str:
+    normalized = w13_layout.lower()
+    if normalized not in _MODEL_OPT_W13_LAYOUTS:
+        raise ValueError(
+            "w13_layout must be one of 'up_gate' or 'gate_up', "
+            f"got {w13_layout!r}"
+        )
+    return normalized
 
 
 def _assert_reciprocal_input_scale_contract(
@@ -467,6 +479,7 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
+_W4A16_MODEL_OPT_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -531,6 +544,7 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _W4A16_PACKED_WEIGHT_CACHE.clear()
+    _W4A16_MODEL_OPT_WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -1576,6 +1590,7 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "up_gate",
     reuse_input_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import (
@@ -1585,6 +1600,7 @@ def _get_w4a16_packed_weights(
     )
 
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -1595,6 +1611,7 @@ def _get_w4a16_packed_weights(
         activation,
         params_dtype,
         source_format,
+        w13_layout,
         reuse_input_storage,
     )
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
@@ -1608,6 +1625,9 @@ def _get_w4a16_packed_weights(
         prepare_weights = prepare_w4a16_mxfp4_native_weights
     else:
         raise AssertionError(f"unhandled W4A16 source_format {source_format!r}")
+    prepare_kwargs = {}
+    if source_format in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
+        prepare_kwargs["w13_layout"] = w13_layout
     prepared = prepare_weights(
         w1_fp4,
         w1_blockscale,
@@ -1618,8 +1638,60 @@ def _get_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         reuse_input_storage=reuse_input_storage,
+        **prepare_kwargs,
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
+    return prepared
+
+def _get_w4a16_modelopt_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "up_gate",
+):
+    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_modelopt_native_weights
+
+    source_format = _normalize_fp4_source_format(source_format)
+    if source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
+        raise ValueError(
+            "native W4A16 ModelOpt weights require source_format='modelopt_nvfp4'"
+        )
+    w13_layout = _normalize_w13_layout(w13_layout)
+    key = (
+        w1_fp4.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w2_alphas.data_ptr(),
+        activation,
+        params_dtype,
+        source_format,
+        w13_layout,
+    )
+    cached = _W4A16_MODEL_OPT_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    prepared = prepare_w4a16_modelopt_native_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+        w13_layout=w13_layout,
+    )
+    _W4A16_MODEL_OPT_WEIGHT_CACHE[key] = prepared
     return prepared
 
 
@@ -1637,6 +1709,7 @@ def prepare_b12x_w4a16_packed_weights(
     params_dtype: torch.dtype,
     quant_mode: str | None = "w4a16",
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "up_gate",
     reuse_input_storage: bool = False,
 ) -> object:
     """Prepare W4A16 packed weights using the same contract as b12x_moe_fp4."""
@@ -1645,6 +1718,7 @@ def prepare_b12x_w4a16_packed_weights(
     if quant_mode != "w4a16":
         raise ValueError("W4A16 packed weights require quant_mode='w4a16'")
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -1665,6 +1739,7 @@ def prepare_b12x_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
     )
 
@@ -1683,6 +1758,7 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
     params_dtype: torch.dtype,
     quant_mode: str | None = "w4a16",
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "up_gate",
     reuse_input_storage: bool = False,
 ) -> object:
     """Prepare ModelOpt NVFP4 W4A16 weights from the normal NVFP4 scale contract.
@@ -1700,16 +1776,17 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    if source_format != "modelopt_nvfp4":
+    if source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
         raise ValueError(
             "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4'"
         )
+    w13_layout = _normalize_w13_layout(w13_layout)
 
     weight_E = int(w1_fp4.shape[0])
     w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
     w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
 
-    return _get_w4a16_packed_weights(
+    return _get_w4a16_modelopt_weights(
         w1_fp4,
         w1_blockscale,
         w1_alphas,
@@ -1719,7 +1796,7 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
-        reuse_input_storage=reuse_input_storage,
+        w13_layout=w13_layout,
     )
 
 
@@ -2024,6 +2101,7 @@ def _validate_frozen_w4a16_launch(
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
     weight_layout: str,
+    w13_layout: str = "packed",
 ) -> None:
     token_count = int(plan.max_tokens_per_launch)
     planned_capacity = min(
@@ -2049,15 +2127,25 @@ def _validate_frozen_w4a16_launch(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, w13_layout, planned_capacity)
+    )
+    if fused is None:
+        fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+            and getattr(legacy_fused, "w13_layout", "packed") == w13_layout
+        ):
             fused = legacy_fused
     if fused is None:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
-            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"w13_layout={w13_layout!r}"
         )
     if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
@@ -2071,6 +2159,7 @@ def _w4a16_preplanned_launches(
     *,
     token_count: int,
     weight_layout: str,
+    w13_layout: str = "packed",
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
     if not workspace.planned_token_counts:
@@ -2084,16 +2173,26 @@ def _w4a16_preplanned_launches(
             "W4A16 MoE workspace was asked to launch an unplanned token count: "
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, w13_layout, planned_capacity)
+    )
+    if fused is None:
+        fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+            and getattr(legacy_fused, "w13_layout", "packed") == w13_layout
+        ):
             fused = legacy_fused
     topk_sum = workspace.planned_topk_sum_launches.get(planned_capacity)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"w13_layout={w13_layout!r}"
         )
     return fused, topk_sum
 
@@ -2108,6 +2207,7 @@ def _resolve_workspace(
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
+    w13_layout: str = "packed",
 ) -> object:
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
@@ -2255,6 +2355,7 @@ def _resolve_workspace(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            w13_layout=w13_layout,
         )
 
     if isinstance(resolved, TPDynamicWorkspace):
@@ -2520,24 +2621,31 @@ def _prewarm_w4a16_planned_launches(
                 workspace.weight_E,
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
-            weight_layout = "packed"
-            fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
-                size_m=token_count,
-                hidden_size=workspace.k,
-                intermediate_size=workspace.n,
-                num_experts=workspace.weight_E,
-                top_k=workspace.num_topk,
-                activation=workspace.activation,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                zero_fc2_output=False,
-                moe_block_size=block_size_m,
-                max_m_blocks=max_m_blocks,
-                element_dtype=element_dtype,
-                sms=sms,
-                max_shared_mem=max_shared_mem,
-                swiglu_limit=swiglu_limit,
-                weight_layout=weight_layout,
-            )
+            for weight_layout, w13_layout in (
+                ("packed", "packed"),
+                ("modelopt", "up_gate"),
+                ("modelopt", "gate_up"),
+            ):
+                fused_launches[
+                    (weight_layout, w13_layout, token_count)
+                ] = compile_w4a16_fused_moe(
+                    size_m=token_count,
+                    hidden_size=workspace.k,
+                    intermediate_size=workspace.n,
+                    num_experts=workspace.weight_E,
+                    top_k=workspace.num_topk,
+                    activation=workspace.activation,
+                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                    zero_fc2_output=False,
+                    moe_block_size=block_size_m,
+                    max_m_blocks=max_m_blocks,
+                    element_dtype=element_dtype,
+                    sms=sms,
+                    max_shared_mem=max_shared_mem,
+                    swiglu_limit=swiglu_limit,
+                    weight_layout=weight_layout,
+                    w13_layout=w13_layout,
+                )
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
                 topk=workspace.num_topk,
@@ -4129,6 +4237,7 @@ def b12x_moe_fp4(
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "up_gate",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
@@ -4142,6 +4251,7 @@ def b12x_moe_fp4(
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -4186,7 +4296,7 @@ def b12x_moe_fp4(
         prepared_w4a16 is None
         and quant_mode_arg is None
         and quant_mode == "w4a16"
-        and source_format != "modelopt_nvfp4"
+        and source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS
     ):
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
@@ -4231,7 +4341,7 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            if source_format == "modelopt_nvfp4":
+            if source_format in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
                 w1_prepare_alphas = _w4a16_default_alpha(
                     w1_alphas,
                     a1_gscale,
@@ -4242,21 +4352,39 @@ def b12x_moe_fp4(
                     a2_gscale,
                     weight_E,
                 )
+                prepared = _get_w4a16_modelopt_weights(
+                    w1_fp4,
+                    w1_blockscale,
+                    w1_prepare_alphas,
+                    w2_fp4,
+                    w2_blockscale,
+                    w2_prepare_alphas,
+                    activation=activation,
+                    params_dtype=a.dtype,
+                    source_format=source_format,
+                    w13_layout=w13_layout,
+                )
             else:
-                w1_prepare_alphas = w1_alphas
-                w2_prepare_alphas = w2_alphas
-            prepared = _get_w4a16_packed_weights(
-                w1_fp4,
-                w1_blockscale,
-                w1_prepare_alphas,
-                w2_fp4,
-                w2_blockscale,
-                w2_prepare_alphas,
-                activation=activation,
-                params_dtype=a.dtype,
-                source_format=source_format,
-            )
+                prepared = _get_w4a16_packed_weights(
+                    w1_fp4,
+                    w1_blockscale,
+                    w1_alphas,
+                    w2_fp4,
+                    w2_blockscale,
+                    w2_alphas,
+                    activation=activation,
+                    params_dtype=a.dtype,
+                    source_format=source_format,
+                    w13_layout=w13_layout,
+                )
         weight_layout = getattr(prepared, "weight_layout", "packed")
+        w13_layout = getattr(
+            prepared,
+            "w13_layout",
+            "up_gate" if weight_layout == "modelopt" else "packed",
+        )
+        if weight_layout != "modelopt":
+            w13_layout = "packed"
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -4277,6 +4405,7 @@ def b12x_moe_fp4(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            w13_layout=w13_layout,
         )
         if not isinstance(w4a16_workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -4296,6 +4425,7 @@ def b12x_moe_fp4(
             w4a16_workspace,
             token_count=m,
             weight_layout=weight_layout,
+            w13_layout=w13_layout,
         )
         return run_w4a16_moe(
             a,

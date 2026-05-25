@@ -14,6 +14,7 @@ from b12x.moe.fused.w4a16.kernel import (
 )
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
+    prepare_w4a16_modelopt_native_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
 )
 from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
@@ -285,6 +286,88 @@ def test_w4a16_modelopt_nvfp4_prepare_moe_matches_oracle(
         topk_ids,
         topk_weights,
         activation=activation,
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prepare_native", [False, True])
+@pytest.mark.parametrize("w13_layout", ["up_gate", "gate_up"])
+def test_w4a16_modelopt_nvfp4_explicit_w13_layout_matches_oracle(
+    prepare_native: bool,
+    w13_layout: str,
+) -> None:
+    """W13 physical order is an explicit input, independent of source_format."""
+    torch.manual_seed(20260525 + (1000 if prepare_native else 0))
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, m = 2, 24
+    activation = "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    source_w13 = w13
+    source_w13_blockscale = w13_blockscale
+    if w13_layout == "gate_up":
+        half = intermediate_size
+        source_w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
+        source_w13_blockscale = torch.cat(
+            [w13_blockscale[:, half:], w13_blockscale[:, :half]], dim=1
+        ).contiguous()
+
+    prepare = prepare_w4a16_modelopt_native_weights if prepare_native else prepare_w4a16_weights
+    kwargs = {"source_format": "modelopt_nvfp4"} if prepare_native else {}
+    prepared = prepare(
+        source_w13,
+        source_w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=x.dtype,
+        w13_layout=w13_layout,
+        **kwargs,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
     )
     expected = _reference_w4a16(
         x,
