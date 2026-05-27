@@ -583,6 +583,98 @@ def test_compressed_index_decode_dense_topk_fp8_compacts_padded_page_table() -> 
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compressed_index_decode_dense_topk_fp8_rekeys_compact_page_widths() -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(91_009)
+
+    rows = 1
+    num_heads = 64
+    first_width_blocks = 1
+    second_width_blocks = 16
+    workspace_width_blocks = 64
+    topk = 8
+    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
+    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    api_weights = weights.unsqueeze(-1)
+    index_k_cache = pack_compressed_index_k_cache_reference(
+        torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 3
+    )
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=num_heads,
+        indexer_num_q_heads=num_heads,
+        head_dim=576,
+        v_head_dim=512,
+        topk=topk,
+        max_page_table_width=workspace_width_blocks,
+        max_total_q=rows,
+        max_batch=rows,
+        max_paged_q_rows=rows,
+        max_kv_rows=0,
+        page_size=64,
+        reserve_paged_indexer_logits=True,
+    )
+    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    def run(width_blocks: int, seqlen: int) -> torch.Tensor:
+        page_table = _make_real_page_table(
+            page_starts=[2],
+            seqlens=[seqlen],
+            width_blocks=width_blocks,
+            device=device,
+        )
+        seqlens = torch.tensor([seqlen], dtype=torch.int32, device=device)
+        metadata = prepare_compressed_indexer_metadata(
+            real_page_table=page_table,
+            cache_seqlens_int32=seqlens,
+            expected_num_q_heads=num_heads,
+            build_schedule=False,
+        )
+        return compressed_index_decode_dense_topk_fp8(
+            q_fp8=q_fp8,
+            weights=api_weights,
+            index_k_cache=index_k_cache,
+            metadata=metadata,
+            topk=topk,
+            expected_num_q_heads=num_heads,
+            workspace=workspace,
+            out_indices=actual,
+        ).clone()
+
+    clear_indexer_caches()
+    first = run(first_width_blocks, 1)
+    torch.cuda.synchronize(device)
+    assert int(first[0, 0]) == 0
+
+    second = run(second_width_blocks, 900)
+    torch.cuda.synchronize(device)
+    expected = _expected_compressed_index_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=_make_real_page_table(
+            page_starts=[2],
+            seqlens=[900],
+            width_blocks=second_width_blocks,
+            device=device,
+        ),
+        seqlens=torch.tensor([900], dtype=torch.int32, device=device),
+        topk=topk,
+    )
+    assert torch.equal(
+        torch.sort(second, dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_compressed_index_decode_supertile_topk_fp8_graph_matches_reference(
     monkeypatch,

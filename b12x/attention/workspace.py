@@ -17,9 +17,16 @@ _ARENA_ALIGN_BYTES = 1024
 _MHC_MULT = 4
 _MHC_PARTIALS = 25
 _MHC_DEFAULT_SPLIT_K = 64
+_WO_MXFP8_SCALE_VEC_SIZE = 32
+_WO_MXFP8_SCALE_ROW_TILE = 128
+_WO_MXFP8_SCALE_K_TILE = 4
 _SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
 _SPLIT_MAX_CHUNKS = 256
 _SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
+
+
+class B12XIndexerTopKPositionBufferUnavailable(RuntimeError):
+    """Raised when an arena does not reserve reusable top-k merge positions."""
 
 
 @dataclass(frozen=True)
@@ -513,6 +520,7 @@ class _B12XAttentionArenaLayout:
     indexer_extend_topk_values_nbytes: int
     indexer_extend_topk_scratch_indices_nbytes: int
     indexer_extend_topk_scratch_values_nbytes: int
+    indexer_extend_topk_position_nbytes: int
     indexer_extend_candidate_values_nbytes: int
     indexer_extend_candidate_indices_nbytes: int
     indexer_extend_lengths_nbytes: int
@@ -543,6 +551,7 @@ class _B12XAttentionArenaLayout:
     indexer_extend_topk_values_offset_bytes: int
     indexer_extend_topk_scratch_indices_offset_bytes: int
     indexer_extend_topk_scratch_values_offset_bytes: int
+    indexer_extend_topk_position_offset_bytes: int
     indexer_extend_candidate_values_offset_bytes: int
     indexer_extend_candidate_indices_offset_bytes: int
     indexer_extend_lengths_offset_bytes: int
@@ -581,6 +590,7 @@ class B12XAttentionArena:
     indexer_extend_topk_values_nbytes: int
     indexer_extend_topk_scratch_indices_nbytes: int
     indexer_extend_topk_scratch_values_nbytes: int
+    indexer_extend_topk_position_nbytes: int
     indexer_extend_candidate_values_nbytes: int
     indexer_extend_candidate_indices_nbytes: int
     indexer_extend_lengths_nbytes: int
@@ -611,6 +621,7 @@ class B12XAttentionArena:
     indexer_extend_topk_values_offset_bytes: int
     indexer_extend_topk_scratch_indices_offset_bytes: int
     indexer_extend_topk_scratch_values_offset_bytes: int
+    indexer_extend_topk_position_offset_bytes: int
     indexer_extend_candidate_values_offset_bytes: int
     indexer_extend_candidate_indices_offset_bytes: int
     indexer_extend_lengths_offset_bytes: int
@@ -837,6 +848,16 @@ class B12XAttentionArena:
                 paged_tile_candidate_chunks,
             )
         candidate_chunks = max(extend_candidate_chunks, paged_candidate_chunks)
+        indexer_extend_topk_position_offset_bytes = extend_offset
+        extend_topk_position_nbytes = 0
+        if candidate_chunks > 1:
+            extend_topk_position_nbytes = (
+                indexer_q_rows
+                * indexer_topk
+                * _dtype_nbytes(torch.int64)
+            )
+            extend_offset += extend_topk_position_nbytes
+            extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_extend_candidate_values_offset_bytes = extend_offset
         extend_candidate_values_nbytes = (
             int(candidate_chunks)
@@ -954,6 +975,7 @@ class B12XAttentionArena:
                 extend_topk_values_nbytes,
                 extend_topk_scratch_indices_nbytes,
                 extend_topk_scratch_values_nbytes,
+                extend_topk_position_nbytes,
                 extend_candidate_values_nbytes,
                 extend_candidate_indices_nbytes,
                 extend_lengths_nbytes,
@@ -966,6 +988,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=extend_lengths_nbytes,
@@ -996,6 +1019,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_offset_bytes=indexer_extend_topk_values_offset_bytes,
             indexer_extend_topk_scratch_indices_offset_bytes=indexer_extend_topk_scratch_indices_offset_bytes,
             indexer_extend_topk_scratch_values_offset_bytes=indexer_extend_topk_scratch_values_offset_bytes,
+            indexer_extend_topk_position_offset_bytes=indexer_extend_topk_position_offset_bytes,
             indexer_extend_candidate_values_offset_bytes=indexer_extend_candidate_values_offset_bytes,
             indexer_extend_candidate_indices_offset_bytes=indexer_extend_candidate_indices_offset_bytes,
             indexer_extend_lengths_offset_bytes=indexer_extend_lengths_offset_bytes,
@@ -1056,6 +1080,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=layout.indexer_extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=layout.indexer_extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=layout.indexer_extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=layout.indexer_extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=layout.indexer_extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=layout.indexer_extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=layout.indexer_extend_lengths_nbytes,
@@ -1086,6 +1111,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_offset_bytes=layout.indexer_extend_topk_values_offset_bytes,
             indexer_extend_topk_scratch_indices_offset_bytes=layout.indexer_extend_topk_scratch_indices_offset_bytes,
             indexer_extend_topk_scratch_values_offset_bytes=layout.indexer_extend_topk_scratch_values_offset_bytes,
+            indexer_extend_topk_position_offset_bytes=layout.indexer_extend_topk_position_offset_bytes,
             indexer_extend_candidate_values_offset_bytes=layout.indexer_extend_candidate_values_offset_bytes,
             indexer_extend_candidate_indices_offset_bytes=layout.indexer_extend_candidate_indices_offset_bytes,
             indexer_extend_lengths_offset_bytes=layout.indexer_extend_lengths_offset_bytes,
@@ -1275,6 +1301,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=self.indexer_extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=self.indexer_extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=self.indexer_extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=self.indexer_extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=self.indexer_extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=self.indexer_extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=self.indexer_extend_lengths_nbytes,
@@ -1351,6 +1378,7 @@ class B12XAttentionWorkspace:
     indexer_extend_topk_values_nbytes: int = 0
     indexer_extend_topk_scratch_indices_nbytes: int = 0
     indexer_extend_topk_scratch_values_nbytes: int = 0
+    indexer_extend_topk_position_nbytes: int = 0
     indexer_extend_candidate_values_nbytes: int = 0
     indexer_extend_candidate_indices_nbytes: int = 0
     indexer_extend_lengths_nbytes: int = 0
@@ -1368,6 +1396,7 @@ class B12XAttentionWorkspace:
     indexer_extend_topk_values: torch.Tensor | None = None
     indexer_extend_topk_scratch_indices: torch.Tensor | None = None
     indexer_extend_topk_scratch_values: torch.Tensor | None = None
+    indexer_extend_topk_positions: torch.Tensor | None = None
     indexer_extend_candidate_values: torch.Tensor | None = None
     indexer_extend_candidate_indices: torch.Tensor | None = None
     indexer_extend_lengths: torch.Tensor | None = None
@@ -1670,6 +1699,7 @@ class B12XAttentionWorkspace:
         self.indexer_extend_topk_values_nbytes = self.arena.indexer_extend_topk_values_nbytes
         self.indexer_extend_topk_scratch_indices_nbytes = self.arena.indexer_extend_topk_scratch_indices_nbytes
         self.indexer_extend_topk_scratch_values_nbytes = self.arena.indexer_extend_topk_scratch_values_nbytes
+        self.indexer_extend_topk_position_nbytes = self.arena.indexer_extend_topk_position_nbytes
         self.indexer_extend_candidate_values_nbytes = self.arena.indexer_extend_candidate_values_nbytes
         self.indexer_extend_candidate_indices_nbytes = self.arena.indexer_extend_candidate_indices_nbytes
         self.indexer_extend_lengths_nbytes = self.arena.indexer_extend_lengths_nbytes
@@ -1828,6 +1858,15 @@ class B12XAttentionWorkspace:
             )
         else:
             self.indexer_extend_topk_scratch_values = None
+        if self.indexer_extend_topk_position_nbytes:
+            self.indexer_extend_topk_positions, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_extend_topk_position_offset_bytes,
+                shape=(indexer_q_rows, int(self.indexer_topk)),
+                dtype=torch.int64,
+            )
+        else:
+            self.indexer_extend_topk_positions = None
         if self.indexer_extend_candidate_values_nbytes:
             candidate_chunks = self.indexer_extend_candidate_values_nbytes // (
                 indexer_q_rows * int(self.indexer_topk) * _dtype_nbytes(torch.float32)
@@ -2093,6 +2132,22 @@ class B12XAttentionWorkspace:
             self.indexer_extend_topk_scratch_values[:row_count],
             self.indexer_extend_topk_scratch_indices[:row_count],
         )
+
+    def get_indexer_extend_topk_position_buffer(self, *, row_count: int) -> torch.Tensor:
+        if self.indexer_extend_topk_positions is None:
+            raise B12XIndexerTopKPositionBufferUnavailable(
+                "fixed-capacity workspace is missing indexer extend top-k position buffer"
+            )
+        row_count = int(row_count)
+        if row_count < 0:
+            raise ValueError(f"row_count must be non-negative, got {row_count}")
+        capacity_rows = int(self.indexer_extend_topk_positions.shape[0])
+        if row_count > capacity_rows:
+            raise ValueError(
+                "row_count "
+                f"{row_count} exceeds workspace top-k position capacity {capacity_rows}"
+            )
+        return self.indexer_extend_topk_positions[:row_count]
 
     def get_indexer_extend_candidate_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if (

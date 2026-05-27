@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from b12x.attention.workspace import B12XIndexerTopKPositionBufferUnavailable
 from b12x.attention.indexer import (
     IndexerPagedDecodeMetadata,
     build_paged_mqa_schedule_metadata,
@@ -672,6 +673,7 @@ def compressed_index_decode_supertile_topk_fp8(
         )
     candidate_values = None
     candidate_indices = None
+    merge_positions = None
     if num_chunks > 1:
         candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
         if candidate_values.shape[0] < num_chunks or candidate_indices.shape[0] < num_chunks:
@@ -681,6 +683,16 @@ def compressed_index_decode_supertile_topk_fp8(
             )
         candidate_values = candidate_values[:num_chunks, :q_rows, :topk]
         candidate_indices = candidate_indices[:num_chunks, :q_rows, :topk]
+        get_position_buffer = getattr(
+            workspace,
+            "get_indexer_extend_topk_position_buffer",
+            None,
+        )
+        if get_position_buffer is not None:
+            try:
+                merge_positions = get_position_buffer(row_count=q_rows)[:, :topk]
+            except B12XIndexerTopKPositionBufferUnavailable:
+                merge_positions = None
 
     active_width = workspace.get_paged_indexer_active_width_cap()
     page_table_for_kernel = metadata.real_page_table
@@ -821,9 +833,12 @@ def compressed_index_decode_supertile_topk_fp8(
             candidate_values=candidate_values,
             candidate_indices=candidate_indices,
             topk=topk,
+            output_values=final_values,
+            output_indices=final_raw_indices,
+            merge_positions=merge_positions,
         )
-        final_values.copy_(merged_values)
-        final_raw_indices.copy_(merged_indices)
+        final_values = merged_values
+        final_raw_indices = merged_indices
 
     return final_raw_indices
 

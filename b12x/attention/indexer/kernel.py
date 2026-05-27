@@ -144,6 +144,21 @@ def _tensor_meta_key(
     )
 
 
+def _contract_key_tensor(
+    contract_phantoms: dict[str, torch.Tensor],
+    name: str,
+    actual: torch.Tensor,
+) -> torch.Tensor:
+    """Use fixed-capacity phantoms only when the compiled tensor shape is fixed."""
+
+    phantom = contract_phantoms.get(name)
+    if phantom is None:
+        return actual
+    if tuple(phantom.shape) != tuple(actual.shape):
+        return actual
+    return phantom
+
+
 def _launcher_cache_lookup(
     kernel: object,
     cache_key: tuple[object, ...],
@@ -1744,16 +1759,20 @@ def run_paged_logits_kernel(
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_meta_key(_contract_key_tensor(_cp, "q_bytes", q_bytes)),
+        _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_patched_k_tma_desc_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_meta_key(
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
+        ),
+        _tensor_meta_key(
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel)
+        ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_cp.get("logits", logits)),
+        _tensor_meta_key(_contract_key_tensor(_cp, "logits", logits)),
     )
     max_pages = int(real_page_table.shape[1])
     if schedule_metadata is not None and schedule_metadata_kernel is None:
@@ -2057,16 +2076,26 @@ def _run_paged_tiled_logits_kernel_common(
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_meta_key(_contract_key_tensor(_cp, "q_bytes", q_bytes)),
+        _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_patched_k_tma_desc_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_meta_key(
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
+        ),
+        _tensor_meta_key(
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel)
+        ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_cp.get("tile_logits", _cp.get("logits", logits))),
+        _tensor_meta_key(
+            _contract_key_tensor(
+                _cp,
+                "tile_logits" if "tile_logits" in _cp else "logits",
+                logits,
+            )
+        ),
     )
     workspace_persistent_ctas = (
         workspace.get_paged_indexer_persistent_ctas()

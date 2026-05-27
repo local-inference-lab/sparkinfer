@@ -997,6 +997,9 @@ def merge_tiled_topk_candidates(
     candidate_values: torch.Tensor,
     candidate_indices: torch.Tensor,
     topk: int,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+    merge_positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge per-supertile exact topk candidates into one row-wise topk."""
     if candidate_values.shape != candidate_indices.shape:
@@ -1012,9 +1015,77 @@ def merge_tiled_topk_candidates(
     candidate_cols = int(num_chunks) * int(topk)
     candidate_values_2d = candidate_values.permute(1, 0, 2).reshape(num_q_rows, candidate_cols)
     candidate_indices_2d = candidate_indices.permute(1, 0, 2).reshape(num_q_rows, candidate_cols)
-    merge_pos = torch.topk(candidate_values_2d, k=topk, dim=1, largest=True, sorted=False).indices
-    topk_indices = torch.gather(candidate_indices_2d, 1, merge_pos).contiguous()
-    topk_values = torch.gather(candidate_values_2d, 1, merge_pos).contiguous()
+    if output_values is None:
+        topk_values = torch.empty(
+            (num_q_rows, topk),
+            dtype=candidate_values.dtype,
+            device=candidate_values.device,
+        )
+    else:
+        if output_values.ndim != 2 or output_values.shape[0] < num_q_rows or output_values.shape[1] < topk:
+            raise ValueError(
+                "output_values must have shape at least "
+                f"({num_q_rows}, {topk}), got {tuple(output_values.shape)}"
+            )
+        if output_values.dtype != candidate_values.dtype:
+            raise ValueError(
+                f"output_values must have dtype {candidate_values.dtype}, got {output_values.dtype}"
+            )
+        if output_values.device != candidate_values.device:
+            raise ValueError("output_values device must match candidate_values")
+        topk_values = output_values[:num_q_rows, :topk]
+
+    if merge_positions is None:
+        merge_pos = torch.empty(
+            (num_q_rows, topk),
+            dtype=torch.int64,
+            device=candidate_values.device,
+        )
+    else:
+        if (
+            merge_positions.ndim != 2
+            or merge_positions.shape[0] < num_q_rows
+            or merge_positions.shape[1] < topk
+        ):
+            raise ValueError(
+                "merge_positions must have shape at least "
+                f"({num_q_rows}, {topk}), got {tuple(merge_positions.shape)}"
+            )
+        if merge_positions.dtype != torch.int64:
+            raise ValueError(
+                f"merge_positions must have dtype torch.int64, got {merge_positions.dtype}"
+            )
+        if merge_positions.device != candidate_values.device:
+            raise ValueError("merge_positions device must match candidate_values")
+        if not merge_positions.is_contiguous():
+            raise ValueError("merge_positions must be contiguous")
+        merge_pos = merge_positions[:num_q_rows, :topk]
+
+    torch.topk(
+        candidate_values_2d,
+        k=topk,
+        dim=1,
+        largest=True,
+        sorted=False,
+        out=(topk_values, merge_pos),
+    )
+
+    if output_indices is None:
+        topk_indices = torch.gather(candidate_indices_2d, 1, merge_pos).contiguous()
+    else:
+        if output_indices.ndim != 2 or output_indices.shape[0] < num_q_rows or output_indices.shape[1] < topk:
+            raise ValueError(
+                "output_indices must have shape at least "
+                f"({num_q_rows}, {topk}), got {tuple(output_indices.shape)}"
+            )
+        if output_indices.dtype != candidate_indices.dtype:
+            raise ValueError(
+                f"output_indices must have dtype {candidate_indices.dtype}, got {output_indices.dtype}"
+            )
+        if output_indices.device != candidate_indices.device:
+            raise ValueError("output_indices device must match candidate_indices")
+        topk_indices = output_indices[:num_q_rows, :topk]
+        torch.gather(candidate_indices_2d, 1, merge_pos, out=topk_indices)
     return topk_values, topk_indices
 
 

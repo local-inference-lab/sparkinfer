@@ -579,6 +579,7 @@ def extend_tiled_topk(
     output_indices: torch.Tensor | None = None,
     candidate_values: torch.Tensor | None = None,
     candidate_indices: torch.Tensor | None = None,
+    merge_positions: torch.Tensor | None = None,
     supertile_k: int | None = None,
 ) -> torch.Tensor:
     """Run the prefill NSA scorer in K-supertiles and consume each tile with tiled topk."""
@@ -783,5 +784,8 @@ def extend_tiled_topk(
         candidate_values=candidate_values,
         candidate_indices=candidate_indices,
         topk=topk,
+        output_values=output_values,
+        output_indices=output_indices,
+        merge_positions=merge_positions,
     )
     return topk_indices
