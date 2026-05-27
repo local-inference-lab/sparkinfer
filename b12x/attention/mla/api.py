@@ -9,6 +9,13 @@ from typing import Literal
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # Keep the pure-PyTorch fallback usable outside vLLM images.
+    triton = None
+    tl = None
+
 from .kernel import (
     clear_sparse_mla_kernel_cache,
     run_sparse_mla_kernel,
@@ -30,6 +37,47 @@ _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
+
+
+if triton is not None and tl is not None:
+
+    @triton.jit
+    def _split_decode_final_lse_kernel(
+        tmp_lse_ptr,
+        num_chunks_ptr,
+        out_lse_ptr,
+        tmp_lse_stride_b: tl.constexpr,
+        tmp_lse_stride_h: tl.constexpr,
+        tmp_lse_stride_c: tl.constexpr,
+        out_lse_stride_b: tl.constexpr,
+        out_lse_stride_h: tl.constexpr,
+        max_chunks: tl.constexpr,
+        block_c: tl.constexpr,
+        natural_scale: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        head = tl.program_id(1)
+        offs = tl.arange(0, block_c)
+        chunk_count = tl.minimum(tl.load(num_chunks_ptr), max_chunks)
+        valid = offs < chunk_count
+        vals = tl.load(
+            tmp_lse_ptr
+            + row * tmp_lse_stride_b
+            + head * tmp_lse_stride_h
+            + offs * tmp_lse_stride_c,
+            mask=valid,
+            other=-float("inf"),
+        )
+        vals = tl.where(vals != vals, -float("inf"), vals)
+        lse_max = tl.max(vals, axis=0)
+        safe_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+        lse_sum = tl.sum(tl.exp2(vals - safe_max), axis=0)
+        lse_base2 = safe_max + tl.log2(lse_sum)
+        out = lse_base2
+        if natural_scale:
+            out = out * 0.69314718055994530942
+        out = tl.where(lse_max == -float("inf"), -float("inf"), out)
+        tl.store(out_lse_ptr + row * out_lse_stride_b + head * out_lse_stride_h, out)
 
 
 @dataclass(frozen=True)
@@ -510,6 +558,28 @@ def _final_lse_from_split_workspace(
         raise TypeError(
             f"workspace split MLA LSE buffer must be FP32, got {chunk_lse.dtype}"
         )
+    if (
+        triton is not None
+        and chunk_lse.device.type == "cuda"
+        and final_lse.device == chunk_lse.device
+    ):
+        if workspace.num_chunks_ptr is None:
+            raise RuntimeError("workspace is missing split MLA chunk-count buffer")
+        block_c = triton.next_power_of_2(chunk_count)
+        _split_decode_final_lse_kernel[(q_rows, num_heads)](
+            chunk_lse,
+            workspace.num_chunks_ptr,
+            final_lse,
+            chunk_lse.stride(0),
+            chunk_lse.stride(1),
+            chunk_lse.stride(2),
+            final_lse.stride(0),
+            final_lse.stride(1),
+            chunk_count,
+            block_c,
+            scale == "natural",
+        )
+        return final_lse
     chunk_lse.mul_(_LN2)
     torch.logsumexp(chunk_lse, dim=-1, out=final_lse)
     if scale == "natural":
