@@ -322,6 +322,12 @@ class B12XAttentionArenaCaps:
     mhc_max_tokens: int = 0
     mhc_hidden_size: int = 0
     mhc_split_k: int = _MHC_DEFAULT_SPLIT_K
+    reserve_wo_projection: bool = False
+    wo_max_tokens: int = 0
+    wo_groups: int = 0
+    wo_group_width: int = 0
+    wo_rank: int = 0
+    wo_hidden_size: int = 0
     extend_indexer_tile_logits_k_rows: int = 0
     paged_indexer_logits_q_rows: int = 0
     paged_indexer_logits_k_rows: int = 0
@@ -422,6 +428,26 @@ class B12XAttentionArenaCaps:
             raise ValueError(
                 "reserve_mhc requires positive mhc_max_tokens and mhc_hidden_size"
             )
+        object.__setattr__(self, "reserve_wo_projection", bool(self.reserve_wo_projection))
+        object.__setattr__(self, "wo_max_tokens", max(int(self.wo_max_tokens), 0))
+        object.__setattr__(self, "wo_groups", max(int(self.wo_groups), 0))
+        object.__setattr__(self, "wo_group_width", max(int(self.wo_group_width), 0))
+        object.__setattr__(self, "wo_rank", max(int(self.wo_rank), 0))
+        object.__setattr__(self, "wo_hidden_size", max(int(self.wo_hidden_size), 0))
+        if self.reserve_wo_projection:
+            if (
+                int(self.wo_max_tokens) <= 0
+                or int(self.wo_groups) <= 0
+                or int(self.wo_group_width) <= 0
+                or int(self.wo_rank) <= 0
+                or int(self.wo_hidden_size) <= 0
+            ):
+                raise ValueError(
+                    "reserve_wo_projection requires positive wo_max_tokens, "
+                    "wo_groups, wo_group_width, wo_rank, and wo_hidden_size"
+                )
+            _check_wo_mxfp8_k(int(self.wo_group_width))
+            _check_wo_mxfp8_k(int(self.wo_rank) * int(self.wo_groups))
         object.__setattr__(
             self,
             "extend_indexer_tile_logits_k_rows",
@@ -497,6 +523,129 @@ class B12XAttentionWorkspaceContract:
 
 
 @dataclass(frozen=True, kw_only=True)
+class _B12XWOProjectionArenaLayout:
+    nbytes: int = 0
+    x_q_values_offset_bytes: int = 0
+    x_q_scale_rows_offset_bytes: int = 0
+    x_q_scale_mma_offset_bytes: int = 0
+    tmp_offset_bytes: int = 0
+    tmp_q_values_offset_bytes: int = 0
+    tmp_q_scale_rows_offset_bytes: int = 0
+    tmp_q_scale_mma_offset_bytes: int = 0
+    output_offset_bytes: int = 0
+
+
+def _check_wo_mxfp8_k(k: int) -> None:
+    if int(k) <= 0 or int(k) % 128 != 0:
+        raise ValueError(f"WO MXFP8 dense-GEMM K must be a positive multiple of 128, got {k}")
+
+
+def _wo_mxfp8_scale_physical_shape(
+    *,
+    m: int,
+    k: int,
+    num_groups: int,
+) -> tuple[int, int, int, int, int, int]:
+    sf_k = int(k) // _WO_MXFP8_SCALE_VEC_SIZE
+    return (
+        int(num_groups),
+        _ceil_div(int(m), _WO_MXFP8_SCALE_ROW_TILE),
+        _ceil_div(sf_k, _WO_MXFP8_SCALE_K_TILE),
+        32,
+        4,
+        4,
+    )
+
+
+def _layout_wo_projection(
+    *,
+    offset_bytes: int,
+    tokens: int,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+) -> _B12XWOProjectionArenaLayout:
+    tokens = max(int(tokens), 1)
+    groups = int(groups)
+    group_width = int(group_width)
+    rank = int(rank)
+    hidden = int(hidden)
+    if groups <= 0 or group_width <= 0 or rank <= 0 or hidden <= 0:
+        raise ValueError("WO projection arena requires positive groups, group_width, rank, and hidden")
+    _check_wo_mxfp8_k(group_width)
+    _check_wo_mxfp8_k(rank * groups)
+
+    start = int(offset_bytes)
+    cursor = _align_up(start, _ARENA_ALIGN_BYTES)
+
+    x_q_values_offset_bytes = cursor
+    cursor += tokens * group_width * groups * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        groups
+        * tokens
+        * (group_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=group_width,
+            num_groups=groups,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_offset_bytes = cursor
+    cursor += tokens * rank * groups * _dtype_nbytes(torch.bfloat16)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_width = rank * groups
+    tmp_q_values_offset_bytes = cursor
+    cursor += tokens * tmp_q_width * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        tokens
+        * (tmp_q_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=tmp_q_width,
+            num_groups=1,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    output_offset_bytes = cursor
+    cursor += tokens * hidden * _dtype_nbytes(torch.bfloat16)
+
+    return _B12XWOProjectionArenaLayout(
+        nbytes=max(0, int(cursor) - start),
+        x_q_values_offset_bytes=x_q_values_offset_bytes,
+        x_q_scale_rows_offset_bytes=x_q_scale_rows_offset_bytes,
+        x_q_scale_mma_offset_bytes=x_q_scale_mma_offset_bytes,
+        tmp_offset_bytes=tmp_offset_bytes,
+        tmp_q_values_offset_bytes=tmp_q_values_offset_bytes,
+        tmp_q_scale_rows_offset_bytes=tmp_q_scale_rows_offset_bytes,
+        tmp_q_scale_mma_offset_bytes=tmp_q_scale_mma_offset_bytes,
+        output_offset_bytes=output_offset_bytes,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class _B12XAttentionArenaLayout:
     arena_nbytes: int
     mla_phase_nbytes: int
@@ -532,6 +681,7 @@ class _B12XAttentionArenaLayout:
     mhc_post_nbytes: int
     mhc_comb_nbytes: int
     mhc_out_nbytes: int
+    wo_projection_layout: _B12XWOProjectionArenaLayout
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
@@ -602,6 +752,7 @@ class B12XAttentionArena:
     mhc_post_nbytes: int
     mhc_comb_nbytes: int
     mhc_out_nbytes: int
+    wo_projection_layout: _B12XWOProjectionArenaLayout
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
@@ -902,55 +1053,67 @@ class B12XAttentionArena:
 
         indexer_phase_nbytes = int(max(extend_offset, paged_offset))
         attention_phase_nbytes = max(mla_phase_nbytes, indexer_phase_nbytes, 1)
-        mhc_offset = attention_phase_nbytes
+        aux_offset = attention_phase_nbytes
         mhc_partials_offset_bytes = mhc_y_offset_bytes = 0
         mhc_post_offset_bytes = mhc_comb_offset_bytes = mhc_out_offset_bytes = 0
         mhc_partials_nbytes = mhc_y_nbytes = mhc_post_nbytes = 0
         mhc_comb_nbytes = mhc_out_nbytes = 0
         if caps.reserve_mhc:
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_partials_offset_bytes = mhc_offset
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_partials_offset_bytes = aux_offset
             mhc_partials_nbytes = (
                 int(caps.mhc_max_tokens)
                 * int(caps.mhc_split_k)
                 * _MHC_PARTIALS
                 * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_partials_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_y_offset_bytes = mhc_offset
+            aux_offset += mhc_partials_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_y_offset_bytes = aux_offset
             mhc_y_nbytes = (
                 int(caps.mhc_max_tokens)
                 * int(caps.mhc_hidden_size)
                 * _dtype_nbytes(caps.dtype)
             )
-            mhc_offset += mhc_y_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_post_offset_bytes = mhc_offset
+            aux_offset += mhc_y_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_post_offset_bytes = aux_offset
             mhc_post_nbytes = (
                 int(caps.mhc_max_tokens) * _MHC_MULT * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_post_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_comb_offset_bytes = mhc_offset
+            aux_offset += mhc_post_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_comb_offset_bytes = aux_offset
             mhc_comb_nbytes = (
                 int(caps.mhc_max_tokens)
                 * _MHC_MULT
                 * _MHC_MULT
                 * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_comb_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_out_offset_bytes = mhc_offset
+            aux_offset += mhc_comb_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_out_offset_bytes = aux_offset
             mhc_out_nbytes = (
                 int(caps.mhc_max_tokens)
                 * _MHC_MULT
                 * int(caps.mhc_hidden_size)
                 * _dtype_nbytes(caps.dtype)
             )
-            mhc_offset += mhc_out_nbytes
-        mhc_nbytes = max(0, int(mhc_offset) - int(attention_phase_nbytes))
-        arena_nbytes = max(attention_phase_nbytes, int(mhc_offset), 1)
+            aux_offset += mhc_out_nbytes
+        mhc_nbytes = max(0, int(aux_offset) - int(attention_phase_nbytes))
+
+        wo_projection_layout = _B12XWOProjectionArenaLayout()
+        if caps.reserve_wo_projection:
+            wo_projection_layout = _layout_wo_projection(
+                offset_bytes=aux_offset,
+                tokens=int(caps.wo_max_tokens),
+                groups=int(caps.wo_groups),
+                group_width=int(caps.wo_group_width),
+                rank=int(caps.wo_rank),
+                hidden=int(caps.wo_hidden_size),
+            )
+            aux_offset += wo_projection_layout.nbytes
+        arena_nbytes = max(attention_phase_nbytes, int(aux_offset), 1)
         ragged_kv_nbytes = max_kv_rows * _MLA_PACKED_DIM * _dtype_nbytes(caps.kv_dtype)
         return _B12XAttentionArenaLayout(
             arena_nbytes=int(arena_nbytes),
@@ -1000,6 +1163,7 @@ class B12XAttentionArena:
             mhc_post_nbytes=mhc_post_nbytes,
             mhc_comb_nbytes=mhc_comb_nbytes,
             mhc_out_nbytes=mhc_out_nbytes,
+            wo_projection_layout=wo_projection_layout,
             ragged_kv_offset_bytes=ragged_kv_offset_bytes,
             tmp_output_offset_bytes=tmp_output_offset_bytes,
             tmp_lse_offset_bytes=tmp_lse_offset_bytes,
@@ -1092,6 +1256,7 @@ class B12XAttentionArena:
             mhc_post_nbytes=layout.mhc_post_nbytes,
             mhc_comb_nbytes=layout.mhc_comb_nbytes,
             mhc_out_nbytes=layout.mhc_out_nbytes,
+            wo_projection_layout=layout.wo_projection_layout,
             ragged_kv_offset_bytes=layout.ragged_kv_offset_bytes,
             tmp_output_offset_bytes=layout.tmp_output_offset_bytes,
             tmp_lse_offset_bytes=layout.tmp_lse_offset_bytes,
@@ -1188,6 +1353,128 @@ class B12XAttentionArena:
             comb=comb,
             out=out,
             split_k=split_k,
+        )
+
+    def make_wo_projection_workspace(self, tokens: int | None = None):
+        if not self.caps.reserve_wo_projection or self.wo_projection_layout.nbytes <= 0:
+            raise RuntimeError("attention arena was allocated without WO projection workspace capacity")
+        from b12x.gemm.wo_projection import MXFP8Rows, WOProjectionWorkspace
+
+        max_tokens = int(self.caps.wo_max_tokens)
+        tokens = max_tokens if tokens is None else int(tokens)
+        if tokens <= 0 or tokens > max_tokens:
+            raise ValueError(
+                f"WO projection tokens={tokens} exceeds arena capacity {max_tokens}"
+            )
+
+        groups = int(self.caps.wo_groups)
+        group_width = int(self.caps.wo_group_width)
+        rank = int(self.caps.wo_rank)
+        hidden = int(self.caps.wo_hidden_size)
+        layout = _layout_wo_projection(
+            offset_bytes=self.wo_projection_layout.x_q_values_offset_bytes,
+            tokens=tokens,
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+        )
+        if layout.nbytes > self.wo_projection_layout.nbytes:
+            raise RuntimeError(
+                "WO projection workspace layout exceeds reserved arena capacity: "
+                f"requested={layout.nbytes}, reserved={self.wo_projection_layout.nbytes}"
+            )
+
+        def mxfp8_rows(
+            *,
+            values_offset_bytes: int,
+            scale_rows_offset_bytes: int,
+            scale_mma_offset_bytes: int,
+            m: int,
+            k: int,
+            num_groups: int,
+        ) -> MXFP8Rows:
+            if num_groups == 1:
+                values, _ = _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=values_offset_bytes,
+                    shape=(m, k),
+                    dtype=torch.float8_e4m3fn,
+                )
+            else:
+                values, _ = _materialize_arena_strided_view(
+                    self.shared_arena,
+                    offset_bytes=values_offset_bytes,
+                    shape=(m, k, num_groups),
+                    stride=(k, 1, m * k),
+                    dtype=torch.float8_e4m3fn,
+                )
+            scale_rows, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=scale_rows_offset_bytes,
+                shape=(num_groups, m, k // _WO_MXFP8_SCALE_VEC_SIZE),
+                dtype=torch.float8_e8m0fnu,
+            )
+            scale_physical_u8, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=scale_mma_offset_bytes,
+                shape=_wo_mxfp8_scale_physical_shape(
+                    m=m,
+                    k=k,
+                    num_groups=num_groups,
+                ),
+                dtype=torch.uint8,
+            )
+            if m % _WO_MXFP8_SCALE_ROW_TILE:
+                scale_physical_u8.fill_(127)
+            scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
+                3,
+                4,
+                1,
+                5,
+                2,
+                0,
+            )
+            return MXFP8Rows(
+                values=values,
+                scale_rows=scale_rows,
+                scale_mma=scale_mma,
+            )
+
+        x_q = mxfp8_rows(
+            values_offset_bytes=layout.x_q_values_offset_bytes,
+            scale_rows_offset_bytes=layout.x_q_scale_rows_offset_bytes,
+            scale_mma_offset_bytes=layout.x_q_scale_mma_offset_bytes,
+            m=tokens,
+            k=group_width,
+            num_groups=groups,
+        )
+        tmp, _ = _materialize_arena_strided_view(
+            self.shared_arena,
+            offset_bytes=layout.tmp_offset_bytes,
+            shape=(tokens, rank, groups),
+            stride=(rank, 1, tokens * rank),
+            dtype=torch.bfloat16,
+        )
+        tmp_q = mxfp8_rows(
+            values_offset_bytes=layout.tmp_q_values_offset_bytes,
+            scale_rows_offset_bytes=layout.tmp_q_scale_rows_offset_bytes,
+            scale_mma_offset_bytes=layout.tmp_q_scale_mma_offset_bytes,
+            m=tokens,
+            k=rank * groups,
+            num_groups=1,
+        )
+        output, _ = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=layout.output_offset_bytes,
+            shape=(tokens, hidden, 1),
+            dtype=torch.bfloat16,
+        )
+        return WOProjectionWorkspace(
+            x_q=x_q,
+            tmp=tmp,
+            tmp_q=tmp_q,
+            output=output,
         )
 
     def make_workspace(

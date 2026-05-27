@@ -13,6 +13,7 @@ FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 MXFP8_SCALE_VEC_SIZE = 32
 MXFP8_SCALE_ROW_TILE = 128
 MXFP8_SCALE_K_TILE = 4
+WO_A_INPUT_QUANT_GROUP_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ def _quantize_grouped_tgd_to_tdg_kernel(
     scale_mma_s3,
     scale_mma_s4,
     scale_mma_s5,
+    SCALE_CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
@@ -115,9 +117,8 @@ def _quantize_grouped_tgd_to_tdg_kernel(
         + d * source_stride_d,
     ).to(tl.float32)
     max_abs = tl.max(tl.abs(src), axis=0)
-    safe = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
-    scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(safe)), -127.0), 127.0)
-    scale = tl.exp2(scale_exp)
+    quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
+    scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     tl.store(
@@ -125,17 +126,130 @@ def _quantize_grouped_tgd_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / scale).to(tl.float8e4nv),
+        (src / quant_scale).to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
-    tl.store(scale_rows + group * tokens * sf_cols + token * sf_cols + chunk, scale_u8)
+    sf_offsets = tl.arange(0, SCALE_CHUNKS)
+    tl.store(
+        scale_rows
+        + group * tokens * sf_cols
+        + token * sf_cols
+        + chunk * SCALE_CHUNKS
+        + sf_offsets,
+        scale_u8,
+    )
 
     row32 = token % 32
     row4 = (token // 32) % 4
     tile_m = token // 128
-    k4 = chunk % 4
-    tile_k = chunk // 4
+    k4 = sf_offsets
+    tile_k = chunk
+    tl.store(
+        scale_mma
+        + row32 * scale_mma_s0
+        + row4 * scale_mma_s1
+        + tile_m * scale_mma_s2
+        + k4 * scale_mma_s3
+        + tile_k * scale_mma_s4
+        + group * scale_mma_s5,
+        scale_u8,
+    )
+
+
+@triton.jit
+def _quantize_attention_inv_rope_to_tdg_kernel(
+    o,
+    positions,
+    cos_sin_cache,
+    values,
+    scale_rows,
+    scale_mma,
+    tokens,
+    groups: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    group_width: tl.constexpr,
+    o_stride_t,
+    o_stride_h,
+    o_stride_d,
+    cos_sin_stride_pos,
+    values_stride_t,
+    values_stride_d,
+    values_stride_g,
+    scale_mma_s0,
+    scale_mma_s1,
+    scale_mma_s2,
+    scale_mma_s3,
+    scale_mma_s4,
+    scale_mma_s5,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    HALF_ROPE_DIM: tl.constexpr,
+    SCALE_CHUNKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    token = tl.program_id(0)
+    group = tl.program_id(1)
+    chunk = tl.program_id(2)
+    offs = tl.arange(0, BLOCK)
+    d = chunk * BLOCK + offs
+
+    head_in_group = d // HEAD_DIM
+    head_d = d - head_in_group * HEAD_DIM
+    head = group * heads_per_group + head_in_group
+
+    src = tl.load(
+        o + token * o_stride_t + head * o_stride_h + head_d * o_stride_d
+    ).to(tl.float32)
+
+    is_rope = head_d >= NOPE_DIM
+    rope_local = head_d - NOPE_DIM
+    partner_d = NOPE_DIM + (rope_local ^ 1)
+    partner = tl.load(
+        o + token * o_stride_t + head * o_stride_h + partner_d * o_stride_d,
+        mask=is_rope,
+        other=0.0,
+    ).to(tl.float32)
+
+    pos = tl.load(positions + token)
+    cs_idx = tl.maximum(rope_local >> 1, 0)
+    cache_base = cos_sin_cache + pos * cos_sin_stride_pos
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE_DIM + cs_idx, mask=is_rope, other=0.0)
+    x_add = src * cos_v + partner * sin_v
+    x_sub = src * cos_v - partner * sin_v
+    rotated = tl.where((rope_local & 1) == 0, x_add, x_sub)
+    src = tl.where(is_rope, rotated, src)
+
+    max_abs = tl.max(tl.abs(src), axis=0)
+    quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
+    scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
+    scale_u8 = (scale_exp + 127.0).to(tl.uint8)
+
+    tl.store(
+        values
+        + token * values_stride_t
+        + d * values_stride_d
+        + group * values_stride_g,
+        (src / quant_scale).to(tl.float8e4nv),
+    )
+
+    sf_cols = group_width // 32
+    sf_offsets = tl.arange(0, SCALE_CHUNKS)
+    tl.store(
+        scale_rows
+        + group * tokens * sf_cols
+        + token * sf_cols
+        + chunk * SCALE_CHUNKS
+        + sf_offsets,
+        scale_u8,
+    )
+
+    row32 = token % 32
+    row4 = (token // 32) % 4
+    tile_m = token // 128
+    k4 = sf_offsets
+    tile_k = chunk
     tl.store(
         scale_mma
         + row32 * scale_mma_s0
@@ -568,7 +682,7 @@ def quantize_wo_a_input_mxfp8(
     *,
     out: MXFP8Rows | None = None,
 ) -> MXFP8Rows:
-    """Quantize grouped WO-A input `[tokens, groups, group_width]` for dense GEMM."""
+    """Quantize grouped WO-A input with SGLang-compatible 128-column scales."""
 
     _check_gpu_tensor("source_tgd", source_tgd)
     if source_tgd.ndim != 3:
@@ -586,7 +700,9 @@ def quantize_wo_a_input_mxfp8(
         )
     else:
         _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
-    _quantize_grouped_tgd_to_tdg_kernel[(tokens, groups, group_width // MXFP8_SCALE_VEC_SIZE)](
+    _quantize_grouped_tgd_to_tdg_kernel[
+        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
+    ](
         source_tgd,
         out.values,
         out.scale_rows.view(torch.uint8),
@@ -606,7 +722,96 @@ def quantize_wo_a_input_mxfp8(
         out.scale_mma.stride(3),
         out.scale_mma.stride(4),
         out.scale_mma.stride(5),
-        BLOCK=MXFP8_SCALE_VEC_SIZE,
+        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
+        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
+    )
+    return out
+
+
+def quantize_wo_a_input_inv_rope_mxfp8(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    groups: int,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    out: MXFP8Rows | None = None,
+) -> MXFP8Rows:
+    """Inverse-RoPE attention output and quantize with 128-column WO-A scales."""
+
+    _check_gpu_tensor("o", o)
+    _check_gpu_tensor("positions", positions)
+    _check_gpu_tensor("cos_sin_cache", cos_sin_cache)
+    if o.ndim != 3:
+        raise ValueError(f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}")
+    tokens, heads, head_dim = o.shape
+    if head_dim != nope_dim + rope_dim:
+        raise ValueError(
+            f"o head_dim must equal nope_dim + rope_dim ({nope_dim + rope_dim}), "
+            f"got {head_dim}"
+        )
+    if heads != groups * heads_per_group:
+        raise ValueError(
+            f"o heads must equal groups * heads_per_group ({groups * heads_per_group}), "
+            f"got {heads}"
+        )
+    if positions.shape != (tokens,):
+        raise ValueError(
+            f"positions must have shape {(tokens,)}, got {tuple(positions.shape)}"
+        )
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != rope_dim:
+        raise ValueError(
+            "cos_sin_cache must have shape [max_position, rope_dim], "
+            f"got {tuple(cos_sin_cache.shape)}"
+        )
+    if rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim must be even, got {rope_dim}")
+
+    group_width = heads_per_group * head_dim
+    _check_mxfp8_k(group_width)
+    if out is None:
+        out = empty_mxfp8_rows_for_dense_gemm(
+            tokens,
+            group_width,
+            num_groups=groups,
+            device=o.device,
+        )
+    else:
+        _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
+
+    _quantize_attention_inv_rope_to_tdg_kernel[
+        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
+    ](
+        o,
+        positions,
+        cos_sin_cache,
+        out.values,
+        out.scale_rows.view(torch.uint8),
+        out.scale_mma.view(torch.uint8),
+        tokens,
+        groups,
+        heads_per_group,
+        group_width,
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        cos_sin_cache.stride(0),
+        out.values.stride(0),
+        out.values.stride(1),
+        out.values.stride(2),
+        out.scale_mma.stride(0),
+        out.scale_mma.stride(1),
+        out.scale_mma.stride(2),
+        out.scale_mma.stride(3),
+        out.scale_mma.stride(4),
+        out.scale_mma.stride(5),
+        HEAD_DIM=head_dim,
+        NOPE_DIM=nope_dim,
+        HALF_ROPE_DIM=rope_dim // 2,
+        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
+        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
     )
     return out
 
@@ -1002,10 +1207,65 @@ def wo_projection_mxfp8(
     return workspace.output[:, :, 0]
 
 
+def wo_projection_inv_rope_mxfp8(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: WOProjectionMXFP8Weights,
+    workspace: WOProjectionWorkspace,
+    *,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    return_3d: bool = False,
+) -> torch.Tensor:
+    """Run WO projection from attention output without BF16 inverse-RoPE storage."""
+
+    _check_gpu_tensor("o", o)
+    _check_wo_projection_weights(weights)
+    if o.ndim != 3:
+        raise ValueError(f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}")
+    tokens, heads, head_dim = o.shape
+    if head_dim != nope_dim + rope_dim:
+        raise ValueError(
+            f"o head_dim must equal nope_dim + rope_dim ({nope_dim + rope_dim}), "
+            f"got {head_dim}"
+        )
+    if heads != weights.groups * heads_per_group:
+        raise ValueError(
+            f"o heads must equal weights.groups * heads_per_group "
+            f"({weights.groups * heads_per_group}), got {heads}"
+        )
+    if weights.group_width != heads_per_group * head_dim:
+        raise ValueError(
+            "weights.group_width does not match heads_per_group * head_dim: "
+            f"{weights.group_width} != {heads_per_group * head_dim}"
+        )
+    _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
+
+    quantize_wo_a_input_inv_rope_mxfp8(
+        o,
+        positions,
+        cos_sin_cache,
+        groups=weights.groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        out=workspace.x_q,
+    )
+    wo_a_dense_gemm_mxfp8(workspace.x_q, weights.wo_a, out=workspace.tmp)
+    quantize_wo_b_input_mxfp8(workspace.tmp, out=workspace.tmp_q)
+    wo_b_dense_gemm_mxfp8(workspace.tmp_q, weights.wo_b, out=workspace.output)
+    if return_3d:
+        return workspace.output
+    return workspace.output[:, :, 0]
+
+
 __all__ = [
     "FP8_E4M3_MAX",
     "MXFP8Rows",
     "MXFP8_SCALE_VEC_SIZE",
+    "WO_A_INPUT_QUANT_GROUP_SIZE",
     "WOProjectionMXFP8Weights",
     "WOProjectionWorkspace",
     "dequantize_mxfp8_rows_torch",
@@ -1016,10 +1276,12 @@ __all__ = [
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
     "quantize_mxfp8_rows_torch",
+    "quantize_wo_a_input_inv_rope_mxfp8",
     "quantize_wo_a_input_mxfp8",
     "quantize_wo_b_input_mxfp8",
     "quantize_wo_projection_weights_mxfp8_torch",
     "wo_a_dense_gemm_mxfp8",
     "wo_b_dense_gemm_mxfp8",
+    "wo_projection_inv_rope_mxfp8",
     "wo_projection_mxfp8",
 ]

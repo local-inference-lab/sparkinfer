@@ -3,6 +3,9 @@ from __future__ import annotations
 import torch
 
 from b12x.gemm.wo_projection import (
+    FP8_E4M3_MAX,
+    MXFP8Rows,
+    WO_A_INPUT_QUANT_GROUP_SIZE,
     dequantize_mxfp8_rows_torch,
     empty_dense_gemm_mnl_view,
     empty_wo_projection_workspace,
@@ -10,6 +13,7 @@ from b12x.gemm.wo_projection import (
     pack_mxfp8_scales_for_dense_gemm,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,
     quantize_mxfp8_rows_torch,
+    quantize_wo_a_input_inv_rope_mxfp8,
     quantize_wo_a_input_mxfp8,
     quantize_wo_b_input_mxfp8,
     quantize_wo_projection_weights_mxfp8_torch,
@@ -28,6 +32,49 @@ def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
         rtol=0,
         atol=0,
     )
+
+
+def _sglang_wo_a_input_quant_reference(source_tgd: torch.Tensor) -> MXFP8Rows:
+    tokens, groups, group_width = source_tgd.shape
+    chunks = group_width // WO_A_INPUT_QUANT_GROUP_SIZE
+    blocked = source_tgd.float().reshape(
+        tokens,
+        groups,
+        chunks,
+        WO_A_INPUT_QUANT_GROUP_SIZE,
+    )
+    max_abs = blocked.abs().amax(dim=-1)
+    quant_scale = torch.where(
+        max_abs > 0,
+        max_abs / FP8_E4M3_MAX,
+        torch.ones_like(max_abs),
+    )
+    scale_u8 = (torch.ceil(torch.log2(quant_scale)).clamp(-127, 127) + 127).to(
+        torch.uint8
+    )
+    values_tgd = (
+        (blocked / quant_scale[..., None])
+        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .reshape(tokens, groups, group_width)
+    )
+    values_grouped = values_tgd.permute(1, 0, 2).contiguous()
+    values = values_grouped.as_strided(
+        (tokens, group_width, groups),
+        (group_width, 1, tokens * group_width),
+    )
+    scale_rows_u8 = scale_u8.repeat_interleave(
+        WO_A_INPUT_QUANT_GROUP_SIZE // 32,
+        dim=2,
+    )
+    scale_rows = scale_rows_u8.permute(1, 0, 2).contiguous().view(torch.float8_e8m0fnu)
+    scale_mma = pack_mxfp8_scales_for_dense_gemm(
+        scale_rows,
+        m=tokens,
+        k=group_width,
+        num_groups=groups,
+    )
+    return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
 
 
 def test_pack_mxfp8_scales_round_trips_grouped_rows() -> None:
@@ -189,7 +236,7 @@ def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
         torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4
     ).contiguous()
     actual_a = quantize_wo_a_input_mxfp8(source_tgd)
-    expected_a = quantize_mxfp8_rows_torch(source_tgd.permute(0, 2, 1).contiguous())
+    expected_a = _sglang_wo_a_input_quant_reference(source_tgd)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
@@ -242,6 +289,65 @@ def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
     torch.testing.assert_close(
         actual_b.scale_mma.view(torch.uint8),
         expected_b.scale_mma.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_wo_a_inv_rope_input_quant_uses_sglang_128_column_groups() -> None:
+    require_sm120()
+    torch.manual_seed(31005)
+
+    tokens = 3
+    groups = 2
+    heads_per_group = 2
+    head_dim = 128
+    nope_dim = 96
+    rope_dim = 32
+    group_width = heads_per_group * head_dim
+    source_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 8
+    ).contiguous()
+    source_tgd[:, :, 0::WO_A_INPUT_QUANT_GROUP_SIZE] = 3.5
+    source_tgd[:, :, 32::WO_A_INPUT_QUANT_GROUP_SIZE] /= 16
+
+    o = source_tgd.reshape(tokens, groups, heads_per_group, head_dim).reshape(
+        tokens,
+        groups * heads_per_group,
+        head_dim,
+    )
+    positions = torch.arange(tokens, device="cuda", dtype=torch.long)
+    cos_sin_cache = torch.zeros((tokens, rope_dim), device="cuda", dtype=torch.float32)
+    cos_sin_cache[:, : rope_dim // 2] = 1
+
+    actual = quantize_wo_a_input_inv_rope_mxfp8(
+        o,
+        positions,
+        cos_sin_cache,
+        groups=groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
+    expected = _sglang_wo_a_input_quant_reference(source_tgd)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.values.view(torch.uint8),
+        expected.values.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual.scale_rows.view(torch.uint8),
+        expected.scale_rows.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual.scale_mma.view(torch.uint8),
+        expected.scale_mma.view(torch.uint8),
         rtol=0,
         atol=0,
     )

@@ -253,6 +253,21 @@ def _attention_caps_cover(
         or getattr(existing, "mhc_split_k", 0) != getattr(requested, "mhc_split_k", 0)
     ):
         return False
+    if getattr(requested, "reserve_wo_projection", False) and not getattr(
+        existing,
+        "reserve_wo_projection",
+        False,
+    ):
+        return False
+    if getattr(requested, "reserve_wo_projection", False) and (
+        getattr(existing, "wo_groups", 0) != getattr(requested, "wo_groups", 0)
+        or getattr(existing, "wo_group_width", 0)
+        != getattr(requested, "wo_group_width", 0)
+        or getattr(existing, "wo_rank", 0) != getattr(requested, "wo_rank", 0)
+        or getattr(existing, "wo_hidden_size", 0)
+        != getattr(requested, "wo_hidden_size", 0)
+    ):
+        return False
     existing_mla_q_chunks = int(
         getattr(existing, "mla_max_q_chunks", 0)
         or int(getattr(existing, "mla_max_total_q", 1))
@@ -286,6 +301,7 @@ def _attention_caps_cover(
             "paged_indexer_logits_k_rows",
             "paged_indexer_tile_logits_k_rows",
             "mhc_max_tokens",
+            "wo_max_tokens",
         ),
     )
 

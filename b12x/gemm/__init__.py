@@ -20,11 +20,13 @@ from .wo_projection import (
     pack_mxfp8_scales_for_dense_gemm,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,
     quantize_mxfp8_rows_torch,
+    quantize_wo_a_input_inv_rope_mxfp8,
     quantize_wo_a_input_mxfp8,
     quantize_wo_b_input_mxfp8,
     quantize_wo_projection_weights_mxfp8_torch,
     wo_a_dense_gemm_mxfp8,
     wo_b_dense_gemm_mxfp8,
+    wo_projection_inv_rope_mxfp8,
     wo_projection_mxfp8,
 )
 
@@ -49,10 +51,12 @@ __all__ = [
     "prewarm_block_fp8_linear_mxfp8",
     "quantize_block_fp8_linear_input_mxfp8",
     "quantize_mxfp8_rows_torch",
+    "quantize_wo_a_input_inv_rope_mxfp8",
     "quantize_wo_a_input_mxfp8",
     "quantize_wo_b_input_mxfp8",
     "quantize_wo_projection_weights_mxfp8_torch",
     "wo_a_dense_gemm_mxfp8",
     "wo_b_dense_gemm_mxfp8",
+    "wo_projection_inv_rope_mxfp8",
     "wo_projection_mxfp8",
 ]
