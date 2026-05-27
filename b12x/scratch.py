@@ -44,7 +44,7 @@ def scratch_tensor(
     owner: str,
 ) -> torch.Tensor:
     if len(specs) != 1:
-        raise RuntimeError(f"{owner} scratch plans currently expect exactly one arena buffer")
+        raise RuntimeError(f"{owner} scratch plans currently expect exactly one scratch buffer")
     spec = specs[0]
     if isinstance(scratch, torch.Tensor):
         tensor = scratch

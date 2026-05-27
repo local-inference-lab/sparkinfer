@@ -1,10 +1,15 @@
 from .dense import DenseGemmKernel, dense_gemm
 from .block_fp8_linear import (
+    BlockFP8LinearBinding,
+    BlockFP8LinearScratchCaps,
+    BlockFP8LinearScratchPlan,
     BlockFP8LinearWeight,
     BlockFP8LinearWorkspace,
+    build_block_fp8_linear_binding,
     block_fp8_linear_mxfp8,
     empty_block_fp8_linear_workspace,
     pack_block_fp8_linear_weight_mxfp8,
+    plan_block_fp8_linear_scratch,
     prewarm_block_fp8_linear_mxfp8,
     quantize_block_fp8_linear_input_mxfp8,
 )
@@ -39,6 +44,9 @@ from .wo_projection import (
 
 __all__ = [
     "DenseGemmKernel",
+    "BlockFP8LinearBinding",
+    "BlockFP8LinearScratchCaps",
+    "BlockFP8LinearScratchPlan",
     "BlockFP8LinearWeight",
     "BlockFP8LinearWorkspace",
     "MXFP8Rows",
@@ -48,6 +56,7 @@ __all__ = [
     "WOProjectionScratchCaps",
     "WOProjectionScratchPlan",
     "WOProjectionWorkspace",
+    "build_block_fp8_linear_binding",
     "build_wo_projection_binding",
     "build_wo_projection_inv_rope_binding",
     "block_fp8_linear_mxfp8",
@@ -61,6 +70,7 @@ __all__ = [
     "pack_fp8_block_scaled_weight_mxfp8",
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
+    "plan_block_fp8_linear_scratch",
     "plan_wo_projection_scratch",
     "prewarm_block_fp8_linear_mxfp8",
     "quantize_block_fp8_linear_input_mxfp8",
