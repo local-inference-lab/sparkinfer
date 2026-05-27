@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 import os
 import warnings
@@ -85,6 +86,69 @@ _NSA_EXTEND_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
 _PREFILL512_MIN_Q_ROWS = 1024
 _PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
+
+
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndexerExtendLogitsKernelBinding:
+    q_fp8: torch.Tensor
+    weights: torch.Tensor
+    k_quant: torch.Tensor
+    k_scale: torch.Tensor
+    k_start: torch.Tensor
+    k_end: torch.Tensor
+    contract_phantoms: dict[str, torch.Tensor] | None = None
+    workspace: object | None = None
+    preinitialize_invalid_logits: bool = True
+    tile_logits: torch.Tensor | None = None
+    tile_k_offset: int = 0
+    tile_num_k_tiles: int | None = None
+
+    def run(self) -> torch.Tensor:
+        return run_extend_logits_kernel(binding=self)
+
+
+def build_indexer_extend_logits_kernel_binding(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    k_quant: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace: object | None = None,
+    preinitialize_invalid_logits: bool = True,
+    tile_logits: torch.Tensor | None = None,
+    tile_k_offset: int = 0,
+    tile_num_k_tiles: int | None = None,
+) -> IndexerExtendLogitsKernelBinding:
+    return IndexerExtendLogitsKernelBinding(
+        q_fp8=q_fp8,
+        weights=weights,
+        k_quant=k_quant,
+        k_scale=k_scale,
+        k_start=k_start,
+        k_end=k_end,
+        contract_phantoms=contract_phantoms,
+        workspace=workspace,
+        preinitialize_invalid_logits=bool(preinitialize_invalid_logits),
+        tile_logits=tile_logits,
+        tile_k_offset=int(tile_k_offset),
+        tile_num_k_tiles=None if tile_num_k_tiles is None else int(tile_num_k_tiles),
+    )
 
 
 def _to_kernel_tensor(
@@ -2028,19 +2092,65 @@ def supports_extend_logits_kernel(
 
 def run_extend_logits_kernel(
     *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    k_quant: torch.Tensor,
-    k_scale: torch.Tensor,
-    k_start: torch.Tensor,
-    k_end: torch.Tensor,
+    q_fp8: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+    k_quant: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    k_start: torch.Tensor | None = None,
+    k_end: torch.Tensor | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
-    preinitialize_invalid_logits: bool = True,
+    preinitialize_invalid_logits: bool | None = None,
     tile_logits: torch.Tensor | None = None,
-    tile_k_offset: int = 0,
+    tile_k_offset: int | None = None,
     tile_num_k_tiles: int | None = None,
+    binding: IndexerExtendLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_fp8", q_fp8),
+                ("weights", weights),
+                ("k_quant", k_quant),
+                ("k_scale", k_scale),
+                ("k_start", k_start),
+                ("k_end", k_end),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("preinitialize_invalid_logits", preinitialize_invalid_logits),
+                ("tile_logits", tile_logits),
+                ("tile_k_offset", tile_k_offset),
+                ("tile_num_k_tiles", tile_num_k_tiles),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_extend_logits_kernel", extras)
+        q_fp8 = binding.q_fp8
+        weights = binding.weights
+        k_quant = binding.k_quant
+        k_scale = binding.k_scale
+        k_start = binding.k_start
+        k_end = binding.k_end
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        preinitialize_invalid_logits = binding.preinitialize_invalid_logits
+        tile_logits = binding.tile_logits
+        tile_k_offset = binding.tile_k_offset
+        tile_num_k_tiles = binding.tile_num_k_tiles
+
+    q_fp8 = _require_bound_arg(q_fp8, api_name="run_extend_logits_kernel", name="q_fp8")
+    weights = _require_bound_arg(weights, api_name="run_extend_logits_kernel", name="weights")
+    k_quant = _require_bound_arg(k_quant, api_name="run_extend_logits_kernel", name="k_quant")
+    k_scale = _require_bound_arg(k_scale, api_name="run_extend_logits_kernel", name="k_scale")
+    k_start = _require_bound_arg(k_start, api_name="run_extend_logits_kernel", name="k_start")
+    k_end = _require_bound_arg(k_end, api_name="run_extend_logits_kernel", name="k_end")
+    preinitialize_invalid_logits = (
+        True if preinitialize_invalid_logits is None else bool(preinitialize_invalid_logits)
+    )
+    tile_k_offset = 0 if tile_k_offset is None else int(tile_k_offset)
+
     if not supports_extend_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,

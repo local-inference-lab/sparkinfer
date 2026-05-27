@@ -1355,6 +1355,44 @@ class PagedAttentionWorkspace:
             )
         return self
 
+    def bind_paged_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+        page_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool = False,
+        window_left: int = -1,
+        active_total_q: int | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+        attention_sink_bias: torch.Tensor | None = None,
+    ):
+        from b12x.integration.paged_attention_scratch import build_paged_attention_binding
+
+        return build_paged_attention_binding(
+            workspace=self,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            window_left=window_left,
+            active_total_q=active_total_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
+
     @torch._dynamo.disable
     def run(
         self,

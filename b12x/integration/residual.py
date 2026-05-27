@@ -8,11 +8,24 @@ fallback path.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
+
+from b12x.attention.workspace import (
+    _ARENA_ALIGN_BYTES,
+    _align_up,
+    _dtype_nbytes,
+    _materialize_arena_view,
+)
+from b12x.integration.scratch import (
+    B12XScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 
 
 MHC_MULT = 4
@@ -60,6 +73,349 @@ class MHCWorkspace:
             out=self.out[:num_tokens],
             split_k=self.split_k,
         )
+
+    def bind(
+        self,
+        *,
+        tokens: int | None = None,
+        out: torch.Tensor | None = None,
+    ) -> "B12XMHCBinding":
+        return build_mhc_binding(workspace=self, tokens=tokens, out=out)
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XMHCBinding:
+    partials: torch.Tensor | None = None
+    y: torch.Tensor | None = None
+    post_buffer: torch.Tensor | None = None
+    comb_buffer: torch.Tensor | None = None
+    out: torch.Tensor | None = None
+    split_k: int = MHC_DEFAULT_SPLIT_K
+
+    def pre(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        *,
+        rms_eps: float,
+        hc_eps: float,
+        sinkhorn_iters: int,
+        block_k: int = MHC_DEFAULT_BLOCK_K,
+        block_h: int = MHC_DEFAULT_BLOCK_H,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return b12x_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            binding=self,
+            block_k=block_k,
+            block_h=block_h,
+        )
+
+    def post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        *,
+        block_h: int = MHC_DEFAULT_BLOCK_H,
+    ) -> torch.Tensor:
+        return b12x_mhc_post(
+            x,
+            residual,
+            post,
+            comb,
+            binding=self,
+            block_h=block_h,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XMHCScratchCaps:
+    device: torch.device | str
+    max_tokens: int
+    hidden_size: int
+    dtype: torch.dtype = torch.bfloat16
+    split_k: int = MHC_DEFAULT_SPLIT_K
+
+    def __post_init__(self) -> None:
+        device = torch.device(self.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
+        object.__setattr__(self, "hidden_size", max(int(self.hidden_size), 1))
+        object.__setattr__(self, "split_k", max(int(self.split_k), 1))
+        if self.dtype != torch.bfloat16:
+            raise ValueError(f"mHC scratch currently supports torch.bfloat16 outputs, got {self.dtype}")
+
+
+@dataclass(frozen=True)
+class _MHCScratchLayout:
+    nbytes: int
+    partials_offset_bytes: int
+
+
+@dataclass(frozen=True)
+class B12XMHCScratchPlan:
+    caps: B12XMHCScratchCaps
+    layout: _MHCScratchLayout
+    _scratch_specs: tuple[B12XScratchBufferSpec, ...]
+
+    def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
+        return self._scratch_specs
+
+    def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def make_pre_workspace(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    ) -> MHCPreWorkspace:
+        scratch_storage = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="mHC",
+        )
+        max_tokens = int(self.caps.max_tokens)
+        split_k = int(self.caps.split_k)
+        partials, _ = _materialize_arena_view(
+            scratch_storage,
+            offset_bytes=self.layout.partials_offset_bytes,
+            shape=(max_tokens, split_k, MHC_PARTIALS),
+            dtype=torch.float32,
+        )
+        return MHCPreWorkspace(partials=partials, split_k=split_k)
+
+    def make_workspace(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    ) -> MHCPreWorkspace:
+        return self.make_pre_workspace(scratch=scratch)
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        tokens: int | None = None,
+        y: torch.Tensor | None = None,
+        post: torch.Tensor | None = None,
+        comb: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> B12XMHCBinding:
+        workspace = self.make_pre_workspace(scratch=scratch)
+        live_tokens = int(self.caps.max_tokens) if tokens is None else int(tokens)
+        if live_tokens < 0 or live_tokens > int(self.caps.max_tokens):
+            raise ValueError(
+                f"tokens={live_tokens} exceeds MHC scratch capacity {self.caps.max_tokens}"
+            )
+        partials = workspace.partials[:live_tokens]
+        _validate_mhc_binding_views(
+            partials=partials,
+            y=y,
+            post=post,
+            comb=comb,
+            out=out,
+            tokens=live_tokens,
+            hidden_size=int(self.caps.hidden_size),
+            split_k=int(self.caps.split_k),
+            dtype=self.caps.dtype,
+            device=self.caps.device,
+        )
+        return B12XMHCBinding(
+            partials=partials,
+            y=y,
+            post_buffer=post,
+            comb_buffer=comb,
+            out=out,
+            split_k=int(self.caps.split_k),
+        )
+
+
+def build_mhc_binding(
+    *,
+    workspace: MHCWorkspace,
+    tokens: int | None = None,
+    out: torch.Tensor | None = None,
+) -> B12XMHCBinding:
+    if not isinstance(workspace, MHCWorkspace):
+        raise TypeError("workspace must be an MHCWorkspace")
+    live_tokens = int(workspace.capacity) if tokens is None else int(tokens)
+    if live_tokens < 0 or live_tokens > int(workspace.capacity):
+        raise ValueError(
+            f"tokens={live_tokens} exceeds MHC workspace capacity {workspace.capacity}"
+        )
+    live = workspace if live_tokens == int(workspace.capacity) else workspace.slice(live_tokens)
+    if out is None:
+        out = live.out
+    _validate_mhc_binding_views(
+        partials=live.partials,
+        y=live.y,
+        post=live.post,
+        comb=live.comb,
+        out=out,
+        tokens=live_tokens,
+        hidden_size=int(workspace.hidden_size),
+        split_k=int(live.split_k),
+        dtype=live.out.dtype,
+        device=live.out.device,
+    )
+    return B12XMHCBinding(
+        partials=live.partials,
+        y=live.y,
+        post_buffer=live.post,
+        comb_buffer=live.comb,
+        out=out,
+        split_k=int(live.split_k),
+    )
+
+
+def _validate_optional_view(
+    tensor: torch.Tensor | None,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> None:
+    if tensor is None:
+        return
+    if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor.device != device:
+        raise ValueError(
+            f"{name} must have shape {shape}, dtype {dtype}, and device {device}; "
+            f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+        )
+    _require_contiguous(tensor, name=name)
+
+
+def _validate_mhc_binding_views(
+    *,
+    partials: torch.Tensor | None,
+    y: torch.Tensor | None,
+    post: torch.Tensor | None,
+    comb: torch.Tensor | None,
+    out: torch.Tensor | None,
+    tokens: int,
+    hidden_size: int,
+    split_k: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if partials is not None:
+        _validate_optional_view(
+            partials,
+            shape=(tokens, split_k, MHC_PARTIALS),
+            dtype=torch.float32,
+            device=device,
+            name="mHC partials",
+        )
+    _validate_optional_view(
+        y,
+        shape=(tokens, hidden_size),
+        dtype=dtype,
+        device=device,
+        name="mHC y",
+    )
+    _validate_optional_view(
+        post,
+        shape=(tokens, MHC_MULT),
+        dtype=torch.float32,
+        device=device,
+        name="mHC post",
+    )
+    _validate_optional_view(
+        comb,
+        shape=(tokens, MHC_MULT, MHC_MULT),
+        dtype=torch.float32,
+        device=device,
+        name="mHC comb",
+    )
+    _validate_optional_view(
+        out,
+        shape=(tokens, MHC_MULT, hidden_size),
+        dtype=dtype,
+        device=device,
+        name="mHC out",
+    )
+
+
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _slice_capacity_view(
+    tensor: torch.Tensor | None,
+    *,
+    tokens: int,
+    tail_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    expected = (tokens, *tail_shape)
+    if tuple(tensor.shape) == expected:
+        return tensor
+    if (
+        tensor.ndim == len(expected)
+        and int(tensor.shape[0]) >= tokens
+        and tuple(tensor.shape[1:]) == tail_shape
+        and tensor.dtype == dtype
+        and tensor.device == device
+    ):
+        return tensor[:tokens]
+    raise ValueError(
+        f"{name} must have shape {expected} or capacity >= {tokens} with tail "
+        f"{tail_shape}, dtype {dtype}, and device {device}; got "
+        f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+    )
+
+
+def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
+    cursor = 0
+
+    def reserve(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[int, int]:
+        nonlocal cursor
+        offset = _align_up(cursor, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+        cursor = offset + _shape_numel(shape) * _dtype_nbytes(dtype)
+        return offset, cursor
+
+    partials_offset_bytes, _ = reserve(
+        (int(caps.max_tokens), int(caps.split_k), MHC_PARTIALS),
+        torch.float32,
+    )
+    return _MHCScratchLayout(
+        nbytes=cursor,
+        partials_offset_bytes=partials_offset_bytes,
+    )
+
+
+def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
+    layout = _layout_mhc_scratch(caps)
+    return B12XMHCScratchPlan(
+        caps=caps,
+        layout=layout,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "mhc.scratch",
+                nbytes=layout.nbytes,
+                device=caps.device,
+            ),
+        ),
+    )
 
 
 @triton.jit
@@ -570,10 +926,32 @@ def b12x_mhc_pre(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    binding: B12XMHCBinding | None = None,
     split_k: int = MHC_DEFAULT_SPLIT_K,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("workspace", workspace),
+                ("y_out", y_out),
+                ("post_out", post_out),
+                ("comb_out", comb_out),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "mHC binding owns workspace and output buffers; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        workspace = binding.partials
+        y_out = binding.y
+        post_out = binding.post_buffer
+        comb_out = binding.comb_buffer
+        split_k = int(binding.split_k)
     tokens, hidden_size, total_k = _validate_pre_inputs(residual, fn, hc_scale, hc_base)
     split_k = int(split_k)
     block_k = int(block_k)
@@ -630,26 +1008,57 @@ def b12x_mhc_pre(
         partials = workspace.partials
     else:
         partials = workspace
+    partials = _slice_capacity_view(
+        partials,
+        tokens=tokens,
+        tail_shape=(split_k, MHC_PARTIALS),
+        dtype=torch.float32,
+        device=residual.device,
+        name="workspace partials",
+    )
     if partials.dtype != torch.float32 or partials.device != residual.device:
         raise ValueError("workspace partials must be float32 on the residual device")
-    if tuple(partials.shape) != (tokens, split_k, MHC_PARTIALS):
-        raise ValueError(
-            f"workspace partials must have shape {(tokens, split_k, MHC_PARTIALS)}, got {tuple(partials.shape)}"
-        )
     _require_contiguous(partials, name="workspace partials")
 
     if y_out is None:
         if capture:
             raise ValueError("b12x_mhc_pre requires caller-owned y_out during CUDA graph capture")
         y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
+    else:
+        y_out = _slice_capacity_view(
+            y_out,
+            tokens=tokens,
+            tail_shape=(hidden_size,),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="y_out",
+        )
     if post_out is None:
         if capture:
             raise ValueError("b12x_mhc_pre requires caller-owned post_out during CUDA graph capture")
         post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
+    else:
+        post_out = _slice_capacity_view(
+            post_out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT,),
+            dtype=torch.float32,
+            device=residual.device,
+            name="post_out",
+        )
     if comb_out is None:
         if capture:
             raise ValueError("b12x_mhc_pre requires caller-owned comb_out during CUDA graph capture")
         comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
+    else:
+        comb_out = _slice_capacity_view(
+            comb_out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT, MHC_MULT),
+            dtype=torch.float32,
+            device=residual.device,
+            name="comb_out",
+        )
     if y_out.shape != (tokens, hidden_size) or y_out.dtype != residual.dtype or y_out.device != residual.device:
         raise ValueError("y_out must match shape [tokens, hidden_size], residual dtype, and residual device")
     if post_out.shape != (tokens, MHC_MULT) or post_out.dtype != torch.float32 or post_out.device != residual.device:
@@ -706,8 +1115,24 @@ def b12x_mhc_post(
     *,
     workspace: MHCWorkspace | None = None,
     out: torch.Tensor | None = None,
+    binding: B12XMHCBinding | None = None,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("workspace", workspace),
+                ("out", out),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "mHC binding owns workspace and output buffer; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        out = binding.out
     if residual.device.type != "cuda":
         raise ValueError("residual must be a CUDA tensor")
     if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
@@ -746,6 +1171,15 @@ def b12x_mhc_post(
         if _capture_active(residual.device):
             raise ValueError("b12x_mhc_post requires caller-owned out during CUDA graph capture")
         out = torch.empty_like(residual)
+    else:
+        out = _slice_capacity_view(
+            out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="out",
+        )
     if out.shape != residual.shape or out.dtype != residual.dtype or out.device != residual.device:
         raise ValueError("out must match residual shape, dtype, and device")
     _require_contiguous(out, name="out")
@@ -767,6 +1201,9 @@ def b12x_mhc_post(
 
 
 __all__ = [
+    "B12XMHCBinding",
+    "B12XMHCScratchCaps",
+    "B12XMHCScratchPlan",
     "MHC_DEFAULT_BLOCK_H",
     "MHC_DEFAULT_BLOCK_K",
     "MHC_DEFAULT_SPLIT_K",
@@ -775,9 +1212,11 @@ __all__ = [
     "MHC_PARTIALS",
     "MHCWorkspace",
     "MHCPreWorkspace",
+    "build_mhc_binding",
     "b12x_mhc_post",
     "b12x_mhc_pre",
     "empty_mhc_workspace",
     "empty_mhc_pre_workspace",
     "mhc_workspace_nbytes",
+    "plan_mhc_scratch",
 ]

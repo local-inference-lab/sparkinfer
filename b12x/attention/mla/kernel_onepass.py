@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 import os
 import warnings
@@ -86,6 +87,54 @@ _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
     os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
 )
+
+
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLAOnePassKernelBinding:
+    q_all: torch.Tensor
+    kv_cache: torch.Tensor
+    page_table_1: torch.Tensor
+    active_token_counts: torch.Tensor
+    sm_scale: float | torch.Tensor
+    output: torch.Tensor
+    workspace: object | None = None
+
+    def run(self) -> None:
+        run_sparse_mla_kernel(binding=self)
+
+
+def build_sparse_mla_onepass_kernel_binding(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: float | torch.Tensor,
+    output: torch.Tensor,
+    workspace: object | None = None,
+) -> SparseMLAOnePassKernelBinding:
+    return SparseMLAOnePassKernelBinding(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        output=output,
+        workspace=workspace,
+    )
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -2210,14 +2259,54 @@ def supports_sparse_mla_kernel(
 
 def run_sparse_mla_kernel(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: float | torch.Tensor,
-    output: torch.Tensor,
+    q_all: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    page_table_1: torch.Tensor | None = None,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float | torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
     workspace: object | None = None,
+    binding: SparseMLAOnePassKernelBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("kv_cache", kv_cache),
+                ("page_table_1", page_table_1),
+                ("active_token_counts", active_token_counts),
+                ("sm_scale", sm_scale),
+                ("output", output),
+                ("workspace", workspace),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_kernel", extras)
+        q_all = binding.q_all
+        kv_cache = binding.kv_cache
+        page_table_1 = binding.page_table_1
+        active_token_counts = binding.active_token_counts
+        sm_scale = binding.sm_scale
+        output = binding.output
+        workspace = binding.workspace
+
+    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")
+    kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_kernel", name="kv_cache")
+    page_table_1 = _require_bound_arg(
+        page_table_1,
+        api_name="run_sparse_mla_kernel",
+        name="page_table_1",
+    )
+    active_token_counts = _require_bound_arg(
+        active_token_counts,
+        api_name="run_sparse_mla_kernel",
+        name="active_token_counts",
+    )
+    sm_scale = _require_bound_arg(sm_scale, api_name="run_sparse_mla_kernel", name="sm_scale")
+    output = _require_bound_arg(output, api_name="run_sparse_mla_kernel", name="output")
+
     traits = select_sparse_mla_traits(
         q_all=q_all,
         kv_cache=kv_cache,

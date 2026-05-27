@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 
 import cuda.bindings.driver as cuda
@@ -58,6 +59,246 @@ from .traits import SparseMLATraits, select_sparse_mla_traits
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLASplitDecodeForwardBinding:
+    q_all: torch.Tensor
+    kv_cache: torch.Tensor
+    page_table_1: torch.Tensor
+    active_token_counts: torch.Tensor
+    sm_scale: torch.Tensor
+    kv_chunk_size_ptr: torch.Tensor
+    num_chunks_ptr: torch.Tensor
+    tmp_output: torch.Tensor
+    tmp_lse: torch.Tensor
+    launch_num_chunks: int
+    workspace: object | None = None
+    identity_page_table: bool = False
+
+    def run(self) -> None:
+        run_sparse_mla_split_decode_forward(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CompressedMLASplitDecodeForwardBinding:
+    q_all: torch.Tensor
+    swa_k_cache: torch.Tensor
+    swa_indices: torch.Tensor
+    swa_lengths: torch.Tensor
+    indexed_k_cache: torch.Tensor
+    indexed_indices: torch.Tensor
+    indexed_lengths: torch.Tensor
+    indexed_page_table: torch.Tensor
+    sm_scale: torch.Tensor
+    kv_chunk_size_ptr: torch.Tensor
+    num_chunks_ptr: torch.Tensor
+    tmp_output: torch.Tensor
+    tmp_lse: torch.Tensor
+    launch_num_chunks: int
+    swa_page_size: int
+    swa_page_nbytes: int
+    indexed_page_size: int
+    indexed_page_nbytes: int
+    has_indexed: bool
+    map_indexed_page_table: bool
+    workspace: object | None = None
+    direct_output: bool = False
+    single_tile_chunks: bool = False
+    attn_sink: torch.Tensor | None = None
+    direct_sink_output: bool = False
+
+    def run(self) -> None:
+        run_compressed_mla_split_decode_forward(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLASplitDecodeMergeBinding:
+    tmp_output: torch.Tensor
+    tmp_lse: torch.Tensor
+    num_chunks_ptr: torch.Tensor
+    output: torch.Tensor
+    attn_sink: torch.Tensor | None = None
+    workspace: object | None = None
+
+    def run(self) -> None:
+        run_sparse_mla_split_decode_merge(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLASplitDecodeBinding:
+    q_all: torch.Tensor
+    kv_cache: torch.Tensor
+    page_table_1: torch.Tensor
+    active_token_counts: torch.Tensor
+    sm_scale: torch.Tensor
+    kv_chunk_size_ptr: torch.Tensor
+    num_chunks_ptr: torch.Tensor
+    tmp_output: torch.Tensor
+    tmp_lse: torch.Tensor
+    output: torch.Tensor
+    launch_num_chunks: int
+    attn_sink: torch.Tensor | None = None
+    workspace: object | None = None
+    identity_page_table: bool = False
+
+    def run(self) -> None:
+        run_sparse_mla_split_decode(binding=self)
+
+
+def build_sparse_mla_split_decode_forward_binding(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    launch_num_chunks: int,
+    workspace: object | None = None,
+    identity_page_table: bool = False,
+) -> SparseMLASplitDecodeForwardBinding:
+    return SparseMLASplitDecodeForwardBinding(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        num_chunks_ptr=num_chunks_ptr,
+        tmp_output=tmp_output,
+        tmp_lse=tmp_lse,
+        launch_num_chunks=int(launch_num_chunks),
+        workspace=workspace,
+        identity_page_table=bool(identity_page_table),
+    )
+
+
+def build_compressed_mla_split_decode_forward_binding(
+    *,
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_k_cache: torch.Tensor,
+    indexed_indices: torch.Tensor,
+    indexed_lengths: torch.Tensor,
+    indexed_page_table: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    launch_num_chunks: int,
+    swa_page_size: int,
+    swa_page_nbytes: int,
+    indexed_page_size: int,
+    indexed_page_nbytes: int,
+    has_indexed: bool,
+    map_indexed_page_table: bool,
+    workspace: object | None = None,
+    direct_output: bool = False,
+    single_tile_chunks: bool = False,
+    attn_sink: torch.Tensor | None = None,
+    direct_sink_output: bool = False,
+) -> CompressedMLASplitDecodeForwardBinding:
+    return CompressedMLASplitDecodeForwardBinding(
+        q_all=q_all,
+        swa_k_cache=swa_k_cache,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_k_cache=indexed_k_cache,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=indexed_page_table,
+        sm_scale=sm_scale,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        num_chunks_ptr=num_chunks_ptr,
+        tmp_output=tmp_output,
+        tmp_lse=tmp_lse,
+        launch_num_chunks=int(launch_num_chunks),
+        swa_page_size=int(swa_page_size),
+        swa_page_nbytes=int(swa_page_nbytes),
+        indexed_page_size=int(indexed_page_size),
+        indexed_page_nbytes=int(indexed_page_nbytes),
+        has_indexed=bool(has_indexed),
+        map_indexed_page_table=bool(map_indexed_page_table),
+        workspace=workspace,
+        direct_output=bool(direct_output),
+        single_tile_chunks=bool(single_tile_chunks),
+        attn_sink=attn_sink,
+        direct_sink_output=bool(direct_sink_output),
+    )
+
+
+def build_sparse_mla_split_decode_merge_binding(
+    *,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor | None = None,
+    workspace: object | None = None,
+) -> SparseMLASplitDecodeMergeBinding:
+    return SparseMLASplitDecodeMergeBinding(
+        tmp_output=tmp_output,
+        tmp_lse=tmp_lse,
+        num_chunks_ptr=num_chunks_ptr,
+        output=output,
+        attn_sink=attn_sink,
+        workspace=workspace,
+    )
+
+
+def build_sparse_mla_split_decode_binding(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    output: torch.Tensor,
+    launch_num_chunks: int,
+    attn_sink: torch.Tensor | None = None,
+    workspace: object | None = None,
+    identity_page_table: bool = False,
+) -> SparseMLASplitDecodeBinding:
+    return SparseMLASplitDecodeBinding(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        num_chunks_ptr=num_chunks_ptr,
+        tmp_output=tmp_output,
+        tmp_lse=tmp_lse,
+        output=output,
+        launch_num_chunks=int(launch_num_chunks),
+        attn_sink=attn_sink,
+        workspace=workspace,
+        identity_page_table=bool(identity_page_table),
+    )
 
 
 def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
@@ -912,19 +1153,103 @@ def clear_sparse_mla_split_kernel_cache() -> None:
 
 def run_sparse_mla_split_decode_forward(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: torch.Tensor,
-    kv_chunk_size_ptr: torch.Tensor,
-    num_chunks_ptr: torch.Tensor,
-    tmp_output: torch.Tensor,
-    tmp_lse: torch.Tensor,
-    launch_num_chunks: int,
+    q_all: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    page_table_1: torch.Tensor | None = None,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: torch.Tensor | None = None,
+    kv_chunk_size_ptr: torch.Tensor | None = None,
+    num_chunks_ptr: torch.Tensor | None = None,
+    tmp_output: torch.Tensor | None = None,
+    tmp_lse: torch.Tensor | None = None,
+    launch_num_chunks: int | None = None,
     workspace: object | None = None,
-    identity_page_table: bool = False,
+    identity_page_table: bool | None = None,
+    binding: SparseMLASplitDecodeForwardBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("kv_cache", kv_cache),
+                ("page_table_1", page_table_1),
+                ("active_token_counts", active_token_counts),
+                ("sm_scale", sm_scale),
+                ("kv_chunk_size_ptr", kv_chunk_size_ptr),
+                ("num_chunks_ptr", num_chunks_ptr),
+                ("tmp_output", tmp_output),
+                ("tmp_lse", tmp_lse),
+                ("launch_num_chunks", launch_num_chunks),
+                ("workspace", workspace),
+                ("identity_page_table", identity_page_table),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_split_decode_forward", extras)
+        q_all = binding.q_all
+        kv_cache = binding.kv_cache
+        page_table_1 = binding.page_table_1
+        active_token_counts = binding.active_token_counts
+        sm_scale = binding.sm_scale
+        kv_chunk_size_ptr = binding.kv_chunk_size_ptr
+        num_chunks_ptr = binding.num_chunks_ptr
+        tmp_output = binding.tmp_output
+        tmp_lse = binding.tmp_lse
+        launch_num_chunks = binding.launch_num_chunks
+        workspace = binding.workspace
+        identity_page_table = binding.identity_page_table
+
+    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_split_decode_forward", name="q_all")
+    kv_cache = _require_bound_arg(
+        kv_cache,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="kv_cache",
+    )
+    page_table_1 = _require_bound_arg(
+        page_table_1,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="page_table_1",
+    )
+    active_token_counts = _require_bound_arg(
+        active_token_counts,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="active_token_counts",
+    )
+    sm_scale = _require_bound_arg(
+        sm_scale,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="sm_scale",
+    )
+    kv_chunk_size_ptr = _require_bound_arg(
+        kv_chunk_size_ptr,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="kv_chunk_size_ptr",
+    )
+    num_chunks_ptr = _require_bound_arg(
+        num_chunks_ptr,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="num_chunks_ptr",
+    )
+    tmp_output = _require_bound_arg(
+        tmp_output,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="tmp_output",
+    )
+    tmp_lse = _require_bound_arg(
+        tmp_lse,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="tmp_lse",
+    )
+    launch_num_chunks = _require_bound_arg(
+        launch_num_chunks,
+        api_name="run_sparse_mla_split_decode_forward",
+        name="launch_num_chunks",
+    )
+    launch_num_chunks = int(launch_num_chunks)
+    identity_page_table = False if identity_page_table is None else bool(identity_page_table)
+
     traits = select_sparse_mla_traits(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -1054,32 +1379,207 @@ def run_sparse_mla_split_decode_forward(
 
 def run_compressed_mla_split_decode_forward(
     *,
-    q_all: torch.Tensor,
-    swa_k_cache: torch.Tensor,
-    swa_indices: torch.Tensor,
-    swa_lengths: torch.Tensor,
-    indexed_k_cache: torch.Tensor,
-    indexed_indices: torch.Tensor,
-    indexed_lengths: torch.Tensor,
-    indexed_page_table: torch.Tensor,
-    sm_scale: torch.Tensor,
-    kv_chunk_size_ptr: torch.Tensor,
-    num_chunks_ptr: torch.Tensor,
-    tmp_output: torch.Tensor,
-    tmp_lse: torch.Tensor,
-    launch_num_chunks: int,
-    swa_page_size: int,
-    swa_page_nbytes: int,
-    indexed_page_size: int,
-    indexed_page_nbytes: int,
-    has_indexed: bool,
-    map_indexed_page_table: bool,
+    q_all: torch.Tensor | None = None,
+    swa_k_cache: torch.Tensor | None = None,
+    swa_indices: torch.Tensor | None = None,
+    swa_lengths: torch.Tensor | None = None,
+    indexed_k_cache: torch.Tensor | None = None,
+    indexed_indices: torch.Tensor | None = None,
+    indexed_lengths: torch.Tensor | None = None,
+    indexed_page_table: torch.Tensor | None = None,
+    sm_scale: torch.Tensor | None = None,
+    kv_chunk_size_ptr: torch.Tensor | None = None,
+    num_chunks_ptr: torch.Tensor | None = None,
+    tmp_output: torch.Tensor | None = None,
+    tmp_lse: torch.Tensor | None = None,
+    launch_num_chunks: int | None = None,
+    swa_page_size: int | None = None,
+    swa_page_nbytes: int | None = None,
+    indexed_page_size: int | None = None,
+    indexed_page_nbytes: int | None = None,
+    has_indexed: bool | None = None,
+    map_indexed_page_table: bool | None = None,
     workspace: object | None = None,
-    direct_output: bool = False,
-    single_tile_chunks: bool = False,
+    direct_output: bool | None = None,
+    single_tile_chunks: bool | None = None,
     attn_sink: torch.Tensor | None = None,
-    direct_sink_output: bool = False,
+    direct_sink_output: bool | None = None,
+    binding: CompressedMLASplitDecodeForwardBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("swa_k_cache", swa_k_cache),
+                ("swa_indices", swa_indices),
+                ("swa_lengths", swa_lengths),
+                ("indexed_k_cache", indexed_k_cache),
+                ("indexed_indices", indexed_indices),
+                ("indexed_lengths", indexed_lengths),
+                ("indexed_page_table", indexed_page_table),
+                ("sm_scale", sm_scale),
+                ("kv_chunk_size_ptr", kv_chunk_size_ptr),
+                ("num_chunks_ptr", num_chunks_ptr),
+                ("tmp_output", tmp_output),
+                ("tmp_lse", tmp_lse),
+                ("launch_num_chunks", launch_num_chunks),
+                ("swa_page_size", swa_page_size),
+                ("swa_page_nbytes", swa_page_nbytes),
+                ("indexed_page_size", indexed_page_size),
+                ("indexed_page_nbytes", indexed_page_nbytes),
+                ("has_indexed", has_indexed),
+                ("map_indexed_page_table", map_indexed_page_table),
+                ("workspace", workspace),
+                ("direct_output", direct_output),
+                ("single_tile_chunks", single_tile_chunks),
+                ("attn_sink", attn_sink),
+                ("direct_sink_output", direct_sink_output),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_compressed_mla_split_decode_forward", extras)
+        q_all = binding.q_all
+        swa_k_cache = binding.swa_k_cache
+        swa_indices = binding.swa_indices
+        swa_lengths = binding.swa_lengths
+        indexed_k_cache = binding.indexed_k_cache
+        indexed_indices = binding.indexed_indices
+        indexed_lengths = binding.indexed_lengths
+        indexed_page_table = binding.indexed_page_table
+        sm_scale = binding.sm_scale
+        kv_chunk_size_ptr = binding.kv_chunk_size_ptr
+        num_chunks_ptr = binding.num_chunks_ptr
+        tmp_output = binding.tmp_output
+        tmp_lse = binding.tmp_lse
+        launch_num_chunks = binding.launch_num_chunks
+        swa_page_size = binding.swa_page_size
+        swa_page_nbytes = binding.swa_page_nbytes
+        indexed_page_size = binding.indexed_page_size
+        indexed_page_nbytes = binding.indexed_page_nbytes
+        has_indexed = binding.has_indexed
+        map_indexed_page_table = binding.map_indexed_page_table
+        workspace = binding.workspace
+        direct_output = binding.direct_output
+        single_tile_chunks = binding.single_tile_chunks
+        attn_sink = binding.attn_sink
+        direct_sink_output = binding.direct_sink_output
+
+    q_all = _require_bound_arg(q_all, api_name="run_compressed_mla_split_decode_forward", name="q_all")
+    swa_k_cache = _require_bound_arg(
+        swa_k_cache,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="swa_k_cache",
+    )
+    swa_indices = _require_bound_arg(
+        swa_indices,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="swa_indices",
+    )
+    swa_lengths = _require_bound_arg(
+        swa_lengths,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="swa_lengths",
+    )
+    indexed_k_cache = _require_bound_arg(
+        indexed_k_cache,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="indexed_k_cache",
+    )
+    indexed_indices = _require_bound_arg(
+        indexed_indices,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="indexed_indices",
+    )
+    indexed_lengths = _require_bound_arg(
+        indexed_lengths,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="indexed_lengths",
+    )
+    indexed_page_table = _require_bound_arg(
+        indexed_page_table,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="indexed_page_table",
+    )
+    sm_scale = _require_bound_arg(
+        sm_scale,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="sm_scale",
+    )
+    kv_chunk_size_ptr = _require_bound_arg(
+        kv_chunk_size_ptr,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="kv_chunk_size_ptr",
+    )
+    num_chunks_ptr = _require_bound_arg(
+        num_chunks_ptr,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="num_chunks_ptr",
+    )
+    tmp_output = _require_bound_arg(
+        tmp_output,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="tmp_output",
+    )
+    tmp_lse = _require_bound_arg(
+        tmp_lse,
+        api_name="run_compressed_mla_split_decode_forward",
+        name="tmp_lse",
+    )
+    launch_num_chunks = int(
+        _require_bound_arg(
+            launch_num_chunks,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="launch_num_chunks",
+        )
+    )
+    swa_page_size = int(
+        _require_bound_arg(
+            swa_page_size,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="swa_page_size",
+        )
+    )
+    swa_page_nbytes = int(
+        _require_bound_arg(
+            swa_page_nbytes,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="swa_page_nbytes",
+        )
+    )
+    indexed_page_size = int(
+        _require_bound_arg(
+            indexed_page_size,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="indexed_page_size",
+        )
+    )
+    indexed_page_nbytes = int(
+        _require_bound_arg(
+            indexed_page_nbytes,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="indexed_page_nbytes",
+        )
+    )
+    has_indexed = bool(
+        _require_bound_arg(
+            has_indexed,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="has_indexed",
+        )
+    )
+    map_indexed_page_table = bool(
+        _require_bound_arg(
+            map_indexed_page_table,
+            api_name="run_compressed_mla_split_decode_forward",
+            name="map_indexed_page_table",
+        )
+    )
+    direct_output = False if direct_output is None else bool(direct_output)
+    single_tile_chunks = False if single_tile_chunks is None else bool(single_tile_chunks)
+    direct_sink_output = False if direct_sink_output is None else bool(direct_sink_output)
+
     if q_all.device.type != "cuda":
         raise ValueError("compressed MLA split decode requires CUDA q_all")
     if q_all.dtype != torch.bfloat16:
@@ -1302,13 +1802,57 @@ def run_compressed_mla_split_decode_forward(
 
 def run_sparse_mla_split_decode_merge(
     *,
-    tmp_output: torch.Tensor,
-    tmp_lse: torch.Tensor,
-    num_chunks_ptr: torch.Tensor,
-    output: torch.Tensor,
+    tmp_output: torch.Tensor | None = None,
+    tmp_lse: torch.Tensor | None = None,
+    num_chunks_ptr: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
     workspace: object | None = None,
+    binding: SparseMLASplitDecodeMergeBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("tmp_output", tmp_output),
+                ("tmp_lse", tmp_lse),
+                ("num_chunks_ptr", num_chunks_ptr),
+                ("output", output),
+                ("attn_sink", attn_sink),
+                ("workspace", workspace),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_split_decode_merge", extras)
+        tmp_output = binding.tmp_output
+        tmp_lse = binding.tmp_lse
+        num_chunks_ptr = binding.num_chunks_ptr
+        output = binding.output
+        attn_sink = binding.attn_sink
+        workspace = binding.workspace
+
+    tmp_output = _require_bound_arg(
+        tmp_output,
+        api_name="run_sparse_mla_split_decode_merge",
+        name="tmp_output",
+    )
+    tmp_lse = _require_bound_arg(
+        tmp_lse,
+        api_name="run_sparse_mla_split_decode_merge",
+        name="tmp_lse",
+    )
+    num_chunks_ptr = _require_bound_arg(
+        num_chunks_ptr,
+        api_name="run_sparse_mla_split_decode_merge",
+        name="num_chunks_ptr",
+    )
+    output = _require_bound_arg(
+        output,
+        api_name="run_sparse_mla_split_decode_merge",
+        name="output",
+    )
+
     if tmp_output.device != output.device or tmp_lse.device != output.device:
         raise ValueError("split MLA merge tensors must be on the same device")
     if tmp_lse.dtype != torch.float32:
@@ -1403,21 +1947,99 @@ def run_sparse_mla_split_decode_merge(
 
 def run_sparse_mla_split_decode(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: torch.Tensor,
-    kv_chunk_size_ptr: torch.Tensor,
-    num_chunks_ptr: torch.Tensor,
-    tmp_output: torch.Tensor,
-    tmp_lse: torch.Tensor,
-    output: torch.Tensor,
-    launch_num_chunks: int,
+    q_all: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    page_table_1: torch.Tensor | None = None,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: torch.Tensor | None = None,
+    kv_chunk_size_ptr: torch.Tensor | None = None,
+    num_chunks_ptr: torch.Tensor | None = None,
+    tmp_output: torch.Tensor | None = None,
+    tmp_lse: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    launch_num_chunks: int | None = None,
     attn_sink: torch.Tensor | None = None,
     workspace: object | None = None,
-    identity_page_table: bool = False,
+    identity_page_table: bool | None = None,
+    binding: SparseMLASplitDecodeBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("kv_cache", kv_cache),
+                ("page_table_1", page_table_1),
+                ("active_token_counts", active_token_counts),
+                ("sm_scale", sm_scale),
+                ("kv_chunk_size_ptr", kv_chunk_size_ptr),
+                ("num_chunks_ptr", num_chunks_ptr),
+                ("tmp_output", tmp_output),
+                ("tmp_lse", tmp_lse),
+                ("output", output),
+                ("launch_num_chunks", launch_num_chunks),
+                ("attn_sink", attn_sink),
+                ("workspace", workspace),
+                ("identity_page_table", identity_page_table),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_split_decode", extras)
+        q_all = binding.q_all
+        kv_cache = binding.kv_cache
+        page_table_1 = binding.page_table_1
+        active_token_counts = binding.active_token_counts
+        sm_scale = binding.sm_scale
+        kv_chunk_size_ptr = binding.kv_chunk_size_ptr
+        num_chunks_ptr = binding.num_chunks_ptr
+        tmp_output = binding.tmp_output
+        tmp_lse = binding.tmp_lse
+        output = binding.output
+        launch_num_chunks = binding.launch_num_chunks
+        attn_sink = binding.attn_sink
+        workspace = binding.workspace
+        identity_page_table = binding.identity_page_table
+
+    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_split_decode", name="q_all")
+    kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_split_decode", name="kv_cache")
+    page_table_1 = _require_bound_arg(
+        page_table_1,
+        api_name="run_sparse_mla_split_decode",
+        name="page_table_1",
+    )
+    active_token_counts = _require_bound_arg(
+        active_token_counts,
+        api_name="run_sparse_mla_split_decode",
+        name="active_token_counts",
+    )
+    sm_scale = _require_bound_arg(sm_scale, api_name="run_sparse_mla_split_decode", name="sm_scale")
+    kv_chunk_size_ptr = _require_bound_arg(
+        kv_chunk_size_ptr,
+        api_name="run_sparse_mla_split_decode",
+        name="kv_chunk_size_ptr",
+    )
+    num_chunks_ptr = _require_bound_arg(
+        num_chunks_ptr,
+        api_name="run_sparse_mla_split_decode",
+        name="num_chunks_ptr",
+    )
+    tmp_output = _require_bound_arg(
+        tmp_output,
+        api_name="run_sparse_mla_split_decode",
+        name="tmp_output",
+    )
+    tmp_lse = _require_bound_arg(tmp_lse, api_name="run_sparse_mla_split_decode", name="tmp_lse")
+    output = _require_bound_arg(output, api_name="run_sparse_mla_split_decode", name="output")
+    launch_num_chunks = int(
+        _require_bound_arg(
+            launch_num_chunks,
+            api_name="run_sparse_mla_split_decode",
+            name="launch_num_chunks",
+        )
+    )
+    identity_page_table = False if identity_page_table is None else bool(identity_page_table)
+
     run_sparse_mla_split_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -19,6 +20,7 @@ from b12x.cute.fp4 import (
     st_global_release_i32,
 )
 from b12x.cute.utils import current_cuda_stream
+from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 from .tiled_topk import (
     _convert_to_uint32,
@@ -91,8 +93,162 @@ def persistent_topk2048_workspace_nbytes(
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     device = torch.device(device)
+    if device.type != "cuda":
+        return max(int(num_rows), 1) * _STATE_WORDS * torch.empty((), dtype=torch.int32).element_size()
     launch = _resolve_launch_config(int(num_rows), int(stride), device)
     return launch.num_groups * _STATE_WORDS * torch.empty((), dtype=torch.int32).element_size()
+
+
+def _persistent_topk2048_capacity_nbytes(
+    max_rows: int,
+    max_stride: int,
+    *,
+    device: torch.device,
+) -> int:
+    max_rows = max(int(max_rows), 1)
+    max_stride = max(int(max_stride), 1)
+    if device.type != "cuda":
+        return persistent_topk2048_workspace_nbytes(max_rows, max_stride, device=device)
+    candidate_strides = {1, max_stride}
+    if max_stride > _RADIX_THRESHOLD:
+        candidate_strides.add(_RADIX_THRESHOLD + 1)
+    return max(
+        persistent_topk2048_workspace_nbytes(max_rows, stride, device=device)
+        for stride in candidate_strides
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XPersistentTopK2048ScratchCaps:
+    device: torch.device | str
+    max_rows: int
+    max_stride: int
+
+    def __post_init__(self) -> None:
+        device = torch.device(self.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "max_rows", max(int(self.max_rows), 1))
+        object.__setattr__(self, "max_stride", max(int(self.max_stride), 1))
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XPersistentTopK2048Binding:
+    logits: torch.Tensor
+    lengths: torch.Tensor
+    workspace: torch.Tensor
+    page_table_1: torch.Tensor | None = None
+    output_indices: torch.Tensor | None = None
+    max_seq_len: int | None = None
+
+    def run(self) -> torch.Tensor:
+        return run_persistent_topk2048(binding=self)
+
+
+@dataclass(frozen=True)
+class B12XPersistentTopK2048ScratchPlan:
+    caps: B12XPersistentTopK2048ScratchCaps
+    workspace_nbytes: int
+    _scratch_specs: tuple[B12XScratchBufferSpec, ...]
+
+    def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
+        return self._scratch_specs
+
+    def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        page_table_1: torch.Tensor | None = None,
+        output_indices: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
+    ) -> B12XPersistentTopK2048Binding:
+        if logits.ndim != 2:
+            raise ValueError(f"logits must be rank-2, got {tuple(logits.shape)}")
+        rows, stride = int(logits.shape[0]), int(logits.shape[1])
+        if rows > int(self.caps.max_rows):
+            raise ValueError(
+                f"logits rows {rows} exceed persistent top-k capacity {self.caps.max_rows}"
+            )
+        if stride > int(self.caps.max_stride):
+            raise ValueError(
+                f"logits stride {stride} exceeds persistent top-k capacity {self.caps.max_stride}"
+            )
+        arena = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="persistent top-k 2048",
+        )
+        workspace = arena[: self.workspace_nbytes].view(torch.int32)
+        return build_persistent_topk2048_binding(
+            logits=logits,
+            lengths=lengths,
+            workspace=workspace,
+            page_table_1=page_table_1,
+            output_indices=output_indices,
+            max_seq_len=max_seq_len,
+        )
+
+
+def plan_persistent_topk2048_scratch(
+    caps: B12XPersistentTopK2048ScratchCaps,
+) -> B12XPersistentTopK2048ScratchPlan:
+    workspace_nbytes = _persistent_topk2048_capacity_nbytes(
+        caps.max_rows,
+        caps.max_stride,
+        device=caps.device,
+    )
+    return B12XPersistentTopK2048ScratchPlan(
+        caps=caps,
+        workspace_nbytes=workspace_nbytes,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "persistent_topk2048.state",
+                nbytes=workspace_nbytes,
+                device=caps.device,
+            ),
+        ),
+    )
+
+
+def build_persistent_topk2048_binding(
+    *,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    workspace: torch.Tensor,
+    page_table_1: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
+) -> B12XPersistentTopK2048Binding:
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be rank-2, got {tuple(logits.shape)}")
+    if lengths.ndim != 1:
+        lengths = lengths.reshape(-1)
+    if lengths.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"lengths rows {int(lengths.shape[0])} do not match logits rows {int(logits.shape[0])}"
+        )
+    if lengths.dtype != torch.int32:
+        raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
+    if lengths.device != logits.device:
+        raise ValueError("lengths must be on the logits device")
+    if workspace.dtype != torch.int32 or workspace.device != logits.device:
+        raise ValueError("workspace must be an int32 tensor on the logits device")
+    if not workspace.is_contiguous():
+        raise ValueError("workspace must be contiguous")
+    return B12XPersistentTopK2048Binding(
+        logits=logits,
+        lengths=lengths,
+        workspace=workspace,
+        page_table_1=page_table_1,
+        output_indices=output_indices,
+        max_seq_len=max_seq_len,
+    )
 
 
 @cute.jit
@@ -603,14 +759,41 @@ def _fallback_topk2048(
 
 
 def run_persistent_topk2048(
-    logits: torch.Tensor,
-    lengths: torch.Tensor,
+    logits: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
     *,
     page_table_1: torch.Tensor | None = None,
     output_indices: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     max_seq_len: int | None = None,
+    binding: B12XPersistentTopK2048Binding | None = None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("logits", logits),
+                ("lengths", lengths),
+                ("page_table_1", page_table_1),
+                ("output_indices", output_indices),
+                ("workspace", workspace),
+                ("max_seq_len", max_seq_len),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "persistent top-k binding owns runtime tensors, workspace, and options; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        logits = binding.logits
+        lengths = binding.lengths
+        page_table_1 = binding.page_table_1
+        output_indices = binding.output_indices
+        workspace = binding.workspace
+        max_seq_len = binding.max_seq_len
+    if logits is None or lengths is None:
+        raise TypeError("run_persistent_topk2048 requires logits/lengths or binding")
     if lengths.ndim != 1:
         lengths = lengths.reshape(-1)
     if max_seq_len is None:

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from b12x.attention.indexer import (
+    B12XPersistentTopK2048Binding,
+    B12XPersistentTopK2048ScratchCaps,
+    B12XPersistentTopK2048ScratchPlan,
     IndexerExtendMetadata,
     IndexerPagedDecodeMetadata,
+    build_persistent_topk2048_binding,
     build_paged_mqa_schedule_metadata,
     clear_indexer_caches,
     extend_logits,
@@ -12,15 +16,36 @@ from b12x.attention.indexer import (
     make_indexer_contract_phantoms,
     paged_decode_logits,
     persistent_topk2048_workspace_nbytes,
+    plan_persistent_topk2048_scratch,
     resolve_extend_prefill_block_k,
     run_persistent_topk2048,
     supports_persistent_topk2048,
     uses_paged_mqa_schedule,
 )
+from b12x.integration.indexer_scratch import (
+    B12XIndexerExtendBinding,
+    B12XIndexerExtendScratchCaps,
+    B12XIndexerExtendScratchPlan,
+    B12XIndexerPagedBinding,
+    B12XIndexerPagedScratchCaps,
+    B12XIndexerPagedScratchPlan,
+    plan_indexer_extend_scratch,
+    plan_indexer_paged_scratch,
+)
 
 __all__ = [
+    "B12XIndexerExtendBinding",
+    "B12XIndexerExtendScratchCaps",
+    "B12XIndexerExtendScratchPlan",
+    "B12XIndexerPagedBinding",
+    "B12XIndexerPagedScratchCaps",
+    "B12XIndexerPagedScratchPlan",
+    "B12XPersistentTopK2048Binding",
+    "B12XPersistentTopK2048ScratchCaps",
+    "B12XPersistentTopK2048ScratchPlan",
     "IndexerExtendMetadata",
     "IndexerPagedDecodeMetadata",
+    "build_persistent_topk2048_binding",
     "build_paged_mqa_schedule_metadata",
     "clear_indexer_caches",
     "extend_logits",
@@ -28,8 +53,11 @@ __all__ = [
     "make_indexer_contract_phantoms",
     "paged_decode_logits",
     "persistent_topk2048_workspace_nbytes",
+    "plan_persistent_topk2048_scratch",
     "resolve_extend_prefill_block_k",
     "run_persistent_topk2048",
     "supports_persistent_topk2048",
     "uses_paged_mqa_schedule",
+    "plan_indexer_extend_scratch",
+    "plan_indexer_paged_scratch",
 ]

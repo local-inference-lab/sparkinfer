@@ -11,14 +11,23 @@ from .api import (
     uses_paged_mqa_schedule,
 )
 from .persistent_topk import (
+    B12XPersistentTopK2048Binding,
+    B12XPersistentTopK2048ScratchCaps,
+    B12XPersistentTopK2048ScratchPlan,
+    build_persistent_topk2048_binding,
     persistent_topk2048_workspace_nbytes,
+    plan_persistent_topk2048_scratch,
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
 
 __all__ = [
+    "B12XPersistentTopK2048Binding",
+    "B12XPersistentTopK2048ScratchCaps",
+    "B12XPersistentTopK2048ScratchPlan",
     "IndexerExtendMetadata",
     "IndexerPagedDecodeMetadata",
+    "build_persistent_topk2048_binding",
     "build_paged_mqa_schedule_metadata",
     "clear_indexer_caches",
     "extend_logits",
@@ -26,6 +35,7 @@ __all__ = [
     "make_indexer_contract_phantoms",
     "paged_decode_logits",
     "persistent_topk2048_workspace_nbytes",
+    "plan_persistent_topk2048_scratch",
     "resolve_extend_prefill_block_k",
     "run_persistent_topk2048",
     "supports_persistent_topk2048",

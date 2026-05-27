@@ -791,9 +791,11 @@ class B12XAttentionArena:
         max_paged_q_rows = max(int(caps.paged_max_q_rows), 1)
         paged_logits_q_rows = max(int(caps.paged_indexer_logits_q_rows), 1)
         max_kv_rows = max(int(caps.extend_max_kv_rows), 1)
-        indexer_k_rows = _align_up(
-            max(int(caps.indexer_max_k_rows or 0), 1),
-            _INDEXER_BLOCK_K,
+        raw_indexer_k_rows = max(int(caps.indexer_max_k_rows or 0), 0)
+        indexer_k_rows = (
+            0
+            if raw_indexer_k_rows == 0
+            else _align_up(raw_indexer_k_rows, _INDEXER_BLOCK_K)
         )
         default_mla_tmp_q_chunks = mla_max_total_q * int(caps.max_chunks_per_row)
         mla_tmp_q_chunks = (
@@ -1959,9 +1961,13 @@ class B12XAttentionWorkspace:
         indexer_q_rows = max(max_total_q, max_paged_q_rows)
         max_kv_rows = max(int(self.max_kv_rows), 1)
         indexer_k_rows = (
-            max(int(self.arena.indexer_k_rows), 1)
+            int(self.arena.indexer_k_rows)
             if self.arena is not None
-            else _align_up(max_kv_rows, _INDEXER_BLOCK_K)
+            else (
+                0
+                if int(self.max_kv_rows) <= 0
+                else _align_up(max_kv_rows, _INDEXER_BLOCK_K)
+            )
         )
         paged_width_tokens = (
             max(int(self.arena.paged_logits_width_tokens), 1)
@@ -2069,28 +2075,40 @@ class B12XAttentionWorkspace:
                 dtype=torch.int32,
             )
 
-        self.indexer_k_quant_bytes, extend_offset = _materialize_arena_view(
-            self.shared_arena,
-            offset_bytes=self.arena.indexer_k_quant_offset_bytes,
-            shape=(indexer_k_rows, _INDEX_HEAD_DIM),
-            dtype=torch.uint8,
-        )
-        self.indexer_k_scales, extend_offset = _materialize_arena_view(
-            self.shared_arena,
-            offset_bytes=self.arena.indexer_k_scale_offset_bytes,
-            shape=(indexer_k_rows,),
-            dtype=torch.float32,
-        )
-        self.indexer_k_tma_desc, self.indexer_k_tma_desc_ptrs = _encode_indexer_k_tma_descriptor(
-            self.indexer_k_quant_bytes,
-            block_k=_INDEXER_BLOCK_K,
-        )
-        self.indexer_k_tma_prefill_desc, self.indexer_k_tma_prefill_desc_ptrs = (
-            _encode_indexer_k_tma_descriptor(
+        if indexer_k_rows > 0:
+            self.indexer_k_quant_bytes, extend_offset = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_k_quant_offset_bytes,
+                shape=(indexer_k_rows, _INDEX_HEAD_DIM),
+                dtype=torch.uint8,
+            )
+            self.indexer_k_scales, extend_offset = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_k_scale_offset_bytes,
+                shape=(indexer_k_rows,),
+                dtype=torch.float32,
+            )
+            (
+                self.indexer_k_tma_desc,
+                self.indexer_k_tma_desc_ptrs,
+            ) = _encode_indexer_k_tma_descriptor(
+                self.indexer_k_quant_bytes,
+                block_k=_INDEXER_BLOCK_K,
+            )
+            (
+                self.indexer_k_tma_prefill_desc,
+                self.indexer_k_tma_prefill_desc_ptrs,
+            ) = _encode_indexer_k_tma_descriptor(
                 self.indexer_k_quant_bytes,
                 block_k=_INDEXER_PREFILL_BLOCK_K,
             )
-        )
+        else:
+            self.indexer_k_quant_bytes = None
+            self.indexer_k_scales = None
+            self.indexer_k_tma_desc = None
+            self.indexer_k_tma_desc_ptrs = None
+            self.indexer_k_tma_prefill_desc = None
+            self.indexer_k_tma_prefill_desc_ptrs = None
         if self.indexer_extend_logits_nbytes:
             self.indexer_extend_logits, _ = _materialize_arena_view(
                 self.shared_arena,
@@ -2258,8 +2276,8 @@ class B12XAttentionWorkspace:
             return
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
-        self.kv_chunk_size_ptr[0] = int(split_cfg.chunk_size)
-        self.num_chunks_ptr[0] = int(split_cfg.num_chunks)
+        self.kv_chunk_size_ptr.fill_(int(split_cfg.chunk_size))
+        self.num_chunks_ptr.fill_(int(split_cfg.num_chunks))
         self.kv_chunk_size_value = int(split_cfg.chunk_size)
         self.num_chunks_value = int(split_cfg.num_chunks)
 
@@ -2274,10 +2292,10 @@ class B12XAttentionWorkspace:
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
         if self.kv_chunk_size_value != int(kv_chunk_size):
-            self.kv_chunk_size_ptr[0] = int(kv_chunk_size)
+            self.kv_chunk_size_ptr.fill_(int(kv_chunk_size))
             self.kv_chunk_size_value = int(kv_chunk_size)
         if self.num_chunks_value != int(num_chunks):
-            self.num_chunks_ptr[0] = int(num_chunks)
+            self.num_chunks_ptr.fill_(int(num_chunks))
             self.num_chunks_value = int(num_chunks)
 
     def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
@@ -2489,6 +2507,112 @@ class B12XAttentionWorkspace:
         if self.paged_indexer_active_width_cap is None:
             raise RuntimeError("fixed-capacity workspace is missing paged indexer active-width cap")
         return self.paged_indexer_active_width_cap
+
+    def bind_compressed_mla(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lengths: torch.Tensor,
+        indexed_indices: torch.Tensor | None = None,
+        indexed_lengths: torch.Tensor | None = None,
+        indexed_page_table: torch.Tensor | None = None,
+    ):
+        from b12x.integration.compressed_scratch import build_compressed_mla_binding
+
+        return build_compressed_mla_binding(
+            workspace=self,
+            q=q,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_lengths,
+            indexed_page_table=indexed_page_table,
+        )
+
+    def bind_sparse_mla(
+        self,
+        *,
+        q: torch.Tensor,
+        selected_indices: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ):
+        from b12x.integration.sparse_mla_scratch import build_sparse_mla_binding
+
+        return build_sparse_mla_binding(
+            workspace=self,
+            q=q,
+            selected_indices=selected_indices,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        )
+
+    def bind_compressed_indexer(
+        self,
+        *,
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
+        expected_num_q_heads: int | None = None,
+        shared_page_table: bool = False,
+    ):
+        from b12x.integration.compressed_scratch import build_compressed_indexer_binding
+
+        return build_compressed_indexer_binding(
+            workspace=self,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            schedule_metadata=schedule_metadata,
+            expected_num_q_heads=expected_num_q_heads,
+            shared_page_table=shared_page_table,
+        )
+
+    def bind_indexer_paged_decode(
+        self,
+        *,
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        paged_mqa_schedule_metadata: torch.Tensor | None = None,
+    ):
+        from b12x.integration.indexer_scratch import build_indexer_paged_binding
+
+        return build_indexer_paged_binding(
+            workspace=self,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+        )
+
+    def bind_indexer_extend(
+        self,
+        *,
+        k_start: torch.Tensor,
+        k_end: torch.Tensor,
+        gather_rows: int | None = None,
+        topk: int | None = None,
+        include_topk_buffers: bool = True,
+        include_candidate_buffers: bool = True,
+        include_lengths: bool = True,
+        include_merge_positions: bool = True,
+    ):
+        from b12x.integration.indexer_scratch import build_indexer_extend_binding
+
+        return build_indexer_extend_binding(
+            workspace=self,
+            k_start=k_start,
+            k_end=k_end,
+            gather_rows=gather_rows,
+            topk=self.indexer_topk if topk is None else topk,
+            include_topk_buffers=include_topk_buffers,
+            include_candidate_buffers=include_candidate_buffers,
+            include_lengths=include_lengths,
+            include_merge_positions=include_merge_positions,
+        )
 
     def get_paged_indexer_persistent_ctas(self) -> int:
         return _resolve_paged_indexer_persistent_ctas(

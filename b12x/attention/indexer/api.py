@@ -310,13 +310,35 @@ def paged_decode_logits(
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
-    metadata: IndexerPagedDecodeMetadata,
+    metadata: IndexerPagedDecodeMetadata | None = None,
     page_size: int = 64,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     preinitialize_invalid_logits: bool = True,
     active_width_override: torch.Tensor | None = None,
+    binding=None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("workspace", workspace),
+                ("active_width_override", active_width_override),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "paged indexer binding owns metadata, workspace, and active width; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        workspace = binding.workspace
+        active_width_override = binding.active_width
+    if metadata is None:
+        raise TypeError("paged_decode_logits requires metadata or binding")
+
     weights_f = _validate_paged_decode_inputs(
         q_fp8=q_fp8,
         weights=weights,
@@ -457,12 +479,35 @@ def extend_logits(
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: IndexerExtendMetadata,
+    metadata: IndexerExtendMetadata | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     preinitialize_invalid_logits: bool = True,
     tile_logits: torch.Tensor | None = None,
+    binding=None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("tile_logits", tile_logits),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "indexer extend binding owns metadata, contract phantoms, workspace, "
+                f"and tile logits; do not also pass {', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        tile_logits = binding.tile_logits
+    if metadata is None:
+        raise TypeError("extend_logits requires metadata or binding")
     k_start = metadata.k_start
     k_end = metadata.k_end
     if q_fp8.ndim != 3:
@@ -569,8 +614,8 @@ def extend_tiled_topk(
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: IndexerExtendMetadata,
-    topk: int,
+    metadata: IndexerExtendMetadata | None = None,
+    topk: int | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     tile_logits: torch.Tensor | None = None,
@@ -581,9 +626,56 @@ def extend_tiled_topk(
     candidate_indices: torch.Tensor | None = None,
     merge_positions: torch.Tensor | None = None,
     supertile_k: int | None = None,
+    binding=None,
 ) -> torch.Tensor:
     """Run the prefill NSA scorer in K-supertiles and consume each tile with tiled topk."""
 
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("tile_logits", tile_logits),
+                ("lengths", lengths),
+                ("output_values", output_values),
+                ("output_indices", output_indices),
+                ("candidate_values", candidate_values),
+                ("candidate_indices", candidate_indices),
+                ("merge_positions", merge_positions),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "indexer extend binding owns metadata, contract phantoms, workspace, "
+                "and top-k scratch buffers; do not also pass "
+                f"{', '.join(extras)}"
+            )
+        if topk is None:
+            topk = binding.topk
+        elif binding.topk is not None and int(topk) != int(binding.topk):
+            raise ValueError(
+                f"topk {int(topk)} does not match bound topk {int(binding.topk)}"
+            )
+        metadata = binding.metadata
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        tile_logits = binding.tile_logits
+        lengths = binding.lengths
+        output_values = binding.output_values
+        output_indices = binding.output_indices
+        candidate_values = binding.candidate_values
+        candidate_indices = binding.candidate_indices
+        merge_positions = binding.merge_positions
+    if metadata is None:
+        raise TypeError("extend_tiled_topk requires metadata or binding")
+    if topk is None:
+        raise TypeError("extend_tiled_topk requires topk or a binding with topk")
+    topk = int(topk)
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
     k_start = metadata.k_start
     k_end = metadata.k_end
     if q_fp8.ndim != 3:

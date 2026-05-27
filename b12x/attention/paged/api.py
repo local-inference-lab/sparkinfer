@@ -380,17 +380,99 @@ def _build_merge_kernel(
     )
 
 
-def paged_attention_forward(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+def _resolve_paged_attention_binding(
     *,
-    workspace: PagedAttentionWorkspace,
-    output: torch.Tensor,
+    binding,
+    q: torch.Tensor | None,
+    k_cache: torch.Tensor | None,
+    v_cache: torch.Tensor | None,
+    workspace: PagedAttentionWorkspace | None,
+    output: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    attention_sink_bias: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    PagedAttentionWorkspace,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    if binding is None:
+        missing = [
+            name
+            for name, value in (
+                ("q", q),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
+                ("workspace", workspace),
+                ("output", output),
+            )
+            if value is None
+        ]
+        if missing:
+            raise TypeError(f"missing required paged attention arguments: {', '.join(missing)}")
+        return q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias
+
+    extras = [
+        name
+        for name, value in (
+            ("q", q),
+            ("k_cache", k_cache),
+            ("v_cache", v_cache),
+            ("workspace", workspace),
+            ("output", output),
+            ("k_descale", k_descale),
+            ("v_descale", v_descale),
+            ("attention_sink_bias", attention_sink_bias),
+        )
+        if value is not None
+    ]
+    if extras:
+        raise ValueError(
+            "paged attention binding owns runtime tensors and workspace; "
+            f"do not also pass {', '.join(extras)}"
+        )
+    return (
+        binding.q,
+        binding.k_cache,
+        binding.v_cache,
+        binding.workspace,
+        binding.output,
+        binding.k_descale,
+        binding.v_descale,
+        binding.attention_sink_bias,
+    )
+
+
+def paged_attention_forward(
+    q: torch.Tensor | None = None,
+    k_cache: torch.Tensor | None = None,
+    v_cache: torch.Tensor | None = None,
+    *,
+    workspace: PagedAttentionWorkspace | None = None,
+    output: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    binding=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias = (
+        _resolve_paged_attention_binding(
+            binding=binding,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            workspace=workspace,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
+    )
     plan = workspace.plan
     page_table = workspace.page_table
     cache_seqlens = workspace.cache_seqlens

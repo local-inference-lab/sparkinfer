@@ -264,19 +264,21 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     calls: dict[str, int | bool] = {}
 
     def fake_forward(**kwargs) -> None:
-        calls["launch_num_chunks"] = int(kwargs["launch_num_chunks"])
-        calls["direct_output"] = bool(kwargs["direct_output"])
-        calls["swa_cache_is_u8"] = kwargs["swa_k_cache"].dtype == torch.uint8
-        assert kwargs["q_all"].shape[0] == contract_rows
-        assert kwargs["swa_indices"].shape[0] == contract_rows
-        assert kwargs["swa_lengths"].shape == (contract_rows,)
-        assert kwargs["indexed_indices"].shape == (contract_rows, live_width)
-        assert kwargs["indexed_lengths"].shape == (contract_rows,)
-        assert kwargs["indexed_page_table"].shape == (contract_rows, page_table_width)
+        binding = kwargs["binding"]
+        calls["launch_num_chunks"] = int(binding.launch_num_chunks)
+        calls["direct_output"] = bool(binding.direct_output)
+        calls["swa_cache_is_u8"] = binding.swa_k_cache.dtype == torch.uint8
+        assert binding.q_all.shape[0] == contract_rows
+        assert binding.swa_indices.shape[0] == contract_rows
+        assert binding.swa_lengths.shape == (contract_rows,)
+        assert binding.indexed_indices.shape == (contract_rows, live_width)
+        assert binding.indexed_lengths.shape == (contract_rows,)
+        assert binding.indexed_page_table.shape == (contract_rows, page_table_width)
 
     def fake_merge(**kwargs) -> None:
-        assert kwargs["output"].shape[0] == contract_rows
-        kwargs["output"].zero_()
+        binding = kwargs["binding"]
+        assert binding.output.shape[0] == contract_rows
+        binding.output.zero_()
         calls["merge"] = True
 
     monkeypatch.setattr(

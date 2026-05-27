@@ -13,6 +13,12 @@ from b12x.attention.paged.workspace import (
     PagedAttentionWorkspace,
     PagedAttentionWorkspaceContract,
 )
+from b12x.integration.paged_attention_scratch import (
+    B12XPagedAttentionBinding,
+    B12XPagedAttentionScratchCaps,
+    B12XPagedAttentionScratchPlan,
+    plan_paged_attention_scratch,
+)
 
 
 def clear_attention_caches() -> None:
@@ -20,6 +26,9 @@ def clear_attention_caches() -> None:
 
 
 __all__ = [
+    "B12XPagedAttentionBinding",
+    "B12XPagedAttentionScratchCaps",
+    "B12XPagedAttentionScratchPlan",
     "PagedAttentionArena",
     "PagedAttentionArenaCaps",
     "PagedAttentionWorkspace",
@@ -28,4 +37,5 @@ __all__ = [
     "create_paged_plan",
     "infer_paged_mode",
     "paged_attention_forward",
+    "plan_paged_attention_scratch",
 ]

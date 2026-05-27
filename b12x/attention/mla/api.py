@@ -171,7 +171,7 @@ def _get_mla_output_view(
 
 def _validate_split_control_tensors(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
 ) -> None:
     for name, tensor in (
         ("kv_chunk_size_ptr", workspace.kv_chunk_size_ptr),
@@ -247,21 +247,98 @@ def _validate_split_workspace_views(
         )
 
 
+def _resolve_sparse_mla_binding(
+    *,
+    binding,
+    q_all: torch.Tensor | None,
+    selected_indices: torch.Tensor | None,
+    cache_seqlens_int32: torch.Tensor | None,
+    nsa_cache_seqlens_int32: torch.Tensor | None,
+    workspace: B12XAttentionWorkspace | None,
+    selected_name: str,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    B12XAttentionWorkspace,
+]:
+    if binding is None:
+        missing = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                (selected_name, selected_indices),
+                ("cache_seqlens_int32", cache_seqlens_int32),
+                ("nsa_cache_seqlens_int32", nsa_cache_seqlens_int32),
+                ("workspace", workspace),
+            )
+            if value is None
+        ]
+        if missing:
+            raise TypeError(f"missing required sparse MLA arguments: {', '.join(missing)}")
+        return (
+            q_all,
+            selected_indices,
+            cache_seqlens_int32,
+            nsa_cache_seqlens_int32,
+            workspace,
+        )
+
+    extras = [
+        name
+        for name, value in (
+            ("q_all", q_all),
+            (selected_name, selected_indices),
+            ("cache_seqlens_int32", cache_seqlens_int32),
+            ("nsa_cache_seqlens_int32", nsa_cache_seqlens_int32),
+            ("workspace", workspace),
+        )
+        if value is not None
+    ]
+    if extras:
+        raise ValueError(
+            "sparse MLA binding owns runtime tensors and workspace; "
+            f"do not also pass {', '.join(extras)}"
+        )
+    return (
+        binding.q,
+        binding.selected_indices,
+        binding.cache_seqlens_int32,
+        binding.nsa_cache_seqlens_int32,
+        binding.workspace,
+    )
+
+
 def sparse_mla_decode_forward(
     *,
-    q_all: torch.Tensor,
+    q_all: torch.Tensor | None = None,
     kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    cache_seqlens_int32: torch.Tensor,
-    nsa_cache_seqlens_int32: torch.Tensor,
-    workspace: B12XAttentionWorkspace,
+    page_table_1: torch.Tensor | None = None,
+    cache_seqlens_int32: torch.Tensor | None = None,
+    nsa_cache_seqlens_int32: torch.Tensor | None = None,
+    workspace: B12XAttentionWorkspace | None = None,
+    binding=None,
     sm_scale: float,
-    v_head_dim: int,
+    v_head_dim: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     attn_sink: torch.Tensor | None = None,
     identity_page_table: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
+        _resolve_sparse_mla_binding(
+            binding=binding,
+            q_all=q_all,
+            selected_indices=page_table_1,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            workspace=workspace,
+            selected_name="page_table_1",
+        )
+    )
+    if v_head_dim is None:
+        v_head_dim = workspace.v_head_dim
     return _run_sparse_mla(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -280,18 +357,32 @@ def sparse_mla_decode_forward(
 
 def sparse_mla_extend_forward(
     *,
-    q_all: torch.Tensor,
+    q_all: torch.Tensor | None = None,
     kv_cache: torch.Tensor,
-    selected_token_offsets: torch.Tensor,
-    cache_seqlens_int32: torch.Tensor,
-    nsa_cache_seqlens_int32: torch.Tensor,
-    workspace: B12XAttentionWorkspace,
+    selected_token_offsets: torch.Tensor | None = None,
+    cache_seqlens_int32: torch.Tensor | None = None,
+    nsa_cache_seqlens_int32: torch.Tensor | None = None,
+    workspace: B12XAttentionWorkspace | None = None,
+    binding=None,
     sm_scale: float,
-    v_head_dim: int,
+    v_head_dim: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     identity_page_table: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    q_all, selected_token_offsets, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
+        _resolve_sparse_mla_binding(
+            binding=binding,
+            q_all=q_all,
+            selected_indices=selected_token_offsets,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            workspace=workspace,
+            selected_name="selected_token_offsets",
+        )
+    )
+    if v_head_dim is None:
+        v_head_dim = workspace.v_head_dim
     return _run_sparse_mla(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -602,7 +693,7 @@ def _run_sparse_mla(
 
 def _final_lse_from_split_workspace(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     q_rows: int,
     num_heads: int,
     launch_num_chunks: int,
@@ -657,7 +748,7 @@ def _final_lse_from_split_workspace(
 
 def _get_sm_scale_tensor(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     device: torch.device,
     sm_scale: float,
 ) -> torch.Tensor:
@@ -672,6 +763,6 @@ def _get_sm_scale_tensor(
         workspace.sm_scale_value = None
     sm_scale_value = float(sm_scale)
     if workspace.sm_scale_value != sm_scale_value:
-        sm_scale_tensor[0] = sm_scale_value
+        sm_scale_tensor.fill_(sm_scale_value)
         workspace.sm_scale_value = sm_scale_value
     return sm_scale_tensor
