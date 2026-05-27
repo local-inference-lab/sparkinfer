@@ -224,10 +224,6 @@ def _require_sm120() -> torch.device | None:
         print("SKIP: CUDA is not available")
         return None
     device = torch.device("cuda")
-    major, minor = torch.cuda.get_device_capability(device)
-    if major != 12 or minor not in (0, 1):
-        print(f"SKIP: SM120 or SM121 required, got sm_{major}{minor}")
-        return None
     return device
 
 

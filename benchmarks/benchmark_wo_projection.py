@@ -83,9 +83,6 @@ def make_l2_flush_fn(*, bytes_hint: int = 0) -> Callable[[], None]:
 def require_sm120() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
 
 
 def bench_events(

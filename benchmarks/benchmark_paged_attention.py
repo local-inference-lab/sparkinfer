@@ -28,9 +28,8 @@ from b12x.attention.paged.planner import (
 
 
 def require_sm120() -> None:
-    major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (12, 0):
-        raise RuntimeError(f"Requires sm_120, got sm_{major}{minor}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
 
 
 def _capture_graph(fn: Callable[[], None], *, warmup: int) -> torch.cuda.CUDAGraph:

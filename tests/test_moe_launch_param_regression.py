@@ -19,9 +19,6 @@ from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec
 def _skip_if_no_sm120() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        pytest.skip(f"Requires SM120 or SM121, got sm_{major}{minor}")
 
 
 def _skip_if_unavailable() -> None:

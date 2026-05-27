@@ -19,9 +19,6 @@ _L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 def require_sm120() -> torch.device:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required to run b12x benchmarks")
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        raise SystemExit(f"SM120 or SM121 is required to run b12x benchmarks, got sm_{major}{minor}")
     return torch.device("cuda")
 
 

@@ -481,9 +481,8 @@ def main():
     )
     args = parser.parse_args()
 
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
     torch.empty(1, device="cuda")
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0

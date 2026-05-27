@@ -33,9 +33,6 @@ from benchmarks.benchmark_moe import (
 def _skip_if_unavailable() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        pytest.skip(f"Requires SM120 or SM121, got sm_{major}{minor}")
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
 

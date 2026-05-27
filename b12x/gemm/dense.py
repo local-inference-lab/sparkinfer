@@ -1545,9 +1545,6 @@ class _DenseGemmLaunch:
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
 
-        if sm_version != "sm_120":
-            raise ValueError(f"dense_gemm launch only supports sm_120, got {sm_version}")
-
         if not DenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
