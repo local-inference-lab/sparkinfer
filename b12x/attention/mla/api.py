@@ -62,6 +62,26 @@ def _is_cuda_graph_capture_active(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
+def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
+    if tensor.numel() == 0:
+        return
+    min_offset = int(tensor.storage_offset())
+    max_offset = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        extent = (int(size) - 1) * int(stride)
+        if extent >= 0:
+            max_offset += extent
+        else:
+            min_offset += extent
+    storage_elems = tensor.untyped_storage().nbytes() // tensor.element_size()
+    if min_offset < 0 or max_offset >= storage_elems:
+        raise ValueError(
+            f"{name} view is out of storage bounds: shape={tuple(tensor.shape)} "
+            f"stride={tuple(tensor.stride())} storage_offset={int(tensor.storage_offset())} "
+            f"storage_elems={storage_elems}"
+        )
+
+
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -145,7 +165,86 @@ def _get_mla_output_view(
             "workspace MLA output buffer is too small: "
             f"buffer={tuple(output_buffer.shape)} required=({rows}, {heads}, {v_head_dim})"
         )
+    _validate_tensor_storage_bounds(output_buffer, name="workspace MLA output buffer")
     return output_buffer[:rows, :heads, :v_head_dim]
+
+
+def _validate_split_control_tensors(
+    *,
+    workspace: B12XAttentionWorkspace,
+) -> None:
+    for name, tensor in (
+        ("kv_chunk_size_ptr", workspace.kv_chunk_size_ptr),
+        ("num_chunks_ptr", workspace.num_chunks_ptr),
+    ):
+        if tensor is None:
+            raise RuntimeError(f"workspace is missing {name}")
+        if tensor.shape != (1,):
+            raise ValueError(f"{name} must have shape (1,), got {tuple(tensor.shape)}")
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tensor.device != workspace.device:
+            raise ValueError(
+                f"{name} device {tensor.device} does not match workspace device {workspace.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+
+def _validate_split_workspace_views(
+    *,
+    workspace: B12XAttentionWorkspace,
+    q_rows: int,
+    num_heads: int,
+    v_head_dim: int,
+    launch_num_chunks: int,
+) -> None:
+    _validate_split_control_tensors(workspace=workspace)
+    if workspace.tmp_output is None or workspace.tmp_lse is None:
+        raise RuntimeError("workspace is missing split MLA buffers")
+
+    q_rows = int(q_rows)
+    num_heads = int(num_heads)
+    v_head_dim = int(v_head_dim)
+    launch_num_chunks = int(launch_num_chunks)
+    tmp_output = workspace.tmp_output
+    tmp_lse = workspace.tmp_lse
+
+    if tmp_output.device != workspace.device or tmp_lse.device != workspace.device:
+        raise ValueError("split MLA scratch buffers must be on the workspace device")
+    if tmp_output.dtype != workspace.dtype:
+        raise TypeError(
+            f"split MLA tmp_output dtype {tmp_output.dtype} does not match workspace dtype {workspace.dtype}"
+        )
+    if tmp_lse.dtype != torch.float32:
+        raise TypeError(f"split MLA tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}")
+    if tmp_output.ndim != 4:
+        raise ValueError(f"split MLA tmp_output must be rank-4, got {tuple(tmp_output.shape)}")
+    if tmp_lse.ndim != 3:
+        raise ValueError(f"split MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}")
+    _validate_tensor_storage_bounds(tmp_output, name="split MLA tmp_output")
+    _validate_tensor_storage_bounds(tmp_lse, name="split MLA tmp_lse")
+    required_output = (q_rows, num_heads, launch_num_chunks, v_head_dim)
+    if (
+        int(tmp_output.shape[0]) < q_rows
+        or int(tmp_output.shape[1]) < num_heads
+        or int(tmp_output.shape[2]) < launch_num_chunks
+        or int(tmp_output.shape[3]) < v_head_dim
+    ):
+        raise ValueError(
+            "split MLA tmp_output is too small: "
+            f"buffer={tuple(tmp_output.shape)} required>={required_output}"
+        )
+    required_lse = (q_rows, num_heads, launch_num_chunks)
+    if (
+        int(tmp_lse.shape[0]) < q_rows
+        or int(tmp_lse.shape[1]) < num_heads
+        or int(tmp_lse.shape[2]) < launch_num_chunks
+    ):
+        raise ValueError(
+            "split MLA tmp_lse is too small: "
+            f"buffer={tuple(tmp_lse.shape)} required>={required_lse}"
+        )
 
 
 def sparse_mla_decode_forward(
@@ -241,6 +340,16 @@ def _run_sparse_mla(
             "nsa_cache_seqlens_int32 must be rank-1, "
             f"got {tuple(active_token_counts.shape)}"
         )
+    if not q_all.is_contiguous():
+        raise ValueError("q_all must be contiguous for sparse MLA")
+    if not kv_cache.is_contiguous():
+        raise ValueError("kv_cache must be contiguous for sparse MLA")
+    if not selected_indices.is_contiguous():
+        raise ValueError("selected indices must be contiguous for sparse MLA")
+    if not cache_seqlens_int32.is_contiguous():
+        raise ValueError("cache_seqlens_int32 must be contiguous for sparse MLA")
+    if not active_token_counts.is_contiguous():
+        raise ValueError("nsa_cache_seqlens_int32 must be contiguous for sparse MLA")
     if q_all.device != workspace.device:
         raise ValueError(
             f"q_all device {q_all.device} does not match workspace device {workspace.device}"
@@ -337,7 +446,6 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
-
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale
     )
@@ -383,8 +491,6 @@ def _run_sparse_mla(
             topk_width=int(selected_indices.shape[1]),
         )
     if split_cfg is not None:
-        if workspace.tmp_output is None or workspace.tmp_lse is None:
-            raise RuntimeError("workspace is missing split MLA buffers")
         if not _is_cuda_graph_capture_active(q_all.device) or not (
             workspace.fixed_capacity or workspace.use_cuda_graph
         ):
@@ -396,6 +502,13 @@ def _run_sparse_mla(
             workspace.max_chunks_per_row
             if (workspace.fixed_capacity or workspace.use_cuda_graph)
             else split_cfg.num_chunks
+        )
+        _validate_split_workspace_views(
+            workspace=workspace,
+            q_rows=int(q_all.shape[0]),
+            num_heads=int(q_all.shape[1]),
+            v_head_dim=int(v_head_dim),
+            launch_num_chunks=int(launch_num_chunks),
         )
         output = _get_mla_output_view(
             workspace=workspace,
@@ -499,7 +612,31 @@ def _final_lse_from_split_workspace(
         raise RuntimeError("workspace is missing split MLA LSE buffer")
     if workspace.final_lse is None:
         raise RuntimeError("workspace is missing final MLA LSE buffer")
-    chunk_count = max(1, min(int(launch_num_chunks), int(workspace.tmp_lse.shape[-1])))
+    q_rows = int(q_rows)
+    num_heads = int(num_heads)
+    chunk_count = int(launch_num_chunks)
+    if chunk_count <= 0:
+        raise ValueError(f"launch_num_chunks must be positive, got {chunk_count}")
+    if workspace.tmp_lse.ndim != 3:
+        raise ValueError(f"workspace split MLA LSE buffer must be rank-3, got {tuple(workspace.tmp_lse.shape)}")
+    _validate_tensor_storage_bounds(workspace.tmp_lse, name="workspace split MLA LSE buffer")
+    if (
+        int(workspace.tmp_lse.shape[0]) < q_rows
+        or int(workspace.tmp_lse.shape[1]) < num_heads
+        or int(workspace.tmp_lse.shape[2]) < chunk_count
+    ):
+        raise ValueError(
+            "workspace split MLA LSE buffer is too small: "
+            f"buffer={tuple(workspace.tmp_lse.shape)} required>=({q_rows}, {num_heads}, {chunk_count})"
+        )
+    if workspace.final_lse.ndim != 2:
+        raise ValueError(f"workspace final MLA LSE buffer must be rank-2, got {tuple(workspace.final_lse.shape)}")
+    _validate_tensor_storage_bounds(workspace.final_lse, name="workspace final MLA LSE buffer")
+    if int(workspace.final_lse.shape[0]) < q_rows or int(workspace.final_lse.shape[1]) < num_heads:
+        raise ValueError(
+            "workspace final MLA LSE buffer is too small: "
+            f"buffer={tuple(workspace.final_lse.shape)} required>=({q_rows}, {num_heads})"
+        )
     final_lse = workspace.final_lse[:q_rows, :num_heads]
     if final_lse.dtype != torch.float32:
         raise TypeError(

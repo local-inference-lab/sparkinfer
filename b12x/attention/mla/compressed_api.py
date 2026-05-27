@@ -11,10 +11,12 @@ from .api import (
     _final_lse_from_split_workspace,
     _get_mla_output_view,
     _get_sm_scale_tensor,
+    _validate_split_control_tensors,
+    _validate_tensor_storage_bounds,
 )
 from .compressed_reference import (
+    COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
-    COMPRESSED_MLA_SWA_PAGE_SIZE,
     compressed_mla_page_nbytes,
 )
 from .split import (
@@ -101,7 +103,7 @@ def compressed_mla_decode_forward(
     swa_topk_lengths: torch.Tensor,
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
-    swa_page_size: int = COMPRESSED_MLA_SWA_PAGE_SIZE,
+    swa_page_size: int = COMPRESSED_MLA_DSV4_PAGE_SIZE,
     indexed_k_cache: torch.Tensor | None = None,
     indexed_indices: torch.Tensor | None = None,
     indexed_topk_lengths: torch.Tensor | None = None,
@@ -121,6 +123,11 @@ def compressed_mla_decode_forward(
     rows, heads, _ = q3.shape
     live_rows = rows
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
+    _validate_compressed_cache_layout(
+        swa_k_cache,
+        page_size=swa_page_size,
+        name="swa_k_cache",
+    )
     if expected_num_q_heads is not None and heads != int(expected_num_q_heads):
         raise ValueError(
             f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
@@ -138,9 +145,17 @@ def compressed_mla_decode_forward(
             raise ValueError("attn_sink must be contiguous")
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
+    if swa_indices_2d.device != q3.device:
+        raise ValueError("swa_indices must be on the same device as q_all")
     if swa_indices_2d.shape[0] != rows:
         raise ValueError("swa_indices row count must match q_all")
-    _validate_lengths(swa_topk_lengths, rows=rows, name="swa_topk_lengths")
+    _validate_lengths(
+        swa_topk_lengths,
+        rows=rows,
+        name="swa_topk_lengths",
+    )
+    if swa_topk_lengths.device != q3.device:
+        raise ValueError("swa_topk_lengths must be on the same device as q_all")
 
     has_indexed = indexed_k_cache is not None or indexed_indices is not None or indexed_topk_lengths is not None
     if has_indexed:
@@ -149,12 +164,27 @@ def compressed_mla_decode_forward(
         if indexed_page_size is None:
             raise ValueError("indexed_page_size is required when indexed_k_cache is provided")
         indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
+        _validate_compressed_cache_layout(
+            indexed_k_cache,
+            page_size=int(indexed_page_size),
+            name="indexed_k_cache",
+        )
         indexed_indices_2d = _normalize_index_matrix(indexed_indices, name="indexed_indices")
+        if indexed_indices_2d.device != q3.device:
+            raise ValueError("indexed_indices must be on the same device as q_all")
         if indexed_indices_2d.shape[0] != rows:
             raise ValueError("indexed_indices row count must match q_all")
-        _validate_lengths(indexed_topk_lengths, rows=rows, name="indexed_topk_lengths")
+        _validate_lengths(
+            indexed_topk_lengths,
+            rows=rows,
+            name="indexed_topk_lengths",
+        )
+        if indexed_topk_lengths.device != q3.device:
+            raise ValueError("indexed_topk_lengths must be on the same device as q_all")
         if indexed_page_table is not None:
             indexed_page_table_2d = _normalize_index_matrix(indexed_page_table, name="indexed_page_table")
+            if indexed_page_table_2d.device != q3.device:
+                raise ValueError("indexed_page_table must be on the same device as q_all")
             if indexed_page_table_2d.shape[0] != rows:
                 raise ValueError("indexed_page_table row count must match q_all")
         else:
@@ -198,8 +228,7 @@ def compressed_mla_decode_forward(
     )
     if workspace.tmp_output is None or workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA buffers")
-    if workspace.kv_chunk_size_ptr is None or workspace.num_chunks_ptr is None:
-        raise RuntimeError("workspace is missing split MLA chunk metadata")
+    _validate_split_control_tensors(workspace=workspace)
 
     graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
     if graph_stable_split:
@@ -268,11 +297,22 @@ def compressed_mla_decode_forward(
         )
         if workspace.output_buffer is None:
             raise RuntimeError("fixed compressed MLA workspace is missing output buffer")
+        if (
+            workspace.output_buffer.ndim != 3
+            or int(workspace.output_buffer.shape[0]) < int(workspace.max_total_q)
+            or int(workspace.output_buffer.shape[1]) < heads
+            or int(workspace.output_buffer.shape[2]) < COMPRESSED_MLA_HEAD_DIM
+        ):
+            raise ValueError(
+                "fixed compressed MLA output buffer is too small: "
+                f"buffer={tuple(workspace.output_buffer.shape)} required>="
+                f"({int(workspace.max_total_q)}, {heads}, {COMPRESSED_MLA_HEAD_DIM})"
+            )
         output_kernel = workspace.output_buffer[
             : workspace.max_total_q,
             :heads,
             :COMPRESSED_MLA_HEAD_DIM,
-        ]
+    ]
     fused_sink_output = attn_sink is not None and not return_lse
     needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
     direct_single_chunk_output = (
@@ -280,10 +320,21 @@ def compressed_mla_decode_forward(
         and attn_sink is None
         and not needs_lse
     )
+    direct_sink_output = False
+    single_tile_chunks = split_cfg.chunk_size <= 64
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace,
         device=q3.device,
         sm_scale=sm_scale,
+    )
+    launch_chunks_for_kernel = 1 if direct_single_chunk_output else int(launch_num_chunks)
+    _validate_compressed_launch_views(
+        tmp_output=output_kernel if direct_single_chunk_output else workspace.tmp_output,
+        tmp_lse=workspace.tmp_lse,
+        q_rows=int(q_kernel.shape[0]),
+        heads=heads,
+        launch_num_chunks=launch_chunks_for_kernel,
+        direct_output=direct_single_chunk_output,
     )
     run_compressed_mla_split_decode_forward(
         q_all=q_kernel,
@@ -299,7 +350,7 @@ def compressed_mla_decode_forward(
         num_chunks_ptr=workspace.num_chunks_ptr,
         tmp_output=output_kernel if direct_single_chunk_output else workspace.tmp_output,
         tmp_lse=workspace.tmp_lse,
-        launch_num_chunks=1 if direct_single_chunk_output else launch_num_chunks,
+        launch_num_chunks=launch_chunks_for_kernel,
         swa_page_size=int(swa_page_size),
         swa_page_nbytes=compressed_mla_page_nbytes(int(swa_page_size)),
         indexed_page_size=indexed_page_size_for_kernel,
@@ -308,7 +359,9 @@ def compressed_mla_decode_forward(
         map_indexed_page_table=map_indexed_page_table,
         workspace=workspace,
         direct_output=direct_single_chunk_output,
-        single_tile_chunks=split_cfg.chunk_size <= 64,
+        single_tile_chunks=single_tile_chunks,
+        attn_sink=attn_sink,
+        direct_sink_output=direct_sink_output,
     )
 
     if direct_single_chunk_output:
@@ -395,6 +448,19 @@ def _stage_fixed_compressed_mla_inputs(
             f"got {tuple(q_stage.shape)}, expected "
             f"({cap_rows}, {int(workspace.num_q_heads)}, {COMPRESSED_MLA_HEAD_DIM})"
         )
+    for name, stage in (
+        ("swa_lengths", swa_lengths_stage),
+        ("indexed_lengths", indexed_lengths_stage),
+    ):
+        if stage.shape != (cap_rows,):
+            raise ValueError(
+                f"compressed MLA {name} staging buffer shape mismatch: "
+                f"got {tuple(stage.shape)}, expected ({cap_rows},)"
+            )
+        if stage.dtype != torch.int32:
+            raise TypeError(f"compressed MLA {name} staging buffer must be int32, got {stage.dtype}")
+        if stage.device != q_all.device:
+            raise ValueError(f"compressed MLA {name} staging buffer must be on {q_all.device}")
     q_stage[:rows].copy_(q_all.detach())
 
     swa_indices_view = _stage_fixed_int_matrix(
@@ -468,6 +534,90 @@ def _normalize_compressed_q(q: torch.Tensor) -> torch.Tensor:
     return q.detach()
 
 
+def _validate_compressed_cache_layout(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    name: str,
+) -> None:
+    page_size = int(page_size)
+    if page_size <= 0:
+        raise ValueError(f"{name} page_size must be positive, got {page_size}")
+    expected_page_nbytes = compressed_mla_page_nbytes(page_size)
+    if int(cache.shape[1]) != expected_page_nbytes:
+        raise ValueError(
+            f"{name} page byte width must be {expected_page_nbytes} for page_size "
+            f"{page_size}, got {int(cache.shape[1])}"
+        )
+
+
+def _validate_compressed_launch_views(
+    *,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    q_rows: int,
+    heads: int,
+    launch_num_chunks: int,
+    direct_output: bool,
+) -> None:
+    if tmp_output is None or tmp_lse is None:
+        raise RuntimeError("compressed MLA launch is missing scratch/output buffers")
+    q_rows = int(q_rows)
+    heads = int(heads)
+    launch_num_chunks = int(launch_num_chunks)
+    if tmp_output.dtype != torch.bfloat16:
+        raise TypeError(f"compressed MLA tmp_output must be BF16, got {tmp_output.dtype}")
+    if tmp_lse.dtype != torch.float32:
+        raise TypeError(f"compressed MLA tmp_lse must be FP32, got {tmp_lse.dtype}")
+    if tmp_output.device != tmp_lse.device:
+        raise ValueError("compressed MLA tmp_output and tmp_lse must be on the same device")
+    _validate_tensor_storage_bounds(tmp_output, name="compressed MLA tmp_output")
+    _validate_tensor_storage_bounds(tmp_lse, name="compressed MLA tmp_lse")
+    if direct_output:
+        if tmp_output.ndim != 3:
+            raise ValueError(
+                f"compressed MLA direct output must be rank-3, got {tuple(tmp_output.shape)}"
+            )
+        required = (q_rows, heads, COMPRESSED_MLA_HEAD_DIM)
+        if (
+            int(tmp_output.shape[0]) < q_rows
+            or int(tmp_output.shape[1]) < heads
+            or int(tmp_output.shape[2]) < COMPRESSED_MLA_HEAD_DIM
+        ):
+            raise ValueError(
+                "compressed MLA direct output is too small: "
+                f"buffer={tuple(tmp_output.shape)} required>={required}"
+            )
+    else:
+        if tmp_output.ndim != 4:
+            raise ValueError(
+                f"compressed MLA split output must be rank-4, got {tuple(tmp_output.shape)}"
+            )
+        required = (q_rows, heads, launch_num_chunks, COMPRESSED_MLA_HEAD_DIM)
+        if (
+            int(tmp_output.shape[0]) < q_rows
+            or int(tmp_output.shape[1]) < heads
+            or int(tmp_output.shape[2]) < launch_num_chunks
+            or int(tmp_output.shape[3]) < COMPRESSED_MLA_HEAD_DIM
+        ):
+            raise ValueError(
+                "compressed MLA split output is too small: "
+                f"buffer={tuple(tmp_output.shape)} required>={required}"
+            )
+    if tmp_lse.ndim != 3:
+        raise ValueError(f"compressed MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}")
+    required_lse = (q_rows, heads, max(1, launch_num_chunks))
+    if (
+        int(tmp_lse.shape[0]) < q_rows
+        or int(tmp_lse.shape[1]) < heads
+        or int(tmp_lse.shape[2]) < max(1, launch_num_chunks)
+    ):
+        raise ValueError(
+            "compressed MLA tmp_lse is too small: "
+            f"buffer={tuple(tmp_lse.shape)} required>={required_lse}"
+        )
+
+
 def _normalize_index_matrix(indices: torch.Tensor, *, name: str) -> torch.Tensor:
     if indices.ndim == 3 and indices.shape[1] == 1:
         indices = indices[:, 0]
@@ -480,7 +630,12 @@ def _normalize_index_matrix(indices: torch.Tensor, *, name: str) -> torch.Tensor
     return indices
 
 
-def _validate_lengths(lengths: torch.Tensor, *, rows: int, name: str) -> None:
+def _validate_lengths(
+    lengths: torch.Tensor,
+    *,
+    rows: int,
+    name: str,
+) -> None:
     if lengths.shape != (rows,):
         raise ValueError(f"{name} must have shape [{rows}], got {tuple(lengths.shape)}")
     if lengths.dtype != torch.int32:

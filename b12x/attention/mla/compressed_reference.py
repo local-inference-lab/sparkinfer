@@ -32,9 +32,11 @@ COMPRESSED_MLA_UE8M0_BIAS = 127
 COMPRESSED_MLA_LOCAL_Q_HEADS_TP2 = 32
 COMPRESSED_MLA_TOTAL_Q_HEADS = 64
 COMPRESSED_MLA_KV_HEADS = 1
-COMPRESSED_MLA_SWA_PAGE_SIZE = 128
-COMPRESSED_MLA_C4_PAGE_SIZE = 64
-COMPRESSED_MLA_C128_PAGE_SIZE = 2
+# SGLang's DSV4 backend hard-codes a 256-token physical KV page. Keep that
+# distinct from the 128-token sliding SWA window.
+COMPRESSED_MLA_DSV4_PAGE_SIZE = 256
+COMPRESSED_MLA_C4_PAGE_SIZE = COMPRESSED_MLA_DSV4_PAGE_SIZE // 4
+COMPRESSED_MLA_C128_PAGE_SIZE = COMPRESSED_MLA_DSV4_PAGE_SIZE // 128
 COMPRESSED_MLA_SWA_TOKENS = 128
 COMPRESSED_MLA_INDEX_TOPK = 512
 
@@ -222,7 +224,7 @@ def compressed_sparse_mla_reference(
     extra_k_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_topk_lengths: torch.Tensor | None = None,
-    swa_page_size: int = COMPRESSED_MLA_SWA_PAGE_SIZE,
+    swa_page_size: int = COMPRESSED_MLA_DSV4_PAGE_SIZE,
     extra_page_size: int | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:

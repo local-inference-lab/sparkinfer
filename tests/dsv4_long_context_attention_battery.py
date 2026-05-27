@@ -20,11 +20,11 @@ import torch
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
+    COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_INDEX_TOPK,
     COMPRESSED_MLA_NOPE_DIM,
     COMPRESSED_MLA_ROPE_DIM,
-    COMPRESSED_MLA_SWA_PAGE_SIZE,
     COMPRESSED_MLA_SWA_TOKENS,
     compressed_mla_page_nbytes,
     compressed_sparse_mla_reference,
@@ -790,7 +790,7 @@ def run_compressed_mla_long_cases(args: argparse.Namespace, device: torch.device
     swa_width = COMPRESSED_MLA_SWA_TOKENS
     swa_cache = _make_compressed_mla_cache(
         tokens=swa_width + rows + 8,
-        page_size=COMPRESSED_MLA_SWA_PAGE_SIZE,
+        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
         seed=args.seed + 12,
         device=device,
     )
@@ -800,7 +800,7 @@ def run_compressed_mla_long_cases(args: argparse.Namespace, device: torch.device
     swa_lengths = torch.full((rows,), swa_width, dtype=torch.int32, device=device)
     empty_swa_cache = _make_compressed_mla_cache(
         tokens=1,
-        page_size=COMPRESSED_MLA_SWA_PAGE_SIZE,
+        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
         seed=args.seed + 113,
         device=device,
     )

@@ -24,6 +24,7 @@ from b12x.attention.workspace import (
 from b12x.cute.fp4 import shared_ptr_to_u32
 from b12x.cute.utils import current_cuda_stream
 
+from .compressed_reference import compressed_mla_page_nbytes
 from .kernel import (
     _COMPRESSED_MLA_HEAD_DIM,
     _MLA_GROUP_SIZE,
@@ -53,6 +54,46 @@ from .kernel import (
     get_sparse_mla_shared_storage_cls,
 )
 from .traits import SparseMLATraits, select_sparse_mla_traits
+
+
+def _is_cuda_graph_capture_active(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
+    if tensor.numel() == 0:
+        return
+    min_offset = int(tensor.storage_offset())
+    max_offset = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        extent = (int(size) - 1) * int(stride)
+        if extent >= 0:
+            max_offset += extent
+        else:
+            min_offset += extent
+    storage_elems = tensor.untyped_storage().nbytes() // tensor.element_size()
+    if min_offset < 0 or max_offset >= storage_elems:
+        raise ValueError(
+            f"{name} view is out of storage bounds: shape={tuple(tensor.shape)} "
+            f"stride={tuple(tensor.stride())} storage_offset={int(tensor.storage_offset())} "
+            f"storage_elems={storage_elems}"
+        )
+
+
+def _validate_split_control_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    device: torch.device,
+) -> None:
+    if tensor.shape != (1,):
+        raise ValueError(f"{name} must have shape (1,), got {tuple(tensor.shape)}")
+    if tensor.dtype != torch.int32:
+        raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
 
 
 def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -319,6 +360,7 @@ class CompressedMLASplitDecodeForwardKernel:
         map_indexed_page_table: bool,
         direct_output: bool = False,
         single_tile_chunks: bool = False,
+        direct_sink_output: bool = False,
     ):
         self.launch_num_chunks = int(launch_num_chunks)
         self.head_tiles = int(head_tiles)
@@ -331,6 +373,7 @@ class CompressedMLASplitDecodeForwardKernel:
         self.map_indexed_page_table = bool(map_indexed_page_table)
         self.direct_output = bool(direct_output)
         self.single_tile_chunks = bool(single_tile_chunks)
+        self.direct_sink_output = bool(direct_sink_output)
 
     @cute.jit
     def __call__(
@@ -348,6 +391,7 @@ class CompressedMLASplitDecodeForwardKernel:
         num_chunks_ptr: cute.Tensor,
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
+        attn_sink: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -364,6 +408,7 @@ class CompressedMLASplitDecodeForwardKernel:
             num_chunks_ptr,
             tmp_output,
             tmp_lse,
+            attn_sink,
         ).launch(
             grid=(
                 q_u32.shape[0],
@@ -390,6 +435,7 @@ class CompressedMLASplitDecodeForwardKernel:
         num_chunks_ptr: cute.Tensor,
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
+        attn_sink: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_tile_idx, chunk_idx = cute.arch.block_idx()
@@ -446,6 +492,8 @@ class CompressedMLASplitDecodeForwardKernel:
                     q_idx,
                     Int32(0),
                     None,
+                    attn_sink,
+                    self.direct_sink_output,
                     self.swa_page_size,
                     self.swa_page_nbytes,
                     self.indexed_page_size,
@@ -479,6 +527,8 @@ class CompressedMLASplitDecodeForwardKernel:
                     q_idx,
                     Int32(0),
                     None,
+                    attn_sink,
+                    self.direct_sink_output,
                     self.swa_page_size,
                     self.swa_page_nbytes,
                     self.indexed_page_size,
@@ -547,6 +597,8 @@ class CompressedMLASplitDecodeForwardKernel:
                         q_idx,
                         chunk_idx,
                         tmp_lse,
+                        attn_sink,
+                        False,
                         self.swa_page_size,
                         self.swa_page_nbytes,
                         self.indexed_page_size,
@@ -580,6 +632,8 @@ class CompressedMLASplitDecodeForwardKernel:
                         q_idx,
                         chunk_idx,
                         tmp_lse,
+                        attn_sink,
+                        False,
                         self.swa_page_size,
                         self.swa_page_nbytes,
                         self.indexed_page_size,
@@ -821,6 +875,7 @@ def _build_compressed_mla_split_forward_kernel(
     map_indexed_page_table: bool,
     direct_output: bool,
     single_tile_chunks: bool,
+    direct_sink_output: bool,
 ) -> CompressedMLASplitDecodeForwardKernel:
     return CompressedMLASplitDecodeForwardKernel(
         launch_num_chunks=launch_num_chunks,
@@ -834,6 +889,7 @@ def _build_compressed_mla_split_forward_kernel(
         map_indexed_page_table=map_indexed_page_table,
         direct_output=direct_output,
         single_tile_chunks=single_tile_chunks,
+        direct_sink_output=direct_sink_output,
     )
 
 
@@ -889,6 +945,22 @@ def run_sparse_mla_split_decode_forward(
             "active_token_counts must be rank-1 with one entry per query row, "
             f"got {tuple(active_token_counts.shape)} for q rows {q_all.shape[0]}"
         )
+    if not q_all.is_contiguous():
+        raise ValueError("q_all must be contiguous for sparse MLA split decode")
+    if not kv_cache.is_contiguous():
+        raise ValueError("kv_cache must be contiguous for sparse MLA split decode")
+    if page_table_1.device != q_all.device:
+        raise ValueError("page_table_1 must be on the same device as q_all")
+    if page_table_1.dtype != torch.int32:
+        raise TypeError(f"page_table_1 must have dtype torch.int32, got {page_table_1.dtype}")
+    if page_table_1.ndim != 2 or int(page_table_1.shape[0]) != int(q_all.shape[0]):
+        raise ValueError(
+            f"page_table_1 must have shape [{int(q_all.shape[0])}, width], got {tuple(page_table_1.shape)}"
+        )
+    if not page_table_1.is_contiguous():
+        raise ValueError("page_table_1 must be contiguous for sparse MLA split decode")
+    if not active_token_counts.is_contiguous():
+        raise ValueError("active_token_counts must be contiguous for sparse MLA split decode")
     if launch_num_chunks <= 0 or launch_num_chunks > _SPLIT_MAX_CHUNKS:
         raise ValueError(
             f"launch_num_chunks must be in [1, {_SPLIT_MAX_CHUNKS}], got {launch_num_chunks}"
@@ -899,6 +971,42 @@ def run_sparse_mla_split_decode_forward(
     q_u32 = _view_last_dim_as_u32(q_all)
     if sm_scale.shape != (1,) or sm_scale.dtype != torch.float32:
         raise ValueError("sm_scale tensor must have shape (1,) and dtype float32")
+    if sm_scale.device != q_all.device:
+        raise ValueError("sm_scale tensor must be on the same device as q_all")
+    _validate_split_control_tensor(
+        kv_chunk_size_ptr,
+        name="kv_chunk_size_ptr",
+        device=q_all.device,
+    )
+    _validate_split_control_tensor(
+        num_chunks_ptr,
+        name="num_chunks_ptr",
+        device=q_all.device,
+    )
+    if tmp_output.device != q_all.device or tmp_lse.device != q_all.device:
+        raise ValueError("split MLA scratch buffers must be on the same device as q_all")
+    if tmp_lse.dtype != torch.float32:
+        raise TypeError(f"tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}")
+    if tmp_output.ndim != 4:
+        raise ValueError(f"tmp_output must have shape [rows, heads, chunks, dim], got {tuple(tmp_output.shape)}")
+    if tmp_lse.ndim != 3:
+        raise ValueError(f"tmp_lse must have shape [rows, heads, chunks], got {tuple(tmp_lse.shape)}")
+    _validate_tensor_storage_bounds(tmp_output, name="split MLA tmp_output")
+    _validate_tensor_storage_bounds(tmp_lse, name="split MLA tmp_lse")
+    if (
+        int(tmp_output.shape[0]) < int(q_all.shape[0])
+        or int(tmp_output.shape[1]) < int(q_all.shape[1])
+        or int(tmp_output.shape[2]) < int(launch_num_chunks)
+        or int(tmp_lse.shape[0]) < int(q_all.shape[0])
+        or int(tmp_lse.shape[1]) < int(q_all.shape[1])
+        or int(tmp_lse.shape[2]) < int(launch_num_chunks)
+    ):
+        raise ValueError(
+            "split MLA scratch buffers are too small: "
+            f"tmp_output={tuple(tmp_output.shape)} tmp_lse={tuple(tmp_lse.shape)} "
+            f"required rows={int(q_all.shape[0])} heads={int(q_all.shape[1])} "
+            f"chunks={int(launch_num_chunks)}"
+        )
 
     forward_kernel = _build_sparse_mla_split_forward_kernel(
         traits,
@@ -969,6 +1077,8 @@ def run_compressed_mla_split_decode_forward(
     workspace: object | None = None,
     direct_output: bool = False,
     single_tile_chunks: bool = False,
+    attn_sink: torch.Tensor | None = None,
+    direct_sink_output: bool = False,
 ) -> None:
     if q_all.device.type != "cuda":
         raise ValueError("compressed MLA split decode requires CUDA q_all")
@@ -985,6 +1095,30 @@ def run_compressed_mla_split_decode_forward(
             raise ValueError(f"{name} must be on the same device as q_all")
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
+    if int(swa_page_size) <= 0 or int(indexed_page_size) <= 0:
+        raise ValueError(
+            f"compressed MLA page sizes must be positive, got swa={swa_page_size} indexed={indexed_page_size}"
+        )
+    expected_swa_nbytes = compressed_mla_page_nbytes(int(swa_page_size))
+    expected_indexed_nbytes = compressed_mla_page_nbytes(int(indexed_page_size))
+    if int(swa_page_nbytes) != expected_swa_nbytes:
+        raise ValueError(
+            f"swa_page_nbytes must be {expected_swa_nbytes} for page_size {int(swa_page_size)}, got {swa_page_nbytes}"
+        )
+    if int(indexed_page_nbytes) != expected_indexed_nbytes:
+        raise ValueError(
+            "indexed_page_nbytes must be "
+            f"{expected_indexed_nbytes} for page_size {int(indexed_page_size)}, got {indexed_page_nbytes}"
+        )
+    if int(swa_k_cache.shape[1]) != expected_swa_nbytes:
+        raise ValueError(
+            f"swa_k_cache page byte width must be {expected_swa_nbytes}, got {int(swa_k_cache.shape[1])}"
+        )
+    if int(indexed_k_cache.shape[1]) != expected_indexed_nbytes:
+        raise ValueError(
+            "indexed_k_cache page byte width must be "
+            f"{expected_indexed_nbytes}, got {int(indexed_k_cache.shape[1])}"
+        )
     rows = int(q_all.shape[0])
     for name, tensor in (
         ("swa_indices", swa_indices),
@@ -1018,12 +1152,74 @@ def run_compressed_mla_split_decode_forward(
         )
     if tmp_lse.ndim != 3:
         raise ValueError("tmp_lse must have shape [rows, heads, chunks]")
+    if tmp_output.device != q_all.device or tmp_lse.device != q_all.device:
+        raise ValueError("compressed MLA scratch/output buffers must be on the same device as q_all")
+    _validate_tensor_storage_bounds(tmp_output, name="compressed MLA tmp_output")
+    _validate_tensor_storage_bounds(tmp_lse, name="compressed MLA tmp_lse")
     if launch_num_chunks <= 0 or launch_num_chunks > _SPLIT_MAX_CHUNKS:
         raise ValueError(
             f"launch_num_chunks must be in [1, {_SPLIT_MAX_CHUNKS}], got {launch_num_chunks}"
         )
+    if direct_output:
+        if (
+            int(tmp_output.shape[0]) < rows
+            or int(tmp_output.shape[1]) < int(q_all.shape[1])
+            or int(tmp_output.shape[2]) < _COMPRESSED_MLA_HEAD_DIM
+        ):
+            raise ValueError(
+                "compressed MLA direct output is too small: "
+                f"buffer={tuple(tmp_output.shape)} required>=({rows}, {int(q_all.shape[1])}, {_COMPRESSED_MLA_HEAD_DIM})"
+            )
+    elif (
+        int(tmp_output.shape[0]) < rows
+        or int(tmp_output.shape[1]) < int(q_all.shape[1])
+        or int(tmp_output.shape[2]) < int(launch_num_chunks)
+        or int(tmp_output.shape[3]) < _COMPRESSED_MLA_HEAD_DIM
+    ):
+        raise ValueError(
+            "compressed MLA split output is too small: "
+            f"buffer={tuple(tmp_output.shape)} required>=({rows}, {int(q_all.shape[1])}, "
+            f"{int(launch_num_chunks)}, {_COMPRESSED_MLA_HEAD_DIM})"
+        )
+    if (
+        int(tmp_lse.shape[0]) < rows
+        or int(tmp_lse.shape[1]) < int(q_all.shape[1])
+        or int(tmp_lse.shape[2]) < int(launch_num_chunks)
+    ):
+        raise ValueError(
+            "compressed MLA tmp_lse is too small: "
+            f"buffer={tuple(tmp_lse.shape)} required>=({rows}, {int(q_all.shape[1])}, {int(launch_num_chunks)})"
+        )
     if sm_scale.shape != (1,) or sm_scale.dtype != torch.float32:
         raise ValueError("sm_scale tensor must have shape (1,) and dtype float32")
+    if sm_scale.device != q_all.device:
+        raise ValueError("sm_scale must be on the same device as q_all")
+    _validate_split_control_tensor(
+        kv_chunk_size_ptr,
+        name="kv_chunk_size_ptr",
+        device=q_all.device,
+    )
+    _validate_split_control_tensor(
+        num_chunks_ptr,
+        name="num_chunks_ptr",
+        device=q_all.device,
+    )
+    if direct_sink_output:
+        if not direct_output:
+            raise ValueError("direct_sink_output requires direct_output=True")
+        if attn_sink is None:
+            raise ValueError("direct_sink_output requires attn_sink")
+        if attn_sink.device != q_all.device:
+            raise ValueError("attn_sink must be on the same device as q_all")
+        if attn_sink.dtype != torch.float32:
+            raise TypeError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+        if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(tmp_output.shape[1]):
+            raise ValueError(
+                f"attn_sink must have shape ({int(tmp_output.shape[1])},), got {tuple(attn_sink.shape)}"
+            )
+        if not attn_sink.is_contiguous():
+            raise ValueError("attn_sink must be contiguous")
+    attn_sink_for_kernel = attn_sink if attn_sink is not None else sm_scale
 
     head_tiles = (int(tmp_output.shape[1]) + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
     q_u32 = _view_last_dim_as_u32(q_all)
@@ -1043,6 +1239,7 @@ def run_compressed_mla_split_decode_forward(
         bool(map_indexed_page_table),
         bool(direct_output),
         bool(single_tile_chunks),
+        bool(direct_sink_output),
     )
     forward_args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
@@ -1058,6 +1255,7 @@ def run_compressed_mla_split_decode_forward(
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(attn_sink_for_kernel, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
     _cq = getattr(workspace, "_contract_q", None)
@@ -1084,6 +1282,7 @@ def run_compressed_mla_split_decode_forward(
             else (_cto if _cto is not None else tmp_output)
         ),
         _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
+        _tensor_meta_key(attn_sink_for_kernel),
         int(launch_num_chunks),
         head_tiles,
         int(swa_page_size),
@@ -1096,6 +1295,7 @@ def run_compressed_mla_split_decode_forward(
         str(tmp_output.dtype),
         bool(direct_output),
         bool(single_tile_chunks),
+        bool(direct_sink_output),
     )
     _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
 
@@ -1109,6 +1309,41 @@ def run_sparse_mla_split_decode_merge(
     attn_sink: torch.Tensor | None = None,
     workspace: object | None = None,
 ) -> None:
+    if tmp_output.device != output.device or tmp_lse.device != output.device:
+        raise ValueError("split MLA merge tensors must be on the same device")
+    if tmp_lse.dtype != torch.float32:
+        raise TypeError(f"tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}")
+    if tmp_output.dtype != output.dtype:
+        raise TypeError(
+            f"tmp_output dtype {tmp_output.dtype} must match output dtype {output.dtype}"
+        )
+    if tmp_output.ndim != 4:
+        raise ValueError(f"tmp_output must have shape [rows, heads, chunks, dim], got {tuple(tmp_output.shape)}")
+    if tmp_lse.ndim != 3:
+        raise ValueError(f"tmp_lse must have shape [rows, heads, chunks], got {tuple(tmp_lse.shape)}")
+    if output.ndim != 3:
+        raise ValueError(f"output must have shape [rows, heads, dim], got {tuple(output.shape)}")
+    if (
+        int(tmp_output.shape[0]) < int(output.shape[0])
+        or int(tmp_output.shape[1]) < int(output.shape[1])
+        or int(tmp_output.shape[3]) < int(output.shape[2])
+        or int(tmp_lse.shape[0]) < int(output.shape[0])
+        or int(tmp_lse.shape[1]) < int(output.shape[1])
+        or int(tmp_lse.shape[2]) < int(tmp_output.shape[2])
+    ):
+        raise ValueError(
+            "split MLA merge scratch/output shapes are inconsistent: "
+            f"tmp_output={tuple(tmp_output.shape)} tmp_lse={tuple(tmp_lse.shape)} "
+            f"output={tuple(output.shape)}"
+        )
+    _validate_tensor_storage_bounds(tmp_output, name="split MLA merge tmp_output")
+    _validate_tensor_storage_bounds(tmp_lse, name="split MLA merge tmp_lse")
+    _validate_tensor_storage_bounds(output, name="split MLA merge output")
+    _validate_split_control_tensor(
+        num_chunks_ptr,
+        name="num_chunks_ptr",
+        device=output.device,
+    )
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     _co = getattr(workspace, "_contract_output", None)

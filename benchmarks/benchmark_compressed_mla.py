@@ -20,10 +20,10 @@ from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
+    COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_NOPE_DIM,
     COMPRESSED_MLA_ROPE_DIM,
-    COMPRESSED_MLA_SWA_PAGE_SIZE,
     COMPRESSED_MLA_SWA_TOKENS,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
@@ -442,7 +442,7 @@ def _benchmark_case(
     swa_tokens = max(case.swa_width, 1)
     swa_cache = _make_compressed_cache(
         tokens=swa_tokens,
-        page_size=COMPRESSED_MLA_SWA_PAGE_SIZE,
+        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
         seed=seed + 1,
         device=device,
     )

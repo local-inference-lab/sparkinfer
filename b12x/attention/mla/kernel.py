@@ -2607,6 +2607,56 @@ def _store_output_group(
 
 
 @cute.jit
+def _store_output_group_with_sink(
+    out_tensor: cute.Tensor,
+    o_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    attn_sink: cute.Tensor,
+    out_row_idx: Int32,
+    head_tile_start: Int32,
+    group_idx: Int32,
+    lane: Int32,
+):
+    lane_group = lane // Int32(4)
+    lane_pair_base = Int32(2) * (lane % Int32(4))
+    for row_slot in cutlass.range_constexpr(2):
+        head_local = lane_group + Int32(8) * row_slot
+        head_idx = head_tile_start + head_local
+        if head_idx < Int32(out_tensor.shape[1]):
+            reg_base = row_slot * 2
+            row_m = Float32(m_frag[0, row_slot])
+            sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
+            new_m = attention_ops.fmax(row_m, sink_m)
+            prev_scale = (
+                Float32(0.0)
+                if row_m == -Float32.inf
+                else _exp2_approx_ftz_f32(row_m - new_m)
+            )
+            sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
+            denom = Float32(d_frag[0, row_slot] * prev_scale + sink_scale)
+            out_scale = (
+                Float32(0.0)
+                if denom == Float32(0.0)
+                else Float32(prev_scale) / denom
+            )
+            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+                dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
+                    o_frag[0, mma_d, reg_base + 0] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
+                    o_frag[0, mma_d, reg_base + 1] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
+                    o_frag[0, mma_d, reg_base + 4] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
+                    o_frag[0, mma_d, reg_base + 5] * out_scale
+                ).to(out_tensor.element_type)
+
+
+@cute.jit
 def _store_output_group_chunked(
     out_tensor: cute.Tensor,
     o_frag: cute.Tensor,
@@ -3520,6 +3570,66 @@ def _store_output_groups(
 
 
 @cute.jit
+def _store_output_groups_with_sink(
+    out_tensor: cute.Tensor,
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    attn_sink: cute.Tensor,
+    out_row_idx: Int32,
+    head_tile_start: Int32,
+    lane: Int32,
+):
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag0,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(0),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag1,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(1),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag2,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(2),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag3,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(3),
+        lane,
+    )
+
+
+@cute.jit
 def _store_output_groups_chunked(
     out_tensor: cute.Tensor,
     o_frag0: cute.Tensor,
@@ -3598,6 +3708,8 @@ def _run_single_tile_compressed_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    attn_sink: cute.Tensor,
+    apply_attn_sink: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -3701,7 +3813,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(0), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(0),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(0), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(0), lane)
 
@@ -3748,7 +3873,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(1), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(1),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(1), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(1), lane)
 
@@ -3795,7 +3933,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(2), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(2),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(2), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(2), lane)
 
@@ -3839,7 +3990,20 @@ def _run_single_tile_compressed_mla_tile(
         indexed_page_nbytes,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(3), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(3),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(3), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(3), lane)
         _store_partial_lse_chunked(
@@ -4142,6 +4306,8 @@ def _run_one_pass_compressed_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    attn_sink: cute.Tensor,
+    apply_attn_sink: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -4267,17 +4433,32 @@ def _run_one_pass_compressed_mla_tile(
         token_base = tile_end
 
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_groups(
-            out_tensor,
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            d_frag,
-            out_row_idx,
-            head_tile_start,
-            lane,
-        )
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_groups_with_sink(
+                out_tensor,
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                lane,
+            )
+        else:
+            _store_output_groups(
+                out_tensor,
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                d_frag,
+                out_row_idx,
+                head_tile_start,
+                lane,
+            )
     else:
         _store_output_groups_chunked(
             out_tensor,

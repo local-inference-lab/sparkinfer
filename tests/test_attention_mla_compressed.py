@@ -15,7 +15,8 @@ from b12x.attention.workspace import (
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
-    COMPRESSED_MLA_SWA_PAGE_SIZE,
+    COMPRESSED_MLA_DSV4_PAGE_SIZE,
+    COMPRESSED_MLA_SWA_TOKENS,
     compressed_mla_page_nbytes,
     compressed_sparse_mla_reference,
     gather_compressed_mla_kv_cache_reference,
@@ -101,7 +102,11 @@ def _make_q(*, rows: int, seed: int, device: torch.device | str) -> torch.Tensor
 
 
 def test_compressed_mla_page_byte_widths_match_padded_layout() -> None:
-    assert compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE) == 74880
+    assert COMPRESSED_MLA_DSV4_PAGE_SIZE == 256
+    assert COMPRESSED_MLA_SWA_TOKENS == 128
+    assert COMPRESSED_MLA_C4_PAGE_SIZE == COMPRESSED_MLA_DSV4_PAGE_SIZE // 4
+    assert COMPRESSED_MLA_C128_PAGE_SIZE == COMPRESSED_MLA_DSV4_PAGE_SIZE // 128
+    assert compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE) == 149760
     assert compressed_mla_page_nbytes(COMPRESSED_MLA_C4_PAGE_SIZE) == 37440
     assert compressed_mla_page_nbytes(COMPRESSED_MLA_C128_PAGE_SIZE) == 1728
 
@@ -236,7 +241,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
 
     q = _make_q(rows=live_rows, seed=121, device=device)
     swa_cache = torch.empty(
-        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE)),
+        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
@@ -314,7 +319,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=21, device=device)
-    swa_cache_bytes = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=22, device=device)
+    swa_cache_bytes = _make_cache(tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=22, device=device)
     indexed_cache_bytes = _make_cache(tokens=32, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=23, device=device)
     swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
     indexed_cache = indexed_cache_bytes.view(torch.float8_e4m3fn)
@@ -390,7 +395,7 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     k_nope[20, 0] = 1
     k_rope = torch.zeros((width, 64), dtype=torch.bfloat16, device=device)
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE)),
+        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
@@ -515,7 +520,7 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
     rows = 8
     width = 8
     q = _make_q(rows=rows, seed=81, device=device)
-    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=82, device=device)
+    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=82, device=device)
     swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
     swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
     for row in range(rows):
@@ -575,7 +580,7 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=71, device=device)
-    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_SWA_PAGE_SIZE, seed=72, device=device)
+    swa_cache = _make_cache(tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=72, device=device)
     indexed_cache = _make_cache(tokens=4, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=73, device=device)
     swa_indices = torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0)
     indexed_indices = torch.full((1, 4), -1, dtype=torch.int32, device=device)
@@ -640,7 +645,7 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel() -> None:
 
     q = _make_q(rows=1, seed=181, device=device)
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE)),
+        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
