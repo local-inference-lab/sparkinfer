@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -67,6 +69,7 @@ from b12x.moe.fused.w4a16.host import (
     select_route_block_size_m,
     validate_activation,
 )
+from b12x.moe.fused.micro import MoEMicroKernelBackend
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 
@@ -78,6 +81,7 @@ _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed", "modelopt"}
 _MODEL_OPT_W13_LAYOUTS = {"up_gate", "gate_up"}
 _MAX_DIRECT_TOPK_ROUTE_M = 6
+_W4A16_SMALL_M_DIRECT_MAX_M = 8
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
@@ -354,6 +358,75 @@ class W4A16FusedMoeCompileResult:
 class _W4A16GemmLaunch:
     kernel: W4A16GemmCompileResult
     c_tmp: torch.Tensor
+
+
+class _W4A16SmallMDirectLaunch(NamedTuple):
+    compiled: object
+    grid_x: int
+    m: int
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    topk: int
+    activation: str
+    fast_math: bool
+    topk_ids_dtype: torch.dtype
+
+
+class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
+    """Decode-sized W4A16 specialization using the native ModelOpt layout."""
+
+    _SUPPORTED_M = (1, 2, 4, 8)
+
+    @classmethod
+    def is_supported(
+        cls,
+        *,
+        m: int,
+        hidden_size: int,
+        intermediate_size: int,
+        topk: int,
+        num_experts: int,
+    ) -> bool:
+        return (
+            int(m) in cls._SUPPORTED_M
+            and int(m) <= _W4A16_SMALL_M_DIRECT_MAX_M
+            and int(hidden_size) > 0
+            and int(hidden_size) % 128 == 0
+            and int(intermediate_size) > 0
+            and int(intermediate_size) % 16 == 0
+            and 0 < int(topk) <= 32
+            and int(num_experts) > 0
+            and MoEMicroKernelBackend.is_supported(
+                int(m),
+                int(hidden_size),
+                int(intermediate_size),
+                int(topk),
+                int(num_experts),
+            )
+        )
+
+    def __init__(
+        self,
+        *,
+        activation: str,
+        fast_math: bool,
+        share_input_across_experts: bool,
+        share_expert_scales: bool,
+        single_token: bool,
+    ):
+        super().__init__(
+            sf_vec_size=16,
+            mma_tiler_mn=(64, 128),
+            output_tile_count_n=1,
+            fast_math=fast_math,
+            activation=activation,
+            share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=single_token,
+            dynamic_down_scale=False,
+            w4a16_mode=True,
+        )
 
 
 class W4A16GemmKernel:
@@ -3474,6 +3547,7 @@ _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+_SMALL_M_DIRECT_CACHE: dict[tuple, _W4A16SmallMDirectLaunch] = {}
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -3490,6 +3564,137 @@ def _cutlass_element_dtype(element_dtype: str):
     if element_dtype == "fp16":
         return cutlass.Float16
     raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+
+
+def _small_m_direct_supported(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+    element_dtype: str,
+    weight_layout: str,
+    w13_layout: str,
+    expert_map: torch.Tensor | None = None,
+) -> bool:
+    if os.environ.get("B12X_W4A16_SMALL_M_DIRECT", "1") == "0":
+        return False
+    if activation not in {"silu", "relu2"}:
+        return False
+    return (
+        element_dtype == "bf16"
+        and weight_layout == "modelopt"
+        and w13_layout == "up_gate"
+        and not bool(apply_router_weight_on_input)
+        and swiglu_limit is None
+        and expert_map is None
+        and _W4A16SmallMDirectKernel.is_supported(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            topk=topk,
+            num_experts=num_experts,
+        )
+    )
+
+
+def _compile_w4a16_small_m_direct(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    topk_ids_dtype: torch.dtype,
+    device: torch.device | None,
+) -> _W4A16SmallMDirectLaunch:
+    if topk_ids_dtype not in (torch.int32, torch.int64):
+        raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
+    cache_key = (
+        "w4a16_small_m_direct",
+        None if device is None else int(device.index or 0),
+        int(m),
+        int(hidden_size),
+        int(intermediate_size),
+        int(num_experts),
+        int(topk),
+        activation,
+        bool(fast_math),
+        topk_ids_dtype,
+    )
+    cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kernel = _W4A16SmallMDirectKernel(
+        activation=activation,
+        fast_math=bool(fast_math),
+        share_input_across_experts=(int(m) == 1),
+        share_expert_scales=True,
+        single_token=(int(m) == 1),
+    )
+    kernel.configure(
+        int(m),
+        int(hidden_size),
+        int(intermediate_size),
+        int(topk),
+        int(num_experts),
+        device=device,
+    )
+
+    def dummy(dt):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    barrier_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = cute.compile(
+        kernel,
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(ids_dtype),
+        dummy(cutlass.Float32),
+        dummy(cutlass.BFloat16),
+        barrier_fake,
+        barrier_fake,
+        Int32(m),
+        Int32(kernel.grid_x),
+        current_cuda_stream(),
+    )
+    launch = _W4A16SmallMDirectLaunch(
+        compiled=compiled,
+        grid_x=int(kernel.grid_x),
+        m=int(m),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(num_experts),
+        topk=int(topk),
+        activation=activation,
+        fast_math=bool(fast_math),
+        topk_ids_dtype=topk_ids_dtype,
+    )
+    _SMALL_M_DIRECT_CACHE[cache_key] = launch
+    return launch
 
 
 def compile_w4a16_gemm(
@@ -3763,6 +3968,32 @@ def compile_w4a16_fused_moe(
     if cached is not None:
         return cached
 
+    if _small_m_direct_supported(
+        m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=top_k,
+        activation=activation,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        swiglu_limit=swiglu_limit,
+        element_dtype=element_dtype,
+        weight_layout=weight_layout,
+        w13_layout=w13_layout,
+    ):
+        for ids_dtype in (torch.int32, torch.int64):
+            _compile_w4a16_small_m_direct(
+                m=size_m,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                topk=top_k,
+                activation=activation,
+                fast_math=fast_math,
+                topk_ids_dtype=ids_dtype,
+                device=torch.device("cuda", device) if device is not None else None,
+            )
+
     packed_route_fake_elements = (
         int(size_m) * int(top_k)
         if direct_topk_routes
@@ -3948,6 +4179,7 @@ def clear_w4a16_kernel_cache() -> None:
     _FUSED_CACHE.clear()
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
+    _SMALL_M_DIRECT_CACHE.clear()
 
 
 def compile_w4a16_activation(
@@ -4289,6 +4521,92 @@ def run_w4a16_moe(
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
     stream = current_cuda_stream() if stream is None else stream
+    if _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=int(prepared.intermediate_size),
+        num_experts=int(prepared.num_experts),
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        swiglu_limit=swiglu_limit,
+        element_dtype=element_dtype,
+        weight_layout=weight_layout,
+        w13_layout=w13_layout,
+        expert_map=expert_map,
+    ):
+        if topk_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("W4A16 small-M direct path requires int32/int64 topk_ids")
+        if not topk_ids.is_cuda:
+            raise ValueError("W4A16 small-M direct path requires CUDA topk_ids")
+        if not intermediate_cache2.is_contiguous() or not output.is_contiguous():
+            raise ValueError(
+                "W4A16 small-M direct path requires contiguous intermediate_cache2 and output"
+            )
+        if intermediate_cache2.dtype != a_input.dtype:
+            raise TypeError(f"intermediate_cache2 must be {a_input.dtype}")
+        if int(prepared.workspace.numel()) < 2:
+            raise ValueError("prepared W4A16 workspace is too small for small-M direct")
+        intermediate_size = int(prepared.intermediate_size)
+        fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+        inter_u32_per_m = fc2_n_chunks * 128 * topk
+        inter_u32 = intermediate_cache2.view(-1).view(torch.uint32)
+        if int(inter_u32.numel()) < m * inter_u32_per_m:
+            raise ValueError(
+                "intermediate_cache2 is smaller than the W4A16 small-M direct scratch "
+                f"requirement: have_u32={int(inter_u32.numel())}, "
+                f"need_u32={m * inter_u32_per_m}"
+            )
+        direct_launch = _compile_w4a16_small_m_direct(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=int(prepared.num_experts),
+            topk=topk,
+            activation=activation,
+            fast_math=bool(fast_math),
+            topk_ids_dtype=topk_ids.dtype,
+            device=a_input.device,
+        )
+        micro_w13_scale = getattr(prepared, "micro_w13_scale", None)
+        micro_w2_scale = getattr(prepared, "micro_w2_scale", None)
+        micro_w13_global = getattr(prepared, "micro_w13_global_scale", None)
+        micro_w2_global = getattr(prepared, "micro_w2_global_scale", None)
+        if (
+            micro_w13_scale is None
+            or micro_w2_scale is None
+            or micro_w13_global is None
+            or micro_w2_global is None
+        ):
+            raise RuntimeError(
+                "W4A16 small-M direct path requires native ModelOpt micro scale metadata"
+            )
+        barrier_count = prepared.workspace[-2:-1]
+        barrier_epoch = prepared.workspace[-1:]
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+        MoEMicroKernelBackend.launch(
+            direct_launch.compiled,
+            x=a_input,
+            w1_fp4=prepared.w13.view(torch.uint8),
+            w1_blockscale=micro_w13_scale,
+            w1_alphas=micro_w13_global,
+            a1_gscale=micro_w13_global,
+            a2_gscale=micro_w2_global,
+            inter_fp32=inter_u32[: m * inter_u32_per_m],
+            w2_fp4=prepared.w2.view(torch.uint8),
+            w2_blockscale=micro_w2_scale,
+            w2_alphas=micro_w2_global,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            out=output,
+            barrier_count=barrier_count,
+            barrier_epoch=barrier_epoch,
+            m=m,
+            grid_x=direct_launch.grid_x,
+        )
+        return output
+
     direct_topk_eligible = (
         m <= _MAX_DIRECT_TOPK_ROUTE_M
         and weight_layout == "packed"

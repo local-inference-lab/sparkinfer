@@ -62,6 +62,10 @@ class W4A16ModelOptWeights:
     params_dtype: torch.dtype
     source_format: str = "modelopt_nvfp4"
     weight_layout: str = "modelopt"
+    micro_w13_scale: torch.Tensor | None = None
+    micro_w13_global_scale: torch.Tensor | None = None
+    micro_w2_scale: torch.Tensor | None = None
+    micro_w2_global_scale: torch.Tensor | None = None
     # Physical order of the two fused FC1 halves in source W13.
     # "up_gate" needs a row rotation before W4A16 SwiGLU; "gate_up" is already
     # in the logical order consumed by the kernel.
@@ -468,17 +472,17 @@ def _prepare_w4a16_packed_weights(
         size_n=hidden_size,
         reuse_input_storage=reuse_input_storage,
     )
-    w13_global_scale = _source_global_scale(
+    native_w13_global_scale = _source_global_scale(
         w13_global_scale,
         source_format=source_format,
     )
-    w2_global_scale = _source_global_scale(
+    native_w2_global_scale = _source_global_scale(
         w2_global_scale,
         source_format=source_format,
     )
     packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
         w13_scale,
-        w13_global_scale,
+        native_w13_global_scale,
         size_k=hidden_size,
         size_n=w13_rows,
         a_dtype=params_dtype,
@@ -486,7 +490,7 @@ def _prepare_w4a16_packed_weights(
     )
     packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
         w2_scale,
-        w2_global_scale,
+        native_w2_global_scale,
         size_k=intermediate_size,
         size_n=hidden_size,
         a_dtype=params_dtype,
@@ -598,11 +602,11 @@ def prepare_w4a16_modelopt_native_weights(
         rows=hidden_size,
         cols=intermediate_size,
     )
-    w13_global_scale = _source_global_scale(
+    native_w13_global_scale = _source_global_scale(
         w13_global_scale,
         source_format=source_format,
     )
-    w2_global_scale = _source_global_scale(
+    native_w2_global_scale = _source_global_scale(
         w2_global_scale,
         source_format=source_format,
     )
@@ -616,7 +620,7 @@ def prepare_w4a16_modelopt_native_weights(
     )
     packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
         w13_scale,
-        w13_global_scale,
+        native_w13_global_scale,
         size_k=hidden_size,
         size_n=w13_rows,
         a_dtype=params_dtype,
@@ -624,7 +628,7 @@ def prepare_w4a16_modelopt_native_weights(
     )
     packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
         w2_scale,
-        w2_global_scale,
+        native_w2_global_scale,
         size_k=intermediate_size,
         size_n=hidden_size,
         a_dtype=params_dtype,
@@ -644,6 +648,10 @@ def prepare_w4a16_modelopt_native_weights(
         is_gated=is_gated,
         params_dtype=params_dtype,
         source_format=source_format,
+        micro_w13_scale=w13_blockscale.contiguous(),
+        micro_w13_global_scale=native_w13_global_scale.contiguous(),
+        micro_w2_scale=w2_blockscale.contiguous(),
+        micro_w2_global_scale=native_w2_global_scale.contiguous(),
         w13_layout=w13_layout,
     )
 
