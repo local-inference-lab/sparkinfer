@@ -18,7 +18,7 @@ from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
@@ -33,7 +33,6 @@ from b12x.cute.fp4 import (
     st_global_v4_f32,
     st_shared_v4_u32,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -48,9 +47,6 @@ _WARPS_K = _BLOCK_K // 16
 _WARPS_PER_CTA = _WARPS_Q * _WARPS_K
 _THREADS_PER_CTA = _WARPS_PER_CTA * _WARP_THREADS
 _MAX_Q_HEADS = 64
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
 _EXTEND_TMA_DESC_CACHE_SIZE = 32
 
 _PREFILL_BLOCK_Q = 32  # Same Q tile size as decode
@@ -174,40 +170,6 @@ def _tensor_meta_key(
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
-
-
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "cute.compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        compiled = b12x_compile(kernel, *args)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    compiled(*args)
 
 
 def _pad_kv_rows(
@@ -2390,7 +2352,17 @@ def run_extend_logits_kernel(
             _tensor_meta_key(tile_logits_kernel),
             ("decode", _tiled_output),
         )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.extend_logits",
+        1,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     if _tiled_output and _use_prefill:
         return tile_logits
     return out_view

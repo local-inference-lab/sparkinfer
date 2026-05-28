@@ -7,7 +7,7 @@ import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
-from b12x.cute.compiler import clear_compile_cache
+from b12x.cute.compiler import clear_compile_cache, compile_cache_info
 from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_native_fp8_attention_mma_flags
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention.paged.reference import paged_attention_reference
@@ -616,8 +616,13 @@ def test_paged_workspace_matches_reference_for_bf16_nosplit_extend_shape() -> No
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
-def test_paged_fixed_capacity_extend_reuses_larger_eager_launcher() -> None:
+def test_paged_fixed_capacity_extend_reuses_larger_compile_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     require_sm120()
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    clear_compile_cache()
     clear_attention_caches()
 
     q_large, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
@@ -650,24 +655,14 @@ def test_paged_fixed_capacity_extend_reuses_larger_eager_launcher() -> None:
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     output_large = torch.empty_like(q_large)
     workspace.run(q_large, k_cache, v_cache, output=output_large)
-
-    traits = select_paged_forward_traits_from_plan(workspace.plan)
-    forward_kernel = _build_extend_forward_kernel(
-        traits,
-        False,
-        False,
-        workspace.plan.window_left,
-        False,
-    )
-    first_launcher_count = len(getattr(forward_kernel, "_eager_host_launchers", {}))
-    assert first_launcher_count == 1
+    first_compile_misses = compile_cache_info()["compile_misses"]
+    assert first_compile_misses >= 1
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q_small)
     output_small = torch.empty_like(q_small)
     workspace.run(q_small, k_cache, v_cache, output=output_small)
 
-    second_launcher_count = len(getattr(forward_kernel, "_eager_host_launchers", {}))
-    assert second_launcher_count == 1
+    assert compile_cache_info()["compile_misses"] == first_compile_misses
 
 
 def test_paged_workspace_matches_reference_for_fp8_nosplit_extend_shape() -> None:
@@ -2988,11 +2983,14 @@ def _count_generate_original_ir_calls(
     return calls, original_generate_original_ir
 
 
-def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_shape() -> None:
+def test_eager_workspace_reuses_compiled_spec_for_identical_nosplit_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     require_sm120()
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    clear_compile_cache()
     clear_attention_caches()
-    from b12x.attention.paged.api import _build_extend_forward_kernel
-    from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[4],
@@ -3014,34 +3012,21 @@ def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_sha
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
-    traits = select_paged_forward_traits_from_plan(workspace.plan)
-    kernel = _build_extend_forward_kernel(
-        traits,
-        False,
-        False,
-        workspace.plan.window_left,
-        False,
-    )
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    assert cache is not None
-    assert len(cache) == 1
-    first_compiled = next(iter(cache.values()))
+    first_compile_misses = compile_cache_info()["compile_misses"]
+    assert first_compile_misses >= 1
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
 
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    assert cache is not None
-    assert len(cache) == 1
-    assert next(iter(cache.values())) is first_compiled
+    assert compile_cache_info()["compile_misses"] == first_compile_misses
 
 
-def test_eager_workspace_reuses_compiled_host_launcher_for_identical_extend_shape(
+def test_eager_workspace_reuses_compiled_spec_for_identical_extend_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm120()
     monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     clear_compile_cache()
     clear_attention_caches()
 

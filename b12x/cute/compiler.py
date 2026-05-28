@@ -8,6 +8,7 @@ import sys
 import traceback
 from collections import OrderedDict
 from contextlib import suppress
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from threading import RLock
@@ -21,6 +22,147 @@ _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
 _COMPILE_MISSES = 0
+
+
+@dataclass(frozen=True)
+class DimKey:
+    kind: str
+    value: object = None
+
+    @staticmethod
+    def exact(value: object) -> "DimKey":
+        return DimKey("exact", value)
+
+    @staticmethod
+    def capacity(value: object) -> "DimKey":
+        return DimKey("capacity", value)
+
+    @staticmethod
+    def bucket(value: object) -> "DimKey":
+        return DimKey("bucket", value)
+
+    @staticmethod
+    def dynamic() -> "DimKey":
+        return DimKey("dynamic")
+
+    @staticmethod
+    def ignored() -> "DimKey":
+        return DimKey("ignored")
+
+
+@dataclass(frozen=True)
+class TensorKey:
+    name: str
+    dtype: str
+    rank: int
+    dims: tuple[DimKey, ...]
+    stride: tuple[int, ...]
+    device: tuple[str, int | None]
+    align: int | None = None
+    layout: object = None
+
+    @staticmethod
+    def from_tensor(
+        name: str,
+        tensor: Any,
+        *,
+        dims: tuple[DimKey, ...] | None = None,
+        align: int | None = None,
+        layout: object = None,
+    ) -> "TensorKey":
+        shape = tuple(int(dim) for dim in tensor.shape)
+        if dims is None:
+            dims = tuple(DimKey.exact(dim) for dim in shape)
+        if len(dims) != len(shape):
+            raise ValueError(
+                f"tensor key {name!r} dim policy rank {len(dims)} "
+                f"does not match tensor rank {len(shape)}"
+            )
+        device = tensor.device
+        return TensorKey(
+            name=name,
+            dtype=str(tensor.dtype),
+            rank=len(shape),
+            dims=dims,
+            stride=tuple(int(stride) for stride in tensor.stride()),
+            device=(device.type, device.index),
+            align=align,
+            layout=layout,
+        )
+
+
+@dataclass(frozen=True)
+class KeyField:
+    name: str
+    value: object
+
+
+@dataclass(frozen=True)
+class KernelCompileSpec:
+    kernel_id: str
+    version: int
+    fields: tuple[KeyField, ...] = ()
+
+    @staticmethod
+    def from_fields(
+        kernel_id: str,
+        version: int,
+        *fields: KeyField | tuple[str, object],
+    ) -> "KernelCompileSpec":
+        return KernelCompileSpec(
+            kernel_id=kernel_id,
+            version=int(version),
+            fields=tuple(_coerce_key_field(field) for field in fields),
+        )
+
+    @staticmethod
+    def from_key(
+        kernel_id: str,
+        version: int,
+        key: tuple[object, ...],
+        *,
+        labels: tuple[str, ...] | None = None,
+    ) -> "KernelCompileSpec":
+        if labels is not None and len(labels) != len(key):
+            raise ValueError(
+                f"compile spec labels length {len(labels)} does not match "
+                f"key length {len(key)}"
+            )
+        return KernelCompileSpec(
+            kernel_id=kernel_id,
+            version=int(version),
+            fields=tuple(
+                KeyField(labels[idx] if labels is not None else f"arg{idx}", value)
+                for idx, value in enumerate(key)
+            ),
+        )
+
+
+def _coerce_key_field(field: KeyField | tuple[str, object]) -> KeyField:
+    if isinstance(field, KeyField):
+        return field
+    name, value = field
+    return KeyField(str(name), value)
+
+
+def key_field(name: str, value: object) -> KeyField:
+    return KeyField(name, value)
+
+
+def tensor_key(
+    name: str,
+    tensor: Any | None,
+    *,
+    dims: tuple[DimKey, ...] | None = None,
+    align: int | None = None,
+    layout: object = None,
+) -> KeyField:
+    return KeyField(
+        name,
+        None
+        if tensor is None
+        else TensorKey.from_tensor(name, tensor, dims=dims, align=align, layout=layout),
+    )
 
 
 def _cute_compile_memory_cache_enabled() -> bool:
@@ -432,10 +574,44 @@ def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
     return {name: value for name, value in env if value}
 
 
-def _compile_cache_payload_log_value(
-    payload: tuple[object, ...] | None
-) -> dict[str, Any]:
-    if payload is None or len(payload) != 8:
+def _compile_cache_payload_log_value(payload: tuple[object, ...] | None) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    if len(payload) == 8 and payload[0] == "b12x_cute_compile_cache_v3_explicit_spec":
+        (
+            _version,
+            target_key,
+            _b12x_fingerprint,
+            toolchain_key,
+            spec_key,
+            kwargs_key,
+            options_key,
+            env_key,
+        ) = payload
+
+        summary: dict[str, Any] = {
+            "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
+            "spec": _cache_key_log_value(spec_key, max_depth=7, max_items=80),
+        }
+        if options_key:
+            summary["options"] = _cache_key_log_value(
+                options_key, max_depth=4, max_items=32
+            )
+        kwargs_summary = _cache_key_log_value(kwargs_key, max_depth=5, max_items=32)
+        if kwargs_summary:
+            summary["kwargs"] = kwargs_summary
+        env_summary = (
+            _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
+        )
+        if env_summary:
+            summary["env"] = env_summary
+        if isinstance(toolchain_key, tuple):
+            toolchain_summary = _toolchain_log_value(toolchain_key)
+            if toolchain_summary:
+                summary["toolchain"] = toolchain_summary
+        return summary
+
+    if len(payload) != 8:
         return {}
     (
         _version,
@@ -673,6 +849,21 @@ def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
     return ("callable", type(func).__module__, type(func).__qualname__, repr(func))
 
 
+def _explicit_spec_compile_target(func: Any) -> Any:
+    if inspect.ismethod(func):
+        return ("method", _function_fingerprint(func.__func__))
+    if inspect.isfunction(func):
+        return ("function", _function_fingerprint(func))
+    if callable(func) and hasattr(func.__call__, "__func__"):
+        return (
+            "callable_instance",
+            type(func).__module__,
+            type(func).__qualname__,
+            _function_fingerprint(func.__call__.__func__),
+        )
+    return ("callable", type(func).__module__, type(func).__qualname__)
+
+
 def _structural_dim_key(dim: Any, visited: set[int]) -> Any:
     if dim is None or isinstance(dim, (bool, int, float, str)):
         return dim
@@ -908,7 +1099,19 @@ def _compile_disk_cache_payload(
     func: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    compile_spec: KernelCompileSpec | None = None,
 ) -> tuple[object, ...]:
+    if compile_spec is not None:
+        return (
+            "b12x_cute_compile_cache_v3_explicit_spec",
+            _explicit_spec_compile_target(func),
+            _b12x_package_fingerprint(),
+            _runtime_toolchain_key(),
+            _structural_cache_key(compile_spec),
+            _structural_cache_key(kwargs),
+            _compile_options_cache_key(compile_callable),
+            _compile_environment_key(),
+        )
     return (
         "b12x_cute_compile_cache_v2",
         _normalize_compile_target(func, set()),
@@ -926,8 +1129,11 @@ def _build_compile_disk_cache_key(
     func: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    compile_spec: KernelCompileSpec | None = None,
 ) -> str:
-    payload = _compile_disk_cache_payload(compile_callable, func, args, kwargs)
+    payload = _compile_disk_cache_payload(
+        compile_callable, func, args, kwargs, compile_spec
+    )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
@@ -1017,13 +1223,20 @@ def compile_cache_info() -> dict[str, int | bool]:
         }
 
 
-def compile(func: Any, *args: Any, **kwargs: Any) -> Any:
+def compile(
+    func: Any,
+    *args: Any,
+    compile_spec: KernelCompileSpec | None = None,
+    **kwargs: Any,
+) -> Any:
     import cutlass.cute as cute
 
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
     compile_callable = cute.compile
-    payload = _compile_disk_cache_payload(compile_callable, func, args, kwargs)
+    payload = _compile_disk_cache_payload(
+        compile_callable, func, args, kwargs, compile_spec
+    )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
     compiled = _memory_cache_get(cache_key)
@@ -1053,9 +1266,42 @@ def compile(func: Any, *args: Any, **kwargs: Any) -> Any:
 
     with _MEMORY_CACHE_LOCK:
         _COMPILE_MISSES += 1
+    from b12x.runtime_control import raise_if_kernel_resolution_frozen
+
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=func,
+        cache_key=compile_spec if compile_spec is not None else payload,
+    )
     compiled = compile_callable(func, *args, **kwargs)
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
     _memory_cache_put(cache_key, compiled)
     return compiled
+
+
+def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
+    if hasattr(compiled, "generate_execution_args") and hasattr(
+        compiled, "run_compiled_program"
+    ):
+        execution_args, _ = compiled.generate_execution_args(*args)
+        return compiled.run_compiled_program(execution_args)
+    return compiled(*args)
+
+
+def launch(
+    func: Any,
+    *,
+    compile_spec: KernelCompileSpec,
+    compile_args: tuple[Any, ...],
+    runtime_args: tuple[Any, ...],
+    compile_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    compiled = compile(
+        func,
+        *compile_args,
+        compile_spec=compile_spec,
+        **(compile_kwargs or {}),
+    )
+    return run_compiled(compiled, runtime_args)

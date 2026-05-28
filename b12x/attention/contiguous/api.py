@@ -12,7 +12,7 @@ import torch
 from cutlass import Int32
 
 from b12x.attention.contiguous.forward import ContiguousAttentionForwardKernel
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.utils import current_cuda_stream, make_ptr
 from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
@@ -995,6 +995,22 @@ def _compile_attention(
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "attention.contiguous.forward",
+            1,
+            (
+                q_shape,
+                k_shape,
+                v_shape,
+                dtype,
+                causal,
+                window_size_left,
+                window_size_right,
+                has_attention_sink_bias,
+                tile_m,
+                tile_n,
+            ),
+        ),
     )
 
 
@@ -1044,6 +1060,26 @@ def _compile_varlen_attention(
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "attention.contiguous.varlen_forward",
+            1,
+            (
+                q_shape,
+                k_shape,
+                v_shape,
+                cu_seqlens_q_shape,
+                cu_seqlens_k_shape,
+                dtype,
+                causal,
+                window_size_left,
+                window_size_right,
+                has_attention_sink_bias,
+                max_seqlen_q,
+                max_seqlen_k,
+                tile_m,
+                tile_n,
+            ),
+        ),
     )
 
 

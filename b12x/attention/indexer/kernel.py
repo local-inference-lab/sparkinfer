@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
-import os
 
 import cutlass
 import cutlass.cute as cute
@@ -18,7 +16,7 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
@@ -29,7 +27,6 @@ from b12x.cute.fp4 import (
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -49,9 +46,6 @@ _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
 _PAGED_TILED_BLOCK_Q = 32
 _PAGED_TILED_BLOCK_K = 512
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
 _PAGED_Q_HEAD_TILE = 16
 _BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES = 128 * 1024
 
@@ -327,40 +321,6 @@ def _contract_key_tensor(
     if tuple(phantom.shape) != tuple(actual.shape):
         return actual
     return phantom
-
-
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "cute.compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        compiled = b12x_compile(kernel, *args)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    compiled(*args)
 
 
 def _assume_paged_k_tma_source_aligned(t: cute.Tensor):
@@ -1982,7 +1942,17 @@ def run_paged_logits_kernel(
             persistent_ctas,
             *common_cache_key,
         )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.paged_logits",
+        1,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     return logits_view
 
 
@@ -2458,7 +2428,17 @@ def _run_paged_tiled_logits_kernel_common(
             int(tile_block_k),
             *common_cache_key,
         )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.paged_tiled_logits",
+        1,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     logits_view._b12x_num_q_tiles = num_q_tiles
     logits_view._b12x_num_k_tiles = num_k_tiles
     logits_view._b12x_block_q = int(tile_block_q)

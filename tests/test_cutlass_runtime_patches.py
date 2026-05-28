@@ -14,6 +14,7 @@ from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.compiler as cute_compiler
 from b12x.cute.compiler import (
+    KernelCompileSpec,
     _build_compile_disk_cache_key,
     _compile_disk_cache_payload,
     _structural_cache_key,
@@ -89,6 +90,93 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
     )
 
     assert key_a == key_b
+
+
+def test_explicit_compile_spec_ignores_full_compile_signature() -> None:
+    fake_a = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    fake_b = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (8, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_fields(
+        "test.explicit",
+        1,
+        ("shape_bucket", "small"),
+    )
+
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_ignores_full_compile_signature,
+        (fake_a, 1),
+        {},
+        compile_spec=spec,
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_ignores_full_compile_signature,
+        (fake_b, 2),
+        {},
+        compile_spec=spec,
+    )
+
+    assert key_a == key_b
+
+
+def test_explicit_compile_spec_includes_compile_kwargs() -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_fields(
+        "test.explicit",
+        1,
+        ("shape_bucket", "small"),
+    )
+
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_includes_compile_kwargs,
+        (fake,),
+        {"options": "a"},
+        compile_spec=spec,
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_includes_compile_kwargs,
+        (fake,),
+        {"options": "b"},
+        compile_spec=spec,
+    )
+
+    assert key_a != key_b
+
+
+def test_explicit_compile_spec_changes_cache_key_when_policy_changes() -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_changes_cache_key_when_policy_changes,
+        (fake,),
+        {},
+        compile_spec=KernelCompileSpec.from_fields(
+            "test.explicit",
+            1,
+            ("shape_bucket", "small"),
+        ),
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_changes_cache_key_when_policy_changes,
+        (fake,),
+        {},
+        compile_spec=KernelCompileSpec.from_fields(
+            "test.explicit",
+            1,
+            ("shape_bucket", "large"),
+        ),
+    )
+
+    assert key_a != key_b
 
 
 def test_compile_miss_log_includes_target_attrs_and_arg_shapes(

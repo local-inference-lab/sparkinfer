@@ -50,7 +50,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.utils import (
     current_cuda_stream,
     cutlass_to_torch_dtype,
@@ -1790,32 +1790,34 @@ def _get_compiled_dense_gemm(
         sm_count=sm_count,
         sm_version=sm_version,
     )
+    compile_key = (
+        n,
+        k,
+        l,
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        policy,
+        sm_count,
+        sm_version,
+    )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
-        cache_key=(
-            n,
-            k,
-            l,
-            ab_dtype,
-            sf_dtype,
-            c_dtype,
-            alpha_dtype,
-            sf_vec_size,
-            mma_k,
-            tile_k,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            policy,
-            sm_count,
-            sm_version,
-        ),
+        cache_key=compile_key,
     )
     compiled_kernel = b12x_compile(
         launch,
         *_make_runtime_pointers(None),
         1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("gemm.dense", 1, compile_key),
     )
 
     def tensor_api(

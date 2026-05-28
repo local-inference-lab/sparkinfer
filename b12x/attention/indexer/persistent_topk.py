@@ -19,12 +19,12 @@ from b12x.cute.fp4 import (
     spin_wait_global_ge_i32,
     st_global_release_i32,
 )
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.utils import current_cuda_stream
 from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 from .tiled_topk import (
     _convert_to_uint32,
-    _run_cached_host_launcher,
     _tensor_meta_key,
     _to_kernel_tensor,
     _smem_red_add,
@@ -887,5 +887,23 @@ def run_persistent_topk2048(
             paged_output,
         ),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.persistent_topk",
+        1,
+        cache_key,
+        labels=(
+            "logits",
+            "lengths",
+            "page_table",
+            "output_indices",
+            "state",
+            "policy",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     return output_indices

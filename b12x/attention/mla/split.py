@@ -22,6 +22,7 @@ from b12x.attention.workspace import (
     default_sparse_mla_split_decode_config_for_width,
     forced_sparse_mla_split_decode_config_for_width,
 )
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import shared_ptr_to_u32
 from b12x.cute.utils import current_cuda_stream
 
@@ -43,7 +44,6 @@ from .kernel import (
     _exp2_approx_ftz_f32,
     _log2_approx_ftz_f32,
     _clamp_active_token_count,
-    _run_cached_host_launcher,
     _run_one_pass_compressed_mla_tile,
     _run_one_pass_sparse_mla_tile,
     _run_single_tile_compressed_mla_tile,
@@ -1374,7 +1374,33 @@ def run_sparse_mla_split_decode_forward(
         str(tmp_output.dtype),
         bool(identity_page_table),
     )
-    _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
+    forward_spec = KernelCompileSpec.from_key(
+        "attention.mla.split_forward",
+        1,
+        forward_cache_key,
+        labels=(
+            "q",
+            "kv_rows",
+            "kv_scales",
+            "page_table",
+            "active_token_counts",
+            "kv_chunk_size_ptr",
+            "num_chunks_ptr",
+            "tmp_output",
+            "tmp_lse",
+            "traits",
+            "launch_num_chunks",
+            "head_tiles",
+            "tmp_output_dtype",
+            "identity_page_table",
+        ),
+    )
+    b12x_launch(
+        forward_kernel,
+        compile_spec=forward_spec,
+        compile_args=forward_args,
+        runtime_args=forward_args,
+    )
 
 
 def run_compressed_mla_split_decode_forward(
@@ -1797,7 +1823,46 @@ def run_compressed_mla_split_decode_forward(
         bool(single_tile_chunks),
         bool(direct_sink_output),
     )
-    _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
+    forward_spec = KernelCompileSpec.from_key(
+        "attention.mla.compressed_split_forward",
+        1,
+        forward_cache_key,
+        labels=(
+            "kind",
+            "q",
+            "swa_cache",
+            "swa_indices",
+            "swa_lengths",
+            "indexed_cache",
+            "indexed_indices",
+            "indexed_lengths",
+            "indexed_page_table",
+            "kv_chunk_size_ptr",
+            "num_chunks_ptr",
+            "output_or_tmp_output",
+            "tmp_lse",
+            "attn_sink",
+            "launch_num_chunks",
+            "head_tiles",
+            "swa_page_size",
+            "swa_page_nbytes",
+            "indexed_page_size",
+            "indexed_page_nbytes",
+            "has_swa",
+            "has_indexed",
+            "map_indexed_page_table",
+            "tmp_output_dtype",
+            "direct_output",
+            "single_tile_chunks",
+            "direct_sink_output",
+        ),
+    )
+    b12x_launch(
+        forward_kernel,
+        compile_spec=forward_spec,
+        compile_args=forward_args,
+        runtime_args=forward_args,
+    )
 
 
 def run_sparse_mla_split_decode_merge(
@@ -1908,7 +1973,25 @@ def run_sparse_mla_split_decode_merge(
             str(tmp_output.dtype),
             str(output.dtype),
         )
-        _run_cached_host_launcher(merge_kernel, merge_cache_key, merge_args)
+        merge_spec = KernelCompileSpec.from_key(
+            "attention.mla.split_merge",
+            1,
+            merge_cache_key,
+            labels=(
+                "tmp_output",
+                "tmp_lse",
+                "num_chunks_ptr",
+                "output",
+                "tmp_output_dtype",
+                "output_dtype",
+            ),
+        )
+        b12x_launch(
+            merge_kernel,
+            compile_spec=merge_spec,
+            compile_args=merge_args,
+            runtime_args=merge_args,
+        )
         return
 
     attn_sink = attn_sink.detach()
@@ -1942,7 +2025,27 @@ def run_sparse_mla_split_decode_merge(
         str(output.dtype),
         "attn_sink",
     )
-    _run_cached_host_launcher(merge_kernel, merge_cache_key, merge_args)
+    merge_spec = KernelCompileSpec.from_key(
+        "attention.mla.split_sink_merge",
+        1,
+        merge_cache_key,
+        labels=(
+            "tmp_output",
+            "tmp_lse",
+            "num_chunks_ptr",
+            "attn_sink",
+            "output",
+            "tmp_output_dtype",
+            "output_dtype",
+            "kind",
+        ),
+    )
+    b12x_launch(
+        merge_kernel,
+        compile_spec=merge_spec,
+        compile_args=merge_args,
+        runtime_args=merge_args,
+    )
 
 
 def run_sparse_mla_split_decode(

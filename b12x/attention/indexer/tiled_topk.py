@@ -10,7 +10,6 @@ initialization before use.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from functools import lru_cache
 import os
 
@@ -23,7 +22,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     atomic_add_shared_i32,
     ld_shared_i32,
@@ -33,11 +32,7 @@ from b12x.cute.fp4 import (
     st_shared_i32,
 )
 from b12x.cute.utils import current_cuda_stream
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
 _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
 _SUPPORTED_TOPK = (512, 2048)
@@ -195,33 +190,6 @@ def _contract_tensor(
             if tensor is not None:
                 return tensor
     return fallback
-
-
-def _launcher_cache_lookup(kernel, cache_key):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
-def _run_cached_host_launcher(kernel, cache_key, args):
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "cute.compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        compiled = b12x_compile(kernel, *args)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    compiled(*args)
 
 
 class SparseNSATiledTopkKernel:
@@ -850,7 +818,25 @@ def run_tiled_topk(
             bool(zero_row_start),
         ),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.tiled_topk",
+        1,
+        cache_key,
+        labels=(
+            "input",
+            "row_start",
+            "lengths",
+            "topk_values",
+            "topk_indices",
+            "policy",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     return topk_values, topk_indices
 
 
@@ -967,7 +953,24 @@ def run_row_topk(
             topk,
         ),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.row_topk",
+        1,
+        cache_key,
+        labels=(
+            "logits",
+            "lengths",
+            "topk_values",
+            "topk_indices",
+            "policy",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     return topk_values, topk_indices
 
 

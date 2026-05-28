@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-
 import pytest
+import cutlass.cute as cute
 
 import b12x
+import b12x.cute.compiler as cute_compiler
 import b12x.runtime_control as runtime_control
-from b12x.attention.mla.kernel import _run_cached_host_launcher
+from b12x.cute.compiler import KernelCompileSpec
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +38,10 @@ def test_kernel_resolution_freeze_error_includes_context() -> None:
     assert "shape" in message
 
 
-def test_cached_host_launcher_allows_hits_but_rejects_new_resolution() -> None:
+def test_cute_launch_allows_cached_hits_but_rejects_new_resolution(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
     compile_calls: list[tuple[tuple[object, ...], bool]] = []
 
     class _Compiled:
@@ -56,19 +59,45 @@ def test_cached_host_launcher_allows_hits_but_rejects_new_resolution() -> None:
             assert exe_args == ()
             self.run_count += 1
 
-    def kernel(*args, compile_only=False):
+    def fake_compile(func, *args, compile_only=False, **kwargs):
+        del func, kwargs
         compile_calls.append((args, compile_only))
-        raise AssertionError("kernel resolution should have been blocked")
+        return compiled
 
     compiled = _Compiled()
-    kernel._eager_host_launchers = OrderedDict([(("hit",), compiled)])
+    monkeypatch.setattr(cute, "compile", fake_compile)
+
+    def kernel() -> None:
+        raise AssertionError("kernel should run through compiled object")
+
+    hit_spec = KernelCompileSpec.from_fields("test.runtime_control", 1, ("shape", "hit"))
+    miss_spec = KernelCompileSpec.from_fields("test.runtime_control", 1, ("shape", "miss"))
+
+    cute_compiler.launch(
+        kernel,
+        compile_spec=hit_spec,
+        compile_args=(),
+        runtime_args=(),
+    )
+    assert compile_calls == [((), False)]
+    assert compiled.run_count == 1
 
     runtime_control.freeze_kernel_resolution("warmup complete")
 
-    _run_cached_host_launcher(kernel, ("hit",), ())
-    assert compiled.run_count == 1
+    cute_compiler.launch(
+        kernel,
+        compile_spec=hit_spec,
+        compile_args=(),
+        runtime_args=(),
+    )
+    assert compiled.run_count == 2
 
     with pytest.raises(runtime_control.KernelResolutionFrozenError):
-        _run_cached_host_launcher(kernel, ("miss",), ())
+        cute_compiler.launch(
+            kernel,
+            compile_spec=miss_spec,
+            compile_args=(),
+            runtime_args=(),
+        )
 
-    assert compile_calls == []
+    assert compile_calls == [((), False)]

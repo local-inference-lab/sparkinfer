@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 import os
@@ -17,7 +16,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -43,7 +42,6 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
@@ -84,11 +82,6 @@ _MLA_ROPE_U32_OFFSET = _MLA_SCALE_U32_OFFSET + _MLA_SCALE_GROUPS
 _MLA_NUM_MMA_KV = 2
 _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
-
-
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
         f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
@@ -178,21 +171,6 @@ def _tensor_meta_key(
     )
 
 
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
 def _workspace_contract_kv_tensors(
     workspace: object | None,
     kv_cache: torch.Tensor,
@@ -206,25 +184,6 @@ def _workspace_contract_kv_tensors(
         getattr(workspace, "_contract_kv_rows", None),
         getattr(workspace, "_contract_kv_scales", None),
     )
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "cute.compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        compiled = b12x_compile(kernel, *args)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    compiled(*args)
 
 
 @cute.jit
@@ -2361,4 +2320,25 @@ def run_sparse_mla_kernel(
         head_tiles,
         str(output.dtype),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.mla.onepass_sparse",
+        1,
+        cache_key,
+        labels=(
+            "q",
+            "kv_rows",
+            "kv_scales",
+            "page_table",
+            "active_token_counts",
+            "output",
+            "traits",
+            "head_tiles",
+            "output_dtype",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )

@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -3645,7 +3645,7 @@ def _get_static_kernel(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         launch,
         a_input_fake,
         topk_ids_fake,
@@ -3675,6 +3675,11 @@ def _get_static_kernel(
         1,
         1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.static",
+            1,
+            cache_key,
+        ),
     )
 
     if reuse_compiled:
@@ -3773,6 +3778,11 @@ def _get_micro_kernel(
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
         current_cuda_stream(),  # stream
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.micro_direct",
+            1,
+            cache_key,
+        ),
         **compile_kwargs,
     )
     with suppress(Exception):
@@ -4379,6 +4389,11 @@ def _get_dynamic_kernel(
         1,
         1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.dynamic",
+            1,
+            cache_key,
+        ),
     )
 
     if reuse_compiled:

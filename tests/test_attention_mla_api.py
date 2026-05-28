@@ -456,9 +456,16 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
 
     captured_cache_keys: list[tuple[object, ...]] = []
 
-    def fake_run_cached_host_launcher(kernel, cache_key, args):
-        del kernel, args
-        captured_cache_keys.append(cache_key)
+    def fake_b12x_launch(
+        kernel,
+        *,
+        compile_spec,
+        compile_args,
+        runtime_args,
+        compile_kwargs=None,
+    ):
+        del kernel, compile_args, runtime_args, compile_kwargs
+        captured_cache_keys.append(tuple(field.value for field in compile_spec.fields))
 
     def identity_to_kernel_tensor(tensor, dtype, *, assumed_align=16):
         del dtype, assumed_align
@@ -471,9 +478,7 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
         return object()
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(
-        mla_split, "_run_cached_host_launcher", fake_run_cached_host_launcher
-    )
+    monkeypatch.setattr(mla_split, "b12x_launch", fake_b12x_launch)
     monkeypatch.setattr(mla_split, "_to_kernel_tensor", identity_to_kernel_tensor)
     monkeypatch.setattr(
         mla_split, "select_sparse_mla_traits", lambda **kwargs: object()

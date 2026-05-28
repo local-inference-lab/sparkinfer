@@ -11,7 +11,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Uint32
 
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
@@ -3615,6 +3615,11 @@ def compile_w4a16_gemm(
         Int32(compile_size_m),
         Int32(1),
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.gemm",
+            1,
+            cache_key,
+        ),
     )
     result = W4A16GemmCompileResult(
         compiled=compiled,
@@ -3891,6 +3896,11 @@ def compile_w4a16_fused_moe(
         1,
         1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.fused_moe",
+            1,
+            cache_key,
+        ),
     )
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
@@ -3978,6 +3988,11 @@ def compile_w4a16_activation(
         activated_fake,
         Int32(compile_rows),
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.activation",
+            1,
+            cache_key,
+        ),
     )
     result = W4A16ActivationCompileResult(
         compiled=compiled,
@@ -4019,6 +4034,11 @@ def compile_w4a16_topk_sum(
         output_fake,
         1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.topk_sum",
+            1,
+            cache_key,
+        ),
     )
     result = W4A16TopKSumCompileResult(
         compiled=compiled,

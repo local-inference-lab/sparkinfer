@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from functools import lru_cache
 import os
 
@@ -11,8 +10,7 @@ import cutlass
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import compile as b12x_compile
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.utils import current_cuda_stream
 
 from .forward_paged import (
@@ -23,9 +21,6 @@ from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 
@@ -218,86 +213,6 @@ def _tensor_meta_key(
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
-
-
-def _format_cache_key_value(value: object) -> str:
-    if value is None:
-        return "None"
-    if (
-        isinstance(value, tuple)
-        and len(value) == 4
-        and isinstance(value[0], tuple)
-        and isinstance(value[1], tuple)
-        and isinstance(value[2], str)
-        and isinstance(value[3], tuple)
-        and len(value[3]) == 2
-    ):
-        shape, stride, dtype, (device_type, device_index) = value
-        return f"shape={shape},stride={stride},dtype={dtype},device={device_type}:{device_index}"
-    return repr(value)
-
-
-def _debug_print_compile_cache_miss(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    cache_key_labels: tuple[str, ...] | None,
-) -> None:
-    kernel_name = type(kernel).__name__
-    if cache_key_labels is None:
-        payload = ", ".join(
-            f"{idx}={_format_cache_key_value(value)}"
-            for idx, value in enumerate(cache_key)
-        )
-    else:
-        payload = ", ".join(
-            f"{label}={_format_cache_key_value(value)}"
-            for label, value in zip(cache_key_labels, cache_key, strict=True)
-        )
-    print(f"[paged] compile-miss {kernel_name}: {payload}", flush=True)
-
-
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-    *,
-    cache_key_labels: tuple[str, ...] | None = None,
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        if os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1":
-            _debug_print_compile_cache_miss(kernel, cache_key, cache_key_labels)
-        raise_if_kernel_resolution_frozen(
-            "cute.compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        compiled = b12x_compile(kernel, *args)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    if hasattr(compiled, "generate_execution_args") and hasattr(
-        compiled, "run_compiled_program"
-    ):
-        exe_args, _ = compiled.generate_execution_args(*args)
-        compiled.run_compiled_program(exe_args)
-    else:
-        compiled(*args)
 
 
 @lru_cache(maxsize=64)
@@ -781,11 +696,17 @@ def paged_attention_forward(
         )
         cache_key_labels.extend(("k_tma_desc_ptrs", "v_tma_desc_ptrs"))
     forward_args.append(stream)
-    _run_cached_host_launcher(
-        forward_kernel,
+    forward_spec = KernelCompileSpec.from_key(
+        "attention.paged.forward",
+        1,
         tuple(forward_cache_key),
-        tuple(forward_args),
-        cache_key_labels=tuple(cache_key_labels),
+        labels=tuple(cache_key_labels),
+    )
+    b12x_launch(
+        forward_kernel,
+        compile_spec=forward_spec,
+        compile_args=tuple(forward_args),
+        runtime_args=tuple(forward_args),
     )
 
     if plan.split_kv:
@@ -866,11 +787,11 @@ def paged_attention_forward(
             merge_regular_decode_graph,
             pair_bf16_merge_partial_loads,
         )
-        _run_cached_host_launcher(
-            merge_kernel,
+        merge_spec = KernelCompileSpec.from_key(
+            "attention.paged.merge",
+            1,
             merge_cache_key,
-            (*merge_args, stream),
-            cache_key_labels=(
+            labels=(
                 "tmp_output",
                 "tmp_lse",
                 "merge_indptr",
@@ -884,6 +805,12 @@ def paged_attention_forward(
                 "regular_decode_graph",
                 "pair_bf16_partial_loads",
             ),
+        )
+        b12x_launch(
+            merge_kernel,
+            compile_spec=merge_spec,
+            compile_args=(*merge_args, stream),
+            runtime_args=(*merge_args, stream),
         )
 
     return output[: plan.total_q], workspace.current_lse_view()
