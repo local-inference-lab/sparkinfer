@@ -462,17 +462,6 @@ def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> No
         assert (
             resolve_decode_graph_ctas_per_sm(
                 kv_dtype=kv_dtype,
-                batch=2,
-                page_size=64,
-                head_dim_qk=128,
-                head_dim_vo=128,
-                gqa_group_size=6,
-            )
-            == 1
-        )
-        assert (
-            resolve_decode_graph_ctas_per_sm(
-                kv_dtype=kv_dtype,
                 batch=5,
                 page_size=64,
                 head_dim_qk=128,
@@ -481,6 +470,28 @@ def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> No
             )
             == 2
         )
+    assert (
+        resolve_decode_graph_ctas_per_sm(
+            kv_dtype=torch.bfloat16,
+            batch=2,
+            page_size=64,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            gqa_group_size=6,
+        )
+        == 6
+    )
+    assert (
+        resolve_decode_graph_ctas_per_sm(
+            kv_dtype=torch.float8_e4m3fn,
+            batch=2,
+            page_size=64,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            gqa_group_size=6,
+        )
+        == 1
+    )
 
 
 def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import logging
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -15,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import record_function
 
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -42,6 +45,17 @@ from b12x.moe.fused.micro import (
 from b12x.moe.tuning import lookup_max_active_clusters
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+
+logger = logging.getLogger(__name__)
+_B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
+    "VLLM_B12X_TIMING", "0"
+) == "1"
+_B12X_TIMING_THRESHOLD_MS = float(
+    os.getenv(
+        "B12X_TIMING_THRESHOLD_MS",
+        os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
+    )
+)
 
 _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
@@ -429,13 +443,16 @@ class TPMoEScratchPlan:
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     ) -> TPMoEWorkspacePool:
+        t0 = time.perf_counter() if _B12X_TIMING else 0.0
         scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
+        t_scratch = time.perf_counter() if _B12X_TIMING else 0.0
         pool = allocate_tp_moe_workspace_pool(
             shared_arena=scratch_storage,
             route_workspace_nbytes=self.layout.route_workspace_nbytes,
             core_workspace_nbytes=self.layout.core_workspace_nbytes,
             frozen=self.caps.frozen,
         )
+        t_pool = time.perf_counter() if _B12X_TIMING else 0.0
         materialize_tp_moe_arena_workspaces(
             pool,
             max_tokens=self.caps.max_tokens,
@@ -452,6 +469,25 @@ class TPMoEScratchPlan:
             swiglu_limit=self.caps.swiglu_limit,
             source_format=self.caps.source_format,
         )
+        if _B12X_TIMING:
+            t_done = time.perf_counter()
+            total_ms = (t_done - t0) * 1000.0
+            if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                logger.warning(
+                    "b12x_tp_moe_make_workspace_pool timing tokens=%d k=%d n=%d "
+                    "E=%d topk=%d quant=%s scratch=%.3fms pool=%.3fms "
+                    "materialize=%.3fms total=%.3fms",
+                    int(self.caps.max_tokens),
+                    int(self.caps.k),
+                    int(self.caps.n),
+                    int(self.caps.weight_E),
+                    int(self.caps.num_topk),
+                    self.caps.quant_mode,
+                    (t_scratch - t0) * 1000.0,
+                    (t_pool - t_scratch) * 1000.0,
+                    (t_done - t_pool) * 1000.0,
+                    total_ms,
+                )
         return pool
 
     def bind(
@@ -771,9 +807,9 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
-_MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-_STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-_DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+_MICRO_KERNEL_CACHE: Dict[Tuple, object] = {}
+_STATIC_KERNEL_CACHE: Dict[Tuple, object] = {}
+_DYNAMIC_KERNEL_CACHE: Dict[Tuple, object] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
@@ -1380,7 +1416,7 @@ def _plan_core_workspace(
                     "weight_expert_ids", (state_E,), torch.int32, init="arange"
                 ),
                 _TensorAllocSpec("global_to_local_expert", (weight_E,), torch.int32),
-                _TensorAllocSpec("compact_topk_ids", (state_E,), torch.int32),
+                _TensorAllocSpec("compact_topk_ids", (routed_rows,), torch.int32),
                 _TensorAllocSpec(
                     "micro_intermediate",
                     (micro_intermediate_elements,),
@@ -2857,7 +2893,9 @@ def _prewarm_w4a16_planned_launches(
     if not token_counts:
         raise ValueError("W4A16 launch planning requires at least one token count")
 
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
     with torch.cuda.device(workspace.device):
+        is_capturing = torch.cuda.is_current_stream_capturing()
         props = torch.cuda.get_device_properties(workspace.device)
         sms = int(props.multi_processor_count)
         max_shared_mem = int(
@@ -2867,6 +2905,7 @@ def _prewarm_w4a16_planned_launches(
         fused_launches: dict[object, object] = {}
         topk_sum_launches: dict[int, object] = {}
         for token_count in token_counts:
+            t_token = time.perf_counter() if _B12X_TIMING else 0.0
             block_size_m = select_route_block_size_m(
                 token_count,
                 workspace.num_topk,
@@ -2880,6 +2919,7 @@ def _prewarm_w4a16_planned_launches(
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
             weight_layout = "packed"
+            t_shape = time.perf_counter() if _B12X_TIMING else 0.0
             fused_launches[
                 (weight_layout, scale_format, token_count)
             ] = compile_w4a16_fused_moe(
@@ -2900,12 +2940,34 @@ def _prewarm_w4a16_planned_launches(
                 weight_layout=weight_layout,
                 scale_format=scale_format,
             )
+            t_fused = time.perf_counter() if _B12X_TIMING else 0.0
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
                 topk=workspace.num_topk,
                 hidden_size=workspace.k,
                 element_dtype=element_dtype,
             )
+            t_sum = time.perf_counter() if _B12X_TIMING else 0.0
+
+            # The real route-pack launch happens in run_w4a16_moe. During CUDA
+            # graph capture this prewarm-only launch would be recorded as
+            # useless work in every captured MoE graph.
+            if is_capturing:
+                if _B12X_TIMING:
+                    total_ms = (t_sum - t_token) * 1000.0
+                    if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                        logger.warning(
+                            "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                            "shape=%.3fms compile_fused=%.3fms "
+                            "compile_sum=%.3fms route_pack=skipped total=%.3fms",
+                            int(token_count),
+                            is_capturing,
+                            (t_shape - t_token) * 1000.0,
+                            (t_fused - t_shape) * 1000.0,
+                            (t_sum - t_fused) * 1000.0,
+                            total_ms,
+                        )
+                continue
 
             dummy_topk_ids = torch.empty(
                 token_count,
@@ -2923,9 +2985,36 @@ def _prewarm_w4a16_planned_launches(
                 packed_route_count=workspace.packed_route_count,
                 expert_offsets=workspace.expert_offsets,
             )
+            if _B12X_TIMING:
+                t_route = time.perf_counter()
+                total_ms = (t_route - t_token) * 1000.0
+                if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                    logger.warning(
+                        "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                        "shape=%.3fms compile_fused=%.3fms compile_sum=%.3fms "
+                        "route_pack=%.3fms total=%.3fms",
+                        int(token_count),
+                        is_capturing,
+                        (t_shape - t_token) * 1000.0,
+                        (t_fused - t_shape) * 1000.0,
+                        (t_sum - t_fused) * 1000.0,
+                        (t_route - t_sum) * 1000.0,
+                        total_ms,
+                    )
         workspace.planned_fused_moe_launches = fused_launches
         workspace.planned_topk_sum_launches = topk_sum_launches
         workspace.planned_scale_format = scale_format
+    if _B12X_TIMING:
+        t_done = time.perf_counter()
+        total_ms = (t_done - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_w4a16_prewarm_total timing counts=%s capturing=%s "
+                "total=%.3fms",
+                token_counts,
+                is_capturing,
+                total_ms,
+            )
 
 
 def materialize_tp_moe_arena_workspaces(
@@ -2946,6 +3035,7 @@ def materialize_tp_moe_arena_workspaces(
     source_format: str = "modelopt_nvfp4",
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
     quant_mode = _normalize_quant_mode(quant_mode)
     source_format = _normalize_fp4_source_format(source_format)
     _validate_fp4_source_format_for_quant_mode(
@@ -2966,6 +3056,7 @@ def materialize_tp_moe_arena_workspaces(
         core_token_counts=core_token_counts,
         quant_mode=quant_mode,
     )
+    t_counts = time.perf_counter() if _B12X_TIMING else 0.0
     selected: dict[tuple, tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]] = {}
     for token_count in core_token_counts:
         plan = _make_workspace_plan(
@@ -3013,6 +3104,9 @@ def materialize_tp_moe_arena_workspaces(
         if existing_selection is None or required_nbytes > existing_selection[2]:
             selected[key] = (plan, core_plan, required_nbytes)
 
+    t_selected = time.perf_counter() if _B12X_TIMING else 0.0
+    materialize_ms = 0.0
+    prewarm_ms = 0.0
     for key, (plan, core_plan, required_nbytes) in selected.items():
         existing = pool.workspaces.get(key)
         if existing is not None:
@@ -3060,6 +3154,7 @@ def materialize_tp_moe_arena_workspaces(
         else:
             a1_init = torch.ones((), dtype=torch.float32, device=plan.device)
             a2_init = torch.ones((), dtype=torch.float32, device=plan.device)
+        t_materialize0 = time.perf_counter() if _B12X_TIMING else 0.0
         materialized = _materialize_workspace_from_core_arena(
             core_plan,
             arena,
@@ -3068,6 +3163,8 @@ def materialize_tp_moe_arena_workspaces(
             input_scales_static=True,
             volatile_launch_state=bool(pool.shared_arena is not None),
         )
+        if _B12X_TIMING:
+            materialize_ms += (time.perf_counter() - t_materialize0) * 1000.0
         if quant_mode == "w4a16":
             if not isinstance(materialized, TPW4A16Workspace):
                 raise TypeError(
@@ -3081,6 +3178,7 @@ def materialize_tp_moe_arena_workspaces(
             materialized.planned_swiglu_limit = _normalize_w4a16_swiglu_limit(
                 swiglu_limit
             )
+            t_prewarm0 = time.perf_counter() if _B12X_TIMING else 0.0
             _prewarm_w4a16_planned_launches(
                 materialized,
                 token_counts=core_token_counts,
@@ -3088,7 +3186,27 @@ def materialize_tp_moe_arena_workspaces(
                 swiglu_limit=materialized.planned_swiglu_limit,
                 scale_format=w4a16_scale_format,
             )
+            if _B12X_TIMING:
+                prewarm_ms += (time.perf_counter() - t_prewarm0) * 1000.0
         pool.workspaces[key] = materialized
+    if _B12X_TIMING:
+        t_done = time.perf_counter()
+        total_ms = (t_done - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_tp_moe_materialize timing max_tokens=%d counts=%s "
+                "selected=%d quant=%s counts=%.3fms select=%.3fms "
+                "materialize=%.3fms prewarm=%.3fms total=%.3fms",
+                max_tokens,
+                core_token_counts,
+                len(selected),
+                quant_mode,
+                (t_counts - t0) * 1000.0,
+                (t_selected - t_counts) * 1000.0,
+                materialize_ms,
+                prewarm_ms,
+                total_ms,
+            )
 
 
 def allocate_tp_moe_workspace_pool(
@@ -3383,12 +3501,9 @@ def _get_static_kernel(
         "static",
         state_E,
         weight_E,
-        m,
         k,
         n,
         num_topk,
-        max_rows,
-        mac,
         mma_tiler_mn,
         topk_ids_dtype,
         fast_math,
@@ -3400,13 +3515,13 @@ def _get_static_kernel(
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
-        return last_kval
+        return last_kval, mac
     reuse_compiled = os.environ.get("B12X_STATIC_REUSE_COMPILED", "1") != "0"
     if reuse_compiled:
         cached = _STATIC_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
-            return cached
+            return cached, mac
 
     weight_dtype = cutlass.Float4E2M1FN
     a_scratch_dtype = weight_dtype
@@ -3429,46 +3544,31 @@ def _get_static_kernel(
         share_expert_scales=share_expert_scales,
     )
 
-    rows_pad_k = align_up(max_rows, 128)
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    launch = _StaticMoELaunch(kernel, k=k, num_topk=num_topk, state_E=state_E)
 
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+    a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_ids_fake = make_ptr(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        topk_ids_align,
+        cute.AddressSpace.gmem,
         assumed_align=topk_ids_align,
     )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
+    topk_weights_fake = make_ptr(
+        cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        a_scratch_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
+    packed_a_fake = make_ptr(
+        a_scratch_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_elements = state_E * max_rows * (k // 2)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (packed_a_storage_elements,),
-        assumed_align=16,
+    packed_a_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
     )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
+    scale_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
     )
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -3535,29 +3635,18 @@ def _get_static_kernel(
         (weight_E,),
         assumed_align=16,
     )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
+    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    token_map_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
+    token_weights_fake = make_ptr(
+        alpha_dtype, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=cache_key
+        "cute.compile", target=launch, cache_key=cache_key
     )
     compiled = cute.compile(
-        kernel,
+        launch,
         a_input_fake,
         topk_ids_fake,
         topk_weights_fake,
@@ -3582,15 +3671,16 @@ def _get_static_kernel(
         scatter_fake,
         token_map_fake,
         token_weights_fake,
-        mac,
+        1,
+        1,
+        1,
         current_cuda_stream(),
     )
 
-    result = (compiled, mac)
     if reuse_compiled:
-        _STATIC_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _STATIC_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, mac
 
 
 def _get_micro_kernel(
@@ -3615,33 +3705,6 @@ def _get_micro_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     dynamic_down_scale = _dynamic_down_scale_enabled()
 
-    global _LAST_KERNEL
-    cache_key = (
-        quant_mode,
-        "micro_direct",
-        m,
-        k,
-        n,
-        num_topk,
-        weight_E,
-        topk_ids_dtype,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-        dynamic_down_scale,
-    )
-    last_kkey, last_kval = _LAST_KERNEL
-    if last_kkey == cache_key:
-        return last_kval
-    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
-    if reuse_compiled:
-        cached = _MICRO_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            _LAST_KERNEL = (cache_key, cached)
-            return cached
-
     kernel = activation_spec.make_micro_kernel(
         sf_vec_size=16,
         mma_tiler_mn=(64, 128),
@@ -3653,6 +3716,24 @@ def _get_micro_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
+    kernel_key = kernel.__cache_key__
+
+    global _LAST_KERNEL
+    cache_key = (
+        quant_mode,
+        "micro_direct",
+        kernel_key,
+        topk_ids_dtype,
+    )
+    last_kkey, last_kval = _LAST_KERNEL
+    if last_kkey == cache_key:
+        return last_kval, kernel.grid_x
+    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
+    if reuse_compiled:
+        cached = _MICRO_KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            _LAST_KERNEL = (cache_key, cached)
+            return cached, kernel.grid_x
 
     def dummy(dt):
         return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -3671,7 +3752,8 @@ def _get_micro_kernel(
     compile_options = os.environ.get("B12X_DIRECT_CUTE_OPTIONS", "")
     if compile_options:
         compile_kwargs["options"] = compile_options
-    compiled = cute.compile(
+    compile_m = int(kernel.m_const) if int(kernel.m_const) != 0 else 8
+    compiled = b12x_compile(
         kernel,
         dummy(cutlass.BFloat16),  # x_ptr
         dummy(cutlass.Uint8),  # w1_ptr
@@ -3688,8 +3770,8 @@ def _get_micro_kernel(
         dummy(cutlass.BFloat16),  # out_ptr
         barrier_fake,  # barrier_count
         barrier_fake,  # barrier_epoch
-        Int32(m),  # m_val
-        Int32(kernel.grid_x),  # grid_x
+        Int32(compile_m),  # m_val
+        Int32(1),  # grid_x
         current_cuda_stream(),  # stream
         **compile_kwargs,
     )
@@ -3697,14 +3779,13 @@ def _get_micro_kernel(
         setattr(
             compiled,
             _DIRECT_MICRO_SHAPE_ATTR,
-            (quant_mode, int(m), int(k), int(n), int(num_topk), int(weight_E)),
+            cache_key,
         )
 
-    result = (compiled, kernel.grid_x)
     if reuse_compiled:
-        _MICRO_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _MICRO_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, kernel.grid_x
 
 
 def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
@@ -3768,6 +3849,122 @@ def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     return accepted
 
 
+class _StaticMoELaunch:
+    """Thin wrapper that makes compact static token counts runtime Int32."""
+
+    def __init__(self, kernel, *, k: int, num_topk: int, state_E: int):
+        self._kernel = kernel
+        self._k = k
+        self._half_k = k // 2
+        self._num_topk = num_topk
+        self._state_E = state_E
+        self._cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+
+    @cute.jit
+    def __call__(
+        self,
+        a_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
+        topk_weights_ptr: cute.Pointer,
+        packed_a_ptr: cute.Pointer,
+        sfa_ptr: cute.Pointer,
+        packed_a_storage_ptr: cute.Pointer,
+        scale_storage_ptr: cute.Pointer,
+        barrier_count: cute.Tensor,
+        barrier_epoch: cute.Tensor,
+        b_w13: cute.Tensor,
+        sfb_w13_ptr: cute.Pointer,
+        b_down: cute.Tensor,
+        sfb_down_ptr: cute.Pointer,
+        row_counts: cute.Tensor,
+        active_expert_count: cute.Tensor,
+        weight_expert_ids: cute.Tensor,
+        global_to_local_expert: cute.Tensor,
+        input_global_scale: cute.Tensor,
+        alpha: cute.Tensor,
+        down_alpha: cute.Tensor,
+        global_scale: cute.Tensor,
+        scatter_ptr: cute.Pointer,
+        token_map_ptr: cute.Pointer,
+        token_weights_ptr: cute.Pointer,
+        num_tokens: cutlass.Int32,
+        max_rows: cutlass.Int32,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        rows_pad_k = ((max_rows + Int32(127)) // Int32(128)) * Int32(128)
+        a_input = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
+        )
+        topk_ids = cute.make_tensor(
+            topk_ids_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        topk_weights_t = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        packed_a = cute.make_tensor(
+            packed_a_ptr,
+            layout=cute.make_layout(
+                (max_rows, self._k, self._state_E),
+                stride=(self._k, 1, max_rows * self._k),
+            ),
+        )
+        packed_a_storage = cute.make_tensor(
+            packed_a_storage_ptr,
+            layout=cute.make_layout(
+                (self._state_E * max_rows * self._half_k,), stride=(1,)
+            ),
+        )
+        scale_storage = cute.make_tensor(
+            scale_storage_ptr,
+            layout=cute.make_layout(
+                (self._state_E * rows_pad_k * self._cols_pad_k,), stride=(1,)
+            ),
+        )
+        scatter_output = cute.make_tensor(
+            scatter_ptr,
+            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+        )
+        token_map = cute.make_tensor(
+            token_map_ptr,
+            layout=cute.make_layout((self._state_E, max_rows), stride=(max_rows, 1)),
+        )
+        token_weights_t = cute.make_tensor(
+            token_weights_ptr,
+            layout=cute.make_layout((self._state_E, max_rows), stride=(max_rows, 1)),
+        )
+        self._kernel(
+            a_input,
+            topk_ids,
+            topk_weights_t,
+            packed_a,
+            sfa_ptr,
+            packed_a_storage,
+            scale_storage,
+            barrier_count,
+            barrier_epoch,
+            b_w13,
+            sfb_w13_ptr,
+            b_down,
+            sfb_down_ptr,
+            row_counts,
+            active_expert_count,
+            weight_expert_ids,
+            global_to_local_expert,
+            input_global_scale,
+            alpha,
+            down_alpha,
+            global_scale,
+            scatter_output,
+            token_map,
+            token_weights_t,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+
+
 class _DynamicMoELaunch:
     """Thin wrapper that makes num_tokens and max_rows runtime Int32."""
 
@@ -3821,7 +4018,7 @@ class _DynamicMoELaunch:
         rows_padded: cutlass.Int32,
         max_tasks: cutlass.Int32,
         max_phys_tiles: cutlass.Int32,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         a_input = cute.make_tensor(
@@ -3958,7 +4155,6 @@ def _get_dynamic_kernel(
         k,
         n,
         num_topk,
-        mac,
         mma_tiler_mn,
         topk_ids_dtype,
         fast_math,
@@ -3968,7 +4164,7 @@ def _get_dynamic_kernel(
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
-        return last_kval
+        return last_kval, mac
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED", "B12X_LEVEL10_REUSE_COMPILED"
     )
@@ -3979,7 +4175,7 @@ def _get_dynamic_kernel(
         cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
-            return cached
+            return cached, mac
 
     weight_dtype = cutlass.Float4E2M1FN
     a_scratch_dtype = weight_dtype
@@ -4139,7 +4335,7 @@ def _get_dynamic_kernel(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         launch,
         a_input_fake,
         topk_ids_fake,
@@ -4181,15 +4377,14 @@ def _get_dynamic_kernel(
         1,
         1,
         1,
-        mac,
+        1,
         current_cuda_stream(),
     )
 
-    result = (compiled, mac)
     if reuse_compiled:
-        _DYNAMIC_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _DYNAMIC_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, mac
 
 
 def _is_exact_relu2_bs1_nemotron_case(
@@ -4392,14 +4587,22 @@ def _launch_exact_relu2_bs1_nemotron(
     )
     assert isinstance(resolved, TPCompactStaticWorkspace)
     _reset_volatile_launch_state(resolved)
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+    ids_cutlass_dtype = (
+        cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
+    )
+    ids_align = 4 if flat_ids.dtype == torch.int32 else 8
     launcher.compiled(
-        a,
-        flat_ids,
-        flat_weights,
-        resolved.packed_a_view,
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, resolved.packed_a_view),
         resolved.sfa_ptr,
-        resolved.packed_a_flat,
-        resolved.scale_flat,
+        _gptr(cutlass.Uint8, resolved.packed_a_flat),
+        _gptr(cutlass.Uint8, resolved.scale_flat),
         resolved.barrier_count,
         resolved.barrier_epoch,
         launcher.weights.w13_fp4,
@@ -4414,9 +4617,12 @@ def _launch_exact_relu2_bs1_nemotron(
         launcher.weights.w1_alpha,
         launcher.weights.w2_alpha,
         launcher.down_input_scale,
-        scatter_output,
-        resolved.token_map,
-        resolved.token_weights,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, resolved.token_map, 4),
+        _gptr(cutlass.Float32, resolved.token_weights, 4),
+        int(a.shape[0]),
+        resolved.max_rows,
+        launcher.mac,
         current_cuda_stream(),
     )
     return scatter_output
@@ -4512,6 +4718,7 @@ def _launch_dynamic(
         workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
+        mac,
         stream,
     )
 
@@ -4552,7 +4759,7 @@ def _launch_compact_static(
         weight_E=weight_E,
     )
     if use_micro_direct:
-        if flat_ids.dtype in (torch.int32, torch.int64) and flat_ids.is_contiguous():
+        if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
             launch_ids = flat_ids
         else:
             launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
@@ -4563,7 +4770,7 @@ def _launch_compact_static(
             k,
             n,
             num_topk,
-            topk_ids_dtype=topk_ids_dtype,
+            topk_ids_dtype=launch_ids.dtype,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
@@ -4626,14 +4833,22 @@ def _launch_compact_static(
     )
     launch_ids = flat_ids
     _reset_volatile_launch_state(workspace)
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+    ids_cutlass_dtype = (
+        cutlass.Int32 if launch_ids.dtype == torch.int32 else cutlass.Int64
+    )
+    ids_align = 4 if launch_ids.dtype == torch.int32 else 8
     compiled(
-        a,
-        launch_ids,
-        flat_weights,
-        workspace.packed_a_view,
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, launch_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
         workspace.sfa_ptr,
-        workspace.packed_a_flat,
-        workspace.scale_flat,
+        _gptr(cutlass.Uint8, workspace.packed_a_flat),
+        _gptr(cutlass.Uint8, workspace.scale_flat),
         workspace.barrier_count,
         workspace.barrier_epoch,
         weights.w13_fp4,
@@ -4648,9 +4863,12 @@ def _launch_compact_static(
         weights.w1_alpha,
         weights.w2_alpha,
         down_input_scale,
-        scatter_output,
-        workspace.token_map,
-        workspace.token_weights,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, workspace.token_map, 4),
+        _gptr(cutlass.Float32, workspace.token_weights, 4),
+        m,
+        workspace.max_rows,
+        mac,
         stream,
     )
 

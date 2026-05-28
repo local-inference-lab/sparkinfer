@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", default=None, help="API key. Defaults to OPENAI_API_KEY, then EMPTY.")
     parser.add_argument("--system", default=None, help="Optional system message.")
     parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument(
@@ -133,6 +133,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        reasoning_effort="high",
     )
 
     state: dict[str, str] = {}

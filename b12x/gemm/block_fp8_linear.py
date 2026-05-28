@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import logging
+import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -24,6 +27,16 @@ from b12x.gemm.wo_projection import (
 )
 from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
+logger = logging.getLogger(__name__)
+_B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
+    "VLLM_B12X_TIMING", "0"
+) == "1"
+_B12X_TIMING_THRESHOLD_MS = float(
+    os.getenv(
+        "B12X_TIMING_THRESHOLD_MS",
+        os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
+    )
+)
 
 _SCRATCH_ALIGN_BYTES = 1024
 
@@ -666,7 +679,9 @@ def block_fp8_linear_mxfp8(
 
     assert x_q_storage is not None
     assert output_storage is not None
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
     x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
+    t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
         (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),
         (
@@ -683,8 +698,24 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
     )[:, :, 0]
+    t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
     if bias is not None:
         output += bias
+    if _B12X_TIMING:
+        t_done = time.perf_counter()
+        total_ms = (t_done - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_block_fp8_linear timing tokens=%d in=%d out=%d "
+                "quant_enqueue=%.3fms dense_gemm=%.3fms bias=%.3fms total=%.3fms",
+                int(tokens),
+                int(packed_weight.in_features),
+                int(packed_weight.out_features),
+                (t_quant - t0) * 1000.0,
+                (t_gemm - t_quant) * 1000.0,
+                (t_done - t_gemm) * 1000.0,
+                total_ms,
+            )
     return output.view(*source.shape[:-1], packed_weight.out_features)
 
 

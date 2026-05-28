@@ -31,6 +31,13 @@ def _import_sglang_nsa_indexer():
         module = importlib.import_module("sglang.srt.layers.attention.nsa.nsa_indexer")
     except Exception as exc:  # pragma: no cover - environment-dependent import path
         pytest.skip(f"unable to import sglang NSA indexer: {exc}")
+    if not (
+        hasattr(module.Indexer, "_use_b12x_indexer")
+        or hasattr(module.Indexer, "_use_b12x_mla_indexer")
+    ):
+        pytest.skip(
+            "sglang NSA/DSA indexer no longer exposes the legacy b12x boundary hooks"
+        )
     return module
 
 

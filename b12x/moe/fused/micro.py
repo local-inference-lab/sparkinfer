@@ -386,6 +386,23 @@ class MoEMicroKernelBackend:
         self.m1_fc2_onepass = False
         self.grid_x = 0
 
+    @property
+    def __cache_key__(self):
+        return (
+            self.sf_vec_size,
+            self.fast_math,
+            self.activation,
+            self.share_input_across_experts,
+            self.share_expert_scales,
+            self.single_token,
+            self.dynamic_down_scale,
+            self.compile_time_phase,
+            self.w4a16_mode,
+            self._cfg,
+            self.m_const,
+            self.m1_fc2_onepass,
+        )
+
     @cute.jit
     def _fp4_dot4_for_math(
         self,
@@ -520,7 +537,7 @@ class MoEMicroKernelBackend:
         m1_fc2_onepass = bool(m == 1 and grid_x >= fc2_tasks)
 
         self._cfg = cfg
-        self.m_const = m
+        self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
         self.grid_x = grid_x
 
@@ -570,6 +587,7 @@ class MoEMicroKernelBackend:
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
+        w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -602,18 +620,18 @@ class MoEMicroKernelBackend:
             xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
             xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
-            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
-            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0)
+            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0) if w_valid > Int32(0) else Uint32(0)
             bsf_byte0 = (sf_word0 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0)
+            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0) if w_valid > Int32(0) else Float32(0.0)
             out_acc0 = out_acc0 + bsf_f0 * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3) * scale_lane
 
-            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off1 = Int64(row_rb1) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_1) * Int64(16) + Int64(row_mode_a1) * Int64(4)
-            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1)
+            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1) if w_valid > Int32(0) else Uint32(0)
             bsf_byte1 = (sf_word1 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1)
+            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1) if w_valid > Int32(0) else Float32(0.0)
             out_acc1 = out_acc1 + bsf_f1 * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3) * scale_lane
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
@@ -646,6 +664,7 @@ class MoEMicroKernelBackend:
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
+        w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -735,6 +754,7 @@ class MoEMicroKernelBackend:
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
+        w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -775,32 +795,32 @@ class MoEMicroKernelBackend:
             xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
             xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
-            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
-            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0)
+            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0) if w_valid > Int32(0) else Uint32(0)
             bsf_byte0 = (sf_word0 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0)
+            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0) if w_valid > Int32(0) else Float32(0.0)
             out_acc0 = out_acc0 + bsf_f0 * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3) * scale_lane
 
-            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off1 = Int64(row_rb1) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_1) * Int64(16) + Int64(row_mode_a1) * Int64(4)
-            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1)
+            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1) if w_valid > Int32(0) else Uint32(0)
             bsf_byte1 = (sf_word1 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1)
+            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1) if w_valid > Int32(0) else Float32(0.0)
             out_acc1 = out_acc1 + bsf_f1 * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3) * scale_lane
 
-            u_packed2 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row2) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed2 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row2) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off2 = Int64(row_rb2) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_2) * Int64(16) + Int64(row_mode_a2) * Int64(4)
-            sf_word2 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off2)
+            sf_word2 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off2) if w_valid > Int32(0) else Uint32(0)
             bsf_byte2 = (sf_word2 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f2 = cvt_e4m3_to_f32_via_f16(bsf_byte2)
+            bsf_f2 = cvt_e4m3_to_f32_via_f16(bsf_byte2) if w_valid > Int32(0) else Float32(0.0)
             out_acc2 = out_acc2 + bsf_f2 * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3) * scale_lane
 
-            u_packed3 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row3) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed3 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row3) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off3 = Int64(row_rb3) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_3) * Int64(16) + Int64(row_mode_a3) * Int64(4)
-            sf_word3 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off3)
+            sf_word3 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off3) if w_valid > Int32(0) else Uint32(0)
             bsf_byte3 = (sf_word3 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f3 = cvt_e4m3_to_f32_via_f16(bsf_byte3)
+            bsf_f3 = cvt_e4m3_to_f32_via_f16(bsf_byte3) if w_valid > Int32(0) else Float32(0.0)
             out_acc3 = out_acc3 + bsf_f3 * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3) * scale_lane
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
@@ -839,7 +859,9 @@ class MoEMicroKernelBackend:
         lane_byte_off = Int64(lane) * Int64(4)
         token_inter_base = t * Int32(cfg.inter_u32)
         sf_cols = Int32(cfg.w2_sf_cols)
+        num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
+        w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -871,18 +893,18 @@ class MoEMicroKernelBackend:
             xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
             xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
-            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
-            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0)
+            sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0) if w_valid > Int32(0) else Uint32(0)
             bsf_byte0 = (sf_word0 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0)
+            bsf_f0 = cvt_e4m3_to_f32_via_f16(bsf_byte0) if w_valid > Int32(0) else Float32(0.0)
             out_acc0 = out_acc0 + bsf_f0 * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3) * scale_lane
 
-            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off)
+            u_packed1 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
             bsf_off1 = Int64(row_rb1) * Int64(sf_cols * 128) + Int64(lane_cb) * Int64(512) + Int64(row_mode_32_1) * Int64(16) + Int64(row_mode_a1) * Int64(4)
-            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1)
+            sf_word1 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off1) if w_valid > Int32(0) else Uint32(0)
             bsf_byte1 = (sf_word1 >> Uint32(bsf_byte_shift)) & Uint32(0xFF)
-            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1)
+            bsf_f1 = cvt_e4m3_to_f32_via_f16(bsf_byte1) if w_valid > Int32(0) else Float32(0.0)
             out_acc1 = out_acc1 + bsf_f1 * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3) * scale_lane
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
@@ -1098,7 +1120,7 @@ class MoEMicroKernelBackend:
         # ===================================================================
         # PHASE 1: FC1 over route-order tasks
         # ===================================================================
-        fc1_task_count = Int32(self.m_const * cfg.num_topk * cfg.fc1_chunks)
+        fc1_task_count = m_val * Int32(cfg.num_topk * cfg.fc1_chunks)
         fc1_task = Int32(bidx_x)
         if cutlass.const_expr(cfg.k_segments == 2):
             buf_idx = Int32(0)
@@ -1147,7 +1169,7 @@ class MoEMicroKernelBackend:
             prev_t = Int32(-1)
         while fc1_task < fc1_task_count:
             if cutlass.const_expr(self.w4a16_mode and self.m_const == 9 and (not cfg.k_segments_aligned) and cfg.k_segments == 6 and cfg.k_blocks == 168):
-                route_count = Int32(self.m_const * cfg.num_topk)
+                route_count = m_val * Int32(cfg.num_topk)
                 chunk_idx = fc1_task // route_count
                 route_idx = fc1_task - chunk_idx * route_count
             else:
@@ -1952,9 +1974,9 @@ class MoEMicroKernelBackend:
         # ---- m>=2 FC2 rowquad ----
         else:
             if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
-                fc2_task_count = Int32((self.m_const * cfg.k_dim) // (_K_PER_CTA * 2))
+                fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 2)
             else:
-                fc2_task_count = Int32((self.m_const * cfg.k_dim) // (_K_PER_CTA * 4))
+                fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 4)
             fc2_task = Int32(bidx_x)
             while fc2_task < fc2_task_count:
                 if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):

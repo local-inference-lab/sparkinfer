@@ -163,10 +163,10 @@ def _direct_micro_launchable(
     return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
 
 
-def test_nvfp4_direct_micro_resource_gate_rejects_qwen_bs8_shape() -> None:
+def test_nvfp4_direct_micro_launches_qwen_bs8_shape() -> None:
     _skip_if_no_sm120()
 
-    assert not _direct_micro_launchable("nvfp4", 8, 256, weight_E=512)
+    assert _direct_micro_launchable("nvfp4", 8, 256, weight_E=512)
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])

@@ -321,7 +321,6 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     torch.cuda.synchronize(device)
 
     pool = allocate_tp_moe_workspace_pool()
-    monkeypatch.setattr(tp_moe, "_eager_dynamic_token_chunk_limit", lambda *args, **kwargs: 13)
     monkeypatch.setattr(tp_moe, "_dynamic_token_chunk_limit", lambda *_args: 13)
     actual = b12x_moe_fp4(
         x,
@@ -588,22 +587,13 @@ def test_dynamic_chunk_limit_uses_compact_layout() -> None:
     assert compact_limit > old_limit
 
 
-def test_eager_dynamic_chunk_limit_uses_exact_routing_tiles() -> None:
+def test_dynamic_chunk_limit_uses_shape_capacity() -> None:
     m = 98_305
-    topk_ids = torch.arange(10, dtype=torch.int32).expand(m, -1).contiguous()
 
-    eager_limit = tp_moe._eager_dynamic_token_chunk_limit(
-        topk_ids,
-        weight_E=512,
-        k=4096,
-        n=256,
-        num_topk=10,
-    )
     compact_limit = tp_moe._dynamic_token_chunk_limit(512, 4096, 256, 10)
 
     assert compact_limit == 98_304
-    assert eager_limit == m
-    assert eager_limit > compact_limit
+    assert compact_limit < m
 
 
 def test_dynamic_task_geometry_caps_active_experts_by_routed_rows() -> None:
@@ -868,7 +858,7 @@ def test_forced_dynamic_single_expert_edge_sizes_match_oracle() -> None:
         _assert_oracle_match(metrics, label=f"forced dynamic edge size m={m}")
 
 
-def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
+def test_dynamic_workspace_pool_uses_capacity_geometry() -> None:
     require_sm120()
     _require_model_weights()
 
@@ -937,18 +927,18 @@ def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
     assert len(pool.workspaces) == 1
     pooled_workspace = next(iter(pool.workspaces.values()))
     assert isinstance(pooled_workspace, tp_moe.TPDynamicWorkspace)
-    exact_tiles, _, exact_tasks = tp_moe._dynamic_task_geometry_from_routing(
-        topk_ids,
-        weight_E=spec.num_experts,
-        n=spec.intermediate_size // spec.tp_size,
+    expected_tiles, _, expected_tasks = tp_moe._dynamic_task_geometry(
+        spec.num_experts,
+        spec.intermediate_size // spec.tp_size,
+        x.shape[0] * spec.top_k,
     )
     assert pooled_workspace.routed_rows_capacity == x.shape[0] * spec.top_k
     assert pooled_workspace.max_rows == tp_moe.align_up(x.shape[0] * spec.top_k, tp_moe._LEVEL_TILE_M)
-    assert pooled_workspace.physical_tiles_capacity == exact_tiles
-    assert pooled_workspace.task_capacity == exact_tasks
+    assert pooled_workspace.physical_tiles_capacity == expected_tiles
+    assert pooled_workspace.task_capacity == expected_tasks
     assert tuple(pooled_workspace.packed_input.shape) == (
         1,
-        exact_tiles * tp_moe._LEVEL_TILE_M,
+        expected_tiles * tp_moe._LEVEL_TILE_M,
         spec.hidden_size // 2,
     )
 

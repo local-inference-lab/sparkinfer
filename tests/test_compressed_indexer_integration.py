@@ -591,10 +591,10 @@ def test_compressed_index_decode_dense_topk_fp8_rekeys_compact_page_widths() -> 
 
     rows = 1
     num_heads = 64
-    first_width_blocks = 1
+    first_width_blocks = 8
     second_width_blocks = 16
     workspace_width_blocks = 64
-    topk = 8
+    topk = 512
     q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
     weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
         device=device

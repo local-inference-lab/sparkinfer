@@ -76,32 +76,29 @@ def test_plane_tma_descriptor_cache_keeps_distinct_layer_bindings() -> None:
 
 def test_cached_host_launcher_warms_compile_cache_during_capture(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    import b12x.attention.paged.api as paged_api
 
     class _Compiled:
         def __init__(self) -> None:
-            self.generate_calls = 0
-            self.run_calls = 0
+            self.calls = 0
 
-        def generate_execution_args(self, *args):
-            self.generate_calls += 1
-            return args, None
+        def __call__(self, *args):
+            self.calls += 1
+            assert args == ("arg",)
 
-        def run_compiled_program(self, exe_args) -> None:
-            self.run_calls += 1
-            assert exe_args == ("arg",)
+    def fake_compile(kernel, *args):
+        kernel.compile_calls += 1
+        assert args == ("arg",)
+        return kernel.compiled
+
+    monkeypatch.setattr(paged_api, "b12x_compile", fake_compile)
 
     class _Kernel:
         def __init__(self) -> None:
-            self.compile_only_calls = 0
-            self.raw_launch_calls = 0
+            self.compile_calls = 0
             self.compiled = _Compiled()
 
-        def __call__(self, *args, compile_only: bool = False):
-            if compile_only:
-                self.compile_only_calls += 1
-                assert args == ("arg",)
-                return self.compiled
-            self.raw_launch_calls += 1
+        def __call__(self, *args):
             assert args == ("arg",)
             return None
 
@@ -111,7 +108,5 @@ def test_cached_host_launcher_warms_compile_cache_during_capture(monkeypatch) ->
     _run_cached_host_launcher(kernel, cache_key, ("arg",))
     _run_cached_host_launcher(kernel, cache_key, ("arg",))
 
-    assert kernel.compile_only_calls == 1
-    assert kernel.raw_launch_calls == 2
-    assert kernel.compiled.generate_calls == 0
-    assert kernel.compiled.run_calls == 0
+    assert kernel.compile_calls == 1
+    assert kernel.compiled.calls == 2

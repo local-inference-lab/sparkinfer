@@ -714,7 +714,7 @@ class TinyMlaPvProbeKernel:
         if const_expr(mOut.element_type != cutlass.Float32):
             raise TypeError("out must be Float32")
         if const_expr(mP.shape != (_MLA_HEADS_PER_TILE, _MLA_TOKEN_TILE)):
-            raise ValueError("P must have shape (16, 32)")
+            raise ValueError(f"P must have shape ({_MLA_HEADS_PER_TILE}, {_MLA_TOKEN_TILE})")
         if const_expr(mVWords.shape != (_MLA_TOKEN_TILE, _MLA_NOPE_GROUP_KV_VECS * 4)):
             raise ValueError("V words must have shape (32, 32)")
         if const_expr(mScale.shape != (_MLA_TOKEN_TILE,)):
@@ -742,8 +742,8 @@ class TinyMlaPvProbeKernel:
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        sScale = storage.token_scale_a.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         token_local = lane
         while token_local < Int32(_MLA_TOKEN_TILE):
@@ -958,9 +958,9 @@ class LiveMlaPvProbeKernel:
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        sScale = storage.token_scale_a.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
         p_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 4), stride=(8, 4, 1))
@@ -984,14 +984,17 @@ class LiveMlaPvProbeKernel:
             Int32(page_table_1.shape[1]),
             Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
+            False,
         )
 
         m_frag = cute.make_rmem_tensor(md_layout, Float32)
         d_frag = cute.make_rmem_tensor(md_layout, Float32)
+        o_rescale_frag = cute.make_rmem_tensor(md_layout, Float32)
         for row_slot in cutlass.range_constexpr(2):
             m_frag[0, row_slot] = Float32(-Float32.inf)
             d_frag[0, row_slot] = Float32(0.0)
-        _update_softmax_stats_b2(score_frag, m_frag, d_frag)
+            o_rescale_frag[0, row_slot] = Float32(1.0)
+        _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
 
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
         _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
@@ -1211,9 +1214,9 @@ class LiveMlaPvRegisterDumpKernel:
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        sScale = storage.token_scale_a.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
         p_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 4), stride=(8, 4, 1))
@@ -1236,14 +1239,17 @@ class LiveMlaPvRegisterDumpKernel:
             Int32(page_table_1.shape[1]),
             Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
+            False,
         )
 
         m_frag = cute.make_rmem_tensor(md_layout, Float32)
         d_frag = cute.make_rmem_tensor(md_layout, Float32)
+        o_rescale_frag = cute.make_rmem_tensor(md_layout, Float32)
         for row_slot in cutlass.range_constexpr(2):
             m_frag[0, row_slot] = Float32(-Float32.inf)
             d_frag[0, row_slot] = Float32(0.0)
-        _update_softmax_stats_b2(score_frag, m_frag, d_frag)
+            o_rescale_frag[0, row_slot] = Float32(1.0)
+        _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
 
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
         _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
@@ -1398,8 +1404,8 @@ class TinyMxfp8RawQkProbeKernelV2:
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        k_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        k_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         _stage_q_u32_block(
             q_u32,
@@ -1561,8 +1567,8 @@ class TinyBf16RawQkProbeKernel:
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        k_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        k_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         _stage_q_u32_block(
             q_u32,
@@ -1645,13 +1651,13 @@ class TinyRawFp8QLoadProbeKernel:
 
         @cute.struct
         class SharedStorage:
-            q_stage: cute.struct.Align[
+            q_group_stage: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, _MLA_HEADS_PER_TILE * 128],
                 16,
             ]
 
         storage = smem.allocate(SharedStorage)
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
 
         linear = lane
         total = Int32(_MLA_HEADS_PER_TILE) * Int32(128 // 16)
@@ -1725,9 +1731,9 @@ class TinyRawFp8QkProbeKernel:
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        k_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
-        s_q_bytes = storage.q_stage.get_tensor(
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        k_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+        s_q_bytes = storage.q_group_stage.get_tensor(
             cute.make_layout((_MLA_HEADS_PER_TILE, 128), stride=(128, 1))
         )
 
@@ -2019,8 +2025,8 @@ class FullMxfp8ScoreProbeKernel:
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        k_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        k_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         _stage_q_u32_block(
             q_u32,
@@ -2149,9 +2155,9 @@ class ScoreTileProbeKernel:
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        sScale = storage.token_scale_a.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
         frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
         score_frag = cute.make_rmem_tensor(frag_layout, Float32)
@@ -2171,6 +2177,7 @@ class ScoreTileProbeKernel:
             Int32(token_end[Int32(0)]),
             Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
             lane,
+            False,
         )
         for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
             for reg_id in cutlass.range_constexpr(8):
@@ -2256,9 +2263,9 @@ def test_tiny_mla_pv_probe_bf16_path_matches_reference() -> None:
     device = require_sm120()
     torch.manual_seed(0)
 
-    p = torch.randn((16, 32), device=device, dtype=torch.float32).to(torch.bfloat16) / 4
-    scales = torch.linspace(0.125, 1.5, 32, device=device, dtype=torch.float32)
-    v_src = torch.randn((32, 128), device=device, dtype=torch.float32) / 4
+    p = torch.randn((16, _MLA_TOKEN_TILE), device=device, dtype=torch.float32).to(torch.bfloat16) / 4
+    scales = torch.linspace(0.125, 1.5, _MLA_TOKEN_TILE, device=device, dtype=torch.float32)
+    v_src = torch.randn((_MLA_TOKEN_TILE, 128), device=device, dtype=torch.float32) / 4
 
     actual, ref = _run_probe(p=p, v_src=v_src, scales=scales, use_mxfp8=False)
     torch.testing.assert_close(actual, ref, atol=5e-2, rtol=0.0)
@@ -2301,9 +2308,9 @@ def test_tiny_mla_pv_probe_mxfp8_unit_scale_matches_reference() -> None:
     device = require_sm120()
     torch.manual_seed(1)
 
-    p = torch.randn((16, 32), device=device, dtype=torch.float32).to(torch.bfloat16) / 2
-    scales = torch.ones((32,), device=device, dtype=torch.float32)
-    v_src = torch.randn((32, 128), device=device, dtype=torch.float32) / 2
+    p = torch.randn((16, _MLA_TOKEN_TILE), device=device, dtype=torch.float32).to(torch.bfloat16) / 2
+    scales = torch.ones((_MLA_TOKEN_TILE,), device=device, dtype=torch.float32)
+    v_src = torch.randn((_MLA_TOKEN_TILE, 128), device=device, dtype=torch.float32) / 2
 
     actual, ref = _run_probe(p=p, v_src=v_src, scales=scales, use_mxfp8=True)
     diff = (actual - ref).abs().max().item()

@@ -6,7 +6,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 import os
-import warnings
 
 import cutlass
 import cutlass.cute as cute
@@ -19,6 +18,7 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
@@ -352,22 +352,15 @@ def _run_cached_host_launcher(
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
         raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
+            "cute.compile",
             target=kernel,
             cache_key=cache_key,
         )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
+        compiled = b12x_compile(kernel, *args)
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
+    compiled(*args)
 
 
 def _assume_paged_k_tma_source_aligned(t: cute.Tensor):

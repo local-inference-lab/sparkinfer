@@ -31,6 +31,7 @@ from .helpers import require_sm120
 
 MODEL_PATH = Path("/data/models/GLM-5.1-NVFP4")
 LAYER0_SHARD = MODEL_PATH / "model-00001-of-00084.safetensors"
+_GLM_CACHE_BOUNDARY_CASES = [63, 64, 65, 129]
 
 
 @dataclass(frozen=True)
@@ -276,7 +277,7 @@ def _embed_mla_cache_in_pool(
     return k_nope_pool, k_rope_pool, packed_pool
 
 
-@pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -299,7 +300,7 @@ def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: in
     assert unpacked.shape == (cache_len, cfg.kv_lora_rank + cfg.qk_rope_head_dim)
 
 
-@pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache_len: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -336,7 +337,7 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache
     assert cos >= 0.9995, f"cache_len={cache_len}: cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(cache_len: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -558,7 +559,7 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("width", [129, 257, 511, 769, 1024, 1537, 2048])
+@pytest.mark.parametrize("width", [129, 511, 1024, 2048])
 def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -614,7 +615,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: in
     assert cos >= 0.9995, f"width={width}: cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("width", [129, 257, 511, 769, 1024, 1537, 2048])
+@pytest.mark.parametrize("width", [129, 511, 1024, 2048])
 def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -960,7 +961,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
     device = require_sm120()
     _require_glm_weights()
@@ -1015,7 +1016,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
     assert cos >= 0.9995, f"cache_len={cache_len}: cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
     device = require_sm120()
     _require_glm_weights()

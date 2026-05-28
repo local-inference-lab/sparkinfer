@@ -1326,10 +1326,10 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
             upcast_stride_full,
         )
         b_f8_0, b_f8_1, b_f8_2, b_f8_3 = ldmatrix_m8n8x4_b16(k_addr)
-        b_f8_0 = frag_layout_swizzle_16b_to_8b(b_f8_0)
-        b_f8_1 = frag_layout_swizzle_16b_to_8b(b_f8_1)
-        b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
-        b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_1)
+        b_f8_left0 = frag_layout_swizzle_16b_to_8b(b_f8_0)
+        b_f8_left1 = frag_layout_swizzle_16b_to_8b(b_f8_2)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_left0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_left1)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
             s_frag[0, 0, 1],
@@ -1363,10 +1363,10 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
             _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q),
             mma_d1,
         ) - Int32(16 * upcast_stride_q)
-        b_f8_2 = frag_layout_swizzle_16b_to_8b(b_f8_2)
-        b_f8_3 = frag_layout_swizzle_16b_to_8b(b_f8_3)
-        b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_2)
-        b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_3)
+        b_f8_right0 = frag_layout_swizzle_16b_to_8b(b_f8_1)
+        b_f8_right1 = frag_layout_swizzle_16b_to_8b(b_f8_3)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_right0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_right1)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
             s_frag[0, 0, 1],

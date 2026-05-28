@@ -45,6 +45,10 @@ def test_cached_host_launcher_allows_hits_but_rejects_new_resolution() -> None:
         def __init__(self) -> None:
             self.run_count = 0
 
+        def __call__(self, *args):
+            exe_args, _ = self.generate_execution_args(*args)
+            self.run_compiled_program(exe_args)
+
         def generate_execution_args(self, *args):
             return args, None
 

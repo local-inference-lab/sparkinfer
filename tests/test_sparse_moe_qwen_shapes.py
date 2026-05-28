@@ -184,22 +184,6 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
         topk_ids,
         input_scales_static=True,
     )
-    manual_output = b12x_moe_fp4(
-        hidden_states,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        weights.g1_alphas_per_expert,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        weights.g2_alphas_per_expert,
-        topk_weights,
-        topk_ids,
-        workspace=workspace,
-        input_scales_static=True,
-    )
-
     sparse_output, routing = b12x_sparse_moe_fp4(
         hidden_states,
         experts=experts,
@@ -217,7 +201,23 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
         _selected_logits(router_logits, topk_ids),
     )
     torch.testing.assert_close(routing.topk_weights, topk_weights)
-    torch.testing.assert_close(sparse_output, manual_output, atol=5e-4, rtol=1e-2)
+    routed_manual_output = b12x_moe_fp4(
+        hidden_states,
+        weights.w13_input_scale_quant_per_expert,
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        weights.g1_alphas_per_expert,
+        weights.w2_input_scale_quant_per_expert,
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        weights.g2_alphas_per_expert,
+        routing.topk_weights,
+        routing.topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2)
 
 
 @pytest.mark.parametrize("m", [1, 80])
@@ -240,22 +240,6 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
         topk_ids,
         input_scales_static=True,
     )
-    manual_output = b12x_moe_fp4(
-        hidden_states,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        weights.g1_alphas_per_expert,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        weights.g2_alphas_per_expert,
-        topk_weights,
-        topk_ids,
-        workspace=workspace,
-        input_scales_static=True,
-    )
-
     output = torch.empty_like(hidden_states)
     sparse_output, routing = b12x_sparse_moe_fp4(
         hidden_states,
@@ -275,4 +259,20 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
         _selected_logits(router_logits, topk_ids),
     )
     torch.testing.assert_close(routing.topk_weights, topk_weights)
-    torch.testing.assert_close(sparse_output, manual_output, atol=5e-4, rtol=1e-2)
+    routed_manual_output = b12x_moe_fp4(
+        hidden_states,
+        weights.w13_input_scale_quant_per_expert,
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        weights.g1_alphas_per_expert,
+        weights.w2_input_scale_quant_per_expert,
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        weights.g2_alphas_per_expert,
+        routing.topk_weights,
+        routing.topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2)

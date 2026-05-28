@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Uint32
 
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
@@ -84,6 +85,15 @@ _SCALE_FORMATS = {
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
+
+
+def _m_specialization_key(size_m: int) -> int:
+    """M bucket for branches that genuinely specialize on token count."""
+    return 1 if int(size_m) == 1 else 0
+
+
+def _fake_m_for_specialization(size_m: int) -> int:
+    return 1 if _m_specialization_key(size_m) == 1 else 2
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
@@ -512,6 +522,29 @@ class W4A16GemmKernel:
         self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
         self.shared_words = self.shared_int4 * 4
 
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            self.size_n,
+            self.size_k,
+            self.num_experts,
+            self.top_k,
+            self.mul_topk_weights,
+            self.tile_n,
+            self.tile_k,
+            self.cta_threads,
+            self.moe_block_size,
+            self.element_dtype,
+            self.epilogue_relu2,
+            self.weight_layout,
+            self.scale_format,
+            self.single_token_route_fast_path,
+            self.direct_topk_routes,
+            self.cta_m_blocks,
+            self.uses_m_block_8,
+            self.shared_words,
+        )
+
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
         row = i // Int32(self.a_gl_rd_delta_o)
@@ -639,9 +672,10 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        grid_x = self.sms * self.blocks_per_sm
         grid = (grid_x, 1, 1)
         self.kernel(
             a_bf16_flat,
@@ -655,6 +689,7 @@ class W4A16GemmKernel:
             topk_weights_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
+            active_m,
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
@@ -675,6 +710,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -710,7 +746,7 @@ class W4A16GemmKernel:
             tid,
             cta,
             Int32(grid_x),
-            Int32(self.size_m),
+            Int32(active_m),
         )
 
     @cute.jit
@@ -2898,6 +2934,32 @@ class W4A16FusedMoeKernel:
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
 
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            self.hidden_size,
+            self.intermediate_size,
+            self.fc1_cols,
+            self.num_experts,
+            self.top_k,
+            self.activation,
+            self.activation_is_gated,
+            self.has_swiglu_limit,
+            self.swiglu_limit,
+            self.weight_layout,
+            self.scale_format,
+            self.apply_router_weight_on_input,
+            self.zero_fc2_output,
+            self.element_dtype,
+            self.fast_math,
+            self.direct_topk_routes,
+            self.fc1.__cache_key__,
+            self.fc2.__cache_key__,
+            self.cta_threads,
+            self.sms,
+            self.shared_words,
+        )
+
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
         if cutlass.const_expr(self.is_fp16):
@@ -2942,6 +3004,7 @@ class W4A16FusedMoeKernel:
         fc2_c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         a_bf16_flat = cute.make_tensor(
@@ -2954,7 +3017,6 @@ class W4A16FusedMoeKernel:
             topk_weights_ptr,
             layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
         )
-        grid_x = self.sms * self.blocks_per_sm
         grid = (grid_x, 1, 1)
         self.kernel(
             a_bf16_flat,
@@ -3201,6 +3263,19 @@ class W4A16ActivationKernel:
         self.fast_math = bool(fast_math)
         self.cta_threads = 256
 
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            self.intermediate_size,
+            self.activation,
+            self.is_gated,
+            self.has_swiglu_limit,
+            self.swiglu_limit,
+            self.element_dtype,
+            self.fast_math,
+            self.cta_threads,
+        )
+
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
         if cutlass.const_expr(self.is_fp16):
@@ -3229,22 +3304,28 @@ class W4A16ActivationKernel:
         self,
         fc1_flat: cute.Tensor,
         activated_flat: cute.Tensor,
+        active_rows: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        total = self.rows * self.intermediate_size
+        total = active_rows * Int32(self.intermediate_size)
         grid = (_covering_count(total, self.cta_threads), 1, 1)
-        self.kernel(fc1_flat, activated_flat).launch(
+        self.kernel(fc1_flat, activated_flat, active_rows).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, fc1_flat: cute.Tensor, activated_flat: cute.Tensor):
+    def kernel(
+        self,
+        fc1_flat: cute.Tensor,
+        activated_flat: cute.Tensor,
+        active_rows: cutlass.Int32,
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
-        total = Int32(self.rows * self.intermediate_size)
+        total = Int32(active_rows) * Int32(self.intermediate_size)
         if idx < total:
             if cutlass.const_expr(self.is_gated):
                 row = idx // Int32(self.intermediate_size)
@@ -3272,13 +3353,12 @@ class W4A16ActivationKernel:
 
 class W4A16TopKSumKernel:
     def __init__(
-        self, *, m: int, topk: int, hidden_size: int, element_dtype: str = "bf16"
+        self, *, topk: int, hidden_size: int, element_dtype: str = "bf16"
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
-        if m <= 0 or topk <= 0 or hidden_size <= 0:
-            raise ValueError("m, topk, and hidden_size must be positive")
-        self.m = int(m)
+        if topk <= 0 or hidden_size <= 0:
+            raise ValueError("topk and hidden_size must be positive")
         self.topk = int(topk)
         self.hidden_size = int(hidden_size)
         self.element_dtype = element_dtype
@@ -3309,7 +3389,7 @@ class W4A16TopKSumKernel:
             output_ptr,
             layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
-        total = self.m * self.hidden_size
+        total = active_m * Int32(self.hidden_size)
         grid = (_covering_count(total, self.cta_threads), 1, 1)
         self.kernel(fc2_flat, output_flat, active_m).launch(
             grid=grid,
@@ -3418,31 +3498,39 @@ def compile_w4a16_gemm(
         device = None
         sms = 120
         max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+    kernel = W4A16GemmKernel(
+        size_m=size_m,
+        size_n=size_n,
+        size_k=size_k,
+        num_experts=num_experts,
+        top_k=top_k,
+        mul_topk_weights=mul_topk_weights,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        scale_format=scale_format,
+    )
     cache_key = (
         "w4a16_gemm",
         device,
-        sms,
-        max_shared_mem,
-        element_dtype,
-        size_m,
-        size_n,
-        size_k,
-        num_experts,
-        top_k,
-        mul_topk_weights,
-        tile_n,
-        tile_k,
-        moe_block_size,
-        max_m_blocks,
-        scale_format,
+        kernel.__cache_key__,
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        return replace(
+            cached,
+            max_m_blocks=max_m_blocks,
+            blocks_per_sm=kernel.blocks_per_sm,
+        )
 
+    compile_size_m = _fake_m_for_specialization(size_m)
+    compile_route_blocks = 1
+    compile_route_slots = compile_route_blocks * int(moe_block_size)
     a_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (size_m * size_k,),
+        (compile_size_m * size_k,),
         assumed_align=16,
     )
     b_fake = cute.runtime.make_fake_compact_tensor(
@@ -3452,7 +3540,7 @@ def compile_w4a16_gemm(
     )
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (size_m * top_k * size_n,),
+        (compile_size_m * top_k * size_n,),
         assumed_align=16,
     )
     scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -3474,12 +3562,12 @@ def compile_w4a16_gemm(
     )
     packed_routes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (max_m_blocks * moe_block_size,),
+        (compile_route_slots,),
         assumed_align=16,
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (max_m_blocks,),
+        (compile_route_blocks,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -3489,14 +3577,14 @@ def compile_w4a16_gemm(
     )
     topk_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (size_m * top_k,),
+        (compile_size_m * top_k,),
         assumed_align=4,
     )
     c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (
             max(
-                size_n * max_m_blocks * moe_block_size,
+                size_n * compile_route_slots,
                 4 * 256 * moe_block_size * 256,
             ),
         ),
@@ -3508,24 +3596,10 @@ def compile_w4a16_gemm(
         assumed_align=16,
     )
 
-    kernel = W4A16GemmKernel(
-        size_m=size_m,
-        size_n=size_n,
-        size_k=size_k,
-        num_experts=num_experts,
-        top_k=top_k,
-        mul_topk_weights=mul_topk_weights,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        moe_block_size=moe_block_size,
-        max_m_blocks=max_m_blocks,
-        element_dtype=element_dtype,
-        scale_format=scale_format,
-    )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         a_fake,
         b_fake,
@@ -3538,6 +3612,8 @@ def compile_w4a16_gemm(
         topk_fake,
         c_tmp_fake,
         locks_fake,
+        Int32(compile_size_m),
+        Int32(1),
         current_cuda_stream(),
     )
     result = W4A16GemmCompileResult(
@@ -3643,40 +3719,50 @@ def compile_w4a16_fused_moe(
                 "fused W4A16 FC1/FC2 selected different thread counts: "
                 f"{fc1_cta_threads} vs {fc2_cta_threads}"
             )
+    kernel = W4A16FusedMoeKernel(
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        zero_fc2_output=zero_fc2_output,
+        fc1_tile_n=fc1_tile_n,
+        fc1_tile_k=fc1_tile_k,
+        fc2_tile_n=fc2_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        swiglu_limit=swiglu_limit,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        direct_topk_routes=direct_topk_routes,
+    )
     cache_key = (
         "w4a16_fused_moe",
         device,
-        sms,
-        max_shared_mem,
-        element_dtype,
-        size_m,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        activation,
-        bool(apply_router_weight_on_input),
-        bool(zero_fc2_output),
-        bool(fast_math),
-        swiglu_limit,
-        weight_layout,
-        fc1_tile_n,
-        fc1_tile_k,
-        fc2_tile_n,
-        fc2_tile_k,
-        moe_block_size,
-        max_m_blocks,
-        scale_format,
-        direct_topk_routes,
+        kernel.__cache_key__,
     )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        return replace(
+            cached,
+            size_m=size_m,
+            max_m_blocks=max_m_blocks,
+            blocks_per_sm=kernel.blocks_per_sm,
+        )
 
+    compile_size_m = _fake_m_for_specialization(size_m)
+    compile_routed_rows = int(compile_size_m) * int(top_k)
+    compile_route_blocks = compile_routed_rows if direct_topk_routes else 1
+    compile_route_slots = compile_route_blocks * int(moe_block_size)
     packed_route_fake_elements = (
-        int(size_m) * int(top_k)
+        compile_routed_rows
         if direct_topk_routes
-        else int(max_m_blocks) * int(moe_block_size)
+        else compile_route_slots
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     w13_fake = cute.runtime.make_fake_compact_tensor(
@@ -3691,17 +3777,17 @@ def compile_w4a16_fused_moe(
     )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (routed_rows * fc1_cols,),
+        (compile_routed_rows * fc1_cols,),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (routed_rows * intermediate_size,),
+        (compile_routed_rows * intermediate_size,),
         assumed_align=16,
     )
     fc2_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (routed_rows * hidden_size,),
+        (compile_routed_rows * hidden_size,),
         assumed_align=16,
     )
     w13_scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -3745,7 +3831,7 @@ def compile_w4a16_fused_moe(
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (max_m_blocks,),
+        (compile_route_blocks,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -3758,7 +3844,7 @@ def compile_w4a16_fused_moe(
         cutlass.Float32,
         (
             max(
-                fc1_cols * max_m_blocks * moe_block_size,
+                fc1_cols * compile_route_slots,
                 4 * 256 * moe_block_size * 256,
             ),
         ),
@@ -3768,7 +3854,7 @@ def compile_w4a16_fused_moe(
         cutlass.Float32,
         (
             max(
-                hidden_size * max_m_blocks * moe_block_size,
+                hidden_size * compile_route_slots,
                 4 * 256 * moe_block_size * 256,
             ),
         ),
@@ -3780,32 +3866,10 @@ def compile_w4a16_fused_moe(
         assumed_align=16,
     )
 
-    kernel = W4A16FusedMoeKernel(
-        size_m=size_m,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        top_k=top_k,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        zero_fc2_output=zero_fc2_output,
-        fc1_tile_n=fc1_tile_n,
-        fc1_tile_k=fc1_tile_k,
-        fc2_tile_n=fc2_tile_n,
-        fc2_tile_k=fc2_tile_k,
-        moe_block_size=moe_block_size,
-        max_m_blocks=max_m_blocks,
-        element_dtype=element_dtype,
-        fast_math=fast_math,
-        swiglu_limit=swiglu_limit,
-        weight_layout=weight_layout,
-        scale_format=scale_format,
-        direct_topk_routes=direct_topk_routes,
-    )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         a_fake,
         w13_fake,
@@ -3824,6 +3888,7 @@ def compile_w4a16_fused_moe(
         fc1_c_tmp_fake,
         fc2_c_tmp_fake,
         locks_fake,
+        1,
         1,
         current_cuda_stream(),
     )
@@ -3876,30 +3941,6 @@ def compile_w4a16_activation(
     swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
     if swiglu_limit is not None and not is_gated:
         raise ValueError("swiglu_limit requires a gated W4A16 activation")
-    cache_key = (
-        "w4a16_activation",
-        element_dtype,
-        rows,
-        intermediate_size,
-        activation,
-        fast_math,
-        swiglu_limit,
-    )
-    cached = _ACTIVATION_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    w13_shards = 2 if is_gated else 1
-    fc1_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (rows * w13_shards * intermediate_size,),
-        assumed_align=16,
-    )
-    activated_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (rows * intermediate_size,),
-        assumed_align=16,
-    )
     kernel = W4A16ActivationKernel(
         rows=rows,
         intermediate_size=intermediate_size,
@@ -3908,13 +3949,34 @@ def compile_w4a16_activation(
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
     )
+    cache_key = (
+        "w4a16_activation",
+        kernel.__cache_key__,
+    )
+    cached = _ACTIVATION_CACHE.get(cache_key)
+    if cached is not None:
+        return replace(cached, rows=rows)
+
+    w13_shards = 2 if is_gated else 1
+    compile_rows = _fake_m_for_specialization(rows)
+    fc1_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        (compile_rows * w13_shards * intermediate_size,),
+        assumed_align=16,
+    )
+    activated_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        (compile_rows * intermediate_size,),
+        assumed_align=16,
+    )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         fc1_fake,
         activated_fake,
+        Int32(compile_rows),
         current_cuda_stream(),
     )
     result = W4A16ActivationCompileResult(
@@ -3936,7 +3998,7 @@ def compile_w4a16_topk_sum(
     element_dtype: str = "bf16",
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
-    cache_key = ("w4a16_topk_sum", element_dtype, m, topk, hidden_size)
+    cache_key = ("w4a16_topk_sum", element_dtype, topk, hidden_size)
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -3944,7 +4006,6 @@ def compile_w4a16_topk_sum(
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     output_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     kernel = W4A16TopKSumKernel(
-        m=m,
         topk=topk,
         hidden_size=hidden_size,
         element_dtype=element_dtype,
@@ -3952,7 +4013,7 @@ def compile_w4a16_topk_sum(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         fc2_fake,
         output_fake,
@@ -3961,7 +4022,7 @@ def compile_w4a16_topk_sum(
     )
     result = W4A16TopKSumCompileResult(
         compiled=compiled,
-        m=m,
+        m=0,
         topk=topk,
         hidden_size=hidden_size,
     )
@@ -4439,6 +4500,7 @@ def run_w4a16_moe(
         fc2_scratch,
         prepared.workspace,
         m,
+        sms * int(fused.blocks_per_sm),
         stream,
     )
 
@@ -4455,10 +4517,10 @@ def run_w4a16_moe(
             int(topk_sum_launch.topk),
             int(topk_sum_launch.hidden_size),
         )
-        if int(topk_sum_launch.m) < m or actual_sum != expected_sum:
+        if actual_sum != expected_sum:
             raise RuntimeError(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
-                f"requested={(m,) + expected_sum}, planned={(int(topk_sum_launch.m),) + actual_sum}"
+                f"requested={expected_sum}, planned={actual_sum}"
             )
         sum_kernel = topk_sum_launch
     sum_kernel.compiled(

@@ -486,7 +486,7 @@ class MoEDynamicKernelBackend:
         scatter_output: cute.Tensor,   # [num_tokens, K]
         token_map: cute.Tensor,
         token_weights: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self.a_dtype = packed_a.element_type

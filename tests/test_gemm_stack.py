@@ -14,13 +14,20 @@ _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
     sys.path.insert(0, str(_FLASHINFER_ROOT))
 
-from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
-from flashinfer.gemm import mm_fp4
-
 from .helpers import require_sm120
 
 
-def _require_cudnn_fp4() -> None:
+def _import_flashinfer_gemm():
+    try:
+        from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+        from flashinfer.gemm import mm_fp4
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"FlashInfer GEMM unavailable: {exc}")
+    return CUDNN_AVAILABLE, mm_fp4
+
+
+def _require_cudnn_fp4():
+    CUDNN_AVAILABLE, mm_fp4 = _import_flashinfer_gemm()
     if not CUDNN_AVAILABLE:
         pytest.skip("cuDNN Python bindings not installed")
     try:
@@ -28,6 +35,7 @@ def _require_cudnn_fp4() -> None:
         _check_cudnn_fp4_availability()
     except RuntimeError as e:
         pytest.skip(f"cuDNN FP4 not available: {e}")
+    return mm_fp4
 
 
 def _make_quantized_operand(
@@ -85,7 +93,7 @@ def test_dense_gemm_matches_flashinfer_cudnn(
     M: int, N: int, K: int, c_dtype_str: str,
 ) -> None:
     require_sm120()
-    _require_cudnn_fp4()
+    mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(42)
 
     lhs, lhs_scale = _make_quantized_operand((1, M, K), dtype=torch.bfloat16)
@@ -203,4 +211,4 @@ def test_default_dense_tile_selector_handles_small_m_wide_n(
     sm_count: int,
     expected: tuple[int, int],
 ) -> None:
-    assert _select_default_mma_tiler_mn(m, n, sm_count) == expected
+    assert _select_default_mma_tiler_mn(m, n, sm_count, is_mxfp8=False) == expected

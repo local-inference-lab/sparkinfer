@@ -4,7 +4,9 @@ import torch
 
 import cutlass
 
+from b12x.attention.paged.api import _to_kernel_tensor, _torch_to_cutlass_dtype
 from b12x.attention.paged.merge import PagedPersistentMergeKernel
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.utils import current_cuda_stream
 
 from .helpers import require_sm120
@@ -97,6 +99,34 @@ def _make_regular_decode_graph_merge_problem(
     return fixed_partial_o, fixed_partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr
 
 
+def _run_merge_kernel(
+    kernel: PagedPersistentMergeKernel,
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    merge_indptr: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    total_rows_ptr: torch.Tensor | None,
+) -> None:
+    args = (
+        _to_kernel_tensor(partial_o, _torch_to_cutlass_dtype(partial_o.dtype)),
+        _to_kernel_tensor(partial_lse, cutlass.Float32),
+        _to_kernel_tensor(merge_indptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(cache_seqlens, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
+        _to_kernel_tensor(lse, cutlass.Float32),
+        None
+        if total_rows_ptr is None
+        else _to_kernel_tensor(total_rows_ptr, cutlass.Int32, assumed_align=4),
+        current_cuda_stream(),
+    )
+    compiled = b12x_compile(kernel, *args)
+    compiled(*args)
+
+
 @torch.inference_mode()
 def test_paged_persistent_merge_matches_reference() -> None:
     require_sm120()
@@ -110,7 +140,8 @@ def test_paged_persistent_merge_matches_reference() -> None:
         persistent_ctas=2,
     )
 
-    kernel(
+    _run_merge_kernel(
+        kernel,
         partial_o,
         partial_lse,
         merge_indptr,
@@ -119,7 +150,6 @@ def test_paged_persistent_merge_matches_reference() -> None:
         output,
         lse,
         total_rows_ptr,
-        stream=current_cuda_stream(),
     )
     torch.cuda.synchronize()
 
@@ -144,7 +174,8 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
 
     output_before = output.clone()
     lse_before = lse.clone()
-    kernel(
+    _run_merge_kernel(
+        kernel,
         partial_o,
         partial_lse,
         merge_indptr,
@@ -153,7 +184,6 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
         output,
         lse,
         total_rows_ptr,
-        stream=current_cuda_stream(),
     )
     torch.cuda.synchronize()
 
@@ -177,7 +207,8 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
         persistent_ctas=2,
     )
 
-    kernel(
+    _run_merge_kernel(
+        kernel,
         partial_o,
         partial_lse,
         merge_indptr,
@@ -186,7 +217,6 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
         output,
         lse,
         total_rows_ptr,
-        stream=current_cuda_stream(),
     )
     torch.cuda.synchronize()
 
@@ -211,7 +241,8 @@ def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None
         regular_decode_graph=True,
     )
 
-    kernel(
+    _run_merge_kernel(
+        kernel,
         partial_o,
         partial_lse,
         merge_indptr,
@@ -220,7 +251,6 @@ def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None
         output,
         lse,
         total_rows_ptr,
-        stream=current_cuda_stream(),
     )
     torch.cuda.synchronize()
 

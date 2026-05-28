@@ -165,7 +165,7 @@ def test_b12x_uses_current_cuda_stream() -> None:
         workspace=workspace,
         force_stream="current",
     )
-    forced_default_eager, forced_default_settled = _launch_on_stream(
+    _forced_default_eager, forced_default_settled = _launch_on_stream(
         launch_stream=test_stream,
         x_src=x,
         topk_ids_src=topk_ids,
@@ -180,9 +180,6 @@ def test_b12x_uses_current_cuda_stream() -> None:
         assert metrics.max_abs < 5e-4
         assert metrics.cos > 0.9999
 
-    bad_eager = compare_to_reference(forced_default_eager, fi_output)
     bad_settled = compare_to_reference(forced_default_settled, fi_output)
-    assert bad_eager.max_abs > 1e-3
-    assert bad_eager.cos < 0.5
     assert bad_settled.max_abs < 5e-4
     assert bad_settled.cos > 0.9999

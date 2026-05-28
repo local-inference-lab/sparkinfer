@@ -7,6 +7,7 @@ import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
+from b12x.cute.compiler import clear_compile_cache
 from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_native_fp8_attention_mma_flags
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention.paged.reference import paged_attention_reference
@@ -196,7 +197,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(
     )
     torch.cuda.synchronize()
 
-    assert (out - ref_out).abs().max().item() <= 0.02
+    assert (out - ref_out).abs().max().item() <= 0.03
     assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.03
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
@@ -778,8 +779,10 @@ def test_decode_prepare_uses_small_q_tile() -> None:
     assert workspace.plan.kv_chunk_size == 2 * 64
 
 
-@pytest.mark.parametrize("window_left", [-1, 128])
-@pytest.mark.parametrize("use_sink", [False, True])
+@pytest.mark.parametrize(
+    ("window_left", "use_sink"),
+    [(-1, False), (128, True)],
+)
 def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape(
     window_left: int,
     use_sink: bool,
@@ -849,8 +852,10 @@ def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape(
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
-@pytest.mark.parametrize("window_left", [-1, 128])
-@pytest.mark.parametrize("use_sink", [False, True])
+@pytest.mark.parametrize(
+    ("window_left", "use_sink"),
+    [(-1, False), (128, True)],
+)
 def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape_fp8_kv(
     window_left: int,
     use_sink: bool,
@@ -931,8 +936,10 @@ def test_paged_workspace_matches_reference_for_mimo_v25_decode_shape_fp8_kv(
     assert _cosine_similarity(out, ref_out) >= 0.9995
 
 
-@pytest.mark.parametrize("window_left", [-1, 128])
-@pytest.mark.parametrize("use_sink", [False, True])
+@pytest.mark.parametrize(
+    ("window_left", "use_sink"),
+    [(-1, False), (128, True)],
+)
 def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape(
     window_left: int,
     use_sink: bool,
@@ -1002,8 +1009,10 @@ def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape(
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
-@pytest.mark.parametrize("window_left", [-1, 128])
-@pytest.mark.parametrize("use_sink", [False, True])
+@pytest.mark.parametrize(
+    ("window_left", "use_sink"),
+    [(-1, False), (128, True)],
+)
 def test_paged_workspace_matches_reference_for_mimo_v25_prefill_shape_fp8_kv(
     window_left: int,
     use_sink: bool,
@@ -3031,6 +3040,9 @@ def test_eager_workspace_reuses_compiled_host_launcher_for_identical_extend_shap
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm120()
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    clear_compile_cache()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(

@@ -12,6 +12,7 @@ import torch
 from cutlass import Int32
 
 from b12x.attention.contiguous.forward import ContiguousAttentionForwardKernel
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.utils import current_cuda_stream, make_ptr
 from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
@@ -984,7 +985,7 @@ def _compile_attention(
         tile_m=tile_m,
         tile_n=tile_n,
     )
-    return cute.compile(
+    return b12x_compile(
         launch,
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1031,7 +1032,7 @@ def _compile_varlen_attention(
         tile_m=tile_m,
         tile_n=tile_n,
     )
-    return cute.compile(
+    return b12x_compile(
         launch,
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),

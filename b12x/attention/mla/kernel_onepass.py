@@ -6,7 +6,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 import os
-import warnings
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -18,6 +17,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
+from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -216,22 +216,15 @@ def _run_cached_host_launcher(
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
         raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
+            "cute.compile",
             target=kernel,
             cache_key=cache_key,
         )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
+        compiled = b12x_compile(kernel, *args)
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
+    compiled(*args)
 
 
 @cute.jit
