@@ -11,6 +11,7 @@ from .api import (
     _final_lse_from_split_workspace,
     _get_mla_output_view,
     _get_sm_scale_tensor,
+    _use_unified_sm120,
     _validate_split_control_tensors,
     _validate_tensor_storage_bounds,
 )
@@ -53,6 +54,7 @@ def compressed_mla_decode_forward(
     expected_num_q_heads: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
+    backend: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages."""
 
@@ -92,6 +94,101 @@ def compressed_mla_decode_forward(
     q3 = _normalize_compressed_q(q_all)
     rows, heads, _ = q3.shape
     live_rows = rows
+
+    # Dispatch into the unified_sm120 backend (DSV4 decode). The unified kernel is
+    # the SM120 sparse-MLA path and supports the FULL upstream DSV4 decode surface:
+    #   * q_head_dim == COMPRESSED_MLA_HEAD_DIM == 512 (DSV4; NOT GLM q=576)
+    #   * MAIN cache, OR the DSV4 DUAL-CACHE (indexed/extra tokens) when the full
+    #     extra trio is provided together with indexed_page_size
+    #   * attn_sink fold (sink-in-merge, upstream design) and return_lse
+    #   * VALID_HPB<16 / non-multiple-of-16 head shards
+    # GENUINELY-UPSTREAM-UNSUPPORTED contracts RAISE (never fall back to legacy):
+    #   * a mapped indexed_page_table (upstream is raw-slot-id only)
+    #   * a partial dual-cache trio (upstream ICHECKs required-together)
+    # A non-512 q_head_dim here is a compressed-API contract error -> RAISE.
+    # When the flag is OFF / backend is None _use_unified_sm120 is False and the
+    # legacy path below stays byte-identical (that is the flag being off, not a
+    # fallback; the default-flip is a separate validated step).
+    if _use_unified_sm120(backend=backend, device=q3.device):
+        _unified_has_extra = (
+            indexed_k_cache is not None
+            or indexed_indices is not None
+            or indexed_topk_lengths is not None
+        )
+        if _unified_has_extra:
+            # Partial dual-cache trio is a HARD ERROR (upstream required-together
+            # ICHECK, sparse_mla_sm120.cu:171-174). NOT a fallback.
+            if not (
+                indexed_k_cache is not None
+                and indexed_indices is not None
+                and indexed_topk_lengths is not None
+                and indexed_page_size is not None
+            ):
+                raise ValueError(
+                    "SM120 sparse-MLA dual-cache decode requires indexed_k_cache, "
+                    "indexed_indices, indexed_topk_lengths, and indexed_page_size "
+                    "together (partial extra trio is unsupported, matching upstream "
+                    "sparse_mla_sm120.cu:171-174)"
+                )
+            # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream
+            # addresses the extra cache by raw slot id only). RAISE, not fallback.
+            if indexed_page_table is not None:
+                raise ValueError(
+                    "SM120 sparse-MLA decode does not support a mapped "
+                    "indexed_page_table (extra cache is raw-slot-id only on the "
+                    "unified backend, matching upstream FlashInfer)"
+                )
+        if int(q3.shape[-1]) != COMPRESSED_MLA_HEAD_DIM:
+            raise ValueError(
+                f"compressed_mla_decode_forward is DSV4 (q_head_dim="
+                f"{COMPRESSED_MLA_HEAD_DIM}) by construction; got q_head_dim="
+                f"{int(q3.shape[-1])}"
+            )
+        from . import unified_sm120
+
+        # PREFILL-LIKE modes (extend/verify/draft_extend) route to the single-pass
+        # DSV4 prefill (run_unified_prefill) -- upstream's num_tokens>64 prefill
+        # orchestrator -- instead of the legacy split-decode. Main cache OR the DSV4
+        # DUAL-CACHE (extra tokens) when the extra trio is provided. An unsupported
+        # prefill shape RAISEs inside run_unified_prefill (error like upstream, NOT
+        # a legacy fallback).
+        if scratch.mode in ("extend", "verify", "draft_extend"):
+            return _run_unified_sm120_compressed_prefill(
+                q3=q3,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                workspace=scratch,
+                sm_scale=sm_scale,
+                swa_page_size=swa_page_size,
+                indexed_k_cache=indexed_k_cache,
+                indexed_indices=indexed_indices,
+                indexed_topk_lengths=indexed_topk_lengths,
+                indexed_page_size=indexed_page_size,
+                attn_sink=attn_sink,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
+                heads=heads,
+            )
+
+        return unified_sm120.run_unified_decode(
+            q_all=q3,
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            workspace=scratch,
+            sm_scale=sm_scale,
+            swa_page_size=swa_page_size,
+            indexed_k_cache=indexed_k_cache,
+            indexed_indices=indexed_indices,
+            indexed_topk_lengths=indexed_topk_lengths,
+            indexed_page_size=indexed_page_size,
+            indexed_page_table=indexed_page_table,
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
+        )
+
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     _validate_compressed_cache_layout(
         swa_k_cache,
@@ -390,6 +487,71 @@ def compressed_mla_decode_forward(
         lse_natural.div_(_LN2)
         return output, lse_natural
     return output, lse_natural
+
+
+def _run_unified_sm120_compressed_prefill(
+    *,
+    q3: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    workspace: B12XAttentionWorkspace,
+    sm_scale: float,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_topk_lengths: torch.Tensor | None,
+    indexed_page_size: int | None,
+    attn_sink: torch.Tensor | None,
+    return_lse: bool,
+    lse_scale: Literal["base2", "natural"],
+    heads: int,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
+    unified SM120 single-pass prefill (run_unified_prefill).
+
+    Mirrors upstream's num_tokens>64 prefill orchestrator: ONE 384-thread CTA per
+    (token, HPB head-group) over ALL topk tiles (FINAL_BF16 epilogue, no split-K
+    merge). Main cache OR the DSV4 DUAL-CACHE union (extra tokens). Per-token
+    ``swa_topk_lengths`` is the per-token main topk_length; attn_sink + return_lse
+    are supported. An unsupported prefill shape RAISEs inside run_unified_prefill
+    (error like upstream, NOT a legacy fallback).
+    """
+    from . import unified_sm120
+
+    swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
+    output = _get_mla_output_view(
+        workspace=workspace,
+        q_all=q3,
+        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
+    )
+
+    extra_kwargs: dict = {}
+    if indexed_k_cache is not None:
+        extra_kwargs = dict(
+            extra_kv_cache=indexed_k_cache,
+            extra_indices=_normalize_index_matrix(
+                indexed_indices, name="indexed_indices"
+            ),
+            extra_topk_length=indexed_topk_lengths,
+            extra_page_block_size=int(indexed_page_size),
+        )
+
+    _, lse_base2 = unified_sm120.run_unified_prefill(
+        q=q3,
+        kv_cache=swa_k_cache,
+        topk_indices=swa_indices_2d,
+        sm_scale=float(sm_scale),
+        page_block_size=int(swa_page_size),
+        topk_length=swa_topk_lengths,
+        attn_sink=attn_sink,
+        output=output,
+        **extra_kwargs,
+    )
+    if not return_lse:
+        return output
+    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
+    return output, lse
 
 
 def _stage_fixed_compressed_mla_inputs(
