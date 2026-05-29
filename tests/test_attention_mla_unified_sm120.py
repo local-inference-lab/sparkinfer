@@ -825,6 +825,67 @@ def test_unified_decode_glm_multi_split_equals_single_split(topk, forced_num_spl
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
+def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
+    """GLM_NSA decode with num_tokens in {1,4,16}, num_heads=128, and MIXED
+    per-token active_token_counts (the GLM topk_length) matches glm_decode_reference
+    per token at the GLM gate (cos > 0.995)."""
+    device = require_sm120_unified()
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+    from b12x.integration.sparse_mla_scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+
+    topk = 512
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=3000 + num_tokens,
+        device=device,
+    )
+    q = case["q"].contiguous()                    # [T, 128, 576]
+    kv_cache = case["kv_cache"].contiguous()
+    idx = case["topk_indices"].contiguous()       # [T, topk] (all valid)
+    sm_scale = case["sm_scale"]
+    s_kv = kv_cache.shape[0]
+    lengths = _mixed_lengths(num_tokens, topk, device)
+
+    exp_O = glm_ref.glm_decode_reference(
+        q, kv_cache, idx, sm_scale, active_token_counts=lengths,
+    ).float()
+
+    n_chunks = (topk + 64 - 1) // 64
+    caps = B12XSparseMLAScratchCaps(
+        device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=num_tokens,
+        max_batch=num_tokens, max_width=topk, max_kv_rows=s_kv,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=max(8, n_chunks), page_size=_GLM_PAGE,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (spec,) = plan.scratch_specs()
+    storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+    cache_seqlens = torch.full((num_tokens,), s_kv, dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=storage, q=q, selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=lengths,
+    )
+    out = run_unified_decode(
+        q_all=q, swa_k_cache=kv_cache, swa_indices=idx, swa_topk_lengths=lengths,
+        workspace=binding.scratch, sm_scale=sm_scale, swa_page_size=_GLM_PAGE,
+        forced_num_splits=2,
+    )
+    torch.cuda.synchronize()
+    got = out.float()
+    for t in range(num_tokens):
+        cos = _cosine(got[t], exp_O[t])
+        assert cos > 0.995, (
+            f"GLM T={num_tokens} token {t} (len={int(lengths[t])}) O cos={cos}"
+        )
+        assert (got[t] - exp_O[t]).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("topk,forced_num_splits", [(128, 1), (512, 4)])
 def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits) -> None:
     """GLM_NSA decode return_lse: the FINAL base-2 LSE reconstructed from mid_lse
@@ -1033,3 +1094,250 @@ def test_unified_decode_valid_hpb_with_lse_and_sink() -> None:
         "heads=24 sink+lse base-2 LSE atol exceeded: "
         f"max|delta|={(got_lse - exp_lse_log2).abs().max().item()}"
     )
+
+
+# ── P10b MULTI-TOKEN + PER-TOKEN topk_length DECODE ────────────────────────────
+# Exercise run_unified_decode with num_tokens in {1,4,16}, num_heads=128, and
+# MIXED per-token topk_length (deliberately non-multiples of 64, plus a near-zero
+# and a full-length token), vs the multi-token dsv4_decode_reference (which masks
+# each token's candidates past topk_length[t]). The per-token kernel reads
+# section_len = clamp(topk_length[t], 0, topk) at t=blockIdx.x; over-allocated
+# chunks for short tokens become fully masked (-> mid_lse=-inf -> merge ignores).
+#
+# SETTLE the open question two ways:
+#   (a) the caller passes REAL per-token lengths and leaves the indices VALID past
+#       the length (only the kernel's per-token section_len masks them). This is
+#       the case the OLD uniform-length kernel got LATENTLY WRONG (it used the full
+#       topk section, so it attended to candidates past topk_length[t]).
+#   (b) the caller -1-pads the indices past each token's length AND passes the
+#       lengths. Here BOTH the section bound and the S3 idx<0 mask agree, so the
+#       OLD uniform kernel was already correct -- the new path must match too.
+_MT_HEADS = 128
+
+
+def _mixed_lengths(num_tokens: int, topk: int, device: torch.device) -> torch.Tensor:
+    """Per-token MIXED lengths: a near-zero token, a full-length token, and the
+    rest deliberately off-64-boundary and spread across [1, topk]."""
+    base = [37, 200, 5, topk, 64 + 13, topk - 7, 128 + 1, 1]
+    vals = [base[i % len(base)] for i in range(num_tokens)]
+    # token 0 is always full topk (so a uniform check on token 0 alone can't hide
+    # the mixing), token 1 near-zero to stress the all-masked-chunk path.
+    if num_tokens >= 1:
+        vals[0] = topk
+    if num_tokens >= 2:
+        vals[1] = 3
+    vals = [max(1, min(int(v), topk)) for v in vals]
+    return torch.tensor(vals, dtype=torch.int32, device=device)
+
+
+def _run_unified_dsv4_multitoken(
+    device, *, num_tokens, topk, lengths, neg_pad_past_len, forced_num_splits, seed,
+):
+    """Build a multi-token DSV4 case, optionally -1-pad indices past each token's
+    length, run the REAL launcher with per-token swa_topk_lengths, and compare per
+    token against dsv4_decode_reference(topk_length=lengths)."""
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+
+    case = dsv4_ref.make_dsv4_decode_case(
+        num_heads=_MT_HEADS, topk=topk, num_tokens=num_tokens,
+        num_blocks=_UNIFIED_NUM_BLOCKS, page_block_size=_DSV4_PAGE,
+        invalidate_half=False, with_sink=False, device=device, seed=seed,
+    )
+    q = case["q"].contiguous()                              # [T, 128, 512]
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS)
+    idx = case["topk_indices"].contiguous()                # [T, topk] (all valid)
+
+    if neg_pad_past_len:
+        # Case (b): force indices at position >= length[t] to the -1 sentinel.
+        ar = torch.arange(topk, device=device).unsqueeze(0)
+        idx = idx.clone()
+        idx[ar >= lengths.unsqueeze(-1)] = -1
+
+    # Reference always masks per-token by length (and by idx<0 for case (b)).
+    exp_O, _ = dsv4_ref.dsv4_decode_reference(
+        q, case["kv_cache"], idx, case["sm_scale"],
+        page_block_size=_DSV4_PAGE, topk_length=lengths, kv_dequant=case["kv_dequant"],
+    )
+
+    n_chunks = (topk + 64 - 1) // 64
+    caps = B12XCompressedMLAScratchCaps(
+        device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens, max_width=topk,
+        head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max(8, forced_num_splits, n_chunks), page_size=_DSV4_PAGE,
+    )
+    layout = _compressed_mla_scratch_layout(caps)
+    storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
+    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+
+    out = run_unified_decode(
+        q_all=q, swa_k_cache=swa_cache, swa_indices=idx, swa_topk_lengths=lengths,
+        workspace=scratch, sm_scale=case["sm_scale"], swa_page_size=_DSV4_PAGE,
+        forced_num_splits=forced_num_splits,
+    )
+    torch.cuda.synchronize()
+    return out.float(), exp_O.float()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
+@pytest.mark.parametrize("neg_pad_past_len", [False, True])
+def test_unified_decode_multitoken_per_token_length(num_tokens, neg_pad_past_len) -> None:
+    """run_unified_decode honours MIXED per-token topk_length for num_tokens in
+    {1,4,16}, num_heads=128, matching the multi-token reference per token --
+    BOTH when the caller passes real lengths with valid indices (a; the OLD uniform
+    kernel was latently wrong) AND when the caller -1-pads indices past the length
+    (b; the OLD uniform kernel was already correct via idx<0)."""
+    device = require_sm120_unified()
+    topk = 512
+    lengths = _mixed_lengths(num_tokens, topk, device)
+    got_O, exp_O = _run_unified_dsv4_multitoken(
+        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
+        neg_pad_past_len=neg_pad_past_len, forced_num_splits=2, seed=1000 + num_tokens,
+    )
+    for t in range(num_tokens):
+        cos = _cosine(got_O[t], exp_O[t])
+        assert cos > 0.999, (
+            f"T={num_tokens} pad={neg_pad_past_len} token {t} "
+            f"(len={int(lengths[t])}) O cos={cos}"
+        )
+        assert (got_O[t] - exp_O[t]).abs().max().item() < 2e-2, (
+            f"T={num_tokens} pad={neg_pad_past_len} token {t} O atol exceeded"
+        )
+
+
+@torch.inference_mode()
+def test_unified_decode_multitoken_old_uniform_was_wrong_for_valid_indices() -> None:
+    """Settle the open question: with REAL per-token lengths but VALID indices past
+    the length (no -1 padding), the per-token kernel must DIFFER from a uniform
+    full-topk decode (proving the per-token masking actually changes the result --
+    i.e. the old uniform-length kernel was latently wrong for this contract)."""
+    device = require_sm120_unified()
+    topk, num_tokens = 512, 4
+    # Real mixed lengths < topk for the short tokens.
+    lengths = _mixed_lengths(num_tokens, topk, device)
+    # Per-token correct result (valid indices, masked only by length).
+    got_pertok, exp_pertok = _run_unified_dsv4_multitoken(
+        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
+        neg_pad_past_len=False, forced_num_splits=1, seed=2024,
+    )
+    # Uniform full-topk decode of the SAME inputs (lengths == topk -> scalar path).
+    full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    got_uniform, _ = _run_unified_dsv4_multitoken(
+        device, num_tokens=num_tokens, topk=topk, lengths=full,
+        neg_pad_past_len=False, forced_num_splits=1, seed=2024,
+    )
+    # The per-token path matches the length-masked reference.
+    for t in range(num_tokens):
+        assert _cosine(got_pertok[t], exp_pertok[t]) > 0.999
+    # For a SHORT token (len < topk), the uniform decode must differ from the
+    # length-masked per-token decode -- the latent bug the per-token threading fixes.
+    short = [t for t in range(num_tokens) if int(lengths[t]) < topk]
+    assert short, "test setup must include a short token"
+    t = short[0]
+    delta = (got_uniform[t] - got_pertok[t]).abs().max().item()
+    assert delta > 1e-3, (
+        f"uniform vs per-token token {t} (len={int(lengths[t])}) delta={delta} "
+        "-- per-token length masking had no effect (unexpected)"
+    )
+
+
+@torch.inference_mode()
+def test_unified_decode_uniform_length_batch_collapses_to_scalar_path() -> None:
+    """A MULTI-token batch whose every topk_length[t] == topk must take the
+    byte-identical scalar (per_token_len=False) path and match the reference: the
+    base-case parity contract for uniform-length batches."""
+    device = require_sm120_unified()
+    import b12x.attention.mla.unified_sm120.launch as L
+    topk, num_tokens = 512, 4
+    full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    got_O, exp_O = _run_unified_dsv4_multitoken(
+        device, num_tokens=num_tokens, topk=topk, lengths=full,
+        neg_pad_past_len=False, forced_num_splits=1, seed=99,
+    )
+    # The launch plan side-channel records whether the per-token kernel was used;
+    # a uniform batch must NOT (the scalar path keeps PTX byte-identical).
+    assert L.LAST_DECODE_PLAN.get("per_token_len") is False, (
+        "uniform-length batch unexpectedly routed to the per-token kernel"
+    )
+    for t in range(num_tokens):
+        assert _cosine(got_O[t], exp_O[t]) > 0.999, f"uniform batch token {t}"
+
+
+@torch.inference_mode()
+def test_unified_decode_mixed_length_routes_to_per_token_kernel() -> None:
+    """A genuinely-mixed-length multi-token batch must route to the per-token
+    kernel (per_token_len=True in the plan side-channel)."""
+    device = require_sm120_unified()
+    import b12x.attention.mla.unified_sm120.launch as L
+    topk, num_tokens = 512, 4
+    lengths = _mixed_lengths(num_tokens, topk, device)
+    _run_unified_dsv4_multitoken(
+        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
+        neg_pad_past_len=False, forced_num_splits=1, seed=99,
+    )
+    assert L.LAST_DECODE_PLAN.get("per_token_len") is True, (
+        "mixed-length batch did not route to the per-token kernel"
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
+def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> None:
+    """DSV4 dual-cache decode with MIXED per-token MAIN topk_length AND per-token
+    EXTRA extra_topk_length (num_tokens in {1,4,16}, num_heads=128) matches
+    dsv4_extra_decode_reference over the masked union, per token."""
+    device = require_sm120_unified()
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+
+    topk, extra_topk, pbs_extra = 512, 128, 2
+    main_blocks = _UNIFIED_NUM_BLOCKS
+    case = dsv4_extra_ref.make_dsv4_extra_decode_case(
+        num_heads=_MT_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=num_tokens,
+        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        invalidate_half=False, with_sink=False, device=device, seed=7000 + num_tokens,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
+    extra_blocks = case["extra_kv_cache"].shape[0]
+    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    main_idx = case["topk_indices"].contiguous()
+    extra_idx = case["extra_indices"].contiguous()
+
+    main_len = _mixed_lengths(num_tokens, topk, device)
+    extra_len = _mixed_lengths(num_tokens, extra_topk, device)
+
+    exp_O, _ = dsv4_extra_ref.dsv4_extra_decode_reference(
+        q, case["kv_cache"], main_idx, case["sm_scale"],
+        case["extra_kv_cache"], extra_idx,
+        page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        topk_length=main_len, extra_topk_length=extra_len,
+        main_kv_dequant=case["kv_dequant"], extra_kv_dequant=case["extra_kv_dequant"],
+    )
+    exp_O = exp_O.float()
+
+    n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
+    caps = B12XCompressedMLAScratchCaps(
+        device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens,
+        max_width=topk + extra_topk, head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max(8, n_chunks), page_size=_DSV4_PAGE,
+    )
+    layout = _compressed_mla_scratch_layout(caps)
+    storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
+    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+
+    out = run_unified_decode(
+        q_all=q, swa_k_cache=swa_cache, swa_indices=main_idx, swa_topk_lengths=main_len,
+        workspace=scratch, sm_scale=case["sm_scale"], swa_page_size=_DSV4_PAGE,
+        indexed_k_cache=idx_cache, indexed_indices=extra_idx,
+        indexed_topk_lengths=extra_len, indexed_page_size=pbs_extra,
+        forced_num_splits=2,
+    )
+    torch.cuda.synchronize()
+    got = out.float()
+    for t in range(num_tokens):
+        cos = _cosine(got[t], exp_O[t])
+        assert cos > 0.999, (
+            f"dual T={num_tokens} token {t} (main_len={int(main_len[t])} "
+            f"extra_len={int(extra_len[t])}) O cos={cos}"
+        )
+        assert (got[t] - exp_O[t]).abs().max().item() < 2e-2

@@ -600,27 +600,26 @@ def _run_sparse_mla(
         # GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) decode via the
         # unified SM120 kernel (cute.constexpr GLM branches beside DSV4). The
         # unified path now covers the upstream DSV3.2/GLM decode surface:
-        # return_lse, attn_sink fold (sink-in-merge), and VALID_HPB<16 /
-        # non-multiple-of-16 head shards. Multi-token rows (q_rows>1) remain a
-        # SEPARATE later step (per-token topk_length threading), so single-token is
-        # still required here; a >1-row GLM decode falls through to legacy until
-        # that lands. Everything else routes to unified unconditionally.
-        _glm_unified_ok = int(q_all.shape[0]) == 1
-        if _glm_unified_ok:
-            from .unified_sm120.launch import run_unified_decode
+        # return_lse, attn_sink fold (sink-in-merge), VALID_HPB<16 /
+        # non-multiple-of-16 head shards, AND multi-token rows (q_rows in [1,64])
+        # with PER-TOKEN active_token_counts (P10b: the per-token topk_length is
+        # read in-kernel at t=blockIdx.x; a uniform-length batch collapses to the
+        # byte-identical scalar path). The q_rows==1 gate is removed -- route q==576
+        # to unified unconditionally (subject only to shape-table support).
+        from .unified_sm120.launch import run_unified_decode
 
-            return run_unified_decode(
-                q_all=q_all,
-                swa_k_cache=kv_cache,
-                swa_indices=selected_indices,
-                swa_topk_lengths=active_token_counts,
-                workspace=workspace,
-                sm_scale=float(sm_scale),
-                swa_page_size=int(workspace.page_size),
-                attn_sink=attn_sink,
-                return_lse=return_lse,
-                lse_scale=lse_scale,
-            )
+        return run_unified_decode(
+            q_all=q_all,
+            swa_k_cache=kv_cache,
+            swa_indices=selected_indices,
+            swa_topk_lengths=active_token_counts,
+            workspace=workspace,
+            sm_scale=float(sm_scale),
+            swa_page_size=int(workspace.page_size),
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
+        )
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale
     )
