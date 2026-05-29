@@ -280,53 +280,14 @@ def s0_quantize_q_to_smem(
 
 
 # =============================================================================
-# S0b -- GLM K-requant (ARBITRARY_FP32): dequant e4m3 K * inline fp32 scale ->
-# re-quant e4m3 (true value, magnitude-absorbed) in place. GLM-ONLY.
+# S0b -- REMOVED (P10f). The prior GLM K dequant+requant stage forced K/V back
+# through e4m3 to use a UNIT block-scale selector, which DISCARDED the per-group
+# e4m3 mantissa headroom (K-dequant cos 0.99968 -> 0.99627) and cost ~0.003 cos
+# end-to-end. GLM now keeps RAW e4m3 K/V and applies its arbitrary fp32 group
+# scale AFTER the MMA: S1 (QK) post-MMA FP32 scale (legacy
+# _accumulate_scaled_score_frag), S6 (V) inline per-group fp32 V-scale. DSV4
+# (UE8M0_BYTE) never ran S0b, so its trace/PTX are unchanged.
 # =============================================================================
-@cute.jit
-def s0b_requant_k_glm(
-    kv_fp8_base_addr: Int32,         # u32 smem addr of kv_fp8[buf] (BI x KV_SMEM_STRIDE)
-    tid: Int32,                      # flat math thread id [0, MATH_THREADS)
-    *,
-    bi: cutlass.Constexpr,           # 64
-    d_nope: cutlass.Constexpr,       # 512
-    quant_tile: cutlass.Constexpr,   # 128
-    kv_smem_stride: cutlass.Constexpr,  # 528
-    num_threads: cutlass.Constexpr,  # 256
-    barrier_id: cutlass.Constexpr,
-):
-    """GLM-only S0b: in-place K dequant+requant so S1 can run the block-scaled
-    MMA with a UNIT sfb (0x7F) on pre-scaled e4m3 frags (kernel_onepass.py:544
-    bfloat2_mul dequant + :610 cvt_bf16x2_to_e4m3x2 requant, but done in smem so
-    the S1 fragment loaders stay byte-identical to the DSV4 e4m3 path).
-
-    The inline ARBITRARY fp32 scale for group g (g = d // QUANT_TILE) lives at
-    ``entry*KV_SMEM_STRIDE + D_NOPE + g*4`` (4 bytes, little-endian). The e4m3
-    nope byte at ``entry*KV_SMEM_STRIDE + d`` is dequantized
-    (``e4m3_to_f32(byte) * scale_arb``) -- the arbitrary scale is folded into the
-    magnitude -- then re-quantized to e4m3 in place. The fp32 scale region itself
-    is left untouched (S1 never reads it: sfb = unit). The caller barriers AFTER
-    this so S1/S6 read the requantized e4m3 coherently."""
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
-    num_scales = d_nope // quant_tile
-    idx = tid
-    while idx < Int32(bi * d_nope):
-        entry = idx // Int32(d_nope)
-        d = idx - entry * Int32(d_nope)
-        g = d // Int32(quant_tile)
-        row = entry * Int32(kv_smem_stride)
-        # inline arbitrary fp32 scale of group g (4B aligned).
-        s_off = row + Int32(d_nope) + g * Int32(4)
-        s_arb = _u32_to_f32(ld_shared_u32(kv_fp8_base_addr + s_off))
-        # dequant e4m3 -> f32 (* arbitrary scale), then requant e4m3 in place.
-        byte = _ld_u8_zext(kv_fp8_base_addr, row + d)
-        true_v = fp8_e4m3_to_f32(byte) * s_arb
-        true_v = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), true_v))
-        new_byte = cvt_f32_to_e4m3(true_v) & Uint32(0xFF)
-        st_shared_u8(_smem_byte(kv_fp8_base_addr, row + d), new_byte.to(cutlass.Uint8))
-        idx += Int32(num_threads)
-    cute.arch.barrier(**bar_kw)
-    _ = num_scales  # silence the unused-constexpr lint when traced
 
 
 # =============================================================================
@@ -360,16 +321,30 @@ def s1_qk_nope_block_scaled(
     sfb DIVERGES on ``scale_format`` (const_expr):
       * UE8M0_BYTE (DSV4): sfb = the K footer UE8M0 byte (kv_sc[cand*8 + blk]).
         The raw e4m3 K is kept and the real pow2 K selector applies (zero cost).
-      * ARBITRARY_FP32 (GLM): sfb = UNIT (0x7F). The K e4m3 in smem was already
-        dequant+requant'd by S0b to its true magnitude (arbitrary fp32 scale
-        absorbed), so the block-scale must NOT re-scale K (kernel_onepass.py:571
-        unit_scale). Q keeps its real pow2 sfa -> qk = (q_e4m3*pow2_q)*(k_true).
+        All NUM_SCALES groups accumulate DIRECTLY into qk (the K pow2 magnitude
+        is folded by the hardware ue8m0 selector).
+      * ARBITRARY_FP32 (GLM, P10f): sfb = UNIT (0x7F) on the RAW e4m3 K (NO S0b
+        requant -- that threw away the per-group e4m3 mantissa headroom). The
+        block-scaled MMA of group ``blk`` runs into a SEPARATE per-group temp
+        accumulator (UNIT K, real pow2 sfa on Q), then the temp is multiplied by
+        the per-CANDIDATE arbitrary fp32 group scale ``k_scale[cand, blk]`` and
+        accumulated into qk in FP32 -- EXACTLY legacy kernel.py
+        _accumulate_scaled_score_frag (:1308-1311) post-MMA FP32 scaling. The
+        arbitrary fp32 K scale (~5e-5, NON-power-of-2) cannot be represented by a
+        ue8m0 selector, so it must apply AFTER the MMA. The inline fp32 group
+        scale lives at ``cand*KV_SMEM_STRIDE + D_NOPE + blk*4`` (4B), where
+        D_NOPE == NUM_SCALES*QUANT_TILE.
 
     A (Q) loaded via ldmatrix.x4 (FP8 A 16x32); B (K) via ldmatrix.x2 (FP8 B
     8x32) -- both with the FLAT FlashInfer ldmatrix addressing.
     """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
+    # GLM only: this lane's two candidate columns (c0 -> qk[0]/qk[2],
+    # c1 -> qk[1]/qk[3]); inline fp32 group-scale base byte D_NOPE.
+    glm_c0 = warp_first_cand + tid * Int32(2)
+    glm_c1 = glm_c0 + Int32(1)
+    glm_scale_base = Int32(num_scales) * Int32(quant_tile)  # == D_NOPE
 
     # ldmatrix A (Q) row/col -- arch/ldmatrix_sm120.cuh ldmatrix_load_A_fp8.
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -392,9 +367,19 @@ def s1_qk_nope_block_scaled(
             sfb_byte_off = sfb_cand * Int32(scale_bytes_per_token) + Int32(blk)
             sfb = _ld_u8_zext(kv_sc_base_addr, sfb_byte_off)
         else:
-            # GLM ARBITRARY_FP32: K e4m3 was requant'd (S0b) to its true value;
-            # the block-scale must not re-scale it -> unit selector (0x7F).
+            # GLM ARBITRARY_FP32 (P10f): raw e4m3 K, UNIT block-scale; the per-group
+            # arbitrary fp32 scale is applied AFTER the MMA (below).
             sfb = Uint32(0x7F)
+        # GLM accumulates each group's partial into a SEPARATE temp so the
+        # arbitrary fp32 group scale can be applied post-MMA; DSV4 accumulates
+        # directly into qk (byte-identical to the pre-P10f trace).
+        if cutlass.const_expr(scale_format == 0):
+            acc0, acc1, acc2, acc3 = qk[0], qk[1], qk[2], qk[3]
+        else:
+            acc0 = Float32(0.0)
+            acc1 = Float32(0.0)
+            acc2 = Float32(0.0)
+            acc3 = Float32(0.0)
         for ks in cutlass.range_constexpr(quant_tile // 32):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(32)
             # A operand: Q (16 heads x 32 fp8 K-dims) at q_fp8 + ko.
@@ -411,16 +396,32 @@ def s1_qk_nope_block_scaled(
                 + b_col,
             )
             b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
-            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                qk[0], qk[1], qk[2], qk[3],
+            acc0, acc1, acc2, acc3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                acc0, acc1, acc2, acc3,
                 a0, a1, a2, a3,
                 b0, b1,
                 sfa, sfb,
             )
-            qk[0] = d0
-            qk[1] = d1
-            qk[2] = d2
-            qk[3] = d3
+        if cutlass.const_expr(scale_format == 0):
+            qk[0] = acc0
+            qk[1] = acc1
+            qk[2] = acc2
+            qk[3] = acc3
+        else:
+            # GLM: post-MMA FP32 scale by the per-candidate arbitrary fp32 group
+            # scale (legacy _accumulate_scaled_score_frag). c0 -> qk[0]/qk[2];
+            # c1 -> qk[1]/qk[3]. Scale read from the inline fp32 footer (the same
+            # bytes io.py gathers in the kv_fp8 nope bulk).
+            ks0 = _u32_to_f32(ld_shared_u32(
+                kv_fp8_base_addr + glm_c0 * Int32(kv_smem_stride)
+                + glm_scale_base + Int32(blk) * Int32(4)))
+            ks1 = _u32_to_f32(ld_shared_u32(
+                kv_fp8_base_addr + glm_c1 * Int32(kv_smem_stride)
+                + glm_scale_base + Int32(blk) * Int32(4)))
+            qk[0] = qk[0] + acc0 * ks0
+            qk[1] = qk[1] + acc1 * ks1
+            qk[2] = qk[2] + acc2 * ks0
+            qk[3] = qk[3] + acc3 * ks1
     return qk
 
 
@@ -786,8 +787,22 @@ def s6_xv_nope(
 
     ``scale_format`` (const_expr) selects the V scale:
       * UE8M0_BYTE (DSV4): V_scale = ue8m0_to_fp32(kv_sc footer byte for vc).
-      * ARBITRARY_FP32 (GLM): V e4m3 was requant'd to its true value in S0b
-        (V == nope, V_HAS_ROPE=false), so V_scale = 1.0 (no footer; unit).
+      * ARBITRARY_FP32 (GLM, P10f): V keeps RAW e4m3 (no S0b requant), so
+        V_scale = the per-(candidate, vc) inline arbitrary fp32 group scale read
+        from the kv_fp8 footer at ``cand*KV_SMEM_STRIDE + D_NOPE + vc*4`` (4B),
+        where D_NOPE == N_V_CHUNKS*V_CHUNK (V-chunk vc == scale group vc since
+        V_CHUNK == QUANT_TILE for GLM). This keeps V's per-group e4m3 mantissa
+        headroom instead of requantizing it away.
+
+    GLM 2-PASS W (P10f): a single e4m3 W (3-bit mantissa) is the dominant PV
+    error for GLM (the arbitrary fp32 V scale spreads W's dynamic range, so the
+    per-head W scale can't capture it -> ~0.9993 cos < the 0.9995 gate). GLM
+    therefore quantizes W into a HIGH e4m3 byte + a LOW e4m3 residual byte
+    (~7 effective mantissa bits) and runs the PLAIN MMA TWICE per (vc, nt),
+    accumulating both into the SAME fp32 xv (W_PASSES=2). The legacy GLM kernel
+    sidesteps this with a bf16 P.V MMA; the residual-split keeps the unified e4m3
+    W.V MMA infrastructure (DSV4 shares it at W_PASSES=1, byte-identical). The
+    fp32 V scale is folded into BOTH W passes via the w_head_sc normalizer.
     ``nt_per_warp_xv`` (const_expr) tiles each V_CHUNK across N_WARPS*8 columns
     NT times: GLM's 128-dim V_CHUNK needs NT=2 (8 warps x 8 dims = 64 per nt)."""
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -797,12 +812,18 @@ def s6_xv_nope(
     cand_e0 = warp_first_cand + tid * Int32(2)
     cand_e1 = cand_e0 + Int32(1)
 
+    glm_scale_base = Int32(n_v_chunks) * Int32(v_chunk)  # == D_NOPE (GLM)
+
     def _vsc(cand: Int32, vc: int):
         if cutlass.const_expr(scale_format == 0):
             return _ue8m0_byte_to_fp32(
                 _ld_u8_zext(kv_sc_base_addr, cand * Int32(scale_bytes_per_token) + Int32(vc))
             )
-        return Float32(1.0)
+        # GLM ARBITRARY_FP32 (P10f): per-(candidate, vc) inline arbitrary fp32
+        # group scale (V keeps raw e4m3). vc == scale group (V_CHUNK==QUANT_TILE).
+        return _u32_to_f32(ld_shared_u32(
+            kv_fp8_base_addr + cand * Int32(kv_smem_stride)
+            + glm_scale_base + Int32(vc) * Int32(4)))
 
     # --- (1) per-vc per-head absmax of |w_pre * V_scale| -> w_head_sc. ---
     for vc in cutlass.range_constexpr(n_v_chunks):
@@ -825,47 +846,119 @@ def s6_xv_nope(
     cute.arch.barrier(**bar_kw)
 
     # --- (3)+(4) per-vc re-quant + per-nt PLAIN MMA. w_fp8 double-buffered. ---
+    if cutlass.const_expr(scale_format == 0):
+        # DSV4 (UE8M0_BYTE): the ORIGINAL single-pass W path, kept VERBATIM so the
+        # DSV4 trace/PTX is byte-identical.
+        for vc in cutlass.range_constexpr(n_v_chunks):
+            w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+            si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+            si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+            vsc0 = _vsc(cand_e0, vc)
+            vsc1 = _vsc(cand_e1, vc)
+            f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
+            f01 = _quant_e4m3_byte(w_pre[1] * vsc1 * si0)
+            f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
+            f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
+            st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
+            cute.arch.barrier(**bar_kw)
+
+            sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+            sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+            # A (W) ldmatrix.x4 row/col -- ldmatrix_load_A_fp8 (nt-invariant).
+            a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+            a_col = (lane >> Int32(4)) * Int32(16)
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
+                dim = Int32(vc) * Int32(v_chunk) + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                xv0 = Float32(0.0)
+                xv1 = Float32(0.0)
+                xv2 = Float32(0.0)
+                xv3 = Float32(0.0)
+                for kstep in cutlass.range_constexpr(bi // 32):
+                    ko = Int32(kstep) * Int32(32)
+                    a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                    b0, b1 = _d2_load_b_fp8(kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride)
+                    xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                    )
+                at = vc * nt_per_warp_xv + nt
+                acc_nope[at][0] = acc_nope[at][0] + xv0 * sc0
+                acc_nope[at][1] = acc_nope[at][1] + xv1 * sc0
+                acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
+                acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
+        return acc_nope
+
+    # GLM (ARBITRARY_FP32, P10f): 2-pass W (HIGH + LOW e4m3 residual) -> ~7 mantissa
+    # bits, run the PLAIN MMA twice per (vc, nt) into the SAME fp32 xv. This is a
+    # SEPARATE const_expr branch, so DSV4 (above) is untouched.
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
         si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
-        vsc0 = _vsc(cand_e0, vc)
-        vsc1 = _vsc(cand_e1, vc)
-        f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
-        f01 = _quant_e4m3_byte(w_pre[1] * vsc1 * si0)
-        f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
-        f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
-        st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
-        st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
-        st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
-        st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
-        cute.arch.barrier(**bar_kw)
-
         sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
-        # A (W) ldmatrix.x4 row/col -- ldmatrix_load_A_fp8 (nt-invariant).
+        vsc0 = _vsc(cand_e0, vc)
+        vsc1 = _vsc(cand_e1, vc)
         a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
         a_col = (lane >> Int32(4)) * Int32(16)
+        # normalized W (= w_pre * V_scale / w_head_sc), the e4m3 quant target.
+        wn00 = w_pre[0] * vsc0 * si0
+        wn01 = w_pre[1] * vsc1 * si0
+        wn10 = w_pre[2] * vsc0 * si1
+        wn11 = w_pre[3] * vsc1 * si1
+        # per-nt fp32 accumulators, carried across the W hi/lo passes.
+        xv = [[Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+              for _ in range(nt_per_warp_xv)]
+        for wpass in cutlass.range_constexpr(2):
+            if cutlass.const_expr(wpass > 0):
+                # serialize: the prev pass's MMA reads of w_fp8 must finish before
+                # we overwrite it with the residual bytes (same double-buffer slot).
+                cute.arch.barrier(**bar_kw)
+                # LOW residual = e4m3(Wn - dequant(hi_byte)); halves W's quant error.
+                f00 = _quant_e4m3_residual_byte(wn00)
+                f01 = _quant_e4m3_residual_byte(wn01)
+                f10 = _quant_e4m3_residual_byte(wn10)
+                f11 = _quant_e4m3_residual_byte(wn11)
+            else:
+                f00 = _quant_e4m3_byte(wn00)
+                f01 = _quant_e4m3_byte(wn01)
+                f10 = _quant_e4m3_byte(wn10)
+                f11 = _quant_e4m3_byte(wn11)
+            st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
+            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
+            cute.arch.barrier(**bar_kw)
+
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
+                dim = Int32(vc) * Int32(v_chunk) + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                xv0 = xv[nt][0]
+                xv1 = xv[nt][1]
+                xv2 = xv[nt][2]
+                xv3 = xv[nt][3]
+                for kstep in cutlass.range_constexpr(bi // 32):
+                    ko = Int32(kstep) * Int32(32)
+                    a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                    b0, b1 = _d2_load_b_fp8(kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride)
+                    xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                    )
+                xv[nt][0] = xv0
+                xv[nt][1] = xv1
+                xv[nt][2] = xv2
+                xv[nt][3] = xv3
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
-            # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
-            dim = Int32(vc) * Int32(v_chunk) + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
-            xv0 = Float32(0.0)
-            xv1 = Float32(0.0)
-            xv2 = Float32(0.0)
-            xv3 = Float32(0.0)
-            for kstep in cutlass.range_constexpr(bi // 32):
-                ko = Int32(kstep) * Int32(32)
-                a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
-                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                b0, b1 = _d2_load_b_fp8(kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride)
-                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
-                    xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
-                )
             at = vc * nt_per_warp_xv + nt
-            acc_nope[at][0] = acc_nope[at][0] + xv0 * sc0
-            acc_nope[at][1] = acc_nope[at][1] + xv1 * sc0
-            acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
-            acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
+            acc_nope[at][0] = acc_nope[at][0] + xv[nt][0] * sc0
+            acc_nope[at][1] = acc_nope[at][1] + xv[nt][1] * sc0
+            acc_nope[at][2] = acc_nope[at][2] + xv[nt][2] * sc1
+            acc_nope[at][3] = acc_nope[at][3] + xv[nt][3] * sc1
     return acc_nope
 
 
@@ -1061,6 +1154,20 @@ def _quant_e4m3_byte(v: Float32) -> Uint32:
     """Clamp to [FP8_MIN, FP8_MAX] then cvt.rn.satfinite.e4m3 -> low byte."""
     vc = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
     return cvt_f32_to_e4m3(vc) & Uint32(0xFF)
+
+
+@cute.jit
+def _quant_e4m3_residual_byte(v: Float32) -> Uint32:
+    """LOW e4m3 residual byte for the GLM 2-pass W (P10f): quantize ``v`` to e4m3
+    (the HIGH byte), dequant it back to f32, and quantize the residual
+    ``v - dequant(hi)`` to e4m3. (HIGH @ V + LOW @ V) recovers ~7 mantissa bits of
+    W, halving the e4m3 W quant error that otherwise floors GLM PV at ~0.9993 cos.
+    The HIGH byte itself is re-derived here (cheap) so the caller only stages bytes."""
+    vc = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
+    hi_byte = cvt_f32_to_e4m3(vc) & Uint32(0xFF)
+    resid = vc - fp8_e4m3_to_f32(hi_byte)
+    resid = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid))
+    return cvt_f32_to_e4m3(resid) & Uint32(0xFF)
 
 
 @cute.jit

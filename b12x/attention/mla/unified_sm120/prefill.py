@@ -62,7 +62,6 @@ from b12x.cute.fp4 import shared_ptr_to_u32
 from .decode_math import (
     EPILOGUE_FINAL_BF16,
     s0_quantize_q_to_smem,
-    s0b_requant_k_glm,
     s1_qk_nope_block_scaled,
     s2_qk_rope_bf16,
     s3_mask_and_scale,
@@ -550,15 +549,10 @@ class UnifiedPrefillKernel:
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
-                # GLM-only S0b (const_expr-elided for DSV4). Kept for symmetry with
-                # the decode kernel; DSV4 prefill never enters it.
-                if cutlass.const_expr(t.scale_format == 1):
-                    s0b_requant_k_glm(
-                        kv_fp8_b, tid,
-                        bi=t.bi, d_nope=t.d_nope, quant_tile=t.quant_tile,
-                        kv_smem_stride=t.kv_smem_stride,
-                        num_threads=self.math_threads, barrier_id=3,
-                    )
+                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant); the
+                # arbitrary fp32 group scale is applied POST-MMA in S1 (QK) / inline
+                # in S6 (V). DSV4 prefill never ran S0b (scale_format==0) so its
+                # trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 qk = s1_qk_nope_block_scaled(
@@ -957,6 +951,11 @@ def run_unified_prefill(
         )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.unified_sm120.prefill",
+        # version 6: P10f GLM accuracy fix (shared decode_math S1/S6). GLM
+        # (scale_format==ARBITRARY_FP32) drops S0b and applies the arbitrary fp32
+        # group scale POST-MMA in S1 (QK) / inline in S6 (V) on RAW e4m3 K/V,
+        # recovering the per-group e4m3 mantissa headroom. Changes ONLY the GLM
+        # prefill device trace; DSV4 (UE8M0_BYTE) PTX stays byte-identical to v5.
         # version 5: P10e EMPTY-ROW guard in the FINAL_BF16 epilogue prologue (force
         # global_sum=0 for a zero-length / fully-masked row, keyed off the per-token
         # section_len) so such a row writes O=0 + LSE=-inf instead of normalizing the
@@ -965,7 +964,7 @@ def run_unified_prefill(
         # version bumps to invalidate stale v4 objects.
         # version 4: P10 GLM prefill (model_type==GLM_NSA traits) + DSV4 dual-cache
         # prefill (has_extra union; call_extra/kernel_extra + has_extra const_expr).
-        5,
+        6,
         *spec_fields,
     )
     # Select the entry: dual-cache uses call_extra (distinct mangled name); the

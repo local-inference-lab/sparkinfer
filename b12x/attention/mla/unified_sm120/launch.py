@@ -57,7 +57,6 @@ from b12x.cute.fp4 import shared_ptr_to_u32
 
 from .decode_math import (
     s0_quantize_q_to_smem,
-    s0b_requant_k_glm,
     s1_qk_nope_block_scaled,
     s2_qk_rope_bf16,
     s3_mask_and_scale,
@@ -612,15 +611,11 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
-                # GLM-only S0b: in-place K dequant+requant (ARBITRARY_FP32 -> true
-                # value e4m3, unit sfb in S1). const_expr-elided for DSV4.
-                if cutlass.const_expr(t.scale_format == 1):
-                    s0b_requant_k_glm(
-                        kv_fp8_b, tid,
-                        bi=t.bi, d_nope=t.d_nope, quant_tile=t.quant_tile,
-                        kv_smem_stride=t.kv_smem_stride,
-                        num_threads=self.math_threads, barrier_id=3,
-                    )
+                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
+                # discarded the per-group e4m3 mantissa headroom and cost ~0.003
+                # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
+                # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
+                # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 qk = s1_qk_nope_block_scaled(
@@ -1084,15 +1079,11 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
-                # GLM-only S0b: in-place K dequant+requant (ARBITRARY_FP32 -> true
-                # value e4m3, unit sfb in S1). const_expr-elided for DSV4.
-                if cutlass.const_expr(t.scale_format == 1):
-                    s0b_requant_k_glm(
-                        kv_fp8_b, tid,
-                        bi=t.bi, d_nope=t.d_nope, quant_tile=t.quant_tile,
-                        kv_smem_stride=t.kv_smem_stride,
-                        num_threads=self.math_threads, barrier_id=3,
-                    )
+                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
+                # discarded the per-group e4m3 mantissa headroom and cost ~0.003
+                # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
+                # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
+                # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 qk = s1_qk_nope_block_scaled(
@@ -1648,13 +1639,21 @@ def run_unified_decode(
                 )
         compile_spec = KernelCompileSpec.from_fields(
             "attention.mla.unified_sm120.decode",
+            # version 4: P10f GLM accuracy fix. GLM (scale_format==ARBITRARY_FP32)
+            # drops S0b K dequant+requant and applies the arbitrary fp32 group scale
+            # POST-MMA in S1 (QK) and inline in S6 (V) on RAW e4m3 K/V -- recovering
+            # the per-group e4m3 mantissa headroom (unified GLM cos ~0.9966 ->
+            # >=0.9995). This changes ONLY the GLM device trace; the DSV4
+            # (UE8M0_BYTE) const_expr branches are untouched so its PTX is
+            # byte-identical to v3, but the cache version still bumps to invalidate
+            # any stale GLM v3 objects.
             # version 3: P10b per-token topk_length entries (kernel_pertok /
             # kernel_extra_pertok + per_token_len const_expr). The cache key is
             # kernel_id + version + fields; this bump invalidates stale v2 objects.
             # The uniform (per_token_len=0) trace + PTX are unchanged from v2 (the
             # length tensor never enters the uniform device entry), and the
             # per_token_len key_field keeps the per-token entries on distinct keys.
-            3,
+            4,
             *spec_fields,
         )
         # Select the entry method: each (single/dual cache) x (uniform/per-token)
