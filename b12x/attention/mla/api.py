@@ -27,11 +27,15 @@ from b12x.attention.workspace import B12XAttentionWorkspace
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
-# Opt-in dispatch into the parallel unified_sm120 sparse-MLA backend. Parsed once at
-# import time via the same _env_flag helper (api.py:86); the legacy path is byte-identical
-# when this is off and no backend="sm120_unified" kwarg is supplied.
+# Dispatch into the unified_sm120 sparse-MLA backend. As of the P10 default-flip the
+# unified backend is the SM120+ CUDA DEFAULT: unset (or "1"/any truthy value) routes
+# unified; only B12X_MLA_SM120_UNIFIED=0 (env) or backend="legacy" (kwarg) forces the
+# legacy path (the escape hatch). The env value is re-read each call (via
+# _unified_enabled_by_env) so a monkeypatched os.environ in tests is honored without
+# re-import. Non-CUDA / pre-SM120 devices always stay legacy (outside the SM120 surface).
 _MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
 _MLA_SM120_UNIFIED_BACKEND = "sm120_unified"
+_MLA_LEGACY_BACKEND = "legacy"
 # GLM_NSA uncompressed decode contract (q_head_dim = d_nope+d_rope = 512+64).
 _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
@@ -93,24 +97,40 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-# Parsed once at import; honored alongside the per-call backend kwarg (which OR-combines).
-_MLA_SM120_UNIFIED_DEFAULT = _env_flag(_MLA_SM120_UNIFIED_ENV)
+def _unified_enabled_by_env() -> bool:
+    """Env half of the SM120 unified gate, default-ON.
+
+    Unset -> unified (the new SM120 default). Only the explicit off values
+    ("0"/"false"/"no"/"off") select the legacy escape hatch; any other value
+    (including "1") routes unified. Re-read each call so a monkeypatched
+    os.environ in tests is honored without re-import.
+    """
+    value = os.environ.get(_MLA_SM120_UNIFIED_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _use_unified_sm120(*, backend: str | None, device: torch.device) -> bool:
-    """Gate for the opt-in unified_sm120 backend.
+    """Gate for the unified_sm120 backend (the SM120+ CUDA DEFAULT).
 
-    Returns True only when (env flag OR backend="sm120_unified") AND the device is
-    SM120+. Re-reads the env flag each call so monkeypatched os.environ in tests is
-    honored without re-import. The contract (q_head_dim) is checked at the call site.
+    Routes unified when the backend is not forced legacy AND the env gate is on
+    (default-on; only B12X_MLA_SM120_UNIFIED=0 turns it off) AND the device is
+    SM120+ CUDA. backend="legacy" forces legacy and backend="sm120_unified"
+    forces unified regardless of the env value. The contract (q_head_dim) is
+    checked at the call site. Non-CUDA / pre-SM120 always returns False (legacy).
     """
-    if backend is not None and backend != _MLA_SM120_UNIFIED_BACKEND:
+    if backend is not None and backend not in (
+        _MLA_SM120_UNIFIED_BACKEND,
+        _MLA_LEGACY_BACKEND,
+    ):
         raise ValueError(
-            f"backend must be None or {_MLA_SM120_UNIFIED_BACKEND!r}, got {backend!r}"
+            f"backend must be None, {_MLA_SM120_UNIFIED_BACKEND!r}, or "
+            f"{_MLA_LEGACY_BACKEND!r}, got {backend!r}"
         )
-    requested = backend == _MLA_SM120_UNIFIED_BACKEND or (
-        _MLA_SM120_UNIFIED_DEFAULT or _env_flag(_MLA_SM120_UNIFIED_ENV)
-    )
+    if backend == _MLA_LEGACY_BACKEND:
+        return False
+    requested = backend == _MLA_SM120_UNIFIED_BACKEND or _unified_enabled_by_env()
     if not requested:
         return False
     if device.type != "cuda":

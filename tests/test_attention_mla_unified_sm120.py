@@ -1,19 +1,19 @@
-"""Opt-in dispatch smoke tests for the parallel unified_sm120 sparse-MLA backend.
+"""Dispatch smoke tests for the unified_sm120 sparse-MLA backend.
 
 These tests do NOT exercise the unified_sm120 kernel itself (a parallel agent owns the
 kernel bodies under b12x/attention/mla/unified_sm120/). They only prove the GATE wired
-into the legacy MLA APIs:
+into the MLA APIs. As of the P10 default-flip the unified backend is the SM120+ CUDA
+DEFAULT:
 
-  * with B12X_MLA_SM120_UNIFIED unset/0 and no backend kwarg, a tiny GLM (q_head_dim==576)
-    decode still routes to the LEGACY path with no behavior change; and
-  * with the env flag on OR backend="sm120_unified", the same call routes into
-    unified_sm120.run_unified_decode, which currently raises NotImplementedError
-    (expected during P5-P7 -- the routing is what is under test here).
+  * with B12X_MLA_SM120_UNIFIED unset/"1" (or backend="sm120_unified"), a tiny GLM
+    (q_head_dim==576) decode routes into unified_sm120.run_unified_decode; and
+  * the legacy path is the escape hatch -- B12X_MLA_SM120_UNIFIED=0 (env) or
+    backend="legacy" (kwarg) forces it.
 
 Scope decisions (.sm120port/scope_decisions.md): DSV3.2 is dropped; GLM_NSA is the
-uncompressed q=576 contract; the unified backend is opt-in and the legacy path stays the
-default. Tensors are kept tiny; the legacy path is forced down its PyTorch reference
-fallback via monkeypatch so test (a) is deterministic without compiling a GLM kernel.
+uncompressed q=576 contract. Tensors are kept tiny; the legacy path is forced down its
+PyTorch reference fallback via monkeypatch so the escape-hatch test is deterministic
+without compiling a GLM kernel.
 """
 
 from __future__ import annotations
@@ -137,13 +137,34 @@ def _force_legacy_reference(monkeypatch) -> dict[str, int]:
 
 
 @torch.inference_mode()
-def test_glm_decode_flag_off_uses_legacy_path(monkeypatch) -> None:
-    """(a) Flag unset/0, no backend kwarg: a tiny GLM decode stays on the LEGACY path."""
+def test_glm_decode_flag_unset_routes_to_unified(monkeypatch) -> None:
+    """(a) Flag UNSET, no backend kwarg: a tiny GLM decode routes to UNIFIED.
+
+    The P10 default-flip makes the unified backend the SM120+ CUDA default, so an
+    unset env routes into unified_sm120.run_unified_decode (NOT the legacy reference).
+    We monkeypatch run_unified_decode to a sentinel so the routing decision is observed
+    without compiling a kernel for tiny inputs, and pin the legacy reference so any
+    accidental legacy fallthrough would be counted (it must stay zero).
+    """
     device = require_sm120_unified()
     monkeypatch.delenv("B12X_MLA_SM120_UNIFIED", raising=False)
     counters = _force_legacy_reference(monkeypatch)
 
-    q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(device)
+    routed = {"calls": 0}
+
+    def fake_run_unified_decode(*, q_all, **kwargs):
+        del kwargs
+        routed["calls"] += 1
+        return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
+
+    import b12x.attention.mla.unified_sm120.launch as unified_launch
+
+    monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
+
+    # HPB=16 contract: heads must be divisible by 16 for the unified GLM route.
+    q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(
+        device, num_q_heads=16
+    )
     output = sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -155,9 +176,10 @@ def test_glm_decode_flag_off_uses_legacy_path(monkeypatch) -> None:
         v_head_dim=_GLM_V_HEAD_DIM,
     )
 
-    assert output.shape == (1, _NUM_Q_HEADS, _GLM_V_HEAD_DIM)
-    # The legacy reference ran exactly once; the unified gate did not intercept.
-    assert counters["reference_calls"] == 1
+    assert output.shape == (1, 16, _GLM_V_HEAD_DIM)
+    # The unified GLM launcher intercepted; the legacy reference did NOT run.
+    assert routed["calls"] == 1
+    assert counters["reference_calls"] == 0
 
 
 @torch.inference_mode()
@@ -903,6 +925,36 @@ def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     )
     cos = _cosine(got_O, exp_O)
     assert cos > 0.999, f"extra=0 main-only cos={cos}"
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("extra_topk,forced_num_splits", [
+    (64, 1),     # single extra chunk, single split (zero-width main only)
+    (128, 1),    # two extra chunks, single split spanning both
+    (128, 2),    # forced multi-split over the extra-only chunk range
+])
+def test_unified_decode_dual_cache_zero_width_main_extra_only(
+    extra_topk, forced_num_splits
+) -> None:
+    """ZERO-WIDTH MAIN (DSV4 dual-cache, swa_indices shape (1,0)): all KV is in
+    the EXTRA cache. num_main_chunks==0 -> the launcher must NOT build a 0-extent
+    main topk layout; the kernel attends ONLY the extra section and matches
+    dsv4_extra_decode_reference (the main concat is empty).
+
+    This is the P10h zero-width-main fix: cute.make_layout(0) is illegal, so the
+    main topk_row is elided to a degenerate 1-extent view that is never read."""
+    device = require_sm120_unified()
+    got_O, exp_O = _run_unified_dsv4_extra(
+        device, topk=0, extra_topk=extra_topk,
+        forced_num_splits=forced_num_splits, seed=extra_topk + 13,
+    )
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, (
+        f"zero-width-main extra={extra_topk} splits={forced_num_splits} O cos={cos}"
+    )
+    assert (got_O - exp_O).abs().max().item() < 2e-2, (
+        f"zero-width-main extra={extra_topk} splits={forced_num_splits} O atol exceeded"
+    )
 
 
 # ── GLM_NSA LAUNCHER NUMERICS (P7b): run_unified_decode vs glm_ref ─────────────

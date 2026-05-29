@@ -333,6 +333,13 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     device = require_sm120()
     clear_mla_caches()
 
+    # ESCAPE HATCH (mapped indexed_page_table): this test passes a mapped extra-cache
+    # indexed_page_table, which is genuinely-upstream-unsupported on the unified SM120
+    # backend (upstream FlashInfer addresses the extra cache by raw slot id only; the
+    # unified path correctly RAISEs). Pin the legacy escape hatch so the test exercises
+    # the legacy split internals it was written for, post P10 default-flip.
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
+
     contract_rows = 128
     contract_width = 2304
     live_rows = 1
@@ -782,9 +789,15 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
 
 @torch.inference_mode()
-def test_compressed_mla_page_table_width_does_not_resolve_new_kernel() -> None:
+def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch) -> None:
     device = require_sm120()
     clear_mla_caches()
+
+    # ESCAPE HATCH (mapped indexed_page_table): passes a mapped extra-cache page table,
+    # genuinely-upstream-unsupported on the unified SM120 backend (raw-slot-id only;
+    # unified correctly RAISEs). Pin the legacy escape hatch so this exercises the
+    # legacy split internals it was written for, post P10 default-flip.
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     q = _make_q(rows=1, seed=181, device=device)
     swa_cache = torch.empty(
@@ -871,9 +884,15 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_accepts_row_shared_page_table() -> None:
+def test_compressed_mla_accepts_row_shared_page_table(monkeypatch) -> None:
     device = require_sm120()
     clear_mla_caches()
+
+    # ESCAPE HATCH (mapped indexed_page_table): passes a row-shared mapped extra-cache
+    # page table, genuinely-upstream-unsupported on the unified SM120 backend
+    # (raw-slot-id only; unified correctly RAISEs). Pin the legacy escape hatch so this
+    # exercises the legacy split internals it was written for, post P10 default-flip.
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     rows = 3
     q = _make_q(rows=rows, seed=186, device=device)
@@ -948,9 +967,15 @@ def test_compressed_mla_accepts_row_shared_page_table() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel() -> None:
+def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkeypatch) -> None:
     device = require_sm120()
     clear_mla_caches()
+
+    # ESCAPE HATCH (mapped indexed_page_table): passes a mapped extra-cache page table,
+    # genuinely-upstream-unsupported on the unified SM120 backend (raw-slot-id only;
+    # unified correctly RAISEs). Pin the legacy escape hatch so this exercises the
+    # legacy split internals it was written for, post P10 default-flip.
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     workspace = B12XAttentionWorkspace.for_contract(
         mode="decode",

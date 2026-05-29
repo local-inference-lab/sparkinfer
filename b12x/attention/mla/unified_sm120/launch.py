@@ -226,13 +226,22 @@ def plan_unified_decode_splits(
     ``num_splits`` is clamped to ``[1, num_chunks]`` and to ``max_chunks`` (the
     workspace mid_out/mid_lse split capacity).
     """
-    topk = max(int(topk), 1)
+    # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache): topk==0 means
+    # NO main chunks -- the main section is elided and the decode attends ONLY the
+    # extra chunks. Keep ceil(0/BI)==0 here (do NOT floor topk to 1, which would
+    # fabricate a phantom main chunk that the num_main_chunks==0 dispatch would
+    # then mis-route as an over-allocated extra chunk). The single-cache /
+    # no-extra empty decode is still protected by the num_chunks>=1 floor below.
+    topk = max(int(topk), 0)
     extra_topk = max(int(extra_topk), 0)
     # num_chunks spans main + extra sections (FlashInfer num_splits = ceil(topk/BI)
     # + ceil(extra_topk/BI)); the wave-balance heuristic then picks the active
-    # block count over the COMBINED chunk count.
-    num_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW + (
-        (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    # block count over the COMBINED chunk count. Floored to >=1 so a fully-empty
+    # decode (topk==0 and extra_topk==0) still launches one (masked) chunk.
+    num_chunks = max(
+        1,
+        (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+        + ((extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW),
     )
 
     if forced_num_splits is not None:
@@ -921,10 +930,24 @@ class UnifiedDecodeKernel:
                     extra_section_len = extra_total
 
         # swa_indices for THIS token row: a 1-D (topk,) slice.
-        topk_row = cute.make_tensor(
-            swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
-            cute.make_layout(swa_indices.shape[1]),
-        )
+        # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
+        # swa_indices.shape[1]==0 means there are NO main chunks (num_main_chunks
+        # ==0) and the main section is never gathered/scanned. cute.make_layout(0)
+        # is illegal (size must be strictly positive), so build a degenerate
+        # 1-extent main view instead -- it is never referenced because every
+        # ``ci < num_main_chunks(==0)`` branch is unreachable, so the kernel
+        # attends ONLY the extra section. This is a const_expr (concrete-shape
+        # trace), so the non-zero-main DSV4/GLM traces are byte-identical.
+        if cutlass.const_expr(int(swa_indices.shape[1]) == 0):
+            topk_row = cute.make_tensor(
+                swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
+                cute.make_layout(1),
+            )
+        else:
+            topk_row = cute.make_tensor(
+                swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
+                cute.make_layout(swa_indices.shape[1]),
+            )
         # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
         # has_extra (extra_indices is None otherwise); const_expr-elided so the
         # no-extra trace never references the extra tensor.
