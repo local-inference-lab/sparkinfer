@@ -941,6 +941,30 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
+    """No-return global atomic add of a packed bf16x2 value (2 contiguous bf16).
+
+    Used by the W4A16 TC-decode FC2 epilogue to fold the per-route partial
+    outputs into the per-token output without a separate top-k-sum launch.
+    The address must be 4-byte aligned and cover two consecutive bf16 lanes.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Uint32(packed).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.noftz.bf16x2 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def atomic_cas_global_i32(addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
     """Global memory int32 atomic compare-and-swap. Returns old value."""
     return Int32(

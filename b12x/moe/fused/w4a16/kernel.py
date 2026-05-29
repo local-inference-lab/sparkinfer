@@ -47,6 +47,7 @@ from b12x.cute.fp4 import (
     packed_dequant_e8m0x4_to_half2x2,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
+    red_add_global_bf16x2,
     red_add_global_release_i32,
     shared_ptr_to_u32,
     st_global_v4_u32,
@@ -90,6 +91,17 @@ _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
+
+# TC-decode: a small-M decode specialization that runs on the PACKED W4A16
+# object (the same weights/scales the prefill GEMM uses). It reuses the packed
+# tensor-core MMA inner loop but folds the top-k sum into the FC2 store
+# epilogue (dropping the separate top-k-sum launch). Gated OFF by default.
+_TC_DECODE_ENV = "B12X_W4A16_TC_DECODE"
+_TC_DECODE_M = (1, 2, 4, 8)
+
+
+def _tc_decode_enabled() -> bool:
+    return os.environ.get(_TC_DECODE_ENV, "0") not in ("", "0", "false", "False")
 
 
 def _m_specialization_key(size_m: int) -> int:
@@ -505,6 +517,8 @@ class W4A16GemmKernel:
         source_n_rotation: int = 0,
         single_token_route_fast_path: bool = False,
         direct_topk_routes: bool = False,
+        fused_topk_sum: bool = False,
+        fused_sum_topk: int = 1,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -558,6 +572,12 @@ class W4A16GemmKernel:
         self.source_n_rotation = int(source_n_rotation)
         self.single_token_route_fast_path = bool(single_token_route_fast_path)
         self.direct_topk_routes = bool(direct_topk_routes)
+        self.fused_topk_sum = bool(fused_topk_sum)
+        self.fused_sum_topk = int(fused_sum_topk)
+        if self.fused_topk_sum and not self.direct_topk_routes:
+            raise ValueError("fused_topk_sum requires direct_topk_routes")
+        if self.fused_topk_sum and self.fused_sum_topk < 1:
+            raise ValueError("fused_sum_topk must be >= 1")
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -650,6 +670,8 @@ class W4A16GemmKernel:
             self.source_n_rotation,
             self.single_token_route_fast_path,
             self.direct_topk_routes,
+            self.fused_topk_sum,
+            self.fused_sum_topk,
             self.cta_m_blocks,
             self.uses_m_block_8,
             self.shared_words,
@@ -2856,13 +2878,27 @@ class W4A16GemmKernel:
                     q1 = self._relu2_elem2(q1)
                     q2 = self._relu2_elem2(q2)
                     q3 = self._relu2_elem2(q3)
-                st_global_v4_u32(
-                    get_ptr_as_int64(c_bf16_flat, true_idx * Int32(8)),
-                    q0,
-                    q1,
-                    q2,
-                    q3,
-                )
+                if cutlass.const_expr(self.fused_topk_sum):
+                    # Fold the per-route partials into the per-token output in
+                    # the epilogue (drops the separate top-k-sum launch). The
+                    # output must be zeroed before launch; each route slot maps
+                    # to token = route_index // top_k.  bf16x2 add lands two
+                    # consecutive hidden lanes per word.
+                    token_idx = route_index // Int32(self.fused_sum_topk)
+                    out_idx = token_idx * c_gl_stride + (c_gl_wr % c_gl_stride)
+                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int32(8))
+                    red_add_global_bf16x2(out_addr, q0)
+                    red_add_global_bf16x2(out_addr + Int64(4), q1)
+                    red_add_global_bf16x2(out_addr + Int64(8), q2)
+                    red_add_global_bf16x2(out_addr + Int64(12), q3)
+                else:
+                    st_global_v4_u32(
+                        get_ptr_as_int64(c_bf16_flat, true_idx * Int32(8)),
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                    )
             c_gl_wr += c_gl_wr_delta
             c_sh_rd += c_sh_rd_delta
         cute.arch.sync_threads()
@@ -3127,6 +3163,7 @@ class W4A16FusedMoeKernel:
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         direct_topk_routes: bool = False,
+        tc_decode_fused_sum: bool = False,
     ):
         is_gated = validate_activation(activation)
         swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
@@ -3140,6 +3177,11 @@ class W4A16FusedMoeKernel:
                 raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
         else:
             w13_layout = "packed"
+        self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        if self.tc_decode_fused_sum and not bool(direct_topk_routes):
+            raise ValueError("tc_decode_fused_sum requires direct_topk_routes")
+        if self.tc_decode_fused_sum and element_dtype != "bf16":
+            raise ValueError("tc_decode_fused_sum currently requires bf16 activations")
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -3209,6 +3251,8 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
+            fused_topk_sum=self.tc_decode_fused_sum,
+            fused_sum_topk=int(top_k),
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -4085,6 +4129,7 @@ def compile_w4a16_fused_moe(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "w13",
     direct_topk_routes: bool = False,
+    tc_decode_fused_sum: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -4101,8 +4146,14 @@ def compile_w4a16_fused_moe(
     else:
         w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
+    tc_decode_fused_sum = bool(tc_decode_fused_sum)
+    # The TC-decode path validates M in {1,2,4,8} itself and uses direct-topk
+    # routing for the whole {1,2,4,8} range, so it lifts the default decode cap.
+    direct_topk_m_cap = (
+        _W4A16_SMALL_M_DIRECT_MAX_M if tc_decode_fused_sum else _MAX_DIRECT_TOPK_ROUTE_M
+    )
     if direct_topk_routes and (
-        int(size_m) > _MAX_DIRECT_TOPK_ROUTE_M
+        int(size_m) > direct_topk_m_cap
         or weight_layout != "packed"
         or bool(zero_fc2_output)
     ):
@@ -4182,6 +4233,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
+        tc_decode_fused_sum=tc_decode_fused_sum,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -4864,8 +4916,27 @@ def run_w4a16_moe(
         )
         return output
 
+    # TC-decode: small-M packed decode that folds the top-k sum into the FC2
+    # store epilogue. Reuses the packed tensor-core MMA path; only the launch
+    # scheduling/epilogue changes. Requires the packed object, bf16 gated
+    # activation, int32 routes, no expert_map, and a runtime-compiled launch.
+    use_tc_decode = bool(
+        _tc_decode_enabled()
+        and fused_launch is None
+        and weight_layout == "packed"
+        and expert_map is None
+        and is_gated
+        and element_dtype == "bf16"
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_ids.is_cuda
+        and int(m) in _TC_DECODE_M
+    )
+    if use_tc_decode and topk_ids.dtype != torch.int32:
+        # The inline direct-topk route path needs int32 route indices.
+        topk_ids = topk_ids.to(torch.int32)
+
     direct_topk_eligible = (
-        m <= _MAX_DIRECT_TOPK_ROUTE_M
+        (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
         and weight_layout == "packed"
         and expert_map is None
     )
@@ -4885,6 +4956,9 @@ def run_w4a16_moe(
             "preplanned W4A16 direct top-k routing requires small-M packed "
             "int32 topk_ids without expert_map"
         )
+
+    # TC-decode requires the inline direct-topk route path (no route-pack).
+    use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
     required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0
@@ -4995,6 +5069,7 @@ def run_w4a16_moe(
             scale_format=scale_format,
             w13_layout=w13_layout,
             direct_topk_routes=use_direct_topk_routes,
+            tc_decode_fused_sum=use_tc_decode,
         )
     else:
         if int(fused_launch.size_m) < m:
@@ -5065,7 +5140,14 @@ def run_w4a16_moe(
         )
     fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
-    fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
+    if use_tc_decode:
+        # FC2 atomically accumulates per-route partials directly into the
+        # per-token output, so the output is the FC2 store target and must be
+        # pre-zeroed. This drops the separate top-k-sum launch.
+        output.zero_()
+        fc2_out = output.view(-1)
+    else:
+        fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
     fc1_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(
             size_n=fc1_cols,
@@ -5124,6 +5206,10 @@ def run_w4a16_moe(
         sms * int(fused.blocks_per_sm),
         stream,
     )
+
+    if use_tc_decode:
+        # FC2 already wrote the top-k-summed result into `output`.
+        return output
 
     if topk_sum_launch is None:
         sum_kernel = compile_w4a16_topk_sum(
