@@ -14,7 +14,11 @@ decode kernel over grid ``(num_tokens, H_BLOCKS, num_splits)`` writing PER-SPLIT
 NORMALIZED partials into the workspace ``mid_out`` / ``mid_lse`` (exactly
 split.py's ``SparseMLASplitDecodeMergeKernel`` convention), then runs the REUSED
 base-2 merge (``run_sparse_mla_split_decode_merge``) to produce the final O.
-``num_splits=1`` is the trivial 1-split merge (partial == final O).
+``num_splits`` is chosen by a FlashInfer-ported wave-balance heuristic (P9b; see
+``plan_unified_decode_splits`` / ``_wave_balanced_num_splits``) -- this fills the
+SMs at batch=1 instead of the prior serial ``num_splits=1`` (the #1 decode-perf
+lever from ``.sm120port/P9_benchmark_findings.md``). ``num_splits=1`` remains the
+trivial 1-split merge (partial == final O).
 
 SCOPE: DSV4 main-cache ONLY. GLM (q=576) and has_extra_cache (extra-tokens) are
 NOT supported here -- the compressed_api.py dispatch gate must fall back to the
@@ -95,6 +99,89 @@ def _env_flag(name: str) -> bool:
 B12X_MLA_SM120_UNIFIED: bool = _env_flag(_MLA_SM120_UNIFIED_ENV)
 
 
+# Optional decode num_splits override (P9b AutoTuner sweep hook). ``<= 0`` (or an
+# unparseable value, or unset) means "use the FlashInfer-ported wave-balanced
+# heuristic"; ``>= 1`` pins num_splits to that value (still clamped to
+# [1, num_chunks] and to the workspace split capacity). Read PER CALL (not cached
+# at import) so a sweep / AutoTuner can flip it between launches.
+_MLA_SM120_NUM_SPLITS_ENV = "B12X_MLA_SM120_NUM_SPLITS"
+
+# FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
+# (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
+# gap looks small but require more than this many integer waves are rejected.
+_CEIL_WAVES_MAX = 3
+
+# Observability: the most recent decode split plan (read by benchmarks / the
+# P9c AutoTuner sweep to report num_splits_used). Pure side-channel -- does NOT
+# affect numerics or the launch. Keys are informational.
+LAST_DECODE_PLAN: dict = {}
+
+
+def _env_num_splits_override() -> int:
+    """Read ``B12X_MLA_SM120_NUM_SPLITS`` per call. ``<= 0`` / unset / bad -> 0
+    (heuristic). Mirrors FlashInfer's ``chunks_per_block_override <= 0 -> C++
+    heuristic`` convention, but for OUR num_splits (== FlashInfer's active block
+    count num_splits_eff)."""
+    raw = os.environ.get(_MLA_SM120_NUM_SPLITS_ENV)
+    if raw is None:
+        return 0
+    try:
+        v = int(raw.strip())
+    except (TypeError, ValueError):
+        return 0
+    return v if v > 0 else 0
+
+
+def _wave_balanced_num_splits(
+    *, num_chunks: int, per_token_head: int, sm_count: int
+) -> int:
+    """Replicate FlashInfer's decode-dsv4 occupancy decision in OUR chunk-range
+    parameterization, returning OUR ``num_splits`` (== FlashInfer's active block
+    count ``num_splits_eff``).
+
+    FlashInfer splits MAXIMALLY: its ``num_splits`` == ``num_chunks`` (one block
+    per KV chunk; sparse_mla_sm120.py:259-260,286), then a C++ heuristic
+    (csrc/sparse_mla_sm120_decode_dsv4.cu:69-102) picks ``chunks_per_block`` to
+    wave-balance the launch and computes ``num_splits_eff = ceil(num_splits /
+    cpb)`` ACTIVE blocks. Our UnifiedDecodeKernel processes a contiguous
+    chunk-RANGE per CTA, so OUR ``num_splits`` directly IS that active count: we
+    port the cpb tail-gap search VERBATIM over ``num_chunks`` chunks, then return
+    ``ceil(num_chunks / cpb*)``.
+
+    Tail-gap formula (VERBATIM from the .cu):
+        per_token_head = num_tokens * H_BLOCKS
+        for cpb in 1..num_chunks:                  # FlashInfer: 1..num_splits
+            eff    = ceil(num_chunks / cpb)
+            active = per_token_head * eff
+            ceil_w = ceil(active / sm_count)
+            if ceil_w > CEIL_WAVES_MAX(=3): continue
+            waves  = active / sm_count
+            gap    = ceil_w - waves
+            pick cpb minimizing gap (tie -> larger cpb, fewer launched blocks)
+        num_splits = ceil(num_chunks / cpb*)       # == FlashInfer num_splits_eff
+    """
+    num_chunks = max(int(num_chunks), 1)
+    per_token_head = max(int(per_token_head), 1)
+    sm_count = max(int(sm_count), 1)
+
+    chunks_per_block = 1
+    best_gap = 2.0
+    for cpb in range(1, num_chunks + 1):
+        eff = (num_chunks + cpb - 1) // cpb
+        active = per_token_head * eff
+        ceil_w = (active + sm_count - 1) // sm_count
+        if ceil_w > _CEIL_WAVES_MAX:
+            continue
+        waves = active / sm_count
+        gap = ceil_w - waves
+        if gap < best_gap - 1e-6 or (gap < best_gap + 1e-6 and cpb > chunks_per_block):
+            best_gap = gap
+            chunks_per_block = cpb
+    # OUR num_splits == FlashInfer's num_splits_eff = ceil(num_splits / cpb*),
+    # where FlashInfer's num_splits == num_chunks (maximal split).
+    return (num_chunks + chunks_per_block - 1) // chunks_per_block
+
+
 # ---------------------------------------------------------------------------
 # Split-K planning. Reuse the compressed planner's chunk-count idiom but pin the
 # per-split chunk granularity to the kernel's BI=64 window so split boundaries
@@ -106,22 +193,47 @@ def plan_unified_decode_splits(
     topk: int,
     max_chunks: int,
     forced_num_splits: int | None = None,
+    num_tokens: int = 1,
+    h_blocks: int = 1,
+    sm_count: int | None = None,
 ) -> tuple[int, int, int]:
     """Return ``(num_chunks, num_splits, chunks_per_split)``.
 
     ``num_chunks = ceil(topk / BI)`` is the number of BI=64 candidate windows.
-    ``num_splits`` defaults to 1 (single-CTA decode; the merge is then trivial);
-    a forced value (e.g. for the multi-split numeric check) splits the chunks
-    into ``num_splits`` chunk-aligned ranges of ``chunks_per_split`` chunks each.
+    ``num_splits`` is chosen by replicating FlashInfer's decode launch tuning:
+    FlashInfer splits MAXIMALLY (one block per KV chunk) then wave-balances via a
+    chunks_per_block heuristic to an ACTIVE block count
+    ``num_splits_eff = ceil(num_chunks / cpb*)``. Our CTA owns a chunk-RANGE, so
+    OUR ``num_splits`` directly IS that active count -- we port the same
+    CEIL_WAVES_MAX=3 tail-gap search (see ``_wave_balanced_num_splits``).
+
+    Override precedence (highest first):
+      1. ``forced_num_splits`` (explicit caller arg -- multi-split numeric checks).
+      2. ``B12X_MLA_SM120_NUM_SPLITS`` env (>=1 pins; <=0/unset -> heuristic).
+      3. The FlashInfer-ported wave-balanced heuristic (needs ``sm_count``;
+         falls back to 1 if ``sm_count`` is unavailable).
+
     ``num_splits`` is clamped to ``[1, num_chunks]`` and to ``max_chunks`` (the
     workspace mid_out/mid_lse split capacity).
     """
     topk = max(int(topk), 1)
     num_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
-    if forced_num_splits is None:
-        num_splits = 1
-    else:
+
+    if forced_num_splits is not None:
         num_splits = max(1, int(forced_num_splits))
+    else:
+        env_override = _env_num_splits_override()
+        if env_override > 0:
+            num_splits = env_override
+        elif sm_count and sm_count > 0:
+            num_splits = _wave_balanced_num_splits(
+                num_chunks=num_chunks,
+                per_token_head=max(1, int(num_tokens)) * max(1, int(h_blocks)),
+                sm_count=int(sm_count),
+            )
+        else:
+            num_splits = 1
+
     num_splits = min(num_splits, num_chunks, max(1, int(max_chunks)))
     chunks_per_split = (num_chunks + num_splits - 1) // num_splits
     return num_chunks, num_splits, chunks_per_split
@@ -555,9 +667,35 @@ def run_unified_decode(
 
     topk = int(swa_indices.shape[1])
     max_chunks = int(workspace.max_chunks_per_row)
+    # SM count read at RUNTIME (RTX PRO 6000 Blackwell sm_120 et al.) -- feeds the
+    # FlashInfer-ported wave-balance tail-gap search. None if no CUDA device.
+    sm_count = None
+    if q_all.is_cuda:
+        sm_count = int(
+            torch.cuda.get_device_properties(q_all.device).multi_processor_count
+        )
     num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
-        topk=topk, max_chunks=max_chunks, forced_num_splits=forced_num_splits,
+        topk=topk,
+        max_chunks=max_chunks,
+        forced_num_splits=forced_num_splits,
+        num_tokens=rows,
+        h_blocks=h_blocks,
+        sm_count=sm_count,
     )
+    # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
+    # LAST_DECODE_PLAN["num_splits"]). Informational only.
+    LAST_DECODE_PLAN.clear()
+    LAST_DECODE_PLAN.update(
+        model_type=str(model_type),
+        topk=int(topk),
+        num_chunks=int(num_chunks),
+        num_splits=int(num_splits),
+        chunks_per_split=int(chunks_per_split),
+        num_tokens=int(rows),
+        h_blocks=int(h_blocks),
+        sm_count=(int(sm_count) if sm_count else None),
+    )
+    # Workspace mid_out/mid_lse must hold num_splits partials per (token, head).
     if num_splits > max_chunks:
         raise ValueError(
             f"unified_sm120 decode num_splits {num_splits} exceeds workspace "
@@ -615,10 +753,17 @@ def run_unified_decode(
         key_field("chunks_per_split", int(chunks_per_split)),
         key_field("page_block_size", int(swa_page_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
-        tensor_key("q_all", q_all, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(q_head_dim))),
-        tensor_key("swa_indices", swa_indices, dims=(DimKey.dynamic(), DimKey.bucket(topk))),
-        tensor_key("mid_out", mid_out, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
-        tensor_key("mid_lse", mid_lse, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits))),
+        # rows (== num_tokens) is BAKED into the launch grid
+        # (grid=(num_tokens, h_blocks, num_splits), concrete-shape trace), so it
+        # MUST be a compile key -- DimKey.exact on every row dim + a num_tokens
+        # key_field. A DimKey.dynamic() row dim would silently REUSE a kernel
+        # traced for a different num_tokens with the wrong grid (latent rows>1
+        # bug); key the exact T, exactly as prefill.py does.
+        key_field("num_tokens", int(rows)),
+        tensor_key("q_all", q_all, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.exact(q_head_dim))),
+        tensor_key("swa_indices", swa_indices, dims=(DimKey.exact(rows), DimKey.bucket(topk))),
+        tensor_key("mid_out", mid_out, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
+        tensor_key("mid_lse", mid_lse, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits))),
     )
     b12x_launch(
         kernel,
