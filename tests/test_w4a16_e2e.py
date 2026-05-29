@@ -22,12 +22,15 @@ from b12x.moe.fused.reference import (
 from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
 from b12x.moe.fused.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
+    _W4A16SmallMDirectKernel,
+    _small_m_direct_supported,
     compile_w4a16_fused_moe,
     compile_w4a16_topk_sum,
     run_w4a16_moe,
 )
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
+    prepare_w4a16_e8m0_native_weights,
     prepare_w4a16_modelopt_native_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
@@ -323,6 +326,235 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
 
     assert bool((actual != 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("w13_layout", ["w13", "w31"])
+# 0.5 is small enough to actually engage the SwiGLU clamp at these scales.
+@pytest.mark.parametrize("swiglu_limit", [None, 0.5])
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
+    activation: str,
+    m: int,
+    swiglu_limit: float | None,
+    w13_layout: str,
+) -> None:
+    """Small-M micro decode path with native MXFP4 (E8M0 K/32) scales."""
+    if swiglu_limit is not None and activation != "silu":
+        pytest.skip("swiglu_limit only applies to gated (silu) activation")
+    experts, hidden_size, intermediate_size = 4, 128, 128
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    topk = 2
+    torch.manual_seed(20260601 + (1000 if activation == "silu" else 0) + m)
+    w13 = torch.randint(
+        0, 256, (experts, rows, hidden_size // 2), dtype=torch.uint8, device="cuda"
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+
+    # Confirm the dispatch routes this native E8M0 case to the micro kernel.
+    assert _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=swiglu_limit,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout=w13_layout,
+        scale_format="e8m0_k32",
+    )
+
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout=w13_layout,
+    )
+    buffers = make_w4a16_buffers(
+        prepared, m=m, topk=topk, dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    # The micro decode path needs m * fc2_n_chunks * 128 * topk u32 of FC1-output
+    # scratch, which is larger than make_w4a16_buffers' generic intermediate_cache2.
+    fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+    intermediate_cache2 = torch.zeros(
+        2 * m * fc2_n_chunks * 128 * topk, dtype=torch.bfloat16, device="cuda"
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(
+        0, experts, (m, topk), dtype=torch.int32, device="cuda"
+    )
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        swiglu_limit=swiglu_limit,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        w13_layout=w13_layout,
+    )
+    torch.cuda.synchronize()
+
+    assert bool((actual != 0).any().item())
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("w13_layout", ["w13", "w31"])
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_e8m0_native_large_m_uses_main_gemm(
+    activation: str,
+    w13_layout: str,
+) -> None:
+    """The native E8M0 object routes med/large M to the main W4A16 GEMM."""
+    experts, hidden_size, intermediate_size = 8, 256, 256
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    topk, m = 2, 24  # m > _W4A16_SMALL_M_DIRECT_MAX_M -> main W4A16 kernel
+    torch.manual_seed(20260607 + (1000 if activation == "silu" else 0))
+    w13 = torch.randint(
+        0, 256, (experts, rows, hidden_size // 2), dtype=torch.uint8, device="cuda"
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+
+    # m=24 must NOT take the small-M micro path.
+    assert not _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout=w13_layout,
+        scale_format="e8m0_k32",
+    )
+
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout=w13_layout,
+    )
+    buffers = make_w4a16_buffers(
+        prepared, m=m, topk=topk, dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(0, experts, (m, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        swiglu_limit=None,
+        w13_layout=w13_layout,
+    )
+    torch.cuda.synchronize()
+    assert bool((actual != 0).any().item())
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+def test_micro_scale_format_distinguishes_compile_cache_key() -> None:
+    """E8M0 vs E4M3 micro kernels must not collide in the compile cache."""
+    common = dict(
+        activation="silu",
+        fast_math=True,
+        share_input_across_experts=True,
+        share_expert_scales=True,
+        single_token=True,
+    )
+    e4m3 = _W4A16SmallMDirectKernel(scale_format="e4m3_k16", **common)
+    e8m0 = _W4A16SmallMDirectKernel(scale_format="e8m0_k32", **common)
+    assert e4m3.__cache_key__ != e8m0.__cache_key__
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

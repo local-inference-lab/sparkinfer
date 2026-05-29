@@ -401,6 +401,7 @@ class TPMoEScratchCaps:
     apply_router_weight_on_input: bool = False
     swiglu_limit: float | None = None
     source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -428,6 +429,7 @@ class TPMoEScratchCaps:
             "source_format",
             _normalize_fp4_source_format(self.source_format),
         )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
         object.__setattr__(self, "frozen", bool(self.frozen))
 
 
@@ -473,6 +475,7 @@ class TPMoEScratchPlan:
             apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
             swiglu_limit=self.caps.swiglu_limit,
             source_format=self.caps.source_format,
+            w13_layout=self.caps.w13_layout,
         )
         if _B12X_TIMING:
             t_done = time.perf_counter()
@@ -748,6 +751,31 @@ def _normalize_w4a16_scale_format(scale_format: str) -> str:
 def _w4a16_scale_format_for_source(source_format: str) -> str:
     source_format = _normalize_fp4_source_format(source_format)
     return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
+
+
+def _w4a16_weight_layout_for_source(source_format: str) -> str:
+    """W4A16 weight layout implied by the FP4 source format.
+
+    E8M0 K/32 weights stay native (``modelopt``) so a single copy serves both
+    the small-M micro decode kernel and the med/large-M main GEMM; NVFP4 sources
+    are repacked (``packed``). Must mirror ``_get_w4a16_packed_weights`` so the
+    plan-time launch and the runtime ``prepared.weight_layout`` agree.
+    """
+    source_format = _normalize_fp4_source_format(source_format)
+    return "modelopt" if source_format == "fp4_e8m0_k32" else "packed"
+
+
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+
+
+def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
+    layout = str(weight_layout).lower()
+    if layout not in _W4A16_WEIGHT_LAYOUTS:
+        raise ValueError(
+            "weight_layout must be one of "
+            f"{sorted(_W4A16_WEIGHT_LAYOUTS)}, got {weight_layout!r}"
+        )
+    return layout
 
 
 def _normalize_w13_layout(w13_layout: str) -> str:
@@ -1893,6 +1921,7 @@ def _get_w4a16_packed_weights(
     reuse_input_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import (
+        prepare_w4a16_e8m0_native_weights,
         prepare_w4a16_packed_weights,
     )
 
@@ -1914,19 +1943,36 @@ def _get_w4a16_packed_weights(
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    prepared = prepare_w4a16_packed_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
-        source_format=source_format,
-        w13_layout=w13_layout,
-        reuse_input_storage=reuse_input_storage,
-    )
+    if source_format == "fp4_e8m0_k32":
+        # Native (weight_layout="modelopt") single-copy object so small-M decode
+        # routes to the micro kernel and med/large M to the main W4A16 GEMM. The
+        # E8M0 scale grid is byte-identical to the packed path (both pack via
+        # _pack_e8m0_k32_scales), so this only changes the weight layout.
+        prepared = prepare_w4a16_e8m0_native_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            activation=activation,
+            params_dtype=params_dtype,
+            w13_layout=w13_layout,
+        )
+    else:
+        prepared = prepare_w4a16_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            activation=activation,
+            params_dtype=params_dtype,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            reuse_input_storage=reuse_input_storage,
+        )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
     return prepared
 
@@ -2892,11 +2938,21 @@ def _prewarm_w4a16_planned_launches(
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
+    w13_layout: str = "w13",
 ) -> None:
-    """Resolve every W4A16 kernel shape owned by a frozen arena."""
+    """Resolve every W4A16 kernel shape owned by a frozen arena.
+
+    ``weight_layout`` and ``w13_layout`` must match the prepared weights the
+    binding will run with: E8M0 sources keep native ``modelopt`` weights (so the
+    FC1 ``source_n_rotation`` depends on ``w13_layout``), while NVFP4 sources are
+    ``packed`` (rotation already folded in, ``w13_layout`` irrelevant).
+    """
     if workspace.device.type != "cuda":
         raise RuntimeError("W4A16 MoE launch planning requires a CUDA device")
     scale_format = _normalize_w4a16_scale_format(scale_format)
+    weight_layout = _normalize_w4a16_weight_layout(weight_layout)
+    w13_layout = _normalize_w13_layout(w13_layout)
 
     from b12x.moe.fused.w4a16.host import (
         max_packed_route_slots,
@@ -2938,7 +2994,6 @@ def _prewarm_w4a16_planned_launches(
                 workspace.weight_E,
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
-            weight_layout = "packed"
             t_shape = time.perf_counter() if _B12X_TIMING else 0.0
             fused_launches[
                 (weight_layout, scale_format, token_count)
@@ -2959,6 +3014,7 @@ def _prewarm_w4a16_planned_launches(
                 swiglu_limit=swiglu_limit,
                 weight_layout=weight_layout,
                 scale_format=scale_format,
+                w13_layout=w13_layout,
             )
             t_fused = time.perf_counter() if _B12X_TIMING else 0.0
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
@@ -3079,16 +3135,19 @@ def materialize_tp_moe_arena_workspaces(
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     quant_mode = _normalize_quant_mode(quant_mode)
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
     )
     w4a16_scale_format = _w4a16_scale_format_for_source(source_format)
+    w4a16_weight_layout = _w4a16_weight_layout_for_source(source_format)
 
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
@@ -3231,6 +3290,8 @@ def materialize_tp_moe_arena_workspaces(
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=materialized.planned_swiglu_limit,
                 scale_format=w4a16_scale_format,
+                weight_layout=w4a16_weight_layout,
+                w13_layout=w13_layout,
             )
             if _B12X_TIMING:
                 prewarm_ms += (time.perf_counter() - t_prewarm0) * 1000.0

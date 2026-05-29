@@ -2002,6 +2002,15 @@ def bench_e2e() -> None:
         default=None,
     )
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
+    parser.add_argument(
+        "--w4a16-native",
+        action="store_true",
+        help=(
+            "Build the native (modelopt) W4A16 representation so small-M shapes "
+            "route to the micro decode kernel. For w31 sources (e.g. DeepSeek V4 "
+            "Flash) the W13 halves are reordered to w13 at prep time."
+        ),
+    )
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
     parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32", "flashinfer"], default=None)
     parser.add_argument("--include-routing", action="store_true")
@@ -2156,6 +2165,8 @@ def bench_e2e() -> None:
     if use_w4a16:
         from b12x.moe.fused.w4a16.prepare import (
             make_w4a16_packed_buffers as make_w4a16_buffers,
+            prepare_w4a16_e8m0_native_weights,
+            prepare_w4a16_modelopt_native_weights,
             prepare_w4a16_packed_weights as prepare_w4a16_weights,
         )
 
@@ -2163,19 +2174,56 @@ def bench_e2e() -> None:
             weights,
             params,
         )
-        backend_w4a16_prepared = prepare_w4a16_weights(
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            w4a16_g1,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            w4a16_g2,
-            activation=args.activation,
-            params_dtype=torch.bfloat16,
-            source_format=source_format,
-            w13_layout=weights.w13_layout,
+        if args.w4a16_native:
+            # Native (modelopt) prep so small-M routes to the micro decode kernel.
+            # The micro kernel handles both w13 and w31 (gate_up) natively, so the
+            # source layout (DeepSeek V4 Flash is w31) is passed through as-is.
+            if source_format == "fp4_e8m0_k32":
+                backend_w4a16_prepared = prepare_w4a16_e8m0_native_weights(
+                    weights.w13_weight,
+                    weights.w13_blockscale_swizzled,
+                    w4a16_g1,
+                    weights.w2_weight,
+                    weights.w2_blockscale_swizzled,
+                    w4a16_g2,
+                    activation=args.activation,
+                    params_dtype=torch.bfloat16,
+                    w13_layout=weights.w13_layout,
+                )
+            else:
+                backend_w4a16_prepared = prepare_w4a16_modelopt_native_weights(
+                    weights.w13_weight,
+                    weights.w13_blockscale_swizzled,
+                    w4a16_g1,
+                    weights.w2_weight,
+                    weights.w2_blockscale_swizzled,
+                    w4a16_g2,
+                    activation=args.activation,
+                    params_dtype=torch.bfloat16,
+                    source_format=source_format,
+                    w13_layout=weights.w13_layout,
+                )
+            print(
+                "W4A16 prep: native (micro decode path enabled for small M, "
+                f"w13_layout={weights.w13_layout})"
+            )
+        else:
+            backend_w4a16_prepared = prepare_w4a16_weights(
+                weights.w13_weight,
+                weights.w13_blockscale_swizzled,
+                w4a16_g1,
+                weights.w2_weight,
+                weights.w2_blockscale_swizzled,
+                w4a16_g2,
+                activation=args.activation,
+                params_dtype=torch.bfloat16,
+                source_format=source_format,
+                w13_layout=weights.w13_layout,
+            )
+        print(
+            "W4A16 scale format: "
+            f"{getattr(backend_w4a16_prepared, 'scale_format', source_format)}"
         )
-        print(f"W4A16 scale format: {backend_w4a16_prepared.scale_format}")
         make_backend_w4a16_buffers = make_w4a16_buffers
 
     unit_scale_contract = uses_unit_scale_contract(

@@ -2971,6 +2971,104 @@ def cvt_e4m3_to_f32_via_f16(
     )
 
 
+@dsl_user_op
+def cvt_e8m0_to_f32(e8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
+    """Convert a single E8M0 scale byte to its true f32 value 2**(byte-127).
+
+    Byte 0 maps to 0.0. Unlike packed_dequant_e8m0x4_* (which fold a 2**7 bias
+    into the MMA input), this returns the unbiased scale so callers can apply it
+    directly in an f32 accumulator.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(e8m0_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p0;
+                .reg .u32 b0;
+                .reg .s32 e0;
+                .reg .f32 ef0;
+                and.b32 b0, $1, 0x000000ff;
+                setp.eq.u32 p0, b0, 0;
+                cvt.s32.u32 e0, b0;
+                sub.s32 e0, e0, 127;
+                cvt.rn.f32.s32 ef0, e0;
+                ex2.approx.f32 $0, ef0;
+                selp.f32 $0, 0f00000000, $0, p0;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_e8m0x4_to_f32x4(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Decode 4 E8M0 scale bytes (packed u32) to 4 x true f32 (2**(byte-127))."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p0, p1, p2, p3;
+            .reg .u32 b0, b1, b2, b3;
+            .reg .s32 e0, e1, e2, e3;
+            .reg .f32 ef0, ef1, ef2, ef3;
+            and.b32 b0, $4, 0x000000ff;
+            shr.u32 b1, $4, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $4, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $4, 24;
+            setp.eq.u32 p0, b0, 0;
+            setp.eq.u32 p1, b1, 0;
+            setp.eq.u32 p2, b2, 0;
+            setp.eq.u32 p3, b3, 0;
+            cvt.s32.u32 e0, b0;
+            cvt.s32.u32 e1, b1;
+            cvt.s32.u32 e2, b2;
+            cvt.s32.u32 e3, b3;
+            sub.s32 e0, e0, 127;
+            sub.s32 e1, e1, 127;
+            sub.s32 e2, e2, 127;
+            sub.s32 e3, e3, 127;
+            cvt.rn.f32.s32 ef0, e0;
+            cvt.rn.f32.s32 ef1, e1;
+            cvt.rn.f32.s32 ef2, e2;
+            cvt.rn.f32.s32 ef3, e3;
+            ex2.approx.f32 $0, ef0;
+            ex2.approx.f32 $1, ef1;
+            ex2.approx.f32 $2, ef2;
+            ex2.approx.f32 $3, ef3;
+            selp.f32 $0, 0f00000000, $0, p0;
+            selp.f32 $1, 0f00000000, $1, p1;
+            selp.f32 $2, 0f00000000, $2, p2;
+            selp.f32 $3, 0f00000000, $3, p3;
+        }
+        """,
+        "=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
 # =============================================================================
 # FP4 (E2M1) Decode Intrinsics
 # =============================================================================

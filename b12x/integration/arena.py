@@ -544,6 +544,7 @@ class B12XExecutionLaneArena:
                     core_token_counts=caps.core_token_counts,
                     quant_mode=caps.quant_mode,
                     source_format=caps.source_format,
+                    w13_layout=caps.w13_layout,
                     activation=caps.activation,
                     apply_router_weight_on_input=caps.apply_router_weight_on_input,
                     swiglu_limit=caps.swiglu_limit,

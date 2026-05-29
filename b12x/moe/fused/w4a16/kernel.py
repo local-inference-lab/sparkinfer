@@ -72,7 +72,7 @@ from b12x.moe.fused.w4a16.host import (
     validate_activation,
 )
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
-from b12x.moe.fused.micro import MoEMicroKernelBackend
+from b12x.moe.fused.micro import MoEMicroKernelBackend, _direct_k_segments_for_k
 
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
@@ -419,7 +419,22 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         intermediate_size: int,
         topk: int,
         num_experts: int,
+        scale_format: str = "e4m3_k16",
     ) -> bool:
+        # E8M0 reads the shared packed scale grid. Both block axes must be /32,
+        # and the FC1 aligned fast paths k_segments in {2,6,12} are not yet
+        # converted to packed addressing (k_segments==8 and the general path are),
+        # so fall back to the main W4A16 GEMM for those shapes.
+        if scale_format == "e8m0_k32":
+            k_segments = _direct_k_segments_for_k(int(hidden_size))
+            k_segments_aligned = (int(hidden_size) // 16) == k_segments * 32
+            scale_block_ok = (
+                int(hidden_size) % 32 == 0
+                and int(intermediate_size) % 32 == 0
+                and not (k_segments_aligned and k_segments in (2, 6, 12))
+            )
+        else:
+            scale_block_ok = True
         return (
             int(m) in cls._SUPPORTED_M
             and int(m) <= _W4A16_SMALL_M_DIRECT_MAX_M
@@ -427,6 +442,7 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
             and int(hidden_size) % 128 == 0
             and int(intermediate_size) > 0
             and int(intermediate_size) % 16 == 0
+            and scale_block_ok
             and 0 < int(topk) <= 32
             and int(num_experts) > 0
             and MoEMicroKernelBackend.is_supported(
@@ -446,6 +462,9 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         share_input_across_experts: bool,
         share_expert_scales: bool,
         single_token: bool,
+        scale_format: str = "e4m3_k16",
+        swiglu_limit: float | None = None,
+        w13_layout: str = "w13",
     ):
         super().__init__(
             sf_vec_size=16,
@@ -458,6 +477,9 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
             single_token=single_token,
             dynamic_down_scale=False,
             w4a16_mode=True,
+            scale_format=scale_format,
+            swiglu_limit=swiglu_limit,
+            w13_layout=w13_layout,
         )
 
 
@@ -3749,6 +3771,7 @@ def _small_m_direct_supported(
     element_dtype: str,
     weight_layout: str,
     w13_layout: str,
+    scale_format: str = "e4m3_k16",
     expert_map: torch.Tensor | None = None,
 ) -> bool:
     if os.environ.get("B12X_W4A16_SMALL_M_DIRECT", "1") == "0":
@@ -3758,9 +3781,9 @@ def _small_m_direct_supported(
     return (
         element_dtype == "bf16"
         and weight_layout == "modelopt"
-        and w13_layout == "w13"
+        and w13_layout in ("w13", "w31")
         and not bool(apply_router_weight_on_input)
-        and swiglu_limit is None
+        and (swiglu_limit is None or activation == "silu")
         and expert_map is None
         and _W4A16SmallMDirectKernel.is_supported(
             m=m,
@@ -3768,6 +3791,7 @@ def _small_m_direct_supported(
             intermediate_size=intermediate_size,
             topk=topk,
             num_experts=num_experts,
+            scale_format=scale_format,
         )
     )
 
@@ -3783,6 +3807,9 @@ def _compile_w4a16_small_m_direct(
     fast_math: bool,
     topk_ids_dtype: torch.dtype,
     device: torch.device | None,
+    scale_format: str = "e4m3_k16",
+    swiglu_limit: float | None = None,
+    w13_layout: str = "w13",
 ) -> _W4A16SmallMDirectLaunch:
     if topk_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
@@ -3797,6 +3824,9 @@ def _compile_w4a16_small_m_direct(
         activation,
         bool(fast_math),
         topk_ids_dtype,
+        scale_format,
+        swiglu_limit,
+        w13_layout,
     )
     cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
     if cached is not None:
@@ -3808,6 +3838,9 @@ def _compile_w4a16_small_m_direct(
         share_input_across_experts=(int(m) == 1),
         share_expert_scales=True,
         single_token=(int(m) == 1),
+        scale_format=scale_format,
+        swiglu_limit=swiglu_limit,
+        w13_layout=w13_layout,
     )
     kernel.configure(
         int(m),
@@ -4176,6 +4209,7 @@ def compile_w4a16_fused_moe(
         element_dtype=element_dtype,
         weight_layout=weight_layout,
         w13_layout=w13_layout,
+        scale_format=scale_format,
     ):
         for ids_dtype in (torch.int32, torch.int64):
             _compile_w4a16_small_m_direct(
@@ -4187,6 +4221,9 @@ def compile_w4a16_fused_moe(
                 activation=activation,
                 fast_math=fast_math,
                 topk_ids_dtype=ids_dtype,
+                scale_format=scale_format,
+                swiglu_limit=swiglu_limit,
+                w13_layout=w13_layout,
                 device=torch.device("cuda", device) if device is not None else None,
             )
 
@@ -4684,7 +4721,14 @@ def run_w4a16_moe(
     weight_layout = getattr(prepared, "weight_layout", "packed")
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
-    scale_format = _normalize_scale_format(getattr(prepared, "scale_format", "e4m3_k16"))
+    scale_format = _normalize_scale_format(
+        getattr(prepared, "scale_format", None)
+        or (
+            "e8m0_k32"
+            if getattr(prepared, "source_format", "") == "fp4_e8m0_k32"
+            else "e4m3_k16"
+        )
+    )
     w13_layout = getattr(
         prepared,
         "w13_layout",
@@ -4742,6 +4786,7 @@ def run_w4a16_moe(
         element_dtype=element_dtype,
         weight_layout=weight_layout,
         w13_layout=w13_layout,
+        scale_format=scale_format,
         expert_map=expert_map,
     ):
         if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -4775,6 +4820,9 @@ def run_w4a16_moe(
             activation=activation,
             fast_math=bool(fast_math),
             topk_ids_dtype=topk_ids.dtype,
+            scale_format=scale_format,
+            swiglu_limit=swiglu_limit,
+            w13_layout=w13_layout,
             device=a_input.device,
         )
         micro_w13_scale = getattr(prepared, "micro_w13_scale", None)
