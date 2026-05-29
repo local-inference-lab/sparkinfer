@@ -28,6 +28,7 @@ from b12x.cute.fp4 import (
     fmax_f32,
     fp4_dot4_sum,
     fp4_dot4_sum_f32acc,
+    fp4_dot8_dual_sum,
     fp4_dot8_sum,
     fp4_dot8_sum_f32acc,
     get_ptr_as_int64,
@@ -503,6 +504,35 @@ class MoEMicroKernelBackend:
         return _block_dot_hfma2_pair_f32acc(up_a, up_b, gate_a, gate_b, smem_xh, xh_base)
 
     @cute.jit
+    def _block_dot_hfma2_pair_regs_for_math(
+        self,
+        up_a: Uint32,
+        up_b: Uint32,
+        gate_a: Uint32,
+        gate_b: Uint32,
+        xh0: Uint32,
+        xh1: Uint32,
+        xh2: Uint32,
+        xh3: Uint32,
+        xh4: Uint32,
+        xh5: Uint32,
+        xh6: Uint32,
+        xh7: Uint32,
+    ) -> Tuple[Float32, Float32]:
+        """Paired up/gate fp4_dot8 over pre-loaded activation registers (no smem
+        read). Identical math to _block_dot_hfma2_pair_for_math but the 8 shared
+        activation words are passed by register so they are read from smem only
+        once per warp-task instead of once per FC1 output row."""
+        if cutlass.const_expr(self.fast_math):
+            return fp4_dot8_dual_sum(
+                up_a, up_b, gate_a, gate_b,
+                xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7,
+            )
+        up = fp4_dot8_sum_f32acc(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+        gate = fp4_dot8_sum_f32acc(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+        return up, gate
+
+    @cute.jit
     def _block_dot4_for_math(
         self,
         u_val: Uint32,
@@ -569,7 +599,16 @@ class MoEMicroKernelBackend:
         cfg = _make_shape_config(m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated)
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
         if self.w4a16_mode and m == 1 and n <= 2048:
-            num_fc1_chunks = min(num_fc1_chunks, n // (2 * _BLOCK_SIZE))
+            # The 4-output-rows/warp retile only helps the k_segments==8 aligned
+            # gated path (its activation reg-hoist + dual-dot assume 4 rows).
+            # Other shapes (e.g. GLM k_segments==12) regress at bs=1, so keep the
+            # original 2 rows/warp there.
+            rows_per_warp_div = (
+                4
+                if (cfg.k_segments_aligned and cfg.k_segments == 8 and self.is_gated)
+                else 2
+            )
+            num_fc1_chunks = min(num_fc1_chunks, n // (rows_per_warp_div * _BLOCK_SIZE))
         if self.w4a16_mode and m > 1:
             # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
             # the 512-thread launch register limit.
@@ -1348,6 +1387,85 @@ class MoEMicroKernelBackend:
                 + lane_pad_base
             )
 
+            # The FC1 activation lives in smem with a lane-segmented, padded
+            # layout that depends only on the lane (and input token), not on the
+            # FC1 output row. The k_segments==8 gated path computes
+            # rows_per_warp_fc1 (=4) output rows per warp, and each row's eight
+            # paired fp4_dot8 calls re-read the SAME 64 activation words from
+            # smem. Hoist those reads ONCE per warp-task into registers so the
+            # per-row dots consume them from register, removing 3x of the smem
+            # activation traffic on the issue-bound decode loop. Scoped to the
+            # k_segments==8 aligned gated path (the TP=2 DeepSeek-V4-Flash shape);
+            # every other FC1 variant keeps reading from smem unchanged.
+            hoist_xh = cutlass.const_expr(
+                cfg.k_segments_aligned and cfg.k_segments == 8 and self.is_gated
+            )
+            if cutlass.const_expr(hoist_xh):
+                xa0 = Uint32(smem_xh[xh_base_t + Int32(0)])
+                xa1 = Uint32(smem_xh[xh_base_t + Int32(1)])
+                xa2 = Uint32(smem_xh[xh_base_t + Int32(2)])
+                xa3 = Uint32(smem_xh[xh_base_t + Int32(3)])
+                xa4 = Uint32(smem_xh[xh_base_t + Int32(4)])
+                xa5 = Uint32(smem_xh[xh_base_t + Int32(5)])
+                xa6 = Uint32(smem_xh[xh_base_t + Int32(6)])
+                xa7 = Uint32(smem_xh[xh_base_t + Int32(7)])
+                xa8 = Uint32(smem_xh[xh_base_t + Int32(8)])
+                xa9 = Uint32(smem_xh[xh_base_t + Int32(9)])
+                xa10 = Uint32(smem_xh[xh_base_t + Int32(10)])
+                xa11 = Uint32(smem_xh[xh_base_t + Int32(11)])
+                xa12 = Uint32(smem_xh[xh_base_t + Int32(12)])
+                xa13 = Uint32(smem_xh[xh_base_t + Int32(13)])
+                xa14 = Uint32(smem_xh[xh_base_t + Int32(14)])
+                xa15 = Uint32(smem_xh[xh_base_t + Int32(15)])
+                xa16 = Uint32(smem_xh[xh_base_t + Int32(16)])
+                xa17 = Uint32(smem_xh[xh_base_t + Int32(17)])
+                xa18 = Uint32(smem_xh[xh_base_t + Int32(18)])
+                xa19 = Uint32(smem_xh[xh_base_t + Int32(19)])
+                xa20 = Uint32(smem_xh[xh_base_t + Int32(20)])
+                xa21 = Uint32(smem_xh[xh_base_t + Int32(21)])
+                xa22 = Uint32(smem_xh[xh_base_t + Int32(22)])
+                xa23 = Uint32(smem_xh[xh_base_t + Int32(23)])
+                xa24 = Uint32(smem_xh[xh_base_t + Int32(24)])
+                xa25 = Uint32(smem_xh[xh_base_t + Int32(25)])
+                xa26 = Uint32(smem_xh[xh_base_t + Int32(26)])
+                xa27 = Uint32(smem_xh[xh_base_t + Int32(27)])
+                xa28 = Uint32(smem_xh[xh_base_t + Int32(28)])
+                xa29 = Uint32(smem_xh[xh_base_t + Int32(29)])
+                xa30 = Uint32(smem_xh[xh_base_t + Int32(30)])
+                xa31 = Uint32(smem_xh[xh_base_t + Int32(31)])
+                xa32 = Uint32(smem_xh[xh_base_t + Int32(32)])
+                xa33 = Uint32(smem_xh[xh_base_t + Int32(33)])
+                xa34 = Uint32(smem_xh[xh_base_t + Int32(34)])
+                xa35 = Uint32(smem_xh[xh_base_t + Int32(35)])
+                xa36 = Uint32(smem_xh[xh_base_t + Int32(36)])
+                xa37 = Uint32(smem_xh[xh_base_t + Int32(37)])
+                xa38 = Uint32(smem_xh[xh_base_t + Int32(38)])
+                xa39 = Uint32(smem_xh[xh_base_t + Int32(39)])
+                xa40 = Uint32(smem_xh[xh_base_t + Int32(40)])
+                xa41 = Uint32(smem_xh[xh_base_t + Int32(41)])
+                xa42 = Uint32(smem_xh[xh_base_t + Int32(42)])
+                xa43 = Uint32(smem_xh[xh_base_t + Int32(43)])
+                xa44 = Uint32(smem_xh[xh_base_t + Int32(44)])
+                xa45 = Uint32(smem_xh[xh_base_t + Int32(45)])
+                xa46 = Uint32(smem_xh[xh_base_t + Int32(46)])
+                xa47 = Uint32(smem_xh[xh_base_t + Int32(47)])
+                xa48 = Uint32(smem_xh[xh_base_t + Int32(48)])
+                xa49 = Uint32(smem_xh[xh_base_t + Int32(49)])
+                xa50 = Uint32(smem_xh[xh_base_t + Int32(50)])
+                xa51 = Uint32(smem_xh[xh_base_t + Int32(51)])
+                xa52 = Uint32(smem_xh[xh_base_t + Int32(52)])
+                xa53 = Uint32(smem_xh[xh_base_t + Int32(53)])
+                xa54 = Uint32(smem_xh[xh_base_t + Int32(54)])
+                xa55 = Uint32(smem_xh[xh_base_t + Int32(55)])
+                xa56 = Uint32(smem_xh[xh_base_t + Int32(56)])
+                xa57 = Uint32(smem_xh[xh_base_t + Int32(57)])
+                xa58 = Uint32(smem_xh[xh_base_t + Int32(58)])
+                xa59 = Uint32(smem_xh[xh_base_t + Int32(59)])
+                xa60 = Uint32(smem_xh[xh_base_t + Int32(60)])
+                xa61 = Uint32(smem_xh[xh_base_t + Int32(61)])
+                xa62 = Uint32(smem_xh[xh_base_t + Int32(62)])
+                xa63 = Uint32(smem_xh[xh_base_t + Int32(63)])
+
             for r_iter in cutlass.range_constexpr(cfg.rows_per_warp_fc1):
                 i_local = warp_id * Int32(cfg.rows_per_warp_fc1) + Int32(r_iter)
                 i = i_chunk_off + i_local
@@ -1433,14 +1551,14 @@ class MoEMicroKernelBackend:
                             sf_g7 * self._block_dot_hfma2_for_math(gw_d2, gw_d3, smem_xh, xh_base_t + Int32(56))
                         )
                     elif cutlass.const_expr(self.is_gated):
-                        dot_u0, dot_g0 = self._block_dot_hfma2_pair_for_math(uw_a0, uw_a1, gw_a0, gw_a1, smem_xh, xh_base_t + Int32(0))
-                        dot_u1, dot_g1 = self._block_dot_hfma2_pair_for_math(uw_a2, uw_a3, gw_a2, gw_a3, smem_xh, xh_base_t + Int32(8))
-                        dot_u2, dot_g2 = self._block_dot_hfma2_pair_for_math(uw_b0, uw_b1, gw_b0, gw_b1, smem_xh, xh_base_t + Int32(16))
-                        dot_u3, dot_g3 = self._block_dot_hfma2_pair_for_math(uw_b2, uw_b3, gw_b2, gw_b3, smem_xh, xh_base_t + Int32(24))
-                        dot_u4, dot_g4 = self._block_dot_hfma2_pair_for_math(uw_c0, uw_c1, gw_c0, gw_c1, smem_xh, xh_base_t + Int32(32))
-                        dot_u5, dot_g5 = self._block_dot_hfma2_pair_for_math(uw_c2, uw_c3, gw_c2, gw_c3, smem_xh, xh_base_t + Int32(40))
-                        dot_u6, dot_g6 = self._block_dot_hfma2_pair_for_math(uw_d0, uw_d1, gw_d0, gw_d1, smem_xh, xh_base_t + Int32(48))
-                        dot_u7, dot_g7 = self._block_dot_hfma2_pair_for_math(uw_d2, uw_d3, gw_d2, gw_d3, smem_xh, xh_base_t + Int32(56))
+                        dot_u0, dot_g0 = self._block_dot_hfma2_pair_regs_for_math(uw_a0, uw_a1, gw_a0, gw_a1, xa0, xa1, xa2, xa3, xa4, xa5, xa6, xa7)
+                        dot_u1, dot_g1 = self._block_dot_hfma2_pair_regs_for_math(uw_a2, uw_a3, gw_a2, gw_a3, xa8, xa9, xa10, xa11, xa12, xa13, xa14, xa15)
+                        dot_u2, dot_g2 = self._block_dot_hfma2_pair_regs_for_math(uw_b0, uw_b1, gw_b0, gw_b1, xa16, xa17, xa18, xa19, xa20, xa21, xa22, xa23)
+                        dot_u3, dot_g3 = self._block_dot_hfma2_pair_regs_for_math(uw_b2, uw_b3, gw_b2, gw_b3, xa24, xa25, xa26, xa27, xa28, xa29, xa30, xa31)
+                        dot_u4, dot_g4 = self._block_dot_hfma2_pair_regs_for_math(uw_c0, uw_c1, gw_c0, gw_c1, xa32, xa33, xa34, xa35, xa36, xa37, xa38, xa39)
+                        dot_u5, dot_g5 = self._block_dot_hfma2_pair_regs_for_math(uw_c2, uw_c3, gw_c2, gw_c3, xa40, xa41, xa42, xa43, xa44, xa45, xa46, xa47)
+                        dot_u6, dot_g6 = self._block_dot_hfma2_pair_regs_for_math(uw_d0, uw_d1, gw_d0, gw_d1, xa48, xa49, xa50, xa51, xa52, xa53, xa54, xa55)
+                        dot_u7, dot_g7 = self._block_dot_hfma2_pair_regs_for_math(uw_d2, uw_d3, gw_d2, gw_d3, xa56, xa57, xa58, xa59, xa60, xa61, xa62, xa63)
                         partial_up = (
                             sf_u0 * dot_u0 +
                             sf_u1 * dot_u1 +

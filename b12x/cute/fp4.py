@@ -3436,6 +3436,116 @@ def fp4_dot4_sum(
 
 
 @dsl_user_op
+def fp4_dot8_dual_sum(
+    up_a: Uint32,
+    up_b: Uint32,
+    gate_a: Uint32,
+    gate_b: Uint32,
+    x0: Uint32,
+    x1: Uint32,
+    x2: Uint32,
+    x3: Uint32,
+    x4: Uint32,
+    x5: Uint32,
+    x6: Uint32,
+    x7: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Fused dual FP4 dot product (up + gate) over the SAME 8 shared f16x2
+    activation words. Decodes both weight rows and runs two INDEPENDENT
+    f16x2 accumulator chains in a single inline-asm block, then reduces each
+    to f32. Bit-identical to running fp4_dot8_sum twice (same per-chain fma
+    order, same lo+hi f32 reduction) but emits one asm block so ptxas can
+    interleave the two independent fma chains for 2-way ILP and halves the
+    per-pair epilogue (mov/cvt/add) op count on the issue-bound decode loop."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Uint32(up_a).ir_value(loc=loc, ip=ip),
+            Uint32(up_b).ir_value(loc=loc, ip=ip),
+            Uint32(gate_a).ir_value(loc=loc, ip=ip),
+            Uint32(gate_b).ir_value(loc=loc, ip=ip),
+            Uint32(x0).ir_value(loc=loc, ip=ip),
+            Uint32(x1).ir_value(loc=loc, ip=ip),
+            Uint32(x2).ir_value(loc=loc, ip=ip),
+            Uint32(x3).ir_value(loc=loc, ip=ip),
+            Uint32(x4).ir_value(loc=loc, ip=ip),
+            Uint32(x5).ir_value(loc=loc, ip=ip),
+            Uint32(x6).ir_value(loc=loc, ip=ip),
+            Uint32(x7).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b8 ua0, ua1, ua2, ua3, ub0, ub1, ub2, ub3;
+            .reg .b8 ga0, ga1, ga2, ga3, gb0, gb1, gb2, gb3;
+            .reg .b32 uh0, uh1, uh2, uh3, uh4, uh5, uh6, uh7;
+            .reg .b32 gh0, gh1, gh2, gh3, gh4, gh5, gh6, gh7;
+            .reg .f16x2 uacc, gacc;
+            .reg .b16 ulo, uhi, glo, ghi;
+            .reg .f32 uflo, ufhi, gflo, gfhi;
+            mov.b32 {ua0, ua1, ua2, ua3}, $2;
+            mov.b32 {ub0, ub1, ub2, ub3}, $3;
+            mov.b32 {ga0, ga1, ga2, ga3}, $4;
+            mov.b32 {gb0, gb1, gb2, gb3}, $5;
+            cvt.rn.f16x2.e2m1x2 uh0, ua0;
+            cvt.rn.f16x2.e2m1x2 uh1, ua1;
+            cvt.rn.f16x2.e2m1x2 uh2, ua2;
+            cvt.rn.f16x2.e2m1x2 uh3, ua3;
+            cvt.rn.f16x2.e2m1x2 uh4, ub0;
+            cvt.rn.f16x2.e2m1x2 uh5, ub1;
+            cvt.rn.f16x2.e2m1x2 uh6, ub2;
+            cvt.rn.f16x2.e2m1x2 uh7, ub3;
+            cvt.rn.f16x2.e2m1x2 gh0, ga0;
+            cvt.rn.f16x2.e2m1x2 gh1, ga1;
+            cvt.rn.f16x2.e2m1x2 gh2, ga2;
+            cvt.rn.f16x2.e2m1x2 gh3, ga3;
+            cvt.rn.f16x2.e2m1x2 gh4, gb0;
+            cvt.rn.f16x2.e2m1x2 gh5, gb1;
+            cvt.rn.f16x2.e2m1x2 gh6, gb2;
+            cvt.rn.f16x2.e2m1x2 gh7, gb3;
+            mov.b32 uacc, 0;
+            mov.b32 gacc, 0;
+            fma.rn.f16x2 uacc, uh0, $6, uacc;
+            fma.rn.f16x2 gacc, gh0, $6, gacc;
+            fma.rn.f16x2 uacc, uh1, $7, uacc;
+            fma.rn.f16x2 gacc, gh1, $7, gacc;
+            fma.rn.f16x2 uacc, uh2, $8, uacc;
+            fma.rn.f16x2 gacc, gh2, $8, gacc;
+            fma.rn.f16x2 uacc, uh3, $9, uacc;
+            fma.rn.f16x2 gacc, gh3, $9, gacc;
+            fma.rn.f16x2 uacc, uh4, $10, uacc;
+            fma.rn.f16x2 gacc, gh4, $10, gacc;
+            fma.rn.f16x2 uacc, uh5, $11, uacc;
+            fma.rn.f16x2 gacc, gh5, $11, gacc;
+            fma.rn.f16x2 uacc, uh6, $12, uacc;
+            fma.rn.f16x2 gacc, gh6, $12, gacc;
+            fma.rn.f16x2 uacc, uh7, $13, uacc;
+            fma.rn.f16x2 gacc, gh7, $13, gacc;
+            mov.b32 {ulo, uhi}, uacc;
+            mov.b32 {glo, ghi}, gacc;
+            cvt.f32.f16 uflo, ulo;
+            cvt.f32.f16 ufhi, uhi;
+            cvt.f32.f16 gflo, glo;
+            cvt.f32.f16 gfhi, ghi;
+            add.f32 $0, uflo, ufhi;
+            add.f32 $1, gflo, gfhi;
+        }
+        """,
+        "=f,=f,r,r,r,r,r,r,r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    up = Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip))
+    gate = Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip))
+    return up, gate
+
+
+@dsl_user_op
 def fp4_dot8_sum(
     u_a: Uint32,
     u_b: Uint32,
