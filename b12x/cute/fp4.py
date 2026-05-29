@@ -809,6 +809,45 @@ def st_shared_v4_u32(
 
 
 @dsl_user_op
+def cp_async_bulk_g2s_mbar(
+    smem_dst_u32: Int32,
+    gmem_src_i64: Int64,
+    nbytes: Int32,
+    mbar_u32: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Emit cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.
+
+    CTA-scope bulk g2s gather completing on a CTA-scope mbarrier. Mirrors
+    FlashInfer cp_async_bulk_g2s (sparse_mla_sm120/arch/cp_async.cuh:64-72)
+    exactly:
+        [$0]=smem dst (u32 shared addr), [$1]=gmem src (i64 generic),
+        $2=bytes (u32), [$3]=mbar (u32 shared addr).
+    Used by the IO warp of the DSV4/GLM sparse-MLA decode port to gather a
+    whole token row (e.g. 656B or 576B+8B) in one transaction.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_dst_u32).ir_value(loc=loc, ip=ip),
+            Int64(gmem_src_i64).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_u32).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+        " [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
     """Store 8 bits to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(
@@ -976,6 +1015,42 @@ def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int3
             ],
             "atom.shared.add.s32 $0, [$1], $2;",
             "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_max_shared_f32(smem_addr: Int32, val: Float32, *, loc=None, ip=None) -> Float32:
+    """Shared-memory (CTA-scope) atomic max of a NON-NEGATIVE fp32 `val` into the
+    slot at 32-bit shared address `smem_addr`. Returns the resulting max.
+
+    Relies on the IEEE-754 ordering of non-negative floats matching the signed
+    int ordering of their bit patterns, so the smem max can be done with a
+    single s32 atomic. Used by the running-max reduction of the sparse-MLA
+    softmax stage.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Int32(smem_addr).ir_value(loc=loc, ip=ip),
+                Float32(val).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .s32 vi, oldi, maxi;
+                mov.b32 vi, $2;
+                atom.shared.max.s32 oldi, [$1], vi;
+                max.s32 maxi, oldi, vi;
+                mov.b32 $0, maxi;
+            }
+            """,
+            "=f,r,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -2594,6 +2669,69 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
 
 
 @dsl_user_op
+def mma_m16n8k32_f32_e4m3(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Plain (non-block-scaled) SM120 FP8 E4M3 warp MMA `m16n8k32`.
+
+    d{0..3} are the accumulator IN-OUT (C on input, D on output)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+# ``mma_m16n8k16_f32_bf16`` was proven during the SM120 sparse-MLA port to be
+# bit-identical (same signature, same emitted
+# ``mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32``, same constraint
+# string and operand grouping) to the pre-existing ``bf16_mma_m16n8k16_f32``
+# above. Expose it under the port's name as a thin alias so the sparse-MLA
+# kernels can import it without duplicating the inline asm.
+mma_m16n8k16_f32_bf16 = bf16_mma_m16n8k16_f32
+
+
+@dsl_user_op
 def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
     """PTX byte permutation helper."""
     return Uint32(
@@ -3503,6 +3641,57 @@ def pack_f32x2_to_f16x2(
 # =============================================================================
 # UE8M0 Intrinsics (for MXFP4)
 # =============================================================================
+
+
+@dsl_user_op
+def pow2_ceil_ue8m0(
+    scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Uint32]:
+    """Round a positive FP32 ``scale`` UP to a power of two, bit-exactly.
+
+    Returns ``(rounded_fp32, ue8m0_byte)`` where:
+      * ``rounded_fp32`` == ``__uint_as_float(power_of_2_round(__float_as_uint(scale)))``
+      * ``ue8m0_byte``   == ``(__float_as_uint(rounded_fp32) >> 23) & 0xFF``
+
+    Bit-exact replica of FlashInfer's fp8_quant.cuh rounding +
+    scale_convert.cuh fp32_to_ue8m0. Integer ops only (no lg2.approx), so unlike
+    ``cvt_f32_to_ue8m0`` it matches the FlashInfer reference bit-for-bit.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.i32()]),
+        [Float32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred  p_mant;
+            .reg .b32   bits, mant;
+
+            // bits = __float_as_uint(scale)
+            mov.b32 bits, $2;
+            // mant = bits & 0x007FFFFF  (mantissa field)
+            and.b32 mant, bits, 8388607;
+            setp.ne.u32 p_mant, mant, 0;
+            // if (mant) bits = (bits + 0x00800000) & 0x7F800000
+            @p_mant add.u32 bits, bits, 8388608;
+            @p_mant and.b32 bits, bits, 2139095040;
+            // rounded fp32 scale = __uint_as_float(bits)
+            mov.b32 $0, bits;
+            // ue8m0 = (bits >> 23) & 0xFF
+            bfe.u32 $1, bits, 23, 8;
+        }
+        """,
+        "=f,=r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    rounded = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    ue8m0 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Float32(rounded), Uint32(ue8m0)
 
 
 @dsl_user_op

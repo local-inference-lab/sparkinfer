@@ -11,6 +11,7 @@ from .api import (
     _final_lse_from_split_workspace,
     _get_mla_output_view,
     _get_sm_scale_tensor,
+    _use_unified_sm120,
     _validate_split_control_tensors,
     _validate_tensor_storage_bounds,
 )
@@ -53,6 +54,7 @@ def compressed_mla_decode_forward(
     expected_num_q_heads: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
+    backend: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages."""
 
@@ -92,6 +94,45 @@ def compressed_mla_decode_forward(
     q3 = _normalize_compressed_q(q_all)
     rows, heads, _ = q3.shape
     live_rows = rows
+
+    # Opt-in dispatch into the parallel unified_sm120 backend (P7). The unified
+    # kernel currently supports the DSV4 MAIN-CACHE contract ONLY:
+    #   * q_head_dim == COMPRESSED_MLA_HEAD_DIM == 512 (DSV4; NOT GLM q=576)
+    #   * no indexed/extra-tokens dual cache (P7c)
+    #   * no attn_sink fold, no return_lse (not yet ported)
+    # Anything unsupported FALLS BACK to the legacy path below (never silently
+    # route an unsupported call to the unified kernel, never raise here). The
+    # legacy path stays byte-identical when the flag is off / backend is None.
+    if _use_unified_sm120(backend=backend, device=q3.device):
+        _unified_has_extra = (
+            indexed_k_cache is not None
+            or indexed_indices is not None
+            or indexed_topk_lengths is not None
+        )
+        _unified_supported = (
+            int(q3.shape[-1]) == COMPRESSED_MLA_HEAD_DIM
+            and not _unified_has_extra
+            and attn_sink is None
+            and not return_lse
+        )
+        if _unified_supported:
+            from . import unified_sm120
+
+            return unified_sm120.run_unified_decode(
+                q_all=q3,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                workspace=scratch,
+                sm_scale=sm_scale,
+                swa_page_size=swa_page_size,
+                attn_sink=None,
+                return_lse=False,
+                lse_scale=lse_scale,
+            )
+        # else: unsupported (GLM q=576 / extra-tokens / sink / return_lse) ->
+        # fall through to the legacy compressed-MLA decode below.
+
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     _validate_compressed_cache_layout(
         swa_k_cache,

@@ -27,6 +27,13 @@ from b12x.attention.workspace import B12XAttentionWorkspace
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
+# Opt-in dispatch into the parallel unified_sm120 sparse-MLA backend. Parsed once at
+# import time via the same _env_flag helper (api.py:86); the legacy path is byte-identical
+# when this is off and no backend="sm120_unified" kwarg is supplied.
+_MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
+_MLA_SM120_UNIFIED_BACKEND = "sm120_unified"
+# GLM_NSA uncompressed decode contract (q_head_dim = d_nope+d_rope = 512+64).
+_MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
@@ -84,6 +91,35 @@ def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Parsed once at import; honored alongside the per-call backend kwarg (which OR-combines).
+_MLA_SM120_UNIFIED_DEFAULT = _env_flag(_MLA_SM120_UNIFIED_ENV)
+
+
+def _use_unified_sm120(*, backend: str | None, device: torch.device) -> bool:
+    """Gate for the opt-in unified_sm120 backend.
+
+    Returns True only when (env flag OR backend="sm120_unified") AND the device is
+    SM120+. Re-reads the env flag each call so monkeypatched os.environ in tests is
+    honored without re-import. The contract (q_head_dim) is checked at the call site.
+    """
+    if backend is not None and backend != _MLA_SM120_UNIFIED_BACKEND:
+        raise ValueError(
+            f"backend must be None or {_MLA_SM120_UNIFIED_BACKEND!r}, got {backend!r}"
+        )
+    requested = backend == _MLA_SM120_UNIFIED_BACKEND or (
+        _MLA_SM120_UNIFIED_DEFAULT or _env_flag(_MLA_SM120_UNIFIED_ENV)
+    )
+    if not requested:
+        return False
+    if device.type != "cuda":
+        return False
+    # Imported lazily: get_sm_version lives in b12x.cute.fp4 (CuTe surface) and we only
+    # need it on the opt-in path so the legacy import graph is unchanged.
+    from b12x.cute.fp4 import get_sm_version
+
+    return get_sm_version(device) >= 120
 
 
 def _resolve_mla_prefill_strategy() -> Literal["auto", "single", "split"]:
@@ -325,6 +361,7 @@ def sparse_mla_decode_forward(
     lse_scale: Literal["base2", "natural"] = "base2",
     attn_sink: torch.Tensor | None = None,
     identity_page_table: bool = False,
+    backend: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -352,6 +389,7 @@ def sparse_mla_decode_forward(
         lse_scale=lse_scale,
         attn_sink=attn_sink,
         identity_page_table=identity_page_table,
+        backend=backend,
     )
 
 
@@ -412,6 +450,7 @@ def _run_sparse_mla(
     lse_scale: Literal["base2", "natural"] = "base2",
     attn_sink: torch.Tensor | None = None,
     identity_page_table: bool = False,
+    backend: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -537,6 +576,45 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
+    # Opt-in dispatch into the parallel unified_sm120 backend (DSV3.2 dropped; this is the
+    # GLM_NSA uncompressed q_head_dim==576 contract). Gated so the legacy path below is
+    # byte-identical when the flag is off and no backend kwarg is supplied.
+    #
+    # P7 SCOPE: the unified backend implements the DSV4 MAIN-CACHE compressed
+    # decode ONLY (routed via compressed_api.compressed_mla_decode_forward). The
+    # GLM_NSA uncompressed path here is DEFERRED to P7b -- so when the gate is on
+    # and the GLM contract is presented we raise NotImplementedError (never
+    # silently route an unsupported GLM call to the DSV4 kernel). q != 576 is a
+    # contract error.
+    if _use_unified_sm120(backend=backend, device=q_all.device):
+        if int(q_all.shape[-1]) != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
+            raise ValueError(
+                f"unified_sm120 sparse decode requires the GLM_NSA contract "
+                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={int(q_all.shape[-1])}"
+            )
+        # P7b: GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) decode
+        # via the unified SM120 kernel (cute.constexpr GLM branches beside DSV4).
+        # Fall back to the legacy path for features the unified kernel does not
+        # yet implement (LSE, attn_sink, multi-token rows) -- never raise so an
+        # unsupported call still computes correctly on the legacy backend.
+        _glm_unified_ok = (
+            not return_lse
+            and attn_sink is None
+            and int(q_all.shape[0]) == 1
+            and int(workspace.num_q_heads) % 16 == 0
+        )
+        if _glm_unified_ok:
+            from .unified_sm120.launch import run_unified_decode
+
+            return run_unified_decode(
+                q_all=q_all,
+                swa_k_cache=kv_cache,
+                swa_indices=selected_indices,
+                swa_topk_lengths=active_token_counts,
+                workspace=workspace,
+                sm_scale=float(sm_scale),
+                swa_page_size=int(workspace.page_size),
+            )
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale
     )

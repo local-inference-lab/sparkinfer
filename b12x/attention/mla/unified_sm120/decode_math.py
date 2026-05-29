@@ -1,0 +1,1042 @@
+"""DSV4 sparse-MLA decode MATH stages (P5) -- the QK path (S0-S3).
+
+100%-CuTeDSL single-CTA DSV4 decode for ONE query token over HPB=16 heads with
+8 math warps (256 threads). This module currently implements the QK score path:
+
+  * S0  Q-quant       : BF16 Q -> per-(QUANT_TILE=64) absmax -> pow2 UE8M0 scale
+                        -> E4M3 quantize into ``q_fp8`` + FP32 pow2 scale into
+                        ``q_sc``; Q-rope copied bf16 into ``q_rope``.
+  * S1  QK-NoPE       : block-scaled FP8 MMA (mxfp8 m16n8k32, ue8m0 selectors)
+                        with REAL sfa (Q pow2 exponent byte from ``q_sc``) and
+                        sfb (K UE8M0 footer byte from ``kv_sc``). NUM_SCALES=7 x
+                        (QUANT_TILE/32)=2 = 14 block-scaled MMAs.
+  * S2  QK-RoPE       : bf16 m16n8k16 accumulating into the SAME qk regs over
+                        D_ROPE=64 (4 K-steps) = 4 bf16 MMAs.
+  * S3  mask + scale  : invalid candidates (idx<0 OR past split_cand_end) -> -inf
+                        (-Float32.inf, the rs-1 base-2 merge sentinel); then
+                        qk *= sm_scale * LOG2E.
+
+The DATA PATH follows FlashInfer ``decode_dsv4_kernel.cuh`` (S0 ``fp8_quant.cuh``
+``quantize_q_to_smem``; S1/S2 the chunk-loop QK block at decode_dsv4 :372-454).
+The ldmatrix loaders mirror ``arch/ldmatrix_sm120.cuh`` (FLAT byte addressing on
+the linear smem regions finalized in ``smem.py``) rather than the GLM onepass
+``_permuted_offset_128b`` XOR swizzle (see the smem.py module docstring).
+
+KEY DIVERGENCE from ``kernel_onepass.py`` (blueprint ORCHESTRATOR NOTE):
+``kernel_onepass`` pre-dequantizes K to bf16 and passes ``unit_scale``
+(0x7F7F7F7F) into the block-scaled MMA. DSV4 instead keeps the FP8 nope bytes RAW
+in smem and feeds the REAL UE8M0 K footer byte + Q pow2 exponent byte as the
+``sfa``/``sfb`` selectors -- the hardware ue8m0 path, zero-cost scaling.
+
+Per-warp QK score fragment layout (single source of truth for the PV agent):
+  * 8 math warps; warp ``w`` owns candidates ``[w*8, w*8+8)`` (DSV4_QK_N_TILES=1
+    so one m16n8 N-tile per warp -> 8 candidate columns per warp; 8 warps cover
+    BI=64).
+  * The MMA M dimension is the HPB=16 heads; N is the candidate column.
+  * Per lane, the m16n8 fragment is 4 FP32 accumulators ``qk[0..3]``:
+      gid = lane >> 2 ;  tid = lane & 3
+      qk[0] = score[head=gid     , cand=w*8 + tid*2    ]
+      qk[1] = score[head=gid     , cand=w*8 + tid*2 + 1]
+      qk[2] = score[head=gid + 8 , cand=w*8 + tid*2    ]
+      qk[3] = score[head=gid + 8 , cand=w*8 + tid*2 + 1]
+    (gid in [0,8) covers heads 0..15 across the two row groups; tid in [0,4)
+    covers the 8 candidate columns in pairs.)
+"""
+
+from __future__ import annotations
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Float32, Int32, Uint32
+
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+from b12x.attention._cute.ops import LOG2_E
+from b12x.cute.fp4 import (
+    atomic_max_shared_f32,
+    byte_perm,
+    cvt_f32_to_e4m3,
+    fabs_f32,
+    fmax_f32,
+    fmin_f32,
+    fp8_e4m3_to_f32,
+    ld_shared_f32,
+    ld_shared_u32,
+    ldmatrix_m8n8x2_b16,
+    ldmatrix_m8n8x4_b16,
+    mma_m16n8k16_f32_bf16,
+    mma_m16n8k32_f32_e4m3,
+    mxfp8_mma_m16n8k32_f32_e4m3,
+    pow2_ceil_ue8m0,
+    shared_ptr_to_u32,
+    st_shared_bf16_from_f32,
+    st_shared_f32,
+    st_shared_u8,
+)
+
+
+@dsl_user_op
+def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
+    """``exp2f``-equivalent base-2 exponential (``ex2.approx.ftz.f32``).
+
+    Matches kernel.py ``_exp2_approx_ftz_f32`` and the decode-dsv4 base-2 online
+    softmax (``exp2f``). FTZ is harmless at the score magnitudes here."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _log2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
+    """``log2f``-equivalent (``lg2.approx.ftz.f32``) for the base-2 LSE epilogue."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "lg2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _f32_to_bits(a: Float32, *, loc=None, ip=None) -> Uint32:
+    """Reinterpret a Float32 as its raw u32 IEEE-754 bits (mov.b32)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+@dsl_user_op
+def _u32_to_f32(a: Uint32, *, loc=None, ip=None) -> Float32:
+    """Reinterpret a Uint32 as its raw Float32 IEEE-754 value (mov.b32).
+
+    GLM ARBITRARY_FP32 path: the 4 inline K scale bytes are an arbitrary fp32
+    (NOT a UE8M0 exponent byte), so the smem word is reinterpreted whole."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(a).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+# ── DSV4 QK-path compile-time geometry (one CTA, one chunk) ──────────────────
+_FP8_MAX = 448.0
+_FP8_MIN = -448.0
+_NEG_INF = float("-inf")
+# Intra-kernel softmax mask sentinel (FlashInfer decode_dsv4 :443). Large FINITE
+# negative so a fully-invalid warp's (qk - local_max) is 0, not inf - inf = nan.
+# The merge -inf sentinel is emitted only at S7 (empty-block LSE).
+_QK_MASK = -1e30
+
+# 8 math warps, BI=64 candidates -> 8 candidates per warp = one m16n8 N-tile.
+_N_WARPS = 8
+_ENTRIES_PER_WARP = 8  # BI // _N_WARPS
+_QK_N_TILES = 1  # _ENTRIES_PER_WARP // 8
+
+
+@cute.jit
+def _smem_byte(base_addr: Int32, byte_off) -> Int32:
+    """Flat smem byte address (base u32 + byte offset); no XOR swizzle."""
+    return base_addr + Int32(byte_off)
+
+
+# =============================================================================
+# S0 -- Q quantization to smem (BF16 -> E4M3 + pow2 UE8M0 scale)
+# Port of fp8_quant.cuh::quantize_q_to_smem. Outputs q_fp8 / q_sc / q_rope.
+# =============================================================================
+@cute.jit
+def s0_quantize_q_to_smem(
+    q_token: cute.Tensor,            # (NUM_HEADS, D_QK) bf16 view for this token
+    q_fp8_base_addr: Int32,          # u32 smem addr of q_fp8 (HPB x Q_NOPE_STRIDE)
+    q_sc_view: cute.Tensor,          # smem fp32 view (HPB*NUM_SCALES,) -- pow2 scales
+    q_rope_base_addr: Int32,         # u32 smem addr of q_rope (HPB x D_ROPE bf16)
+    amax_view: cute.Tensor,          # smem fp32 scratch (>= HPB*NUM_SCALES) reused as amax
+    head_base: Int32,                # first head index of this CTA (h_start)
+    valid_hpb: Int32,                # number of valid heads (<= HPB)
+    tid: Int32,                      # flat thread id in [0, MATH_THREADS)
+    *,
+    d_nope: cutlass.Constexpr,       # 448
+    d_rope: cutlass.Constexpr,       # 64
+    d_qk: cutlass.Constexpr,         # 512
+    quant_tile: cutlass.Constexpr,   # 64
+    num_scales: cutlass.Constexpr,   # 7
+    hpb: cutlass.Constexpr,          # 16
+    q_nope_stride: cutlass.Constexpr,  # 464
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,   # named-barrier slot for the math-only sync
+):
+    """S0: cooperative BF16->E4M3 Q quant with per-tile pow2 UE8M0 scale.
+
+    Mirrors fp8_quant.cuh exactly:
+      1. copy Q-rope bf16 -> smem (zero-fill invalid heads)
+      2. init amax[HPB*NUM_SCALES] = 0
+      3. per-(head,tile) absmax via atomicMax-on-int (atomic_max_shared_f32)
+      4. raw = max(amax,1e-4)/FP8_MAX ; pow2-ceil -> q_sc (FP32 pow2 scale)
+      5. quantize q_nope * (1/q_sc) -> E4M3 into q_fp8 (zero-fill invalid heads)
+    The caller fences (named barrier) AFTER this returns so S1 reads a coherent
+    Q stage. The internal barriers separate the 5 phases.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+
+    # --- Step 1: copy Q-rope bf16 -> smem; zero-fill invalid heads. ---
+    i = tid
+    while i < Int32(hpb * d_rope):
+        h = i // Int32(d_rope)
+        d = i - h * Int32(d_rope)
+        s_byte = h * Int32(d_rope * 2) + d * Int32(2)
+        val = Float32(0.0)
+        if h < valid_hpb:
+            val = Float32(q_token[head_base + h, Int32(d_nope) + d])
+        st_shared_bf16_from_f32(_smem_byte(q_rope_base_addr, s_byte), val)
+        i += Int32(num_threads)
+
+    # --- Step 2: init amax = 0. ---
+    i = tid
+    while i < Int32(hpb * num_scales):
+        amax_view[i] = Float32(0.0)
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    # --- Step 3: per-(head,tile) absmax over valid heads. ---
+    idx = tid
+    while idx < valid_hpb * Int32(d_nope):
+        h = idx // Int32(d_nope)
+        d = idx - h * Int32(d_nope)
+        blk = d // Int32(quant_tile)
+        v = Float32(q_token[head_base + h, d])
+        slot = h * Int32(num_scales) + blk
+        amax_addr = shared_ptr_to_u32(amax_view.iterator) + slot * Int32(4)
+        atomic_max_shared_f32(amax_addr, fabs_f32(v))
+        idx += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    # --- Step 4: scale = pow2_ceil(max(amax,1e-4)/FP8_MAX) -> q_sc (FP32). ---
+    i = tid
+    while i < Int32(hpb * num_scales):
+        raw = fmax_f32(amax_view[i], Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
+        rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
+        q_sc_view[i] = rounded
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    # --- Step 5: quantize q_nope to E4M3 into q_fp8; zero-fill invalid heads. ---
+    idx = tid
+    while idx < Int32(hpb * d_nope):
+        h = idx // Int32(d_nope)
+        d = idx - h * Int32(d_nope)
+        blk = d // Int32(quant_tile)
+        out_byte = h * Int32(q_nope_stride) + d
+        fp8_bits = Uint32(0)
+        if h < valid_hpb:
+            si = Float32(1.0) / q_sc_view[h * Int32(num_scales) + blk]
+            v = Float32(q_token[head_base + h, d]) * si
+            v = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
+            fp8_bits = cvt_f32_to_e4m3(v)
+        st_shared_u8(_smem_byte(q_fp8_base_addr, out_byte), (fp8_bits & Uint32(0xFF)).to(cutlass.Uint8))
+        idx += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+
+# =============================================================================
+# S0b -- GLM K-requant (ARBITRARY_FP32): dequant e4m3 K * inline fp32 scale ->
+# re-quant e4m3 (true value, magnitude-absorbed) in place. GLM-ONLY.
+# =============================================================================
+@cute.jit
+def s0b_requant_k_glm(
+    kv_fp8_base_addr: Int32,         # u32 smem addr of kv_fp8[buf] (BI x KV_SMEM_STRIDE)
+    tid: Int32,                      # flat math thread id [0, MATH_THREADS)
+    *,
+    bi: cutlass.Constexpr,           # 64
+    d_nope: cutlass.Constexpr,       # 512
+    quant_tile: cutlass.Constexpr,   # 128
+    kv_smem_stride: cutlass.Constexpr,  # 528
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """GLM-only S0b: in-place K dequant+requant so S1 can run the block-scaled
+    MMA with a UNIT sfb (0x7F) on pre-scaled e4m3 frags (kernel_onepass.py:544
+    bfloat2_mul dequant + :610 cvt_bf16x2_to_e4m3x2 requant, but done in smem so
+    the S1 fragment loaders stay byte-identical to the DSV4 e4m3 path).
+
+    The inline ARBITRARY fp32 scale for group g (g = d // QUANT_TILE) lives at
+    ``entry*KV_SMEM_STRIDE + D_NOPE + g*4`` (4 bytes, little-endian). The e4m3
+    nope byte at ``entry*KV_SMEM_STRIDE + d`` is dequantized
+    (``e4m3_to_f32(byte) * scale_arb``) -- the arbitrary scale is folded into the
+    magnitude -- then re-quantized to e4m3 in place. The fp32 scale region itself
+    is left untouched (S1 never reads it: sfb = unit). The caller barriers AFTER
+    this so S1/S6 read the requantized e4m3 coherently."""
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    num_scales = d_nope // quant_tile
+    idx = tid
+    while idx < Int32(bi * d_nope):
+        entry = idx // Int32(d_nope)
+        d = idx - entry * Int32(d_nope)
+        g = d // Int32(quant_tile)
+        row = entry * Int32(kv_smem_stride)
+        # inline arbitrary fp32 scale of group g (4B aligned).
+        s_off = row + Int32(d_nope) + g * Int32(4)
+        s_arb = _u32_to_f32(ld_shared_u32(kv_fp8_base_addr + s_off))
+        # dequant e4m3 -> f32 (* arbitrary scale), then requant e4m3 in place.
+        byte = _ld_u8_zext(kv_fp8_base_addr, row + d)
+        true_v = fp8_e4m3_to_f32(byte) * s_arb
+        true_v = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), true_v))
+        new_byte = cvt_f32_to_e4m3(true_v) & Uint32(0xFF)
+        st_shared_u8(_smem_byte(kv_fp8_base_addr, row + d), new_byte.to(cutlass.Uint8))
+        idx += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+    _ = num_scales  # silence the unused-constexpr lint when traced
+
+
+# =============================================================================
+# S1 -- QK-NoPE block-scaled FP8 MMA (ue8m0 selectors, REAL sfa/sfb)
+# =============================================================================
+@cute.jit
+def s1_qk_nope_block_scaled(
+    qk,                              # length-4 python list of Float32 (in/out accum)
+    q_fp8_base_addr: Int32,         # u32 smem addr of q_fp8
+    kv_fp8_base_addr: Int32,        # u32 smem addr of kv_fp8[buf]
+    q_sc_view: cute.Tensor,         # smem fp32 view (HPB*NUM_SCALES,)
+    kv_sc_base_addr: Int32,         # u32 smem addr of kv_sc[buf] (BI x 8 footer bytes)
+    warp_first_cand: Int32,         # first candidate of this warp (warp_id * 8)
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,    # 7
+    quant_tile: cutlass.Constexpr,    # 64
+    q_nope_stride: cutlass.Constexpr,  # 464
+    kv_smem_stride: cutlass.Constexpr,  # 464
+    scale_bytes_per_token: cutlass.Constexpr,  # 8
+    scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+):
+    """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
+    block-scaled MMAs (14 DSV4 / 16 GLM).
+
+    range_constexpr-unrolled NUM_SCALES x (QUANT_TILE/32) so the (default-0)
+    bid/tid selectors fold to i16 immediates. sfa = the UE8M0 exponent byte of
+    the Q pow2 scale (extracted from the FP32 q_sc) -- IDENTICAL for both models
+    (Q is always quantized to a pow2 UE8M0 scale in S0).
+
+    sfb DIVERGES on ``scale_format`` (const_expr):
+      * UE8M0_BYTE (DSV4): sfb = the K footer UE8M0 byte (kv_sc[cand*8 + blk]).
+        The raw e4m3 K is kept and the real pow2 K selector applies (zero cost).
+      * ARBITRARY_FP32 (GLM): sfb = UNIT (0x7F). The K e4m3 in smem was already
+        dequant+requant'd by S0b to its true magnitude (arbitrary fp32 scale
+        absorbed), so the block-scale must NOT re-scale K (kernel_onepass.py:571
+        unit_scale). Q keeps its real pow2 sfa -> qk = (q_e4m3*pow2_q)*(k_true).
+
+    A (Q) loaded via ldmatrix.x4 (FP8 A 16x32); B (K) via ldmatrix.x2 (FP8 B
+    8x32) -- both with the FLAT FlashInfer ldmatrix addressing.
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+
+    # ldmatrix A (Q) row/col -- arch/ldmatrix_sm120.cuh ldmatrix_load_A_fp8.
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    # ldmatrix B (K) row/col -- ldmatrix_load_B_fp8.
+    b_row = lane & Int32(7)
+    b_col = ((lane >> Int32(3)) & Int32(1)) * Int32(16)
+
+    # sfa head index: (gid + (lane&1)*8) -- matches decode_dsv4 :378.
+    sfa_head = gid + (lane & Int32(1)) * Int32(8)
+    # sfb candidate row = warp_first_cand + gid (the N-tile base + gid). nt=0.
+    sfb_cand = warp_first_cand + gid
+
+    for blk in cutlass.range_constexpr(num_scales):
+        # sfa = exponent byte of the FP32 pow2 Q scale for this (head, blk).
+        q_scale = q_sc_view[sfa_head * Int32(num_scales) + Int32(blk)]
+        sfa = _fp32_to_ue8m0_byte(q_scale)
+        if cutlass.const_expr(scale_format == 0):
+            # DSV4 UE8M0_BYTE: sfb = K footer UE8M0 byte for this candidate + blk.
+            sfb_byte_off = sfb_cand * Int32(scale_bytes_per_token) + Int32(blk)
+            sfb = _ld_u8_zext(kv_sc_base_addr, sfb_byte_off)
+        else:
+            # GLM ARBITRARY_FP32: K e4m3 was requant'd (S0b) to its true value;
+            # the block-scale must not re-scale it -> unit selector (0x7F).
+            sfb = Uint32(0x7F)
+        for ks in cutlass.range_constexpr(quant_tile // 32):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(32)
+            # A operand: Q (16 heads x 32 fp8 K-dims) at q_fp8 + ko.
+            a_addr = _smem_byte(
+                q_fp8_base_addr, a_row * Int32(q_nope_stride) + ko + a_col
+            )
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+            # B operand: K (8 cands x 32 fp8 K-dims) at kv_fp8 + cand_base*stride + ko.
+            b_addr = _smem_byte(
+                kv_fp8_base_addr,
+                warp_first_cand * Int32(kv_smem_stride)
+                + b_row * Int32(kv_smem_stride)
+                + ko
+                + b_col,
+            )
+            b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
+            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                qk[0], qk[1], qk[2], qk[3],
+                a0, a1, a2, a3,
+                b0, b1,
+                sfa, sfb,
+            )
+            qk[0] = d0
+            qk[1] = d1
+            qk[2] = d2
+            qk[3] = d3
+    return qk
+
+
+# =============================================================================
+# S2 -- QK-RoPE bf16 m16n8k16 MMA (accumulate into the SAME qk regs)
+# =============================================================================
+@cute.jit
+def s2_qk_rope_bf16(
+    qk,                              # length-4 python list of Float32 (in/out accum)
+    q_rope_base_addr: Int32,        # u32 smem addr of q_rope (HPB x D_ROPE bf16)
+    kv_rope_base_addr: Int32,       # u32 smem addr of kv_rope[buf] (BI x D_ROPE bf16)
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    d_rope: cutlass.Constexpr,        # 64
+):
+    """S2: accumulate Q_rope . K_rope into qk[0..3] via D_ROPE/16=4 bf16 MMAs.
+
+    A (Q-rope, 16x16 bf16) via ldmatrix.x4 (ldmatrix_load_A_bf16); B (K-rope)
+    via per-lane scalar u32 reads -- the N-major rope smem layout can't feed
+    ldmatrix.x2 here (decode_dsv4 :401-425).
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    # Each lane's K-rope entry = warp_first_cand + gid (nt=0).
+    entry = warp_first_cand + gid
+
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        # A: Q-rope (bf16) at q_rope + ks*16 (elems), stride D_ROPE elems.
+        a_byte = a_row * Int32(d_rope * 2) + (ko + a_col) * Int32(2)
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_base_addr, a_byte))
+        # B: per-lane scalar reads of two consecutive bf16 pairs.
+        row_byte = entry * Int32(d_rope * 2) + ko * Int32(2)
+        b0 = _ld_u32(kv_rope_base_addr, row_byte + tid * Int32(2) * Int32(2))
+        b1 = _ld_u32(kv_rope_base_addr, row_byte + (tid * Int32(2) + Int32(8)) * Int32(2))
+        d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3],
+            a0, a1, a2, a3,
+            b0, b1,
+        )
+        qk[0] = d0
+        qk[1] = d1
+        qk[2] = d2
+        qk[3] = d3
+    return qk
+
+
+# =============================================================================
+# S3 -- mask invalid candidates -> -inf, then qk *= sm_scale * LOG2E
+# =============================================================================
+@cute.jit
+def s3_mask_and_scale(
+    qk,                              # length-4 python list of Float32 (in/out)
+    sTokenIdx: cute.Tensor,          # smem int32 validity buffer (BI,)
+    warp_first_cand: Int32,
+    split_cand_start: Int32,         # chunk_in_section * DSV4_CAND_WINDOW
+    split_cand_end: Int32,           # min(start + CAND_WINDOW, section_len)
+    section_len: Int32,
+    sm_scale_log2: Float32,          # sm_scale * LOG2E
+    lane: Int32,
+):
+    """S3: mask + base-2 prescale. Validity = staged token index (gap #9).
+
+    The lane owns candidate columns c0 = warp_first_cand + tid*2 and c1 = c0+1
+    (qk[0],qk[2] -> c0 ; qk[1],qk[3] -> c1). Invalid if the absolute candidate
+    position is past split_cand_end OR the staged raw slot id is < 0.
+
+    Masked qk is set to ``-1e30`` (NOT -inf) -- matches decode_dsv4 :443. After
+    the ``* sm_scale_log2`` this is a large FINITE negative (~-6.38e28); the S4
+    online softmax relies on this finiteness so a fully-invalid warp's
+    ``qk - local_max`` is 0 (not the ``inf - inf = nan`` that -inf would give).
+    The merge sentinel (-inf empty-block LSE) is emitted separately in S7."""
+    tid = lane & Int32(3)
+    c0 = warp_first_cand + tid * Int32(2)
+    c1 = c0 + Int32(1)
+    abs_c0 = c0 + split_cand_start
+    abs_c1 = c1 + split_cand_start
+
+    idx0 = Int32(-1)
+    if abs_c0 < section_len:
+        idx0 = Int32(sTokenIdx[c0])
+    idx1 = Int32(-1)
+    if abs_c1 < section_len:
+        idx1 = Int32(sTokenIdx[c1])
+
+    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+        qk[0] = Float32(_QK_MASK)
+        qk[2] = Float32(_QK_MASK)
+    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+        qk[1] = Float32(_QK_MASK)
+        qk[3] = Float32(_QK_MASK)
+
+    qk[0] = qk[0] * sm_scale_log2
+    qk[1] = qk[1] * sm_scale_log2
+    qk[2] = qk[2] * sm_scale_log2
+    qk[3] = qk[3] * sm_scale_log2
+    return qk
+
+
+# ── small smem byte-access helpers (typed loads the imported ops don't cover) ─
+@cute.jit
+def _fp32_to_ue8m0_byte(scale: Float32) -> Uint32:
+    """sfa = (float_as_uint(scale) >> 23) & 0xFF -- scale_convert.cuh fp32_to_ue8m0.
+
+    ``scale`` is already a pow2 (mantissa 0) so this is its exponent byte; the
+    block-scaled MMA uses only the low byte of the u32 (scale_vec::1X)."""
+    bits = _f32_to_bits(scale)
+    return (bits >> Uint32(23)) & Uint32(0xFF)
+
+
+@cute.jit
+def _ld_u8_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
+    """Load one u8 from smem (base+byte_off), zero-extended to u32."""
+    word = byte_off & ~Int32(3)
+    sh = (byte_off & Int32(3)) * Int32(8)
+    val = ld_shared_u32(base_addr + word)
+    return (val >> sh.to(Uint32)) & Uint32(0xFF)
+
+
+@cute.jit
+def _ld_u32(base_addr: Int32, byte_off: Int32) -> Uint32:
+    return ld_shared_u32(base_addr + byte_off)
+
+
+@cute.jit
+def _ld_u16_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
+    """Load one u16 (bf16) from smem (base+byte_off), zero-extended to u32.
+
+    ``byte_off`` is 2-byte aligned (bf16 element). Reads the containing 4-byte
+    word and selects the low/high half. Used for the per-lane K-rope/V-rope
+    scalar reads packed into the m16n8k16 bf16 MMA b0/b1 operands."""
+    word = byte_off & ~Int32(3)
+    sh = (byte_off & Int32(2)) * Int32(8)  # 0 or 16
+    val = ld_shared_u32(base_addr + word)
+    return (val >> sh.to(Uint32)) & Uint32(0xFFFF)
+
+
+@cute.jit
+def _ue8m0_byte_to_fp32(byte: Uint32) -> Float32:
+    """value = 2^(byte - 127) -- scale_convert.cuh ue8m0_to_fp32 (the V-scale).
+
+    Reconstructs the FP32 power-of-2 from its UE8M0 exponent byte by placing the
+    byte in the IEEE-754 exponent field (zero mantissa)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(byte & Uint32(0xFF)).ir_value()],
+            "{ .reg .b32 b; shl.b32 b, $1, 23; mov.b32 $0, b; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# =============================================================================
+# S4 -- online softmax (warp-local + cross-warp + cross-chunk rescale)
+# Port of decode_dsv4 :456-566 + online_softmax.cuh; base-2 (exp2f).
+# =============================================================================
+@cute.jit
+def s4_online_softmax(
+    qk,                              # length-4 Float32 (masked, base-2-prescaled)
+    p,                               # length-4 Float32 out: exp2(qk - local_max)
+    acc_nope,                        # list[N_V_CHUNKS] of length-4 Float32 lists (in/out)
+    acc_rope,                        # length-4 Float32 list (in/out)
+    global_max,                      # length-2 Float32 list (in/out): [row0, row1]
+    global_sum,                      # length-2 Float32 list (in/out)
+    reduce_max_addr: Int32,          # u32 smem addr of warp_max (N_WARPS*HPB f32)
+    reduce_sum_addr: Int32,          # u32 smem addr of warp_sum (N_WARPS*HPB f32)
+    is_first_chunk: cutlass.Constexpr,  # True for the very first chunk in the loop
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,                 # flat thread id [0, MATH_THREADS)
+    *,
+    n_v_chunks: cutlass.Constexpr,   # 7
+    hpb: cutlass.Constexpr,          # 16
+    n_warps: cutlass.Constexpr,      # 8
+    valid_hpb: cutlass.Constexpr,    # <= HPB
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,   # math-only named-barrier slot
+    n_acc_tiles: cutlass.Constexpr = None,  # len(acc_nope); defaults to n_v_chunks
+):
+    """S4: per-warp + cross-warp max/sum, exp2(qk-max), cross-chunk rescale.
+
+    Returns ``(p, warp_rescale0, warp_rescale1)``; mutates ``acc_nope`` /
+    ``acc_rope`` (rescaled by the cross-chunk alpha) and ``global_max`` /
+    ``global_sum`` in place. ``p`` is exp2(qk - local_max) (the warp-local-frame
+    probabilities); the caller multiplies by ``warp_rescale`` before storing
+    sm_p_full (kills all-invalid-warp spurious 1s). Exactly decode_dsv4
+    :456-587."""
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    # alpha "has-prev-max" guard threshold == decode_dsv4 :520 (> -1e29f).
+    _NI = Float32(-1e29)
+
+    # --- per-warp local max over the 2 physical rows (gid heads, gid+8 heads). ---
+    local_max0 = fmax_f32(qk[0], qk[1])
+    local_max1 = fmax_f32(qk[2], qk[3])
+    # shfl_xor offsets {2,1} finish the 8-lane (tid in [0,4) over 2-lane pairs)
+    # reduction across the candidate columns of this warp's N-tile.
+    local_max0 = fmax_f32(local_max0, cute.arch.shuffle_sync_bfly(local_max0, offset=2))
+    local_max1 = fmax_f32(local_max1, cute.arch.shuffle_sync_bfly(local_max1, offset=2))
+    local_max0 = fmax_f32(local_max0, cute.arch.shuffle_sync_bfly(local_max0, offset=1))
+    local_max1 = fmax_f32(local_max1, cute.arch.shuffle_sync_bfly(local_max1, offset=1))
+
+    # --- p = exp2(qk - local_max); local sum over the 4 frag entries. ---
+    p[0] = _exp2_approx_ftz_f32(qk[0] - local_max0)
+    p[1] = _exp2_approx_ftz_f32(qk[1] - local_max0)
+    p[2] = _exp2_approx_ftz_f32(qk[2] - local_max1)
+    p[3] = _exp2_approx_ftz_f32(qk[3] - local_max1)
+    local_sum0 = p[0] + p[1]
+    local_sum1 = p[2] + p[3]
+    local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(local_sum0, offset=2)
+    local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(local_sum1, offset=2)
+    local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(local_sum0, offset=1)
+    local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(local_sum1, offset=1)
+
+    # --- cross-warp reduce: stage per-warp (max,sum) for heads gid / gid+8. ---
+    if tid == Int32(0):
+        st_shared_f32(reduce_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), local_max0)
+        st_shared_f32(reduce_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4), local_max1)
+        st_shared_f32(reduce_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), local_sum0)
+        st_shared_f32(reduce_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4), local_sum1)
+    cute.arch.barrier(**bar_kw)
+
+    # one thread per head folds the 8 warps' (max,sum) into a block reduction.
+    if tid_flat < Int32(valid_hpb):
+        h = tid_flat
+        bmax = Float32(-1e30)
+        for w in cutlass.range_constexpr(n_warps):
+            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
+            bmax = fmax_f32(bmax, wm)
+        bsum = Float32(0.0)
+        for w in cutlass.range_constexpr(n_warps):
+            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
+            ws = ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
+            bsum = bsum + ws * _exp2_approx_ftz_f32(wm - bmax)
+        st_shared_f32(reduce_max_addr + h * Int32(4), bmax)
+        st_shared_f32(reduce_sum_addr + h * Int32(4), bsum)
+    cute.arch.barrier(**bar_kw)
+
+    block_local_max0 = ld_shared_f32(reduce_max_addr + gid * Int32(4))
+    block_local_max1 = ld_shared_f32(reduce_max_addr + (gid + Int32(8)) * Int32(4))
+    block_local_sum0 = ld_shared_f32(reduce_sum_addr + gid * Int32(4))
+    block_local_sum1 = ld_shared_f32(reduce_sum_addr + (gid + Int32(8)) * Int32(4))
+
+    # --- online softmax update (cross-chunk). ---
+    new_gmax0 = fmax_f32(global_max[0], block_local_max0)
+    new_gmax1 = fmax_f32(global_max[1], block_local_max1)
+    alpha0 = Float32(0.0)
+    alpha1 = Float32(0.0)
+    if global_max[0] > _NI:
+        alpha0 = _exp2_approx_ftz_f32(global_max[0] - new_gmax0)
+    if global_max[1] > _NI:
+        alpha1 = _exp2_approx_ftz_f32(global_max[1] - new_gmax1)
+    block_rescale0 = _exp2_approx_ftz_f32(block_local_max0 - new_gmax0)
+    block_rescale1 = _exp2_approx_ftz_f32(block_local_max1 - new_gmax1)
+    warp_rescale0 = _exp2_approx_ftz_f32(local_max0 - new_gmax0)
+    warp_rescale1 = _exp2_approx_ftz_f32(local_max1 - new_gmax1)
+
+    _n_acc = cutlass.const_expr(n_acc_tiles if n_acc_tiles is not None else n_v_chunks)
+    if cutlass.const_expr(not is_first_chunk):
+        for vc in cutlass.range_constexpr(_n_acc):
+            acc_nope[vc][0] = acc_nope[vc][0] * alpha0
+            acc_nope[vc][1] = acc_nope[vc][1] * alpha0
+            acc_nope[vc][2] = acc_nope[vc][2] * alpha1
+            acc_nope[vc][3] = acc_nope[vc][3] * alpha1
+        acc_rope[0] = acc_rope[0] * alpha0
+        acc_rope[1] = acc_rope[1] * alpha0
+        acc_rope[2] = acc_rope[2] * alpha1
+        acc_rope[3] = acc_rope[3] * alpha1
+        global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * block_rescale0
+        global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * block_rescale1
+    else:
+        global_sum[0] = block_local_sum0 * block_rescale0
+        global_sum[1] = block_local_sum1 * block_rescale1
+    global_max[0] = new_gmax0
+    global_max[1] = new_gmax1
+
+    return p, warp_rescale0, warp_rescale1
+
+
+# =============================================================================
+# S5 -- sm_p_full fill (normalized P -> bf16) + w_head_sc zero-init
+# Port of decode_dsv4 :568-593.
+# =============================================================================
+@cute.jit
+def s5_fill_sm_p_full(
+    w_pre,                           # length-4 Float32 (= p * warp_rescale)
+    sm_p_full_addr: Int32,           # u32 smem addr of sm_p_full (HPB x BI bf16)
+    w_head_sc_view: cute.Tensor,     # smem fp32 view (N_V_CHUNKS*HPB,)
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    bi: cutlass.Constexpr,           # 64
+    n_v_chunks: cutlass.Constexpr,   # 7
+    hpb: cutlass.Constexpr,          # 16
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """S5: store warp-rescaled P (bf16) to sm_p_full; zero w_head_sc. The caller
+    barriers AFTER this so S6/S6b read coherent sm_p_full / w_head_sc."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    cand_col_base = warp_id * Int32(8)  # ENTRIES_PER_WARP = 8 (DSV4_QK_N_TILES=1)
+    c0 = cand_col_base + tid * Int32(2)
+    c1 = c0 + Int32(1)
+    # sm_p_full[head][cand] bf16, row stride BI elems (2 bytes each).
+    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(bi) + c0) * Int32(2), w_pre[0])
+    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(bi) + c1) * Int32(2), w_pre[1])
+    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(bi) + c0) * Int32(2), w_pre[2])
+    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(bi) + c1) * Int32(2), w_pre[3])
+
+    # zero-init w_head_sc (cooperative; covered by the caller's barrier).
+    i = tid_flat
+    while i < Int32(n_v_chunks * hpb):
+        w_head_sc_view[i] = Float32(0.0)
+        i += Int32(num_threads)
+
+
+# =============================================================================
+# S6 -- XV-NoPE: per-vc absmax + P re-quant + PLAIN m16n8k32.e4m3 MMA
+# Port of decode_dsv4 :595-671.
+# =============================================================================
+@cute.jit
+def s6_xv_nope(
+    w_pre,                           # length-4 Float32 (= p * warp_rescale)
+    acc_nope,                        # list[N_V_CHUNKS*NT_PER_WARP_XV] of length-4 (in/out)
+    kv_fp8_base_addr: Int32,         # u32 smem addr of kv_fp8[buf]
+    kv_sc_base_addr: Int32,          # u32 smem addr of kv_sc[buf] (BI x 8 footer)
+    w_head_sc_view: cute.Tensor,     # smem fp32 view (N_V_CHUNKS*HPB,)
+    w_fp8_base_addr: Int32,          # u32 smem addr of w_fp8 (2 x HPB x W_FP8_STRIDE)
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,   # 7
+    v_chunk: cutlass.Constexpr,      # QUANT_TILE = 64
+    hpb: cutlass.Constexpr,          # 16
+    bi: cutlass.Constexpr,           # 64
+    kv_smem_stride: cutlass.Constexpr,  # 464
+    w_fp8_stride: cutlass.Constexpr,    # BI + 16 = 80
+    n_warps: cutlass.Constexpr,         # 8
+    scale_bytes_per_token: cutlass.Constexpr,  # 8
+    nt_per_warp_xv: cutlass.Constexpr = 1,  # 1 DSV4 / 2 GLM (V_CHUNK/N_WARPS/8)
+    scale_format: cutlass.Constexpr = 0,    # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
+    (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
+
+    Per V-chunk vc: (1) absmax of |w_pre * V_scale| into w_head_sc[vc][head];
+    (2) normalize w_head_sc -> max/FP8_MAX; (3) re-quant W to e4m3 into
+    w_fp8[vc&1]; (4) per N-tile nt a PLAIN m16n8k32 MMA (W ldmatrix.x4 A, V via
+    d2_load_b prmt B), post-scaled by the per-head w_head_sc. XV_KSTEPS = BI/32.
+
+    ``scale_format`` (const_expr) selects the V scale:
+      * UE8M0_BYTE (DSV4): V_scale = ue8m0_to_fp32(kv_sc footer byte for vc).
+      * ARBITRARY_FP32 (GLM): V e4m3 was requant'd to its true value in S0b
+        (V == nope, V_HAS_ROPE=false), so V_scale = 1.0 (no footer; unit).
+    ``nt_per_warp_xv`` (const_expr) tiles each V_CHUNK across N_WARPS*8 columns
+    NT times: GLM's 128-dim V_CHUNK needs NT=2 (8 warps x 8 dims = 64 per nt)."""
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    warp_first_cand = warp_id * Int32(8)
+    cand_e0 = warp_first_cand + tid * Int32(2)
+    cand_e1 = cand_e0 + Int32(1)
+
+    def _vsc(cand: Int32, vc: int):
+        if cutlass.const_expr(scale_format == 0):
+            return _ue8m0_byte_to_fp32(
+                _ld_u8_zext(kv_sc_base_addr, cand * Int32(scale_bytes_per_token) + Int32(vc))
+            )
+        return Float32(1.0)
+
+    # --- (1) per-vc per-head absmax of |w_pre * V_scale| -> w_head_sc. ---
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        vsc0 = _vsc(cand_e0, vc)
+        vsc1 = _vsc(cand_e1, vc)
+        m0 = fmax_f32(fabs_f32(w_pre[0] * vsc0), fabs_f32(w_pre[1] * vsc1))
+        m1 = fmax_f32(fabs_f32(w_pre[2] * vsc0), fabs_f32(w_pre[3] * vsc1))
+        w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+        sc0_addr = w_head_sc_base + (Int32(vc) * Int32(hpb) + gid) * Int32(4)
+        sc1_addr = w_head_sc_base + (Int32(vc) * Int32(hpb) + gid + Int32(8)) * Int32(4)
+        atomic_max_shared_f32(sc0_addr, m0)
+        atomic_max_shared_f32(sc1_addr, m1)
+    cute.arch.barrier(**bar_kw)
+
+    # --- (2) normalize w_head_sc -> max(.,1e-10)/FP8_MAX. ---
+    i = tid_flat
+    while i < Int32(n_v_chunks * hpb):
+        w_head_sc_view[i] = fmax_f32(w_head_sc_view[i], Float32(1e-10)) * Float32(1.0 / _FP8_MAX)
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    # --- (3)+(4) per-vc re-quant + per-nt PLAIN MMA. w_fp8 double-buffered. ---
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+        si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+        si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+        vsc0 = _vsc(cand_e0, vc)
+        vsc1 = _vsc(cand_e1, vc)
+        f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
+        f01 = _quant_e4m3_byte(w_pre[1] * vsc1 * si0)
+        f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
+        f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
+        st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
+        st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
+        st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
+        st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
+        cute.arch.barrier(**bar_kw)
+
+        sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+        sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+        # A (W) ldmatrix.x4 row/col -- ldmatrix_load_A_fp8 (nt-invariant).
+        a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+        a_col = (lane >> Int32(4)) * Int32(16)
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
+            dim = Int32(vc) * Int32(v_chunk) + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for kstep in cutlass.range_constexpr(bi // 32):
+                ko = Int32(kstep) * Int32(32)
+                a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                b0, b1 = _d2_load_b_fp8(kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride)
+                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                    xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + xv0 * sc0
+            acc_nope[at][1] = acc_nope[at][1] + xv1 * sc0
+            acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
+            acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
+    return acc_nope
+
+
+# =============================================================================
+# S6b -- XV-RoPE: bf16 m16n8k16 MMA (V_HAS_ROPE gate), V read from sm_kv_rope
+# Port of decode_dsv4 :673-708.
+# =============================================================================
+@cute.jit
+def s6b_xv_rope(
+    acc_rope,                        # length-4 Float32 (in/out)
+    sm_p_full_addr: Int32,           # u32 smem addr of sm_p_full (HPB x BI bf16)
+    kv_rope_base_addr: Int32,        # u32 smem addr of kv_rope[buf] (BI x D_ROPE bf16)
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr,           # 64
+    d_rope: cutlass.Constexpr,       # 64
+    n_warps: cutlass.Constexpr,      # 8
+):
+    """S6b: acc_rope += P . V_rope via D_ROPE/N_WARPS->BI/16=4 bf16 m16n8k16 MMAs.
+
+    A (P) via ldmatrix.x4 from sm_p_full (bf16, stride BI); B (V_rope) via
+    per-lane scalar u16 reads from sm_kv_rope packed into b0/b1. Each warp owns
+    ROPE_DIMS_PER_WARP = D_ROPE/N_WARPS = 8 rope dims (n_col = warp_id*8)."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    rope_dim_base = warp_id * Int32(d_rope // n_warps)  # ROPE_DIMS_PER_WARP = 8
+    col = rope_dim_base + gid  # nt=0 -> n_col = rope_dim_base
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+
+    for ks in cutlass.range_constexpr(bi // 16):
+        k_base = Int32(ks) * Int32(16)
+        # A: sm_p_full[0][ks*16], stride BI bf16 elems.
+        a_byte = (a_row * Int32(bi) + (k_base + a_col)) * Int32(2)
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+        # B: per-lane scalar reads of v[ent][col], packed (ent0,ent1)/(ent8,ent9).
+        ent0 = k_base + tid * Int32(2)
+        v0 = _ld_u16_zext(kv_rope_base_addr, (ent0 * Int32(d_rope) + col) * Int32(2))
+        v1 = _ld_u16_zext(kv_rope_base_addr, ((ent0 + Int32(1)) * Int32(d_rope) + col) * Int32(2))
+        v8 = _ld_u16_zext(kv_rope_base_addr, ((ent0 + Int32(8)) * Int32(d_rope) + col) * Int32(2))
+        v9 = _ld_u16_zext(kv_rope_base_addr, ((ent0 + Int32(9)) * Int32(d_rope) + col) * Int32(2))
+        b0 = v0 | (v1 << Uint32(16))
+        b1 = v8 | (v9 << Uint32(16))
+        acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3] = mma_m16n8k16_f32_bf16(
+            acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3],
+            a0, a1, a2, a3, b0, b1,
+        )
+    return acc_rope
+
+
+# =============================================================================
+# S7 -- epilogue: per-SPLIT NORMALIZED partial writeback in split.py's convention
+# Port of decode_dsv4 :725-783, adapted to the rs-1 base-2 merge (split.py:1138).
+# =============================================================================
+@cute.jit
+def s7_epilogue(
+    acc_nope,                        # list[N_V_CHUNKS*NT_PER_WARP_XV] of length-4
+    acc_rope,                        # length-4 Float32 (unused if not v_has_rope)
+    global_max,                      # length-2 Float32 list
+    global_sum,                      # length-2 Float32 list
+    out_o: cute.Tensor,              # (HPB, D_V) bf16 mid_out[token,:,split,:] view
+    out_lse: cute.Tensor,            # (HPB,) f32 mid_lse[token,:,split] base-2 LSE view
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,   # 7
+    v_chunk: cutlass.Constexpr,      # QUANT_TILE = 64
+    d_nope: cutlass.Constexpr,       # 448
+    d_rope: cutlass.Constexpr,       # 64
+    n_warps: cutlass.Constexpr,      # 8
+    valid_hpb: cutlass.Constexpr,    # <= HPB
+    nt_per_warp_xv: cutlass.Constexpr = 1,  # 1 DSV4 / 2 GLM
+    v_has_rope: cutlass.Constexpr = True,   # True DSV4 / False GLM (V == nope only)
+):
+    """S7: write this SPLIT's NORMALIZED partial O + base-2 LSE in the exact rs-1
+    split.py merge convention (SparseMLASplitDecodeMergeKernel, split.py:1094).
+
+    The merge reduces over the split axis assuming each partial is the
+    PER-SPLIT-NORMALIZED output (acc / this split's softmax sum) tagged with the
+    split's base-2 LSE (log2(sum) + max). It seeds ``merged_d = 1.0`` and takes
+    the first valid split's O directly, then base-2-rescales subsequent splits
+    by ``exp2(lse_i - new_max)`` -- so the partials MUST be normalized (NOT the
+    FlashInfer unnormalized acc + separate denom). Empty split -> LSE = -inf
+    sentinel (the merge's skip condition) and O = 0.
+
+    inv_g = 1/global_sum (0 if empty); O[head][dim] = acc * inv_g; base-2 LSE =
+    log2(global_sum) + global_max. ``num_splits=1`` is the trivial 1-split merge:
+    it seeds acc=O_0, merged_d=1.0 and divides by 1.0 -> O_0 unchanged."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    inv_g0 = Float32(0.0)
+    inv_g1 = Float32(0.0)
+    if global_sum[0] > Float32(0.0):
+        inv_g0 = Float32(1.0) / global_sum[0]
+    if global_sum[1] > Float32(0.0):
+        inv_g1 = Float32(1.0) / global_sum[1]
+
+    # NoPE dims: d0 = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 + tid*2 (per N-tile).
+    # Cast to the output element type (bf16 for the split.py mid_out partials;
+    # the merge consumes bf16 -- fp32 also works for the standalone probe).
+    _ot = out_o.element_type
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            at = vc * nt_per_warp_xv + nt
+            d0 = (Int32(vc) * Int32(v_chunk)
+                  + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                  + tid * Int32(2))
+            out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
+            out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
+            if cutlass.const_expr(valid_hpb > 8):
+                out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
+                out_o[gid + Int32(8), d0 + Int32(1)] = (acc_nope[at][3] * inv_g1).to(_ot)
+
+    # RoPE dims (DSV4 only: V_HAS_ROPE). GLM V == nope-only so this is elided.
+    if cutlass.const_expr(v_has_rope):
+        rd0 = Int32(d_nope) + warp_id * Int32(8) + tid * Int32(2)
+        out_o[gid, rd0] = (acc_rope[0] * inv_g0).to(_ot)
+        out_o[gid, rd0 + Int32(1)] = (acc_rope[1] * inv_g0).to(_ot)
+        if cutlass.const_expr(valid_hpb > 8):
+            out_o[gid + Int32(8), rd0] = (acc_rope[2] * inv_g1).to(_ot)
+            out_o[gid + Int32(8), rd0 + Int32(1)] = (acc_rope[3] * inv_g1).to(_ot)
+
+    # base-2 LSE (warp 0, tid 0 owns one head pair via gid).
+    if warp_id == Int32(0) and tid == Int32(0):
+        lse0 = Float32(_NEG_INF)
+        lse1 = Float32(_NEG_INF)
+        if global_sum[0] > Float32(0.0):
+            lse0 = _log2_approx_ftz_f32(global_sum[0]) + global_max[0]
+        if global_sum[1] > Float32(0.0):
+            lse1 = _log2_approx_ftz_f32(global_sum[1]) + global_max[1]
+        out_lse[gid] = lse0
+        if cutlass.const_expr(valid_hpb > 8):
+            out_lse[gid + Int32(8)] = lse1
+
+
+# ── extra typed helpers for the PV path ───────────────────────────────────────
+@cute.jit
+def _quant_e4m3_byte(v: Float32) -> Uint32:
+    """Clamp to [FP8_MIN, FP8_MAX] then cvt.rn.satfinite.e4m3 -> low byte."""
+    vc = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
+    return cvt_f32_to_e4m3(vc) & Uint32(0xFF)
+
+
+@cute.jit
+def _d2_load_b_fp8(
+    kv_fp8_base_addr: Int32,
+    entry_base: Int32,
+    dim: Int32,
+    lane: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+):
+    """Direct-B synthesizer for the PLAIN fp8 XV MMA (d2_load_b.cuh).
+
+    Produces b0/b1 (QMMA.16832 B operand) from kv_fp8[entry][dim] without a
+    transpose buffer: 8 LDS.32 + 6 prmt. b0 byte j = V[entry_base+tid*4+j][dim+gid]
+    (K=0..15); b1 = the +16 entries (K=16..31)."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    d = dim + gid
+    d_base = d & ~Int32(3)
+    d_sel = d & Int32(3)
+    sel = ((Int32(4) + d_sel) << Int32(4)) | d_sel
+
+    r0 = ld_shared_u32(kv_fp8_base_addr + (entry_base + tid * Int32(4) + Int32(0)) * Int32(kv_smem_stride) + d_base)
+    r1 = ld_shared_u32(kv_fp8_base_addr + (entry_base + tid * Int32(4) + Int32(1)) * Int32(kv_smem_stride) + d_base)
+    r2 = ld_shared_u32(kv_fp8_base_addr + (entry_base + tid * Int32(4) + Int32(2)) * Int32(kv_smem_stride) + d_base)
+    r3 = ld_shared_u32(kv_fp8_base_addr + (entry_base + tid * Int32(4) + Int32(3)) * Int32(kv_smem_stride) + d_base)
+    t01 = byte_perm(r0, r1, sel)
+    t23 = byte_perm(r2, r3, sel)
+    b0 = byte_perm(t01, t23, Int32(0x5410))
+
+    r0 = ld_shared_u32(kv_fp8_base_addr + (entry_base + Int32(16) + tid * Int32(4) + Int32(0)) * Int32(kv_smem_stride) + d_base)
+    r1 = ld_shared_u32(kv_fp8_base_addr + (entry_base + Int32(16) + tid * Int32(4) + Int32(1)) * Int32(kv_smem_stride) + d_base)
+    r2 = ld_shared_u32(kv_fp8_base_addr + (entry_base + Int32(16) + tid * Int32(4) + Int32(2)) * Int32(kv_smem_stride) + d_base)
+    r3 = ld_shared_u32(kv_fp8_base_addr + (entry_base + Int32(16) + tid * Int32(4) + Int32(3)) * Int32(kv_smem_stride) + d_base)
+    t01 = byte_perm(r0, r1, sel)
+    t23 = byte_perm(r2, r3, sel)
+    b1 = byte_perm(t01, t23, Int32(0x5410))
+    return b0, b1
