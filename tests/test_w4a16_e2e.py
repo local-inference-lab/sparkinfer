@@ -691,6 +691,173 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_w4a16_tc_decode_fused_sum_matches_oracle(
+    m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TC-decode (B12X_W4A16_TC_DECODE) folds the top-k sum into the FC2 store via
+    atomic accumulate. Validate the epilogue across the whole small-M range, not
+    just powers of two, since 3/5/6/7 were never exercised through it before."""
+    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "1")
+
+    # Spy on the fused compile so we can assert the fused-sum path actually engaged
+    # (a silent fallback to the packed GEMM would also pass the cosine gate).
+    real_compile = w4a16_kernel.compile_w4a16_fused_moe
+    saw_tc_decode: list[bool] = []
+
+    def _spy_compile(*args, **kwargs):
+        saw_tc_decode.append(bool(kwargs.get("tc_decode_fused_sum", False)))
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(w4a16_kernel, "compile_w4a16_fused_moe", _spy_compile)
+
+    torch.manual_seed(20260529 + m)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    assert prepared.weight_layout == "packed"
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    tiny_route_workspace = torch.empty((1,), dtype=torch.int32, device=x.device)
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=tiny_route_workspace,
+        block_expert_ids=tiny_route_workspace,
+        packed_route_count=tiny_route_workspace,
+        expert_offsets=tiny_route_workspace,
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    assert any(saw_tc_decode), (
+        f"TC-decode fused-sum path did not engage for m={m}; "
+        f"compile calls: {saw_tc_decode}"
+    )
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 2, 3, 6, 8])
+def test_w4a16_tc_decode_preplanned_launch_matches_oracle(
+    m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vLLM binding path passes a *preplanned* fused launch. Validate that a
+    preplanned TC-decode launch (direct_topk_routes + tc_decode_fused_sum) is
+    consumed correctly by run_w4a16_moe (contract validation + guard + epilogue)."""
+    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "1")
+
+    torch.manual_seed(20260529 + 100 + m)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    prepared = prepare_w4a16_weights(
+        *weights, activation=activation, params_dtype=x.dtype
+    )
+    buffers = make_w4a16_buffers(
+        prepared, m=m, topk=topk, dtype=x.dtype, device=x.device
+    )
+    tiny = torch.empty((1,), dtype=torch.int32, device=x.device)
+
+    # Build the preplanned TC-decode launch exactly as the prewarm does.
+    props = torch.cuda.get_device_properties(x.device)
+    block_size_m = select_route_block_size_m(m, topk, experts)
+    tc_launch = compile_w4a16_fused_moe(
+        size_m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        top_k=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=block_size_m,
+        max_m_blocks=m * topk,
+        element_dtype="bf16",
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(
+            getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+        ),
+        weight_layout="packed",
+        scale_format="e4m3_k16",
+        w13_layout="packed",
+        direct_topk_routes=True,
+        tc_decode_fused_sum=True,
+    )
+    assert bool(tc_launch.tc_decode_fused_sum)
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=tiny,
+        block_expert_ids=tiny,
+        packed_route_count=tiny,
+        expert_offsets=tiny,
+        fused_launch=tc_launch,
+    )
+    expected = _reference_w4a16(
+        x, *weights, topk_ids, topk_weights, activation=activation
+    )
+    torch.cuda.synchronize()
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [1, 4, 6])
 def test_w4a16_small_m_packed_direct_topk_routes_matches_oracle(m: int) -> None:
     torch.manual_seed(20260524 + m)

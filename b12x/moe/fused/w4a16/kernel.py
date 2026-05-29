@@ -97,7 +97,12 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 # tensor-core MMA inner loop but folds the top-k sum into the FC2 store
 # epilogue (dropping the separate top-k-sum launch). Gated OFF by default.
 _TC_DECODE_ENV = "B12X_W4A16_TC_DECODE"
-_TC_DECODE_M = (1, 2, 4, 8)
+# TC-decode is available for the whole small-M direct-topk range. Its only hard
+# ceiling is the direct-topk route cap (above it, expert route-packing wins); it
+# never regresses vs the packed GEMM within this range. _TC_DECODE_M is retained
+# for callers/tests that enumerate the supported sizes.
+_TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
+_TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
 
 def _tc_decode_enabled() -> bool:
@@ -396,6 +401,7 @@ class W4A16FusedMoeCompileResult:
     w13_layout: str = "w13"
     direct_topk_routes: bool = False
     scale_format: str = "e4m3_k16"
+    tc_decode_fused_sum: bool = False
 
 
 @dataclass(frozen=True)
@@ -4457,6 +4463,7 @@ def compile_w4a16_fused_moe(
         w13_layout=w13_layout,
         direct_topk_routes=kernel.direct_topk_routes,
         scale_format=scale_format,
+        tc_decode_fused_sum=bool(tc_decode_fused_sum),
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -4920,16 +4927,20 @@ def run_w4a16_moe(
     # store epilogue. Reuses the packed tensor-core MMA path; only the launch
     # scheduling/epilogue changes. Requires the packed object, bf16 gated
     # activation, int32 routes, no expert_map, and a runtime-compiled launch.
+    # A preplanned launch built with the TC-decode fused-sum epilogue carries
+    # ``tc_decode_fused_sum``; accept it through the binding path. A runtime
+    # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
+    preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
         _tc_decode_enabled()
-        and fused_launch is None
+        and (fused_launch is None or preplanned_tc_decode)
         and weight_layout == "packed"
         and expert_map is None
         and is_gated
         and element_dtype == "bf16"
         and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.is_cuda
-        and int(m) in _TC_DECODE_M
+        and int(m) <= _TC_DECODE_MAX_M
     )
     if use_tc_decode and topk_ids.dtype != torch.int32:
         # The inline direct-topk route path needs int32 route indices.
@@ -4959,6 +4970,17 @@ def run_w4a16_moe(
 
     # TC-decode requires the inline direct-topk route path (no route-pack).
     use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
+
+    # A preplanned TC-decode launch atomically accumulates FC2 partials into the
+    # (pre-zeroed) output and emits no separate top-k sum. If it was selected but
+    # the decode preconditions don't hold, running it would corrupt the output,
+    # so fail loudly instead.
+    if preplanned_tc_decode and not use_tc_decode:
+        raise RuntimeError(
+            "preplanned TC-decode W4A16 launch requires small-M packed bf16 "
+            f"decode (m <= {_TC_DECODE_MAX_M}, cuda int32/int64 topk_ids, "
+            "no expert_map)"
+        )
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
     required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0

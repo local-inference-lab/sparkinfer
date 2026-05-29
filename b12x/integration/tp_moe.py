@@ -185,6 +185,9 @@ class TPW4A16Workspace:
     planned_scale_format: str = "e4m3_k16"
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
+    # TC-decode fused-sum launches, keyed by exact token count (only the small-M
+    # decode sizes in B12X_W4A16_TC_DECODE's supported set, packed layout only).
+    planned_tc_decode_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
 
@@ -1325,6 +1328,10 @@ def _plan_core_workspace(
     activation: str = "silu",
     dynamic_physical_tiles: int | None = None,
     dynamic_task_capacity: int | None = None,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
     if implementation == "w4a16":
@@ -1333,7 +1340,12 @@ def _plan_core_workspace(
             max_packed_route_slots,
             packed_gemm_scratch_elements,
         )
+        from b12x.moe.fused.w4a16.kernel import _small_m_direct_supported
 
+        source_format = _normalize_fp4_source_format(source_format)
+        w13_layout = _normalize_w13_layout(w13_layout)
+        scale_format = _w4a16_scale_format_for_source(source_format)
+        weight_layout = _w4a16_weight_layout_for_source(source_format)
         routed_capacity = max(int(routed_rows), 1)
         fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
@@ -1368,6 +1380,34 @@ def _plan_core_workspace(
                     sms=sms,
                 ),
             )
+        intermediate_cache2_elements = routed_capacity * int(n)
+        direct_m = routed_capacity // max(int(num_topk), 1)
+        if (
+            routed_capacity == direct_m * int(num_topk)
+            and _small_m_direct_supported(
+                m=direct_m,
+                hidden_size=int(k),
+                intermediate_size=int(n),
+                num_experts=int(weight_E),
+                topk=int(num_topk),
+                activation=activation,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                swiglu_limit=swiglu_limit,
+                element_dtype=_w4a16_element_dtype(dtype),
+                weight_layout=weight_layout,
+                w13_layout=w13_layout,
+                scale_format=scale_format,
+                expert_map=None,
+            )
+        ):
+            fc2_n_chunks = ((int(n) // 2) + 127) // 128
+            direct_cache2_u32 = direct_m * fc2_n_chunks * 128 * int(num_topk)
+            direct_cache2_nbytes = direct_cache2_u32 * _dtype_nbytes(torch.uint32)
+            intermediate_cache2_elements = max(
+                intermediate_cache2_elements,
+                align_up(direct_cache2_nbytes, _dtype_nbytes(dtype))
+                // _dtype_nbytes(dtype),
+            )
         return _TPCoreWorkspacePlan(
             implementation=implementation,
             quant_mode=quant_mode,
@@ -1389,7 +1429,7 @@ def _plan_core_workspace(
                 ),
                 _TensorAllocSpec(
                     "intermediate_cache2",
-                    (routed_capacity, int(n)),
+                    (intermediate_cache2_elements,),
                     dtype,
                 ),
                 _TensorAllocSpec("fc1_c_tmp", (fc1_c_tmp_elements,), torch.float32),
@@ -2503,6 +2543,19 @@ def _w4a16_preplanned_launches(
     scale_format = _normalize_w4a16_scale_format(scale_format)
     if not workspace.planned_token_counts:
         return None, None
+    # Prefer a preplanned TC-decode launch for an exact small-M decode size. It
+    # was compiled at this exact token count (its FC2 atomically sums per-route
+    # partials into the output), so it only applies when m matches exactly.
+    from b12x.moe.fused.w4a16.kernel import _TC_DECODE_MAX_M, _tc_decode_enabled
+
+    if (
+        _tc_decode_enabled()
+        and weight_layout == "packed"
+        and token_count <= _TC_DECODE_MAX_M
+    ):
+        tc_decode = workspace.planned_tc_decode_launches.get(token_count)
+        if tc_decode is not None:
+            return tc_decode, workspace.planned_topk_sum_launches.get(token_count)
     planned_capacity = min(
         (planned for planned in workspace.planned_token_counts if planned >= token_count),
         default=None,
@@ -2793,9 +2846,19 @@ def plan_tp_moe_arena_layout(
     route_logits_dtype: torch.dtype | None = None,
     quant_mode: str | None = None,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
     weight_E = max(int(weight_E), 1)
@@ -2840,6 +2903,10 @@ def plan_tp_moe_arena_layout(
             activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
         )
         core_nbytes = max(core_nbytes, _core_workspace_nbytes(core_plan))
     if route_num_experts > 0:
@@ -2874,6 +2941,10 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         route_logits_dtype=caps.route_logits_dtype,
         quant_mode=caps.quant_mode,
         activation=caps.activation,
+        apply_router_weight_on_input=caps.apply_router_weight_on_input,
+        swiglu_limit=caps.swiglu_limit,
+        source_format=caps.source_format,
+        w13_layout=caps.w13_layout,
     )
     return TPMoEScratchPlan(
         caps=caps,
@@ -2899,7 +2970,13 @@ def _select_arena_core_workspace_plan(
     dtype: torch.dtype,
     quant_mode: str,
     activation: str,
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
 ) -> tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]:
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     selected_plan: TPMoEPlan | None = None
     selected_core_plan: _TPCoreWorkspacePlan | None = None
     selected_nbytes = -1
@@ -2930,6 +3007,10 @@ def _select_arena_core_workspace_plan(
             activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
         )
         nbytes = _core_workspace_nbytes(core_plan)
         if nbytes > selected_nbytes:
@@ -2978,6 +3059,8 @@ def _prewarm_w4a16_planned_launches(
     )
     from b12x.moe.fused.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
+        _TC_DECODE_MAX_M,
+        _tc_decode_enabled,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
         pack_topk_routes_by_expert,
@@ -2998,6 +3081,15 @@ def _prewarm_w4a16_planned_launches(
         element_dtype = _w4a16_element_dtype(workspace.dtype)
         fused_launches: dict[object, object] = {}
         topk_sum_launches: dict[int, object] = {}
+        tc_decode_launches: dict[int, object] = {}
+        # TC-decode (B12X_W4A16_TC_DECODE) is a packed-layout small-M decode path.
+        # Build its fused-sum launch variant only for the supported decode sizes
+        # so the binding can dispatch to it instead of the general fused launch.
+        build_tc_decode = bool(
+            _tc_decode_enabled()
+            and weight_layout == "packed"
+            and element_dtype == "bf16"
+        )
         for token_count in token_counts:
             t_token = time.perf_counter() if _B12X_TIMING else 0.0
             block_size_m = select_route_block_size_m(
@@ -3121,8 +3213,42 @@ def _prewarm_w4a16_planned_launches(
                         (t_route - t_sum) * 1000.0,
                         total_ms,
                     )
+        if build_tc_decode:
+            # The capture/route-pack token counts above are powers of two, but the
+            # real decode shapes are seqs*(1+num_spec) (e.g. 3, 6 under MTP). The
+            # binding looks up TC-decode launches by the *exact* runtime m, so build
+            # one for every small-M size in the supported range, independent of the
+            # capture buckets.
+            for tc_m in range(1, _TC_DECODE_MAX_M + 1):
+                tc_block_size_m = select_route_block_size_m(
+                    tc_m, workspace.num_topk, workspace.weight_E
+                )
+                tc_decode_launches[tc_m] = compile_w4a16_fused_moe(
+                    size_m=tc_m,
+                    hidden_size=workspace.k,
+                    intermediate_size=workspace.n,
+                    num_experts=workspace.weight_E,
+                    top_k=workspace.num_topk,
+                    activation=workspace.activation,
+                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                    zero_fc2_output=False,
+                    moe_block_size=tc_block_size_m,
+                    # Direct-topk routing uses one block per routed row.
+                    max_m_blocks=tc_m * int(workspace.num_topk),
+                    element_dtype=element_dtype,
+                    sms=sms,
+                    max_shared_mem=max_shared_mem,
+                    swiglu_limit=swiglu_limit,
+                    weight_layout=weight_layout,
+                    scale_format=scale_format,
+                    w13_layout=w13_layout,
+                    direct_topk_routes=True,
+                    tc_decode_fused_sum=True,
+                )
+
         workspace.planned_fused_moe_launches = fused_launches
         workspace.planned_topk_sum_launches = topk_sum_launches
+        workspace.planned_tc_decode_launches = tc_decode_launches
         workspace.planned_scale_format = scale_format
     if _B12X_TIMING:
         t_done = time.perf_counter()
@@ -3208,6 +3334,10 @@ def materialize_tp_moe_arena_workspaces(
             activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
         )
         required_nbytes = _core_workspace_nbytes(core_plan)
         key = _workspace_pool_key(

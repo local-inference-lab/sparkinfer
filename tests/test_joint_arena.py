@@ -390,6 +390,80 @@ def test_w4a16_preplanned_launches_use_packed_layout() -> None:
     ) == ("packed-launch", "topk-sum")
 
 
+def _tc_decode_selection_workspace() -> "tp_moe.TPW4A16Workspace":
+    empty = torch.empty(0)
+    return tp_moe.TPW4A16Workspace(
+        implementation="w4a16",
+        quant_mode="w4a16",
+        activation="silu",
+        state_E=8,
+        weight_E=8,
+        max_rows=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        routed_rows_capacity=16,
+        intermediate_cache13=empty,
+        intermediate_cache2=empty,
+        fc1_c_tmp=empty,
+        fc2_c_tmp=empty,
+        packed_route_indices=empty,
+        block_expert_ids=empty,
+        packed_route_count=empty,
+        expert_offsets=empty,
+        planned_token_counts=frozenset({1, 2, 3, 4, 6, 8}),
+        planned_fused_moe_launches={
+            ("packed", "e4m3_k16", tc): f"packed-launch-{tc}"
+            for tc in (1, 2, 3, 4, 6, 8)
+        },
+        planned_topk_sum_launches={tc: f"topk-sum-{tc}" for tc in (1, 2, 3, 4, 6, 8)},
+        # Built for the whole small-M range, including the MTP verify sizes 3, 6.
+        planned_tc_decode_launches={
+            tc: f"tc-decode-{tc}" for tc in (1, 2, 3, 4, 6, 8)
+        },
+    )
+
+
+def test_w4a16_preplanned_launches_select_tc_decode_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "1")
+    workspace = _tc_decode_selection_workspace()
+
+    # Every small-M decode size (m <= 8), including the MTP verify sizes 3 and 6,
+    # routes to the TC-decode fused-sum launch when one was preplanned.
+    for tc in (1, 2, 3, 4, 6, 8):
+        fused, _ = tp_moe._w4a16_preplanned_launches(
+            workspace, token_count=tc, weight_layout="packed"
+        )
+        assert fused == f"tc-decode-{tc}", (tc, fused)
+
+    # A small-M size with no preplanned TC-decode launch falls back to the
+    # general packed fused launch rather than erroring.
+    del workspace.planned_tc_decode_launches[3]
+    fused, _ = tp_moe._w4a16_preplanned_launches(
+        workspace, token_count=3, weight_layout="packed"
+    )
+    assert fused == "packed-launch-3", fused
+
+
+def test_w4a16_preplanned_launches_ignore_tc_decode_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "0")
+    workspace = _tc_decode_selection_workspace()
+
+    # With the flag off the general packed launch is selected for every size,
+    # even though TC-decode launches were preplanned.
+    for tc in (1, 2, 4, 8):
+        fused, _ = tp_moe._w4a16_preplanned_launches(
+            workspace, token_count=tc, weight_layout="packed"
+        )
+        assert fused == f"packed-launch-{tc}", (tc, fused)
+
+
 def test_nvfp4_joint_arena_materializes_planned_workspaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
