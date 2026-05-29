@@ -77,8 +77,6 @@ from .traits import (
 )
 
 
-_MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
-
 # natural-log of 2 (base2 <-> natural LSE conversion).
 _LN2 = math.log(2.0)
 
@@ -93,17 +91,6 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
-
-
-def _env_flag(name: str) -> bool:
-    """Match api.py:86 exactly so flag parsing is identical across backends."""
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-# Parsed ONCE at import time (module-level bool). The dispatcher consults this
-# (OR the backend kwarg) together with get_sm_version() >= 120 before routing to
-# the unified backend.
-B12X_MLA_SM120_UNIFIED: bool = _env_flag(_MLA_SM120_UNIFIED_ENV)
 
 
 # Optional decode num_splits override (P9b AutoTuner sweep hook). ``<= 0`` (or an

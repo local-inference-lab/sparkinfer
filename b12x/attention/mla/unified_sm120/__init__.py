@@ -10,7 +10,6 @@ and untouched. Gated by ``B12X_MLA_SM120_UNIFIED`` (see launch.py).
 from __future__ import annotations
 
 from .launch import (
-    B12X_MLA_SM120_UNIFIED,
     run_unified_decode,
     run_unified_merge,
     run_unified_prefill,
@@ -34,7 +33,6 @@ __all__ = [
     "make_unified_traits",
     "infer_model_type",
     # launch / dispatch
-    "B12X_MLA_SM120_UNIFIED",
     "run_unified_decode",
     "run_unified_prefill",
     "run_unified_merge",
