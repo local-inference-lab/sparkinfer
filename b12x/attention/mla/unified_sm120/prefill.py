@@ -74,13 +74,17 @@ from .decode_math import (
 )
 from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
-from .traits import infer_model_type, make_unified_traits
+from .traits import ModelType, infer_model_type, make_unified_traits
 
 
 # BI=64 candidates per chunk (one full/empty KV buffer window). Same as decode.
 _CAND_WINDOW = 64
 # DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
 _DSV4_HEAD_DIM = 512
+# GLM_NSA uncompressed contract head dim (q_nope 512 + q_rope 64).
+_GLM_HEAD_DIM = 576
+# GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
+_GLM_KV_GMEM_STRIDE = 656
 
 # P8b: 4-IO / 384-thread layout for FlashInfer prefill PTX parity. The decode
 # traits pin block_threads=288 (1 IO warp); prefill overrides to 384 = 8 math
@@ -124,7 +128,8 @@ class UnifiedPrefillKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, num_tiles,
-                 num_tokens, h_blocks, num_heads, has_sink):
+                 num_tokens, h_blocks, num_heads, has_sink,
+                 has_extra=False, pbs_extra=1, num_main_tiles=0):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -133,6 +138,14 @@ class UnifiedPrefillKernel:
         self.h_blocks = int(h_blocks)
         self.num_heads = int(num_heads)
         self.has_sink = bool(has_sink)
+        # DSV4 dual-cache prefill (P10 3c). When False the extra-section code is
+        # const_expr-elided -> no-extra DSV4 / GLM prefill PTX byte-identical. The
+        # union spans num_main_tiles main chunks (gathered from the main cache) then
+        # the remaining (num_tiles - num_main_tiles) extra chunks (gathered from the
+        # extra cache), exactly like the decode has_extra union.
+        self.has_extra = bool(has_extra)
+        self.pbs_extra = int(pbs_extra)
+        self.num_main_tiles = int(num_main_tiles)
         self.math_threads = int(traits.math_threads)  # 256
         # P8b: prefill runs 384 threads (8 math + 4 IO), NOT the decode 288. The
         # decode traits.block_threads (288) is left untouched so the decode
@@ -153,6 +166,11 @@ class UnifiedPrefillKernel:
         stride_kv_block: Int64,
         stream: cuda.CUstream,
     ):
+        # SINGLE-CACHE entry (DSV4 main OR GLM): EXACTLY the original traced
+        # signature (9 data args + stream). The dispatcher selects this (func=kernel
+        # -> __call__) when has_extra=False so the no-extra DSV4 / GLM trace +
+        # mangled name + launched @cute.kernel stay byte-identical: the extra-section
+        # args never enter the device entry.
         self.kernel(
             q_all, kv_cache_u8, indices, topk_length, attn_sink,
             output, out_lse, sm_scale_log2, stride_kv_block,
@@ -164,6 +182,41 @@ class UnifiedPrefillKernel:
             # DimKey.exact on the q/output row dim + a num_tokens key_field) so a
             # cached T=1 kernel is NOT reused for a later T>1 call (which would
             # launch only token 0). h_blocks is keyed via num_heads.
+            grid=(self.num_tokens, self.h_blocks, 1),
+            block=[self.block_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_extra(
+        self,
+        q_all: cute.Tensor,          # (T, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,    # flat u8 MAIN cache
+        indices: cute.Tensor,        # (T, topk) int32 MAIN indices
+        topk_length: cute.Tensor,    # (T,) int32 per-token MAIN valid length
+        attn_sink: cute.Tensor,      # (heads,) f32 (dummy 1-elem when no sink)
+        output: cute.Tensor,         # (T, heads, D_V) bf16
+        out_lse: cute.Tensor,        # (T, heads) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        stride_kv_block: Int64,      # MAIN per-block byte stride
+        extra_kv_cache_u8: cute.Tensor,  # flat u8 EXTRA cache (DSV4 dual-cache)
+        extra_indices: cute.Tensor,      # (T, extra_topk) int32
+        extra_topk_length: cute.Tensor,  # (T,) int32 per-token EXTRA valid length
+        stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        stream: cuda.CUstream,
+    ):
+        # DUAL-CACHE entry (DSV4 prefill P10 3c): the dispatcher selects this
+        # (func=kernel.call_extra) only when has_extra=True, so its DISTINCT mangled
+        # name never collides with the byte-identical single-cache __call__. It
+        # launches the 13-param @cute.kernel (self.kernel_extra), which shares the
+        # body via _prefill_body(has_extra=True). num_main_tiles (the uniform
+        # main/extra chunk split) is a compile-time self.num_main_tiles.
+        self.kernel_extra(
+            q_all, kv_cache_u8, indices, topk_length, attn_sink,
+            output, out_lse, sm_scale_log2, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_topk_length,
+            stride_extra_kv_block,
+        ).launch(
             grid=(self.num_tokens, self.h_blocks, 1),
             block=[self.block_threads, 1, 1],
             stream=stream,
@@ -181,6 +234,62 @@ class UnifiedPrefillKernel:
         out_lse: cute.Tensor,
         sm_scale_log2: Float32,
         stride_kv_block: Int64,
+    ):
+        # SINGLE-CACHE @cute.kernel (9 device params): the byte-identical DSV4-main /
+        # GLM prefill path. Threads dummy extra args into the shared body with
+        # has_extra=False so the extra-section code is fully const_expr-elided.
+        self._prefill_body(
+            q_all, kv_cache_u8, indices, topk_length, attn_sink,
+            output, out_lse, sm_scale_log2, stride_kv_block,
+            kv_cache_u8, indices, topk_length, stride_kv_block,
+            has_extra=False,
+        )
+
+    @cute.kernel
+    def kernel_extra(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        indices: cute.Tensor,
+        topk_length: cute.Tensor,
+        attn_sink: cute.Tensor,
+        output: cute.Tensor,
+        out_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,
+        stride_extra_kv_block: Int64,
+    ):
+        # DUAL-CACHE @cute.kernel (13 device params): threads the real extra-section
+        # args into the shared body (has_extra=True).
+        self._prefill_body(
+            q_all, kv_cache_u8, indices, topk_length, attn_sink,
+            output, out_lse, sm_scale_log2, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_topk_length,
+            stride_extra_kv_block,
+            has_extra=True,
+        )
+
+    @cute.jit
+    def _prefill_body(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        indices: cute.Tensor,
+        topk_length: cute.Tensor,
+        attn_sink: cute.Tensor,
+        output: cute.Tensor,
+        out_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,
+        stride_extra_kv_block: Int64,
+        *,
+        has_extra: cutlass.Constexpr,
     ):
         t = self.traits
         L = self.layout
@@ -248,11 +357,34 @@ class UnifiedPrefillKernel:
         if section_len > topk_total:
             section_len = topk_total
 
+        # DSV4 dual-cache: PER-TOKEN EXTRA section length (the union's second pool).
+        # const_expr-elided when has_extra=False so the no-extra trace is unchanged.
+        num_main_tiles = Int32(self.num_main_tiles)
+        if cutlass.const_expr(has_extra):
+            extra_total = Int32(extra_indices.shape[1])
+            extra_section_len = Int32(extra_topk_length[token_idx])
+            if extra_section_len < Int32(0):
+                extra_section_len = Int32(0)
+            if extra_section_len > extra_total:
+                extra_section_len = extra_total
+        else:
+            extra_section_len = section_len
+
         # indices for THIS token row (1-D (topk,) slice).
         topk_row = cute.make_tensor(
             indices.iterator + token_idx.to(Int64) * Int64(indices.stride[0]),
             cute.make_layout(indices.shape[1]),
         )
+        # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
+        # has_extra; const_expr-elided so the no-extra trace never references it.
+        if cutlass.const_expr(has_extra):
+            extra_row = cute.make_tensor(
+                extra_indices.iterator
+                + token_idx.to(Int64) * Int64(extra_indices.stride[0]),
+                cute.make_layout(extra_indices.shape[1]),
+            )
+        else:
+            extra_row = topk_row
         # q for THIS token (2-D (heads, D_QK) view; s0 indexes [head_base+h, d]).
         q_token = cute.make_tensor(
             q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
@@ -277,13 +409,14 @@ class UnifiedPrefillKernel:
             io_lane = tid - Int32(self.math_threads)  # [0, 128)
             prod_phase = Int32(1)
             prod_idx = Int32(0)
+            io_kw = dict(
+                bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
+                scale_format=t.scale_format, io_threads=_PREFILL_IO_THREADS,
+            )
             for lc in cutlass.range(self.num_tiles, unroll=1):
                 ci = Int32(lc)
                 buf = Int32(lc) & Int32(1)
-                g_start = ci * Int32(_CAND_WINDOW)
-                g_end = g_start + Int32(_CAND_WINDOW)
-                if g_end > section_len:
-                    g_end = section_len
 
                 cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
 
@@ -291,19 +424,62 @@ class UnifiedPrefillKernel:
                     token_idx_view.iterator + buf * tok_buf_elems,
                     cute.make_layout(int(L.token_idx_buf_bytes // 4)),
                 )
-                io_issue_gather(
-                    kv_cache_u8, topk_row,
-                    kv_fp8_addr + buf * kv_fp8_buf,
-                    kv_rope_addr + buf * kv_rope_buf,
-                    kv_sc_addr + buf * kv_sc_buf,
-                    tok_buf_view,
-                    mbar_base + buf,  # full[buf]
-                    g_start, g_end,
-                    Int32(self.page_block_size), stride_kv_block, io_lane,
-                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
-                    scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
-                    scale_format=t.scale_format, io_threads=_PREFILL_IO_THREADS,
-                )
+                # Per-chunk section dispatch (DSV4 dual-cache; mirrors decode
+                # _kernel_body). chunks [0, num_main_tiles) gather from the MAIN
+                # cache; chunks >= num_main_tiles re-base their offset and gather from
+                # the EXTRA cache (its own base ptr / page size / indices / stride).
+                # const_expr-pinned to the main gather when has_extra=False -> the
+                # no-extra trace + PTX are byte-identical.
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_tiles:
+                        cis = ci - num_main_tiles
+                        g_start = cis * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > extra_section_len:
+                            g_end = extra_section_len
+                        io_issue_gather(
+                            extra_kv_cache_u8, extra_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.pbs_extra), stride_extra_kv_block, io_lane,
+                            **io_kw,
+                        )
+                    else:
+                        g_start = ci * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > section_len:
+                            g_end = section_len
+                        io_issue_gather(
+                            kv_cache_u8, topk_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.page_block_size), stride_kv_block, io_lane,
+                            **io_kw,
+                        )
+                else:
+                    g_start = ci * Int32(_CAND_WINDOW)
+                    g_end = g_start + Int32(_CAND_WINDOW)
+                    if g_end > section_len:
+                        g_end = section_len
+                    io_issue_gather(
+                        kv_cache_u8, topk_row,
+                        kv_fp8_addr + buf * kv_fp8_buf,
+                        kv_rope_addr + buf * kv_rope_buf,
+                        kv_sc_addr + buf * kv_sc_buf,
+                        tok_buf_view,
+                        mbar_base + buf,  # full[buf]
+                        g_start, g_end,
+                        Int32(self.page_block_size), stride_kv_block, io_lane,
+                        **io_kw,
+                    )
                 prod_idx += Int32(1)
                 if prod_idx == Int32(n_buf):
                     prod_idx = Int32(0)
@@ -386,14 +562,33 @@ class UnifiedPrefillKernel:
 
                 # PER-TOKEN mask: invalid if idx<0 OR abs_cand >= section_len. The
                 # single CTA owns the whole row so split_cand_end == section_len.
-                split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
-                if split_cand_end > section_len:
-                    split_cand_end = section_len
-                qk = s3_mask_and_scale(
-                    qk, tok_buf_view, warp_first_cand,
-                    split_cand_start, split_cand_end, section_len,
-                    sm_scale_log2, lane,
-                )
+                # DSV4 dual-cache: an extra chunk (ci >= num_main_tiles) re-bases the
+                # candidate offset WITHIN ITS SECTION and swaps in the extra section
+                # length; the MATH (S0-S6b) reads only the buffered smem, so it is
+                # section-agnostic. const_expr-pinned to the main expressions when
+                # has_extra=False -> the no-extra trace + PTX are byte-identical.
+                if cutlass.const_expr(has_extra):
+                    sc_start = split_cand_start
+                    sec_len = section_len
+                    if ci >= num_main_tiles:
+                        sc_start = (ci - num_main_tiles) * Int32(_CAND_WINDOW)
+                        sec_len = extra_section_len
+                    sc_end = sc_start + Int32(_CAND_WINDOW)
+                    if sc_end > sec_len:
+                        sc_end = sec_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        sc_start, sc_end, sec_len, sm_scale_log2, lane,
+                    )
+                else:
+                    split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                    if split_cand_end > section_len:
+                        split_cand_end = section_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        split_cand_start, split_cand_end, section_len,
+                        sm_scale_log2, lane,
+                    )
 
                 p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 p, wr0, wr1 = s4_online_softmax(
@@ -513,30 +708,46 @@ def run_unified_prefill(
     output: torch.Tensor | None = None,
     lse_out: torch.Tensor | None = None,
     stride_kv_block: int | None = None,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_topk_length: torch.Tensor | None = None,
+    extra_page_block_size: int | None = None,
+    stride_extra_kv_block: int | None = None,
     workspace=None,
 ):
-    """Unified SM120 sparse-MLA DSV4 prefill: single-pass kernel -> BF16 O + LSE.
+    """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
     A THIN launcher over ``UnifiedPrefillKernel`` (the decode CTA body run at the
     implicit num_splits=1, with the FINAL_BF16 epilogue + per-token section_len +
     optional attn_sink). P8b: 4 IO warps, 384 threads (8 math + 4 IO), the proven
     1-IO mbarrier protocol scaled to 128 IO threads + setmaxnreg dec/inc.
 
+    Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE) AND GLM_NSA
+    (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope) through the SAME kernel
+    via the traits const_expr branches (model_type/scale_format/v_has_rope/
+    nt_per_warp_xv), exactly like the decode launcher. DSV4 additionally supports a
+    DUAL-CACHE union (extra_kv_cache / extra_indices / extra_topk_length /
+    extra_page_block_size): the CTA attends over the UNION of the MAIN topk cache and
+    the EXTRA cache in ONE online softmax (num_main_tiles main chunks then the extra
+    chunks). The extra cache is DSV4-only (GLM has no extra section -> RAISE).
+
     Args:
-      q:            (T, heads, D_QK=512) bf16. T query tokens (prefill regime).
-      kv_cache:     flat uint8 KV cache (reshaped to 1-D). For DSV4 the per-page
-                    byte stride is ``stride_kv_block`` (compressed page nbytes).
+      q:            (T, heads, D_QK) bf16. D_QK 512 (DSV4) or 576 (GLM_NSA).
+      kv_cache:     flat uint8 MAIN KV cache (reshaped to 1-D).
       topk_indices: (T, topk) int32 flat slot ids (-1 = invalid sentinel).
       sm_scale:     softmax scale (typically D_QK**-0.5).
-      page_block_size: tokens per KV block (64 for DSV4).
-      topk_length:  optional (T,) int32 per-token valid length; entries past it
+      page_block_size: tokens per MAIN KV block (64 for DSV4/GLM).
+      topk_length:  optional (T,) int32 per-token MAIN valid length; entries past it
                     are masked. Defaults to full ``topk`` for every token.
       attn_sink:    optional (heads,) fp32 per-head natural-log sink, folded into
                     the normalizer + base-2 LSE (FlashMLA V4).
       output:       optional pre-allocated (T, heads, D_V) bf16 output (else made).
       lse_out:      optional pre-allocated (T, heads) f32 base-2 LSE (else made).
-      stride_kv_block: per-block gmem byte stride. Derived from page_block_size
-                    when omitted (compressed_mla_page_nbytes for DSV4).
+      stride_kv_block: per-block gmem byte stride for the MAIN cache. Derived from
+                    page_block_size + model_type when omitted.
+      extra_kv_cache / extra_indices / extra_topk_length / extra_page_block_size:
+                    DSV4 dual-cache EXTRA pool (all-or-none; partial trio RAISEs).
+      stride_extra_kv_block: EXTRA per-block byte stride (derived when omitted).
       workspace:    unused (prefill is single-pass, no split/merge workspace);
                     accepted for launcher-signature symmetry.
 
@@ -547,15 +758,20 @@ def run_unified_prefill(
     del workspace  # prefill is single-pass; no split/merge workspace needed.
 
     q_head_dim = int(q.shape[-1])
-    if q_head_dim != _DSV4_HEAD_DIM:
-        raise NotImplementedError(
-            f"unified_sm120 prefill supports DSV4 (q_head_dim=512) only; got {q_head_dim}"
+    if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
+        # Genuinely-unsupported contract -> error like upstream (infer_model_type
+        # ICHECKs d_qk in {512, 576}). NOT a legacy fallback.
+        raise ValueError(
+            f"unified_sm120 prefill supports DSV4 (q_head_dim=512) or GLM_NSA "
+            f"(q_head_dim=576); got q_head_dim={q_head_dim}"
         )
 
     num_tokens, heads, _ = q.shape
     hpb = 16
     if heads % hpb != 0:
-        raise NotImplementedError(
+        # VALID_HPB<16 small-TP shards are a separate (decode-landed) feature; until
+        # ported in prefill this is an unsupported shape -> RAISE (not legacy).
+        raise ValueError(
             f"unified_sm120 prefill requires heads divisible by HPB={hpb}, got {heads}"
         )
     h_blocks = heads // hpb
@@ -565,8 +781,38 @@ def run_unified_prefill(
     layout = make_smem_layout(traits)
     d_v = int(traits.d_v)
 
+    # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
+    has_extra = (
+        extra_kv_cache is not None
+        or extra_indices is not None
+        or extra_topk_length is not None
+    )
+    if has_extra:
+        if (
+            extra_kv_cache is None
+            or extra_indices is None
+            or extra_page_block_size is None
+        ):
+            raise ValueError(
+                "unified_sm120 prefill dual-cache requires extra_kv_cache, "
+                "extra_indices, and extra_page_block_size together (partial extra "
+                "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
+            )
+        if model_type != ModelType.DSV4:
+            raise ValueError(
+                "unified_sm120 prefill dual-cache (extra tokens) is DSV4-only "
+                "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
+            )
+
     topk = int(topk_indices.shape[1])
-    num_tiles = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    num_main_tiles = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    if has_extra:
+        extra_topk = int(extra_indices.shape[1])
+        num_extra_tiles = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    else:
+        extra_topk = 0
+        num_extra_tiles = 0
+    num_tiles = num_main_tiles + num_extra_tiles
 
     device = q.device
     if topk_length is None:
@@ -582,7 +828,12 @@ def run_unified_prefill(
         attn_sink_t = torch.zeros(1, dtype=torch.float32, device=device)
 
     if stride_kv_block is None:
-        stride_kv_block = int(compressed_mla_page_nbytes(int(page_block_size)))
+        if model_type == ModelType.GLM_NSA:
+            # GLM cache: per-token 656B contiguous record; a paged "block" holds
+            # page_block_size tokens, so the per-block byte stride is pbs*656.
+            stride_kv_block = int(page_block_size) * _GLM_KV_GMEM_STRIDE
+        else:
+            stride_kv_block = int(compressed_mla_page_nbytes(int(page_block_size)))
 
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()
@@ -591,14 +842,38 @@ def run_unified_prefill(
     if lse_out is None:
         lse_out = torch.empty((num_tokens, heads), dtype=torch.float32, device=device)
 
+    # ── EXTRA (dual-cache) tensors / stride. When no extra cache they alias the main
+    #    cache / indices and the has_extra=False const_expr elides the extra reads. ──
+    if has_extra:
+        pbs_extra = int(extra_page_block_size)
+        if stride_extra_kv_block is None:
+            stride_extra_kv_block = int(compressed_mla_page_nbytes(pbs_extra))
+        extra_kv_flat = extra_kv_cache.reshape(-1)
+        extra_indices_t = extra_indices.contiguous()
+        if extra_topk_length is None:
+            extra_len_t = torch.full(
+                (num_tokens,), extra_topk, dtype=torch.int32, device=device
+            )
+        else:
+            extra_len_t = extra_topk_length.to(
+                device=device, dtype=torch.int32
+            ).contiguous()
+    else:
+        pbs_extra = 1
+        stride_extra_kv_block = 0
+        extra_kv_flat = kv_cache.reshape(-1)  # alias (never read when has_extra=False)
+        extra_indices_t = topk_indices        # alias (never read)
+        extra_len_t = topk_length             # alias (never read)
+
     kernel = UnifiedPrefillKernel(
         traits, layout, int(page_block_size), num_tiles,
         num_tokens=num_tokens, h_blocks=h_blocks, num_heads=heads, has_sink=has_sink,
+        has_extra=has_extra, pbs_extra=pbs_extra, num_main_tiles=num_main_tiles,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     kv_flat = kv_cache.reshape(-1)
-    args = (
+    base_args = (
         _to_cute(q, cutlass.BFloat16),
         _to_cute(kv_flat, cutlass.Uint8, align=16),
         _to_cute(topk_indices, cutlass.Int32, align=4),
@@ -608,24 +883,35 @@ def run_unified_prefill(
         _to_cute(lse_out, cutlass.Float32, align=4),
         Float32(float(sm_scale) * LOG2_E),
         Int64(stride_kv_block),
-        stream,
     )
-    compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.prefill",
-        # version 3: P8b 4-IO/384-thread scale-up (8 math + 4 IO, io_threads=128,
-        # setmaxnreg dec/inc) over the proven v2 1-IO mbarrier protocol. The cache
-        # key is kernel_id + version + fields only (NOT a source hash), so this
-        # bump invalidates any stale v2 288-thread prefill objects on disk.
-        3,
+    if has_extra:
+        args = base_args + (
+            _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+            _to_cute(extra_indices_t, cutlass.Int32, align=4),
+            _to_cute(extra_len_t, cutlass.Int32, align=4),
+            Int64(stride_extra_kv_block),
+            stream,
+        )
+    else:
+        args = base_args + (stream,)
+
+    spec_fields = [
         key_field("model_type", traits.model_type),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("num_heads", int(heads)),
         key_field("hpb", int(hpb)),
         key_field("num_tiles", int(num_tiles)),
+        key_field("num_main_tiles", int(num_main_tiles)),
         key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
         key_field("has_sink", int(has_sink)),
+        # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache prefill:
+        # has_extra gates the extra-section const_expr (no-extra DSV4/GLM PTX
+        # byte-identical), pbs_extra is the runtime extra page block size.
+        key_field("has_extra", int(has_extra)),
+        key_field("pbs_extra", int(pbs_extra)),
+        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         # num_tokens is baked into the launch grid (concrete-shape trace), so it
         # MUST be a compile key (DimKey.exact row dims below). A T-bucket here
         # would silently reuse a wrong-grid kernel; key the exact T.
@@ -634,9 +920,28 @@ def run_unified_prefill(
         tensor_key("topk_indices", topk_indices, dims=(DimKey.exact(num_tokens), DimKey.bucket(topk))),
         tensor_key("output", output, dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(d_v))),
         tensor_key("out_lse", lse_out, dims=(DimKey.exact(num_tokens), DimKey.exact(heads))),
+    ]
+    if has_extra:
+        spec_fields.append(
+            tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(num_tokens), DimKey.bucket(max(extra_topk, 1))))
+        )
+    compile_spec = KernelCompileSpec.from_fields(
+        "attention.mla.unified_sm120.prefill",
+        # version 4: P10 GLM prefill (model_type==GLM_NSA traits) + DSV4 dual-cache
+        # prefill (has_extra union; call_extra/kernel_extra + has_extra const_expr).
+        # The cache key is kernel_id + version + fields only; this bump invalidates
+        # stale v3 objects. The no-extra DSV4-main trace + PTX are UNCHANGED from v3
+        # (the extra args / has_extra=0 const_expr never enter that device entry; the
+        # added num_main_tiles key_field equals num_tiles there, a pure key bump).
+        4,
+        *spec_fields,
     )
+    # Select the entry: dual-cache uses call_extra (distinct mangled name); the
+    # no-extra DSV4/GLM path uses the kernel object (-> __call__) whose name + PTX
+    # stay byte-identical to the pre-P10 single-cache prefill.
+    entry = kernel.call_extra if has_extra else kernel
     b12x_launch(
-        kernel,
+        entry,
         compile_spec=compile_spec,
         compile_args=args,
         runtime_args=args,

@@ -146,6 +146,31 @@ def compressed_mla_decode_forward(
             )
         from . import unified_sm120
 
+        # PREFILL-LIKE modes (extend/verify/draft_extend) route to the single-pass
+        # DSV4 prefill (run_unified_prefill) -- upstream's num_tokens>64 prefill
+        # orchestrator -- instead of the legacy split-decode. Main cache OR the DSV4
+        # DUAL-CACHE (extra tokens) when the extra trio is provided. An unsupported
+        # prefill shape RAISEs inside run_unified_prefill (error like upstream, NOT
+        # a legacy fallback).
+        if scratch.mode in ("extend", "verify", "draft_extend"):
+            return _run_unified_sm120_compressed_prefill(
+                q3=q3,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                workspace=scratch,
+                sm_scale=sm_scale,
+                swa_page_size=swa_page_size,
+                indexed_k_cache=indexed_k_cache,
+                indexed_indices=indexed_indices,
+                indexed_topk_lengths=indexed_topk_lengths,
+                indexed_page_size=indexed_page_size,
+                attn_sink=attn_sink,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
+                heads=heads,
+            )
+
         return unified_sm120.run_unified_decode(
             q_all=q3,
             swa_k_cache=swa_k_cache,
@@ -462,6 +487,71 @@ def compressed_mla_decode_forward(
         lse_natural.div_(_LN2)
         return output, lse_natural
     return output, lse_natural
+
+
+def _run_unified_sm120_compressed_prefill(
+    *,
+    q3: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    workspace: B12XAttentionWorkspace,
+    sm_scale: float,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_topk_lengths: torch.Tensor | None,
+    indexed_page_size: int | None,
+    attn_sink: torch.Tensor | None,
+    return_lse: bool,
+    lse_scale: Literal["base2", "natural"],
+    heads: int,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
+    unified SM120 single-pass prefill (run_unified_prefill).
+
+    Mirrors upstream's num_tokens>64 prefill orchestrator: ONE 384-thread CTA per
+    (token, HPB head-group) over ALL topk tiles (FINAL_BF16 epilogue, no split-K
+    merge). Main cache OR the DSV4 DUAL-CACHE union (extra tokens). Per-token
+    ``swa_topk_lengths`` is the per-token main topk_length; attn_sink + return_lse
+    are supported. An unsupported prefill shape RAISEs inside run_unified_prefill
+    (error like upstream, NOT a legacy fallback).
+    """
+    from . import unified_sm120
+
+    swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
+    output = _get_mla_output_view(
+        workspace=workspace,
+        q_all=q3,
+        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
+    )
+
+    extra_kwargs: dict = {}
+    if indexed_k_cache is not None:
+        extra_kwargs = dict(
+            extra_kv_cache=indexed_k_cache,
+            extra_indices=_normalize_index_matrix(
+                indexed_indices, name="indexed_indices"
+            ),
+            extra_topk_length=indexed_topk_lengths,
+            extra_page_block_size=int(indexed_page_size),
+        )
+
+    _, lse_base2 = unified_sm120.run_unified_prefill(
+        q=q3,
+        kv_cache=swa_k_cache,
+        topk_indices=swa_indices_2d,
+        sm_scale=float(sm_scale),
+        page_block_size=int(swa_page_size),
+        topk_length=swa_topk_lengths,
+        attn_sink=attn_sink,
+        output=output,
+        **extra_kwargs,
+    )
+    if not return_lse:
+        return output
+    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
+    return output, lse
 
 
 def _stage_fixed_compressed_mla_inputs(

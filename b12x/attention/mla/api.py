@@ -592,20 +592,33 @@ def _run_sparse_mla(
     # silently route an unsupported GLM call to the DSV4 kernel). q != 576 is a
     # contract error.
     if _use_unified_sm120(backend=backend, device=q_all.device):
-        if int(q_all.shape[-1]) != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
+        q_head_dim = int(q_all.shape[-1])
+        if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
             raise ValueError(
                 f"unified_sm120 sparse decode requires the GLM_NSA contract "
-                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={int(q_all.shape[-1])}"
+                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={q_head_dim}"
             )
-        # GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) decode via the
-        # unified SM120 kernel (cute.constexpr GLM branches beside DSV4). The
-        # unified path now covers the upstream DSV3.2/GLM decode surface:
-        # return_lse, attn_sink fold (sink-in-merge), VALID_HPB<16 /
-        # non-multiple-of-16 head shards, AND multi-token rows (q_rows in [1,64])
-        # with PER-TOKEN active_token_counts (P10b: the per-token topk_length is
-        # read in-kernel at t=blockIdx.x; a uniform-length batch collapses to the
-        # byte-identical scalar path). The q_rows==1 gate is removed -- route q==576
-        # to unified unconditionally (subject only to shape-table support).
+        # GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) via the unified
+        # SM120 kernel (cute.constexpr GLM branches beside DSV4). The decode path
+        # covers the upstream DSV3.2/GLM decode surface (return_lse, attn_sink fold
+        # via sink-in-merge, VALID_HPB<16, multi-token rows with PER-TOKEN
+        # active_token_counts). The PREFILL-LIKE modes (extend/verify/draft_extend)
+        # route to the single-pass GLM prefill (run_unified_prefill, model_type==
+        # GLM_NSA) instead of the legacy split path; for an unsupported prefill shape
+        # run_unified_prefill RAISEs (error like upstream, NOT legacy).
+        if workspace.mode in ("extend", "verify", "draft_extend"):
+            return _run_unified_sm120_prefill(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                selected_indices=selected_indices,
+                active_token_counts=active_token_counts,
+                workspace=workspace,
+                sm_scale=float(sm_scale),
+                v_head_dim=int(v_head_dim),
+                attn_sink=attn_sink,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
+            )
         from .unified_sm120.launch import run_unified_decode
 
         return run_unified_decode(
@@ -772,6 +785,52 @@ def _run_sparse_mla(
     if return_lse:
         return output, lse
     return output
+
+
+def _run_unified_sm120_prefill(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    workspace: B12XAttentionWorkspace,
+    sm_scale: float,
+    v_head_dim: int,
+    attn_sink: torch.Tensor | None,
+    return_lse: bool,
+    lse_scale: Literal["base2", "natural"],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Route a prefill-like (extend/verify/draft_extend) call to the unified SM120
+    single-pass prefill (run_unified_prefill).
+
+    Mirrors upstream's num_tokens>64 prefill orchestrator: ONE 384-thread CTA per
+    (token, HPB head-group) over ALL topk tiles, FINAL_BF16 epilogue (no split-K
+    merge). DSV4 (q==512) and GLM_NSA (q==576) route by traits; per-token
+    ``active_token_counts`` is the per-token topk_length; attn_sink + return_lse are
+    supported. An unsupported prefill shape RAISEs inside run_unified_prefill
+    (error like upstream, NOT a legacy fallback).
+    """
+    from .unified_sm120.launch import run_unified_prefill
+
+    output = _get_mla_output_view(
+        workspace=workspace,
+        q_all=q_all,
+        v_head_dim=v_head_dim,
+    )
+    _, lse_base2 = run_unified_prefill(
+        q=q_all,
+        kv_cache=kv_cache,
+        topk_indices=selected_indices,
+        sm_scale=float(sm_scale),
+        page_block_size=int(workspace.page_size),
+        topk_length=active_token_counts,
+        attn_sink=attn_sink,
+        output=output,
+    )
+    if not return_lse:
+        return output
+    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
+    return output, lse
 
 
 def _final_lse_from_split_workspace(

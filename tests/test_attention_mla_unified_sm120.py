@@ -39,7 +39,7 @@ import glm_ref  # noqa: E402
 
 import b12x.attention.mla.api as mla_api
 import b12x.attention.mla.compressed_api as compressed_api_impl
-from b12x.attention.mla.api import sparse_mla_decode_forward
+from b12x.attention.mla.api import sparse_mla_decode_forward, sparse_mla_extend_forward
 from b12x.attention.mla.compressed_api import compressed_mla_decode_forward
 from b12x.attention.mla.compressed_reference import (
     compressed_mla_page_nbytes,
@@ -230,6 +230,137 @@ def test_glm_decode_flag_on_routes_to_unified(monkeypatch) -> None:
     assert counters["reference_calls"] == 0
 
 
+# ── P10 (3a) PREFILL routing: extend/verify/draft_extend -> run_unified_prefill ──
+def _make_glm_extend_inputs(device: torch.device, num_q_heads: int = _NUM_Q_HEADS,
+                            mode: str = "extend"):
+    """A tiny GLM (q=576) prefill-like (extend) call + its workspace."""
+    rows = 1
+    width = 4
+    q_all = torch.zeros(
+        (rows, num_q_heads, _GLM_Q_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.zeros(
+        (16, 1, _GLM_KV_BYTES_PER_TOKEN), dtype=torch.uint8, device=device
+    )
+    selected = torch.zeros((rows, width), dtype=torch.int32, device=device)
+    cache_seqlens = torch.full((rows,), width, dtype=torch.int32, device=device)
+    from b12x.attention.workspace import B12XAttentionWorkspace
+
+    workspace = B12XAttentionWorkspace.for_contract(
+        mode=mode,
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=num_q_heads,
+        head_dim=_GLM_Q_HEAD_DIM,
+        v_head_dim=_GLM_V_HEAD_DIM,
+        topk=width,
+        max_total_q=rows,
+        max_batch=rows,
+        max_kv_rows=rows * width,
+        use_cuda_graph=False,
+    )
+    return q_all, kv_cache, selected, cache_seqlens, workspace
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
+def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
+    """(3a) GLM extend/verify/draft_extend + flag on: the prefill-like modes route
+    into unified_sm120 run_unified_prefill (NOT run_unified_decode, NOT legacy).
+
+    The launcher is exercised end-to-end by .sm120port/probes/glm_prefill_e2e_check.py
+    vs glm_prefill_ref; here we prove ONLY the GATE intercepts a prefill-like GLM
+    contract and routes to prefill (not decode / not legacy split)."""
+    device = require_sm120_unified()
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
+    counters = _force_legacy_reference(monkeypatch)
+
+    routed = {"prefill": 0, "decode": 0}
+
+    def fake_run_unified_prefill(*, q, output=None, **kwargs):
+        del kwargs
+        routed["prefill"] += 1
+        if output is not None:
+            output.zero_()
+            out = output
+        else:
+            out = q[:, :, :_GLM_V_HEAD_DIM].clone()
+        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+        return out, lse
+
+    def fake_run_unified_decode(*, q_all, **kwargs):
+        del kwargs
+        routed["decode"] += 1
+        return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
+
+    import b12x.attention.mla.unified_sm120.launch as unified_launch
+
+    monkeypatch.setattr(unified_launch, "run_unified_prefill", fake_run_unified_prefill)
+    monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
+
+    q_all, kv_cache, selected, cache_seqlens, workspace = _make_glm_extend_inputs(
+        device, num_q_heads=16, mode=mode
+    )
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        selected_token_offsets=selected,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        workspace=workspace,
+        sm_scale=_SM_SCALE,
+        v_head_dim=_GLM_V_HEAD_DIM,
+    )
+
+    assert output.shape == (1, 16, _GLM_V_HEAD_DIM)
+    assert routed["prefill"] == 1   # prefill intercepted
+    assert routed["decode"] == 0    # NOT decode
+    assert counters["reference_calls"] == 0   # NOT legacy
+
+
+@torch.inference_mode()
+def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
+    """(3a) The decode mode still routes to run_unified_decode (prefill routing is
+    gated on workspace.mode -- decode must NOT regress to prefill)."""
+    device = require_sm120_unified()
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
+    _force_legacy_reference(monkeypatch)
+
+    routed = {"prefill": 0, "decode": 0}
+
+    def fake_run_unified_prefill(*, q, **kwargs):
+        del q, kwargs
+        routed["prefill"] += 1
+        raise AssertionError("decode mode must not route to prefill")
+
+    def fake_run_unified_decode(*, q_all, **kwargs):
+        del kwargs
+        routed["decode"] += 1
+        return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
+
+    import b12x.attention.mla.unified_sm120.launch as unified_launch
+
+    monkeypatch.setattr(unified_launch, "run_unified_prefill", fake_run_unified_prefill)
+    monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
+
+    q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(
+        device, num_q_heads=16
+    )
+    sparse_mla_decode_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        workspace=workspace,
+        sm_scale=_SM_SCALE,
+        v_head_dim=_GLM_V_HEAD_DIM,
+    )
+    assert routed["decode"] == 1
+    assert routed["prefill"] == 0
+
+
 # ── DSV4 MAIN-CACHE compressed decode (P7): real kernel + split-K + merge ──────
 _DSV4_HEADS = 32          # local q heads (2 head blocks of HPB=16)
 _DSV4_HEAD_DIM = 512
@@ -305,6 +436,65 @@ def test_dsv4_compressed_decode_routes_to_unified_and_matches_reference(monkeypa
                 (got.flatten().double().norm() * exp.flatten().double().norm()))
     assert cos > 0.999, f"DSV4 unified decode cos={cos}"
     assert (got - exp).abs().max().item() < 2e-2
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
+def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
+    """(3a) Flag on + DSV4 compressed contract in a prefill-like mode: the gate routes
+    compressed_mla_decode_forward to unified_sm120.run_unified_prefill (single-pass
+    DSV4 prefill), NOT the legacy split forward and NOT run_unified_decode."""
+    device = require_sm120_unified()
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
+
+    legacy = {"forward": 0}
+    routed = {"prefill": 0, "decode": 0}
+
+    def fail_forward(**kwargs):
+        legacy["forward"] += 1
+        raise AssertionError("legacy compressed split forward ran for a DSV4 prefill case")
+
+    def fake_run_unified_prefill(*, q, output=None, **kwargs):
+        del kwargs
+        routed["prefill"] += 1
+        if output is not None:
+            output.zero_()
+            out = output
+        else:
+            out = q[:, :, :_DSV4_HEAD_DIM].clone()
+        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+        return out, lse
+
+    def fake_run_unified_decode(**kwargs):
+        routed["decode"] += 1
+        raise AssertionError("prefill mode must not route to decode")
+
+    import b12x.attention.mla.unified_sm120 as unified_pkg
+
+    monkeypatch.setattr(compressed_api_impl, "run_compressed_mla_split_decode_forward", fail_forward)
+    monkeypatch.setattr(unified_pkg, "run_unified_prefill", fake_run_unified_prefill)
+    monkeypatch.setattr(unified_pkg, "run_unified_decode", fake_run_unified_decode)
+
+    topk = 64
+    q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
+    scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
+    # Mark the scratch prefill-like (the mode gate is what selects the prefill route;
+    # the materialized scratch mode is mutable).
+    scratch.mode = mode
+
+    out = compressed_mla_decode_forward(
+        q_all=q,
+        swa_k_cache=cache,
+        swa_indices=idx,
+        swa_topk_lengths=lengths,
+        workspace=scratch,
+        sm_scale=_DSV4_SM_SCALE,
+        swa_page_size=_DSV4_PAGE,
+    )
+    assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
+    assert routed["prefill"] == 1
+    assert routed["decode"] == 0
+    assert legacy["forward"] == 0
 
 
 @torch.inference_mode()
