@@ -1286,6 +1286,16 @@ def run_unified_decode(
         or indexed_indices is not None
         or indexed_topk_lengths is not None
     )
+    # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream is
+    # raw-slot-id only; no page-table indirection). RAISE, not fallback. Checked
+    # BEFORE the has_extra branch so a mapped page table passed WITHOUT the extra
+    # trio is still a hard error (never silently ignored / silently routed).
+    if indexed_page_table is not None:
+        raise ValueError(
+            "unified_sm120 decode: indexed_page_table (mapped extra pages) is "
+            "unsupported on SM120 sparse-MLA; upstream addresses the extra cache "
+            "by raw slot id only"
+        )
     if has_extra:
         # Partial dual-cache trio is a HARD ERROR (upstream ICHECKs extra_indices
         # requires extra_kv_cache; sparse_mla_sm120.cu:171-174). NOT a fallback.
@@ -1298,14 +1308,6 @@ def run_unified_decode(
                 "unified_sm120 decode dual-cache requires indexed_k_cache, "
                 "indexed_indices, and indexed_page_size together (partial extra "
                 "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
-            )
-        # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream is
-        # raw-slot-id only; no page-table indirection). RAISE, not fallback.
-        if indexed_page_table is not None:
-            raise ValueError(
-                "unified_sm120 decode: indexed_page_table (mapped extra pages) is "
-                "unsupported on SM120 sparse-MLA; upstream addresses the extra cache "
-                "by raw slot id only"
             )
         if int(q_all.shape[-1]) != _DSV4_HEAD_DIM:
             raise ValueError(
@@ -1380,9 +1382,22 @@ def run_unified_decode(
     # bound + the S3 idx<0 mask already realise the per-token length). For a
     # GENUINELY-mixed-length batch (some topk_length[t] < topk) the per-token
     # kernel reads each token's clamped length, so over-allocated chunks for short
-    # tokens are fully masked (-> mid_lse=-inf -> merge ignores). rows==1 is
-    # ALWAYS uniform here (a single length cannot be "mixed"), so single-token and
-    # uniform-length batches stay on the scalar path -> PTX byte-identical.
+    # tokens are fully masked (-> mid_lse=-inf -> merge ignores). A batch is uniform
+    # ONLY when EVERY row's length >= the full section width (so the scalar bound
+    # already equals each clamped length); a single SHORT row (lt[0] < cap) is NOT
+    # uniform and must take the per-token clamp path.
+    # CUDA-graph capture safety: the uniform-vs-per-token decision below reads a
+    # data-dependent reduction off the device (torch.all(...).item()), which is a
+    # device->host SYNC and is ILLEGAL during stream capture (cudaErrorStreamCapture
+    # Unsupported). It is also fundamentally graph-unsafe: the length tensor values
+    # can change between graph replays, so a length-dependent kernel SELECTION baked
+    # at capture time would be wrong. Under capture we therefore SKIP the sync and
+    # conservatively take the PER-TOKEN path (the per-token kernel reads each token's
+    # clamped length, so it is correct for uniform batches too -- uniform is a subset
+    # of per-token). Outside capture we keep the host-sync fast-path so the common
+    # uniform decode stays on the byte-identical scalar kernel.
+    capturing = q_all.is_cuda and torch.cuda.is_current_stream_capturing()
+
     def _length_tensor(lengths, name, cap):
         if lengths is None:
             return None, True
@@ -1394,6 +1409,17 @@ def run_unified_decode(
                 f"got {tuple(lengths.shape)}"
             )
         lt = lengths.to(device=q_all.device, dtype=torch.int32).contiguous()
+        # Under graph capture: no host sync allowed -> conservatively take the
+        # PER-TOKEN path (uniform=False). The per-token kernel reads each token's
+        # CLAMPED length, so it is correct for every case (uniform full-width AND a
+        # genuinely-short single row); only the scalar fast-path is skipped. NOTE:
+        # rows==1 is NOT automatically uniform here -- a single row whose length is
+        # SHORTER than the section width (lt[0] < cap) must still be clamped, so it
+        # is per-token, not scalar. (The earlier "rows==1 is always uniform" claim
+        # conflated cross-token mixing with the per-token clamp and was wrong for a
+        # short single row.)
+        if capturing:
+            return lt, False
         # Uniform iff every token's CLAMPED length is the full section width: then
         # the scalar section bound (Int32(cap)) already equals every token's length
         # -> byte-identical scalar path. A length >= cap clamps to cap in-kernel, so
