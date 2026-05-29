@@ -1,10 +1,13 @@
 """Unified SM120 sparse-MLA *prefill* (P8) -- CORRECTNESS-FIRST, decode-reuse.
 
-This is the P8 prefill: a CORRECT single-pass DSV4 prefill built by REUSING the
-proven, byte-identical decode pipeline (decode_math S0-S7 + io.py io_issue_gather
-+ smem) with the ABSOLUTE MINIMUM of new code. It deliberately does NOT introduce
-the 384-thread / 4-IO-warp structure (that is a PERF/PTX-parity optimization
-deferred to P8b/P9; the earlier 4-IO attempt DEADLOCKED on the mbarrier parity).
+This is the P8/P8b prefill: a CORRECT single-pass DSV4 prefill built by REUSING
+the proven, byte-identical decode pipeline (decode_math S0-S7 + io.py
+io_issue_gather + smem) with the ABSOLUTE MINIMUM of new code. P8b SURGICALLY
+scales the proven 1-IO/288 pipeline to the FlashInfer 4-IO/384 layout (8 math +
+4 IO warps, io_threads=128, setmaxnreg dec/inc) for PREFILL PTX PARITY -- the
+mbarrier full/empty protocol is KEPT BIT-IDENTICAL (the from-scratch 4-IO attempt
+that built a NEW pipeline DEADLOCKED; this one changes ONLY the IO thread count +
+register split, never the handshake).
 
 KEY INSIGHT (why this works): the DSV4 decode CTA at ``num_splits=1`` ALREADY
 processes ALL topk candidates for one query token in a single CTA, carrying the
@@ -23,13 +26,15 @@ That IS a correct single-pass prefill. The ONLY differences vs decode are:
   (d) GRID is per query token: ``(num_tokens, H_BLOCKS, 1)`` (num_tokens may be
       >1; one CTA per (token, HPB head-group)).
 
-So this prefill kernel is the decode CTA body (288 threads = 8 math + 1 IO warp,
-io_threads=32) with: a compile-time chunk loop of ``num_tiles = ceil(topk/BI)``
-chunks, a PER-TOKEN ``section_len = topk_length[token]`` (chunks past the token's
-length gather all -1 -> S3 masks them -> they add nothing to the online softmax),
-and ``s7_epilogue(epilogue_mode=FINAL_BF16, attn_sink=...)``. The hot-op MMA PTX
+So this prefill kernel is the decode CTA body (P8b: 384 threads = 8 math + 4 IO
+warps, io_threads=128) with: a compile-time chunk loop of
+``num_tiles = ceil(topk/BI)`` chunks, a PER-TOKEN ``section_len =
+topk_length[token]`` (chunks past the token's length gather all -1 -> S3 masks
+them -> they add nothing to the online softmax), and
+``s7_epilogue(epilogue_mode=FINAL_BF16, attn_sink=...)``. The hot-op MMA PTX
 (14 block-scaled + 14 plain e4m3 + 8 bf16) and the mbarrier handshake are
-IDENTICAL to the decode kernel -- a correct 1-IO pipeline does NOT deadlock.
+IDENTICAL to the decode kernel -- scaling 32->128 IO threads does NOT touch the
+full/empty parity, so the proven deadlock-free pipeline stays deadlock-free.
 
 SCOPE: DSV4, FP8 compute, main cache. DSV4 + GLM DECODE kernels stay byte-identical.
 """
@@ -77,23 +82,45 @@ _CAND_WINDOW = 64
 # DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
 _DSV4_HEAD_DIM = 512
 
+# P8b: 4-IO / 384-thread layout for FlashInfer prefill PTX parity. The decode
+# traits pin block_threads=288 (1 IO warp); prefill overrides to 384 = 8 math
+# warps (256, the CONSUMER) + 4 IO warps (128, the PRODUCER) so the gather is
+# shared across 128 IO threads (io.py io_issue_gather io_threads=128). The
+# mbarrier full/empty double-buffer protocol is KEPT BIT-IDENTICAL to the proven
+# 1-IO pipeline; the ONLY semantic change is 4x more IO threads. setmaxnreg
+# dec(32)/inc(232) matches FlashInfer prefill_kernel.cuh:126/161 (IO/math reg
+# split). DECODE is untouched (its traits.block_threads stays 288).
+_PREFILL_BLOCK_THREADS = 384  # 8 math (256) + 4 IO (128).
+_PREFILL_IO_THREADS = 128     # 4 IO warps share one gather (io.py io_threads).
+_IO_REGS = 32                 # setmaxnreg.dec on the IO warps.
+_MATH_REGS = 232              # setmaxnreg.inc on the math warps.
+
 
 class UnifiedPrefillKernel:
-    """288-thread single-pass DSV4 prefill: ONE CTA per (token, HPB head-group).
+    """384-thread single-pass DSV4 prefill: ONE CTA per (token, HPB head-group).
 
-    Structurally the UnifiedDecodeKernel CTA body (8 math warps + 1 IO warp,
-    io_threads=32, the proven full/empty mbarrier double-buffer) run at the
-    implicit ``num_splits=1``: the math loops over ALL ``num_tiles=ceil(topk/BI)``
-    chunks carrying ``global_max``/``global_sum``/``acc_o`` across the loop (the
-    decode S4 cross-chunk online softmax), then ``s7_epilogue`` writes the FINAL
-    normalized BF16 O directly to output[token, head, :] + the final base-2 LSE
-    (FINAL_BF16 epilogue, with optional attn_sink fold).
+    P8b: structurally the UnifiedDecodeKernel CTA body (8 math warps = CONSUMER +
+    4 IO warps = PRODUCER, io_threads=128, the proven full/empty mbarrier
+    double-buffer) run at the implicit ``num_splits=1``: the math loops over ALL
+    ``num_tiles=ceil(topk/BI)`` chunks carrying
+    ``global_max``/``global_sum``/``acc_o`` across the loop (the decode S4
+    cross-chunk online softmax), then ``s7_epilogue`` writes the FINAL normalized
+    BF16 O directly to output[token, head, :] + the final base-2 LSE (FINAL_BF16
+    epilogue, with optional attn_sink fold).
+
+    The 4-IO scale-up vs the proven 1-IO prefill is SURGICAL: block 288->384, the
+    IO gather shared across 128 IO threads (io_threads=128, io_lane = tid-256),
+    setmaxnreg dec(32)/inc(232) on the IO/math split. The mbarrier full/empty
+    parity + arrive_expect_tx(leader) + try_wait(consumer) + math-only
+    ``barrier(3, 256)`` are KEPT BIT-IDENTICAL to the 1-IO pipeline; the IO warps
+    NEVER enter a 256-count named barrier (gap #8 deadlock guard). DECODE traits
+    stay 288 -- the decode kernel is untouched.
 
     The PER-TOKEN ``topk_length[token]`` is the per-CTA ``section_len`` (a runtime
     scalar): the io gather clamps each chunk to ``g_end=min(g_start+BI, len)`` and
     stages -1 for out-of-range candidates, and S3 masks ``abs_cand >= section_len``
     -> chunks past the token's length contribute nothing. Grid = (num_tokens,
-    h_blocks, 1); IO threads stay 32 (NO 4-IO, NO 384 threads).
+    h_blocks, 1).
     """
 
     def __init__(self, traits, layout, page_block_size, num_tiles,
@@ -107,7 +134,10 @@ class UnifiedPrefillKernel:
         self.num_heads = int(num_heads)
         self.has_sink = bool(has_sink)
         self.math_threads = int(traits.math_threads)  # 256
-        self.block_threads = int(traits.block_threads)  # 288 (8 math + 1 IO)
+        # P8b: prefill runs 384 threads (8 math + 4 IO), NOT the decode 288. The
+        # decode traits.block_threads (288) is left untouched so the decode
+        # kernel stays byte-identical; prefill pins 384 here.
+        self.block_threads = _PREFILL_BLOCK_THREADS  # 384 (8 math + 4 IO)
 
     @cute.jit
     def __call__(
@@ -187,7 +217,10 @@ class UnifiedPrefillKernel:
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
 
-        # ── 288 threads = 8 math warps (CONSUMER) + 1 IO warp (warp 8). ──
+        # ── 384 threads = 8 math warps (CONSUMER, warps 0-7 = 256) + 4 IO warps
+        #    (PRODUCER, warps 8-11 = 128). math_threads//32 == 8, so warp_id>=8
+        #    selects exactly the 4 IO warps. The 256-count named barriers below
+        #    EXCLUDE these IO warps (the gap #8 deadlock guard). ──
         is_io = warp_id >= Int32(self.math_threads // 32)
 
         kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
@@ -234,7 +267,14 @@ class UnifiedPrefillKernel:
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER). EXACT decode protocol.
         # ════════════════════════════════════════════════════════════════════
         if is_io:
-            io_lane = lane
+            # setmaxnreg.dec(32): release registers on the 4 IO warps so the math
+            # warps can claim 232 (FlashInfer prefill_kernel.cuh:126). Perf/parity
+            # only; the gather is register-light.
+            cute.arch.setmaxregister_decrease(_IO_REGS)
+            # io_lane is the lane within the WHOLE IO group [0, 128) (4 warps), NOT
+            # the per-warp lane: io_issue_gather strides BI=64 entries across all
+            # 128 IO threads (1 pass) and the leader is io_lane==0 (tid==256).
+            io_lane = tid - Int32(self.math_threads)  # [0, 128)
             prod_phase = Int32(1)
             prod_idx = Int32(0)
             for lc in cutlass.range(self.num_tiles, unroll=1):
@@ -262,7 +302,7 @@ class UnifiedPrefillKernel:
                     Int32(self.page_block_size), stride_kv_block, io_lane,
                     bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
-                    scale_format=t.scale_format,
+                    scale_format=t.scale_format, io_threads=_PREFILL_IO_THREADS,
                 )
                 prod_idx += Int32(1)
                 if prod_idx == Int32(n_buf):
@@ -271,6 +311,9 @@ class UnifiedPrefillKernel:
 
         else:
             # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
+            # setmaxnreg.inc(232): claim the registers the IO warps released
+            # (FlashInfer prefill_kernel.cuh:161). Perf/parity only.
+            cute.arch.setmaxregister_increase(_MATH_REGS)
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
             s0_quantize_q_to_smem(
                 q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
@@ -476,7 +519,8 @@ def run_unified_prefill(
 
     A THIN launcher over ``UnifiedPrefillKernel`` (the decode CTA body run at the
     implicit num_splits=1, with the FINAL_BF16 epilogue + per-token section_len +
-    optional attn_sink). 1 IO warp, 288 threads -- NO 4-IO / NO 384 threads.
+    optional attn_sink). P8b: 4 IO warps, 384 threads (8 math + 4 IO), the proven
+    1-IO mbarrier protocol scaled to 128 IO threads + setmaxnreg dec/inc.
 
     Args:
       q:            (T, heads, D_QK=512) bf16. T query tokens (prefill regime).
@@ -568,11 +612,11 @@ def run_unified_prefill(
     )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.unified_sm120.prefill",
-        # version 2: P8 correctness-first rewrite (288-thread decode-reuse,
-        # FINAL_BF16 epilogue, RUNTIME q-rows grid). The cache key is kernel_id +
-        # version + fields only (NOT a source hash), so this bump invalidates any
-        # stale v1 4-IO/baked-grid prefill objects on the disk cache.
-        2,
+        # version 3: P8b 4-IO/384-thread scale-up (8 math + 4 IO, io_threads=128,
+        # setmaxnreg dec/inc) over the proven v2 1-IO mbarrier protocol. The cache
+        # key is kernel_id + version + fields only (NOT a source hash), so this
+        # bump invalidates any stale v2 288-thread prefill objects on disk.
+        3,
         key_field("model_type", traits.model_type),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
