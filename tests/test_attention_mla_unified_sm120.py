@@ -1531,3 +1531,97 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
             f"extra_len={int(extra_len[t])}) O cos={cos}"
         )
         assert (got[t] - exp_O[t]).abs().max().item() < 2e-2
+
+
+# ── P10e GLM PREFILL (extend) MIXED per-token topk_length incl a ZERO-LENGTH row ──
+# The extend API (sparse_mla_extend_forward) threads its per-token active_token_counts
+# into run_unified_prefill as the per-token topk_length; prefill masks each token's
+# candidates past section_len=topk_length[t]. The catastrophic gap this guards: a
+# token with topk_length[t]==0 (a TRUE zero-length row) AND NON--1-padded indices.
+# With section_len==0 every candidate is masked, but the all-masked online softmax
+# leaves a SPURIOUS positive global_sum (exp2(qk-local_max)=exp2(0)=1 for the FINITE
+# _QK_MASK sentinel), so without the empty-row guard S7 normalizes garbage instead of
+# writing O=0 / LSE=-inf. This exercises the REAL launcher and compares per token vs
+# glm_decode_reference (the single-pass prefill shares the GLM s0-s7 math), settling
+# both contracts: real per-token lengths with VALID indices past the length (the case
+# the masking bug got catastrophically wrong) AND -1-padded indices.
+def _glm_prefill_mixed_lengths(num_tokens: int, topk: int, device: torch.device) -> torch.Tensor:
+    """Per-token MIXED lengths with a TRUE zero-length row at token 1 (the
+    extend-API zero active_token_counts contract). Other tokens are off-64-boundary
+    and spread across [1, topk]; token 0 is full topk so a uniform check can't hide
+    mixing."""
+    base = [topk, 0, topk - 7, 64 + 13, 1, 128 + 5, topk // 2, 3]
+    vals = [base[i % len(base)] for i in range(num_tokens)]
+    if num_tokens >= 1:
+        vals[0] = topk           # full-length token
+    if num_tokens >= 2:
+        vals[1] = 0              # TRUE zero-length row (the catastrophic case)
+    vals = [max(0, min(int(v), topk)) for v in vals]
+    return torch.tensor(vals, dtype=torch.int32, device=device)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [2, 5, 16])
+@pytest.mark.parametrize("neg_pad_past_len", [False, True])
+def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
+    num_tokens, neg_pad_past_len
+) -> None:
+    """run_unified_prefill (the GLM extend route) honours MIXED per-token topk_length
+    INCLUDING a true zero-length row + non--1-padded valid indices, matching
+    glm_decode_reference(active_token_counts=lengths) per token. The zero-length row
+    must produce O==0 (cos==1 via _cosine's 0-norm guard, plus an explicit norm
+    check) -- without the empty-row guard it normalized a spurious all-masked softmax
+    sum to garbage (the cos~0.20 extend failure)."""
+    device = require_sm120_unified()
+    from b12x.attention.mla.unified_sm120.launch import run_unified_prefill
+
+    topk = 257  # off-64-boundary width (ceil(257/64)=5 tiles), like the failing test
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=9000 + num_tokens,
+        device=device,
+    )
+    q = case["q"].contiguous()                    # [T, 128, 576]
+    kv_cache = case["kv_cache"].contiguous()
+    idx = case["topk_indices"].contiguous()       # [T, topk] (ALL valid -> non -1-padded)
+    sm_scale = case["sm_scale"]
+    lengths = _glm_prefill_mixed_lengths(num_tokens, topk, device)
+    assert int((lengths == 0).sum()) >= 1, "test must include a true zero-length row"
+
+    if neg_pad_past_len:
+        # Also settle the -1-padded contract: force indices past each length to -1
+        # (a zero-length row becomes a fully -1 row). Both the section bound and the
+        # S3 idx<0 mask then agree.
+        ar = torch.arange(topk, device=device).unsqueeze(0)
+        idx = idx.clone()
+        idx[ar >= lengths.unsqueeze(-1)] = -1
+
+    # Reference masks per token by length (and idx<0 for the padded case).
+    exp_O = glm_ref.glm_decode_reference(
+        q, kv_cache, idx, sm_scale, active_token_counts=lengths,
+    ).float()
+
+    O, lse = run_unified_prefill(
+        q=q, kv_cache=kv_cache, topk_indices=idx, sm_scale=sm_scale,
+        page_block_size=_GLM_PAGE, topk_length=lengths,
+    )
+    torch.cuda.synchronize()
+    got = O.float()
+    for t in range(num_tokens):
+        if int(lengths[t]) == 0:
+            # Zero-length row: O must be exactly zero and LSE the -inf empty sentinel.
+            assert got[t].abs().max().item() == 0.0, (
+                f"GLM prefill T={num_tokens} zero-length token {t} O not zero: "
+                f"norm={got[t].norm().item()}"
+            )
+            assert torch.isinf(lse[t]).all() and (lse[t] < 0).all(), (
+                f"GLM prefill zero-length token {t} LSE must be -inf, got {lse[t]}"
+            )
+            continue
+        cos = _cosine(got[t], exp_O[t])
+        assert cos > 0.995, (
+            f"GLM prefill T={num_tokens} token {t} (len={int(lengths[t])}, "
+            f"neg_pad={neg_pad_past_len}) O cos={cos}"
+        )
+        assert (got[t] - exp_O[t]).abs().max().item() < 3e-2

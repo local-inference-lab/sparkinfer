@@ -370,6 +370,18 @@ class UnifiedPrefillKernel:
         else:
             extra_section_len = section_len
 
+        # EMPTY-ROW flag: a (token, head-block) with NO valid candidates -- the
+        # per-token section_len (main + any extra) is 0. Used by the FINAL_BF16
+        # epilogue to force O=0 + LSE=-inf (a row with no keys has no attention
+        # output). Detect it HERE from the section length(s), NOT from a magic
+        # global_max threshold: the all-masked online softmax leaves global_max at
+        # the FINITE _QK_MASK sentinel (-1e30 * sm_scale_log2), whose magnitude
+        # scales with sm_scale, so no fixed cutoff cleanly separates it from a real
+        # (small) qk. The section length IS the exact contract.
+        is_empty_row = section_len == Int32(0)
+        if cutlass.const_expr(has_extra):
+            is_empty_row = is_empty_row and (extra_section_len == Int32(0))
+
         # indices for THIS token row (1-D (topk,) slice).
         topk_row = cute.make_tensor(
             indices.iterator + token_idx.to(Int64) * Int64(indices.stride[0]),
@@ -654,6 +666,24 @@ class UnifiedPrefillKernel:
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
 
+            # EMPTY-ROW guard. A row with no valid candidates (section_len==0, and
+            # for dual-cache extra_section_len==0 too) leaves EVERY qk at the FINITE
+            # _QK_MASK sentinel (-1e30 * sm_scale_log2). s4 then computes
+            # p = exp2(qk - local_max) = exp2(0) = 1 for those masked candidates, so
+            # global_sum becomes a SPURIOUS positive (== masked-candidate count) and
+            # global_max sits at the sentinel level. The warp_rescale trick only
+            # cancels those spurious 1s when SOME warp holds a real (higher) max; for
+            # a fully-empty row no warp is valid, so nothing cancels it and S7's
+            # `global_sum > 0` empty-guard never fires -> garbage normalized output
+            # (the zero-length extend row that lands cos~0). Force global_sum=0 so S7
+            # takes its inv_g=0 path -> O=0 + LSE=-inf, the correct no-valid-keys
+            # result. PREFILL-ONLY: s4/s7 and the decode path are untouched (decode
+            # merges per-split via the -inf LSE sentinel; this single-pass prefill
+            # has no merge to consume it). NON-empty rows are bit-unchanged.
+            if is_empty_row:
+                fin_gsum[0] = Float32(0.0)
+                fin_gsum[1] = Float32(0.0)
+
             # output[token, head_base + h, dim]: (HPB, D_V) view for this
             # (token, head_block). output stride = (heads*Dv, Dv, 1).
             out_o = cute.make_tensor(
@@ -927,13 +957,15 @@ def run_unified_prefill(
         )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.unified_sm120.prefill",
+        # version 5: P10e EMPTY-ROW guard in the FINAL_BF16 epilogue prologue (force
+        # global_sum=0 for a zero-length / fully-masked row, keyed off the per-token
+        # section_len) so such a row writes O=0 + LSE=-inf instead of normalizing the
+        # spurious all-masked softmax sum. This changes the device trace/PTX for ALL
+        # prefill specializations (DSV4 + GLM, single- and dual-cache), so the cache
+        # version bumps to invalidate stale v4 objects.
         # version 4: P10 GLM prefill (model_type==GLM_NSA traits) + DSV4 dual-cache
         # prefill (has_extra union; call_extra/kernel_extra + has_extra const_expr).
-        # The cache key is kernel_id + version + fields only; this bump invalidates
-        # stale v3 objects. The no-extra DSV4-main trace + PTX are UNCHANGED from v3
-        # (the extra args / has_extra=0 const_expr never enter that device entry; the
-        # added num_main_tiles key_field equals num_tiles there, a pure key bump).
-        4,
+        5,
         *spec_fields,
     )
     # Select the entry: dual-cache uses call_extra (distinct mangled name); the
