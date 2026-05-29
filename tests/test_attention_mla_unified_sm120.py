@@ -34,6 +34,7 @@ _SM120PORT = os.path.join(_REPO_ROOT, ".sm120port")
 if _SM120PORT not in sys.path:
     sys.path.insert(0, _SM120PORT)
 import dsv4_ref  # noqa: E402
+import dsv4_extra_ref  # noqa: E402
 import glm_ref  # noqa: E402
 
 import b12x.attention.mla.api as mla_api
@@ -307,19 +308,83 @@ def test_dsv4_compressed_decode_routes_to_unified_and_matches_reference(monkeypa
 
 
 @torch.inference_mode()
-def test_dsv4_compressed_decode_extra_cache_falls_back_to_legacy(monkeypatch) -> None:
-    """(d) Flag on but has_extra_cache (indexed/extra-tokens, P7c): the gate must FALL
-    BACK to the legacy path -- never route an unsupported call to the unified kernel."""
+def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> None:
+    """(d) Flag on + has_extra_cache (indexed/extra-tokens, P7c): the gate now
+    ROUTES the DSV4 dual-cache to unified (the legacy split forward must NOT run)
+    and the result matches dsv4_extra_ref.dsv4_extra_decode_reference over the
+    UNION of the main + extra topk rows.
+
+    A MAPPED indexed_page_table still falls back to legacy (the unified gather
+    addresses the extra cache by raw slot id); that guard is checked separately."""
+    device = require_sm120_unified()
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
+
+    legacy = {"forward": 0}
+
+    def fail_forward(**kwargs):
+        legacy["forward"] += 1
+        raise AssertionError("legacy compressed split forward ran for a DSV4 dual-cache unified case")
+
+    monkeypatch.setattr(compressed_api_impl, "run_compressed_mla_split_decode_forward", fail_forward)
+
+    topk, extra_topk, pbs_extra = 64, 128, 2
+    main_blocks = 16
+    case = dsv4_extra_ref.make_dsv4_extra_decode_case(
+        num_heads=_DSV4_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=1,
+        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        invalidate_half=True, with_sink=False, device=device, seed=11,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
+    extra_blocks = case["extra_kv_cache"].shape[0]
+    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    main_idx = case["topk_indices"].contiguous()
+    extra_idx = case["extra_indices"].contiguous()
+    lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    extra_lengths = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
+    exp_O = case["expected_O"][0].float()
+
+    n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
+    scratch = _make_dsv4_scratch(device, topk=topk + extra_topk, max_chunks=max(8, n_chunks))
+
+    out = compressed_mla_decode_forward(
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=main_idx,
+        swa_topk_lengths=lengths,
+        indexed_k_cache=idx_cache,
+        indexed_indices=extra_idx,
+        indexed_topk_lengths=extra_lengths,
+        indexed_page_size=pbs_extra,
+        workspace=scratch,
+        sm_scale=case["sm_scale"],
+        swa_page_size=_DSV4_PAGE,
+    )
+    torch.cuda.synchronize()
+    assert legacy["forward"] == 0      # gate routed to unified, not legacy
+    assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
+
+    got = out[0].float()
+    cos = float((got.flatten().double() @ exp_O.flatten().double()) /
+                (got.flatten().double().norm() * exp_O.flatten().double().norm()))
+    assert cos > 0.999, f"DSV4 dual-cache unified decode cos={cos}"
+    assert (got - exp_O).abs().max().item() < 2e-2
+
+
+@torch.inference_mode()
+def test_dsv4_compressed_decode_mapped_extra_page_table_falls_back(monkeypatch) -> None:
+    """(d') has_extra_cache WITH a mapped indexed_page_table: the unified gather
+    addresses the extra cache by raw slot id, so a mapped page table is unsupported
+    and the gate must FALL BACK to legacy (never route it to unified)."""
     device = require_sm120_unified()
     monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
 
     routed = {"unified": 0}
-
     import b12x.attention.mla.unified_sm120 as unified_mod
 
     def spy_unified(**kwargs):
         routed["unified"] += 1
-        raise AssertionError("unsupported (extra-cache) DSV4 call was routed to unified")
+        raise AssertionError("mapped-page-table extra-cache call was routed to unified")
 
     monkeypatch.setattr(unified_mod, "run_unified_decode", spy_unified)
 
@@ -340,10 +405,8 @@ def test_dsv4_compressed_decode_extra_cache_falls_back_to_legacy(monkeypatch) ->
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=7)
     scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
-    # Use the live-shape (non-fixed) legacy planning so this fallback test does
-    # not exercise the fixed-capacity staging buffers (which a B12XAttentionWorkspace
-    # owns, not this minimal compressed scratch); the gate decision is what's under test.
     scratch.fixed_capacity = False
+    page_table = torch.zeros((1, topk), dtype=torch.int32, device=device)
 
     out = compressed_mla_decode_forward(
         q_all=q,
@@ -354,11 +417,12 @@ def test_dsv4_compressed_decode_extra_cache_falls_back_to_legacy(monkeypatch) ->
         indexed_indices=idx,
         indexed_topk_lengths=lengths,
         indexed_page_size=_DSV4_PAGE,
+        indexed_page_table=page_table,
         workspace=scratch,
         sm_scale=_DSV4_SM_SCALE,
         swa_page_size=_DSV4_PAGE,
     )
-    assert routed["unified"] == 0      # NOT routed to unified
+    assert routed["unified"] == 0      # mapped page table -> NOT routed to unified
     assert legacy["forward"] == 1      # fell back to legacy
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
 
@@ -561,6 +625,89 @@ def test_unified_decode_multi_split_equals_single_split(topk, forced_num_splits)
     assert delta < 5e-3, (
         f"topk={topk} splits={forced_num_splits} multi vs single max|delta|={delta}"
     )
+
+
+# ── DSV4 DUAL-CACHE LAUNCHER NUMERICS (P7c): run_unified_decode (main + extra) ──
+# Exercise the REAL launcher with the has_extra (extra-tokens) second KV pool:
+# ceil(topk/BI) main chunks (gather from swa_k_cache) then ceil(extra_topk/BI)
+# extra chunks (gather from indexed_k_cache with its own page size) folded into
+# ONE online softmax + the reused base-2 merge, vs dsv4_extra_decode_reference.
+def _run_unified_dsv4_extra(device, *, topk, extra_topk, forced_num_splits, seed):
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+
+    pbs_extra = 2
+    main_blocks = _UNIFIED_NUM_BLOCKS
+    case = dsv4_extra_ref.make_dsv4_extra_decode_case(
+        num_heads=_UNIFIED_NUM_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=1,
+        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        invalidate_half=True, with_sink=False, device=device, seed=seed,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
+    extra_blocks = case["extra_kv_cache"].shape[0]
+    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    main_idx = case["topk_indices"].contiguous()
+    extra_idx = case["extra_indices"].contiguous()
+    lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    extra_lengths = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
+    exp_O = case["expected_O"][0].float()
+
+    n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
+    scratch = _make_dsv4_scratch_heads(
+        device, topk=topk + extra_topk, max_chunks=max(8, forced_num_splits, n_chunks),
+        num_heads=_UNIFIED_NUM_HEADS,
+    )
+    out = run_unified_decode(
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=main_idx,
+        swa_topk_lengths=lengths,
+        workspace=scratch,
+        sm_scale=case["sm_scale"],
+        swa_page_size=_DSV4_PAGE,
+        indexed_k_cache=idx_cache,
+        indexed_indices=extra_idx,
+        indexed_topk_lengths=extra_lengths,
+        indexed_page_size=pbs_extra,
+        forced_num_splits=forced_num_splits,
+    )
+    torch.cuda.synchronize()
+    return out[0].float(), exp_O
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk,extra_topk,forced_num_splits", [
+    (512, 64, 1), (512, 128, 1),     # single split spanning both sections
+    (512, 64, 4), (512, 128, 6),     # forced multi-split (chunk-aligned, both sections)
+])
+def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_num_splits) -> None:
+    """run_unified_decode DSV4 dual-cache (main + extra, ONE online softmax over the
+    union) matches dsv4_extra_decode_reference for num_heads=128, topk=512 x
+    extra_topk in {64,128}, single AND forced>1 split, at the P5 gate."""
+    device = require_sm120_unified()
+    got_O, exp_O = _run_unified_dsv4_extra(
+        device, topk=topk, extra_topk=extra_topk,
+        forced_num_splits=forced_num_splits, seed=topk + extra_topk,
+    )
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"dual topk={topk} extra={extra_topk} splits={forced_num_splits} O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 2e-2, (
+        f"dual topk={topk} extra={extra_topk} splits={forced_num_splits} O atol exceeded"
+    )
+
+
+@torch.inference_mode()
+def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
+    """extra_topk=0 (no extra cache) must reduce to the single-cache decode: the
+    dual reference's concat is a no-op, so the unified main-only path matches."""
+    device = require_sm120_unified()
+    # main-only via the single-cache launcher path (extra args omitted) vs the
+    # dual reference with extra_topk=0 (== dsv4_decode_reference).
+    got_O, _, exp_O, _, _ = _run_unified_dsv4(
+        device, topk=512, forced_num_splits=1, seed=512,
+    )
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"extra=0 main-only cos={cos}"
 
 
 # ── GLM_NSA LAUNCHER NUMERICS (P7b): run_unified_decode vs glm_ref ─────────────

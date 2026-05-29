@@ -191,13 +191,20 @@ def unified_enabled(enabled: bool):
 # warmup+capture, then time replays.
 # --------------------------------------------------------------------------- #
 def _time_graph(run, *, spy: UnifiedSpy, warmup: int, replays: int, l2_flush):
+    import b12x.attention.mla.unified_sm120.launch as _launch_mod
+
     spy.reset()
+    _launch_mod.LAST_DECODE_PLAN.clear()
     graph = capture_cuda_graph(run, warmup=warmup)
     # snapshot the spy AFTER warmup+capture: any unified cubin / dispatch hit is
     # now recorded.  (Replays do not re-enter Python, so this is the proof.)
     kernel_launches = spy.kernel_launches
     decode_dispatch = spy.decode_dispatch
     prefill_dispatch = spy.prefill_dispatch
+    # The launcher records the chosen wave-balanced split plan as a side-channel
+    # (LAST_DECODE_PLAN). For the unified run this is the num_splits actually used
+    # in the captured graph; for the legacy run the dict stays empty.
+    num_splits_used = int(_launch_mod.LAST_DECODE_PLAN.get("num_splits", 0) or 0)
     try:
         stats = bench_cuda_graph(graph, replays=replays, l2_flush=l2_flush)
     finally:
@@ -212,6 +219,7 @@ def _time_graph(run, *, spy: UnifiedSpy, warmup: int, replays: int, l2_flush):
         "kernel_launches": kernel_launches,
         "decode_dispatch": decode_dispatch,
         "prefill_dispatch": prefill_dispatch,
+        "num_splits_used": num_splits_used,
     }
 
 
@@ -498,6 +506,7 @@ def _assemble(*, config, legacy, unified, kv_bytes, kind):
         "legacy_min_us": round(legacy["min_us"], 3),
         "unified_min_us": round(unified["min_us"], 3),
         "speedup": round(speedup, 3),
+        "num_splits_used": unified.get("num_splits_used", 0),
         "unified_actually_ran": bool(unified_ran),
         "unified_kernel_launches": unified["kernel_launches"],
         "unified_decode_dispatch": unified["decode_dispatch"],
@@ -611,7 +620,7 @@ def main(argv=None) -> int:
         spy.uninstall()
 
     print("\n==================== UNIFIED vs LEGACY (graph-captured) ====================")
-    hdr = f"{'config':<52} {'legacy_us':>10} {'unified_us':>11} {'speedup':>8} {'unified_ran':>12}"
+    hdr = f"{'config':<52} {'legacy_us':>10} {'unified_us':>11} {'speedup':>8} {'splits':>7} {'unified_ran':>12}"
     print(hdr)
     print("-" * len(hdr))
     for r in results:
@@ -619,7 +628,8 @@ def main(argv=None) -> int:
             print(f"{r['config']:<52} {'ERROR':>10} {r['error']}")
             continue
         print(f"{r['config']:<52} {r['legacy_us']:>10.2f} {r['unified_us']:>11.2f} "
-              f"{r['speedup']:>8.3f} {str(r['unified_actually_ran']):>12}")
+              f"{r['speedup']:>8.3f} {r.get('num_splits_used', 0):>7} "
+              f"{str(r['unified_actually_ran']):>12}")
     print("\n--- KV bandwidth ---")
     for r in results:
         if "error" in r:

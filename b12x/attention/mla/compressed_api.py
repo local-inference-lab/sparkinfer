@@ -96,9 +96,12 @@ def compressed_mla_decode_forward(
     live_rows = rows
 
     # Opt-in dispatch into the parallel unified_sm120 backend (P7). The unified
-    # kernel currently supports the DSV4 MAIN-CACHE contract ONLY:
+    # kernel supports the DSV4 contract:
     #   * q_head_dim == COMPRESSED_MLA_HEAD_DIM == 512 (DSV4; NOT GLM q=576)
-    #   * no indexed/extra-tokens dual cache (P7c)
+    #   * MAIN cache, OR the DSV4 DUAL-CACHE (indexed/extra tokens; P7c) when the
+    #     extra trio is provided together with indexed_page_size and NO mapped
+    #     indexed_page_table (the in-kernel gather addresses the extra cache by
+    #     raw slot id, like the main cache)
     #   * no attn_sink fold, no return_lse (not yet ported)
     # Anything unsupported FALLS BACK to the legacy path below (never silently
     # route an unsupported call to the unified kernel, never raise here). The
@@ -109,9 +112,19 @@ def compressed_mla_decode_forward(
             or indexed_indices is not None
             or indexed_topk_lengths is not None
         )
+        # DSV4 dual-cache requires the full extra trio + page size and rejects a
+        # MAPPED page table (the unified gather indexes the extra cache by raw
+        # slot id). A partial / mapped extra request falls back to legacy.
+        _extra_ok = (not _unified_has_extra) or (
+            indexed_k_cache is not None
+            and indexed_indices is not None
+            and indexed_topk_lengths is not None
+            and indexed_page_size is not None
+            and indexed_page_table is None
+        )
         _unified_supported = (
             int(q3.shape[-1]) == COMPRESSED_MLA_HEAD_DIM
-            and not _unified_has_extra
+            and _extra_ok
             and attn_sink is None
             and not return_lse
         )
@@ -126,11 +139,16 @@ def compressed_mla_decode_forward(
                 workspace=scratch,
                 sm_scale=sm_scale,
                 swa_page_size=swa_page_size,
+                indexed_k_cache=indexed_k_cache,
+                indexed_indices=indexed_indices,
+                indexed_topk_lengths=indexed_topk_lengths,
+                indexed_page_size=indexed_page_size,
+                indexed_page_table=indexed_page_table,
                 attn_sink=None,
                 return_lse=False,
                 lse_scale=lse_scale,
             )
-        # else: unsupported (GLM q=576 / extra-tokens / sink / return_lse) ->
+        # else: unsupported (GLM q=576 / mapped extra / sink / return_lse) ->
         # fall through to the legacy compressed-MLA decode below.
 
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")

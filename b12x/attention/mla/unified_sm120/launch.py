@@ -20,9 +20,14 @@ SMs at batch=1 instead of the prior serial ``num_splits=1`` (the #1 decode-perf
 lever from ``.sm120port/P9_benchmark_findings.md``). ``num_splits=1`` remains the
 trivial 1-split merge (partial == final O).
 
-SCOPE: DSV4 main-cache ONLY. GLM (q=576) and has_extra_cache (extra-tokens) are
-NOT supported here -- the compressed_api.py dispatch gate must fall back to the
-legacy backend for those (and for non-SM120 devices); see compressed_api.py.
+SCOPE: DSV4 (main cache + the P7c DUAL-CACHE extra-tokens second KV pool) AND
+GLM_NSA (q=576, main cache; no extra). The DSV4 dual-cache uses TWO @cute.kernel
+entries that share ``_kernel_body(has_extra)``: ``kernel`` (8 device params, the
+byte-identical-to-pre-P7c single-cache path, used when has_extra=False) and
+``kernel_extra`` (13 params, the dual-cache path). The single-cache __call__ ->
+kernel trace + PTX are UNCHANGED from the pre-P7c kernel (extra args never enter
+that device entry). Non-SM120 / unsupported features fall back to legacy via the
+compressed_api.py dispatch gate.
 
 ``run_unified_prefill`` / ``run_unified_merge`` remain STUBS (out of P7 scope).
 """
@@ -196,10 +201,13 @@ def plan_unified_decode_splits(
     num_tokens: int = 1,
     h_blocks: int = 1,
     sm_count: int | None = None,
+    extra_topk: int = 0,
 ) -> tuple[int, int, int]:
     """Return ``(num_chunks, num_splits, chunks_per_split)``.
 
-    ``num_chunks = ceil(topk / BI)`` is the number of BI=64 candidate windows.
+    ``num_chunks = ceil(topk / BI) + ceil(extra_topk / BI)`` is the number of
+    BI=64 candidate windows spanning BOTH the main and the EXTRA cache sections
+    (DSV4 dual-cache; ``extra_topk=0`` reduces to the single-cache main count).
     ``num_splits`` is chosen by replicating FlashInfer's decode launch tuning:
     FlashInfer splits MAXIMALLY (one block per KV chunk) then wave-balances via a
     chunks_per_block heuristic to an ACTIVE block count
@@ -217,7 +225,13 @@ def plan_unified_decode_splits(
     workspace mid_out/mid_lse split capacity).
     """
     topk = max(int(topk), 1)
-    num_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    extra_topk = max(int(extra_topk), 0)
+    # num_chunks spans main + extra sections (FlashInfer num_splits = ceil(topk/BI)
+    # + ceil(extra_topk/BI)); the wave-balance heuristic then picks the active
+    # block count over the COMBINED chunk count.
+    num_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW + (
+        (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    )
 
     if forced_num_splits is not None:
         num_splits = max(1, int(forced_num_splits))
@@ -253,7 +267,8 @@ class UnifiedDecodeKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, chunks_per_split,
-                 num_tokens, h_blocks, num_splits):
+                 num_tokens, h_blocks, num_splits, has_extra=False,
+                 pbs_extra=1):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -261,6 +276,10 @@ class UnifiedDecodeKernel:
         self.num_tokens = int(num_tokens)
         self.h_blocks = int(h_blocks)
         self.num_splits = int(num_splits)
+        # DSV4 dual-cache (P7c). When False the extra-section code is const_expr-
+        # elided -> no-extra DSV4 / GLM PTX byte-identical.
+        self.has_extra = bool(has_extra)
+        self.pbs_extra = int(pbs_extra)
         self.math_threads = int(traits.math_threads)
         self.block_threads = int(traits.block_threads)
 
@@ -268,24 +287,57 @@ class UnifiedDecodeKernel:
     def __call__(
         self,
         q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
-        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8
-        swa_indices: cute.Tensor,    # (rows, topk) int32
+        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,    # (rows, topk) int32 (MAIN indices)
         mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
         mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
         sm_scale_log2: Float32,
-        section_len: Int32,
-        stride_kv_block: Int64,
+        section_len: Int32,          # MAIN per-row valid topk length
+        stride_kv_block: Int64,      # MAIN per-block byte stride
         stream: cuda.CUstream,
     ):
+        # SINGLE-CACHE entry: EXACTLY the v1 traced signature (8 data args +
+        # stream). The dispatcher selects this (func=kernel -> __call__) when
+        # has_extra=False so the no-extra DSV4 / GLM trace, mangled name, and the
+        # launched @cute.kernel (self.kernel, 8 params) stay byte-identical to the
+        # pre-P7c kernel: the extra-section args never enter the device entry.
         self.kernel(
-            q_all,
-            kv_cache_u8,
-            swa_indices,
-            mid_out,
-            mid_lse,
-            sm_scale_log2,
-            section_len,
-            stride_kv_block,
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
+        ).launch(
+            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_extra(
+        self,
+        q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,    # (rows, topk) int32 (MAIN indices)
+        mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
+        mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        section_len: Int32,          # MAIN per-row valid topk length
+        stride_kv_block: Int64,      # MAIN per-block byte stride
+        extra_kv_cache_u8: cute.Tensor,  # flat u8 EXTRA cache (DSV4 dual-cache)
+        extra_indices: cute.Tensor,      # (rows, extra_topk) int32
+        extra_section_len: Int32,        # EXTRA per-row valid length
+        num_main_chunks: Int32,          # ceil(main_len/BI); chunks >= this read the EXTRA cache
+        stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        stream: cuda.CUstream,
+    ):
+        # DUAL-CACHE entry (DSV4 P7c): the dispatcher selects this (func=
+        # kernel.call_extra) only when has_extra=True, so its DISTINCT mangled name
+        # never collides with the byte-identical single-cache __call__. It launches
+        # the 13-param @cute.kernel (self.kernel_extra), which shares the body via
+        # _kernel_body(has_extra=True).
+        self.kernel_extra(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_section_len,
+            num_main_chunks, stride_extra_kv_block,
         ).launch(
             grid=(self.num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
@@ -589,6 +641,413 @@ class UnifiedDecodeKernel:
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
             )
 
+    @cute.kernel
+    def kernel_extra(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        section_len: Int32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_section_len: Int32,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+    ):
+        # DUAL-CACHE @cute.kernel: 13 device params; threads the real extra-section
+        # args into the shared body (has_extra=True).
+        self._kernel_body(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_section_len,
+            num_main_chunks, stride_extra_kv_block,
+            has_extra=True,
+        )
+
+    @cute.jit
+    def _kernel_body(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        section_len: Int32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_section_len: Int32,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+        *,
+        has_extra: cutlass.Constexpr,
+    ):
+        t = self.traits
+        L = self.layout
+        tid = Int32(cute.arch.thread_idx()[0])
+        lane = cute.arch.lane_idx()
+        warp_id = tid >> Int32(5)
+
+        token_idx, head_block, split_idx = cute.arch.block_idx()
+        token_idx = Int32(token_idx)
+        head_block = Int32(head_block)
+        split_idx = Int32(split_idx)
+        head_base = head_block * Int32(t.hpb)
+
+        smem = cutlass_utils.SmemAllocator()
+        SharedStorage = get_unified_shared_storage_cls(t)
+        st = smem.allocate(SharedStorage)
+
+        q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
+        q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
+        kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
+        kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
+        reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+        reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
+        reduce_sum_addr = reduce_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+        w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
+        sm_p_full_addr = shared_ptr_to_u32(st.sm_p_full.data_ptr())
+
+        q_sc_view = st.q_sc.get_tensor(cute.make_layout(int(L.q_sc_bytes // 4)))
+        amax_view = st.reduce.get_tensor(cute.make_layout(int(L.reduce_bytes // 4)))
+        token_idx_view = st.token_idx.get_tensor(
+            cute.make_layout(int(L.token_idx_buf_bytes * L.token_idx_bufs // 4))
+        )
+        w_head_sc_view = st.w_head_sc.get_tensor(
+            cute.make_layout(int(L.w_head_sc_bytes // 4))
+        )
+
+        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        is_io = warp_id >= Int32(self.math_threads // 32)
+
+        kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
+        kv_rope_buf = Int32(L.kv_rope_buf_bytes)
+        kv_sc_buf = Int32(L.kv_sc_buf_bytes)
+        tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
+
+        # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
+        mbar_base = st.mbar.data_ptr()
+        n_buf = int(L.kv_bufs)
+
+        if tid == Int32(0):
+            for s in cutlass.range_constexpr(n_buf):
+                cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
+                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
+        cute.arch.barrier()  # full-CTA (288) structural fence.
+
+        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
+
+        # swa_indices for THIS token row: a 1-D (topk,) slice.
+        topk_row = cute.make_tensor(
+            swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
+            cute.make_layout(swa_indices.shape[1]),
+        )
+        # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
+        # has_extra (extra_indices is None otherwise); const_expr-elided so the
+        # no-extra trace never references the extra tensor.
+        if cutlass.const_expr(has_extra):
+            extra_row = cute.make_tensor(
+                extra_indices.iterator + token_idx.to(Int64) * Int64(extra_indices.stride[0]),
+                cute.make_layout(extra_indices.shape[1]),
+            )
+        else:
+            extra_row = topk_row
+        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        q_token = cute.make_tensor(
+            q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
+            cute.make_layout(
+                (q_all.shape[1], q_all.shape[2]),
+                stride=(q_all.stride[1], q_all.stride[2]),
+            ),
+        )
+        warp_first_cand = warp_id * Int32(8)
+
+        # ════════════════════════════════════════════════════════════════════
+        # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
+        # ════════════════════════════════════════════════════════════════════
+        if is_io:
+            io_lane = lane
+            prod_phase = Int32(1)
+            prod_idx = Int32(0)
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                buf = Int32(lc) & Int32(1)
+
+                cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
+
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+                io_kw = dict(
+                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                    scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
+                    scale_format=t.scale_format,
+                )
+                # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
+                # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
+                # MAIN cache; chunks >= num_main_chunks gather from the EXTRA cache
+                # (different base ptr / page size / indices / stride). is_extra is
+                # uniform across the IO warp (derived from the chunk index) so the
+                # runtime branch is divergence-free. When has_extra=False this is
+                # const_expr-pinned to the main gather -> byte-identical PTX.
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_chunks:
+                        cis = ci - num_main_chunks
+                        g_start = cis * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > extra_section_len:
+                            g_end = extra_section_len
+                        io_issue_gather(
+                            extra_kv_cache_u8, extra_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.pbs_extra), stride_extra_kv_block, io_lane,
+                            **io_kw,
+                        )
+                    else:
+                        g_start = ci * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > section_len:
+                            g_end = section_len
+                        io_issue_gather(
+                            kv_cache_u8, topk_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.page_block_size), stride_kv_block, io_lane,
+                            **io_kw,
+                        )
+                else:
+                    g_start = ci * Int32(_CAND_WINDOW)
+                    g_end = g_start + Int32(_CAND_WINDOW)
+                    if g_end > section_len:
+                        g_end = section_len
+                    io_issue_gather(
+                        kv_cache_u8, topk_row,
+                        kv_fp8_addr + buf * kv_fp8_buf,
+                        kv_rope_addr + buf * kv_rope_buf,
+                        kv_sc_addr + buf * kv_sc_buf,
+                        tok_buf_view,
+                        mbar_base + buf,
+                        g_start, g_end,
+                        Int32(self.page_block_size), stride_kv_block, io_lane,
+                        **io_kw,
+                    )
+                prod_idx += Int32(1)
+                if prod_idx == Int32(n_buf):
+                    prod_idx = Int32(0)
+                    prod_phase ^= Int32(1)
+
+        else:
+            # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
+            n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
+            s0_quantize_q_to_smem(
+                q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
+                head_base, Int32(t.hpb), tid,
+                d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
+                quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
+                q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
+            )
+
+            accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
+            accr_frag = cute.make_rmem_tensor(4, Float32)
+            gmax_frag = cute.make_rmem_tensor(2, Float32)
+            gsum_frag = cute.make_rmem_tensor(2, Float32)
+            for k in cutlass.range_constexpr(n_acc_tiles * 4):
+                accn_frag[k] = Float32(0.0)
+            for k in cutlass.range_constexpr(4):
+                accr_frag[k] = Float32(0.0)
+            gmax_frag[0] = Float32(-1e30); gmax_frag[1] = Float32(-1e30)
+            gsum_frag[0] = Float32(0.0); gsum_frag[1] = Float32(0.0)
+
+            cons_phase = Int32(0)
+            cons_idx = Int32(0)
+
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                split_cand_start = ci * Int32(_CAND_WINDOW)
+                buf = Int32(lc) & Int32(1)
+
+                kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
+                kv_rope_b = kv_rope_addr + buf * kv_rope_buf
+                kv_sc_b = kv_sc_addr + buf * kv_sc_buf
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+
+                acc_nope = [
+                    [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                     accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                    for at in range(n_acc_tiles)
+                ]
+                acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+                global_max = [gmax_frag[0], gmax_frag[1]]
+                global_sum = [gsum_frag[0], gsum_frag[1]]
+
+                cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                # GLM-only S0b: in-place K dequant+requant (ARBITRARY_FP32 -> true
+                # value e4m3, unit sfb in S1). const_expr-elided for DSV4.
+                if cutlass.const_expr(t.scale_format == 1):
+                    s0b_requant_k_glm(
+                        kv_fp8_b, tid,
+                        bi=t.bi, d_nope=t.d_nope, quant_tile=t.quant_tile,
+                        kv_smem_stride=t.kv_smem_stride,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+
+                qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                qk = s1_qk_nope_block_scaled(
+                    qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                    warp_first_cand, lane,
+                    num_scales=t.num_scales, quant_tile=t.quant_tile,
+                    q_nope_stride=t.q_nope_stride, kv_smem_stride=t.kv_smem_stride,
+                    scale_bytes_per_token=8, scale_format=t.scale_format,
+                )
+                qk = s2_qk_rope_bf16(
+                    qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
+                )
+
+                # Per-chunk section dispatch for the S3 mask: compare the
+                # candidate's offset WITHIN ITS SECTION against that section's
+                # length. has_extra=False uses the EXACT pre-P7c expressions
+                # (split_cand_start, section_len) verbatim -> byte-identical PTX.
+                # An extra chunk (ci >= num_main_chunks) re-bases the offset and
+                # swaps in the extra section length; the MATH (S0-S6b) above reads
+                # only the buffered smem, so it is section-agnostic.
+                if cutlass.const_expr(has_extra):
+                    sc_start = split_cand_start
+                    sec_len = section_len
+                    if ci >= num_main_chunks:
+                        sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                        sec_len = extra_section_len
+                    sc_end = sc_start + Int32(_CAND_WINDOW)
+                    if sc_end > sec_len:
+                        sc_end = sec_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        sc_start, sc_end, sec_len, sm_scale_log2, lane,
+                    )
+                else:
+                    split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                    if split_cand_end > section_len:
+                        split_cand_end = section_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        split_cand_start, split_cand_end, section_len,
+                        sm_scale_log2, lane,
+                    )
+
+                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                p, wr0, wr1 = s4_online_softmax(
+                    qk, p, acc_nope, acc_rope, global_max, global_sum,
+                    reduce_max_addr, reduce_sum_addr, False,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=t.hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                    n_acc_tiles=n_acc_tiles,
+                )
+                w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
+
+                s5_fill_sm_p_full(
+                    w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
+                    bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                acc_nope = s6_xv_nope(
+                    w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view, w_fp8_addr,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb, bi=t.bi,
+                    kv_smem_stride=t.kv_smem_stride, w_fp8_stride=t.bi + 16, n_warps=8,
+                    scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
+                    scale_format=t.scale_format,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+
+                # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
+                if cutlass.const_expr(t.v_has_rope):
+                    acc_rope = s6b_xv_rope(
+                        acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
+                        bi=t.bi, d_rope=t.d_rope, n_warps=8,
+                    )
+
+                for at in cutlass.range_constexpr(n_acc_tiles):
+                    accn_frag[at * 4 + 0] = acc_nope[at][0]
+                    accn_frag[at * 4 + 1] = acc_nope[at][1]
+                    accn_frag[at * 4 + 2] = acc_nope[at][2]
+                    accn_frag[at * 4 + 3] = acc_nope[at][3]
+                accr_frag[0] = acc_rope[0]; accr_frag[1] = acc_rope[1]
+                accr_frag[2] = acc_rope[2]; accr_frag[3] = acc_rope[3]
+                gmax_frag[0] = global_max[0]; gmax_frag[1] = global_max[1]
+                gsum_frag[0] = global_sum[0]; gsum_frag[1] = global_sum[1]
+
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                if tid == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                cons_idx += Int32(1)
+                if cons_idx == Int32(n_buf):
+                    cons_idx = Int32(0)
+                    cons_phase ^= Int32(1)
+
+            # ── S7: write this split's NORMALIZED partial + base-2 LSE into
+            #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
+            fin_acc_nope = [
+                [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                 accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                for at in range(n_acc_tiles)
+            ]
+            fin_acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+            fin_gmax = [gmax_frag[0], gmax_frag[1]]
+            fin_gsum = [gsum_frag[0], gsum_frag[1]]
+
+            # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
+            # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
+            out_o = cute.make_tensor(
+                mid_out.iterator
+                + token_idx.to(Int64) * Int64(mid_out.stride[0])
+                + head_base.to(Int64) * Int64(mid_out.stride[1])
+                + split_idx.to(Int64) * Int64(mid_out.stride[2]),
+                cute.make_layout(
+                    (t.hpb, t.d_v),
+                    stride=(mid_out.stride[1], mid_out.stride[3]),
+                ),
+            )
+            # mid_lse[token, head_base + h, split]: (HPB,) view.
+            out_lse = cute.make_tensor(
+                mid_lse.iterator
+                + token_idx.to(Int64) * Int64(mid_lse.stride[0])
+                + head_base.to(Int64) * Int64(mid_lse.stride[1])
+                + split_idx.to(Int64) * Int64(mid_lse.stride[2]),
+                cute.make_layout((t.hpb,), stride=(mid_lse.stride[1],)),
+            )
+            s7_epilogue(
+                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
+                warp_id, lane,
+                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
+                d_rope=t.d_rope, n_warps=8, valid_hpb=t.hpb,
+                nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
+            )
+
 
 def _to_cute(x, dtype, align=16):
     c = from_dlpack(x, assumed_align=align)
@@ -628,14 +1087,45 @@ def run_unified_decode(
     cute.constexpr traits branches (model_type/scale_format/v_has_rope). The
     dispatch gate guarantees SM120; this entrypoint rejects unsupported features
     so an accidental route never silently mis-computes.
+
+    DSV4 DUAL-CACHE (P7c): when ``indexed_k_cache`` / ``indexed_indices`` /
+    ``indexed_topk_lengths`` are supplied (the "extra"-tokens second KV pool), the
+    decode attends over the UNION of the MAIN paged topk cache and the EXTRA cache
+    in ONE online softmax. The chunk loop processes ``num_main_chunks =
+    ceil(topk/BI)`` main chunks (gathering from the main cache) then
+    ``num_extra_chunks = ceil(extra_topk/BI)`` extra chunks (gathering from
+    ``indexed_k_cache`` with ``indexed_page_size`` / its own per-block stride);
+    ``num_splits`` spans both. The extra cache is DSV4-only (GLM has no extra
+    section). With no extra cache the kernel is compiled with ``has_extra=False``
+    so the extra-section code is const_expr-elided (PTX byte-identical).
     """
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
-    if indexed_k_cache is not None or indexed_indices is not None or indexed_topk_lengths is not None:
-        raise NotImplementedError(
-            "unified_sm120 decode: has_extra_cache / indexed (extra-tokens) is P7c; "
-            "the dispatch gate must fall back to legacy"
-        )
+    has_extra = (
+        indexed_k_cache is not None
+        or indexed_indices is not None
+        or indexed_topk_lengths is not None
+    )
+    if has_extra:
+        if (
+            indexed_k_cache is None
+            or indexed_indices is None
+            or indexed_page_size is None
+        ):
+            raise NotImplementedError(
+                "unified_sm120 decode dual-cache requires indexed_k_cache, "
+                "indexed_indices, and indexed_page_size together; fall back to legacy"
+            )
+        if indexed_page_table is not None:
+            raise NotImplementedError(
+                "unified_sm120 decode: indexed_page_table (mapped extra pages) is "
+                "not supported; fall back to legacy"
+            )
+        if int(q_all.shape[-1]) != _DSV4_HEAD_DIM:
+            raise NotImplementedError(
+                "unified_sm120 decode dual-cache (extra tokens) is DSV4-only "
+                "(q_head_dim==512); fall back to legacy"
+            )
     if attn_sink is not None:
         raise NotImplementedError(
             "unified_sm120 decode: attn_sink fold is not yet supported; fall back to legacy"
@@ -666,6 +1156,8 @@ def run_unified_decode(
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
     topk = int(swa_indices.shape[1])
+    extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
+    num_main_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
     max_chunks = int(workspace.max_chunks_per_row)
     # SM count read at RUNTIME (RTX PRO 6000 Blackwell sm_120 et al.) -- feeds the
     # FlashInfer-ported wave-balance tail-gap search. None if no CUDA device.
@@ -681,6 +1173,7 @@ def run_unified_decode(
         num_tokens=rows,
         h_blocks=h_blocks,
         sm_count=sm_count,
+        extra_topk=extra_topk,
     )
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
@@ -688,6 +1181,9 @@ def run_unified_decode(
     LAST_DECODE_PLAN.update(
         model_type=str(model_type),
         topk=int(topk),
+        extra_topk=int(extra_topk),
+        has_extra=bool(has_extra),
+        num_main_chunks=int(num_main_chunks),
         num_chunks=int(num_chunks),
         num_splits=int(num_splits),
         chunks_per_split=int(chunks_per_split),
@@ -722,16 +1218,36 @@ def run_unified_decode(
     else:
         stride_kv_block = int(compressed_mla_page_nbytes(int(swa_page_size)))
 
+    # ── EXTRA (indexed) cache views. When there is no extra cache they alias the
+    #    main cache / main indices and the kernel's has_extra=False const_expr
+    #    elides the extra-section reads -> PTX byte-identical. ──
+    if has_extra:
+        pbs_extra = int(indexed_page_size)
+        # The extra cache uses the IDENTICAL DSV4 compressed packed byte layout, so
+        # its per-block stride is compressed_mla_page_nbytes(pbs_extra) (same as
+        # the main cache derives from swa_page_size). DSV4-only here.
+        stride_extra_kv_block = int(compressed_mla_page_nbytes(pbs_extra))
+        extra_kv_flat = indexed_k_cache.reshape(-1)
+        extra_indices_t = indexed_indices.contiguous()
+    else:
+        pbs_extra = 1
+        stride_extra_kv_block = 0
+        extra_kv_flat = swa_k_cache.reshape(-1)  # alias (never read when has_extra=False)
+        extra_indices_t = swa_indices            # alias (never read)
+
     output = workspace.output_buffer[:rows, :heads, :d_v]
 
     kernel = UnifiedDecodeKernel(
         traits, layout, int(swa_page_size), chunks_per_split,
         num_tokens=rows, h_blocks=h_blocks, num_splits=num_splits,
+        has_extra=has_extra, pbs_extra=pbs_extra,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     kv_flat = swa_k_cache.reshape(-1)
-    args = (
+    # Base (single-cache) args -- EXACTLY the v1 traced signature. The no-extra
+    # path passes ONLY these, so its trace + PTX stay byte-identical.
+    base_args = (
         _to_cute(q_all, cutlass.BFloat16),
         _to_cute(kv_flat, cutlass.Uint8, align=16),
         _to_cute(swa_indices, cutlass.Int32, align=4),
@@ -740,11 +1256,20 @@ def run_unified_decode(
         Float32(float(sm_scale) * LOG2_E),
         Int32(topk),
         Int64(stride_kv_block),
-        stream,
     )
-    compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.decode",
-        1,
+    if has_extra:
+        args = base_args + (
+            _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+            _to_cute(extra_indices_t, cutlass.Int32, align=4),
+            Int32(extra_topk),
+            Int32(num_main_chunks),
+            Int64(stride_extra_kv_block),
+            stream,
+        )
+    else:
+        args = base_args + (stream,)
+
+    spec_fields = [
         key_field("model_type", traits.model_type),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
@@ -753,6 +1278,13 @@ def run_unified_decode(
         key_field("chunks_per_split", int(chunks_per_split)),
         key_field("page_block_size", int(swa_page_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
+        # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache
+        # kernel: has_extra gates the extra-section const_expr (no-extra DSV4 PTX
+        # byte-identical), pbs_extra is the runtime extra page block size, and the
+        # extra topk bucket keeps the key compact.
+        key_field("has_extra", int(has_extra)),
+        key_field("pbs_extra", int(pbs_extra)),
+        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         # rows (== num_tokens) is BAKED into the launch grid
         # (grid=(num_tokens, h_blocks, num_splits), concrete-shape trace), so it
         # MUST be a compile key -- DimKey.exact on every row dim + a num_tokens
@@ -764,9 +1296,26 @@ def run_unified_decode(
         tensor_key("swa_indices", swa_indices, dims=(DimKey.exact(rows), DimKey.bucket(topk))),
         tensor_key("mid_out", mid_out, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
         tensor_key("mid_lse", mid_lse, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits))),
+    ]
+    if has_extra:
+        spec_fields.append(
+            tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))))
+        )
+    compile_spec = KernelCompileSpec.from_fields(
+        "attention.mla.unified_sm120.decode",
+        # version 2: P7c dual-cache kernel signature (extra_* args + has_extra
+        # const_expr). The cache key is kernel_id + version + fields, so this bump
+        # invalidates any stale v1 single-cache decode objects on the disk cache.
+        # The no-extra (has_extra=0) trace + PTX are unchanged from v1.
+        2,
+        *spec_fields,
     )
+    # Select the entry method: the dual-cache path uses kernel.call_extra (a
+    # DISTINCT mangled name); the single-cache path uses the kernel object (->
+    # __call__) whose name + PTX stay byte-identical to the pre-P7c kernel.
+    entry = kernel.call_extra if has_extra else kernel
     b12x_launch(
-        kernel,
+        entry,
         compile_spec=compile_spec,
         compile_args=args,
         runtime_args=args,

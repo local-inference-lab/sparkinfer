@@ -85,8 +85,8 @@ def io_issue_gather(
     full_mbar_ptr,                 # cute.Pointer (u64) of mbar_full[buf]
     g_start: Int32,                # absolute candidate offset of entry 0 (chunk_in_section*CAND_WINDOW)
     g_end: Int32,                  # min(g_start + CAND_WINDOW, section_len)
-    page_block_size: Int32,        # pbs: tokens per paged block
-    stride_kv_block: Int64,        # per-block byte stride in gmem
+    page_block_size: Int32,        # pbs: tokens per paged block (THIS section)
+    stride_kv_block: Int64,        # per-block byte stride in gmem (THIS section)
     io_lane: Int32,                # lane within the IO warp [0, 32)
     *,
     bi: cutlass.Constexpr,                 # 64
@@ -118,7 +118,25 @@ def io_issue_gather(
       4. cp.async.bulk NoPE (448B) + RoPE (128B) per entry; bulk completion
          decrements the full[buf] tx. 32 IO threads -> 2 unrolled passes cover
          BI=64 entries -> 4 cp.async.bulk in the static PTX.
+
+    DUAL-CACHE (DSV4 only; FlashInfer ``issue_gather`` :243-306): this function
+    gathers ONE chunk from ONE section. The dual-cache section dispatch lives in
+    the KERNEL IO loop (launch.py): for a MAIN chunk it calls this with the main
+    cache / indices / page_block_size / stride_kv_block; for an EXTRA chunk it
+    calls this with the extra cache / extra indices / pbs_extra /
+    stride_extra_kv_block. The smem dst layout + per-entry byte geometry are
+    IDENTICAL across sections, so this body is section-agnostic and the no-extra
+    DSV4 / GLM PTX is unchanged (the caller never emits the extra branch).
     """
+    # Section-agnostic gather: ``kv_cache_u8`` / ``topk_indices`` /
+    # ``page_block_size`` / ``stride_kv_block`` are THIS section's pool (the caller
+    # selects main vs extra). Aliased to the historical ``_section_*`` names used
+    # by the per-entry addressing below.
+    _section_kv = kv_cache_u8
+    _section_idx = topk_indices
+    _section_pbs = page_block_size
+    _section_stride = stride_kv_block
+
     # Per-model gmem geometry (const_expr). DSV4: 576B data + grouped 8B footer;
     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
     if cutlass.const_expr(scale_format == 0):
@@ -141,7 +159,7 @@ def io_issue_gather(
             cand_pos = g_start + entry
             idx_raw = Int32(-1)
             if cand_pos < g_end:
-                idx_raw = Int32(topk_indices[cand_pos])
+                idx_raw = Int32(_section_idx[cand_pos])
             # gap #9: stage the raw index (incl -1) for the S3 consumer mask.
             token_idx_view[entry] = idx_raw
             if cutlass.const_expr(scale_format == 0):
@@ -150,15 +168,15 @@ def io_issue_gather(
                 f0 = Uint32(0)
                 f1 = Uint32(0)
                 if idx_raw >= Int32(0):
-                    block_idx = idx_raw // page_block_size
-                    local_idx = idx_raw - block_idx * page_block_size
+                    block_idx = idx_raw // _section_pbs
+                    local_idx = idx_raw - block_idx * _section_pbs
                     scale_base_off = (
-                        Int64(block_idx) * stride_kv_block
-                        + Int64(page_block_size) * _IOS
+                        Int64(block_idx) * _section_stride
+                        + Int64(_section_pbs) * _IOS
                         + Int64(local_idx) * Int64(_FOOT)
                     )
                     f0, f1 = ld_global_nc_v2_u32(
-                        get_ptr_as_int64(kv_cache_u8, scale_base_off)
+                        get_ptr_as_int64(_section_kv, scale_base_off)
                     )
                 s_byte = entry * _FOOT
                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
@@ -183,16 +201,16 @@ def io_issue_gather(
             cand_pos = g_start + entry
             idx_raw = Int32(-1)
             if cand_pos < g_end:
-                idx_raw = Int32(topk_indices[cand_pos])
+                idx_raw = Int32(_section_idx[cand_pos])
             idx = idx_raw
             if idx < Int32(0):
                 idx = Int32(0)
-            block_idx = idx // page_block_size
-            local_idx = idx - block_idx * page_block_size
+            block_idx = idx // _section_pbs
+            local_idx = idx - block_idx * _section_pbs
             data_base_off = (
-                Int64(block_idx) * stride_kv_block + Int64(local_idx) * _IOS
+                Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
             )
-            data_base_i64 = get_ptr_as_int64(kv_cache_u8, data_base_off)
+            data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
 
             # NoPE (DSV4 448B e4m3 / GLM 528B e4m3+inline-fp32) -> kv_fp8 row.
             cp_async_bulk_g2s_mbar(
