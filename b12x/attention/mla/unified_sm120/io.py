@@ -95,9 +95,17 @@ def io_issue_gather(
     scale_bytes_per_token: cutlass.Constexpr,  # 8 (DSV4 footer); unused for GLM
     bulk_tx_bytes: cutlass.Constexpr,      # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
     scale_format: cutlass.Constexpr = 0,   # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
+
+    ``io_threads`` (const_expr) is the number of IO threads sharing this gather
+    (32 for the decode single IO warp, 128 for the prefill 4 IO warps). The entry
+    stride + unroll count both fold to ``io_threads`` so the BI=64 entries are
+    distributed across the available IO threads (prefill: 1 pass of 64 over 128
+    threads; decode: 2 passes of 32). ``io_lane`` is the lane within the whole IO
+    group ([0, io_threads)). Defaulting to 32 keeps the decode PTX byte-identical.
 
       1. SCALAR footer gather (32 IO threads stride over BI entries; v2.u32 read
          of the 8 footer bytes, clamped-invalid -> 0) into the contiguous smem
@@ -127,7 +135,7 @@ def io_issue_gather(
 
     # --- (1) per-entry validity index staging + (DSV4 only) scalar footer gather. ---
     eo = Int32(0)
-    for _ in cutlass.range_constexpr((bi + _IO_THREADS - 1) // _IO_THREADS):
+    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
         entry = eo + io_lane
         if entry < Int32(bi):
             cand_pos = g_start + entry
@@ -155,7 +163,7 @@ def io_issue_gather(
                 s_byte = entry * _FOOT
                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
-        eo += Int32(_IO_THREADS)
+        eo += Int32(io_threads)
 
     # --- (2) CTA-scope fence: footer/index stores visible before expect_tx. ---
     # == FlashInfer __threadfence_block() (issue_gather :281). try_wait.parity
@@ -169,7 +177,7 @@ def io_issue_gather(
     # --- (4) cp.async.bulk NoPE(+inline scales for GLM) + RoPE per entry. ---
     full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
     eo = Int32(0)
-    for _ in cutlass.range_constexpr((bi + _IO_THREADS - 1) // _IO_THREADS):
+    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
         entry = eo + io_lane
         if entry < Int32(bi):
             cand_pos = g_start + entry
@@ -200,4 +208,4 @@ def io_issue_gather(
                 _ROPE,
                 full_mbar_u32,
             )
-        eo += Int32(_IO_THREADS)
+        eo += Int32(io_threads)

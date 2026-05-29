@@ -1,32 +1,40 @@
-"""Launch / dispatch entrypoints for the unified SM120 sparse-MLA backend.
+"""Unified SM120 sparse-MLA *prefill* (P8) -- CORRECTNESS-FIRST, decode-reuse.
 
-This is the opt-in, parallel backend (existing kernels remain the default and
-untouched). Selection is gated by the ``B12X_MLA_SM120_UNIFIED`` env flag (or a
-``backend="sm120_unified"`` kwarg wired in by the API agent). The flag is parsed
-ONCE into a module-level bool using the SAME helper pattern as
-``b12x/attention/mla/api.py``'s ``_env_flag`` (api.py:85-86):
+This is the P8 prefill: a CORRECT single-pass DSV4 prefill built by REUSING the
+proven, byte-identical decode pipeline (decode_math S0-S7 + io.py io_issue_gather
++ smem) with the ABSOLUTE MINIMUM of new code. It deliberately does NOT introduce
+the 384-thread / 4-IO-warp structure (that is a PERF/PTX-parity optimization
+deferred to P8b/P9; the earlier 4-IO attempt DEADLOCKED on the mbarrier parity).
 
-    os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+KEY INSIGHT (why this works): the DSV4 decode CTA at ``num_splits=1`` ALREADY
+processes ALL topk candidates for one query token in a single CTA, carrying the
+online-softmax ``global_max``/``global_sum`` + ``acc_o`` across the chunk loop
+(decode_math S4 does the per-chunk cross-warp reduce + cross-chunk acc rescale).
+That IS a correct single-pass prefill. The ONLY differences vs decode are:
 
-The ``run_unified_decode`` entrypoint (P7) is a REAL launcher: it builds views,
-plans the split-K chunk ranges, launches the warp-specialized 288-thread DSV4
-decode kernel over grid ``(num_tokens, H_BLOCKS, num_splits)`` writing PER-SPLIT
-NORMALIZED partials into the workspace ``mid_out`` / ``mid_lse`` (exactly
-split.py's ``SparseMLASplitDecodeMergeKernel`` convention), then runs the REUSED
-base-2 merge (``run_sparse_mla_split_decode_merge``) to produce the final O.
-``num_splits=1`` is the trivial 1-split merge (partial == final O).
+  (a) EPILOGUE: decode writes PER-SPLIT NORMALIZED partials to mid_out/mid_lse for
+      the split.py merge; prefill wants the FINAL normalized BF16 O written
+      directly to output[token, h, :] + a final base-2 LSE. This is exactly the
+      ``epilogue_mode=FINAL_BF16`` branch added to ``decode_math.s7_epilogue``
+      (the partial-writeback default keeps decode byte-identical).
+  (b) attn_sink (optional) folded into the normalizer + LSE (FINAL_BF16 path).
+  (c) PER-TOKEN variable ``topk_length`` -> the per-token ``section_len`` (the
+      same runtime scalar the decode S3 mask + io gather already key off).
+  (d) GRID is per query token: ``(num_tokens, H_BLOCKS, 1)`` (num_tokens may be
+      >1; one CTA per (token, HPB head-group)).
 
-SCOPE: DSV4 main-cache ONLY. GLM (q=576) and has_extra_cache (extra-tokens) are
-NOT supported here -- the compressed_api.py dispatch gate must fall back to the
-legacy backend for those (and for non-SM120 devices); see compressed_api.py.
+So this prefill kernel is the decode CTA body (288 threads = 8 math + 1 IO warp,
+io_threads=32) with: a compile-time chunk loop of ``num_tiles = ceil(topk/BI)``
+chunks, a PER-TOKEN ``section_len = topk_length[token]`` (chunks past the token's
+length gather all -1 -> S3 masks them -> they add nothing to the online softmax),
+and ``s7_epilogue(epilogue_mode=FINAL_BF16, attn_sink=...)``. The hot-op MMA PTX
+(14 block-scaled + 14 plain e4m3 + 8 bf16) and the mbarrier handshake are
+IDENTICAL to the decode kernel -- a correct 1-IO pipeline does NOT deadlock.
 
-``run_unified_prefill`` / ``run_unified_merge`` remain STUBS (out of P7 scope).
+SCOPE: DSV4, FP8 compute, main cache. DSV4 + GLM DECODE kernels stay byte-identical.
 """
 
 from __future__ import annotations
-
-import math
-import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -47,6 +55,7 @@ from b12x.cute.compiler import (
 from b12x.cute.fp4 import shared_ptr_to_u32
 
 from .decode_math import (
+    EPILOGUE_FINAL_BF16,
     s0_quantize_q_to_smem,
     s0b_requant_k_glm,
     s1_qk_nope_block_scaled,
@@ -60,122 +69,72 @@ from .decode_math import (
 )
 from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
-from .traits import (
-    ComputeMode,
-    ModelType,
-    ScaleFormat,
-    infer_model_type,
-    make_unified_traits,
-)
+from .traits import infer_model_type, make_unified_traits
 
 
-_MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
-
-# BI=64 candidates per chunk (one full/empty KV buffer window). The split-K
-# planner cuts the topk into chunk-aligned ranges so split partials are disjoint
-# and the merge is exact (split boundary == chunk boundary).
+# BI=64 candidates per chunk (one full/empty KV buffer window). Same as decode.
 _CAND_WINDOW = 64
-
 # DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
 _DSV4_HEAD_DIM = 512
-# GLM_NSA uncompressed contract head dim (q_nope 512 + q_rope 64).
-_GLM_HEAD_DIM = 576
-# GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
-_GLM_KV_GMEM_STRIDE = 656
 
 
-def _env_flag(name: str) -> bool:
-    """Match api.py:86 exactly so flag parsing is identical across backends."""
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+class UnifiedPrefillKernel:
+    """288-thread single-pass DSV4 prefill: ONE CTA per (token, HPB head-group).
 
+    Structurally the UnifiedDecodeKernel CTA body (8 math warps + 1 IO warp,
+    io_threads=32, the proven full/empty mbarrier double-buffer) run at the
+    implicit ``num_splits=1``: the math loops over ALL ``num_tiles=ceil(topk/BI)``
+    chunks carrying ``global_max``/``global_sum``/``acc_o`` across the loop (the
+    decode S4 cross-chunk online softmax), then ``s7_epilogue`` writes the FINAL
+    normalized BF16 O directly to output[token, head, :] + the final base-2 LSE
+    (FINAL_BF16 epilogue, with optional attn_sink fold).
 
-# Parsed ONCE at import time (module-level bool). The dispatcher consults this
-# (OR the backend kwarg) together with get_sm_version() >= 120 before routing to
-# the unified backend.
-B12X_MLA_SM120_UNIFIED: bool = _env_flag(_MLA_SM120_UNIFIED_ENV)
-
-
-# ---------------------------------------------------------------------------
-# Split-K planning. Reuse the compressed planner's chunk-count idiom but pin the
-# per-split chunk granularity to the kernel's BI=64 window so split boundaries
-# land on chunk boundaries (a candidate is processed by exactly one split ->
-# multi-split is numerically identical to single-split).
-# ---------------------------------------------------------------------------
-def plan_unified_decode_splits(
-    *,
-    topk: int,
-    max_chunks: int,
-    forced_num_splits: int | None = None,
-) -> tuple[int, int, int]:
-    """Return ``(num_chunks, num_splits, chunks_per_split)``.
-
-    ``num_chunks = ceil(topk / BI)`` is the number of BI=64 candidate windows.
-    ``num_splits`` defaults to 1 (single-CTA decode; the merge is then trivial);
-    a forced value (e.g. for the multi-split numeric check) splits the chunks
-    into ``num_splits`` chunk-aligned ranges of ``chunks_per_split`` chunks each.
-    ``num_splits`` is clamped to ``[1, num_chunks]`` and to ``max_chunks`` (the
-    workspace mid_out/mid_lse split capacity).
-    """
-    topk = max(int(topk), 1)
-    num_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
-    if forced_num_splits is None:
-        num_splits = 1
-    else:
-        num_splits = max(1, int(forced_num_splits))
-    num_splits = min(num_splits, num_chunks, max(1, int(max_chunks)))
-    chunks_per_split = (num_chunks + num_splits - 1) // num_splits
-    return num_chunks, num_splits, chunks_per_split
-
-
-class UnifiedDecodeKernel:
-    """288-thread warp-specialized DSV4 decode with split-K partial writeback.
-
-    Grid = (num_tokens, H_BLOCKS, num_splits). Each CTA owns one query token, one
-    HPB=16-head block, and one chunk-range slice (split). 8 math warps consume
-    the double-buffered KV gathered by the 9th IO warp (cp.async.bulk + mbarrier,
-    io.py); the math runs S0-S6b over the split's chunks then S7 writes this
-    split's NORMALIZED partial O + base-2 LSE into mid_out / mid_lse in the exact
-    split.py merge convention. The hot-op MMA PTX (14 block-scaled + 14 plain
-    e4m3 + 8 bf16) is identical to the single-CTA P6 kernel: the split slicing
-    only changes the chunk-loop BOUNDS and the epilogue DESTINATION.
+    The PER-TOKEN ``topk_length[token]`` is the per-CTA ``section_len`` (a runtime
+    scalar): the io gather clamps each chunk to ``g_end=min(g_start+BI, len)`` and
+    stages -1 for out-of-range candidates, and S3 masks ``abs_cand >= section_len``
+    -> chunks past the token's length contribute nothing. Grid = (num_tokens,
+    h_blocks, 1); IO threads stay 32 (NO 4-IO, NO 384 threads).
     """
 
-    def __init__(self, traits, layout, page_block_size, chunks_per_split,
-                 num_tokens, h_blocks, num_splits):
+    def __init__(self, traits, layout, page_block_size, num_tiles,
+                 num_tokens, h_blocks, num_heads, has_sink):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
-        self.chunks_per_split = int(chunks_per_split)
+        self.num_tiles = int(num_tiles)  # ceil(topk / BI), compile-time chunk count.
         self.num_tokens = int(num_tokens)
         self.h_blocks = int(h_blocks)
-        self.num_splits = int(num_splits)
-        self.math_threads = int(traits.math_threads)
-        self.block_threads = int(traits.block_threads)
+        self.num_heads = int(num_heads)
+        self.has_sink = bool(has_sink)
+        self.math_threads = int(traits.math_threads)  # 256
+        self.block_threads = int(traits.block_threads)  # 288 (8 math + 1 IO)
 
     @cute.jit
     def __call__(
         self,
-        q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
+        q_all: cute.Tensor,          # (T, heads, D_QK) bf16
         kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8
-        swa_indices: cute.Tensor,    # (rows, topk) int32
-        mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
-        mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
+        indices: cute.Tensor,        # (T, topk) int32
+        topk_length: cute.Tensor,    # (T,) int32 per-token valid length
+        attn_sink: cute.Tensor,      # (heads,) f32 (dummy 1-elem when no sink)
+        output: cute.Tensor,         # (T, heads, D_V) bf16
+        out_lse: cute.Tensor,        # (T, heads) f32 base-2 LSE
         sm_scale_log2: Float32,
-        section_len: Int32,
         stride_kv_block: Int64,
         stream: cuda.CUstream,
     ):
         self.kernel(
-            q_all,
-            kv_cache_u8,
-            swa_indices,
-            mid_out,
-            mid_lse,
-            sm_scale_log2,
-            section_len,
-            stride_kv_block,
+            q_all, kv_cache_u8, indices, topk_length, attn_sink,
+            output, out_lse, sm_scale_log2, stride_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            # Grid = (num_tokens, h_blocks, 1), one CTA per (token, HPB head-group).
+            # These launchers trace with CONCRETE-shape tensors (compile_args ==
+            # runtime_args), so the grid token dim is baked at trace time -- the
+            # compile key MUST therefore distinguish ``num_tokens`` (keyed via
+            # DimKey.exact on the q/output row dim + a num_tokens key_field) so a
+            # cached T=1 kernel is NOT reused for a later T>1 call (which would
+            # launch only token 0). h_blocks is keyed via num_heads.
+            grid=(self.num_tokens, self.h_blocks, 1),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -185,11 +144,12 @@ class UnifiedDecodeKernel:
         self,
         q_all: cute.Tensor,
         kv_cache_u8: cute.Tensor,
-        swa_indices: cute.Tensor,
-        mid_out: cute.Tensor,
-        mid_lse: cute.Tensor,
+        indices: cute.Tensor,
+        topk_length: cute.Tensor,
+        attn_sink: cute.Tensor,
+        output: cute.Tensor,
+        out_lse: cute.Tensor,
         sm_scale_log2: Float32,
-        section_len: Int32,
         stride_kv_block: Int64,
     ):
         t = self.traits
@@ -198,10 +158,9 @@ class UnifiedDecodeKernel:
         lane = cute.arch.lane_idx()
         warp_id = tid >> Int32(5)
 
-        token_idx, head_block, split_idx = cute.arch.block_idx()
+        token_idx, head_block, _ = cute.arch.block_idx()
         token_idx = Int32(token_idx)
         head_block = Int32(head_block)
-        split_idx = Int32(split_idx)
         head_base = head_block * Int32(t.hpb)
 
         smem = cutlass_utils.SmemAllocator()
@@ -228,7 +187,7 @@ class UnifiedDecodeKernel:
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
 
-        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        # ── 288 threads = 8 math warps (CONSUMER) + 1 IO warp (warp 8). ──
         is_io = warp_id >= Int32(self.math_threads // 32)
 
         kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
@@ -246,16 +205,22 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
         cute.arch.barrier()  # full-CTA (288) structural fence.
 
-        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
+        # PER-TOKEN valid length: this CTA's section_len (the decode mask + io
+        # gather boundary). Clamped to [0, topk]. Chunks with g_start >= section_len
+        # gather all -1 (io clamps g_end) and S3 masks them -> they add nothing.
+        topk_total = Int32(indices.shape[1])
+        section_len = Int32(topk_length[token_idx])
+        if section_len < Int32(0):
+            section_len = Int32(0)
+        if section_len > topk_total:
+            section_len = topk_total
 
-        # swa_indices for THIS token row: a 1-D (topk,) slice.
+        # indices for THIS token row (1-D (topk,) slice).
         topk_row = cute.make_tensor(
-            swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
-            cute.make_layout(swa_indices.shape[1]),
+            indices.iterator + token_idx.to(Int64) * Int64(indices.stride[0]),
+            cute.make_layout(indices.shape[1]),
         )
-        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        # q for THIS token (2-D (heads, D_QK) view; s0 indexes [head_base+h, d]).
         q_token = cute.make_tensor(
             q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
             cute.make_layout(
@@ -266,14 +231,14 @@ class UnifiedDecodeKernel:
         warp_first_cand = warp_id * Int32(8)
 
         # ════════════════════════════════════════════════════════════════════
-        # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
+        # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER). EXACT decode protocol.
         # ════════════════════════════════════════════════════════════════════
         if is_io:
             io_lane = lane
             prod_phase = Int32(1)
             prod_idx = Int32(0)
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
-                ci = split_first_chunk + Int32(lc)
+            for lc in cutlass.range(self.num_tiles, unroll=1):
+                ci = Int32(lc)
                 buf = Int32(lc) & Int32(1)
                 g_start = ci * Int32(_CAND_WINDOW)
                 g_end = g_start + Int32(_CAND_WINDOW)
@@ -329,8 +294,8 @@ class UnifiedDecodeKernel:
             cons_phase = Int32(0)
             cons_idx = Int32(0)
 
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
-                ci = split_first_chunk + Int32(lc)
+            for lc in cutlass.range(self.num_tiles, unroll=1):
+                ci = Int32(lc)
                 split_cand_start = ci * Int32(_CAND_WINDOW)
                 buf = Int32(lc) & Int32(1)
 
@@ -354,8 +319,8 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
-                # GLM-only S0b: in-place K dequant+requant (ARBITRARY_FP32 -> true
-                # value e4m3, unit sfb in S1). const_expr-elided for DSV4.
+                # GLM-only S0b (const_expr-elided for DSV4). Kept for symmetry with
+                # the decode kernel; DSV4 prefill never enters it.
                 if cutlass.const_expr(t.scale_format == 1):
                     s0b_requant_k_glm(
                         kv_fp8_b, tid,
@@ -376,6 +341,8 @@ class UnifiedDecodeKernel:
                     qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
                 )
 
+                # PER-TOKEN mask: invalid if idx<0 OR abs_cand >= section_len. The
+                # single CTA owns the whole row so split_cand_end == section_len.
                 split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
                 if split_cand_end > section_len:
                     split_cand_end = section_len
@@ -413,7 +380,6 @@ class UnifiedDecodeKernel:
                     num_threads=self.math_threads, barrier_id=3,
                 )
 
-                # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
                 if cutlass.const_expr(t.v_has_rope):
                     acc_rope = s6b_xv_rope(
                         acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
@@ -438,8 +404,9 @@ class UnifiedDecodeKernel:
                     cons_idx = Int32(0)
                     cons_phase ^= Int32(1)
 
-            # ── S7: write this split's NORMALIZED partial + base-2 LSE into
-            #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
+            # ── S7 FINAL_BF16: write the final normalized BF16 O directly into
+            #    output[token, head_base + h, dim] + the final base-2 LSE (with
+            #    optional attn_sink fold). NO merge. ──
             fin_acc_nope = [
                 [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
                  accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
@@ -449,35 +416,38 @@ class UnifiedDecodeKernel:
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
 
-            # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
-            # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
+            # output[token, head_base + h, dim]: (HPB, D_V) view for this
+            # (token, head_block). output stride = (heads*Dv, Dv, 1).
             out_o = cute.make_tensor(
-                mid_out.iterator
-                + token_idx.to(Int64) * Int64(mid_out.stride[0])
-                + head_base.to(Int64) * Int64(mid_out.stride[1])
-                + split_idx.to(Int64) * Int64(mid_out.stride[2]),
+                output.iterator
+                + token_idx.to(Int64) * Int64(output.stride[0])
+                + head_base.to(Int64) * Int64(output.stride[1]),
                 cute.make_layout(
                     (t.hpb, t.d_v),
-                    stride=(mid_out.stride[1], mid_out.stride[3]),
+                    stride=(output.stride[1], output.stride[2]),
                 ),
             )
-            # mid_lse[token, head_base + h, split]: (HPB,) view.
-            out_lse = cute.make_tensor(
-                mid_lse.iterator
-                + token_idx.to(Int64) * Int64(mid_lse.stride[0])
-                + head_base.to(Int64) * Int64(mid_lse.stride[1])
-                + split_idx.to(Int64) * Int64(mid_lse.stride[2]),
-                cute.make_layout((t.hpb,), stride=(mid_lse.stride[1],)),
+            # out_lse[token, head_base + h]: (HPB,) view.
+            out_lse_v = cute.make_tensor(
+                out_lse.iterator
+                + token_idx.to(Int64) * Int64(out_lse.stride[0])
+                + head_base.to(Int64) * Int64(out_lse.stride[1]),
+                cute.make_layout((t.hpb,), stride=(out_lse.stride[1],)),
             )
             s7_epilogue(
-                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
+                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse_v,
                 warp_id, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
                 d_rope=t.d_rope, n_warps=8, valid_hpb=t.hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
+                epilogue_mode=EPILOGUE_FINAL_BF16,
+                has_attn_sink=self.has_sink, attn_sink=attn_sink, head_base=head_base,
             )
 
 
+# ---------------------------------------------------------------------------
+# Launcher
+# ---------------------------------------------------------------------------
 def _to_cute(x, dtype, align=16):
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
@@ -485,140 +455,141 @@ def _to_cute(x, dtype, align=16):
 
 
 def _topk_bucket(topk: int) -> int:
-    """Coarse topk bucket for the compile key (chunks_per_split is the real
-    specialization driver; the bucket just keeps the key compact)."""
     return 1 << (max(int(topk), 1) - 1).bit_length()
 
 
-def run_unified_decode(
+def run_unified_prefill(
     *,
-    q_all: torch.Tensor,
-    swa_k_cache: torch.Tensor,
-    swa_indices: torch.Tensor,
-    swa_topk_lengths: torch.Tensor,
-    workspace,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
     sm_scale: float,
-    swa_page_size: int,
-    indexed_k_cache: torch.Tensor | None = None,
-    indexed_indices: torch.Tensor | None = None,
-    indexed_topk_lengths: torch.Tensor | None = None,
-    indexed_page_size: int | None = None,
-    indexed_page_table: torch.Tensor | None = None,
+    page_block_size: int,
+    topk_length: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
-    return_lse: bool = False,
-    lse_scale: str = "base2",
-    forced_num_splits: int | None = None,
+    output: torch.Tensor | None = None,
+    lse_out: torch.Tensor | None = None,
+    stride_kv_block: int | None = None,
+    workspace=None,
 ):
-    """Unified SM120 sparse-MLA decode: kernel (split-K partials) + merge.
+    """Unified SM120 sparse-MLA DSV4 prefill: single-pass kernel -> BF16 O + LSE.
 
-    Routes DSV4 (q_head_dim==512, UE8M0 footer) AND GLM_NSA (q_head_dim==576,
-    ARBITRARY_FP32 inline scales) to the SAME warp-specialized kernel via the
-    cute.constexpr traits branches (model_type/scale_format/v_has_rope). The
-    dispatch gate guarantees SM120; this entrypoint rejects unsupported features
-    so an accidental route never silently mis-computes.
+    A THIN launcher over ``UnifiedPrefillKernel`` (the decode CTA body run at the
+    implicit num_splits=1, with the FINAL_BF16 epilogue + per-token section_len +
+    optional attn_sink). 1 IO warp, 288 threads -- NO 4-IO / NO 384 threads.
+
+    Args:
+      q:            (T, heads, D_QK=512) bf16. T query tokens (prefill regime).
+      kv_cache:     flat uint8 KV cache (reshaped to 1-D). For DSV4 the per-page
+                    byte stride is ``stride_kv_block`` (compressed page nbytes).
+      topk_indices: (T, topk) int32 flat slot ids (-1 = invalid sentinel).
+      sm_scale:     softmax scale (typically D_QK**-0.5).
+      page_block_size: tokens per KV block (64 for DSV4).
+      topk_length:  optional (T,) int32 per-token valid length; entries past it
+                    are masked. Defaults to full ``topk`` for every token.
+      attn_sink:    optional (heads,) fp32 per-head natural-log sink, folded into
+                    the normalizer + base-2 LSE (FlashMLA V4).
+      output:       optional pre-allocated (T, heads, D_V) bf16 output (else made).
+      lse_out:      optional pre-allocated (T, heads) f32 base-2 LSE (else made).
+      stride_kv_block: per-block gmem byte stride. Derived from page_block_size
+                    when omitted (compressed_mla_page_nbytes for DSV4).
+      workspace:    unused (prefill is single-pass, no split/merge workspace);
+                    accepted for launcher-signature symmetry.
+
+    Returns (O[T, heads, D_V=512] bf16, lse[T, heads] f32 base-2).
     """
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
-    if indexed_k_cache is not None or indexed_indices is not None or indexed_topk_lengths is not None:
+    del workspace  # prefill is single-pass; no split/merge workspace needed.
+
+    q_head_dim = int(q.shape[-1])
+    if q_head_dim != _DSV4_HEAD_DIM:
         raise NotImplementedError(
-            "unified_sm120 decode: has_extra_cache / indexed (extra-tokens) is P7c; "
-            "the dispatch gate must fall back to legacy"
-        )
-    if attn_sink is not None:
-        raise NotImplementedError(
-            "unified_sm120 decode: attn_sink fold is not yet supported; fall back to legacy"
-        )
-    if return_lse:
-        raise NotImplementedError(
-            "unified_sm120 decode: return_lse is not yet supported; fall back to legacy"
+            f"unified_sm120 prefill supports DSV4 (q_head_dim=512) only; got {q_head_dim}"
         )
 
-    q_head_dim = int(q_all.shape[-1])
-    if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
-        raise NotImplementedError(
-            f"unified_sm120 decode supports q_head_dim 512 (DSV4) or 576 (GLM); "
-            f"got {q_head_dim} -- fall back to legacy"
-        )
-
-    rows, heads, _ = q_all.shape
+    num_tokens, heads, _ = q.shape
     hpb = 16
     if heads % hpb != 0:
         raise NotImplementedError(
-            f"unified_sm120 decode requires heads divisible by HPB={hpb}, got {heads}"
+            f"unified_sm120 prefill requires heads divisible by HPB={hpb}, got {heads}"
         )
     h_blocks = heads // hpb
 
-    model_type, compute_mode, scale_format = infer_model_type(q_head_dim, swa_k_cache.dtype)
+    model_type, compute_mode, scale_format = infer_model_type(q_head_dim, kv_cache.dtype)
     traits = make_unified_traits(model_type, compute_mode, scale_format)
     layout = make_smem_layout(traits)
-    d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
+    d_v = int(traits.d_v)
 
-    topk = int(swa_indices.shape[1])
-    max_chunks = int(workspace.max_chunks_per_row)
-    num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
-        topk=topk, max_chunks=max_chunks, forced_num_splits=forced_num_splits,
-    )
-    if num_splits > max_chunks:
-        raise ValueError(
-            f"unified_sm120 decode num_splits {num_splits} exceeds workspace "
-            f"max_chunks_per_row {max_chunks}"
-        )
+    topk = int(topk_indices.shape[1])
+    num_tiles = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
 
-    if workspace.tmp_output is None or workspace.tmp_lse is None:
-        raise RuntimeError("unified_sm120 decode workspace is missing mid_out/mid_lse")
-
-    # mid_out / mid_lse views over the workspace split buffers (the merge's
-    # exact tmp_output[rows,heads,chunks,dim] / tmp_lse[rows,heads,chunks]). The
-    # partial O dim is d_v (512) for both models.
-    mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
-    mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
-    # Seed empty-split LSE = -inf so the merge skips splits with no chunks (and
-    # so partially-written rows are well-defined). The kernel overwrites every
-    # (token, head, split) it actually runs.
-    mid_lse.fill_(float("-inf"))
-
-    if model_type == ModelType.GLM_NSA:
-        # GLM cache: per-token 656B contiguous record; one paged "block" holds
-        # page_block_size tokens, so the per-block byte stride is pbs*656.
-        stride_kv_block = int(swa_page_size) * _GLM_KV_GMEM_STRIDE
+    device = q.device
+    if topk_length is None:
+        topk_length = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     else:
-        stride_kv_block = int(compressed_mla_page_nbytes(int(swa_page_size)))
+        topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
 
-    output = workspace.output_buffer[:rows, :heads, :d_v]
+    has_sink = attn_sink is not None
+    if has_sink:
+        attn_sink_t = attn_sink.to(device=device, dtype=torch.float32).contiguous()
+    else:
+        # dummy 1-elem tensor so the kernel arg exists; never read (const_expr gate).
+        attn_sink_t = torch.zeros(1, dtype=torch.float32, device=device)
 
-    kernel = UnifiedDecodeKernel(
-        traits, layout, int(swa_page_size), chunks_per_split,
-        num_tokens=rows, h_blocks=h_blocks, num_splits=num_splits,
+    if stride_kv_block is None:
+        stride_kv_block = int(compressed_mla_page_nbytes(int(page_block_size)))
+
+    q = q.contiguous()
+    topk_indices = topk_indices.contiguous()
+    if output is None:
+        output = torch.empty((num_tokens, heads, d_v), dtype=torch.bfloat16, device=device)
+    if lse_out is None:
+        lse_out = torch.empty((num_tokens, heads), dtype=torch.float32, device=device)
+
+    kernel = UnifiedPrefillKernel(
+        traits, layout, int(page_block_size), num_tiles,
+        num_tokens=num_tokens, h_blocks=h_blocks, num_heads=heads, has_sink=has_sink,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    kv_flat = swa_k_cache.reshape(-1)
+    kv_flat = kv_cache.reshape(-1)
     args = (
-        _to_cute(q_all, cutlass.BFloat16),
+        _to_cute(q, cutlass.BFloat16),
         _to_cute(kv_flat, cutlass.Uint8, align=16),
-        _to_cute(swa_indices, cutlass.Int32, align=4),
-        _to_cute(mid_out, cutlass.BFloat16, align=16),
-        _to_cute(mid_lse, cutlass.Float32, align=4),
+        _to_cute(topk_indices, cutlass.Int32, align=4),
+        _to_cute(topk_length, cutlass.Int32, align=4),
+        _to_cute(attn_sink_t, cutlass.Float32, align=4),
+        _to_cute(output, cutlass.BFloat16, align=16),
+        _to_cute(lse_out, cutlass.Float32, align=4),
         Float32(float(sm_scale) * LOG2_E),
-        Int32(topk),
         Int64(stride_kv_block),
         stream,
     )
     compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.decode",
-        1,
+        "attention.mla.unified_sm120.prefill",
+        # version 2: P8 correctness-first rewrite (288-thread decode-reuse,
+        # FINAL_BF16 epilogue, RUNTIME q-rows grid). The cache key is kernel_id +
+        # version + fields only (NOT a source hash), so this bump invalidates any
+        # stale v1 4-IO/baked-grid prefill objects on the disk cache.
+        2,
         key_field("model_type", traits.model_type),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("num_heads", int(heads)),
         key_field("hpb", int(hpb)),
-        key_field("chunks_per_split", int(chunks_per_split)),
-        key_field("page_block_size", int(swa_page_size)),
+        key_field("num_tiles", int(num_tiles)),
+        key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
-        tensor_key("q_all", q_all, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(q_head_dim))),
-        tensor_key("swa_indices", swa_indices, dims=(DimKey.dynamic(), DimKey.bucket(topk))),
-        tensor_key("mid_out", mid_out, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
-        tensor_key("mid_lse", mid_lse, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits))),
+        key_field("has_sink", int(has_sink)),
+        # num_tokens is baked into the launch grid (concrete-shape trace), so it
+        # MUST be a compile key (DimKey.exact row dims below). A T-bucket here
+        # would silently reuse a wrong-grid kernel; key the exact T.
+        key_field("num_tokens", int(num_tokens)),
+        tensor_key("q", q, dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(q_head_dim))),
+        tensor_key("topk_indices", topk_indices, dims=(DimKey.exact(num_tokens), DimKey.bucket(topk))),
+        tensor_key("output", output, dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(d_v))),
+        tensor_key("out_lse", lse_out, dims=(DimKey.exact(num_tokens), DimKey.exact(heads))),
     )
     b12x_launch(
         kernel,
@@ -626,48 +597,4 @@ def run_unified_decode(
         compile_args=args,
         runtime_args=args,
     )
-
-    # ── REUSED base-2 merge over the split axis -> final O. num_splits=1 is the
-    #    trivial 1-split merge (partial == final O). ──
-    from b12x.attention.mla.split import (
-        build_sparse_mla_split_decode_merge_binding,
-        run_sparse_mla_split_decode_merge,
-    )
-
-    if int(workspace.num_chunks_value or -1) != num_splits:
-        workspace.set_split_chunk_config(kv_chunk_size=_CAND_WINDOW, num_chunks=num_splits)
-
-    merge_binding = build_sparse_mla_split_decode_merge_binding(
-        tmp_output=mid_out,
-        tmp_lse=mid_lse,
-        num_chunks_ptr=workspace.num_chunks_ptr,
-        output=output,
-        attn_sink=None,
-        workspace=workspace,
-    )
-    run_sparse_mla_split_decode_merge(binding=merge_binding)
-    return output
-
-
-def run_unified_prefill(*args, **kwargs):
-    """Unified SM120 sparse-MLA DSV4 prefill (P8).
-
-    Thin re-export of ``prefill.run_unified_prefill`` (the correctness-first
-    single-pass DSV4 prefill that REUSES the proven 288-thread / 1-IO-warp decode
-    pipeline with a FINAL_BF16 epilogue). Imported lazily so launch.py has no hard
-    dependency on the prefill module's CuTe symbols at import time."""
-    from .prefill import run_unified_prefill as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def run_unified_merge(*args, **kwargs):
-    """Unified SM120 sparse-MLA partial merge.
-
-    The unified decode REUSES split.py's base-2 SparseMLASplitDecodeMergeKernel
-    directly (see run_unified_decode), so a separate merge entrypoint is not
-    needed; kept as a STUB for API symmetry."""
-    raise NotImplementedError(
-        "unified_sm120 run_unified_merge: the decode reuses split.py's merge "
-        "(run_sparse_mla_split_decode_merge) directly"
-    )
+    return output, lse_out

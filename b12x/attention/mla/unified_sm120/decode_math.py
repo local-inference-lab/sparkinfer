@@ -167,6 +167,14 @@ _N_WARPS = 8
 _ENTRIES_PER_WARP = 8  # BI // _N_WARPS
 _QK_N_TILES = 1  # _ENTRIES_PER_WARP // 8
 
+# S7 epilogue modes (cutlass.Constexpr int keys). The decode/split path writes
+# PER-SPLIT NORMALIZED partials + base-2 LSE into mid_out/mid_lse for the reused
+# split.py merge (PARTIAL_WRITEBACK, the DEFAULT so decode stays byte-identical).
+# The prefill single-pass path writes the FINAL normalized BF16 O directly into
+# output[token,h,d] + a base-2 LSE with an optional attn_sink fold (FINAL_BF16).
+EPILOGUE_PARTIAL_WRITEBACK = 0
+EPILOGUE_FINAL_BF16 = 1
+
 
 @cute.jit
 def _smem_byte(base_addr: Int32, byte_off) -> Int32:
@@ -920,8 +928,8 @@ def s7_epilogue(
     acc_rope,                        # length-4 Float32 (unused if not v_has_rope)
     global_max,                      # length-2 Float32 list
     global_sum,                      # length-2 Float32 list
-    out_o: cute.Tensor,              # (HPB, D_V) bf16 mid_out[token,:,split,:] view
-    out_lse: cute.Tensor,            # (HPB,) f32 mid_lse[token,:,split] base-2 LSE view
+    out_o: cute.Tensor,              # (HPB, D_V) bf16 O view (partial mid_out OR final output)
+    out_lse: cute.Tensor,            # (HPB,) f32 base-2 LSE view (mid_lse OR out_lse)
     warp_id: Int32,
     lane: Int32,
     *,
@@ -933,33 +941,67 @@ def s7_epilogue(
     valid_hpb: cutlass.Constexpr,    # <= HPB
     nt_per_warp_xv: cutlass.Constexpr = 1,  # 1 DSV4 / 2 GLM
     v_has_rope: cutlass.Constexpr = True,   # True DSV4 / False GLM (V == nope only)
+    epilogue_mode: cutlass.Constexpr = EPILOGUE_PARTIAL_WRITEBACK,
+    has_attn_sink: cutlass.Constexpr = False,  # FINAL_BF16 only: fold per-head sink
+    attn_sink=None,                  # (heads,) f32 view (FINAL_BF16 + has_attn_sink)
+    head_base: Int32 = None,         # first head index of this CTA (sink indexing)
 ):
-    """S7: write this SPLIT's NORMALIZED partial O + base-2 LSE in the exact rs-1
-    split.py merge convention (SparseMLASplitDecodeMergeKernel, split.py:1094).
+    """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
+    selects the destination + normalizer convention; the (gid, d0) output-write
+    geometry is IDENTICAL for both, so only the per-row inverse-normalizer and the
+    LSE fold diverge.
 
+    PARTIAL_WRITEBACK (DEFAULT, decode/split -- byte-identical to the prior decode
+    epilogue): write this SPLIT's NORMALIZED partial O + base-2 LSE in the exact
+    rs-1 split.py merge convention (SparseMLASplitDecodeMergeKernel, split.py:1094).
     The merge reduces over the split axis assuming each partial is the
     PER-SPLIT-NORMALIZED output (acc / this split's softmax sum) tagged with the
-    split's base-2 LSE (log2(sum) + max). It seeds ``merged_d = 1.0`` and takes
-    the first valid split's O directly, then base-2-rescales subsequent splits
-    by ``exp2(lse_i - new_max)`` -- so the partials MUST be normalized (NOT the
-    FlashInfer unnormalized acc + separate denom). Empty split -> LSE = -inf
-    sentinel (the merge's skip condition) and O = 0.
+    split's base-2 LSE (log2(sum) + max). inv_g = 1/global_sum (0 if empty);
+    O[head][dim] = acc * inv_g; base-2 LSE = log2(global_sum) + global_max. Empty
+    split -> LSE = -inf sentinel (the merge's skip condition) and O = 0.
+    ``num_splits=1`` is the trivial 1-split merge (partial == final O).
 
-    inv_g = 1/global_sum (0 if empty); O[head][dim] = acc * inv_g; base-2 LSE =
-    log2(global_sum) + global_max. ``num_splits=1`` is the trivial 1-split merge:
-    it seeds acc=O_0, merged_d=1.0 and divides by 1.0 -> O_0 unchanged."""
+    FINAL_BF16 (prefill single-pass): the CTA processed ALL topk in one online
+    softmax, so ``global_sum``/``global_max`` are the FINAL row sum l / max m and
+    we write the FINAL normalized BF16 O directly into output[token,h,d] (this
+    out_o view), plus the FINAL base-2 LSE (NO merge). With ``has_attn_sink`` the
+    FlashMLA V4 sink folds into BOTH the normalizer and the LSE
+    (prefill_kernel.cuh:485-560, base-2 domain):
+        il  = 1 / (l + exp2(sink_log2 - m))          (vs 1/l without sink)
+        lse = log2(l) + m ; lse += log2(1 + exp2(sink_log2 - lse))  (empty -> sink_log2)
+    where sink_log2 = attn_sink[head] * LOG2E. This is algebraically the FlashMLA
+    ``out *= sigmoid(lse_e - sink)`` + log-sum-exp LSE fold the prefill reference
+    cross-checks."""
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
-    inv_g0 = Float32(0.0)
-    inv_g1 = Float32(0.0)
-    if global_sum[0] > Float32(0.0):
-        inv_g0 = Float32(1.0) / global_sum[0]
-    if global_sum[1] > Float32(0.0):
-        inv_g1 = Float32(1.0) / global_sum[1]
+
+    # ── per-physical-row inverse normalizer (gid heads, gid+8 heads). ──
+    if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
+        # FINAL_BF16 + sink: il = 1/(l + exp2(sink_log2 - m)) (FlashInfer:494).
+        s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+        denom0 = global_sum[0] + _exp2_approx_ftz_f32(s0 - global_max[0])
+        inv_g0 = Float32(0.0)
+        if denom0 > Float32(0.0):
+            inv_g0 = Float32(1.0) / denom0
+        inv_g1 = Float32(0.0)
+        if cutlass.const_expr(valid_hpb > 8):
+            s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
+            denom1 = global_sum[1] + _exp2_approx_ftz_f32(s1 - global_max[1])
+            if denom1 > Float32(0.0):
+                inv_g1 = Float32(1.0) / denom1
+    else:
+        # PARTIAL_WRITEBACK or FINAL_BF16-without-sink: il = 1/l (0 if empty).
+        inv_g0 = Float32(0.0)
+        inv_g1 = Float32(0.0)
+        if global_sum[0] > Float32(0.0):
+            inv_g0 = Float32(1.0) / global_sum[0]
+        if global_sum[1] > Float32(0.0):
+            inv_g1 = Float32(1.0) / global_sum[1]
 
     # NoPE dims: d0 = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 + tid*2 (per N-tile).
-    # Cast to the output element type (bf16 for the split.py mid_out partials;
-    # the merge consumes bf16 -- fp32 also works for the standalone probe).
+    # Cast to the output element type (bf16 for the split.py mid_out partials AND
+    # the prefill final output; the merge consumes bf16 -- fp32 also works for the
+    # standalone probe). Output-write geometry is mode-invariant.
     _ot = out_o.element_type
     for vc in cutlass.range_constexpr(n_v_chunks):
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
@@ -982,7 +1024,9 @@ def s7_epilogue(
             out_o[gid + Int32(8), rd0] = (acc_rope[2] * inv_g1).to(_ot)
             out_o[gid + Int32(8), rd0 + Int32(1)] = (acc_rope[3] * inv_g1).to(_ot)
 
-    # base-2 LSE (warp 0, tid 0 owns one head pair via gid).
+    # base-2 LSE (warp 0, tid 0 owns one head pair via gid). The PARTIAL_WRITEBACK
+    # path is the EXACT prior decode epilogue (byte-identical IR); the FINAL_BF16 +
+    # sink fold is a const_expr-gated addition that is fully elided for decode.
     if warp_id == Int32(0) and tid == Int32(0):
         lse0 = Float32(_NEG_INF)
         lse1 = Float32(_NEG_INF)
@@ -990,6 +1034,22 @@ def s7_epilogue(
             lse0 = _log2_approx_ftz_f32(global_sum[0]) + global_max[0]
         if global_sum[1] > Float32(0.0):
             lse1 = _log2_approx_ftz_f32(global_sum[1]) + global_max[1]
+        if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
+            # FlashMLA sink fold: lse += log2(1 + exp2(sink_log2 - lse)); empty ->
+            # sink_log2 (prefill_kernel.cuh:548-560).
+            sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+            if lse0 > Float32(_NEG_INF):
+                lse0 = lse0 + _log2_approx_ftz_f32(
+                    Float32(1.0) + _exp2_approx_ftz_f32(sink0 - lse0))
+            else:
+                lse0 = sink0
+            if cutlass.const_expr(valid_hpb > 8):
+                sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
+                if lse1 > Float32(_NEG_INF):
+                    lse1 = lse1 + _log2_approx_ftz_f32(
+                        Float32(1.0) + _exp2_approx_ftz_f32(sink1 - lse1))
+                else:
+                    lse1 = sink1
         out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
             out_lse[gid + Int32(8)] = lse1
