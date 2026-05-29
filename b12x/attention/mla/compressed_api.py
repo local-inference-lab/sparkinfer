@@ -95,61 +95,74 @@ def compressed_mla_decode_forward(
     rows, heads, _ = q3.shape
     live_rows = rows
 
-    # Opt-in dispatch into the parallel unified_sm120 backend (P7). The unified
-    # kernel supports the DSV4 contract:
+    # Dispatch into the unified_sm120 backend (DSV4 decode). The unified kernel is
+    # the SM120 sparse-MLA path and supports the FULL upstream DSV4 decode surface:
     #   * q_head_dim == COMPRESSED_MLA_HEAD_DIM == 512 (DSV4; NOT GLM q=576)
-    #   * MAIN cache, OR the DSV4 DUAL-CACHE (indexed/extra tokens; P7c) when the
-    #     extra trio is provided together with indexed_page_size and NO mapped
-    #     indexed_page_table (the in-kernel gather addresses the extra cache by
-    #     raw slot id, like the main cache)
-    #   * no attn_sink fold, no return_lse (not yet ported)
-    # Anything unsupported FALLS BACK to the legacy path below (never silently
-    # route an unsupported call to the unified kernel, never raise here). The
-    # legacy path stays byte-identical when the flag is off / backend is None.
+    #   * MAIN cache, OR the DSV4 DUAL-CACHE (indexed/extra tokens) when the full
+    #     extra trio is provided together with indexed_page_size
+    #   * attn_sink fold (sink-in-merge, upstream design) and return_lse
+    #   * VALID_HPB<16 / non-multiple-of-16 head shards
+    # GENUINELY-UPSTREAM-UNSUPPORTED contracts RAISE (never fall back to legacy):
+    #   * a mapped indexed_page_table (upstream is raw-slot-id only)
+    #   * a partial dual-cache trio (upstream ICHECKs required-together)
+    # A non-512 q_head_dim here is a compressed-API contract error -> RAISE.
+    # When the flag is OFF / backend is None _use_unified_sm120 is False and the
+    # legacy path below stays byte-identical (that is the flag being off, not a
+    # fallback; the default-flip is a separate validated step).
     if _use_unified_sm120(backend=backend, device=q3.device):
         _unified_has_extra = (
             indexed_k_cache is not None
             or indexed_indices is not None
             or indexed_topk_lengths is not None
         )
-        # DSV4 dual-cache requires the full extra trio + page size and rejects a
-        # MAPPED page table (the unified gather indexes the extra cache by raw
-        # slot id). A partial / mapped extra request falls back to legacy.
-        _extra_ok = (not _unified_has_extra) or (
-            indexed_k_cache is not None
-            and indexed_indices is not None
-            and indexed_topk_lengths is not None
-            and indexed_page_size is not None
-            and indexed_page_table is None
-        )
-        _unified_supported = (
-            int(q3.shape[-1]) == COMPRESSED_MLA_HEAD_DIM
-            and _extra_ok
-            and attn_sink is None
-            and not return_lse
-        )
-        if _unified_supported:
-            from . import unified_sm120
-
-            return unified_sm120.run_unified_decode(
-                q_all=q3,
-                swa_k_cache=swa_k_cache,
-                swa_indices=swa_indices,
-                swa_topk_lengths=swa_topk_lengths,
-                workspace=scratch,
-                sm_scale=sm_scale,
-                swa_page_size=swa_page_size,
-                indexed_k_cache=indexed_k_cache,
-                indexed_indices=indexed_indices,
-                indexed_topk_lengths=indexed_topk_lengths,
-                indexed_page_size=indexed_page_size,
-                indexed_page_table=indexed_page_table,
-                attn_sink=None,
-                return_lse=False,
-                lse_scale=lse_scale,
+        if _unified_has_extra:
+            # Partial dual-cache trio is a HARD ERROR (upstream required-together
+            # ICHECK, sparse_mla_sm120.cu:171-174). NOT a fallback.
+            if not (
+                indexed_k_cache is not None
+                and indexed_indices is not None
+                and indexed_topk_lengths is not None
+                and indexed_page_size is not None
+            ):
+                raise ValueError(
+                    "SM120 sparse-MLA dual-cache decode requires indexed_k_cache, "
+                    "indexed_indices, indexed_topk_lengths, and indexed_page_size "
+                    "together (partial extra trio is unsupported, matching upstream "
+                    "sparse_mla_sm120.cu:171-174)"
+                )
+            # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream
+            # addresses the extra cache by raw slot id only). RAISE, not fallback.
+            if indexed_page_table is not None:
+                raise ValueError(
+                    "SM120 sparse-MLA decode does not support a mapped "
+                    "indexed_page_table (extra cache is raw-slot-id only on the "
+                    "unified backend, matching upstream FlashInfer)"
+                )
+        if int(q3.shape[-1]) != COMPRESSED_MLA_HEAD_DIM:
+            raise ValueError(
+                f"compressed_mla_decode_forward is DSV4 (q_head_dim="
+                f"{COMPRESSED_MLA_HEAD_DIM}) by construction; got q_head_dim="
+                f"{int(q3.shape[-1])}"
             )
-        # else: unsupported (GLM q=576 / mapped extra / sink / return_lse) ->
-        # fall through to the legacy compressed-MLA decode below.
+        from . import unified_sm120
+
+        return unified_sm120.run_unified_decode(
+            q_all=q3,
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            workspace=scratch,
+            sm_scale=sm_scale,
+            swa_page_size=swa_page_size,
+            indexed_k_cache=indexed_k_cache,
+            indexed_indices=indexed_indices,
+            indexed_topk_lengths=indexed_topk_lengths,
+            indexed_page_size=indexed_page_size,
+            indexed_page_table=indexed_page_table,
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
+        )
 
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     _validate_compressed_cache_layout(

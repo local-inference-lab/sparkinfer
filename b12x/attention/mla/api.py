@@ -529,9 +529,14 @@ def _run_sparse_mla(
         raise ValueError(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
+    # The unified SM120 backend supports attn_sink together with return_lse (the
+    # sink folds into O in the merge and into the returned LSE). The legacy fused
+    # path is output-only, so the return_lse+attn_sink restriction applies ONLY
+    # when the unified path will NOT be taken.
+    _sm120_unified_route = _use_unified_sm120(backend=backend, device=q_all.device)
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
-        if return_lse:
+        if return_lse and not _sm120_unified_route:
             raise ValueError("fused sparse MLA attn_sink currently supports output-only calls")
         if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(q_all.shape[1]):
             raise ValueError(
@@ -592,17 +597,15 @@ def _run_sparse_mla(
                 f"unified_sm120 sparse decode requires the GLM_NSA contract "
                 f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={int(q_all.shape[-1])}"
             )
-        # P7b: GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) decode
-        # via the unified SM120 kernel (cute.constexpr GLM branches beside DSV4).
-        # Fall back to the legacy path for features the unified kernel does not
-        # yet implement (LSE, attn_sink, multi-token rows) -- never raise so an
-        # unsupported call still computes correctly on the legacy backend.
-        _glm_unified_ok = (
-            not return_lse
-            and attn_sink is None
-            and int(q_all.shape[0]) == 1
-            and int(workspace.num_q_heads) % 16 == 0
-        )
+        # GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) decode via the
+        # unified SM120 kernel (cute.constexpr GLM branches beside DSV4). The
+        # unified path now covers the upstream DSV3.2/GLM decode surface:
+        # return_lse, attn_sink fold (sink-in-merge), and VALID_HPB<16 /
+        # non-multiple-of-16 head shards. Multi-token rows (q_rows>1) remain a
+        # SEPARATE later step (per-token topk_length threading), so single-token is
+        # still required here; a >1-row GLM decode falls through to legacy until
+        # that lands. Everything else routes to unified unconditionally.
+        _glm_unified_ok = int(q_all.shape[0]) == 1
         if _glm_unified_ok:
             from .unified_sm120.launch import run_unified_decode
 
@@ -614,6 +617,9 @@ def _run_sparse_mla(
                 workspace=workspace,
                 sm_scale=float(sm_scale),
                 swa_page_size=int(workspace.page_size),
+                attn_sink=attn_sink,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
             )
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale

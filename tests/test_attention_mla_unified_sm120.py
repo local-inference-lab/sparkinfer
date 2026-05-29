@@ -372,35 +372,13 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
 
 
 @torch.inference_mode()
-def test_dsv4_compressed_decode_mapped_extra_page_table_falls_back(monkeypatch) -> None:
-    """(d') has_extra_cache WITH a mapped indexed_page_table: the unified gather
-    addresses the extra cache by raw slot id, so a mapped page table is unsupported
-    and the gate must FALL BACK to legacy (never route it to unified)."""
+def test_dsv4_compressed_decode_mapped_extra_page_table_raises(monkeypatch) -> None:
+    """(d') has_extra_cache WITH a mapped indexed_page_table is GENUINELY-UPSTREAM-
+    UNSUPPORTED (upstream FlashInfer addresses the extra cache by raw slot id only).
+    Per the no-legacy-fallback directive the dispatch must RAISE a clear error, not
+    silently route to legacy."""
     device = require_sm120_unified()
     monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
-
-    routed = {"unified": 0}
-    import b12x.attention.mla.unified_sm120 as unified_mod
-
-    def spy_unified(**kwargs):
-        routed["unified"] += 1
-        raise AssertionError("mapped-page-table extra-cache call was routed to unified")
-
-    monkeypatch.setattr(unified_mod, "run_unified_decode", spy_unified)
-
-    legacy = {"forward": 0}
-
-    def fake_forward(**kwargs):
-        legacy["forward"] += 1
-        binding = kwargs["binding"]
-        binding.tmp_output.zero_()
-        binding.tmp_lse.fill_(float("-inf"))
-
-    def fake_merge(**kwargs):
-        kwargs["binding"].output.zero_()
-
-    monkeypatch.setattr(compressed_api_impl, "run_compressed_mla_split_decode_forward", fake_forward)
-    monkeypatch.setattr(compressed_api_impl, "run_sparse_mla_split_decode_merge", fake_merge)
 
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=7)
@@ -408,23 +386,50 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_falls_back(monkeypatch) 
     scratch.fixed_capacity = False
     page_table = torch.zeros((1, topk), dtype=torch.int32, device=device)
 
-    out = compressed_mla_decode_forward(
-        q_all=q,
-        swa_k_cache=cache,
-        swa_indices=idx,
-        swa_topk_lengths=lengths,
-        indexed_k_cache=cache,
-        indexed_indices=idx,
-        indexed_topk_lengths=lengths,
-        indexed_page_size=_DSV4_PAGE,
-        indexed_page_table=page_table,
-        workspace=scratch,
-        sm_scale=_DSV4_SM_SCALE,
-        swa_page_size=_DSV4_PAGE,
-    )
-    assert routed["unified"] == 0      # mapped page table -> NOT routed to unified
-    assert legacy["forward"] == 1      # fell back to legacy
-    assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
+    with pytest.raises(ValueError, match="mapped"):
+        compressed_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=cache,
+            swa_indices=idx,
+            swa_topk_lengths=lengths,
+            indexed_k_cache=cache,
+            indexed_indices=idx,
+            indexed_topk_lengths=lengths,
+            indexed_page_size=_DSV4_PAGE,
+            indexed_page_table=page_table,
+            workspace=scratch,
+            sm_scale=_DSV4_SM_SCALE,
+            swa_page_size=_DSV4_PAGE,
+        )
+
+
+@torch.inference_mode()
+def test_dsv4_compressed_decode_partial_extra_trio_raises(monkeypatch) -> None:
+    """A partial dual-cache trio (some-but-not-all indexed_* args) is a HARD ERROR
+    matching upstream's required-together ICHECK (sparse_mla_sm120.cu:171-174), NOT
+    a legacy fallback."""
+    device = require_sm120_unified()
+    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "1")
+
+    topk = 64
+    q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=11)
+    scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
+    scratch.fixed_capacity = False
+
+    with pytest.raises(ValueError, match="(?i)dual-cache|together|trio"):
+        compressed_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=cache,
+            swa_indices=idx,
+            swa_topk_lengths=lengths,
+            indexed_k_cache=cache,        # extra cache provided
+            indexed_indices=idx,          # extra indices provided
+            indexed_topk_lengths=None,    # MISSING -> partial trio
+            indexed_page_size=_DSV4_PAGE,
+            workspace=scratch,
+            sm_scale=_DSV4_SM_SCALE,
+            swa_page_size=_DSV4_PAGE,
+        )
 
 
 @torch.inference_mode()
@@ -816,4 +821,215 @@ def test_unified_decode_glm_multi_split_equals_single_split(topk, forced_num_spl
     delta = (got_multi - got_single).abs().max().item()
     assert delta < 5e-3, (
         f"GLM topk={topk} splits={forced_num_splits} multi vs single max|delta|={delta}"
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk,forced_num_splits", [(128, 1), (512, 4)])
+def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits) -> None:
+    """GLM_NSA decode return_lse: the FINAL base-2 LSE reconstructed from mid_lse
+    matches the glm_ref oracle base-2 LSE (the GLM branch shares the merge + LSE
+    reconstruction with DSV4)."""
+    device = require_sm120_unified()
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=True, seed=topk + 5, device=device,
+    )
+    q = case["q"].contiguous()
+    kv_cache = case["kv_cache"].contiguous()
+    idx = case["topk_indices"].contiguous()
+    exp_O = case["expected_O"][0].float()
+    exp_lse_log2 = case["expected_lse"][0].float()
+    sm_scale = case["sm_scale"]
+    s_kv = kv_cache.shape[0]
+
+    max_chunks = max(8, forced_num_splits)
+    plan, storage = _make_glm_sparse_scratch(
+        device, topk=topk, max_chunks=max_chunks, num_heads=_GLM_NUM_HEADS, s_kv=s_kv,
+    )
+    cache_seqlens = torch.full((1,), s_kv, dtype=torch.int32, device=device)
+    nsa_seqlens = torch.full((1,), topk, dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=storage, q=q, selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=nsa_seqlens,
+    )
+    out_o, out_lse = run_unified_decode(
+        q_all=q,
+        swa_k_cache=kv_cache,
+        swa_indices=idx,
+        swa_topk_lengths=nsa_seqlens,
+        workspace=binding.scratch,
+        sm_scale=sm_scale,
+        swa_page_size=_GLM_PAGE,
+        return_lse=True,
+        lse_scale="base2",
+        forced_num_splits=forced_num_splits,
+    )
+    torch.cuda.synchronize()
+    got_O = out_o[0].float()
+    got_lse = out_lse[0].float()
+    assert _cosine(got_O, exp_O) > 0.995
+    assert torch.isfinite(got_lse).all()
+    assert (got_lse - exp_lse_log2).abs().max().item() < 5e-2, (
+        f"GLM return_lse topk={topk} splits={forced_num_splits} base-2 LSE atol exceeded: "
+        f"max|delta|={(got_lse - exp_lse_log2).abs().max().item()}"
+    )
+
+
+# ── P10a DECODE PARITY: attn_sink fold, return_lse, VALID_HPB<16 ───────────────
+# These exercise the four P10a decode features (attn_sink in the merge, returned
+# final LSE, non-multiple-of-16 head shards) against the SAME dsv4_ref oracle that
+# folds sink in its LSE/O and computes per-head independently.
+
+
+def _run_unified_dsv4_feature(
+    device, *, topk, num_heads, with_sink, return_lse, lse_scale, forced_num_splits, seed
+):
+    """Run the REAL unified DSV4 decode launcher for an arbitrary head count, with
+    optional attn_sink fold + return_lse, and return
+    (got_O, got_lse_or_None, exp_O, exp_lse_log2, attn_sink)."""
+    from b12x.attention.mla.unified_sm120.launch import run_unified_decode
+
+    case = dsv4_ref.make_dsv4_decode_case(
+        num_heads=num_heads, topk=topk, num_tokens=1,
+        num_blocks=_UNIFIED_NUM_BLOCKS, page_block_size=_DSV4_PAGE,
+        invalidate_half=True, with_sink=with_sink, device=device, seed=seed,
+    )
+    q = case["q"].contiguous()                    # [1, H, 512] bf16
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS)
+    idx = case["topk_indices"].contiguous()       # [1, topk] int32
+    lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    exp_O = case["expected_O"][0].float()         # [H, 512]
+    exp_lse_log2 = case["expected_lse"][0].float()  # [H] base-2 (sink-folded if with_sink)
+    sm_scale = case["sm_scale"]
+    attn_sink = case["attn_sink"]                 # [H] f32 or None
+
+    max_chunks = max(8, forced_num_splits)
+    scratch = _make_dsv4_scratch_heads(
+        device, topk=topk, max_chunks=max_chunks, num_heads=num_heads,
+    )
+
+    out = run_unified_decode(
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=idx,
+        swa_topk_lengths=lengths,
+        workspace=scratch,
+        sm_scale=sm_scale,
+        swa_page_size=_DSV4_PAGE,
+        attn_sink=attn_sink if with_sink else None,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
+        forced_num_splits=forced_num_splits,
+    )
+    torch.cuda.synchronize()
+    if return_lse:
+        out_o, out_lse = out
+        return out_o[0].float(), out_lse[0].float(), exp_O, exp_lse_log2, attn_sink
+    return out[0].float(), None, exp_O, exp_lse_log2, attn_sink
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk,forced_num_splits", [(128, 1), (512, 1), (512, 4)])
+def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> None:
+    """attn_sink fold (wired into the split.py sink-merge, upstream's sink-in-merge
+    design) matches the dsv4_ref oracle (which folds sink as output *= sigmoid(lse_e
+    - sink))."""
+    device = require_sm120_unified()
+    got_O, _, exp_O, _, sink = _run_unified_dsv4_feature(
+        device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=True,
+        return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
+        seed=topk + 1,
+    )
+    assert sink is not None
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"sink topk={topk} splits={forced_num_splits} O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 2e-2, (
+        f"sink topk={topk} splits={forced_num_splits} O atol exceeded: "
+        f"max|delta|={(got_O - exp_O).abs().max().item()}"
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk,forced_num_splits", [(128, 1), (512, 1), (512, 4)])
+def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) -> None:
+    """return_lse returns the FINAL base-2 LSE reconstructed from the per-split
+    mid_lse; it matches the dsv4_ref base-2 LSE (no sink)."""
+    device = require_sm120_unified()
+    got_O, got_lse, exp_O, exp_lse_log2, _ = _run_unified_dsv4_feature(
+        device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
+        return_lse=True, lse_scale="base2", forced_num_splits=forced_num_splits,
+        seed=topk + 2,
+    )
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"lse topk={topk} splits={forced_num_splits} O cos={cos}"
+    assert torch.isfinite(exp_lse_log2).all()
+    assert torch.isfinite(got_lse).all()
+    assert (got_lse - exp_lse_log2).abs().max().item() < 5e-2, (
+        f"return_lse topk={topk} splits={forced_num_splits} base-2 LSE atol exceeded: "
+        f"max|delta|={(got_lse - exp_lse_log2).abs().max().item()}"
+    )
+
+
+@torch.inference_mode()
+def test_unified_decode_return_lse_natural_scale() -> None:
+    """return_lse with lse_scale='natural' returns the natural-log LSE (= base-2 *
+    ln2)."""
+    device = require_sm120_unified()
+    _, got_lse_nat, _, exp_lse_log2, _ = _run_unified_dsv4_feature(
+        device, topk=256, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
+        return_lse=True, lse_scale="natural", forced_num_splits=1, seed=99,
+    )
+    exp_lse_nat = exp_lse_log2 * _LN2
+    assert (got_lse_nat - exp_lse_nat).abs().max().item() < 5e-2, (
+        "natural-scale LSE atol exceeded: "
+        f"max|delta|={(got_lse_nat - exp_lse_nat).abs().max().item()}"
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_heads", [8, 24, 48])
+@pytest.mark.parametrize("forced_num_splits", [1, 4])
+def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_splits) -> None:
+    """VALID_HPB<16 / non-multiple-of-16 head shards: num_heads in {8 (<16), 24, 48
+    (not multiples of 16)} match the dsv4_ref oracle (which attends per-head over
+    only the valid heads). The kernel zero-pads the HPB=16 tile and gates writes to
+    the valid head rows via the (up to two) per-head-block grids."""
+    device = require_sm120_unified()
+    topk = 256
+    got_O, _, exp_O, _, _ = _run_unified_dsv4_feature(
+        device, topk=topk, num_heads=num_heads, with_sink=False,
+        return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
+        seed=num_heads * 7 + 3,
+    )
+    assert got_O.shape == (num_heads, _DSV4_HEAD_DIM)
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"heads={num_heads} splits={forced_num_splits} O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 2e-2, (
+        f"heads={num_heads} splits={forced_num_splits} O atol exceeded: "
+        f"max|delta|={(got_O - exp_O).abs().max().item()}"
+    )
+
+
+@torch.inference_mode()
+def test_unified_decode_valid_hpb_with_lse_and_sink() -> None:
+    """A non-multiple-of-16 head shard (24) WITH both attn_sink + return_lse: O and
+    the sink-folded LSE both match the reference on exactly the valid heads."""
+    device = require_sm120_unified()
+    got_O, got_lse, exp_O, exp_lse_log2, sink = _run_unified_dsv4_feature(
+        device, topk=256, num_heads=24, with_sink=True,
+        return_lse=True, lse_scale="base2", forced_num_splits=2, seed=4242,
+    )
+    assert sink is not None
+    assert got_O.shape == (24, _DSV4_HEAD_DIM)
+    assert got_lse.shape == (24,)
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"heads=24 sink+lse O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 2e-2
+    assert (got_lse - exp_lse_log2).abs().max().item() < 5e-2, (
+        "heads=24 sink+lse base-2 LSE atol exceeded: "
+        f"max|delta|={(got_lse - exp_lse_log2).abs().max().item()}"
     )

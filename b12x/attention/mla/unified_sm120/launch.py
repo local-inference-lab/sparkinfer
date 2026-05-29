@@ -80,6 +80,9 @@ from .traits import (
 
 _MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
 
+# natural-log of 2 (base2 <-> natural LSE conversion).
+_LN2 = math.log(2.0)
+
 # BI=64 candidates per chunk (one full/empty KV buffer window). The split-K
 # planner cuts the topk into chunk-aligned ranges so split partials are disjoint
 # and the merge is exact (split boundary == chunk boundary).
@@ -268,7 +271,7 @@ class UnifiedDecodeKernel:
 
     def __init__(self, traits, layout, page_block_size, chunks_per_split,
                  num_tokens, h_blocks, num_splits, has_extra=False,
-                 pbs_extra=1):
+                 pbs_extra=1, valid_hpb=None, head_block_offset=0):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -280,6 +283,22 @@ class UnifiedDecodeKernel:
         # elided -> no-extra DSV4 / GLM PTX byte-identical.
         self.has_extra = bool(has_extra)
         self.pbs_extra = int(pbs_extra)
+        # VALID_HPB (small-TP / non-multiple-of-16 head shards). Upstream
+        # VALID_HPB=min(NUM_HEADS,HPB) (decode_dsv4_kernel.cuh:152): the kernel
+        # computes a FULL HPB=16 tile with zero-Q padding then gates output/LSE
+        # writes to valid_hpb rows. ``valid_hpb`` is a const_expr (s0/s4/s7 gate on
+        # it). When valid_hpb == t.hpb (the FULL-block default) the s0/s4/s7 calls
+        # pass the IDENTICAL constexpr value as the pre-P10 kernel, so the
+        # full-block trace + PTX stay byte-identical. A REMAINDER block (heads not
+        # a multiple of 16) is launched as a SEPARATE 1-block grid with
+        # valid_hpb=remainder and head_block_offset shifting head_base to the
+        # tail head range.
+        self.valid_hpb = int(valid_hpb) if valid_hpb is not None else int(traits.hpb)
+        # head_block_offset shifts head_base = (head_block + offset) * hpb so a
+        # remainder-only 1-block grid writes the correct (tail) head range. When 0
+        # (the full-block / base path) the const_expr branch is elided -> the
+        # head_base computation is byte-identical to the pre-P10 kernel.
+        self.head_block_offset = int(head_block_offset)
         self.math_threads = int(traits.math_threads)
         self.block_threads = int(traits.block_threads)
 
@@ -366,6 +385,10 @@ class UnifiedDecodeKernel:
         token_idx = Int32(token_idx)
         head_block = Int32(head_block)
         split_idx = Int32(split_idx)
+        # REMAINDER-block grids shift head_base to the tail head range; the offset
+        # const_expr is elided (==0) for the full-block / base path -> byte-identical.
+        if cutlass.const_expr(self.head_block_offset != 0):
+            head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(t.hpb)
 
         smem = cutlass_utils.SmemAllocator()
@@ -473,7 +496,7 @@ class UnifiedDecodeKernel:
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
             s0_quantize_q_to_smem(
                 q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
-                head_base, Int32(t.hpb), tid,
+                head_base, Int32(self.valid_hpb), tid,
                 d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
                 quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
                 q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
@@ -554,7 +577,7 @@ class UnifiedDecodeKernel:
                     qk, p, acc_nope, acc_rope, global_max, global_sum,
                     reduce_max_addr, reduce_sum_addr, False,
                     warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=t.hpb,
+                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
                     num_threads=self.math_threads, barrier_id=3,
                     n_acc_tiles=n_acc_tiles,
                 )
@@ -637,7 +660,7 @@ class UnifiedDecodeKernel:
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
                 warp_id, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
-                d_rope=t.d_rope, n_warps=8, valid_hpb=t.hpb,
+                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
             )
 
@@ -697,6 +720,10 @@ class UnifiedDecodeKernel:
         token_idx = Int32(token_idx)
         head_block = Int32(head_block)
         split_idx = Int32(split_idx)
+        # REMAINDER-block grids shift head_base to the tail head range; the offset
+        # const_expr is elided (==0) for the full-block / base path -> byte-identical.
+        if cutlass.const_expr(self.head_block_offset != 0):
+            head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(t.hpb)
 
         smem = cutlass_utils.SmemAllocator()
@@ -859,7 +886,7 @@ class UnifiedDecodeKernel:
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
             s0_quantize_q_to_smem(
                 q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
-                head_base, Int32(t.hpb), tid,
+                head_base, Int32(self.valid_hpb), tid,
                 d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
                 quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
                 q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
@@ -961,7 +988,7 @@ class UnifiedDecodeKernel:
                     qk, p, acc_nope, acc_rope, global_max, global_sum,
                     reduce_max_addr, reduce_sum_addr, False,
                     warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=t.hpb,
+                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
                     num_threads=self.math_threads, barrier_id=3,
                     n_acc_tiles=n_acc_tiles,
                 )
@@ -1044,7 +1071,7 @@ class UnifiedDecodeKernel:
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
                 warp_id, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
-                d_rope=t.d_rope, n_warps=8, valid_hpb=t.hpb,
+                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
             )
 
@@ -1107,33 +1134,31 @@ def run_unified_decode(
         or indexed_topk_lengths is not None
     )
     if has_extra:
+        # Partial dual-cache trio is a HARD ERROR (upstream ICHECKs extra_indices
+        # requires extra_kv_cache; sparse_mla_sm120.cu:171-174). NOT a fallback.
         if (
             indexed_k_cache is None
             or indexed_indices is None
             or indexed_page_size is None
         ):
-            raise NotImplementedError(
+            raise ValueError(
                 "unified_sm120 decode dual-cache requires indexed_k_cache, "
-                "indexed_indices, and indexed_page_size together; fall back to legacy"
+                "indexed_indices, and indexed_page_size together (partial extra "
+                "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
             )
+        # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream is
+        # raw-slot-id only; no page-table indirection). RAISE, not fallback.
         if indexed_page_table is not None:
-            raise NotImplementedError(
+            raise ValueError(
                 "unified_sm120 decode: indexed_page_table (mapped extra pages) is "
-                "not supported; fall back to legacy"
+                "unsupported on SM120 sparse-MLA; upstream addresses the extra cache "
+                "by raw slot id only"
             )
         if int(q_all.shape[-1]) != _DSV4_HEAD_DIM:
-            raise NotImplementedError(
+            raise ValueError(
                 "unified_sm120 decode dual-cache (extra tokens) is DSV4-only "
-                "(q_head_dim==512); fall back to legacy"
+                "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
-    if attn_sink is not None:
-        raise NotImplementedError(
-            "unified_sm120 decode: attn_sink fold is not yet supported; fall back to legacy"
-        )
-    if return_lse:
-        raise NotImplementedError(
-            "unified_sm120 decode: return_lse is not yet supported; fall back to legacy"
-        )
 
     q_head_dim = int(q_all.shape[-1])
     if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
@@ -1144,11 +1169,44 @@ def run_unified_decode(
 
     rows, heads, _ = q_all.shape
     hpb = 16
-    if heads % hpb != 0:
-        raise NotImplementedError(
-            f"unified_sm120 decode requires heads divisible by HPB={hpb}, got {heads}"
+    if heads <= 0:
+        raise ValueError(f"unified_sm120 decode requires heads > 0, got {heads}")
+
+    # attn_sink [num_heads] f32: upstream applies it in the DECODE MERGE
+    # (sparse_mla_sm120_decode_dsv4.cu:128-129). Validate shape/dtype/device; the
+    # fold itself is wired into the split.py sink-merge below (no kernel change).
+    if attn_sink is not None:
+        attn_sink = attn_sink.detach()
+        if attn_sink.shape != (heads,):
+            raise ValueError(
+                f"unified_sm120 decode attn_sink must have shape [{heads}], "
+                f"got {tuple(attn_sink.shape)}"
+            )
+        if attn_sink.dtype != torch.float32:
+            raise TypeError(
+                f"unified_sm120 decode attn_sink must be float32, got {attn_sink.dtype}"
+            )
+        if attn_sink.device != q_all.device:
+            raise ValueError(
+                "unified_sm120 decode attn_sink must be on the same device as q_all"
+            )
+        if not attn_sink.is_contiguous():
+            raise ValueError("unified_sm120 decode attn_sink must be contiguous")
+    if lse_scale not in ("base2", "natural"):
+        raise ValueError(
+            f"unified_sm120 decode lse_scale must be 'base2' or 'natural', got {lse_scale!r}"
         )
-    h_blocks = heads // hpb
+    # VALID_HPB<16 / non-multiple-of-16 heads (small-TP shards): upstream
+    # VALID_HPB=min(NUM_HEADS,HPB) (decode_dsv4_kernel.cuh:152) computes a full
+    # HPB=16 tile with zero-Q padding and gates writes to valid_hpb rows. We
+    # realise this with up to TWO grid launches: ``h_blocks_full`` full blocks
+    # (valid_hpb=16) plus one REMAINDER block (valid_hpb=heads%16) when heads is
+    # not a multiple of 16. heads in {8} -> 0 full blocks + 1 remainder block of
+    # valid_hpb=8. The base case (heads multiple of 16, e.g. 128) is a single
+    # full-block grid -> byte-identical to the pre-P10 kernel.
+    h_blocks_full = heads // hpb
+    rem_heads = heads % hpb
+    h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
     model_type, compute_mode, scale_format = infer_model_type(q_head_dim, swa_k_cache.dtype)
     traits = make_unified_traits(model_type, compute_mode, scale_format)
@@ -1237,11 +1295,6 @@ def run_unified_decode(
 
     output = workspace.output_buffer[:rows, :heads, :d_v]
 
-    kernel = UnifiedDecodeKernel(
-        traits, layout, int(swa_page_size), chunks_per_split,
-        num_tokens=rows, h_blocks=h_blocks, num_splits=num_splits,
-        has_extra=has_extra, pbs_extra=pbs_extra,
-    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     kv_flat = swa_k_cache.reshape(-1)
@@ -1269,57 +1322,83 @@ def run_unified_decode(
     else:
         args = base_args + (stream,)
 
-    spec_fields = [
-        key_field("model_type", traits.model_type),
-        key_field("compute_mode", traits.compute_mode),
-        key_field("scale_format", traits.scale_format),
-        key_field("num_heads", int(heads)),
-        key_field("hpb", int(hpb)),
-        key_field("chunks_per_split", int(chunks_per_split)),
-        key_field("page_block_size", int(swa_page_size)),
-        key_field("topk_bucket", _topk_bucket(topk)),
-        # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache
-        # kernel: has_extra gates the extra-section const_expr (no-extra DSV4 PTX
-        # byte-identical), pbs_extra is the runtime extra page block size, and the
-        # extra topk bucket keeps the key compact.
-        key_field("has_extra", int(has_extra)),
-        key_field("pbs_extra", int(pbs_extra)),
-        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
-        # rows (== num_tokens) is BAKED into the launch grid
-        # (grid=(num_tokens, h_blocks, num_splits), concrete-shape trace), so it
-        # MUST be a compile key -- DimKey.exact on every row dim + a num_tokens
-        # key_field. A DimKey.dynamic() row dim would silently REUSE a kernel
-        # traced for a different num_tokens with the wrong grid (latent rows>1
-        # bug); key the exact T, exactly as prefill.py does.
-        key_field("num_tokens", int(rows)),
-        tensor_key("q_all", q_all, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.exact(q_head_dim))),
-        tensor_key("swa_indices", swa_indices, dims=(DimKey.exact(rows), DimKey.bucket(topk))),
-        tensor_key("mid_out", mid_out, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
-        tensor_key("mid_lse", mid_lse, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits))),
-    ]
-    if has_extra:
-        spec_fields.append(
-            tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))))
+    def _launch_grid(grid_h_blocks: int, valid_hpb: int, head_block_offset: int):
+        # Build + launch ONE grid of ``grid_h_blocks`` head-blocks with a fixed
+        # ``valid_hpb`` const_expr and a ``head_block_offset`` that shifts head_base
+        # to the right head range. The full-block grid (valid_hpb=16, offset=0,
+        # heads a multiple of 16) is the byte-identical base path; the remainder
+        # grid (valid_hpb<16, offset=h_blocks_full) handles the tail head-block.
+        kernel = UnifiedDecodeKernel(
+            traits, layout, int(swa_page_size), chunks_per_split,
+            num_tokens=rows, h_blocks=int(grid_h_blocks), num_splits=num_splits,
+            has_extra=has_extra, pbs_extra=pbs_extra,
+            valid_hpb=int(valid_hpb), head_block_offset=int(head_block_offset),
         )
-    compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.decode",
-        # version 2: P7c dual-cache kernel signature (extra_* args + has_extra
-        # const_expr). The cache key is kernel_id + version + fields, so this bump
-        # invalidates any stale v1 single-cache decode objects on the disk cache.
-        # The no-extra (has_extra=0) trace + PTX are unchanged from v1.
-        2,
-        *spec_fields,
-    )
-    # Select the entry method: the dual-cache path uses kernel.call_extra (a
-    # DISTINCT mangled name); the single-cache path uses the kernel object (->
-    # __call__) whose name + PTX stay byte-identical to the pre-P7c kernel.
-    entry = kernel.call_extra if has_extra else kernel
-    b12x_launch(
-        entry,
-        compile_spec=compile_spec,
-        compile_args=args,
-        runtime_args=args,
-    )
+        spec_fields = [
+            key_field("model_type", traits.model_type),
+            key_field("compute_mode", traits.compute_mode),
+            key_field("scale_format", traits.scale_format),
+            key_field("num_heads", int(heads)),
+            key_field("hpb", int(hpb)),
+            # valid_hpb + head_block_offset specialize the VALID_HPB<16 / tail
+            # head-block const_expr (full-block grid keeps valid_hpb=16, offset=0
+            # -> PTX byte-identical to the pre-P10 kernel).
+            key_field("valid_hpb", int(valid_hpb)),
+            key_field("head_block_offset", int(head_block_offset)),
+            key_field("grid_h_blocks", int(grid_h_blocks)),
+            key_field("chunks_per_split", int(chunks_per_split)),
+            key_field("page_block_size", int(swa_page_size)),
+            key_field("topk_bucket", _topk_bucket(topk)),
+            # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache
+            # kernel: has_extra gates the extra-section const_expr (no-extra DSV4 PTX
+            # byte-identical), pbs_extra is the runtime extra page block size, and the
+            # extra topk bucket keeps the key compact.
+            key_field("has_extra", int(has_extra)),
+            key_field("pbs_extra", int(pbs_extra)),
+            key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
+            # rows (== num_tokens) is BAKED into the launch grid
+            # (grid=(num_tokens, h_blocks, num_splits), concrete-shape trace), so it
+            # MUST be a compile key -- DimKey.exact on every row dim + a num_tokens
+            # key_field. A DimKey.dynamic() row dim would silently REUSE a kernel
+            # traced for a different num_tokens with the wrong grid (latent rows>1
+            # bug); key the exact T, exactly as prefill.py does.
+            key_field("num_tokens", int(rows)),
+            tensor_key("q_all", q_all, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.exact(q_head_dim))),
+            tensor_key("swa_indices", swa_indices, dims=(DimKey.exact(rows), DimKey.bucket(topk))),
+            tensor_key("mid_out", mid_out, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
+            tensor_key("mid_lse", mid_lse, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits))),
+        ]
+        if has_extra:
+            spec_fields.append(
+                tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))))
+            )
+        compile_spec = KernelCompileSpec.from_fields(
+            "attention.mla.unified_sm120.decode",
+            # version 2: P7c dual-cache kernel signature (extra_* args + has_extra
+            # const_expr). The cache key is kernel_id + version + fields, so this bump
+            # invalidates any stale v1 single-cache decode objects on the disk cache.
+            # The no-extra (has_extra=0) trace + PTX are unchanged from v1.
+            2,
+            *spec_fields,
+        )
+        # Select the entry method: the dual-cache path uses kernel.call_extra (a
+        # DISTINCT mangled name); the single-cache path uses the kernel object (->
+        # __call__) whose name + PTX stay byte-identical to the pre-P7c kernel.
+        entry = kernel.call_extra if has_extra else kernel
+        b12x_launch(
+            entry,
+            compile_spec=compile_spec,
+            compile_args=args,
+            runtime_args=args,
+        )
+
+    if h_blocks_full > 0:
+        # FULL HPB=16 head-blocks (the base path when heads is a multiple of 16).
+        _launch_grid(h_blocks_full, hpb, 0)
+    if rem_heads:
+        # REMAINDER tail head-block: a 1-block grid with valid_hpb=rem_heads at
+        # head_block offset h_blocks_full (so head_base = h_blocks_full*16).
+        _launch_grid(1, rem_heads, h_blocks_full)
 
     # ── REUSED base-2 merge over the split axis -> final O. num_splits=1 is the
     #    trivial 1-split merge (partial == final O). ──
@@ -1331,16 +1410,43 @@ def run_unified_decode(
     if int(workspace.num_chunks_value or -1) != num_splits:
         workspace.set_split_chunk_config(kv_chunk_size=_CAND_WINDOW, num_chunks=num_splits)
 
+    # When attn_sink is supplied, the merge SELECTS the sink-folding merge kernel
+    # (split.py SparseMLASplitDecodeSinkMergeKernel) which applies the FlashMLA V4
+    # fold output *= sigmoid(lse_e - sink) directly into O (exactly upstream's
+    # sink-in-merge design, sparse_mla_sm120_decode_dsv4.cu:128-129). With no sink
+    # it is the plain base-2 merge -> PTX/numerics byte-identical to the base path.
     merge_binding = build_sparse_mla_split_decode_merge_binding(
         tmp_output=mid_out,
         tmp_lse=mid_lse,
         num_chunks_ptr=workspace.num_chunks_ptr,
         output=output,
-        attn_sink=None,
+        attn_sink=attn_sink,
         workspace=workspace,
     )
     run_sparse_mla_split_decode_merge(binding=merge_binding)
-    return output
+    if not return_lse:
+        return output
+
+    # return_lse: reconstruct the FINAL LSE from the per-split base-2 mid_lse
+    # (logsumexp over the split axis, base2->natural). mid_lse aliases
+    # workspace.tmp_lse[:rows,:heads,:num_splits], so reuse the shared helper.
+    from b12x.attention.mla.api import _final_lse_from_split_workspace
+
+    lse_natural = _final_lse_from_split_workspace(
+        workspace=workspace,
+        q_rows=rows,
+        num_heads=heads,
+        launch_num_chunks=num_splits,
+        scale="natural",
+    )
+    if attn_sink is not None:
+        # Fold the per-head sink into the LSE in the natural-log domain (the merge
+        # already folded it into O): lse' = log(exp(lse) + exp(sink)).
+        sink = attn_sink.float().view(1, heads)
+        lse_natural = torch.logaddexp(lse_natural.float(), sink)
+    if lse_scale == "base2":
+        return output, (lse_natural / _LN2)
+    return output, lse_natural
 
 
 def run_unified_prefill(*args, **kwargs):
