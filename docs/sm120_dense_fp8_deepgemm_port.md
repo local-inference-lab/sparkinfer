@@ -51,6 +51,13 @@ faster. Built on branch `rs-2`, validated on RTX PRO 6000 Blackwell (sm_120,
 
 ## 2. The reframing finding (audit beat the premise)
 
+> **Correction (2026-05-30, see §8):** the claim below that "the port was never a
+> numerics gap" was **right for activations but wrong for weights**, and was
+> *asserted, never measured*. A rigorous re-audit found a dropped
+> re-quantization step in weight packing (DeepSeek arbitrary-fp32 block scales
+> were rounded to UE8M0 while keeping stale FP8 values → ~2.7× excess weight
+> error). Fixed; see §8.
+
 b12x **already had** a working CuTeDSL SM120 block-scaled FP8 GEMM, and it
 **already does DeepSeek-style scaling with the identical MMA instruction**
 (`mma.sync...mxf8f6f4.block_scale.scale_vec::1X.m16n8k32...ue8m0`). Activations
@@ -199,3 +206,60 @@ diminishing returns:
 
 *Built via Claude Code dynamic-workflow orchestration; every gate independently
 re-run before commit.*
+
+---
+
+## 8. Correction: the dropped weight re-quantization step (2026-05-30)
+
+A re-audit re-examined the §2 premise *"the port was never a numerics gap"*
+against DeepGEMM's actual quantizer (`deepgemm-other/deep_gemm/utils/math.py`),
+**measuring** byte-exactness instead of asserting it. Findings:
+
+**Activations were genuinely at parity** (the §2 claim was correct here):
+- `quantize_block_fp8_linear_input_mxfp8` is **byte-for-byte identical** to
+  DeepGEMM `per_token_cast_to_fp8` at gran_k=32 — same FP8 bytes *and* same
+  UE8M0 scales (`benchmarks/probe_quant_parity_deepgemm.py`: 100%/100%).
+- The `ceil(log2)/exp2` UE8M0 path equals DeepGEMM's bit-exact `ceil_to_ue8m0`
+  across 200k values incl. exact powers of two and the real Triton kernel
+  (`benchmarks/probe_quant_parity_adversarial.py`: 0 mismatches).
+- gran_k=32 (b12x) vs 128 (DeepGEMM) is real but **numerically neutral** in
+  realistic regimes (identical cos even with 3%×40 outlier channels) and costs
+  nothing at the MMA (which consumes per-32 SF either way).
+
+**The weight path dropped a re-quantization step (the real bug):**
+- DeepSeek checkpoints carry `(w_fp8, weight_scale_inv)` where `weight_scale_inv
+  = block_amax/448` is an **arbitrary fp32** 128×128 block scale. Production
+  (`vllm-other …/scaled_mm/b12x.py`) feeds it straight to
+  `pack_fp8_block_scaled_weight_mxfp8` — used by **both** dense `block_fp8` and
+  the WO `wo_a`/`wo_b` weights.
+- The packer **rounded the scale to the nearest power of two and kept the
+  original FP8 values**, leaving values matched to the *unrounded* scale →
+  per-block scale error up to √2.
+- Measured (`benchmarks/probe_weight_requant_parity.py`, N=K=4096): weight
+  rel-Fro vs bf16 **0.102** (round-keep) vs **0.0264** checkpoint floor — i.e.
+  ~3.9× the irreducible error, ~10% GEMM error vs the fp32 oracle.
+- **Why it was missed:** there was never a byte-exact test vs DeepGEMM, and the
+  one test that exercises this packer (`test_pack_fp8_block_scaled_weight_…`)
+  feeds **already-power-of-two e8m0** scales, so the arbitrary-fp32 case never
+  ran. The GEMM correctness gate compared b12x to a reference consuming b12x's
+  *own* FP8, so a DeepGEMM divergence was invisible.
+
+**Fix** (`b12x/gemm/wo_projection.py`): when the block scale is **not** already
+exact UE8M0, `pack_fp8_block_scaled_weight_mxfp8` now **re-quantizes** —
+reconstruct `w_fp8 · s_fp32`, then ceil-UE8M0 `per_block_cast` to derive *fresh*
+FP8 values consistent with the power-of-two scale (DeepGEMM
+`per_block_cast_to_fp8` parity). One-time at weight load; no serving-path cost.
+Already-UE8M0 scales keep their FP8 values verbatim (`_scale_is_exact_ue8m0`
+guard), so the existing e8m0 contract is byte-identical.
+
+- **Result:** dense weight rel-Fro **0.102 → 0.0373**, WO (num_groups>1)
+  **0.0369** — at the DeepGEMM/e4m3 floor (`probe_weight_requant_integration.py`).
+- **Gate:** `tests/test_fp8_quant_deepgemm_parity.py` (new) — the byte-exact
+  DeepGEMM comparison that should have existed. Full FP8 surface shows **no new
+  failures** vs baseline under the flashinfer interpreter (4 pre-existing
+  failures unchanged: 2 WO-A *activation*-quant-vs-reference 32-vs-128 column
+  mismatches — numerically neutral — and 2 `alpha` test-mock TypeErrors).
+
+*Re-audit via Claude Code multi-agent orchestration; agent claims (e.g. a
+spurious "divisor 240" and a mis-stated "128-col activation" granularity) were
+re-verified against source and discarded where wrong before any change.*
