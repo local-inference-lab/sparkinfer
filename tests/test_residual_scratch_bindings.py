@@ -148,6 +148,92 @@ def test_mhc_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
     assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
 
 
+def test_mhc_pre_post_binding_supplies_workspace_outputs(monkeypatch) -> None:
+    workspace = empty_mhc_workspace(
+        num_tokens=4,
+        hidden_size=16,
+        split_k=MHC_DEFAULT_SPLIT_K,
+        device="cpu",
+    )
+    binding = workspace.bind()
+    residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
+    x = torch.empty((0, 16), dtype=torch.bfloat16)
+    fn = torch.empty((24, 64), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+
+    def fake_validate_pre_inputs(*args):
+        return 0, 16, MHC_DEFAULT_SPLIT_K * MHC_DEFAULT_BLOCK_K
+
+    monkeypatch.setattr(residual_impl, "_validate_pre_inputs", fake_validate_pre_inputs)
+
+    y, post, comb, out = residual_impl.b12x_mhc_pre_post(
+        x,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=2,
+        binding=binding,
+    )
+
+    assert y.shape == (0, 16)
+    assert post.shape == (0, 4)
+    assert comb.shape == (0, 4, 4)
+    assert out.shape == (0, 4, 16)
+    assert y.untyped_storage().data_ptr() == workspace.y.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == workspace.post.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
+    assert out.untyped_storage().data_ptr() == workspace.out.untyped_storage().data_ptr()
+
+
+def test_mhc_post_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
+    workspace = empty_mhc_workspace(
+        num_tokens=4,
+        hidden_size=16,
+        split_k=MHC_DEFAULT_SPLIT_K,
+        device="cpu",
+    )
+    binding = workspace.bind()
+    residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
+    x = torch.empty((0, 16), dtype=torch.bfloat16)
+    prev_post = torch.empty((0, 4, 1), dtype=torch.float32)
+    prev_comb = torch.empty((0, 4, 4), dtype=torch.float32)
+    fn = torch.empty((24, 64), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+
+    def fake_validate_pre_inputs(*args):
+        return 0, 16, MHC_DEFAULT_SPLIT_K * MHC_DEFAULT_BLOCK_K
+
+    monkeypatch.setattr(residual_impl, "_validate_pre_inputs", fake_validate_pre_inputs)
+
+    residual_cur, post, comb, y = residual_impl.b12x_mhc_post_pre(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=2,
+        binding=binding,
+    )
+
+    assert residual_cur.shape == (0, 4, 16)
+    assert post.shape == (0, 4)
+    assert comb.shape == (0, 4, 4)
+    assert y.shape == (0, 16)
+    assert residual_cur.untyped_storage().data_ptr() == workspace.out.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == workspace.post.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
+    assert y.untyped_storage().data_ptr() == workspace.y.untyped_storage().data_ptr()
+
+
 def test_mhc_pre_binding_owns_outputs() -> None:
     workspace = empty_mhc_workspace(
         num_tokens=4,
