@@ -453,6 +453,53 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
     torch.testing.assert_close(workspace.output[:, :, 0], eager, rtol=0, atol=0)
 
 
+def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
+    # The DeepGEMM-style expected_m hint must thread orchestrator -> wo_b leaf ->
+    # dense_gemm and change ONLY the wo_b up-projection tile (N=hidden>1536),
+    # leaving the result byte-identical (tiling does not change the block-scaled
+    # MMA). hidden=2048 (>1536) so expected_m=64 actually selects a different
+    # wo_b tile (32x128) than the default (64x128).
+    require_sm120()
+    torch.manual_seed(31004)
+
+    tokens, groups, group_width, rank, hidden = 32, 2, 128, 64, 2048
+    x_tgd = torch.randn(
+        (tokens, groups, group_width), device="cuda", dtype=torch.bfloat16
+    ) / 4
+    wo_a_grd = (
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / group_width**0.5
+    )
+    wo_b_hgr = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
+    ws = empty_wo_projection_workspace(
+        tokens,
+        groups=groups,
+        group_width=group_width,
+        rank=rank,
+        hidden=hidden,
+        device="cuda",
+    )
+
+    # Different regime tiles must give byte-identical output (tiling does not
+    # change the block-scaled MMA): decode 32x128 (expected_m<=128) vs prefill
+    # 64x128 (expected_m>128).
+    out_decode = wo_projection_mxfp8(x_tgd, weights, ws, expected_m=8).clone()
+    out_prefill = wo_projection_mxfp8(x_tgd, weights, ws, expected_m=4096).clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_decode, out_prefill, rtol=0, atol=0)
+
+    # WO auto-defaults expected_m to the token count: omitting it at tokens=32
+    # must match expected_m=32 (both pick the decode 32x128 tile here).
+    out_auto = wo_projection_mxfp8(x_tgd, weights, ws).clone()
+    out_explicit = wo_projection_mxfp8(x_tgd, weights, ws, expected_m=32).clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_auto, out_explicit, rtol=0, atol=0)
+
+
 def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
     require_sm120()
     torch.manual_seed(31004)

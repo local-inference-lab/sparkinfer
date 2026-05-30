@@ -131,7 +131,7 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
         calls["x_q_out"] = out
         return out
 
-    def fake_wo_a(x_q, wo_a, *, out):
+    def fake_wo_a(x_q, wo_a, *, out, expected_m=None):
         calls["x_q"] = x_q
         calls["wo_a"] = wo_a
         calls["tmp_out"] = out
@@ -142,7 +142,7 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
         calls["tmp_q_out"] = out
         return out
 
-    def fake_wo_b(tmp_q, wo_b, *, out):
+    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None):
         calls["tmp_q"] = tmp_q
         calls["wo_b"] = wo_b
         calls["output_out"] = out
@@ -194,10 +194,12 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         return kwargs["out"]
 
     monkeypatch.setattr(wo_impl, "quantize_wo_a_input_inv_rope_mxfp8", fake_quantize_a)
-    monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", lambda x_q, wo_a, *, out: out)
+    monkeypatch.setattr(
+        wo_impl, "wo_a_dense_gemm_mxfp8", lambda x_q, wo_a, *, out, expected_m=None: out
+    )
     monkeypatch.setattr(wo_impl, "quantize_wo_b_input_mxfp8", lambda tmp, *, out: out)
 
-    def fake_wo_b(tmp_q, wo_b, *, out):
+    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None):
         out.zero_()
         return out
 

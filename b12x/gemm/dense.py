@@ -1868,17 +1868,39 @@ def _select_default_mma_tiler_mn(
     sm_count: int,
     *,
     is_mxfp8: bool,
+    expected_m: Optional[int] = None,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
     if is_mxfp8 and n > 1536:
-        # Keep the true single-token decode specialization, but do not let
-        # ordinary live prefill tails choose compile-time-only small-M tiles.
-        # vLLM warms attention with large prefill shapes and then passes the
-        # live token count at launch; prefix-cache continuations can otherwise
-        # hit first-use compiles for m=16/32/128 during serving.
+        # DeepGEMM-style regime hint. When a caller declares expected_m, pick the
+        # per-regime optimal tile and key the compile on it: ONE kernel per
+        # (N,K,expected_m), reused for every live M in that regime under frozen
+        # resolution (M-independent within the regime). Probe optima
+        # (benchmarks/probe_dense_fp8_tile_sweep.py): expected_m<=1 -> 16x128;
+        # <=128 (decode/small batch) -> 32x128 (~25% faster than 64x128 at
+        # M=32..128); else -> 64x128 (the M-independent default, good to prefill).
+        if expected_m is not None:
+            if expected_m <= 1:
+                return (16, 128)
+            if expected_m <= 128:
+                return (32, 128)
+            return (64, 128)
+        # No regime hint: stay M-INDEPENDENT so one kernel serves all live M.
+        # Keep the true single-token decode specialization.
         if m == 1:
             return (16, 128)
-        return coarse_tile
+        # Wide-N MXFP8: the 128x128 pin spans only ceil(N/128) column tiles, so
+        # at small/medium M it launches ~32-64 CTAs and runs flat (~80us, B-BW
+        # starved). It is in fact the WORST tile at every M (geomean ~121us over
+        # M=2..4096; see benchmarks/probe_dense_fp8_tile_sweep.py). 64x128 is the
+        # best M-INDEPENDENT tile: it beats 128x128 at every M (1.1x-2.4x; geomean
+        # ~69us) with byte-identical output. M-independence is required because
+        # dense serving warms one kernel per (N,K) and reuses it for all live M
+        # under frozen resolution (see test_block_fp8_linear_small_live_m_reuses_
+        # prefill_dense_kernel) -- an M-dependent tile forces an illegal recompile
+        # mid-serve. (Smaller 32x128/16x128 are faster at M<=128 but regress
+        # prefill M>=2k and would break that one-kernel-per-(N,K) reuse contract.)
+        return (64, 128)
 
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
@@ -1919,8 +1941,16 @@ def dense_gemm(
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     alpha: Optional[torch.Tensor] = None,
     alpha_dtype: Optional[str] = None,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
-    """Execute dense block-scaled GEMM for one expert-major batch stack."""
+    """Execute dense block-scaled GEMM for one expert-major batch stack.
+
+    expected_m: optional regime hint (DeepGEMM-style). When set, the default tile
+    is chosen for that representative M instead of being M-independent, giving a
+    per-regime-optimal kernel that is still reused across all live M in the regime
+    (e.g. expected_m<=128 selects a decode-tuned tile). Ignored when mma_tiler_mn
+    is given. Live M stays a runtime arg; only the tile (a compile key) changes.
+    """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
 
@@ -1949,6 +1979,7 @@ def dense_gemm(
             n,
             sm_count,
             is_mxfp8=is_mxfp8,
+            expected_m=expected_m,
         )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]

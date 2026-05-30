@@ -68,12 +68,14 @@ class WOProjectionWorkspace:
         source_tgd: torch.Tensor,
         weights: "WOProjectionMXFP8Weights",
         return_3d: bool = False,
+        expected_m: int | None = None,
     ) -> "WOProjectionBinding":
         return build_wo_projection_binding(
             workspace=self,
             source_tgd=source_tgd,
             weights=weights,
             return_3d=return_3d,
+            expected_m=expected_m,
         )
 
     def bind_inv_rope(
@@ -87,6 +89,7 @@ class WOProjectionWorkspace:
         nope_dim: int = 448,
         rope_dim: int = 64,
         return_3d: bool = False,
+        expected_m: int | None = None,
     ) -> "WOProjectionInvRopeBinding":
         return build_wo_projection_inv_rope_binding(
             workspace=self,
@@ -98,6 +101,7 @@ class WOProjectionWorkspace:
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             return_3d=return_3d,
+            expected_m=expected_m,
         )
 
 
@@ -110,6 +114,9 @@ class WOProjectionBinding:
     tmp_q: MXFP8Rows
     output: torch.Tensor
     return_3d: bool = False
+    # DeepGEMM-style regime hint forwarded to the wo_b up-projection (N=hidden,
+    # the n>1536 path). None keeps the M-independent default tile.
+    expected_m: int | None = None
 
     def run(self) -> torch.Tensor:
         return wo_projection_mxfp8(binding=self)
@@ -129,6 +136,8 @@ class WOProjectionInvRopeBinding:
     nope_dim: int = 448
     rope_dim: int = 64
     return_3d: bool = False
+    # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
+    expected_m: int | None = None
 
     def run(self) -> torch.Tensor:
         return wo_projection_inv_rope_mxfp8(binding=self)
@@ -182,6 +191,7 @@ class WOProjectionScratchPlan:
         source_tgd: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
         return_3d: bool = False,
+        expected_m: int | None = None,
     ) -> WOProjectionBinding:
         tokens = _validate_wo_projection_inputs(source_tgd, weights)
         self._check_live_capacity(tokens=tokens, weights=weights)
@@ -191,6 +201,7 @@ class WOProjectionScratchPlan:
             source_tgd=source_tgd,
             weights=weights,
             return_3d=return_3d,
+            expected_m=expected_m,
         )
 
     def bind_inv_rope(
@@ -205,6 +216,7 @@ class WOProjectionScratchPlan:
         nope_dim: int = 448,
         rope_dim: int = 64,
         return_3d: bool = False,
+        expected_m: int | None = None,
     ) -> WOProjectionInvRopeBinding:
         tokens = _validate_wo_projection_inv_rope_inputs(
             o=o,
@@ -225,6 +237,7 @@ class WOProjectionScratchPlan:
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             return_3d=return_3d,
+            expected_m=expected_m,
         )
 
     def make_workspace(
@@ -1467,6 +1480,7 @@ def build_wo_projection_binding(
     source_tgd: torch.Tensor,
     weights: WOProjectionMXFP8Weights,
     return_3d: bool = False,
+    expected_m: int | None = None,
 ) -> WOProjectionBinding:
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
@@ -1478,6 +1492,7 @@ def build_wo_projection_binding(
         tmp_q=workspace.tmp_q,
         output=workspace.output,
         return_3d=bool(return_3d),
+        expected_m=expected_m,
     )
 
 
@@ -1492,6 +1507,7 @@ def build_wo_projection_inv_rope_binding(
     nope_dim: int = 448,
     rope_dim: int = 64,
     return_3d: bool = False,
+    expected_m: int | None = None,
 ) -> WOProjectionInvRopeBinding:
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
@@ -1516,6 +1532,7 @@ def build_wo_projection_inv_rope_binding(
         nope_dim=int(nope_dim),
         rope_dim=int(rope_dim),
         return_3d=bool(return_3d),
+        expected_m=expected_m,
     )
 
 
@@ -1546,6 +1563,7 @@ def wo_a_dense_gemm_mxfp8(
     wo_a_rdg: MXFP8Rows,
     *,
     out: torch.Tensor | None = None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run WO-A as grouped MXFP8 dense GEMM.
 
@@ -1578,6 +1596,7 @@ def wo_a_dense_gemm_mxfp8(
         c_dtype="bfloat16",
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=out,
+        expected_m=expected_m,
     )
 
 
@@ -1586,6 +1605,7 @@ def wo_b_dense_gemm_mxfp8(
     wo_b_hgr: MXFP8Rows,
     *,
     out: torch.Tensor | None = None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run group-major WO-B as MXFP8 dense GEMM.
 
@@ -1634,6 +1654,7 @@ def wo_b_dense_gemm_mxfp8(
         c_dtype="bfloat16",
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=out,
+        expected_m=expected_m,
     )
 
 
@@ -1644,6 +1665,7 @@ def wo_projection_mxfp8(
     *,
     return_3d: bool = False,
     binding: WOProjectionBinding | None = None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run the native MXFP8 WO-A/WO-B projection.
 
@@ -1677,6 +1699,7 @@ def wo_projection_mxfp8(
         tmp_q = binding.tmp_q
         output = binding.output
         return_3d = binding.return_3d
+        expected_m = binding.expected_m
     else:
         x_q = None
         tmp = None
@@ -1685,6 +1708,13 @@ def wo_projection_mxfp8(
     if source_tgd is None or weights is None:
         raise TypeError("wo_projection_mxfp8 requires source_tgd, weights, and workspace or binding")
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
+    # WO auto-defaults the regime hint to the (capture-fixed) token count so the
+    # wo_b up-projection (N=hidden>1536) picks the decode tile (32x128) at small
+    # M and the prefill tile (64x128) at large M, with no caller change.
+    # Freeze-safe: the binding is built per-forward / per-capture, so `tokens`
+    # is fixed per compiled kernel. Pass expected_m explicitly to override.
+    if expected_m is None:
+        expected_m = int(tokens)
     if workspace is not None:
         _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
         x_q = workspace.x_q
@@ -1695,9 +1725,9 @@ def wo_projection_mxfp8(
         raise TypeError("wo_projection_mxfp8 requires source_tgd, weights, and workspace or binding")
 
     quantize_wo_a_input_mxfp8(source_tgd, out=x_q)
-    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp)
+    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp, expected_m=expected_m)
     quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
-    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output)
+    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output, expected_m=expected_m)
     if return_3d:
         return output
     return output[:, :, 0]
@@ -1715,6 +1745,7 @@ def wo_projection_inv_rope_mxfp8(
     rope_dim: int = 64,
     return_3d: bool = False,
     binding: WOProjectionInvRopeBinding | None = None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run WO projection from attention output without BF16 inverse-RoPE storage."""
 
@@ -1760,6 +1791,7 @@ def wo_projection_inv_rope_mxfp8(
         nope_dim = binding.nope_dim
         rope_dim = binding.rope_dim
         return_3d = binding.return_3d
+        expected_m = binding.expected_m
     else:
         x_q = None
         tmp = None
@@ -1785,6 +1817,10 @@ def wo_projection_inv_rope_mxfp8(
     )
     _check_gpu_tensor("positions", positions)
     _check_gpu_tensor("cos_sin_cache", cos_sin_cache)
+    # Auto-default the regime hint to the (capture-fixed) token count (see
+    # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
+    if expected_m is None:
+        expected_m = int(tokens)
     if workspace is not None:
         _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
         x_q = workspace.x_q
@@ -1807,9 +1843,9 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim=rope_dim,
         out=x_q,
     )
-    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp)
+    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp, expected_m=expected_m)
     quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
-    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output)
+    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output, expected_m=expected_m)
     if return_3d:
         return output
     return output[:, :, 0]

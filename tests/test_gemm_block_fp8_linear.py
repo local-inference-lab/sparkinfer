@@ -256,3 +256,57 @@ def test_block_fp8_linear_small_live_m_reuses_prefill_dense_kernel() -> None:
             assert actual.shape == (tokens, out_features)
     finally:
         unfreeze_kernel_resolution()
+
+
+def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
+    # DeepGEMM-style expected_m hint: a decode-regime kernel (expected_m<=128 ->
+    # 32x128 tile) must (a) produce byte-identical output to the default
+    # (tile choice does not change the block-scaled MMA result) and (b) be
+    # reused for every live M in the regime under frozen resolution.
+    require_sm120()
+    from b12x.gemm.dense import _select_default_mma_tiler_mn
+
+    torch.manual_seed(20260530)
+    in_features, out_features = 1024, 8192  # wide-N (>1536) MXFP8 regime
+    expected_m = 64  # decode/small-batch regime
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    assert _select_default_mma_tiler_mn(
+        expected_m, out_features, sm, is_mxfp8=True, expected_m=expected_m
+    ) == (32, 128)
+
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    # (a) tile-independence of numerics: hint (32x128) vs default (64x128).
+    x = (
+        torch.randn((32, in_features), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
+    default_out = block_fp8_linear_mxfp8(x, packed)
+    hinted_out = block_fp8_linear_mxfp8(x, packed, expected_m=expected_m)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(hinted_out.float(), default_out.float(), rtol=0, atol=0)
+
+    # (b) warm the decode kernel once, freeze, serve a range of live M -> all
+    # reuse the same warmed (32x128) kernel (no recompile under frozen
+    # resolution). Live M stays in the persistent-scheduler policy class (m>=16),
+    # matching the warm M; M==1 / m<16 are separate policy regimes
+    # (use_m1_non_tma / direct scheduler) that must be warmed on their own -- a
+    # pre-existing dense_gemm constraint independent of the expected_m hint.
+    warm_x = (
+        torch.randn((256, in_features), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
+    block_fp8_linear_mxfp8(warm_x, packed, expected_m=expected_m)
+    torch.cuda.synchronize()
+
+    freeze_kernel_resolution("decode-regime block FP8 reused for all live M")
+    try:
+        for tokens in (16, 32, 128):
+            live_x = (
+                torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16)
+                / 4
+            ).contiguous()
+            out = block_fp8_linear_mxfp8(live_x, packed, expected_m=expected_m)
+            torch.cuda.synchronize()
+            assert out.shape == (tokens, out_features)
+    finally:
+        unfreeze_kernel_resolution()

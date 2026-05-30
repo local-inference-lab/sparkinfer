@@ -60,6 +60,7 @@ class BlockFP8LinearWorkspace:
         source: torch.Tensor,
         packed_weight: "BlockFP8LinearWeight",
         bias: torch.Tensor | None = None,
+        expected_m: int | None = None,
     ) -> "BlockFP8LinearBinding":
         return build_block_fp8_linear_binding(
             source=source,
@@ -67,6 +68,7 @@ class BlockFP8LinearWorkspace:
             x_q=self.x_q,
             output=self.output,
             bias=bias,
+            expected_m=expected_m,
         )
 
 
@@ -77,6 +79,10 @@ class BlockFP8LinearBinding:
     x_q: MXFP8Rows
     output: torch.Tensor
     bias: torch.Tensor | None = None
+    # DeepGEMM-style regime hint forwarded to dense_gemm (decode vs prefill tile).
+    # None keeps the M-independent default; set it at bind time so the warmed
+    # kernel matches the regime this binding serves.
+    expected_m: int | None = None
 
     def run(self) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self)
@@ -122,6 +128,7 @@ class BlockFP8LinearScratchPlan:
         packed_weight: BlockFP8LinearWeight,
         output: torch.Tensor,
         bias: torch.Tensor | None = None,
+        expected_m: int | None = None,
     ) -> BlockFP8LinearBinding:
         source_2d = _source_2d(source)
         tokens, in_features = map(int, source_2d.shape)
@@ -159,6 +166,7 @@ class BlockFP8LinearScratchPlan:
             x_q=x_q,
             output=output,
             bias=bias,
+            expected_m=expected_m,
         )
 
 
@@ -441,6 +449,7 @@ def build_block_fp8_linear_binding(
     x_q: MXFP8Rows,
     output: torch.Tensor,
     bias: torch.Tensor | None = None,
+    expected_m: int | None = None,
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -465,6 +474,7 @@ def build_block_fp8_linear_binding(
         x_q=x_q,
         output=output,
         bias=bias,
+        expected_m=expected_m,
     )
 
 
@@ -607,8 +617,14 @@ def block_fp8_linear_mxfp8(
     workspace: BlockFP8LinearWorkspace | None = None,
     bias: torch.Tensor | None = None,
     binding: BlockFP8LinearBinding | None = None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
-    """Run a serialized block-FP8 linear through the native b12x MXFP8 GEMM."""
+    """Run a serialized block-FP8 linear through the native b12x MXFP8 GEMM.
+
+    expected_m forwards a DeepGEMM-style regime hint to dense_gemm (decode vs
+    prefill tile); None keeps the M-independent default. When a binding is given
+    its stored expected_m is used.
+    """
 
     if binding is not None:
         extras = [
@@ -631,6 +647,7 @@ def block_fp8_linear_mxfp8(
         x_q_storage = binding.x_q
         output_storage = binding.output
         bias = binding.bias
+        expected_m = binding.expected_m
     else:
         x_q_storage = None
         output_storage = None
@@ -697,6 +714,7 @@ def block_fp8_linear_mxfp8(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
+        expected_m=expected_m,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
     if bias is not None:
@@ -724,8 +742,13 @@ def prewarm_block_fp8_linear_mxfp8(
     token_counts: Iterable[int],
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    expected_m: int | None = None,
 ) -> None:
-    """Compile and warm the native block-FP8 linear kernels for planned M values."""
+    """Compile and warm the native block-FP8 linear kernels for planned M values.
+
+    Pass the same expected_m the serving path will use so the warmed tile matches
+    the regime kernel that live calls reuse under frozen resolution.
+    """
 
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -750,7 +773,9 @@ def prewarm_block_fp8_linear_mxfp8(
                 dtype=output_dtype,
                 device=device,
             )
-            block_fp8_linear_mxfp8(source, packed_weight, workspace=workspace)
+            block_fp8_linear_mxfp8(
+                source, packed_weight, workspace=workspace, expected_m=expected_m
+            )
         torch.cuda.synchronize(device)
 
 
