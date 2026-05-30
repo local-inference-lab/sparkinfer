@@ -21,7 +21,8 @@ FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 MXFP8_SCALE_VEC_SIZE = 32
 MXFP8_SCALE_ROW_TILE = 128
 MXFP8_SCALE_K_TILE = 4
-WO_A_INPUT_QUANT_GROUP_SIZE = 128
+WO_A_INPUT_QUANT_GROUP_SIZE = MXFP8_SCALE_VEC_SIZE
+_ALPHA_ONE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
 @dataclass(frozen=True)
@@ -424,6 +425,18 @@ def _check_mxfp8_k(k: int) -> None:
         raise ValueError(f"MXFP8 dense_gemm K must be a positive multiple of 128, got {k}")
 
 
+def _cached_alpha_one(device: torch.device | str) -> torch.Tensor:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    key = (resolved.type, resolved.index)
+    alpha = _ALPHA_ONE_CACHE.get(key)
+    if alpha is None or alpha.device != resolved:
+        alpha = torch.ones((1,), dtype=torch.float32, device=resolved)
+        _ALPHA_ONE_CACHE[key] = alpha
+    return alpha
+
+
 @triton.jit
 def _quantize_grouped_tgd_to_tdg_kernel(
     source,
@@ -463,6 +476,7 @@ def _quantize_grouped_tgd_to_tdg_kernel(
     max_abs = tl.max(tl.abs(src), axis=0)
     quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
+    scale = tl.exp2(scale_exp)
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     tl.store(
@@ -470,25 +484,20 @@ def _quantize_grouped_tgd_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / quant_scale).to(tl.float8e4nv),
+        (src / scale).to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
-    sf_offsets = tl.arange(0, SCALE_CHUNKS)
     tl.store(
-        scale_rows
-        + group * tokens * sf_cols
-        + token * sf_cols
-        + chunk * SCALE_CHUNKS
-        + sf_offsets,
+        scale_rows + group * tokens * sf_cols + token * sf_cols + chunk,
         scale_u8,
     )
 
     row32 = token % 32
     row4 = (token // 32) % 4
     tile_m = token // 128
-    k4 = sf_offsets
-    tile_k = chunk
+    k4 = chunk % 4
+    tile_k = chunk // 4
     tl.store(
         scale_mma
         + row32 * scale_mma_s0
@@ -568,6 +577,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     max_abs = tl.max(tl.abs(src), axis=0)
     quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
+    scale = tl.exp2(scale_exp)
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     tl.store(
@@ -575,25 +585,20 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / quant_scale).to(tl.float8e4nv),
+        (src / scale).to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
-    sf_offsets = tl.arange(0, SCALE_CHUNKS)
     tl.store(
-        scale_rows
-        + group * tokens * sf_cols
-        + token * sf_cols
-        + chunk * SCALE_CHUNKS
-        + sf_offsets,
+        scale_rows + group * tokens * sf_cols + token * sf_cols + chunk,
         scale_u8,
     )
 
     row32 = token % 32
     row4 = (token // 32) % 4
     tile_m = token // 128
-    k4 = sf_offsets
-    tile_k = chunk
+    k4 = chunk % 4
+    tile_k = chunk // 4
     tl.store(
         scale_mma
         + row32 * scale_mma_s0
@@ -1026,7 +1031,7 @@ def quantize_wo_a_input_mxfp8(
     *,
     out: MXFP8Rows | None = None,
 ) -> MXFP8Rows:
-    """Quantize grouped WO-A input with SGLang-compatible 128-column scales."""
+    """Quantize grouped WO-A input into per-32-column MXFP8 rows."""
 
     _check_gpu_tensor("source_tgd", source_tgd)
     if source_tgd.ndim != 3:
@@ -1563,6 +1568,7 @@ def wo_a_dense_gemm_mxfp8(
     wo_a_rdg: MXFP8Rows,
     *,
     out: torch.Tensor | None = None,
+    alpha: torch.Tensor | None = None,
     expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run WO-A as grouped MXFP8 dense GEMM.
@@ -1588,6 +1594,13 @@ def wo_a_dense_gemm_mxfp8(
         )
     else:
         _check_dense_gemm_mnl_view("out", out)
+    mma_tiler_mn = (
+        (16, 64)
+        if expected_m is not None
+        and 1 <= expected_m <= 8
+        and wo_a_rdg.values.shape[0] <= 1536
+        else None
+    )
     return dense_gemm(
         (x_tdg.values, x_tdg.scale_mma),
         (wo_a_rdg.values, wo_a_rdg.scale_mma),
@@ -1596,6 +1609,8 @@ def wo_a_dense_gemm_mxfp8(
         c_dtype="bfloat16",
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=out,
+        alpha=alpha,
+        mma_tiler_mn=mma_tiler_mn,
         expected_m=expected_m,
     )
 
@@ -1605,6 +1620,7 @@ def wo_b_dense_gemm_mxfp8(
     wo_b_hgr: MXFP8Rows,
     *,
     out: torch.Tensor | None = None,
+    alpha: torch.Tensor | None = None,
     expected_m: int | None = None,
 ) -> torch.Tensor:
     """Run group-major WO-B as MXFP8 dense GEMM.
@@ -1654,6 +1670,7 @@ def wo_b_dense_gemm_mxfp8(
         c_dtype="bfloat16",
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=out,
+        alpha=alpha,
         expected_m=expected_m,
     )
 
@@ -1724,10 +1741,23 @@ def wo_projection_mxfp8(
     if x_q is None or tmp is None or tmp_q is None or output is None:
         raise TypeError("wo_projection_mxfp8 requires source_tgd, weights, and workspace or binding")
 
+    alpha_one = _cached_alpha_one(source_tgd.device)
     quantize_wo_a_input_mxfp8(source_tgd, out=x_q)
-    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp, expected_m=expected_m)
+    wo_a_dense_gemm_mxfp8(
+        x_q,
+        weights.wo_a,
+        out=tmp,
+        alpha=alpha_one,
+        expected_m=expected_m,
+    )
     quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
-    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output, expected_m=expected_m)
+    wo_b_dense_gemm_mxfp8(
+        tmp_q,
+        weights.wo_b,
+        out=output,
+        alpha=alpha_one,
+        expected_m=expected_m,
+    )
     if return_3d:
         return output
     return output[:, :, 0]
@@ -1833,6 +1863,7 @@ def wo_projection_inv_rope_mxfp8(
             "weights, workspace, and heads_per_group or binding"
         )
 
+    alpha_one = _cached_alpha_one(o.device)
     quantize_wo_a_input_inv_rope_mxfp8(
         o,
         positions,
@@ -1843,9 +1874,21 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim=rope_dim,
         out=x_q,
     )
-    wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, out=tmp, expected_m=expected_m)
+    wo_a_dense_gemm_mxfp8(
+        x_q,
+        weights.wo_a,
+        out=tmp,
+        alpha=alpha_one,
+        expected_m=expected_m,
+    )
     quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
-    wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, out=output, expected_m=expected_m)
+    wo_b_dense_gemm_mxfp8(
+        tmp_q,
+        weights.wo_b,
+        out=output,
+        alpha=alpha_one,
+        expected_m=expected_m,
+    )
     if return_3d:
         return output
     return output[:, :, 0]
