@@ -61,6 +61,7 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
+from b12x.cute.fp4 import get_ptr_as_int64, scatter_add_bf16, scatter_add_bf16x2
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ _B12X_TIMING_THRESHOLD_MS = float(
         os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
     )
 )
+_B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "0") == "1"
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -139,6 +141,7 @@ class _DenseGemmPolicy:
     direct_one_m_tile_scheduler: bool
     use_m1_non_tma: bool
     split_k_slices: int
+    split_k_atomic_bf16: bool
 
 
 def _max_active_clusters_for(
@@ -203,6 +206,7 @@ def _dense_gemm_policy_for(
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
         split_k_slices=split_k_slices,
+        split_k_atomic_bf16=_B12X_DENSE_SPLITK_TURBO,
     )
 
 
@@ -240,6 +244,7 @@ class DenseGemmKernel:
         enable_pdl: bool = True,
         direct_one_m_tile_scheduler: bool = False,
         split_k_slices: int = 1,
+        split_k_atomic_bf16: bool = False,
         use_m1_non_tma_a: bool = False,
         use_m1_non_tma_c: bool = False,
         use_m1_non_tma_sfa: bool = False,
@@ -261,6 +266,7 @@ class DenseGemmKernel:
         self.enable_pdl = enable_pdl
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
         self.split_k_slices = split_k_slices
+        self.split_k_atomic_bf16 = split_k_atomic_bf16
         self.use_m1_non_tma_a = use_m1_non_tma_a
         self.use_m1_non_tma_c = use_m1_non_tma_c
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
@@ -1180,31 +1186,121 @@ class DenseGemmKernel:
                             coord_mn = _reshape_acc_to_mn(
                                 thr_mma.partition_C(c_identity)
                             )
-                            split_idx = Int32(block_idx[1])
-                            for acc_m in cutlass.range_constexpr(
-                                cute.size(acc_mn.shape[0])
-                            ):
-                                for acc_n in cutlass.range_constexpr(
-                                    cute.size(acc_mn.shape[1])
+                            if cutlass.const_expr(self.split_k_atomic_bf16):
+                                for acc_m in cutlass.range_constexpr(
+                                    cute.size(acc_mn.shape[0])
                                 ):
-                                    coord = coord_mn[acc_m, acc_n]
-                                    m_coord = (
-                                        tile_coord_mnl[0]
-                                        * Int32(self.tile_shape_mnk[0])
-                                        + coord[0]
-                                    )
-                                    n_coord = (
-                                        tile_coord_mnl[1]
-                                        * Int32(self.tile_shape_mnk[1])
-                                        + coord[1]
-                                    )
-                                    if (
-                                        m_coord < Int32(directC_mnl.shape[0])
-                                        and n_coord < Int32(directC_mnl.shape[1])
+                                    for acc_n_pair in cutlass.range_constexpr(
+                                        cute.size(acc_mn.shape[1]) // 2
                                     ):
-                                        directC_mnl[
-                                            (m_coord, n_coord, split_idx)
-                                        ] = alpha_value * acc_mn[acc_m, acc_n]
+                                        acc_n0 = acc_n_pair * 2
+                                        acc_n1 = acc_n0 + 1
+                                        coord0 = coord_mn[acc_m, acc_n0]
+                                        coord1 = coord_mn[acc_m, acc_n1]
+                                        m_coord0 = (
+                                            tile_coord_mnl[0]
+                                            * Int32(self.tile_shape_mnk[0])
+                                            + coord0[0]
+                                        )
+                                        n_coord0 = (
+                                            tile_coord_mnl[1]
+                                            * Int32(self.tile_shape_mnk[1])
+                                            + coord0[1]
+                                        )
+                                        m_coord1 = (
+                                            tile_coord_mnl[0]
+                                            * Int32(self.tile_shape_mnk[0])
+                                            + coord1[0]
+                                        )
+                                        n_coord1 = (
+                                            tile_coord_mnl[1]
+                                            * Int32(self.tile_shape_mnk[1])
+                                            + coord1[1]
+                                        )
+                                        if (
+                                            m_coord0 < Int32(directC_mnl.shape[0])
+                                            and m_coord1 < Int32(directC_mnl.shape[0])
+                                            and n_coord0
+                                            < Int32(directC_mnl.shape[1])
+                                            and n_coord1
+                                            < Int32(directC_mnl.shape[1])
+                                        ):
+                                            c_offset = cute.crd2idx(
+                                                (
+                                                    m_coord0,
+                                                    n_coord0,
+                                                    Int32(0),
+                                                ),
+                                                directC_mnl.layout,
+                                            )
+                                            scatter_add_bf16x2(
+                                                get_ptr_as_int64(
+                                                    directC_mnl,
+                                                    c_offset,
+                                                ),
+                                                alpha_value * acc_mn[acc_m, acc_n0],
+                                                alpha_value * acc_mn[acc_m, acc_n1],
+                                            )
+                                    if cutlass.const_expr(
+                                        cute.size(acc_mn.shape[1]) % 2 == 1
+                                    ):
+                                        acc_n = cute.size(acc_mn.shape[1]) - 1
+                                        coord = coord_mn[acc_m, acc_n]
+                                        m_coord = (
+                                            tile_coord_mnl[0]
+                                            * Int32(self.tile_shape_mnk[0])
+                                            + coord[0]
+                                        )
+                                        n_coord = (
+                                            tile_coord_mnl[1]
+                                            * Int32(self.tile_shape_mnk[1])
+                                            + coord[1]
+                                        )
+                                        if (
+                                            m_coord < Int32(directC_mnl.shape[0])
+                                            and n_coord < Int32(directC_mnl.shape[1])
+                                        ):
+                                            c_offset = cute.crd2idx(
+                                                (
+                                                    m_coord,
+                                                    n_coord,
+                                                    Int32(0),
+                                                ),
+                                                directC_mnl.layout,
+                                            )
+                                            scatter_add_bf16(
+                                                get_ptr_as_int64(
+                                                    directC_mnl,
+                                                    c_offset,
+                                                ),
+                                                alpha_value * acc_mn[acc_m, acc_n],
+                                            )
+                            else:
+                                split_idx = Int32(block_idx[1])
+                                for acc_m in cutlass.range_constexpr(
+                                    cute.size(acc_mn.shape[0])
+                                ):
+                                    for acc_n in cutlass.range_constexpr(
+                                        cute.size(acc_mn.shape[1])
+                                    ):
+                                        coord = coord_mn[acc_m, acc_n]
+                                        m_coord = (
+                                            tile_coord_mnl[0]
+                                            * Int32(self.tile_shape_mnk[0])
+                                            + coord[0]
+                                        )
+                                        n_coord = (
+                                            tile_coord_mnl[1]
+                                            * Int32(self.tile_shape_mnk[1])
+                                            + coord[1]
+                                        )
+                                        if (
+                                            m_coord < Int32(directC_mnl.shape[0])
+                                            and n_coord < Int32(directC_mnl.shape[1])
+                                        ):
+                                            directC_mnl[
+                                                (m_coord, n_coord, split_idx)
+                                            ] = alpha_value * acc_mn[acc_m, acc_n]
                         else:
                             # Type conversion with alpha scaling
                             tRS_rD_out = cute.make_rmem_tensor(
@@ -1810,6 +1906,7 @@ class _DenseGemmLaunch:
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
             split_k_slices=policy.split_k_slices,
+            split_k_atomic_bf16=policy.split_k_atomic_bf16,
             # M=1 FP8 benefits from normal TMA loads for A/SFA on the
             # standalone tiny-M profile. Keep C on the direct epilogue path;
             # the normal TMA store did not beat it in the DSV4F TP=2 GPU5 run.
@@ -2131,8 +2228,16 @@ def dense_gemm(
     )
     split_k_slices = policy.split_k_slices
     split_k_output = split_k_slices > 1
-    kernel_c_cutlass_dtype = cutlass.Float32 if split_k_output else c_cutlass_dtype
-    kernel_c_l = split_k_slices if split_k_output else l
+    split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
+    if split_k_atomic_bf16:
+        kernel_c_cutlass_dtype = c_cutlass_dtype
+        kernel_c_l = l
+    elif split_k_output:
+        kernel_c_cutlass_dtype = cutlass.Float32
+        kernel_c_l = split_k_slices
+    else:
+        kernel_c_cutlass_dtype = c_cutlass_dtype
+        kernel_c_l = l
     split_storage = None
     split_scratch = None
     if split_k_output:
@@ -2142,12 +2247,15 @@ def dense_gemm(
                 dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
                 device=a_torch.device,
             )
-        split_storage = torch.empty(
-            (split_k_slices, m, n),
-            dtype=torch.float32,
-            device=a_torch.device,
-        )
-        split_scratch = split_storage.permute(1, 2, 0)
+        if split_k_atomic_bf16:
+            out.zero_()
+        else:
+            split_storage = torch.empty(
+                (split_k_slices, m, n),
+                dtype=torch.float32,
+                device=a_torch.device,
+            )
+            split_scratch = split_storage.permute(1, 2, 0)
 
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     cache_before = _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None
@@ -2173,15 +2281,18 @@ def dense_gemm(
         sm_version="sm_120",
     )
     t_compiled = time.perf_counter() if _B12X_TIMING else 0.0
+    c_tensor_gpu = (
+        out if split_k_atomic_bf16 else split_scratch if split_k_output else out
+    )
     result = compiled(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
         sfa_tensor_gpu=sfa_torch,
         sfb_tensor_gpu=sfb_torch,
-        c_tensor_gpu=split_scratch if split_k_output else out,
+        c_tensor_gpu=c_tensor_gpu,
         alpha_tensor_gpu=alpha,
     )
-    if split_k_output:
+    if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
         torch.add(split_scratch[:, :, 0], split_scratch[:, :, 1], out=out[:, :, 0])

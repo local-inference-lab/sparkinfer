@@ -1503,6 +1503,27 @@ def scatter_add_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def scatter_add_bf16(addr: Int64, val_f32, *, loc=None, ip=None):
+    """BF16 atomic reduction add to global memory.
+
+    Converts the f32 input to bf16 inside PTX and atomically accumulates it into
+    one bf16 output lane. This is intended for opt-in approximate reductions.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            val_f32.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 packed; cvt.rn.satfinite.bf16.f32 packed, $1; red.relaxed.gpu.global.add.noftz.bf16 [$0], packed; }",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def scatter_add_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
     """Vectorized BF16x2 atomic reduction: 8 bf16 values (16 bytes) in one go.
 
