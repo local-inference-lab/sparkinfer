@@ -250,6 +250,7 @@ def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
     fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
     compile_callable = cute.compile
 
+    cute_compiler.clear_compile_cache()
     monkeypatch.delenv("NVCC_PREPEND_FLAGS", raising=False)
     key_a = _build_compile_disk_cache_key(
         compile_callable,
@@ -258,6 +259,7 @@ def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
         {},
     )
 
+    cute_compiler.clear_compile_cache()
     monkeypatch.setenv("NVCC_PREPEND_FLAGS", "--use_fast_math")
     key_b = _build_compile_disk_cache_key(
         compile_callable,
@@ -273,6 +275,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
     compile_callable = cute.compile
 
+    cute_compiler.clear_compile_cache()
     monkeypatch.setattr(
         cute_compiler,
         "_runtime_toolchain_key",
@@ -285,6 +288,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
         {},
     )
 
+    cute_compiler.clear_compile_cache()
     monkeypatch.setattr(
         cute_compiler,
         "_runtime_toolchain_key",
@@ -298,6 +302,26 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     )
 
     assert key_a != key_b
+
+
+def test_b12x_package_fingerprint_is_process_static(monkeypatch) -> None:
+    calls = 0
+
+    def fake_compute_fingerprint():
+        nonlocal calls
+        calls += 1
+        return f"fingerprint-{calls}"
+
+    cute_compiler._b12x_package_fingerprint.cache_clear()
+    cute_compiler._static_compile_cache_context.cache_clear()
+    monkeypatch.setattr(
+        cute_compiler, "_compute_b12x_package_fingerprint", fake_compute_fingerprint
+    )
+
+    assert cute_compiler._b12x_package_fingerprint() == "fingerprint-1"
+    assert cute_compiler._b12x_package_fingerprint() == "fingerprint-1"
+    assert calls == 1
+    cute_compiler._b12x_package_fingerprint.cache_clear()
 
 
 def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:

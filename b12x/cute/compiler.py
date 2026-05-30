@@ -703,22 +703,10 @@ def _iter_fingerprint_files(root: Path) -> list[Path]:
     return files
 
 
-def _tree_state(root: Path) -> tuple[tuple[str, int, int], ...]:
-    entries = []
-    for path in _iter_fingerprint_files(root):
-        stat = path.stat()
-        entries.append((str(path.relative_to(root)), stat.st_mtime_ns, stat.st_size))
-    return tuple(entries)
-
-
-@lru_cache(maxsize=8)
-def _tree_fingerprint_cached(
-    root_str: str, state: tuple[tuple[str, int, int], ...]
-) -> str:
-    root = Path(root_str)
+def _compute_b12x_package_fingerprint() -> str:
     digest = hashlib.sha256()
-    for rel_path, _mtime_ns, _size in state:
-        path = root / rel_path
+    for path in _iter_fingerprint_files(_B12X_PACKAGE_ROOT):
+        rel_path = str(path.relative_to(_B12X_PACKAGE_ROOT))
         digest.update(rel_path.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -726,12 +714,9 @@ def _tree_fingerprint_cached(
     return digest.hexdigest()
 
 
-def _tree_fingerprint(root: Path) -> str:
-    return _tree_fingerprint_cached(str(root), _tree_state(root))
-
-
+@lru_cache(maxsize=1)
 def _b12x_package_fingerprint() -> str:
-    return _tree_fingerprint(_B12X_PACKAGE_ROOT)
+    return _compute_b12x_package_fingerprint()
 
 
 def _distribution_version(name: str) -> str:
@@ -783,6 +768,7 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
     )
 
 
+@lru_cache(maxsize=1)
 def _compile_environment_key() -> tuple[tuple[str, str], ...]:
     compile_env_vars = (
         "CC",
@@ -796,6 +782,16 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "NVCC_PREPEND_FLAGS",
     )
     return tuple((name, os.environ.get(name, "")) for name in compile_env_vars)
+
+
+@lru_cache(maxsize=16)
+def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
+    return (
+        _b12x_package_fingerprint(),
+        _runtime_toolchain_key(),
+        _compile_options_cache_key(compile_callable),
+        _compile_environment_key(),
+    )
 
 
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
@@ -1101,26 +1097,32 @@ def _compile_disk_cache_payload(
     kwargs: dict[str, Any],
     compile_spec: KernelCompileSpec | None = None,
 ) -> tuple[object, ...]:
+    (
+        package_fingerprint,
+        runtime_toolchain,
+        compile_options,
+        compile_environment,
+    ) = _static_compile_cache_context(compile_callable)
     if compile_spec is not None:
         return (
             "b12x_cute_compile_cache_v3_explicit_spec",
             _explicit_spec_compile_target(func),
-            _b12x_package_fingerprint(),
-            _runtime_toolchain_key(),
+            package_fingerprint,
+            runtime_toolchain,
             _structural_cache_key(compile_spec),
             _structural_cache_key(kwargs),
-            _compile_options_cache_key(compile_callable),
-            _compile_environment_key(),
+            compile_options,
+            compile_environment,
         )
     return (
         "b12x_cute_compile_cache_v2",
         _normalize_compile_target(func, set()),
-        _b12x_package_fingerprint(),
-        _runtime_toolchain_key(),
+        package_fingerprint,
+        runtime_toolchain,
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
-        _compile_options_cache_key(compile_callable),
-        _compile_environment_key(),
+        compile_options,
+        compile_environment,
     )
 
 
@@ -1201,6 +1203,8 @@ def clear_compile_cache() -> None:
     global _MEMORY_CACHE_MISSES
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
+    _compile_environment_key.cache_clear()
+    _static_compile_cache_context.cache_clear()
     with _MEMORY_CACHE_LOCK:
         _MEMORY_CACHE.clear()
         _MEMORY_CACHE_HITS = 0
