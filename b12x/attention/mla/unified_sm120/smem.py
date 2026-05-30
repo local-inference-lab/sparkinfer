@@ -15,7 +15,7 @@ that way) -- it does NOT use the ``_permuted_offset_128b`` XOR bank-swizzle that
 the GLM ``kernel_onepass`` QK path uses. The bank-conflict mitigation for DSV4
 comes from the STRIDE choice instead (``KV_SMEM_STRIDE=464``: ``464/4 % 32 = 20``
 -> clean; ``d2_load_b.cuh:44``). So every sub-region here is a plain linear
-array at the documented stride; the loader (``sync_load.py``) and the math write
+array at the documented stride; the IO loader (``io.py``) and the math write
 and read it as ``entry * STRIDE + dim``.
 
 Regions (DSV4 ``DecodeDsv4Smem`` order; offsets are const_expr ints):

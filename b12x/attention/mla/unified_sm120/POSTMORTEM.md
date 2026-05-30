@@ -35,7 +35,6 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
 | `traits.py` | `ModelType`/`ComputeMode`/`ScaleFormat` int enums (const_expr keys) + `UnifiedMLATraits` + `infer_model_type` |
 | `smem.py` | per-model SharedStorage layout (const_expr offsets), ~91 KB DSV4 / ~99 KB GLM |
 | `io.py` | IO-warp producer: `cp_async_bulk_g2s_mbar` gather + mbarrier; `io_threads` param (32 decode / 128 prefill); per-chunk main/extra section dispatch |
-| `sync_load.py` | synchronous (non-TMA) gather — P5 scaffold for math-first bring-up; kept as reference |
 | `decode_math.py` | the shared math stages S0–S7 (Q-quant, QK block-scaled / GLM post-MMA-scale, RoPE, online softmax, P/W-quant, XV, epilogue) — used by BOTH decode and prefill |
 | `decode` kernel (in `launch.py`) | 288-thread warp-specialized decode (8 math + 1 IO) + split-K planner + merge wiring |
 | `prefill.py` | 384-thread/4-IO single-pass prefill reusing the decode stages |
