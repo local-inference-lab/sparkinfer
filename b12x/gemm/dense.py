@@ -2166,6 +2166,24 @@ def _select_default_mma_tiler_mn(
         # prefill M>=2k and would break that one-kernel-per-(N,K) reuse contract.)
         return (64, 128)
 
+    if is_mxfp8:
+        # Narrow-N MXFP8 (n <= 1536; the n > 1536 case returned above). The
+        # (128,128) coarse tile spans only ceil(N/128) column tiles (<=12 at
+        # N<=1536), so at M>=512 it launches ~32-48 CTAs on a 188-SM part and
+        # runs CTA-starved -- 2x-3.5x slower than a CTA-multiplying tile
+        # (probe_dense_fp8_tile_sweep.py: N=1024 M=512 (128,128)=63.5us vs
+        # (64,64)=18.4us; N=1536 M=512 (128,128)=65.5us vs (64,128)=24.6us).
+        # Mirror the wide-N expected_m design. Declared prefill (expected_m>128)
+        # -> (64,128): the best narrow-N tile at M>=512 for both N=1024 and
+        # N=1536 across M=512..8192 (probe sweep), recovering both the M~512
+        # cliff and the large-M tail (N=1024 M=4096: (64,128)=80us vs
+        # (64,64)=105us vs (128,128)=125us). Decode/small and the no-hint
+        # default use the M-independent (64,64) (max CTAs; best at M<=512),
+        # preserving the one-kernel-per-(N,K) reuse contract.
+        if expected_m is not None and expected_m > 128:
+            return (64, 128)
+        return (64, 64)
+
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
