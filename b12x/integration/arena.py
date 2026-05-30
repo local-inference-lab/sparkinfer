@@ -75,6 +75,7 @@ class B12XMoEArenaCaps:
     dtype: torch.dtype
     quant_mode: str | None = None
     source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
     weight_E: int
     k: int
     n: int
@@ -98,6 +99,7 @@ class B12XMoEArenaCaps:
             raise ValueError(f"unsupported quant_mode {self.quant_mode!r}")
         object.__setattr__(self, "quant_mode", quant_mode)
         object.__setattr__(self, "source_format", str(self.source_format).lower())
+        object.__setattr__(self, "w13_layout", str(self.w13_layout).lower())
         object.__setattr__(self, "weight_E", max(int(self.weight_E), 1))
         object.__setattr__(self, "k", max(int(self.k), 1))
         object.__setattr__(self, "n", max(int(self.n), 1))
@@ -142,6 +144,10 @@ class B12XMoEArenaCaps:
             route_logits_dtype=self.route_logits_dtype,
             quant_mode=self.quant_mode,
             activation=self.activation,
+            source_format=self.source_format,
+            w13_layout=self.w13_layout,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            swiglu_limit=self.swiglu_limit,
         )
 
 
