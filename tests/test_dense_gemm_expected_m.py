@@ -20,14 +20,18 @@ def _tile(m, *, expected_m=None, n=WIDE_N):
 
 
 def test_expected_m_decode_regime_selects_32x128():
-    # expected_m in the decode/small-batch regime -> 32x128 (probe optimum,
+    # expected_m in the small-batch regime (9..128) -> 32x128 (probe optimum,
     # ~25% faster than 64x128 at M=32..128).
-    for em in (2, 16, 32, 64, 128):
+    for em in (16, 32, 64, 128):
         assert _tile(64, expected_m=em) == (32, 128), em
 
 
-def test_expected_m_single_token_selects_16x128():
-    assert _tile(64, expected_m=1) == (16, 128)
+def test_expected_m_tiny_m_decode_selects_16x128():
+    # Tiny-M decode (expected_m<=8) -> 16x128, mirroring the no-hint m<=8
+    # specialization. Callers like vLLM set expected_m == live m per capture, so
+    # decode batches <=8 must get the decode tile, not the 32x128 bucket.
+    for em in (1, 2, 4, 8):
+        assert _tile(64, expected_m=em) == (16, 128), em
 
 
 def test_expected_m_prefill_regime_selects_64x128():
@@ -46,11 +50,13 @@ def test_expected_m_is_independent_of_live_m():
 
 
 def test_no_hint_preserves_graft_a_default():
-    # expected_m=None must reproduce the M-independent Graft A behavior exactly:
-    # m==1 -> 16x128, m>=2 -> 64x128 (never the decode 32x128 without a hint, so
-    # the one-kernel-per-(N,K) freeze/reuse contract is preserved by default).
+    # expected_m=None preserves the M-independent Graft A behavior outside the
+    # tiny standalone decode range: m=1..8 -> 16x128, and
+    # m>=16 -> 64x128.
     assert _tile(1, expected_m=None) == (16, 128)
-    for m in (2, 16, 32, 64, 128, 256, 4096):
+    for m in (2, 4, 8):
+        assert _tile(m, expected_m=None) == (16, 128), m
+    for m in (16, 32, 64, 128, 256, 4096):
         assert _tile(m, expected_m=None) == (64, 128), m
 
 

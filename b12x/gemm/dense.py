@@ -140,12 +140,15 @@ def _dense_gemm_policy_for(
         * l
         <= max_active_clusters
     )
-    direct_one_m_tile_scheduler = (
+    single_work_tile_per_cta = (
         one_work_tile_per_cta and m < 16 and m <= tile_m and l == 1
+    )
+    direct_one_m_tile_scheduler = (
+        one_work_tile_per_cta and m == 1 and m <= tile_m and l == 1
     )
     use_m1_non_tma = ab_dtype == cutlass.Float8E4M3FN and m == 1
     return _DenseGemmPolicy(
-        single_work_tile_per_cta=direct_one_m_tile_scheduler,
+        single_work_tile_per_cta=single_work_tile_per_cta,
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
     )
@@ -746,9 +749,12 @@ class DenseGemmKernel:
         # Tile scheduler
         block_idx = cute.arch.block_idx()
         if cutlass.const_expr(self.direct_one_m_tile_scheduler):
+            direct_tile_valid = Int32(block_idx[2]) < Int32(
+                tile_sched_params.problem_shape_ntile_mnl[1]
+            )
             work_tile = WorkTileInfo(
                 (Int32(0), Int32(block_idx[2]), Int32(0)),
-                cutlass.Boolean(1),
+                direct_tile_valid,
             )
         else:
             tile_sched = utils.StaticPersistentTileScheduler.create(
@@ -1372,7 +1378,7 @@ class DenseGemmKernel:
             - epi_bytes
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
         ab_stage = max(1, min(raw_ab_stage, 4))
-        if tile_shape_mnk[0] == 64 and tile_shape_mnk[1] == 128:
+        if tile_shape_mnk[0] in (16, 64) and tile_shape_mnk[1] == 128:
             ab_stage = max(1, min(raw_ab_stage, 5))
         return ab_stage, epi_stage
 
@@ -1685,12 +1691,12 @@ class _DenseGemmLaunch:
             tile_k=self._tile_k,
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
-            # The M=1 FP8 shape uses a 128-row MMA/TMA tile. In this lowering,
-            # the narrow A/SFA/C tensor-map paths illegal-instruction instead
-            # of relying on OOB handling, so keep them as explicit direct paths.
-            use_m1_non_tma_a=policy.use_m1_non_tma,
+            # M=1 FP8 benefits from normal TMA loads for A/SFA on the
+            # standalone tiny-M profile. Keep C on the direct epilogue path;
+            # the normal TMA store did not beat it in the DSV4F TP=2 GPU5 run.
+            use_m1_non_tma_a=False,
             use_m1_non_tma_c=policy.use_m1_non_tma,
-            use_m1_non_tma_sfa=policy.use_m1_non_tma,
+            use_m1_non_tma_sfa=False,
         )(
             a_tensor,
             b_tensor,
@@ -1876,18 +1882,24 @@ def _select_default_mma_tiler_mn(
         # per-regime optimal tile and key the compile on it: ONE kernel per
         # (N,K,expected_m), reused for every live M in that regime under frozen
         # resolution (M-independent within the regime). Probe optima
-        # (benchmarks/probe_dense_fp8_tile_sweep.py): expected_m<=1 -> 16x128;
-        # <=128 (decode/small batch) -> 32x128 (~25% faster than 64x128 at
-        # M=32..128); else -> 64x128 (the M-independent default, good to prefill).
+        # (benchmarks/probe_dense_fp8_tile_sweep.py): expected_m<=8 -> 16x128
+        # (tiny-M decode; mirrors the no-hint m<=8 specialization so cudagraph
+        # decode batches <=8 -- where callers like vLLM set expected_m == live m
+        # -- get the decode tile instead of being lumped into the 32x128 bucket);
+        # <=128 (small batch) -> 32x128 (~25% faster than 64x128 at M=32..128);
+        # else -> 64x128 (the M-independent default, good to prefill).
         if expected_m is not None:
-            if expected_m <= 1:
+            if expected_m <= 8:
                 return (16, 128)
             if expected_m <= 128:
                 return (32, 128)
             return (64, 128)
-        # No regime hint: stay M-INDEPENDENT so one kernel serves all live M.
-        # Keep the true single-token decode specialization.
+        # No regime hint: keep the true single-token decode specialization and
+        # use the decode-tuned tile for tiny standalone graph shapes. Broader
+        # live-M reuse still falls back to the M-independent prefill-safe tile.
         if m == 1:
+            return (16, 128)
+        if m <= 8:
             return (16, 128)
         # Wide-N MXFP8: the 128x128 pin spans only ceil(N/128) column tiles, so
         # at small/medium M it launches ~32-64 CTAs and runs flat (~80us, B-BW
