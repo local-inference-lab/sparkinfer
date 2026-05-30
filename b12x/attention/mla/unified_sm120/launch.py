@@ -1497,10 +1497,12 @@ def run_unified_decode(
     # partial O dim is d_v (512) for both models.
     mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
     mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
-    # Seed empty-split LSE = -inf so the merge skips splits with no chunks (and
-    # so partially-written rows are well-defined). The kernel overwrites every
-    # (token, head, split) it actually runs.
-    mid_lse.fill_(float("-inf"))
+    has_empty_split_slots = (num_splits - 1) * chunks_per_split >= num_chunks
+    if has_empty_split_slots:
+        # Seed empty-split LSE = -inf so the merge skips splits with no chunks
+        # (and so partially-written rows are well-defined). The kernel overwrites
+        # every (token, head, split) it actually runs.
+        mid_lse.fill_(float("-inf"))
 
     if model_type == ModelType.GLM_NSA:
         # GLM cache: per-token 656B contiguous record; one paged "block" holds
