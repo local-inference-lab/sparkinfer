@@ -45,6 +45,8 @@ import logging
 import os
 import time
 import torch
+import triton
+import triton.language as tl
 from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -75,6 +77,37 @@ _B12X_TIMING_THRESHOLD_MS = float(
     )
 )
 _B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "0") == "1"
+
+
+@triton.jit
+def _reduce_split_k2_bf16_kernel(partials, out, total: tl.constexpr, BLOCK: tl.constexpr) -> None:
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    accum = tl.load(partials + offs, mask=mask).to(tl.float32)
+    accum += tl.load(partials + total + offs, mask=mask).to(tl.float32)
+    tl.store(out + offs, accum, mask=mask)
+
+
+def _reduce_split_k2_bf16(partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int) -> None:
+    """Fused 2-way split-K FP32-partials reduction (exact); faster than torch.add.
+
+    Falls back to torch.add when the scratch/output layout is not the expected
+    [m, n, 2] / [m, n, 1] contiguous-row form.
+    """
+    total = int(m) * int(n)
+    if (
+        partials.shape == (m, n, 2)
+        and partials.stride() == (n, 1, total)
+        and out.shape == (m, n, 1)
+        and out.stride()[0] == n
+        and out.stride()[1] == 1
+    ):
+        block = 1024
+        grid = (triton.cdiv(total, block),)
+        _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
+    else:
+        torch.add(partials[:, :, 0], partials[:, :, 1], out=out[:, :, 0])
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -2295,7 +2328,7 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        torch.add(split_scratch[:, :, 0], split_scratch[:, :, 1], out=out[:, :, 0])
+        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()
