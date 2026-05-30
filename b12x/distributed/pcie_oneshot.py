@@ -433,6 +433,13 @@ class PCIeOneshotAllReduce:
             )
 
     def _check_stream(self, stream: object = None) -> None:
+        if stream is None and _is_current_stream_capturing(self.device):
+            # During CUDA graph capture the current stream is a torch-owned,
+            # ephemeral capture stream (true for piecewise/inductor graphs used
+            # by MTP and spec-decode). Stream affinity does not apply: the
+            # captured kernel replays on the caller's stream, not this one, so
+            # skip the affinity guard instead of rejecting the capture stream.
+            return
         self._bind_stream_key(_current_stream_key(self.device, stream))
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
@@ -844,9 +851,21 @@ class PCIeOneshotAllReducePool:
         if channel is not None:
             return channel
         if _is_current_stream_capturing(self.device):
+            # Piecewise / inductor CUDA graphs (MTP, spec-decode) capture on a
+            # torch-owned stream that we cannot pre-register before capture
+            # starts. Allocating a fresh channel here is impossible (it would
+            # touch CUDA APIs that are illegal mid-capture), so reuse an
+            # existing channel: the signal/IPC buffers are stream-agnostic and
+            # the all-reduce is recorded on the current (capturing) stream and
+            # replays on whatever stream the caller uses.
+            if self._channels:
+                channel = next(iter(self._channels.values()))
+                self._channels[channel_key] = channel
+                return channel
             raise RuntimeError(
-                "PCIe oneshot pool cannot allocate a new stream channel during CUDA graph capture; "
-                "call for_stream(stream) before capture starts"
+                "PCIe oneshot pool has no channel to reuse during CUDA graph "
+                "capture; perform an eager all-reduce (or call for_stream) "
+                "before capture starts"
             )
         channel = self._new_channel(stream_key)
         self._channels[channel_key] = channel
