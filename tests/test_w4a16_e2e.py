@@ -695,12 +695,11 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 def test_w4a16_tc_decode_fused_sum_matches_oracle(
     m: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TC-decode (B12X_W4A16_TC_DECODE) folds the top-k sum into the FC2 store via
-    atomic accumulate. Validate the epilogue across the whole small-M range, not
-    just powers of two, since 3/5/6/7 were never exercised through it before."""
+    """TC-decode folds the top-k sum into the FC2 store via atomic accumulate.
+    Validate the epilogue across the whole small-M range, not just powers of
+    two, since 3/5/6/7 were never exercised through it before. TC-decode is
+    unconditional for packed small-M, so no toggle is needed."""
     import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-
-    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "1")
 
     # Spy on the fused compile so we can assert the fused-sum path actually engaged
     # (a silent fallback to the packed GEMM would also pass the cosine gate).
@@ -776,14 +775,10 @@ def test_w4a16_tc_decode_fused_sum_matches_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [1, 2, 3, 6, 8])
-def test_w4a16_tc_decode_preplanned_launch_matches_oracle(
-    m: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_w4a16_tc_decode_preplanned_launch_matches_oracle(m: int) -> None:
     """The vLLM binding path passes a *preplanned* fused launch. Validate that a
     preplanned TC-decode launch (direct_topk_routes + tc_decode_fused_sum) is
     consumed correctly by run_w4a16_moe (contract validation + guard + epilogue)."""
-    monkeypatch.setenv("B12X_W4A16_TC_DECODE", "1")
-
     torch.manual_seed(20260529 + 100 + m)
     experts, hidden_size, intermediate_size = 8, 128, 128
     topk, activation = 2, "silu"

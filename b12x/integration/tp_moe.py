@@ -186,7 +186,7 @@ class TPW4A16Workspace:
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     # TC-decode fused-sum launches, keyed by exact token count (only the small-M
-    # decode sizes in B12X_W4A16_TC_DECODE's supported set, packed layout only).
+    # decode sizes in TC-decode's supported set, packed layout only).
     planned_tc_decode_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
@@ -871,8 +871,8 @@ def _w4a16_weight_layout_for_source(source_format: str) -> str:
     """W4A16 weight layout implied by the FP4 source format.
 
     All serving W4A16 sources (E8M0 K/32 and NVFP4) are repacked to ``packed``;
-    small-M decode is served by the TC-decode path on that same packed object
-    (see ``B12X_W4A16_TC_DECODE``), so no native ``modelopt`` copy is needed.
+    small-M decode is served by the TC-decode path on that same packed object,
+    so no native ``modelopt`` copy is needed.
     Must mirror ``_get_w4a16_packed_weights`` so the plan-time launch and the
     runtime ``prepared.weight_layout`` agree. (The ``modelopt`` layout + micro
     decode kernel remain reachable for offline/benchmark use via the prepare API,
@@ -2905,11 +2905,10 @@ def _w4a16_preplanned_launches(
     # Prefer a preplanned TC-decode launch for an exact small-M decode size. It
     # was compiled at this exact token count (its FC2 atomically sums per-route
     # partials into the output), so it only applies when m matches exactly.
-    from b12x.moe.fused.w4a16.kernel import _TC_DECODE_MAX_M, _tc_decode_enabled
+    from b12x.moe.fused.w4a16.kernel import _TC_DECODE_MAX_M
 
     if (
-        _tc_decode_enabled()
-        and weight_layout == "packed"
+        weight_layout == "packed"
         and token_count <= _TC_DECODE_MAX_M
     ):
         tc_decode = workspace.planned_tc_decode_launches.get(token_count)
@@ -3397,7 +3396,6 @@ def _prewarm_w4a16_planned_launches(
     from b12x.moe.fused.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         _TC_DECODE_MAX_M,
-        _tc_decode_enabled,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
         pack_topk_routes_by_expert,
@@ -3419,12 +3417,11 @@ def _prewarm_w4a16_planned_launches(
         fused_launches: dict[object, object] = {}
         topk_sum_launches: dict[int, object] = {}
         tc_decode_launches: dict[int, object] = {}
-        # TC-decode (B12X_W4A16_TC_DECODE) is a packed-layout small-M decode path.
-        # Build its fused-sum launch variant only for the supported decode sizes
-        # so the binding can dispatch to it instead of the general fused launch.
+        # TC-decode is a packed-layout small-M decode path; always build its
+        # fused-sum launch variant for the supported decode sizes so the binding
+        # can dispatch to it instead of the general fused launch.
         build_tc_decode = bool(
-            _tc_decode_enabled()
-            and weight_layout == "packed"
+            weight_layout == "packed"
             and element_dtype == "bf16"
         )
         for token_count in token_counts:

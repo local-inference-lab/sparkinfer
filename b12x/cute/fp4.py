@@ -2129,7 +2129,6 @@ def packed_dequant_e8m0x4_to_bfloat2x2(
         [Uint32(packed).ir_value(loc=loc, ip=ip)],
         """
         {
-            .reg .pred p;
             .reg .u32 b0, b1, b2, b3;
             .reg .u32 h0, h1, h2, h3;
             .reg .u32 t0, t1;
@@ -2149,24 +2148,6 @@ def packed_dequant_e8m0x4_to_bfloat2x2(
             shl.b32 h1, h1, 7;
             shl.b32 h2, h2, 7;
             shl.b32 h3, h3, 7;
-
-            setp.ge.u32 p, b0, 248;
-            selp.b32 h0, 0x00007f80, h0, p;
-            setp.ge.u32 p, b1, 248;
-            selp.b32 h1, 0x00007f80, h1, p;
-            setp.ge.u32 p, b2, 248;
-            selp.b32 h2, 0x00007f80, h2, p;
-            setp.ge.u32 p, b3, 248;
-            selp.b32 h3, 0x00007f80, h3, p;
-
-            setp.eq.u32 p, b0, 255;
-            selp.b32 h0, 0x00007fc0, h0, p;
-            setp.eq.u32 p, b1, 255;
-            selp.b32 h1, 0x00007fc0, h1, p;
-            setp.eq.u32 p, b2, 255;
-            selp.b32 h2, 0x00007fc0, h2, p;
-            setp.eq.u32 p, b3, 255;
-            selp.b32 h3, 0x00007fc0, h3, p;
 
             shl.b32 t0, h2, 16;
             or.b32 $0, h0, t0;

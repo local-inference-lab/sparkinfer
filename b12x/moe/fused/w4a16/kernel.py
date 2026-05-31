@@ -95,18 +95,14 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 # TC-decode: a small-M decode specialization that runs on the PACKED W4A16
 # object (the same weights/scales the prefill GEMM uses). It reuses the packed
 # tensor-core MMA inner loop but folds the top-k sum into the FC2 store
-# epilogue (dropping the separate top-k-sum launch). Gated OFF by default.
-_TC_DECODE_ENV = "B12X_W4A16_TC_DECODE"
+# epilogue (dropping the separate top-k-sum launch). It never regresses vs the
+# packed GEMM within its supported M range, so it is ALWAYS used for the small-M
+# direct-topk decode sizes — there is no opt-in/opt-out switch.
 # TC-decode is available for the whole small-M direct-topk range. Its only hard
-# ceiling is the direct-topk route cap (above it, expert route-packing wins); it
-# never regresses vs the packed GEMM within this range. _TC_DECODE_M is retained
-# for callers/tests that enumerate the supported sizes.
+# ceiling is the direct-topk route cap (above it, expert route-packing wins).
+# _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
 _TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
-
-
-def _tc_decode_enabled() -> bool:
-    return os.environ.get(_TC_DECODE_ENV, "0") not in ("", "0", "false", "False")
 
 
 def _m_specialization_key(size_m: int) -> int:
@@ -123,6 +119,9 @@ def _fake_m_for_specialization(size_m: int) -> int:
 # SM121 JIT output and keep launch occupancy stable across refactors.
 _W4A16_REGS_SM121 = {
     (256, 1, 8, 8, True): 118,
+    (256, 1, 16, 4, True): 118,
+    (256, 1, 16, 8, True): 118,
+    (256, 1, 32, 2, True): 118,
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
     (256, 1, 8, 8, False): 158,
@@ -241,7 +240,18 @@ def _determine_blocks_per_sm(
         _DEVICE_MAX_REG_BYTES // register_bytes,
         int(max_shared_mem) // (smem_bytes + 1536),
     )
-    if cta_m_blocks == 1:
+    if uses_m_block_8:
+        # Small-M (moe_block_size==8) TC-decode is weight-bandwidth/overhead
+        # bound, not parallelism bound (only m*top_k route-blocks of GEMM work).
+        # The fused FC1->activation->FC2 path crosses several grid barriers whose
+        # tid==0 atomic-counter increment serializes across all grid_x CTAs, so an
+        # oversized grid pays barrier-atomic latency proportional to grid_x for no
+        # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
+        # barrier participant count while still covering the machine for the
+        # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
+        # is numerically identical.
+        blocks_per_sm_limit = 1
+    elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 2), 1)
@@ -918,7 +928,24 @@ class W4A16GemmKernel:
 
         tail_mn_tiles = global_mn_tiles
         full_grid_mn_iters = Int32(0)
-        if global_mn_tiles > grid_x:
+        force_one_tile_per_cta = Int32(0)
+        if cutlass.const_expr(self.uses_m_block_8):
+            # TC-decode small-M: when every mn-tile fits inside the launched grid
+            # (FC1 has only route_blocks*n_tiles tiles, far fewer than grid_x),
+            # the default tail path fans each mn-tile across multiple CTAs along
+            # K and pays a lock-serialized cross-CTA split-K finalize plus the
+            # reduction-turn handshake. Instead give the first global_mn_tiles
+            # CTAs exactly one full mn-tile (all k_tiles, reduce_slice_count==1,
+            # no finalize, no lock traffic) and idle the rest. grid_x and the
+            # grid-barrier participant count are unchanged (so FC2 coverage is
+            # untouched); only FC1's intra-GEMM work partition changes. Numerically
+            # identical: a single CTA computes the whole K-reduction per tile.
+            if global_mn_tiles <= grid_x:
+                force_one_tile_per_cta = Int32(1)
+        if force_one_tile_per_cta != Int32(0):
+            tail_mn_tiles = Int32(0)
+            full_grid_mn_iters = Int32(1)
+        elif global_mn_tiles > grid_x:
             tail_mn_tiles = global_mn_tiles - (global_mn_tiles // grid_x) * grid_x
             if tail_mn_tiles * Int32(3) <= grid_x:
                 tail_mn_tiles += grid_x
@@ -3421,6 +3448,31 @@ class W4A16FusedMoeKernel:
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
 
+        if cutlass.const_expr(self.tc_decode_fused_sum):
+            # The TC-decode FC2 epilogue atomically accumulates per-route
+            # partials directly into the per-token output, so the output must be
+            # pre-zeroed. Previously this was a SEPARATE host-side output.zero_()
+            # kernel launch on the latency-bound decode critical path (an extra
+            # launch + its grid-fill memset before the fused kernel even starts).
+            # Fold it into the fused kernel prologue here: every CTA zeroes a
+            # grid-strided slice of the output BEFORE FC1, and the EXISTING
+            # post-FC1 grid barrier (already required to order FC1 writes before
+            # the activation/FC2 read) makes all zero stores globally visible
+            # before the first FC2 atomic -- so no extra barrier is added. The
+            # tiny m*hidden bf16 memset (decode: <=4*4096 elems) is dwarfed by
+            # FC1's whole-K FP4-weight stream, but we delete one whole kernel
+            # launch from the per-decode chain. The TC-decode output is per-token
+            # (top_k routes atomically summed into the SAME token row), so the
+            # zero span is active_m*hidden_size -- NOT the per-route
+            # active_m*top_k*hidden_size of _zero_fc2_output.
+            zidx = cta * Int32(self.cta_threads) + tid
+            zstride = grid_x * Int32(self.cta_threads)
+            ztotal = active_m * Int32(self.hidden_size)
+            zzero = self._cast_elem(cutlass.Float32(0.0))
+            while zidx < ztotal:
+                fc2_bf16_flat[zidx] = zzero
+                zidx += zstride
+
         if cutlass.const_expr(self.activation_is_gated):
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,
@@ -4210,6 +4262,129 @@ def compile_w4a16_fused_moe(
                 "fused W4A16 FC1/FC2 selected different thread counts: "
                 f"{fc1_cta_threads} vs {fc2_cta_threads}"
             )
+    # TC-decode FC1 wide-N override (single-wave-collapse sizes only): in the m8
+    # fused path the host right-sizes grid_x to the FC1 mn-tile count and forces
+    # one whole mn-tile per CTA over the full K. With the default fc1_tile_n=128,
+    # FC1 (N=fc1_cols=2*intermediate_size) produces size_m*top_k*(fc1_cols/128)
+    # mn-tiles. For TP=2 I_tp=1024 (fc1_cols=2048 => 16 n-tiles/route) bs=1 is
+    # 96 tiles (<= 188 SMs, one wave); bs=2 is 192 -- JUST over the single-wave
+    # SM cap -- forcing a 2-wave launch of grid_x=96 (half the machine idle per
+    # wave, a serialized second FC1 wave of pure tail latency on the bandwidth-
+    # bound decode). Widening FC1 to tile_n=256 (256-wide N slab per CTA over
+    # full K; tile_k=64 keeps cta_threads=256) HALVES FC1's mn-tile count, so
+    # bs=2 collapses to 96 tiles = exactly ONE wave, removing that whole second
+    # FC1 wave. The narrower tile_k=64 is slower per-tile, so we apply this ONLY
+    # where it turns a 2-wave launch into a 1-wave launch: the default 128-wide
+    # FC1 spans 2 waves (sms < default_mn_tiles <= 2*sms) AND the wide tile fits
+    # in one (default/2 <= sms). bs=1 (one wave already) and bs>=4 (still multi-
+    # wave after halving) keep the faster default 128x128 tile.
+    # Guarded by fc1_cols%256==0, smem-fit, and 256-thread geometry so the fused
+    # FC1/FC2 single-thread-geometry contract is preserved.
+    default_fc1_mn_tiles = (
+        int(size_m) * int(top_k) * (int(fc1_cols) // int(fc1_tile_n))
+        if fc1_tile_n > 0
+        else 0
+    )
+    if (
+        bool(tc_decode_fused_sum)
+        and int(fc1_cols) % 256 == 0
+        and fc1_tile_n == 128
+        and (fc1_tile_n * fc1_tile_k) // 64 == 256
+        and int(sms) < default_fc1_mn_tiles <= 2 * int(sms)
+        and (default_fc1_mn_tiles // 2) <= int(sms)
+    ):
+        wide_fc1_tile_k = 64
+        if _candidate_tile_fits(
+            problem_n=fc1_cols,
+            problem_k=hidden_size,
+            cta_m_blocks=_covering_count(moe_block_size, 16),
+            tile_n=256,
+            tile_k=wide_fc1_tile_k,
+            cta_threads=256,
+            max_shared_mem=int(max_shared_mem) - 512,
+            scale_format=scale_format,
+        ):
+            fc1_tile_n = 256
+            fc1_tile_k = wide_fc1_tile_k
+            fc1_cta_threads = 256
+    # TC-decode FC2 wide-N override: in the m8 fused path the host right-sizes
+    # grid_x to the FC1 mn-tile count (one persistent wave, no split-K). FC2
+    # (N=hidden_size, K=intermediate_size) with the default tile_n=128 produces
+    # route_blocks*(hidden_size/128) mn-tiles -- roughly double FC1's count --
+    # so FC2 would need ~2 persistent waves while FC1 fits in 1; that second
+    # FC2 wave is pure serialized tail latency on the bandwidth-bound decode.
+    # Selecting tile_n=256 for FC2 (a 256-wide N slab per CTA over full K)
+    # halves FC2's mn-tile count so it also fits one wave. Guarded by smem-fit,
+    # hidden_size%256==0, and matching cta_threads so the fused single
+    # thread-geometry contract is preserved.
+    if (
+        bool(tc_decode_fused_sum)
+        and int(hidden_size) % 256 == 0
+        and fc2_tile_n == 128
+        and fc1_cta_threads == 256
+    ):
+        wide_fc2_tile_k = 64
+        if _candidate_tile_fits(
+            problem_n=hidden_size,
+            problem_k=intermediate_size,
+            cta_m_blocks=_covering_count(moe_block_size, 16),
+            tile_n=256,
+            tile_k=wide_fc2_tile_k,
+            cta_threads=256,
+            max_shared_mem=int(max_shared_mem) - 512,
+            scale_format=scale_format,
+        ):
+            fc2_tile_n = 256
+            fc2_tile_k = wide_fc2_tile_k
+            fc2_cta_threads = 256
+    # TC-decode FC2 ultra-wide override (perfect wave-balance with FC1): the
+    # persistent grid_x is right-sized to FC1's mn-tile count. After the FC1/FC2
+    # wide-N (tile_n=256) overrides, bs=2 still has FC1=route_blocks*8 tiles vs
+    # FC2=route_blocks*16 tiles -- FC2 is DOUBLE FC1 and thus needs a second
+    # persistent wave at grid_x sized to FC1. That FC2 second wave is pure
+    # serialized tail latency on the bandwidth-bound decode. Widening FC2 to
+    # tile_n=512 (a 512-wide N slab per CTA over full K) halves FC2's mn-tile
+    # count again so FC2 == FC1's tile count and fits the SAME single wave. A
+    # 512-wide N tile needs tile_k=32 to keep cta_threads=256 (512*32/64); that
+    # is below the generic tile_k>=64 fits-floor, so we validate the footprint
+    # directly here. tile_k=32 == the e8m0_k32 scale group, so cta_k_blocks=2
+    # with one e8m0 scale group per k-tile -- the existing scale layout is a
+    # clean covering. Fire ONLY when it drops FC2 from >1 wave to FC1's wave
+    # count (bs=2). Numerically identical: only the FC2 output-tile width changes.
+    fc1_mn_after = (
+        int(size_m) * int(top_k) * (int(fc1_cols) // int(fc1_tile_n))
+        if fc1_tile_n > 0
+        else 0
+    )
+    fc2_mn_after = (
+        int(size_m) * int(top_k) * (int(hidden_size) // int(fc2_tile_n))
+        if fc2_tile_n > 0
+        else 0
+    )
+    if (
+        bool(tc_decode_fused_sum)
+        and int(hidden_size) % 512 == 0
+        and fc2_tile_n == 256
+        and fc1_cta_threads == 256
+        and fc1_mn_after > 0
+        and fc2_mn_after > fc1_mn_after
+        and (fc2_mn_after // 2) <= fc1_mn_after
+        and fc1_mn_after <= int(sms)
+    ):
+        ultra_fc2_tile_k = 32
+        ultra_smem = _shared_memory_footprint(
+            cta_m_blocks=_covering_count(moe_block_size, 16),
+            tile_n=512,
+            tile_k=ultra_fc2_tile_k,
+            scale_format=scale_format,
+        )
+        if (
+            int(intermediate_size) % ultra_fc2_tile_k == 0
+            and ultra_smem <= int(max_shared_mem) - 512
+        ):
+            fc2_tile_n = 512
+            fc2_tile_k = ultra_fc2_tile_k
+            fc2_cta_threads = 256
     kernel = W4A16FusedMoeKernel(
         size_m=size_m,
         hidden_size=hidden_size,
@@ -4837,9 +5012,67 @@ def _w4a16_fused_moe_launch_flat(
         fc2_scratch,
         workspace,
         m,
-        sms * int(fused.blocks_per_sm),
+        _w4a16_fused_persistent_grid_x(
+            fused=fused,
+            m=m,
+            topk=topk,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            direct_topk_routes=bool(direct_topk_routes),
+            sms=sms,
+        ),
         cuda.CUstream(stream_int),
     )
+
+
+def _w4a16_fused_persistent_grid_x(
+    *,
+    fused: W4A16FusedMoeCompileResult,
+    m: int,
+    topk: int,
+    intermediate_size: int,
+    activation: str,
+    direct_topk_routes: bool,
+    sms: int,
+) -> int:
+    """Right-size the persistent grid for the fused FC1+FC2 launch.
+
+    The default over-subscribes the cooperative grid (sms*blocks_per_sm CTAs)
+    and forces the larger GEMM into the cross-CTA split-K tail (lock-serialized
+    finalize + c_tmp gmem round-trip) whenever its mn-tile count exceeds the
+    grid. For the small-M direct-topk decode the host knows the exact FC1
+    mn-tile count, so pick the fewest full persistent waves that fit the
+    co-residency cap and set grid_x to that wave's tile count. Then every CTA
+    owns whole FC1 (and FC2, whose tile count is an integer multiple) mn-tiles
+    over the full K -- no split-K reduction, no lock traffic -- with fewer
+    grid-barrier participants, while staying <= the cap so the cooperative
+    barrier never deadlocks. Falls back to the default for the route-pack path
+    where the host cannot know route_blocks ahead of the launch.
+    """
+    cap = int(sms) * int(fused.blocks_per_sm)
+    if not direct_topk_routes or m <= 0:
+        return max(cap, 1)
+    is_gated = activation in ("silu", "swiglu")
+    fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
+    fc1_tile_n = int(getattr(fused, "fc1_tile_n", 0))
+    if fc1_tile_n <= 0 or fc1_cols % fc1_tile_n != 0:
+        return max(cap, 1)
+    n_tiles = fc1_cols // fc1_tile_n
+    route_blocks = int(m) * int(topk)
+    fc1_mn_tiles = route_blocks * n_tiles
+    if fc1_mn_tiles <= 0 or cap <= 0:
+        return max(cap, 1)
+    waves = (fc1_mn_tiles + cap - 1) // cap
+    if waves <= 0:
+        return max(cap, 1)
+    # Only commit to the right-sized grid when every wave is a whole tile cover
+    # (no remainder => no split-K tail); otherwise keep the safe default.
+    if fc1_mn_tiles % waves != 0:
+        return max(cap, 1)
+    grid_x = fc1_mn_tiles // waves
+    if grid_x < 1 or grid_x > cap:
+        return max(cap, 1)
+    return grid_x
 
 
 @torch.library.custom_op(
@@ -5383,8 +5616,7 @@ def run_w4a16_moe(
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
-        _tc_decode_enabled()
-        and (fused_launch is None or preplanned_tc_decode)
+        (fused_launch is None or preplanned_tc_decode)
         and weight_layout == "packed"
         and expert_map is None
         and is_gated
@@ -5616,8 +5848,11 @@ def run_w4a16_moe(
     if use_tc_decode:
         # FC2 atomically accumulates per-route partials directly into the
         # per-token output, so the output is the FC2 store target and must be
-        # pre-zeroed. This drops the separate top-k-sum launch.
-        output.zero_()
+        # pre-zeroed. The fused tc_decode kernel now zeroes the output in its
+        # own prologue (before FC1, made visible by the existing post-FC1 grid
+        # barrier), so the separate host-side output.zero_() launch is removed
+        # from the decode critical path here. This drops the separate top-k-sum
+        # launch as well.
         fc2_out = output.view(-1)
     else:
         fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
