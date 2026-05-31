@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import b12x.attention.mla.kernel as mla_kernel
 import b12x.attention.mla.kernel_onepass as mla_onepass_kernel
@@ -62,6 +63,123 @@ def _compressed_tensors():
         tmp_output,
         tmp_lse,
     )
+
+
+def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
+    # Import modules for registration side effects.
+    __import__("b12x.attention.mla.unified_sm120.launch")
+    __import__("b12x.attention.mla.unified_sm120.prefill")
+
+    with FakeTensorMode():
+        q_all = torch.empty((2, 2, 512), dtype=torch.bfloat16)
+        cache = torch.empty((4, 1024), dtype=torch.uint8)
+        indices = torch.empty((2, 4), dtype=torch.int32)
+        lengths = torch.empty((2,), dtype=torch.int32)
+        scalar_i32 = torch.empty((1,), dtype=torch.int32)
+        sm_scale_t = torch.empty((1,), dtype=torch.float32)
+        tmp_output = torch.empty((2, 2, 4, 512), dtype=torch.bfloat16)
+        tmp_lse = torch.empty((2, 2, 4), dtype=torch.float32)
+        attn_sink = torch.empty((2,), dtype=torch.float32)
+        output = torch.empty((2, 2, 512), dtype=torch.bfloat16)
+
+        torch.ops.b12x.compressed_mla_split_decode_forward(
+            q_all,
+            cache,
+            indices,
+            lengths,
+            cache,
+            indices,
+            lengths,
+            indices,
+            sm_scale_t,
+            scalar_i32,
+            scalar_i32,
+            tmp_output,
+            tmp_lse,
+            attn_sink,
+            2,
+            64,
+            1024,
+            64,
+            1024,
+            True,
+            True,
+            False,
+            False,
+            True,
+            False,
+        )
+        torch.ops.b12x.sparse_mla_split_decode_merge(
+            tmp_output,
+            tmp_lse,
+            scalar_i32,
+            output,
+            attn_sink,
+            tmp_output,
+            tmp_lse,
+            output,
+            True,
+        )
+
+        mid_output = torch.empty((2, 2, 2, 512), dtype=torch.bfloat16)
+        mid_lse = torch.empty((2, 2, 2), dtype=torch.float32)
+        torch.ops.b12x.unified_sm120_decode_grid(
+            q_all,
+            cache,
+            indices,
+            mid_output,
+            mid_lse,
+            lengths,
+            cache,
+            indices,
+            lengths,
+            0.1,
+            0,
+            0,
+            0,
+            64,
+            4,
+            4,
+            1,
+            2,
+            1,
+            1024,
+            64,
+            1024,
+            1,
+            2,
+            0,
+            True,
+            False,
+        )
+
+        prefill_lse = torch.empty((2, 2), dtype=torch.float32)
+        torch.ops.b12x.unified_sm120_prefill(
+            q_all,
+            cache,
+            indices,
+            lengths,
+            attn_sink,
+            output,
+            prefill_lse,
+            cache,
+            indices,
+            lengths,
+            0.1,
+            0,
+            0,
+            0,
+            64,
+            4,
+            4,
+            1,
+            1,
+            1024,
+            64,
+            1024,
+            True,
+            True,
+        )
 
 
 def test_sparse_mla_kernel_binding_run_uses_binding_argument(monkeypatch) -> None:

@@ -8,7 +8,7 @@ import sys
 import traceback
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
 from pathlib import Path
 from threading import RLock
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 _B12X_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-_MEMORY_CACHE: OrderedDict[str, Any] = OrderedDict()
+_MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
 _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
@@ -163,6 +163,103 @@ def tensor_key(
         if tensor is None
         else TensorKey.from_tensor(name, tensor, dims=dims, align=align, layout=layout),
     )
+
+
+def _compile_spec_shape_key(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return ("bytes", value)
+    if isinstance(value, Path):
+        return ("path", str(value))
+    if isinstance(value, DimKey):
+        return ("dim", value.kind, _compile_spec_shape_key(value.value))
+    if isinstance(value, TensorKey):
+        return (
+            "tensor",
+            value.name,
+            value.dtype,
+            value.rank,
+            tuple(_compile_spec_shape_key(dim) for dim in value.dims),
+            value.stride,
+            value.device,
+            value.align,
+            _compile_spec_shape_key(value.layout),
+        )
+    if isinstance(value, KeyField):
+        return ("field", value.name, _compile_spec_shape_key(value.value))
+    if isinstance(value, KernelCompileSpec):
+        return (
+            "kernel_spec",
+            value.kernel_id,
+            value.version,
+            tuple(_compile_spec_shape_key(field) for field in value.fields),
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_compile_spec_shape_key(item) for item in value)
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (
+                    _compile_spec_shape_key(key),
+                    _compile_spec_shape_key(item_value),
+                )
+                for key, item_value in value.items()
+            ),
+        )
+    if isinstance(value, type):
+        return ("type", value.__module__, value.__qualname__)
+    cache_key_attr = getattr(value, "__cache_key__", None)
+    if cache_key_attr is not None:
+        return (
+            "cache_key",
+            type(value).__module__,
+            type(value).__qualname__,
+            _compile_spec_shape_key(cache_key_attr),
+        )
+    if is_dataclass(value):
+        return (
+            "dataclass",
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple(
+                (
+                    field.name,
+                    _compile_spec_shape_key(getattr(value, field.name)),
+                )
+                for field in fields(value)
+            ),
+        )
+    return (
+        "repr",
+        type(value).__module__,
+        type(value).__qualname__,
+        repr(value),
+    )
+
+
+def _compile_memory_cache_key(
+    compile_callable: Any,
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    compile_spec: KernelCompileSpec | None,
+) -> object:
+    if compile_spec is not None:
+        key: tuple[object, ...] = (
+            "b12x_cute_memory_cache_v1_explicit_spec",
+            _compile_spec_shape_key(compile_spec),
+        )
+        if kwargs:
+            key += (_compile_spec_shape_key(kwargs),)
+        return key
+
+    return hashlib.sha256(
+        repr(_compile_disk_cache_payload(compile_callable, func, args, kwargs)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _cute_compile_memory_cache_enabled() -> bool:
@@ -577,7 +674,10 @@ def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
 def _compile_cache_payload_log_value(payload: tuple[object, ...] | None) -> dict[str, Any]:
     if payload is None:
         return {}
-    if len(payload) == 8 and payload[0] == "b12x_cute_compile_cache_v3_explicit_spec":
+    if len(payload) == 8 and payload[0] in {
+        "b12x_cute_compile_cache_v3_explicit_spec",
+        "b12x_cute_compile_cache_v4_explicit_spec",
+    }:
         (
             _version,
             target_key,
@@ -1105,12 +1205,12 @@ def _compile_disk_cache_payload(
     ) = _static_compile_cache_context(compile_callable)
     if compile_spec is not None:
         return (
-            "b12x_cute_compile_cache_v3_explicit_spec",
+            "b12x_cute_compile_cache_v4_explicit_spec",
             _explicit_spec_compile_target(func),
             package_fingerprint,
             runtime_toolchain,
-            _structural_cache_key(compile_spec),
-            _structural_cache_key(kwargs),
+            _compile_spec_shape_key(compile_spec),
+            _compile_spec_shape_key(kwargs),
             compile_options,
             compile_environment,
         )
@@ -1173,7 +1273,7 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
     os.replace(tmp_path, object_path)
 
 
-def _memory_cache_get(cache_key: str) -> Any | None:
+def _memory_cache_get(cache_key: object) -> Any | None:
     global _MEMORY_CACHE_HITS
     global _MEMORY_CACHE_MISSES
     if not _cute_compile_memory_cache_enabled():
@@ -1188,7 +1288,7 @@ def _memory_cache_get(cache_key: str) -> Any | None:
         return compiled
 
 
-def _memory_cache_put(cache_key: str, compiled: Any) -> None:
+def _memory_cache_put(cache_key: object, compiled: Any) -> None:
     if not _cute_compile_memory_cache_enabled():
         return
     with _MEMORY_CACHE_LOCK:
@@ -1238,21 +1338,24 @@ def compile(
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
     compile_callable = cute.compile
+    memory_cache_key = _compile_memory_cache_key(
+        compile_callable, func, args, kwargs, compile_spec
+    )
+    compiled = _memory_cache_get(memory_cache_key)
+    if compiled is not None:
+        return compiled
+
     payload = _compile_disk_cache_payload(
         compile_callable, func, args, kwargs, compile_spec
     )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
-
-    compiled = _memory_cache_get(cache_key)
-    if compiled is not None:
-        return compiled
 
     if _cute_compile_disk_cache_enabled():
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
             with _MEMORY_CACHE_LOCK:
                 _DISK_CACHE_HITS += 1
-            _memory_cache_put(cache_key, compiled)
+            _memory_cache_put(memory_cache_key, compiled)
             return compiled
         cache_status = "disk-cache-miss"
     else:
@@ -1281,7 +1384,7 @@ def compile(
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
-    _memory_cache_put(cache_key, compiled)
+    _memory_cache_put(memory_cache_key, compiled)
     return compiled
 
 

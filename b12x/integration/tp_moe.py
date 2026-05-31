@@ -440,6 +440,7 @@ class TPMoEScratchCaps:
 class TPMoEScratchPlan:
     caps: TPMoEScratchCaps
     layout: TPMoEArenaLayout
+    _core_workspace_plan: _TPCoreWorkspacePlan
     _scratch_specs: tuple[B12XScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
@@ -447,6 +448,29 @@ class TPMoEScratchPlan:
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def _workspace_from_scratch(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        a1_gscale: torch.Tensor,
+        a2_gscale: torch.Tensor,
+        input_scales_static: bool,
+    ) -> TPMoEWorkspace | TPW4A16Workspace:
+        scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
+        arena = _materialize_core_arena(
+            self._core_workspace_plan,
+            scratch_storage,
+            offset_bytes=self.layout.route_workspace_nbytes,
+            capacity_nbytes=self.layout.core_workspace_nbytes,
+        )
+        return _materialize_workspace_from_core_arena(
+            self._core_workspace_plan,
+            arena,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=input_scales_static,
+        )
 
     def make_workspace_pool(
         self,
@@ -529,9 +553,29 @@ class TPMoEScratchPlan:
         prepared_w4a16: object | None = None,
         swiglu_limit: float | None = None,
     ) -> "TPMoEFP4Binding":
-        pool = self.make_workspace_pool(scratch=scratch)
+        if int(a.shape[0]) > int(self.caps.max_tokens):
+            raise ValueError(
+                f"input tokens {int(a.shape[0])} exceed TP MoE scratch capacity "
+                f"{int(self.caps.max_tokens)}"
+            )
+        if int(a.shape[1]) != int(self.caps.k):
+            raise ValueError(
+                f"input hidden size {int(a.shape[1])} does not match TP MoE "
+                f"scratch K={int(self.caps.k)}"
+            )
+        if int(topk_ids.shape[1]) != int(self.caps.num_topk):
+            raise ValueError(
+                f"top-k {int(topk_ids.shape[1])} does not match TP MoE scratch "
+                f"top-k={int(self.caps.num_topk)}"
+            )
+        workspace = self._workspace_from_scratch(
+            scratch=scratch,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=input_scales_static,
+        )
         return build_tp_moe_fp4_binding(
-            workspace=pool,
+            workspace=workspace,
             a=a,
             a1_gscale=a1_gscale,
             w1_fp4=w1_fp4,
@@ -571,7 +615,15 @@ class TPMoEFP4Binding:
     w2_alphas: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool
+    implementation: str
+    state_E: int
+    weight_E: int
+    max_rows: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device
+    dtype: torch.dtype
     apply_router_weight_on_input: bool = False
     output: torch.Tensor | None = None
     input_scales_are_reciprocal: bool | None = None
@@ -584,6 +636,29 @@ class TPMoEFP4Binding:
     w13_layout: str = "w13"
     prepared_w4a16: object | None = None
     swiglu_limit: float | None = None
+    row_counts: torch.Tensor | None = None
+    token_map: torch.Tensor | None = None
+    token_weights: torch.Tensor | None = None
+    packed_input: torch.Tensor | None = None
+    packed_input_scale: torch.Tensor | None = None
+    barrier_count: torch.Tensor | None = None
+    barrier_epoch: torch.Tensor | None = None
+    packed_a_view: object = None
+    sfa_ptr: object = None
+    packed_a_flat: torch.Tensor | None = None
+    scale_flat: torch.Tensor | None = None
+    packed_a_storage_ptr: object = None
+    routed_rows_capacity: int | None = None
+    intermediate_cache13: torch.Tensor | None = None
+    intermediate_cache2: torch.Tensor | None = None
+    fc1_c_tmp: torch.Tensor | None = None
+    fc2_c_tmp: torch.Tensor | None = None
+    packed_route_indices: torch.Tensor | None = None
+    block_expert_ids: torch.Tensor | None = None
+    packed_route_count: torch.Tensor | None = None
+    expert_offsets: torch.Tensor | None = None
+    fused_launch: object | None = None
+    topk_sum_launch: object | None = None
 
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
@@ -2911,9 +2986,42 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
     )
+    capacity_tokens = max(layout.core_token_counts or (int(caps.max_tokens),))
+    launch_plan = _make_workspace_plan(
+        num_tokens=capacity_tokens,
+        weight_E=caps.weight_E,
+        k=caps.k,
+        n=caps.n,
+        num_topk=caps.num_topk,
+        device=caps.device,
+        dtype=caps.dtype,
+        quant_mode=caps.quant_mode,
+        activation=caps.activation,
+    )
+    core_workspace_plan = _plan_core_workspace(
+        launch_plan.implementation,
+        launch_plan.quant_mode,
+        launch_plan.state_E,
+        launch_plan.weight_E,
+        launch_plan.k,
+        launch_plan.n,
+        launch_plan.num_topk,
+        launch_plan.device,
+        launch_plan.dtype,
+        routed_rows=launch_plan.routed_rows,
+        max_rows=launch_plan.max_rows,
+        activation=launch_plan.activation,
+        dynamic_physical_tiles=launch_plan.dynamic_physical_tiles,
+        dynamic_task_capacity=launch_plan.dynamic_task_capacity,
+        source_format=caps.source_format,
+        w13_layout=caps.w13_layout,
+        apply_router_weight_on_input=caps.apply_router_weight_on_input,
+        swiglu_limit=caps.swiglu_limit,
+    )
     return TPMoEScratchPlan(
         caps=caps,
         layout=layout,
+        _core_workspace_plan=core_workspace_plan,
         _scratch_specs=(
             scratch_buffer_spec(
                 "tp_moe.scratch",
@@ -3492,7 +3600,59 @@ def build_tp_moe_fp4_binding(
         raise ValueError(
             f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
         )
-    return TPMoEFP4Binding(
+    workspace_quant_mode = getattr(workspace, "quant_mode", None)
+    quant_mode = _normalize_quant_mode(
+        quant_mode if quant_mode is not None else workspace_quant_mode
+    )
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    m, k = map(int, a.shape)
+    num_topk = int(topk_ids.shape[1])
+    if prepared_w4a16 is not None:
+        weight_E = int(getattr(prepared_w4a16, "num_experts"))
+        n = int(getattr(prepared_w4a16, "intermediate_size"))
+    else:
+        weight_E = int(w1_fp4.shape[0])
+        n = int(w2_fp4.shape[2]) * 2
+    if isinstance(workspace, TPMoEWorkspacePool):
+        weight_layout = "packed"
+        scale_format = "e4m3_k16"
+        if quant_mode == "w4a16":
+            if prepared_w4a16 is not None:
+                weight_layout = getattr(prepared_w4a16, "weight_layout", "packed")
+                scale_format = _normalize_w4a16_scale_format(
+                    getattr(
+                        prepared_w4a16,
+                        "scale_format",
+                        _w4a16_scale_format_for_source(source_format),
+                    )
+                )
+            else:
+                weight_layout = _w4a16_weight_layout_for_source(source_format)
+                scale_format = _w4a16_scale_format_for_source(source_format)
+        plan = _make_workspace_plan(
+            num_tokens=m,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=a.device,
+            dtype=a.dtype,
+            quant_mode=quant_mode,
+            activation=activation,
+        )
+        workspace = _resolve_workspace(
+            workspace,
+            plan=plan,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=input_scales_static,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+            weight_layout=weight_layout,
+            scale_format=scale_format,
+        )
+    common_kwargs = dict(
         a=a,
         a1_gscale=a1_gscale,
         w1_fp4=w1_fp4,
@@ -3504,7 +3664,6 @@ def build_tp_moe_fp4_binding(
         w2_alphas=w2_alphas,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        scratch=workspace,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         output=output,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
@@ -3517,6 +3676,76 @@ def build_tp_moe_fp4_binding(
         w13_layout=w13_layout,
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
+    )
+    if isinstance(workspace, TPW4A16Workspace):
+        weight_layout = "packed"
+        scale_format = "e4m3_k16"
+        if prepared_w4a16 is not None:
+            weight_layout = getattr(prepared_w4a16, "weight_layout", "packed")
+            scale_format = _normalize_w4a16_scale_format(
+                getattr(
+                    prepared_w4a16,
+                    "scale_format",
+                    _w4a16_scale_format_for_source(source_format),
+                )
+            )
+        elif quant_mode == "w4a16":
+            weight_layout = _w4a16_weight_layout_for_source(source_format)
+            scale_format = _w4a16_scale_format_for_source(source_format)
+        fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
+            workspace,
+            token_count=m,
+            weight_layout=weight_layout,
+            scale_format=scale_format,
+        )
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            implementation=workspace.implementation,
+            state_E=workspace.state_E,
+            weight_E=workspace.weight_E,
+            max_rows=workspace.max_rows,
+            k=workspace.k,
+            n=workspace.n,
+            num_topk=workspace.num_topk,
+            device=workspace.device,
+            dtype=workspace.dtype,
+            routed_rows_capacity=workspace.routed_rows_capacity,
+            intermediate_cache13=workspace.intermediate_cache13,
+            intermediate_cache2=workspace.intermediate_cache2,
+            fc1_c_tmp=workspace.fc1_c_tmp,
+            fc2_c_tmp=workspace.fc2_c_tmp,
+            packed_route_indices=workspace.packed_route_indices,
+            block_expert_ids=workspace.block_expert_ids,
+            packed_route_count=workspace.packed_route_count,
+            expert_offsets=workspace.expert_offsets,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
+        )
+    if not isinstance(workspace, TPMoEWorkspace):
+        raise TypeError("expected a materialized TP MoE workspace")
+    return TPMoEFP4Binding(
+        **common_kwargs,
+        implementation=workspace.implementation,
+        state_E=workspace.state_E,
+        weight_E=workspace.weight_E,
+        max_rows=workspace.max_rows,
+        k=workspace.k,
+        n=workspace.n,
+        num_topk=workspace.num_topk,
+        device=workspace.device,
+        dtype=workspace.dtype,
+        row_counts=workspace.row_counts,
+        token_map=workspace.token_map,
+        token_weights=workspace.token_weights,
+        packed_input=workspace.packed_input,
+        packed_input_scale=workspace.packed_input_scale,
+        barrier_count=workspace.barrier_count,
+        barrier_epoch=workspace.barrier_epoch,
+        packed_a_view=workspace.packed_a_view,
+        sfa_ptr=workspace.sfa_ptr,
+        packed_a_flat=workspace.packed_a_flat,
+        scale_flat=workspace.scale_flat,
+        packed_a_storage_ptr=workspace.packed_a_storage_ptr,
     )
 
 
@@ -4863,6 +5092,296 @@ def _launch_exact_relu2_bs1_nemotron(
     return scatter_output
 
 
+def _launch_dynamic_flat(
+    *,
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    pair_head: torch.Tensor,
+    producers_done_count: torch.Tensor,
+    all_work_published: torch.Tensor,
+    task_head: torch.Tensor,
+    task_tail: torch.Tensor,
+    task_ready: torch.Tensor,
+    task_expert: torch.Tensor,
+    task_m_tile: torch.Tensor,
+    task_slice_begin: torch.Tensor,
+    task_slice_count: torch.Tensor,
+    task_valid_rows: torch.Tensor,
+    tile_write_count: torch.Tensor,
+    row_counts: torch.Tensor,
+    expert_write_rows: torch.Tensor,
+    expert_tile_base: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    physical_tiles_capacity: int,
+    task_capacity: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    activation: str,
+    quant_mode: str,
+    share_input_across_experts: bool,
+    volatile_launch_state: bool,
+) -> None:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
+    if not _dynamic_multicta_enabled():
+        effective_mac = 1
+    compiled, mac = _get_dynamic_kernel(
+        E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
+        fast_math=fast_math,
+        mac_override=effective_mac,
+        activation=activation,
+        quant_mode=quant_mode,
+        share_input_across_experts=share_input_across_experts,
+    )
+    if volatile_launch_state:
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+
+    ids_cutlass_dtype = cutlass.Int32 if topk_ids_are_i32 else cutlass.Int64
+    ids_align = 4 if topk_ids_are_i32 else 8
+    compiled(
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, packed_a_view),
+        _gptr(cutlass.Float8E4M3FN, scale_flat),
+        _gptr(cutlass.Uint8, packed_a_flat),
+        _gptr(cutlass.Uint8, scale_flat),
+        barrier_count,
+        barrier_epoch,
+        pair_head,
+        producers_done_count,
+        all_work_published,
+        task_head,
+        task_tail,
+        _gptr(cutlass.Int32, task_ready, 4),
+        _gptr(cutlass.Int32, task_expert, 4),
+        _gptr(cutlass.Int32, task_m_tile, 4),
+        _gptr(cutlass.Int32, task_slice_begin, 4),
+        _gptr(cutlass.Int32, task_slice_count, 4),
+        _gptr(cutlass.Int32, task_valid_rows, 4),
+        _gptr(cutlass.Int32, tile_write_count, 4),
+        w13_fp4,
+        _gptr(cutlass.Float8E4M3FN, w13_sf),
+        down_fp4,
+        _gptr(cutlass.Float8E4M3FN, down_sf),
+        row_counts,
+        expert_write_rows,
+        expert_tile_base,
+        input_gs,
+        w1_alpha,
+        w2_alpha,
+        down_input_scale,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, token_map, 4),
+        _gptr(cutlass.Float32, token_weights, 4),
+        m,
+        max_rows,
+        physical_tiles_capacity * _dynamic_tile_m(quant_mode),
+        task_capacity,
+        physical_tiles_capacity,
+        mac,
+        current_cuda_stream(),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::tp_moe_dynamic_launch",
+    mutates_args="unknown",
+)
+def _tp_moe_dynamic_launch_op(
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    pair_head: torch.Tensor,
+    producers_done_count: torch.Tensor,
+    all_work_published: torch.Tensor,
+    task_head: torch.Tensor,
+    task_tail: torch.Tensor,
+    task_ready: torch.Tensor,
+    task_expert: torch.Tensor,
+    task_m_tile: torch.Tensor,
+    task_slice_begin: torch.Tensor,
+    task_slice_count: torch.Tensor,
+    task_valid_rows: torch.Tensor,
+    tile_write_count: torch.Tensor,
+    row_counts: torch.Tensor,
+    expert_write_rows: torch.Tensor,
+    expert_tile_base: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    physical_tiles_capacity: int,
+    task_capacity: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    activation: str,
+    quant_mode: str,
+    share_input_across_experts: bool,
+    volatile_launch_state: bool,
+) -> None:
+    _launch_dynamic_flat(
+        packed_a_view=packed_a_view,
+        packed_a_flat=packed_a_flat,
+        scale_flat=scale_flat,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        pair_head=pair_head,
+        producers_done_count=producers_done_count,
+        all_work_published=all_work_published,
+        task_head=task_head,
+        task_tail=task_tail,
+        task_ready=task_ready,
+        task_expert=task_expert,
+        task_m_tile=task_m_tile,
+        task_slice_begin=task_slice_begin,
+        task_slice_count=task_slice_count,
+        task_valid_rows=task_valid_rows,
+        tile_write_count=tile_write_count,
+        row_counts=row_counts,
+        expert_write_rows=expert_write_rows,
+        expert_tile_base=expert_tile_base,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        token_map=token_map,
+        token_weights=token_weights,
+        w13_fp4=w13_fp4,
+        w13_sf=w13_sf,
+        down_fp4=down_fp4,
+        down_sf=down_sf,
+        w1_alpha=w1_alpha,
+        w2_alpha=w2_alpha,
+        a=a,
+        flat_ids=flat_ids,
+        flat_weights=flat_weights,
+        scatter_output=scatter_output,
+        E=E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        routed_rows=routed_rows,
+        max_rows=max_rows,
+        physical_tiles_capacity=physical_tiles_capacity,
+        task_capacity=task_capacity,
+        topk_ids_are_i32=topk_ids_are_i32,
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode=quant_mode,
+        share_input_across_experts=share_input_across_experts,
+        volatile_launch_state=volatile_launch_state,
+    )
+
+
+@_tp_moe_dynamic_launch_op.register_fake
+def _tp_moe_dynamic_launch_fake(
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    pair_head: torch.Tensor,
+    producers_done_count: torch.Tensor,
+    all_work_published: torch.Tensor,
+    task_head: torch.Tensor,
+    task_tail: torch.Tensor,
+    task_ready: torch.Tensor,
+    task_expert: torch.Tensor,
+    task_m_tile: torch.Tensor,
+    task_slice_begin: torch.Tensor,
+    task_slice_count: torch.Tensor,
+    task_valid_rows: torch.Tensor,
+    tile_write_count: torch.Tensor,
+    row_counts: torch.Tensor,
+    expert_write_rows: torch.Tensor,
+    expert_tile_base: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    physical_tiles_capacity: int,
+    task_capacity: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    activation: str,
+    quant_mode: str,
+    share_input_across_experts: bool,
+    volatile_launch_state: bool,
+) -> None:
+    return None
+
+
 def _launch_dynamic(
     *,
     workspace: TPDynamicWorkspace,
@@ -4885,41 +5404,11 @@ def _launch_dynamic(
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
 ) -> None:
-    quant_mode = _normalize_quant_mode(quant_mode)
-    effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
-    if not _dynamic_multicta_enabled():
-        effective_mac = 1
-    compiled, mac = _get_dynamic_kernel(
-        E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        topk_ids_dtype=topk_ids_dtype,
-        fast_math=fast_math,
-        mac_override=effective_mac,
-        activation=activation,
-        quant_mode=quant_mode,
-        share_input_across_experts=share_input_across_experts,
-    )
-    _reset_volatile_launch_state(workspace)
-    def _gptr(dtype, t, align=16):
-        return make_ptr(
-            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
-        )
-    ids_cutlass_dtype = (
-        cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
-    )
-    ids_align = 4 if flat_ids.dtype == torch.int32 else 8
-    compiled(
-        _gptr(cutlass.BFloat16, a),
-        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
-        _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
-        workspace.sfa_ptr,
-        _gptr(cutlass.Uint8, workspace.packed_a_flat),
-        _gptr(cutlass.Uint8, workspace.scale_flat),
+    del stream
+    torch.ops.b12x.tp_moe_dynamic_launch(
+        workspace.packed_a_view,
+        workspace.packed_a_flat,
+        workspace.scale_flat,
         workspace.barrier_count,
         workspace.barrier_epoch,
         workspace.pair_head,
@@ -4927,35 +5416,455 @@ def _launch_dynamic(
         workspace.all_work_published,
         workspace.task_head,
         workspace.task_tail,
-        _gptr(cutlass.Int32, workspace.task_ready, 4),
-        _gptr(cutlass.Int32, workspace.task_expert, 4),
-        _gptr(cutlass.Int32, workspace.task_m_tile, 4),
-        _gptr(cutlass.Int32, workspace.task_slice_begin, 4),
-        _gptr(cutlass.Int32, workspace.task_slice_count, 4),
-        _gptr(cutlass.Int32, workspace.task_valid_rows, 4),
-        _gptr(cutlass.Int32, workspace.tile_write_count, 4),
-        weights.w13_fp4,
-        weights.sfb_w13_ptr,
-        weights.down_fp4,
-        weights.sfb_down_ptr,
+        workspace.task_ready,
+        workspace.task_expert,
+        workspace.task_m_tile,
+        workspace.task_slice_begin,
+        workspace.task_slice_count,
+        workspace.task_valid_rows,
+        workspace.tile_write_count,
         workspace.row_counts,
         workspace.expert_write_rows,
         workspace.expert_tile_base,
         workspace.input_gs,
+        workspace.down_input_scale,
+        workspace.token_map,
+        workspace.token_weights,
+        weights.w13_fp4,
+        weights.w13_sf,
+        weights.down_fp4,
+        weights.down_sf,
         weights.w1_alpha,
         weights.w2_alpha,
-        workspace.down_input_scale,
+        a,
+        flat_ids,
+        flat_weights,
+        scatter_output,
+        E,
+        m,
+        k,
+        n,
+        num_topk,
+        routed_rows,
+        max_rows,
+        workspace.physical_tiles_capacity,
+        workspace.task_capacity,
+        topk_ids_dtype == torch.int32,
+        bool(fast_math),
+        activation,
+        quant_mode,
+        bool(share_input_across_experts),
+        workspace.volatile_launch_state,
+    )
+
+
+def _launch_compact_micro_flat(
+    *,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+    micro_cls = activation_spec.micro_kernel_cls
+    compiled, grid_x = _get_micro_kernel(
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        topk_ids_dtype=launch_ids.dtype,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=(m == 1),
+        activation=activation,
+        device=a.device,
+        quant_mode=quant_mode,
+    )
+    if not _compiled_direct_micro_accepts_block_dim(
+        compiled,
+        _DIRECT_MICRO_BLOCK_DIM,
+    ):
+        raise RuntimeError("compiled direct micro MoE kernel cannot launch")
+    if volatile_launch_state:
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+    micro_cls.launch(
+        compiled,
+        x=a,
+        w1_fp4=w1_storage,
+        w1_blockscale=w1_scale_storage,
+        w1_alphas=w1_alpha,
+        a1_gscale=input_gs,
+        a2_gscale=down_input_scale,
+        inter_fp32=micro_intermediate,
+        w2_fp4=w2_storage,
+        w2_blockscale=w2_scale_storage,
+        w2_alphas=w2_alpha,
+        topk_ids=launch_ids.view(m, num_topk),
+        topk_weights=flat_weights.view(m, num_topk),
+        out=scatter_output,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        m=m,
+        grid_x=grid_x,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::tp_moe_compact_micro_launch",
+    mutates_args="unknown",
+)
+def _tp_moe_compact_micro_launch_op(
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    _launch_compact_micro_flat(
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        micro_intermediate=micro_intermediate,
+        w1_storage=w1_storage,
+        w1_scale_storage=w1_scale_storage,
+        w2_storage=w2_storage,
+        w2_scale_storage=w2_scale_storage,
+        w1_alpha=w1_alpha,
+        w2_alpha=w2_alpha,
+        a=a,
+        launch_ids=launch_ids,
+        flat_weights=flat_weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        scatter_output=scatter_output,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        activation=activation,
+        quant_mode=quant_mode,
+        volatile_launch_state=volatile_launch_state,
+    )
+
+
+@_tp_moe_compact_micro_launch_op.register_fake
+def _tp_moe_compact_micro_launch_fake(
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    return None
+
+
+def _launch_compact_static_flat(
+    *,
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    row_counts: torch.Tensor,
+    active_expert_count: torch.Tensor,
+    weight_expert_ids: torch.Tensor,
+    global_to_local_expert: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    static_mac = _get_impl_mac("static", routed_rows=routed_rows)
+    if routed_rows <= 16:
+        static_mac = min(static_mac, 32)
+    elif routed_rows < 40:
+        static_mac = min(static_mac, 64)
+
+    compiled, mac = _get_static_kernel(
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
+        fast_math=fast_math,
+        mac_override=static_mac,
+        activation=activation,
+        single_token=(m == 1),
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        quant_mode=quant_mode,
+    )
+    if volatile_launch_state:
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+
+    ids_cutlass_dtype = cutlass.Int32 if topk_ids_are_i32 else cutlass.Int64
+    ids_align = 4 if topk_ids_are_i32 else 8
+    compiled(
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, packed_a_view),
+        _gptr(cutlass.Float8E4M3FN, scale_flat),
+        _gptr(cutlass.Uint8, packed_a_flat),
+        _gptr(cutlass.Uint8, scale_flat),
+        barrier_count,
+        barrier_epoch,
+        w13_fp4,
+        _gptr(cutlass.Float8E4M3FN, w13_sf),
+        down_fp4,
+        _gptr(cutlass.Float8E4M3FN, down_sf),
+        row_counts,
+        active_expert_count,
+        weight_expert_ids,
+        global_to_local_expert,
+        input_gs,
+        w1_alpha,
+        w2_alpha,
+        down_input_scale,
         _gptr(cutlass.BFloat16, scatter_output),
-        _gptr(cutlass.Int32, workspace.token_map, 4),
-        _gptr(cutlass.Float32, workspace.token_weights, 4),
+        _gptr(cutlass.Int32, token_map, 4),
+        _gptr(cutlass.Float32, token_weights, 4),
         m,
         max_rows,
-        workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
-        workspace.task_capacity,
-        workspace.physical_tiles_capacity,
         mac,
-        stream,
+        current_cuda_stream(),
     )
+
+
+@torch.library.custom_op(
+    "b12x::tp_moe_compact_static_launch",
+    mutates_args="unknown",
+)
+def _tp_moe_compact_static_launch_op(
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    row_counts: torch.Tensor,
+    active_expert_count: torch.Tensor,
+    weight_expert_ids: torch.Tensor,
+    global_to_local_expert: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    _launch_compact_static_flat(
+        packed_a_view=packed_a_view,
+        packed_a_flat=packed_a_flat,
+        scale_flat=scale_flat,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        row_counts=row_counts,
+        active_expert_count=active_expert_count,
+        weight_expert_ids=weight_expert_ids,
+        global_to_local_expert=global_to_local_expert,
+        token_map=token_map,
+        token_weights=token_weights,
+        w13_fp4=w13_fp4,
+        w13_sf=w13_sf,
+        down_fp4=down_fp4,
+        down_sf=down_sf,
+        w1_alpha=w1_alpha,
+        w2_alpha=w2_alpha,
+        a=a,
+        flat_ids=flat_ids,
+        flat_weights=flat_weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        scatter_output=scatter_output,
+        state_E=state_E,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        routed_rows=routed_rows,
+        max_rows=max_rows,
+        topk_ids_are_i32=topk_ids_are_i32,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        activation=activation,
+        quant_mode=quant_mode,
+        volatile_launch_state=volatile_launch_state,
+    )
+
+
+@_tp_moe_compact_static_launch_op.register_fake
+def _tp_moe_compact_static_launch_fake(
+    packed_a_view: torch.Tensor,
+    packed_a_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    row_counts: torch.Tensor,
+    active_expert_count: torch.Tensor,
+    weight_expert_ids: torch.Tensor,
+    global_to_local_expert: torch.Tensor,
+    token_map: torch.Tensor,
+    token_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_sf: torch.Tensor,
+    down_fp4: torch.Tensor,
+    down_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    routed_rows: int,
+    max_rows: int,
+    topk_ids_are_i32: bool,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    activation: str,
+    quant_mode: str,
+    volatile_launch_state: bool,
+) -> None:
+    return None
 
 
 def _launch_compact_static(
@@ -4983,6 +5892,7 @@ def _launch_compact_static(
     quant_mode: str = "nvfp4",
     unit_scale_contract: bool = False,
 ) -> None:
+    del stream, unit_scale_contract
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
@@ -4999,116 +5909,85 @@ def _launch_compact_static(
         else:
             launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             launch_ids.copy_(flat_ids.to(torch.int32))
-        compiled, grid_x = _get_micro_kernel(
+        torch.ops.b12x.tp_moe_compact_micro_launch(
+            workspace.barrier_count,
+            workspace.barrier_epoch,
+            workspace.micro_intermediate,
+            weights.w1_storage,
+            weights.w1_scale_storage,
+            weights.w2_storage,
+            weights.w2_scale_storage,
+            weights.w1_alpha,
+            weights.w2_alpha,
+            a,
+            launch_ids,
+            flat_weights,
+            input_gs,
+            down_input_scale,
+            scatter_output,
             weight_E,
             m,
             k,
             n,
             num_topk,
-            topk_ids_dtype=launch_ids.dtype,
-            fast_math=fast_math,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=(m == 1),
-            activation=activation,
-            device=a.device,
-            quant_mode=quant_mode,
+            bool(fast_math),
+            bool(share_input_across_experts),
+            bool(share_expert_scales),
+            activation,
+            quant_mode,
+            workspace.volatile_launch_state,
         )
-        if _compiled_direct_micro_accepts_block_dim(
-            compiled,
-            _DIRECT_MICRO_BLOCK_DIM,
-        ):
-            _reset_volatile_launch_state(workspace)
-            micro_cls.launch(
-                compiled,
-                x=a,
-                w1_fp4=weights.w1_storage,
-                w1_blockscale=weights.w1_scale_storage,
-                w1_alphas=weights.w1_alpha,
-                a1_gscale=input_gs,
-                a2_gscale=down_input_scale,
-                inter_fp32=workspace.micro_intermediate,
-                w2_fp4=weights.w2_storage,
-                w2_blockscale=weights.w2_scale_storage,
-                w2_alphas=weights.w2_alpha,
-                topk_ids=launch_ids.view(m, num_topk),
-                topk_weights=flat_weights.view(m, num_topk),
-                out=scatter_output,
-                barrier_count=workspace.barrier_count,
-                barrier_epoch=workspace.barrier_epoch,
-                m=m,
-                grid_x=grid_x,
-            )
-            return
+        return
 
-    static_mac = _get_impl_mac("static", routed_rows=routed_rows)
-    if routed_rows <= 16:
-        static_mac = min(static_mac, 32)
-    elif routed_rows < 40:
-        # Tiny compact launches have very little FC2 tile work, so capping
-        # resident clusters avoids idle CTA participation in the barrier phases.
-        static_mac = min(static_mac, 64)
-
-    compiled, mac = _get_static_kernel(
+    torch.ops.b12x.tp_moe_compact_static_launch(
+        workspace.packed_a_view,
+        workspace.packed_a_flat,
+        workspace.scale_flat,
+        workspace.barrier_count,
+        workspace.barrier_epoch,
+        workspace.row_counts,
+        workspace.active_expert_count,
+        workspace.weight_expert_ids,
+        workspace.global_to_local_expert,
+        workspace.token_map,
+        workspace.token_weights,
+        weights.w13_fp4,
+        weights.w13_sf,
+        weights.down_fp4,
+        weights.down_sf,
+        weights.w1_alpha,
+        weights.w2_alpha,
+        a,
+        flat_ids,
+        flat_weights,
+        input_gs,
+        down_input_scale,
+        scatter_output,
         workspace.state_E,
         weight_E,
         m,
         k,
         n,
         num_topk,
+        routed_rows,
         workspace.max_rows,
-        topk_ids_dtype=topk_ids_dtype,
-        fast_math=fast_math,
-        mac_override=static_mac,
-        activation=activation,
-        single_token=(m == 1),
-        share_input_across_experts=share_input_across_experts,
-        share_expert_scales=share_expert_scales,
-        quant_mode=quant_mode,
-    )
-    launch_ids = flat_ids
-    _reset_volatile_launch_state(workspace)
-    def _gptr(dtype, t, align=16):
-        return make_ptr(
-            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
-        )
-    ids_cutlass_dtype = (
-        cutlass.Int32 if launch_ids.dtype == torch.int32 else cutlass.Int64
-    )
-    ids_align = 4 if launch_ids.dtype == torch.int32 else 8
-    compiled(
-        _gptr(cutlass.BFloat16, a),
-        _gptr(ids_cutlass_dtype, launch_ids, ids_align),
-        _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
-        workspace.sfa_ptr,
-        _gptr(cutlass.Uint8, workspace.packed_a_flat),
-        _gptr(cutlass.Uint8, workspace.scale_flat),
-        workspace.barrier_count,
-        workspace.barrier_epoch,
-        weights.w13_fp4,
-        weights.sfb_w13_ptr,
-        weights.down_fp4,
-        weights.sfb_down_ptr,
-        workspace.row_counts,
-        workspace.active_expert_count,
-        workspace.weight_expert_ids,
-        workspace.global_to_local_expert,
-        input_gs,
-        weights.w1_alpha,
-        weights.w2_alpha,
-        down_input_scale,
-        _gptr(cutlass.BFloat16, scatter_output),
-        _gptr(cutlass.Int32, workspace.token_map, 4),
-        _gptr(cutlass.Float32, workspace.token_weights, 4),
-        m,
-        workspace.max_rows,
-        mac,
-        stream,
+        topk_ids_dtype == torch.int32,
+        bool(fast_math),
+        bool(share_input_across_experts),
+        bool(share_expert_scales),
+        activation,
+        quant_mode,
+        workspace.volatile_launch_state,
     )
 
 
-@torch._dynamo.disable
+def _require_binding_field(binding: TPMoEFP4Binding, field_name: str):
+    value = getattr(binding, field_name)
+    if value is None:
+        raise RuntimeError(f"TP MoE FP4 binding is missing {field_name}")
+    return value
+
+
 def b12x_moe_fp4(
     a: torch.Tensor | None = None,  # [m, k] bf16 activations
     a1_gscale: torch.Tensor | None = None,  # [E] or scalar — reciprocal input quant global scale
@@ -5182,7 +6061,7 @@ def b12x_moe_fp4(
             extras.append("w13_layout")
         if extras:
             raise ValueError(
-                "TP MoE FP4 binding owns runtime tensors, scratch, and options; "
+                "TP MoE FP4 binding owns runtime tensors, scratch views, and options; "
                 f"do not also pass {', '.join(extras)}"
             )
         a = binding.a
@@ -5196,7 +6075,7 @@ def b12x_moe_fp4(
         w2_alphas = binding.w2_alphas
         topk_weights = binding.topk_weights
         topk_ids = binding.topk_ids
-        workspace = binding.scratch
+        workspace = None
         apply_router_weight_on_input = binding.apply_router_weight_on_input
         output = binding.output
         input_scales_are_reciprocal = binding.input_scales_are_reciprocal
@@ -5209,6 +6088,33 @@ def b12x_moe_fp4(
         w13_layout = binding.w13_layout
         prepared_w4a16 = binding.prepared_w4a16
         swiglu_limit = binding.swiglu_limit
+        if binding.implementation != "w4a16":
+            workspace = TPMoEWorkspace(
+                implementation=binding.implementation,
+                quant_mode=_normalize_quant_mode(binding.quant_mode),
+                state_E=binding.state_E,
+                weight_E=binding.weight_E,
+                max_rows=binding.max_rows,
+                k=binding.k,
+                n=binding.n,
+                num_topk=binding.num_topk,
+                device=binding.device,
+                dtype=binding.dtype,
+                row_counts=_require_binding_field(binding, "row_counts"),
+                token_map=_require_binding_field(binding, "token_map"),
+                token_weights=_require_binding_field(binding, "token_weights"),
+                packed_input=_require_binding_field(binding, "packed_input"),
+                packed_input_scale=_require_binding_field(
+                    binding, "packed_input_scale"
+                ),
+                barrier_count=_require_binding_field(binding, "barrier_count"),
+                barrier_epoch=_require_binding_field(binding, "barrier_epoch"),
+                packed_a_view=binding.packed_a_view,
+                sfa_ptr=binding.sfa_ptr,
+                packed_a_flat=binding.packed_a_flat,
+                scale_flat=binding.scale_flat,
+                packed_a_storage_ptr=binding.packed_a_storage_ptr,
+            )
     if (
         a is None
         or a1_gscale is None
@@ -5221,7 +6127,7 @@ def b12x_moe_fp4(
         or w2_alphas is None
         or topk_weights is None
         or topk_ids is None
-        or workspace is None
+        or (binding is None and workspace is None)
     ):
         raise TypeError(
             "b12x_moe_fp4 requires all FP4 tensors, routing tensors, and workspace or binding"
@@ -5324,30 +6230,67 @@ def b12x_moe_fp4(
                 _w4a16_scale_format_for_source(source_format),
             )
         )
-        plan = _make_workspace_plan(
-            num_tokens=m,
-            weight_E=weight_E,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            device=device,
-            dtype=a.dtype,
-            quant_mode=quant_mode,
-            activation=activation,
-        )
-        w4a16_workspace = _resolve_workspace(
-            workspace,
-            plan=plan,
-            a1_gscale=a1_gscale,
-            a2_gscale=a2_gscale,
-            input_scales_static=effective_input_scales_static,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            weight_layout=weight_layout,
-            scale_format=scale_format,
-        )
-        if not isinstance(w4a16_workspace, TPW4A16Workspace):
-            raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
+        if binding is not None:
+            if binding.implementation != "w4a16":
+                raise TypeError("expected a W4A16 TP MoE binding")
+            if (binding.routed_rows_capacity or 0) < routed_rows:
+                raise RuntimeError(
+                    "W4A16 TP MoE binding capacity is too small: "
+                    f"capacity={binding.routed_rows_capacity}, requested={routed_rows}"
+                )
+            intermediate_cache13 = _require_binding_field(
+                binding, "intermediate_cache13"
+            )
+            intermediate_cache2 = _require_binding_field(binding, "intermediate_cache2")
+            fc1_c_tmp = _require_binding_field(binding, "fc1_c_tmp")
+            fc2_c_tmp = _require_binding_field(binding, "fc2_c_tmp")
+            packed_route_indices = _require_binding_field(
+                binding, "packed_route_indices"
+            )
+            block_expert_ids = _require_binding_field(binding, "block_expert_ids")
+            packed_route_count = _require_binding_field(binding, "packed_route_count")
+            expert_offsets = _require_binding_field(binding, "expert_offsets")
+            fused_launch = binding.fused_launch
+            topk_sum_launch = binding.topk_sum_launch
+        else:
+            plan = _make_workspace_plan(
+                num_tokens=m,
+                weight_E=weight_E,
+                k=k,
+                n=n,
+                num_topk=num_topk,
+                device=device,
+                dtype=a.dtype,
+                quant_mode=quant_mode,
+                activation=activation,
+            )
+            w4a16_workspace = _resolve_workspace(
+                workspace,
+                plan=plan,
+                a1_gscale=a1_gscale,
+                a2_gscale=a2_gscale,
+                input_scales_static=effective_input_scales_static,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                swiglu_limit=swiglu_limit,
+                weight_layout=weight_layout,
+                scale_format=scale_format,
+            )
+            if not isinstance(w4a16_workspace, TPW4A16Workspace):
+                raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
+            intermediate_cache13 = w4a16_workspace.intermediate_cache13
+            intermediate_cache2 = w4a16_workspace.intermediate_cache2
+            fc1_c_tmp = w4a16_workspace.fc1_c_tmp
+            fc2_c_tmp = w4a16_workspace.fc2_c_tmp
+            packed_route_indices = w4a16_workspace.packed_route_indices
+            block_expert_ids = w4a16_workspace.block_expert_ids
+            packed_route_count = w4a16_workspace.packed_route_count
+            expert_offsets = w4a16_workspace.expert_offsets
+            fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
+                w4a16_workspace,
+                token_count=m,
+                weight_layout=weight_layout,
+                scale_format=scale_format,
+            )
         if not topk_weights.is_contiguous():
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(
@@ -5360,12 +6303,6 @@ def b12x_moe_fp4(
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
-        fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
-            w4a16_workspace,
-            token_count=m,
-            weight_layout=weight_layout,
-            scale_format=scale_format,
-        )
         return run_w4a16_moe(
             a,
             prepared,
@@ -5374,15 +6311,15 @@ def b12x_moe_fp4(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             fast_math=fast_math,
-            intermediate_cache13=w4a16_workspace.intermediate_cache13,
-            intermediate_cache2=w4a16_workspace.intermediate_cache2,
+            intermediate_cache13=intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
             output=scatter_output,
-            fc1_c_tmp=w4a16_workspace.fc1_c_tmp,
-            fc2_c_tmp=w4a16_workspace.fc2_c_tmp,
-            packed_route_indices=w4a16_workspace.packed_route_indices,
-            block_expert_ids=w4a16_workspace.block_expert_ids,
-            packed_route_count=w4a16_workspace.packed_route_count,
-            expert_offsets=w4a16_workspace.expert_offsets,
+            fc1_c_tmp=fc1_c_tmp,
+            fc2_c_tmp=fc2_c_tmp,
+            packed_route_indices=packed_route_indices,
+            block_expert_ids=block_expert_ids,
+            packed_route_count=packed_route_count,
+            expert_offsets=expert_offsets,
             swiglu_limit=swiglu_limit,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,

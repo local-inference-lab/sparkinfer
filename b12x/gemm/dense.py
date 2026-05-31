@@ -2120,6 +2120,170 @@ def _get_compiled_dense_gemm(
     return tensor_api
 
 
+def _dense_gemm_launch_flat(
+    a_tensor_gpu: torch.Tensor,
+    b_tensor_gpu: torch.Tensor,
+    sfa_tensor_gpu: torch.Tensor,
+    sfb_tensor_gpu: torch.Tensor,
+    c_tensor_gpu: torch.Tensor,
+    alpha_tensor_gpu: torch.Tensor,
+    n: int,
+    k: int,
+    l: int,
+    c_l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    alpha_dtype: str,
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    cluster_shape_m: int,
+    cluster_shape_n: int,
+    sm_count: int,
+    single_work_tile_per_cta: bool,
+    direct_one_m_tile_scheduler: bool,
+    use_m1_non_tma: bool,
+    split_k_slices: int,
+    split_k_atomic_bf16: bool,
+) -> None:
+    policy = _DenseGemmPolicy(
+        single_work_tile_per_cta=single_work_tile_per_cta,
+        direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
+        use_m1_non_tma=use_m1_non_tma,
+        split_k_slices=split_k_slices,
+        split_k_atomic_bf16=split_k_atomic_bf16,
+    )
+    compiled = _get_compiled_dense_gemm(
+        n=n,
+        k=k,
+        l=l,
+        c_l=c_l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=get_cutlass_dtype(ab_dtype),
+        sf_dtype=get_cutlass_dtype(sf_dtype),
+        c_dtype=get_cutlass_dtype(c_dtype),
+        alpha_dtype=get_cutlass_dtype(alpha_dtype),
+        sf_vec_size=sf_vec_size,
+        mma_k=mma_k,
+        tile_k=tile_k,
+        mma_tiler_mn=(mma_tile_m, mma_tile_n),
+        cluster_shape_mn=(cluster_shape_m, cluster_shape_n),
+        policy=policy,
+        sm_count=sm_count,
+        sm_version="sm_120",
+    )
+    compiled(
+        a_tensor_gpu=a_tensor_gpu,
+        b_tensor_gpu=b_tensor_gpu,
+        sfa_tensor_gpu=sfa_tensor_gpu,
+        sfb_tensor_gpu=sfb_tensor_gpu,
+        c_tensor_gpu=c_tensor_gpu,
+        alpha_tensor_gpu=alpha_tensor_gpu,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::dense_gemm_launch",
+    mutates_args=("c_tensor_gpu",),
+)
+def _dense_gemm_launch_op(
+    a_tensor_gpu: torch.Tensor,
+    b_tensor_gpu: torch.Tensor,
+    sfa_tensor_gpu: torch.Tensor,
+    sfb_tensor_gpu: torch.Tensor,
+    c_tensor_gpu: torch.Tensor,
+    alpha_tensor_gpu: torch.Tensor,
+    n: int,
+    k: int,
+    l: int,
+    c_l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    alpha_dtype: str,
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    cluster_shape_m: int,
+    cluster_shape_n: int,
+    sm_count: int,
+    single_work_tile_per_cta: bool,
+    direct_one_m_tile_scheduler: bool,
+    use_m1_non_tma: bool,
+    split_k_slices: int,
+    split_k_atomic_bf16: bool,
+) -> None:
+    _dense_gemm_launch_flat(
+        a_tensor_gpu,
+        b_tensor_gpu,
+        sfa_tensor_gpu,
+        sfb_tensor_gpu,
+        c_tensor_gpu,
+        alpha_tensor_gpu,
+        n,
+        k,
+        l,
+        c_l,
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tile_m,
+        mma_tile_n,
+        cluster_shape_m,
+        cluster_shape_n,
+        sm_count,
+        single_work_tile_per_cta,
+        direct_one_m_tile_scheduler,
+        use_m1_non_tma,
+        split_k_slices,
+        split_k_atomic_bf16,
+    )
+
+
+@_dense_gemm_launch_op.register_fake
+def _dense_gemm_launch_fake(
+    a_tensor_gpu: torch.Tensor,
+    b_tensor_gpu: torch.Tensor,
+    sfa_tensor_gpu: torch.Tensor,
+    sfb_tensor_gpu: torch.Tensor,
+    c_tensor_gpu: torch.Tensor,
+    alpha_tensor_gpu: torch.Tensor,
+    n: int,
+    k: int,
+    l: int,
+    c_l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    alpha_dtype: str,
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    cluster_shape_m: int,
+    cluster_shape_n: int,
+    sm_count: int,
+    single_work_tile_per_cta: bool,
+    direct_one_m_tile_scheduler: bool,
+    use_m1_non_tma: bool,
+    split_k_slices: int,
+    split_k_atomic_bf16: bool,
+) -> None:
+    return None
+
+
 def _select_default_mma_tiler_mn(
     m: int,
     n: int,
@@ -2253,7 +2417,6 @@ def dense_gemm(
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
     ab_cutlass_dtype = get_cutlass_dtype(ab_dtype)
-    sf_cutlass_dtype = get_cutlass_dtype(sf_dtype)
     c_cutlass_dtype = get_cutlass_dtype(c_dtype)
     if mma_tiler_mn is None:
         mma_tiler_mn = _select_default_mma_tiler_mn(
@@ -2265,7 +2428,6 @@ def dense_gemm(
         )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
-    alpha_cutlass_dtype = get_cutlass_dtype(alpha_dtype)
     policy = _dense_gemm_policy_for(
         m=m,
         n=n,
@@ -2281,13 +2443,10 @@ def dense_gemm(
     split_k_output = split_k_slices > 1
     split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
     if split_k_atomic_bf16:
-        kernel_c_cutlass_dtype = c_cutlass_dtype
         kernel_c_l = l
     elif split_k_output:
-        kernel_c_cutlass_dtype = cutlass.Float32
         kernel_c_l = split_k_slices
     else:
-        kernel_c_cutlass_dtype = c_cutlass_dtype
         kernel_c_l = l
     split_storage = None
     split_scratch = None
@@ -2307,42 +2466,55 @@ def dense_gemm(
                 device=a_torch.device,
             )
             split_scratch = split_storage.permute(1, 2, 0)
+    elif out is None:
+        out = torch.empty(
+            (m, n, l),
+            dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
+            device=a_torch.device,
+        )
+    if alpha is None:
+        alpha = torch.ones((1,), dtype=torch.float32, device=a_torch.device)
 
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     cache_before = _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None
-    compiled = _get_compiled_dense_gemm(
-        n=n,
-        k=k,
-        l=l,
-        c_l=kernel_c_l,
-        a_major="k",
-        b_major="k",
-        c_major="n",
-        ab_dtype=ab_cutlass_dtype,
-        sf_dtype=sf_cutlass_dtype,
-        c_dtype=kernel_c_cutlass_dtype,
-        alpha_dtype=alpha_cutlass_dtype,
-        sf_vec_size=sf_vec_size,
-        mma_k=mma_k,
-        tile_k=tile_k,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-        policy=policy,
-        sm_count=sm_count,
-        sm_version="sm_120",
+    t_compiled = t0
+    kernel_c_dtype_name = (
+        "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
     )
-    t_compiled = time.perf_counter() if _B12X_TIMING else 0.0
     c_tensor_gpu = (
         out if split_k_atomic_bf16 else split_scratch if split_k_output else out
     )
-    result = compiled(
-        a_tensor_gpu=a_torch,
-        b_tensor_gpu=b_torch,
-        sfa_tensor_gpu=sfa_torch,
-        sfb_tensor_gpu=sfb_torch,
-        c_tensor_gpu=c_tensor_gpu,
-        alpha_tensor_gpu=alpha,
+    assert c_tensor_gpu is not None
+    torch.ops.b12x.dense_gemm_launch(
+        a_torch,
+        b_torch,
+        sfa_torch,
+        sfb_torch,
+        c_tensor_gpu,
+        alpha,
+        n,
+        k,
+        l,
+        kernel_c_l,
+        ab_dtype,
+        sf_dtype,
+        kernel_c_dtype_name,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tiler_mn[0],
+        mma_tiler_mn[1],
+        cluster_shape_mn[0],
+        cluster_shape_mn[1],
+        sm_count,
+        policy.single_work_tile_per_cta,
+        policy.direct_one_m_tile_scheduler,
+        policy.use_m1_non_tma,
+        policy.split_k_slices,
+        policy.split_k_atomic_bf16,
     )
+    result = out
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None

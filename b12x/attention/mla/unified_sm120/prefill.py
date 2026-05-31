@@ -720,6 +720,231 @@ def _topk_bucket(topk: int) -> int:
     return 1 << (max(int(topk), 1) - 1).bit_length()
 
 
+def _unified_sm120_prefill_flat_launch(
+    q: torch.Tensor,
+    kv_flat: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink_t: torch.Tensor,
+    output: torch.Tensor,
+    lse_out: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    page_block_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_tiles: int,
+    num_tiles: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    has_sink: bool,
+    has_extra: bool,
+) -> None:
+    traits = make_unified_traits(
+        int(model_type),
+        int(compute_mode),
+        int(scale_format),
+    )
+    layout = make_smem_layout(traits)
+    q_head_dim = int(q.shape[-1])
+    num_tokens = int(q.shape[0])
+    heads = int(q.shape[1])
+    hpb = int(traits.hpb)
+    h_blocks = heads // hpb
+    d_v = int(traits.d_v)
+    kernel = UnifiedPrefillKernel(
+        traits,
+        layout,
+        int(page_block_size),
+        int(num_tiles),
+        num_tokens=num_tokens,
+        h_blocks=h_blocks,
+        num_heads=heads,
+        has_sink=bool(has_sink),
+        has_extra=bool(has_extra),
+        pbs_extra=int(pbs_extra),
+        num_main_tiles=int(num_main_tiles),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    base_args = (
+        _to_cute(q, cutlass.BFloat16),
+        _to_cute(kv_flat, cutlass.Uint8, align=16),
+        _to_cute(topk_indices, cutlass.Int32, align=4),
+        _to_cute(topk_length, cutlass.Int32, align=4),
+        _to_cute(attn_sink_t, cutlass.Float32, align=4),
+        _to_cute(output, cutlass.BFloat16, align=16),
+        _to_cute(lse_out, cutlass.Float32, align=4),
+        Float32(float(sm_scale) * LOG2_E),
+        Int64(stride_kv_block),
+    )
+    if has_extra:
+        args = base_args + (
+            _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+            _to_cute(extra_indices_t, cutlass.Int32, align=4),
+            _to_cute(extra_len_t, cutlass.Int32, align=4),
+            Int64(stride_extra_kv_block),
+            stream,
+        )
+    else:
+        args = base_args + (stream,)
+
+    spec_fields = [
+        key_field("model_type", traits.model_type),
+        key_field("compute_mode", traits.compute_mode),
+        key_field("scale_format", traits.scale_format),
+        key_field("num_heads", heads),
+        key_field("hpb", hpb),
+        key_field("num_tiles", int(num_tiles)),
+        key_field("num_main_tiles", int(num_main_tiles)),
+        key_field("page_block_size", int(page_block_size)),
+        key_field("topk_bucket", _topk_bucket(topk)),
+        key_field("has_sink", int(has_sink)),
+        key_field("has_extra", int(has_extra)),
+        key_field("pbs_extra", int(pbs_extra)),
+        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
+        key_field("num_tokens", num_tokens),
+        tensor_key(
+            "q",
+            q,
+            dims=(
+                DimKey.exact(num_tokens),
+                DimKey.exact(heads),
+                DimKey.exact(q_head_dim),
+            ),
+        ),
+        tensor_key(
+            "topk_indices",
+            topk_indices,
+            dims=(DimKey.exact(num_tokens), DimKey.bucket(topk)),
+        ),
+        tensor_key(
+            "output",
+            output,
+            dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(d_v)),
+        ),
+        tensor_key(
+            "out_lse",
+            lse_out,
+            dims=(DimKey.exact(num_tokens), DimKey.exact(heads)),
+        ),
+    ]
+    if has_extra:
+        spec_fields.append(
+            tensor_key(
+                "extra_indices",
+                extra_indices_t,
+                dims=(DimKey.exact(num_tokens), DimKey.bucket(max(extra_topk, 1))),
+            )
+        )
+    compile_spec = KernelCompileSpec.from_fields(
+        "attention.mla.unified_sm120.prefill",
+        6,
+        *spec_fields,
+    )
+    entry = kernel.call_extra if has_extra else kernel
+    b12x_launch(
+        entry,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::unified_sm120_prefill",
+    mutates_args=("output", "lse_out"),
+)
+def _unified_sm120_prefill_op(
+    q: torch.Tensor,
+    kv_flat: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink_t: torch.Tensor,
+    output: torch.Tensor,
+    lse_out: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    page_block_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_tiles: int,
+    num_tiles: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    has_sink: bool,
+    has_extra: bool,
+) -> None:
+    _unified_sm120_prefill_flat_launch(
+        q,
+        kv_flat,
+        topk_indices,
+        topk_length,
+        attn_sink_t,
+        output,
+        lse_out,
+        extra_kv_flat,
+        extra_indices_t,
+        extra_len_t,
+        sm_scale,
+        model_type,
+        compute_mode,
+        scale_format,
+        page_block_size,
+        topk,
+        extra_topk,
+        num_main_tiles,
+        num_tiles,
+        stride_kv_block,
+        pbs_extra,
+        stride_extra_kv_block,
+        has_sink,
+        has_extra,
+    )
+
+
+@_unified_sm120_prefill_op.register_fake
+def _unified_sm120_prefill_fake(
+    q: torch.Tensor,
+    kv_flat: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink_t: torch.Tensor,
+    output: torch.Tensor,
+    lse_out: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    page_block_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_tiles: int,
+    num_tiles: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    has_sink: bool,
+    has_extra: bool,
+) -> None:
+    return None
+
+
 def run_unified_prefill(
     *,
     q: torch.Tensor,
@@ -798,11 +1023,9 @@ def run_unified_prefill(
         raise ValueError(
             f"unified_sm120 prefill requires heads divisible by HPB={hpb}, got {heads}"
         )
-    h_blocks = heads // hpb
 
     model_type, compute_mode, scale_format = infer_model_type(q_head_dim, kv_cache.dtype)
     traits = make_unified_traits(model_type, compute_mode, scale_format)
-    layout = make_smem_layout(traits)
     d_v = int(traits.d_v)
 
     # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
@@ -889,92 +1112,31 @@ def run_unified_prefill(
         extra_indices_t = topk_indices        # alias (never read)
         extra_len_t = topk_length             # alias (never read)
 
-    kernel = UnifiedPrefillKernel(
-        traits, layout, int(page_block_size), num_tiles,
-        num_tokens=num_tokens, h_blocks=h_blocks, num_heads=heads, has_sink=has_sink,
-        has_extra=has_extra, pbs_extra=pbs_extra, num_main_tiles=num_main_tiles,
-    )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
     kv_flat = kv_cache.reshape(-1)
-    base_args = (
-        _to_cute(q, cutlass.BFloat16),
-        _to_cute(kv_flat, cutlass.Uint8, align=16),
-        _to_cute(topk_indices, cutlass.Int32, align=4),
-        _to_cute(topk_length, cutlass.Int32, align=4),
-        _to_cute(attn_sink_t, cutlass.Float32, align=4),
-        _to_cute(output, cutlass.BFloat16, align=16),
-        _to_cute(lse_out, cutlass.Float32, align=4),
-        Float32(float(sm_scale) * LOG2_E),
-        Int64(stride_kv_block),
-    )
-    if has_extra:
-        args = base_args + (
-            _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-            _to_cute(extra_indices_t, cutlass.Int32, align=4),
-            _to_cute(extra_len_t, cutlass.Int32, align=4),
-            Int64(stride_extra_kv_block),
-            stream,
-        )
-    else:
-        args = base_args + (stream,)
-
-    spec_fields = [
-        key_field("model_type", traits.model_type),
-        key_field("compute_mode", traits.compute_mode),
-        key_field("scale_format", traits.scale_format),
-        key_field("num_heads", int(heads)),
-        key_field("hpb", int(hpb)),
-        key_field("num_tiles", int(num_tiles)),
-        key_field("num_main_tiles", int(num_main_tiles)),
-        key_field("page_block_size", int(page_block_size)),
-        key_field("topk_bucket", _topk_bucket(topk)),
-        key_field("has_sink", int(has_sink)),
-        # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache prefill:
-        # has_extra gates the extra-section const_expr (no-extra DSV4/GLM PTX
-        # byte-identical), pbs_extra is the runtime extra page block size.
-        key_field("has_extra", int(has_extra)),
-        key_field("pbs_extra", int(pbs_extra)),
-        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
-        # num_tokens is baked into the launch grid (concrete-shape trace), so it
-        # MUST be a compile key (DimKey.exact row dims below). A T-bucket here
-        # would silently reuse a wrong-grid kernel; key the exact T.
-        key_field("num_tokens", int(num_tokens)),
-        tensor_key("q", q, dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(q_head_dim))),
-        tensor_key("topk_indices", topk_indices, dims=(DimKey.exact(num_tokens), DimKey.bucket(topk))),
-        tensor_key("output", output, dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(d_v))),
-        tensor_key("out_lse", lse_out, dims=(DimKey.exact(num_tokens), DimKey.exact(heads))),
-    ]
-    if has_extra:
-        spec_fields.append(
-            tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(num_tokens), DimKey.bucket(max(extra_topk, 1))))
-        )
-    compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.prefill",
-        # version 6: P10f GLM accuracy fix (shared decode_math S1/S6). GLM
-        # (scale_format==ARBITRARY_FP32) drops S0b and applies the arbitrary fp32
-        # group scale POST-MMA in S1 (QK) / inline in S6 (V) on RAW e4m3 K/V,
-        # recovering the per-group e4m3 mantissa headroom. Changes ONLY the GLM
-        # prefill device trace; DSV4 (UE8M0_BYTE) PTX stays byte-identical to v5.
-        # version 5: P10e EMPTY-ROW guard in the FINAL_BF16 epilogue prologue (force
-        # global_sum=0 for a zero-length / fully-masked row, keyed off the per-token
-        # section_len) so such a row writes O=0 + LSE=-inf instead of normalizing the
-        # spurious all-masked softmax sum. This changes the device trace/PTX for ALL
-        # prefill specializations (DSV4 + GLM, single- and dual-cache), so the cache
-        # version bumps to invalidate stale v4 objects.
-        # version 4: P10 GLM prefill (model_type==GLM_NSA traits) + DSV4 dual-cache
-        # prefill (has_extra union; call_extra/kernel_extra + has_extra const_expr).
-        6,
-        *spec_fields,
-    )
-    # Select the entry: dual-cache uses call_extra (distinct mangled name); the
-    # no-extra DSV4/GLM path uses the kernel object (-> __call__) whose name + PTX
-    # stay byte-identical to the pre-P10 single-cache prefill.
-    entry = kernel.call_extra if has_extra else kernel
-    b12x_launch(
-        entry,
-        compile_spec=compile_spec,
-        compile_args=args,
-        runtime_args=args,
+    torch.ops.b12x.unified_sm120_prefill(
+        q,
+        kv_flat,
+        topk_indices,
+        topk_length,
+        attn_sink_t,
+        output,
+        lse_out,
+        extra_kv_flat,
+        extra_indices_t,
+        extra_len_t,
+        float(sm_scale),
+        int(model_type),
+        int(compute_mode),
+        int(scale_format),
+        int(page_block_size),
+        int(topk),
+        int(extra_topk),
+        int(num_main_tiles),
+        int(num_tiles),
+        int(stride_kv_block),
+        int(pbs_extra),
+        int(stride_extra_kv_block),
+        bool(has_sink),
+        bool(has_extra),
     )
     return output, lse_out

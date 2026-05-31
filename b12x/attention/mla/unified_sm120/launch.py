@@ -69,9 +69,7 @@ from .decode_math import (
 from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
-    ComputeMode,
     ModelType,
-    ScaleFormat,
     infer_model_type,
     make_unified_traits,
 )
@@ -1242,6 +1240,292 @@ def _topk_bucket(topk: int) -> int:
     return 1 << (max(int(topk), 1) - 1).bit_length()
 
 
+def _unified_sm120_decode_grid_flat_launch(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    traits = make_unified_traits(
+        int(model_type),
+        int(compute_mode),
+        int(scale_format),
+    )
+    layout = make_smem_layout(traits)
+    q_head_dim = int(q_all.shape[-1])
+    rows = int(q_all.shape[0])
+    heads = int(q_all.shape[1])
+    hpb = int(traits.hpb)
+    d_v = int(traits.d_v)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    if per_token_len:
+        pertok_base = (
+            _to_cute(q_all, cutlass.BFloat16),
+            _to_cute(kv_flat, cutlass.Uint8, align=16),
+            _to_cute(swa_indices, cutlass.Int32, align=4),
+            _to_cute(mid_out, cutlass.BFloat16, align=16),
+            _to_cute(mid_lse, cutlass.Float32, align=4),
+            Float32(float(sm_scale) * LOG2_E),
+            _to_cute(swa_len_t, cutlass.Int32, align=4),
+            Int64(stride_kv_block),
+        )
+        if has_extra:
+            args = pertok_base + (
+                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4),
+                _to_cute(extra_len_t, cutlass.Int32, align=4),
+                Int32(num_main_chunks),
+                Int64(stride_extra_kv_block),
+                stream,
+            )
+        else:
+            args = pertok_base + (stream,)
+    else:
+        base_args = (
+            _to_cute(q_all, cutlass.BFloat16),
+            _to_cute(kv_flat, cutlass.Uint8, align=16),
+            _to_cute(swa_indices, cutlass.Int32, align=4),
+            _to_cute(mid_out, cutlass.BFloat16, align=16),
+            _to_cute(mid_lse, cutlass.Float32, align=4),
+            Float32(float(sm_scale) * LOG2_E),
+            Int32(topk),
+            Int64(stride_kv_block),
+        )
+        if has_extra:
+            args = base_args + (
+                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4),
+                Int32(extra_topk),
+                Int32(num_main_chunks),
+                Int64(stride_extra_kv_block),
+                stream,
+            )
+        else:
+            args = base_args + (stream,)
+
+    kernel = UnifiedDecodeKernel(
+        traits,
+        layout,
+        int(swa_page_size),
+        int(chunks_per_split),
+        num_tokens=rows,
+        h_blocks=int(grid_h_blocks),
+        num_splits=int(num_splits),
+        has_extra=bool(has_extra),
+        pbs_extra=int(pbs_extra),
+        valid_hpb=int(valid_hpb),
+        head_block_offset=int(head_block_offset),
+        per_token_len=bool(per_token_len),
+    )
+    spec_fields = [
+        key_field("model_type", traits.model_type),
+        key_field("compute_mode", traits.compute_mode),
+        key_field("scale_format", traits.scale_format),
+        key_field("num_heads", heads),
+        key_field("hpb", hpb),
+        key_field("valid_hpb", int(valid_hpb)),
+        key_field("head_block_offset", int(head_block_offset)),
+        key_field("grid_h_blocks", int(grid_h_blocks)),
+        key_field("chunks_per_split", int(chunks_per_split)),
+        key_field("page_block_size", int(swa_page_size)),
+        key_field("topk_bucket", _topk_bucket(topk)),
+        key_field("has_extra", int(has_extra)),
+        key_field("pbs_extra", int(pbs_extra)),
+        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
+        key_field("per_token_len", int(per_token_len)),
+        key_field("num_tokens", rows),
+        tensor_key(
+            "q_all",
+            q_all,
+            dims=(
+                DimKey.exact(rows),
+                DimKey.exact(heads),
+                DimKey.exact(q_head_dim),
+            ),
+        ),
+        tensor_key(
+            "swa_indices",
+            swa_indices,
+            dims=(DimKey.exact(rows), DimKey.bucket(topk)),
+        ),
+        tensor_key(
+            "mid_out",
+            mid_out,
+            dims=(
+                DimKey.exact(rows),
+                DimKey.exact(heads),
+                DimKey.bucket(num_splits),
+                DimKey.exact(d_v),
+            ),
+        ),
+        tensor_key(
+            "mid_lse",
+            mid_lse,
+            dims=(
+                DimKey.exact(rows),
+                DimKey.exact(heads),
+                DimKey.bucket(num_splits),
+            ),
+        ),
+    ]
+    if has_extra:
+        spec_fields.append(
+            tensor_key(
+                "extra_indices",
+                extra_indices_t,
+                dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))),
+            )
+        )
+    if per_token_len:
+        spec_fields.append(
+            tensor_key("topk_length", swa_len_t, dims=(DimKey.exact(rows),))
+        )
+        if has_extra:
+            spec_fields.append(
+                tensor_key(
+                    "extra_topk_length",
+                    extra_len_t,
+                    dims=(DimKey.exact(rows),),
+                )
+            )
+    compile_spec = KernelCompileSpec.from_fields(
+        "attention.mla.unified_sm120.decode",
+        4,
+        *spec_fields,
+    )
+    if per_token_len:
+        entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
+    else:
+        entry = kernel.call_extra if has_extra else kernel
+    b12x_launch(
+        entry,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::unified_sm120_decode_grid",
+    mutates_args=("mid_out", "mid_lse"),
+)
+def _unified_sm120_decode_grid_op(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    _unified_sm120_decode_grid_flat_launch(
+        q_all,
+        kv_flat,
+        swa_indices,
+        mid_out,
+        mid_lse,
+        swa_len_t,
+        extra_kv_flat,
+        extra_indices_t,
+        extra_len_t,
+        sm_scale,
+        model_type,
+        compute_mode,
+        scale_format,
+        swa_page_size,
+        topk,
+        extra_topk,
+        num_main_chunks,
+        num_splits,
+        chunks_per_split,
+        stride_kv_block,
+        pbs_extra,
+        stride_extra_kv_block,
+        grid_h_blocks,
+        valid_hpb,
+        head_block_offset,
+        has_extra,
+        per_token_len,
+    )
+
+
+@_unified_sm120_decode_grid_op.register_fake
+def _unified_sm120_decode_grid_fake(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    return None
+
+
 def run_unified_decode(
     *,
     q_all: torch.Tensor,
@@ -1366,7 +1650,6 @@ def run_unified_decode(
 
     model_type, compute_mode, scale_format = infer_model_type(q_head_dim, swa_k_cache.dtype)
     traits = make_unified_traits(model_type, compute_mode, scale_format)
-    layout = make_smem_layout(traits)
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
     topk = int(swa_indices.shape[1])
@@ -1387,18 +1670,6 @@ def run_unified_decode(
     # ONLY when EVERY row's length >= the full section width (so the scalar bound
     # already equals each clamped length); a single SHORT row (lt[0] < cap) is NOT
     # uniform and must take the per-token clamp path.
-    # CUDA-graph capture safety: the uniform-vs-per-token decision below reads a
-    # data-dependent reduction off the device (torch.all(...).item()), which is a
-    # device->host SYNC and is ILLEGAL during stream capture (cudaErrorStreamCapture
-    # Unsupported). It is also fundamentally graph-unsafe: the length tensor values
-    # can change between graph replays, so a length-dependent kernel SELECTION baked
-    # at capture time would be wrong. Under capture we therefore SKIP the sync and
-    # conservatively take the PER-TOKEN path (the per-token kernel reads each token's
-    # clamped length, so it is correct for uniform batches too -- uniform is a subset
-    # of per-token). Outside capture we keep the host-sync fast-path so the common
-    # uniform decode stays on the byte-identical scalar kernel.
-    capturing = q_all.is_cuda and torch.cuda.is_current_stream_capturing()
-
     def _length_tensor(lengths, name, cap):
         if lengths is None:
             return None, True
@@ -1410,16 +1681,14 @@ def run_unified_decode(
                 f"got {tuple(lengths.shape)}"
             )
         lt = lengths.to(device=q_all.device, dtype=torch.int32).contiguous()
-        # Under graph capture: no host sync allowed -> conservatively take the
-        # PER-TOKEN path (uniform=False). The per-token kernel reads each token's
-        # CLAMPED length, so it is correct for every case (uniform full-width AND a
-        # genuinely-short single row); only the scalar fast-path is skipped. NOTE:
-        # rows==1 is NOT automatically uniform here -- a single row whose length is
-        # SHORTER than the section width (lt[0] < cap) must still be clamped, so it
-        # is per-token, not scalar. (The earlier "rows==1 is always uniform" claim
-        # conflated cross-token mixing with the per-token clamp and was wrong for a
-        # short single row.)
-        if capturing:
+        # CUDA serving must not read length values back to the host to choose a
+        # kernel. The per-token path reads each token's CLAMPED length in-kernel,
+        # so it is correct for uniform full-width rows and genuinely-short rows;
+        # it only skips the scalar fast path. NOTE: rows==1 is NOT automatically
+        # uniform here -- a single row whose length is SHORTER than the section
+        # width (lt[0] < cap) must still be clamped, so it is per-token, not
+        # scalar.
+        if q_all.is_cuda:
             return lt, False
         # Uniform iff every token's CLAMPED length is the full section width: then
         # the scalar section bound (Int32(cap)) already equals every token's length
@@ -1530,157 +1799,39 @@ def run_unified_decode(
 
     output = workspace.output_buffer[:rows, :heads, :d_v]
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
     kv_flat = swa_k_cache.reshape(-1)
-    if per_token_len:
-        # PER-TOKEN entry args: the (rows,) int32 length tensor(s) replace the
-        # scalar section_len / extra_section_len (section_len read per CTA in-kernel
-        # at t=blockIdx.x). num_main_chunks stays a UNIFORM scalar (main/extra chunk
-        # split over the MAX topk); per-token clamping masks short-token chunks.
-        pertok_base = (
-            _to_cute(q_all, cutlass.BFloat16),
-            _to_cute(kv_flat, cutlass.Uint8, align=16),
-            _to_cute(swa_indices, cutlass.Int32, align=4),
-            _to_cute(mid_out, cutlass.BFloat16, align=16),
-            _to_cute(mid_lse, cutlass.Float32, align=4),
-            Float32(float(sm_scale) * LOG2_E),
-            _to_cute(swa_len_t, cutlass.Int32, align=4),
-            Int64(stride_kv_block),
-        )
-        if has_extra:
-            args = pertok_base + (
-                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-                _to_cute(extra_indices_t, cutlass.Int32, align=4),
-                _to_cute(extra_len_t, cutlass.Int32, align=4),
-                Int32(num_main_chunks),
-                Int64(stride_extra_kv_block),
-                stream,
-            )
-        else:
-            args = pertok_base + (stream,)
-    else:
-        # Base (single-cache) args -- EXACTLY the v1 traced signature. The no-extra
-        # path passes ONLY these, so its trace + PTX stay byte-identical.
-        base_args = (
-            _to_cute(q_all, cutlass.BFloat16),
-            _to_cute(kv_flat, cutlass.Uint8, align=16),
-            _to_cute(swa_indices, cutlass.Int32, align=4),
-            _to_cute(mid_out, cutlass.BFloat16, align=16),
-            _to_cute(mid_lse, cutlass.Float32, align=4),
-            Float32(float(sm_scale) * LOG2_E),
-            Int32(topk),
-            Int64(stride_kv_block),
-        )
-        if has_extra:
-            args = base_args + (
-                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-                _to_cute(extra_indices_t, cutlass.Int32, align=4),
-                Int32(extra_topk),
-                Int32(num_main_chunks),
-                Int64(stride_extra_kv_block),
-                stream,
-            )
-        else:
-            args = base_args + (stream,)
+    swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices
+    extra_len_for_op = extra_len_t if extra_len_t is not None else swa_indices
 
     def _launch_grid(grid_h_blocks: int, valid_hpb: int, head_block_offset: int):
-        # Build + launch ONE grid of ``grid_h_blocks`` head-blocks with a fixed
-        # ``valid_hpb`` const_expr and a ``head_block_offset`` that shifts head_base
-        # to the right head range. The full-block grid (valid_hpb=16, offset=0,
-        # heads a multiple of 16) is the byte-identical base path; the remainder
-        # grid (valid_hpb<16, offset=h_blocks_full) handles the tail head-block.
-        kernel = UnifiedDecodeKernel(
-            traits, layout, int(swa_page_size), chunks_per_split,
-            num_tokens=rows, h_blocks=int(grid_h_blocks), num_splits=num_splits,
-            has_extra=has_extra, pbs_extra=pbs_extra,
-            valid_hpb=int(valid_hpb), head_block_offset=int(head_block_offset),
-            per_token_len=per_token_len,
-        )
-        spec_fields = [
-            key_field("model_type", traits.model_type),
-            key_field("compute_mode", traits.compute_mode),
-            key_field("scale_format", traits.scale_format),
-            key_field("num_heads", int(heads)),
-            key_field("hpb", int(hpb)),
-            # valid_hpb + head_block_offset specialize the VALID_HPB<16 / tail
-            # head-block const_expr (full-block grid keeps valid_hpb=16, offset=0
-            # -> PTX byte-identical to the pre-P10 kernel).
-            key_field("valid_hpb", int(valid_hpb)),
-            key_field("head_block_offset", int(head_block_offset)),
-            key_field("grid_h_blocks", int(grid_h_blocks)),
-            key_field("chunks_per_split", int(chunks_per_split)),
-            key_field("page_block_size", int(swa_page_size)),
-            key_field("topk_bucket", _topk_bucket(topk)),
-            # has_extra + pbs_extra + extra_topk_bucket specialize the dual-cache
-            # kernel: has_extra gates the extra-section const_expr (no-extra DSV4 PTX
-            # byte-identical), pbs_extra is the runtime extra page block size, and the
-            # extra topk bucket keeps the key compact.
-            key_field("has_extra", int(has_extra)),
-            key_field("pbs_extra", int(pbs_extra)),
-            key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
-            # per_token_len gates the P10b per-token section_len const_expr: the
-            # uniform (per_token_len=0) trace + PTX are byte-identical to the
-            # pre-P10b kernel (the length tensor never enters that device entry).
-            key_field("per_token_len", int(per_token_len)),
-            # rows (== num_tokens) is BAKED into the launch grid
-            # (grid=(num_tokens, h_blocks, num_splits), concrete-shape trace), so it
-            # MUST be a compile key -- DimKey.exact on every row dim + a num_tokens
-            # key_field. A DimKey.dynamic() row dim would silently REUSE a kernel
-            # traced for a different num_tokens with the wrong grid (latent rows>1
-            # bug); key the exact T, exactly as prefill.py does.
-            key_field("num_tokens", int(rows)),
-            tensor_key("q_all", q_all, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.exact(q_head_dim))),
-            tensor_key("swa_indices", swa_indices, dims=(DimKey.exact(rows), DimKey.bucket(topk))),
-            tensor_key("mid_out", mid_out, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(d_v))),
-            tensor_key("mid_lse", mid_lse, dims=(DimKey.exact(rows), DimKey.exact(heads), DimKey.bucket(num_splits))),
-        ]
-        if has_extra:
-            spec_fields.append(
-                tensor_key("extra_indices", extra_indices_t, dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))))
-            )
-        if per_token_len:
-            # The (rows,) int32 length tensor(s) enter the per-token device entry; key
-            # their row dim (exact rows, baked into the grid).
-            spec_fields.append(
-                tensor_key("topk_length", swa_len_t, dims=(DimKey.exact(rows),))
-            )
-            if has_extra:
-                spec_fields.append(
-                    tensor_key("extra_topk_length", extra_len_t, dims=(DimKey.exact(rows),))
-                )
-        compile_spec = KernelCompileSpec.from_fields(
-            "attention.mla.unified_sm120.decode",
-            # version 4: P10f GLM accuracy fix. GLM (scale_format==ARBITRARY_FP32)
-            # drops S0b K dequant+requant and applies the arbitrary fp32 group scale
-            # POST-MMA in S1 (QK) and inline in S6 (V) on RAW e4m3 K/V -- recovering
-            # the per-group e4m3 mantissa headroom (unified GLM cos ~0.9966 ->
-            # >=0.9995). This changes ONLY the GLM device trace; the DSV4
-            # (UE8M0_BYTE) const_expr branches are untouched so its PTX is
-            # byte-identical to v3, but the cache version still bumps to invalidate
-            # any stale GLM v3 objects.
-            # version 3: P10b per-token topk_length entries (kernel_pertok /
-            # kernel_extra_pertok + per_token_len const_expr). The cache key is
-            # kernel_id + version + fields; this bump invalidates stale v2 objects.
-            # The uniform (per_token_len=0) trace + PTX are unchanged from v2 (the
-            # length tensor never enters the uniform device entry), and the
-            # per_token_len key_field keeps the per-token entries on distinct keys.
-            4,
-            *spec_fields,
-        )
-        # Select the entry method: each (single/dual cache) x (uniform/per-token)
-        # combination has a DISTINCT mangled name. The uniform single-cache path
-        # uses the kernel object (-> __call__) whose name + PTX stay byte-identical
-        # to the pre-P7c/P10b kernel; the others use their named entries.
-        if per_token_len:
-            entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
-        else:
-            entry = kernel.call_extra if has_extra else kernel
-        b12x_launch(
-            entry,
-            compile_spec=compile_spec,
-            compile_args=args,
-            runtime_args=args,
+        torch.ops.b12x.unified_sm120_decode_grid(
+            q_all,
+            kv_flat,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            swa_len_for_op,
+            extra_kv_flat,
+            extra_indices_t,
+            extra_len_for_op,
+            float(sm_scale),
+            int(model_type),
+            int(compute_mode),
+            int(scale_format),
+            int(swa_page_size),
+            int(topk),
+            int(extra_topk),
+            int(num_main_chunks),
+            int(num_splits),
+            int(chunks_per_split),
+            int(stride_kv_block),
+            int(pbs_extra),
+            int(stride_extra_kv_block),
+            int(grid_h_blocks),
+            int(valid_hpb),
+            int(head_block_offset),
+            bool(has_extra),
+            bool(per_token_len),
         )
 
     if h_blocks_full > 0:

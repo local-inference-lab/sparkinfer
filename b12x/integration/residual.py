@@ -84,6 +84,36 @@ class B12XMHCBinding:
     out: torch.Tensor | None = None
     split_k: int = MHC_DEFAULT_SPLIT_K
 
+    def pre(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        *,
+        rms_eps: float,
+        hc_eps: float,
+        sinkhorn_iters: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+        block_k: int = MHC_DEFAULT_BLOCK_K,
+        block_h: int = MHC_DEFAULT_BLOCK_H,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return b12x_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            binding=self,
+            block_k=block_k,
+            block_h=block_h,
+        )
+
     def post_pre(
         self,
         x: torch.Tensor,
@@ -611,6 +641,219 @@ def _workspace_views_for_pre(
     return partials, y_out, post_out, comb_out
 
 
+def b12x_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    workspace: MHCWorkspace | MHCPreWorkspace | torch.Tensor | None = None,
+    y_out: torch.Tensor | None = None,
+    post_out: torch.Tensor | None = None,
+    comb_out: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+    binding: B12XMHCBinding | None = None,
+    split_k: int = MHC_DEFAULT_SPLIT_K,
+    block_k: int = MHC_DEFAULT_BLOCK_K,
+    block_h: int = MHC_DEFAULT_BLOCK_H,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("workspace", workspace),
+                ("y_out", y_out),
+                ("post_out", post_out),
+                ("comb_out", comb_out),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "mHC binding owns workspace and output buffers; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        workspace = binding.partials
+        y_out = binding.y
+        post_out = binding.post_buffer
+        comb_out = binding.comb_buffer
+        split_k = int(binding.split_k)
+
+    tokens, hidden_size, _ = _validate_pre_inputs(
+        residual, fn, hc_scale, hc_base
+    )
+    _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
+
+    split_k = int(split_k)
+    block_k = int(block_k)
+    block_h = int(block_h)
+    sinkhorn_iters = int(sinkhorn_iters)
+    if sinkhorn_iters <= 0:
+        raise ValueError(f"sinkhorn_iters must be positive, got {sinkhorn_iters}")
+    if split_k <= 0:
+        raise ValueError(f"split_k must be positive, got {split_k}")
+    if block_k <= 0:
+        raise ValueError(f"block_k must be positive, got {block_k}")
+    if block_h <= 0:
+        raise ValueError(f"block_h must be positive, got {block_h}")
+
+    capture = _capture_active(residual.device)
+    if workspace is None:
+        if capture:
+            raise ValueError(
+                "b12x_mhc_pre requires a caller-owned workspace (partials "
+                "scratch) during CUDA graph capture"
+            )
+        partials = torch.empty(
+            (tokens, split_k, MHC_PARTIALS),
+            dtype=torch.float32,
+            device=residual.device,
+        )
+    elif isinstance(workspace, MHCWorkspace):
+        partials, workspace_y, workspace_post, workspace_comb = (
+            _workspace_views_for_pre(
+                workspace,
+                tokens=tokens,
+                hidden_size=hidden_size,
+                split_k=split_k,
+                dtype=residual.dtype,
+                device=residual.device,
+            )
+        )
+        if y_out is None:
+            y_out = workspace_y
+        if post_out is None:
+            post_out = workspace_post
+        if comb_out is None:
+            comb_out = workspace_comb
+    elif isinstance(workspace, MHCPreWorkspace):
+        if int(workspace.split_k) != split_k:
+            raise ValueError(
+                f"workspace split_k={workspace.split_k} does not match "
+                f"split_k={split_k}"
+            )
+        partials = workspace.partials
+    else:
+        partials = workspace
+
+    if partials is not None:
+        partials = _slice_capacity_view(
+            partials,
+            tokens=tokens,
+            tail_shape=(split_k, MHC_PARTIALS),
+            dtype=torch.float32,
+            device=residual.device,
+            name="workspace partials",
+        )
+        if partials.dtype != torch.float32 or partials.device != residual.device:
+            raise ValueError("workspace partials must be float32 on the residual device")
+        _require_contiguous(partials, name="workspace partials")
+
+    if y_out is None:
+        if capture:
+            raise ValueError("b12x_mhc_pre requires caller-owned y_out during CUDA graph capture")
+        y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
+    else:
+        y_out = _slice_capacity_view(
+            y_out,
+            tokens=tokens,
+            tail_shape=(hidden_size,),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="y_out",
+        )
+    if post_out is None:
+        if capture:
+            raise ValueError("b12x_mhc_pre requires caller-owned post_out during CUDA graph capture")
+        post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
+    else:
+        post_out = _slice_capacity_view(
+            post_out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT,),
+            dtype=torch.float32,
+            device=residual.device,
+            name="post_out",
+        )
+    if comb_out is None:
+        if capture:
+            raise ValueError("b12x_mhc_pre requires caller-owned comb_out during CUDA graph capture")
+        comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
+    else:
+        comb_out = _slice_capacity_view(
+            comb_out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT, MHC_MULT),
+            dtype=torch.float32,
+            device=residual.device,
+            name="comb_out",
+        )
+
+    if y_out.shape != (tokens, hidden_size) or y_out.dtype != residual.dtype or y_out.device != residual.device:
+        raise ValueError("y_out must match shape [tokens, hidden_size], residual dtype, and residual device")
+    if post_out.shape != (tokens, MHC_MULT) or post_out.dtype != torch.float32 or post_out.device != residual.device:
+        raise ValueError("post_out must match shape [tokens, 4], dtype float32, and residual device")
+    if comb_out.shape != (tokens, MHC_MULT, MHC_MULT) or comb_out.dtype != torch.float32 or comb_out.device != residual.device:
+        raise ValueError("comb_out must match shape [tokens, 4, 4], dtype float32, and residual device")
+    _require_contiguous(y_out, name="y_out")
+    _require_contiguous(post_out, name="post_out")
+    _require_contiguous(comb_out, name="comb_out")
+
+    if tokens == 0:
+        return y_out, post_out, comb_out
+
+    if (
+        partials is not None
+        and hidden_size == 4096
+        and split_k == MHC_DEFAULT_SPLIT_K
+        and block_k == MHC_DEFAULT_BLOCK_K
+        and block_h == MHC_DEFAULT_BLOCK_H
+        and float(rms_eps) == 1.0e-6
+        and float(hc_eps) == 1.0e-6
+        and sinkhorn_iters == 20
+    ):
+        from b12x.integration.residual_kernels import (
+            run_mhc_finalize_gram,
+            run_mhc_pre_partial,
+        )
+
+        run_mhc_pre_partial(
+            residual=residual,
+            fn=fn,
+            partials=partials,
+            compute_gram=norm_weight is not None,
+        )
+        run_mhc_finalize_gram(
+            residual=residual,
+            partials=partials,
+            scale=hc_scale,
+            bias=hc_base,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            rms_eps=float(rms_eps),
+            hc_eps=float(hc_eps),
+            sinkhorn_iters=sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=float(norm_eps),
+        )
+        return y_out, post_out, comb_out
+
+    raise ValueError(
+        "b12x_mhc_pre is served only by the fused Gram kernel, which "
+        "supports the decode config "
+        f"(hidden_size=4096, split_k={MHC_DEFAULT_SPLIT_K}, "
+        f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
+        "sinkhorn_iters=20); got "
+        f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
+        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}"
+    )
+
+
 def b12x_mhc_post_pre(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -889,6 +1132,7 @@ __all__ = [
     "MHCWorkspace",
     "MHCPreWorkspace",
     "build_mhc_binding",
+    "b12x_mhc_pre",
     "b12x_mhc_post_pre",
     "empty_mhc_workspace",
     "empty_mhc_pre_workspace",

@@ -15,12 +15,10 @@ from cutlass import Float32, Int32
 from b12x.attention._cute import ops as attention_ops
 from b12x.attention.workspace import (
     SparseMLASplitDecodeConfig,
-    _SPLIT_CHUNK_LADDER,
     _SPLIT_MAX_CHUNKS,
-    _SPLIT_MAX_WIDTH,
     _ceil_div,
     default_sparse_mla_split_decode_config_for_width,
-    forced_sparse_mla_split_decode_config_for_width,
+    forced_sparse_mla_split_decode_config_for_width,  # noqa: F401
 )
 from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import shared_ptr_to_u32
@@ -32,9 +30,6 @@ from .kernel import (
     _MLA_GROUP_SIZE,
     _MLA_HEADS_PER_TILE,
     _MLA_KV_STAGE_BYTES,
-    _MLA_NOPE_DIM,
-    _MLA_OUTPUT_FRAGMENTS_PER_LANE,
-    _MLA_Q_STAGE_BYTES,
     _MLA_Q_GROUP_STAGE_BYTES,
     _MLA_SCALE_GROUPS,
     _MLA_SHARED_SCALE_STAGE_ELEMS,
@@ -42,7 +37,6 @@ from .kernel import (
     _MLA_WARP_THREADS,
     _extract_packed_kv_runtime_views,
     _exp2_approx_ftz_f32,
-    _log2_approx_ftz_f32,
     _clamp_active_token_count,
     _run_one_pass_compressed_mla_tile,
     _run_one_pass_sparse_mla_tile,
@@ -52,7 +46,6 @@ from .kernel import (
     _torch_to_cutlass_dtype,
     _view_last_dim_as_u32,
     _workspace_contract_kv_tensors,
-    get_sparse_mla_shared_storage_cls,
 )
 from .traits import SparseMLATraits, select_sparse_mla_traits
 
@@ -306,7 +299,7 @@ def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
         return
     min_offset = int(tensor.storage_offset())
     max_offset = int(tensor.storage_offset())
-    for size, stride in zip(tensor.shape, tensor.stride()):
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
         extent = (int(size) - 1) * int(stride)
         if extent >= 0:
             max_offset += extent
@@ -1680,6 +1673,456 @@ def run_sparse_mla_split_decode_forward(
     )
 
 
+def _compressed_mla_split_decode_forward_flat_launch(
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_k_cache: torch.Tensor,
+    indexed_indices: torch.Tensor,
+    indexed_lengths: torch.Tensor,
+    indexed_page_table: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    attn_sink_for_kernel: torch.Tensor,
+    launch_num_chunks: int,
+    swa_page_size: int,
+    swa_page_nbytes: int,
+    indexed_page_size: int,
+    indexed_page_nbytes: int,
+    has_swa: bool,
+    has_indexed: bool,
+    map_indexed_page_table: bool,
+    direct_output: bool,
+    single_tile_chunks: bool,
+    direct_sink_output: bool,
+) -> None:
+    head_tiles = (
+        int(tmp_output.shape[1]) + _MLA_HEADS_PER_TILE - 1
+    ) // _MLA_HEADS_PER_TILE
+    q_u32 = _view_last_dim_as_u32(q_all)
+    swa_u8 = swa_k_cache.reshape(-1)
+    indexed_u8 = indexed_k_cache.reshape(-1)
+    num_heads = int(q_all.shape[1])
+    q_u32_width = int(q_u32.shape[2])
+    swa_indices_width = int(swa_indices.shape[1])
+    indexed_indices_width = int(indexed_indices.shape[1])
+    indexed_page_table_width = int(indexed_page_table.shape[1])
+    tmp_output_chunk_capacity = 1 if direct_output else _SPLIT_MAX_CHUNKS
+    tmp_lse_chunk_capacity = _SPLIT_MAX_CHUNKS
+    swa_cache_nbytes = int(swa_u8.numel())
+    indexed_cache_nbytes = int(indexed_u8.numel())
+
+    forward_kernel = _build_compressed_mla_split_forward_kernel(
+        1,
+        head_tiles,
+        int(swa_page_size),
+        int(swa_page_nbytes),
+        int(indexed_page_size),
+        int(indexed_page_nbytes),
+        num_heads,
+        swa_cache_nbytes,
+        indexed_cache_nbytes,
+        swa_indices_width,
+        indexed_indices_width,
+        tmp_output_chunk_capacity,
+        tmp_lse_chunk_capacity,
+        bool(has_swa),
+        bool(has_indexed),
+        bool(map_indexed_page_table),
+        bool(direct_output),
+        bool(single_tile_chunks),
+        bool(direct_sink_output),
+    )
+    forward_args = (
+        _gmem_ptr(q_u32, cutlass.Uint32, assumed_align=16),
+        _gmem_ptr(swa_u8, cutlass.Uint8, assumed_align=16),
+        _gmem_ptr(swa_indices, cutlass.Int32, assumed_align=4),
+        _gmem_ptr(swa_lengths, cutlass.Int32, assumed_align=4),
+        _gmem_ptr(indexed_u8, cutlass.Uint8, assumed_align=16),
+        _gmem_ptr(indexed_indices, cutlass.Int32, assumed_align=4),
+        _gmem_ptr(indexed_lengths, cutlass.Int32, assumed_align=4),
+        _gmem_ptr(indexed_page_table, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(sm_scale, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
+        _gmem_ptr(
+            tmp_output,
+            _torch_to_cutlass_dtype(tmp_output.dtype),
+            assumed_align=16,
+        ),
+        _gmem_ptr(tmp_lse, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(attn_sink_for_kernel, cutlass.Float32, assumed_align=4),
+        indexed_page_table_width,
+        int(indexed_page_table.stride(0)),
+        int(tmp_output.stride(0)),
+        int(tmp_output.stride(1)),
+        int(tmp_output.stride(2)),
+        int(tmp_output.stride(3)) if tmp_output.ndim == 4 else 1,
+        int(tmp_lse.stride(0)),
+        int(tmp_lse.stride(1)),
+        int(tmp_lse.stride(2)),
+        int(launch_num_chunks),
+        int(q_all.shape[0]),
+        current_cuda_stream(),
+    )
+    attn_sink_fake_shape = (num_heads,) if direct_sink_output else (1,)
+    forward_compile_args = (
+        _fake_gmem_ptr(cutlass.Uint32, assumed_align=16),
+        _fake_gmem_ptr(cutlass.Uint8, assumed_align=16),
+        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
+        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
+        _fake_gmem_ptr(cutlass.Uint8, assumed_align=16),
+        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
+        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
+        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
+        _fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4),
+        _fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        _fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        _fake_gmem_ptr(
+            _torch_to_cutlass_dtype(tmp_output.dtype),
+            assumed_align=16,
+        ),
+        _fake_gmem_ptr(cutlass.Float32, assumed_align=4),
+        _fake_compact_tensor(cutlass.Float32, attn_sink_fake_shape, assumed_align=4),
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        current_cuda_stream(),
+    )
+    forward_cache_key = (
+        "compressed_mla_split_forward_ptr",
+        (q_all.device.type, q_all.device.index),
+        num_heads,
+        q_u32_width,
+        swa_cache_nbytes,
+        indexed_cache_nbytes,
+        swa_indices_width,
+        indexed_indices_width,
+        tmp_output_chunk_capacity,
+        tmp_lse_chunk_capacity,
+        _tensor_meta_key(kv_chunk_size_ptr),
+        _tensor_meta_key(num_chunks_ptr),
+        _tensor_meta_key(attn_sink_for_kernel),
+        "dynamic",
+        head_tiles,
+        int(swa_page_size),
+        int(swa_page_nbytes),
+        int(indexed_page_size),
+        int(indexed_page_nbytes),
+        bool(has_swa),
+        bool(has_indexed),
+        bool(map_indexed_page_table),
+        str(tmp_output.dtype),
+        bool(direct_output),
+        bool(single_tile_chunks),
+        bool(direct_sink_output),
+    )
+    forward_spec = KernelCompileSpec.from_key(
+        "attention.mla.compressed_split_forward",
+        4,
+        forward_cache_key,
+        labels=(
+            "kind",
+            "device",
+            "num_heads",
+            "q_u32_width",
+            "swa_cache_nbytes",
+            "indexed_cache_nbytes",
+            "swa_indices_width",
+            "indexed_indices_width",
+            "tmp_output_chunk_capacity",
+            "tmp_lse_chunk_capacity",
+            "kv_chunk_size_ptr",
+            "num_chunks_ptr",
+            "attn_sink",
+            "launch_num_chunks_policy",
+            "head_tiles",
+            "swa_page_size",
+            "swa_page_nbytes",
+            "indexed_page_size",
+            "indexed_page_nbytes",
+            "has_swa",
+            "has_indexed",
+            "map_indexed_page_table",
+            "tmp_output_dtype",
+            "direct_output",
+            "single_tile_chunks",
+            "direct_sink_output",
+        ),
+    )
+    b12x_launch(
+        forward_kernel,
+        compile_spec=forward_spec,
+        compile_args=forward_compile_args,
+        runtime_args=forward_args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::compressed_mla_split_decode_forward",
+    mutates_args=("tmp_output", "tmp_lse"),
+)
+def _compressed_mla_split_decode_forward_op(
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_k_cache: torch.Tensor,
+    indexed_indices: torch.Tensor,
+    indexed_lengths: torch.Tensor,
+    indexed_page_table: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    attn_sink_for_kernel: torch.Tensor,
+    launch_num_chunks: int,
+    swa_page_size: int,
+    swa_page_nbytes: int,
+    indexed_page_size: int,
+    indexed_page_nbytes: int,
+    has_swa: bool,
+    has_indexed: bool,
+    map_indexed_page_table: bool,
+    direct_output: bool,
+    single_tile_chunks: bool,
+    direct_sink_output: bool,
+) -> None:
+    _compressed_mla_split_decode_forward_flat_launch(
+        q_all,
+        swa_k_cache,
+        swa_indices,
+        swa_lengths,
+        indexed_k_cache,
+        indexed_indices,
+        indexed_lengths,
+        indexed_page_table,
+        sm_scale,
+        kv_chunk_size_ptr,
+        num_chunks_ptr,
+        tmp_output,
+        tmp_lse,
+        attn_sink_for_kernel,
+        launch_num_chunks,
+        swa_page_size,
+        swa_page_nbytes,
+        indexed_page_size,
+        indexed_page_nbytes,
+        has_swa,
+        has_indexed,
+        map_indexed_page_table,
+        direct_output,
+        single_tile_chunks,
+        direct_sink_output,
+    )
+
+
+@_compressed_mla_split_decode_forward_op.register_fake
+def _compressed_mla_split_decode_forward_fake(
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_k_cache: torch.Tensor,
+    indexed_indices: torch.Tensor,
+    indexed_lengths: torch.Tensor,
+    indexed_page_table: torch.Tensor,
+    sm_scale: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    attn_sink_for_kernel: torch.Tensor,
+    launch_num_chunks: int,
+    swa_page_size: int,
+    swa_page_nbytes: int,
+    indexed_page_size: int,
+    indexed_page_nbytes: int,
+    has_swa: bool,
+    has_indexed: bool,
+    map_indexed_page_table: bool,
+    direct_output: bool,
+    single_tile_chunks: bool,
+    direct_sink_output: bool,
+) -> None:
+    return None
+
+
+def _sparse_mla_split_decode_merge_flat_launch(
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    contract_tmp_output: torch.Tensor,
+    contract_tmp_lse: torch.Tensor,
+    contract_output: torch.Tensor,
+    has_attn_sink: bool,
+) -> None:
+    if not has_attn_sink:
+        merge_kernel = _build_sparse_mla_split_merge_kernel()
+        merge_args = (
+            _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
+            _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
+            _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
+            current_cuda_stream(),
+        )
+        merge_cache_key = (
+            _tensor_compile_key(
+                "tmp_output",
+                contract_tmp_output,
+                dynamic_dims=(0, 2),
+                dynamic_strides=(2,),
+            ),
+            _tensor_compile_key(
+                "tmp_lse",
+                contract_tmp_lse,
+                dynamic_dims=(0, 2),
+                dynamic_strides=(0, 1),
+            ),
+            _tensor_meta_key(num_chunks_ptr),
+            _tensor_compile_key(
+                "output",
+                contract_output,
+                dynamic_dims=(0,),
+            ),
+            str(tmp_output.dtype),
+            str(output.dtype),
+        )
+        merge_spec = KernelCompileSpec.from_key(
+            "attention.mla.split_merge",
+            3,
+            merge_cache_key,
+            labels=(
+                "tmp_output",
+                "tmp_lse",
+                "num_chunks_ptr",
+                "output",
+                "tmp_output_dtype",
+                "output_dtype",
+            ),
+        )
+        b12x_launch(
+            merge_kernel,
+            compile_spec=merge_spec,
+            compile_args=merge_args,
+            runtime_args=merge_args,
+        )
+        return
+
+    merge_kernel = _build_sparse_mla_split_sink_merge_kernel()
+    merge_args = (
+        _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
+        _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(attn_sink, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
+        current_cuda_stream(),
+    )
+    merge_cache_key = (
+        _tensor_compile_key(
+            "tmp_output",
+            contract_tmp_output,
+            dynamic_dims=(0, 2),
+            dynamic_strides=(2,),
+        ),
+        _tensor_compile_key(
+            "tmp_lse",
+            contract_tmp_lse,
+            dynamic_dims=(0, 2),
+            dynamic_strides=(0, 1),
+        ),
+        _tensor_meta_key(num_chunks_ptr),
+        _tensor_meta_key(attn_sink),
+        _tensor_compile_key(
+            "output",
+            contract_output,
+            dynamic_dims=(0,),
+        ),
+        str(tmp_output.dtype),
+        str(output.dtype),
+        "attn_sink",
+    )
+    merge_spec = KernelCompileSpec.from_key(
+        "attention.mla.split_sink_merge",
+        3,
+        merge_cache_key,
+        labels=(
+            "tmp_output",
+            "tmp_lse",
+            "num_chunks_ptr",
+            "attn_sink",
+            "output",
+            "tmp_output_dtype",
+            "output_dtype",
+            "kind",
+        ),
+    )
+    b12x_launch(
+        merge_kernel,
+        compile_spec=merge_spec,
+        compile_args=merge_args,
+        runtime_args=merge_args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::sparse_mla_split_decode_merge",
+    mutates_args=("output",),
+)
+def _sparse_mla_split_decode_merge_op(
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    contract_tmp_output: torch.Tensor,
+    contract_tmp_lse: torch.Tensor,
+    contract_output: torch.Tensor,
+    has_attn_sink: bool,
+) -> None:
+    _sparse_mla_split_decode_merge_flat_launch(
+        tmp_output,
+        tmp_lse,
+        num_chunks_ptr,
+        output,
+        attn_sink,
+        contract_tmp_output,
+        contract_tmp_lse,
+        contract_output,
+        has_attn_sink,
+    )
+
+
+@_sparse_mla_split_decode_merge_op.register_fake
+def _sparse_mla_split_decode_merge_fake(
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    contract_tmp_output: torch.Tensor,
+    contract_tmp_lse: torch.Tensor,
+    contract_output: torch.Tensor,
+    has_attn_sink: bool,
+) -> None:
+    return None
+
+
 def run_compressed_mla_split_decode_forward(
     *,
     q_all: torch.Tensor | None = None,
@@ -2066,125 +2509,24 @@ def run_compressed_mla_split_decode_forward(
         if not attn_sink.is_contiguous():
             raise ValueError("attn_sink must be contiguous")
     attn_sink_for_kernel = attn_sink if attn_sink is not None else sm_scale
-
-    head_tiles = (
-        int(tmp_output.shape[1]) + _MLA_HEADS_PER_TILE - 1
-    ) // _MLA_HEADS_PER_TILE
-    q_u32 = _view_last_dim_as_u32(q_all)
-    swa_u8 = swa_k_cache.reshape(-1)
-    indexed_u8 = indexed_k_cache.reshape(-1)
     has_swa = int(swa_indices.shape[1]) > 0
-    num_heads = int(q_all.shape[1])
-    q_u32_width = int(q_u32.shape[2])
-    swa_indices_width = int(swa_indices.shape[1])
-    indexed_indices_width = int(indexed_indices.shape[1])
-    indexed_page_table_width = int(indexed_page_table.shape[1])
-    tmp_output_chunk_capacity = 1 if direct_output else _SPLIT_MAX_CHUNKS
-    tmp_lse_chunk_capacity = _SPLIT_MAX_CHUNKS
-    swa_cache_nbytes = int(swa_u8.numel())
-    indexed_cache_nbytes = int(indexed_u8.numel())
 
-    forward_kernel = _build_compressed_mla_split_forward_kernel(
-        1,
-        head_tiles,
-        int(swa_page_size),
-        int(swa_page_nbytes),
-        int(indexed_page_size),
-        int(indexed_page_nbytes),
-        num_heads,
-        swa_cache_nbytes,
-        indexed_cache_nbytes,
-        swa_indices_width,
-        indexed_indices_width,
-        tmp_output_chunk_capacity,
-        tmp_lse_chunk_capacity,
-        bool(has_swa),
-        bool(has_indexed),
-        bool(map_indexed_page_table),
-        bool(direct_output),
-        bool(single_tile_chunks),
-        bool(direct_sink_output),
-    )
-    forward_args = (
-        _gmem_ptr(q_u32, cutlass.Uint32, assumed_align=16),
-        _gmem_ptr(swa_u8, cutlass.Uint8, assumed_align=16),
-        _gmem_ptr(swa_indices, cutlass.Int32, assumed_align=4),
-        _gmem_ptr(swa_lengths, cutlass.Int32, assumed_align=4),
-        _gmem_ptr(indexed_u8, cutlass.Uint8, assumed_align=16),
-        _gmem_ptr(indexed_indices, cutlass.Int32, assumed_align=4),
-        _gmem_ptr(indexed_lengths, cutlass.Int32, assumed_align=4),
-        _gmem_ptr(indexed_page_table, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(sm_scale, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
-        _gmem_ptr(
-            tmp_output,
-            _torch_to_cutlass_dtype(tmp_output.dtype),
-            assumed_align=16,
-        ),
-        _gmem_ptr(tmp_lse, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(attn_sink_for_kernel, cutlass.Float32, assumed_align=4),
-        indexed_page_table_width,
-        int(indexed_page_table.stride(0)),
-        int(tmp_output.stride(0)),
-        int(tmp_output.stride(1)),
-        int(tmp_output.stride(2)),
-        int(tmp_output.stride(3)) if tmp_output.ndim == 4 else 1,
-        int(tmp_lse.stride(0)),
-        int(tmp_lse.stride(1)),
-        int(tmp_lse.stride(2)),
+    torch.ops.b12x.compressed_mla_split_decode_forward(
+        q_all,
+        swa_k_cache,
+        swa_indices,
+        swa_lengths,
+        indexed_k_cache,
+        indexed_indices,
+        indexed_lengths,
+        indexed_page_table,
+        sm_scale,
+        kv_chunk_size_ptr,
+        num_chunks_ptr,
+        tmp_output,
+        tmp_lse,
+        attn_sink_for_kernel,
         int(launch_num_chunks),
-        rows,
-        current_cuda_stream(),
-    )
-    attn_sink_fake_shape = (num_heads,) if direct_sink_output else (1,)
-    forward_compile_args = (
-        _fake_gmem_ptr(cutlass.Uint32, assumed_align=16),
-        _fake_gmem_ptr(cutlass.Uint8, assumed_align=16),
-        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
-        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
-        _fake_gmem_ptr(cutlass.Uint8, assumed_align=16),
-        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
-        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
-        _fake_gmem_ptr(cutlass.Int32, assumed_align=4),
-        _fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4),
-        _fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
-        _fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
-        _fake_gmem_ptr(
-            _torch_to_cutlass_dtype(tmp_output.dtype),
-            assumed_align=16,
-        ),
-        _fake_gmem_ptr(cutlass.Float32, assumed_align=4),
-        _fake_compact_tensor(cutlass.Float32, attn_sink_fake_shape, assumed_align=4),
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        current_cuda_stream(),
-    )
-    forward_cache_key = (
-        "compressed_mla_split_forward_ptr",
-        (q_all.device.type, q_all.device.index),
-        num_heads,
-        q_u32_width,
-        swa_cache_nbytes,
-        indexed_cache_nbytes,
-        swa_indices_width,
-        indexed_indices_width,
-        tmp_output_chunk_capacity,
-        tmp_lse_chunk_capacity,
-        _tensor_meta_key(kv_chunk_size_ptr),
-        _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(attn_sink_for_kernel),
-        "dynamic",
-        head_tiles,
         int(swa_page_size),
         int(swa_page_nbytes),
         int(indexed_page_size),
@@ -2192,49 +2534,9 @@ def run_compressed_mla_split_decode_forward(
         bool(has_swa),
         bool(has_indexed),
         bool(map_indexed_page_table),
-        str(tmp_output.dtype),
         bool(direct_output),
         bool(single_tile_chunks),
         bool(direct_sink_output),
-    )
-    forward_spec = KernelCompileSpec.from_key(
-        "attention.mla.compressed_split_forward",
-        4,
-        forward_cache_key,
-        labels=(
-            "kind",
-            "device",
-            "num_heads",
-            "q_u32_width",
-            "swa_cache_nbytes",
-            "indexed_cache_nbytes",
-            "swa_indices_width",
-            "indexed_indices_width",
-            "tmp_output_chunk_capacity",
-            "tmp_lse_chunk_capacity",
-            "kv_chunk_size_ptr",
-            "num_chunks_ptr",
-            "attn_sink",
-            "launch_num_chunks_policy",
-            "head_tiles",
-            "swa_page_size",
-            "swa_page_nbytes",
-            "indexed_page_size",
-            "indexed_page_nbytes",
-            "has_swa",
-            "has_indexed",
-            "map_indexed_page_table",
-            "tmp_output_dtype",
-            "direct_output",
-            "single_tile_chunks",
-            "direct_sink_output",
-        ),
-    )
-    b12x_launch(
-        forward_kernel,
-        compile_spec=forward_spec,
-        compile_args=forward_compile_args,
-        runtime_args=forward_args,
     )
 
 
@@ -2335,125 +2637,35 @@ def run_sparse_mla_split_decode_merge(
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     _co = getattr(workspace, "_contract_output", None)
-    if attn_sink is None:
-        merge_kernel = _build_sparse_mla_split_merge_kernel()
-        merge_args = (
-            _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
-            _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
-            _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
-            _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
-            current_cuda_stream(),
-        )
-        merge_cache_key = (
-            _tensor_compile_key(
-                "tmp_output",
-                _cto if _cto is not None else tmp_output,
-                dynamic_dims=(0, 2),
-                dynamic_strides=(2,),
-            ),
-            _tensor_compile_key(
-                "tmp_lse",
-                _ctl if _ctl is not None else tmp_lse,
-                dynamic_dims=(0, 2),
-                dynamic_strides=(0, 1),
-            ),
-            _tensor_meta_key(num_chunks_ptr),
-            _tensor_compile_key(
-                "output",
-                _co if _co is not None else output,
-                dynamic_dims=(0,),
-            ),
-            str(tmp_output.dtype),
-            str(output.dtype),
-        )
-        merge_spec = KernelCompileSpec.from_key(
-            "attention.mla.split_merge",
-            3,
-            merge_cache_key,
-            labels=(
-                "tmp_output",
-                "tmp_lse",
-                "num_chunks_ptr",
-                "output",
-                "tmp_output_dtype",
-                "output_dtype",
-            ),
-        )
-        b12x_launch(
-            merge_kernel,
-            compile_spec=merge_spec,
-            compile_args=merge_args,
-            runtime_args=merge_args,
-        )
-        return
 
-    attn_sink = attn_sink.detach()
-    if attn_sink.dtype != torch.float32:
-        raise ValueError(
-            f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}"
-        )
-    if attn_sink.device != output.device:
-        raise ValueError("attn_sink must be on the same CUDA device as output")
-    if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(output.shape[1]):
-        raise ValueError(
-            f"attn_sink must have shape ({int(output.shape[1])},), got {tuple(attn_sink.shape)}"
-        )
-    if not attn_sink.is_contiguous():
-        raise ValueError("attn_sink must be contiguous for the fused split-merge path")
+    has_attn_sink = attn_sink is not None
+    if has_attn_sink:
+        attn_sink = attn_sink.detach()
+        if attn_sink.dtype != torch.float32:
+            raise ValueError(
+                f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}"
+            )
+        if attn_sink.device != output.device:
+            raise ValueError("attn_sink must be on the same CUDA device as output")
+        if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(output.shape[1]):
+            raise ValueError(
+                f"attn_sink must have shape ({int(output.shape[1])},), got {tuple(attn_sink.shape)}"
+            )
+        if not attn_sink.is_contiguous():
+            raise ValueError(
+                "attn_sink must be contiguous for the fused split-merge path"
+            )
 
-    merge_kernel = _build_sparse_mla_split_sink_merge_kernel()
-    merge_args = (
-        _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
-        _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(attn_sink, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
-        current_cuda_stream(),
-    )
-    merge_cache_key = (
-        _tensor_compile_key(
-            "tmp_output",
-            _cto if _cto is not None else tmp_output,
-            dynamic_dims=(0, 2),
-            dynamic_strides=(2,),
-        ),
-        _tensor_compile_key(
-            "tmp_lse",
-            _ctl if _ctl is not None else tmp_lse,
-            dynamic_dims=(0, 2),
-            dynamic_strides=(0, 1),
-        ),
-        _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(attn_sink),
-        _tensor_compile_key(
-            "output",
-            _co if _co is not None else output,
-            dynamic_dims=(0,),
-        ),
-        str(tmp_output.dtype),
-        str(output.dtype),
-        "attn_sink",
-    )
-    merge_spec = KernelCompileSpec.from_key(
-        "attention.mla.split_sink_merge",
-        3,
-        merge_cache_key,
-        labels=(
-            "tmp_output",
-            "tmp_lse",
-            "num_chunks_ptr",
-            "attn_sink",
-            "output",
-            "tmp_output_dtype",
-            "output_dtype",
-            "kind",
-        ),
-    )
-    b12x_launch(
-        merge_kernel,
-        compile_spec=merge_spec,
-        compile_args=merge_args,
-        runtime_args=merge_args,
+    torch.ops.b12x.sparse_mla_split_decode_merge(
+        tmp_output,
+        tmp_lse,
+        num_chunks_ptr,
+        output,
+        attn_sink if attn_sink is not None else tmp_lse,
+        _cto if _cto is not None else tmp_output,
+        _ctl if _ctl is not None else tmp_lse,
+        _co if _co is not None else output,
+        bool(has_attn_sink),
     )
 
 

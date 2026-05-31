@@ -14,7 +14,9 @@ from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.compiler as cute_compiler
 from b12x.cute.compiler import (
+    DimKey,
     KernelCompileSpec,
+    TensorKey,
     _build_compile_disk_cache_key,
     _compile_disk_cache_payload,
     _structural_cache_key,
@@ -350,6 +352,60 @@ def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
     info = cute_compiler.compile_cache_info()
     assert info["memory_cache_hits"] == 1
     assert info["compile_misses"] == 1
+
+
+def test_explicit_spec_memory_hit_uses_lightweight_shape_key(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
+
+    calls = []
+
+    def fake_compile(func, *args, **kwargs):
+        compiled = object()
+        calls.append(compiled)
+        return compiled
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    spec = KernelCompileSpec.from_fields(
+        "test.explicit.memory",
+        1,
+        (
+            "q",
+            TensorKey(
+                name="q",
+                dtype="torch.bfloat16",
+                rank=2,
+                dims=(DimKey.exact(1), DimKey.bucket(64)),
+                stride=(64, 1),
+                device=("cuda", 0),
+                align=16,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(cute, "compile", fake_compile)
+    kernel = FakeKernel()
+
+    compiled_a = cute_compiler.compile(kernel, object(), compile_spec=spec)
+
+    def fail_disk_payload(*args, **kwargs):
+        raise AssertionError("memory hit should not build disk cache payload")
+
+    def fail_structural_key(*args, **kwargs):
+        raise AssertionError("explicit spec hit should not use structural key")
+
+    monkeypatch.setattr(cute_compiler, "_compile_disk_cache_payload", fail_disk_payload)
+    monkeypatch.setattr(cute_compiler, "_structural_cache_key", fail_structural_key)
+
+    compiled_b = cute_compiler.compile(kernel, object(), compile_spec=spec)
+
+    assert compiled_a is compiled_b
+    assert len(calls) == 1
+    assert cute_compiler.compile_cache_info()["memory_cache_hits"] == 1
 
 
 def test_b12x_compile_can_disable_memory_cache(monkeypatch) -> None:

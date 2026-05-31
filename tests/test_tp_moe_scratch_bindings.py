@@ -206,11 +206,55 @@ def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
-    assert isinstance(binding.scratch, TPMoEWorkspacePool)
-    assert binding.scratch.shared_arena is not None
-    assert binding.scratch.shared_arena.data_ptr() == scratch[0].data_ptr()
+    assert not hasattr(binding, "scratch")
+    assert binding.row_counts is not None
+    assert binding.token_map is not None
+    assert binding.packed_input is not None
     assert binding.a is tensors["a"]
     assert binding.topk_ids is tensors["topk_ids"]
+
+
+def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_materialize(*_args, **_kwargs) -> None:
+        raise AssertionError("bind must not materialize or prewarm workspaces")
+
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "materialize_tp_moe_arena_workspaces",
+        _fail_materialize,
+    )
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_prewarm_w4a16_planned_launches",
+        _fail_materialize,
+    )
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            weight_E=8,
+            k=128,
+            n=64,
+            num_topk=2,
+            dtype=torch.bfloat16,
+            route_num_experts=0,
+            quant_mode="w4a16",
+        )
+    )
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+
+    binding = plan.bind(scratch=scratch, **tensors, quant_mode="w4a16")
+
+    assert isinstance(binding, TPMoEFP4Binding)
+    assert not hasattr(binding, "workspace")
+    assert not hasattr(binding, "scratch")
+    assert binding.intermediate_cache13 is not None
+    assert binding.intermediate_cache2 is not None
+    assert binding.packed_route_indices is not None
 
 
 def test_tp_moe_workspace_pool_bind_fp4_returns_common_binding_type() -> None:
@@ -223,7 +267,9 @@ def test_tp_moe_workspace_pool_bind_fp4_returns_common_binding_type() -> None:
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is pool
+    assert not hasattr(binding, "scratch")
+    assert binding.row_counts is not None
+    assert binding.token_map is not None
     assert binding.a is tensors["a"]
     assert binding.topk_ids is tensors["topk_ids"]
 

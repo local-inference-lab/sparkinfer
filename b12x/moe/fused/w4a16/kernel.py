@@ -3969,15 +3969,8 @@ def compile_w4a16_gemm(
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if torch.cuda.is_available():
         device = int(torch.cuda.current_device())
-        props = torch.cuda.get_device_properties(device)
-        sms = int(props.multi_processor_count)
-        max_shared_mem = int(
-            getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
-        )
     else:
         device = None
-        sms = 120
-        max_shared_mem = _DEFAULT_MAX_SHARED_MEM
     kernel = W4A16GemmKernel(
         size_m=size_m,
         size_n=size_n,
@@ -4590,6 +4583,471 @@ def compile_w4a16_topk_sum(
     return result
 
 
+def _w4a16_small_m_direct_launch_flat(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    w13_layout: str,
+    stream_int: int,
+) -> None:
+    swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
+    direct_launch = _compile_w4a16_small_m_direct(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        fast_math=bool(fast_math),
+        topk_ids_dtype=topk_ids.dtype,
+        scale_format=scale_format,
+        swiglu_limit=swiglu_limit,
+        w13_layout=w13_layout,
+        device=a_input.device,
+    )
+
+    def ptr(dt, tensor: torch.Tensor):
+        return make_ptr(dt, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int64 if topk_ids.dtype == torch.int64 else cutlass.Int32
+    direct_launch.compiled(
+        ptr(cutlass.BFloat16, a_input),
+        ptr(cutlass.Uint8, w13_u8),
+        ptr(cutlass.Uint8, w13_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w13_global_scale),
+        ptr(cutlass.Float32, w13_global_scale),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(cutlass.Uint32, inter_u32.view(torch.uint32)),
+        ptr(cutlass.Uint8, w2_u8),
+        ptr(cutlass.Uint8, w2_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(ids_dtype, topk_ids),
+        ptr(cutlass.Float32, topk_weights),
+        ptr(cutlass.BFloat16, output),
+        barrier_count,
+        barrier_epoch,
+        Int32(m),
+        Int32(direct_launch.grid_x),
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_small_m_direct_launch",
+    mutates_args="unknown",
+)
+def _w4a16_small_m_direct_launch_op(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    w13_layout: str,
+    stream_int: int,
+) -> None:
+    _w4a16_small_m_direct_launch_flat(
+        a_input=a_input,
+        w13_u8=w13_u8,
+        w13_scale_u8=w13_scale_u8,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        inter_u32=inter_u32,
+        w2_u8=w2_u8,
+        w2_scale_u8=w2_scale_u8,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output=output,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        fast_math=fast_math,
+        scale_format=scale_format,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        w13_layout=w13_layout,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_small_m_direct_launch_op.register_fake
+def _w4a16_small_m_direct_launch_fake(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    w13_layout: str,
+    stream_int: int,
+) -> None:
+    return None
+
+
+def _w4a16_fused_moe_launch_flat(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    direct_topk_routes: bool,
+    tc_decode_fused_sum: bool,
+    stream_int: int,
+) -> None:
+    swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
+    fused = compile_w4a16_fused_moe(
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=topk,
+        activation=activation,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        zero_fc2_output=bool(zero_fc2_output),
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        swiglu_limit=swiglu_limit,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        direct_topk_routes=bool(direct_topk_routes),
+        tc_decode_fused_sum=bool(tc_decode_fused_sum),
+    )
+    fused.compiled(
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            a_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        w13_arg,
+        w2_arg,
+        fc1_out,
+        activated,
+        fc2_out,
+        w13_scale_i32,
+        w2_scale_i32,
+        w13_global_scale,
+        w2_global_scale,
+        packed_route_indices,
+        block_expert_ids,
+        packed_route_count,
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        fc1_scratch,
+        fc2_scratch,
+        workspace,
+        m,
+        sms * int(fused.blocks_per_sm),
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_fused_moe_launch",
+    mutates_args="unknown",
+)
+def _w4a16_fused_moe_launch_op(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    direct_topk_routes: bool,
+    tc_decode_fused_sum: bool,
+    stream_int: int,
+) -> None:
+    _w4a16_fused_moe_launch_flat(
+        a_input=a_input,
+        w13_arg=w13_arg,
+        w2_arg=w2_arg,
+        fc1_out=fc1_out,
+        activated=activated,
+        fc2_out=fc2_out,
+        w13_scale_i32=w13_scale_i32,
+        w2_scale_i32=w2_scale_i32,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        topk_weights=topk_weights,
+        fc1_scratch=fc1_scratch,
+        fc2_scratch=fc2_scratch,
+        workspace=workspace,
+        m=m,
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        zero_fc2_output=zero_fc2_output,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        direct_topk_routes=direct_topk_routes,
+        tc_decode_fused_sum=tc_decode_fused_sum,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_fused_moe_launch_op.register_fake
+def _w4a16_fused_moe_launch_fake(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    direct_topk_routes: bool,
+    tc_decode_fused_sum: bool,
+    stream_int: int,
+) -> None:
+    return None
+
+
+def _w4a16_topk_sum_launch_flat(
+    fc2_out: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    topk: int,
+    hidden_size: int,
+    element_dtype: str,
+    stream_int: int,
+) -> None:
+    sum_kernel = compile_w4a16_topk_sum(
+        m=m,
+        topk=topk,
+        hidden_size=hidden_size,
+        element_dtype=element_dtype,
+    )
+    sum_kernel.compiled(
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            fc2_out.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        m,
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_topk_sum_launch",
+    mutates_args=("output",),
+)
+def _w4a16_topk_sum_launch_op(
+    fc2_out: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    topk: int,
+    hidden_size: int,
+    element_dtype: str,
+    stream_int: int,
+) -> None:
+    _w4a16_topk_sum_launch_flat(
+        fc2_out=fc2_out,
+        output=output,
+        m=m,
+        topk=topk,
+        hidden_size=hidden_size,
+        element_dtype=element_dtype,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_topk_sum_launch_op.register_fake
+def _w4a16_topk_sum_launch_fake(
+    fc2_out: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    topk: int,
+    hidden_size: int,
+    element_dtype: str,
+    stream_int: int,
+) -> None:
+    return None
+
+
 def _get_c_tmp(
     elements: int,
     *,
@@ -4870,20 +5328,6 @@ def run_w4a16_moe(
                 f"requirement: have_u32={int(inter_u32.numel())}, "
                 f"need_u32={m * inter_u32_per_m}"
             )
-        direct_launch = _compile_w4a16_small_m_direct(
-            m=m,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=int(prepared.num_experts),
-            topk=topk,
-            activation=activation,
-            fast_math=bool(fast_math),
-            topk_ids_dtype=topk_ids.dtype,
-            scale_format=scale_format,
-            swiglu_limit=swiglu_limit,
-            w13_layout=w13_layout,
-            device=a_input.device,
-        )
         micro_w13_scale = getattr(prepared, "micro_w13_scale", None)
         micro_w2_scale = getattr(prepared, "micro_w2_scale", None)
         micro_w13_global = getattr(prepared, "micro_w13_global_scale", None)
@@ -4901,25 +5345,32 @@ def run_w4a16_moe(
         barrier_epoch = prepared.workspace[-1:]
         barrier_count.zero_()
         barrier_epoch.zero_()
-        MoEMicroKernelBackend.launch(
-            direct_launch.compiled,
-            x=a_input,
-            w1_fp4=prepared.w13.view(torch.uint8),
-            w1_blockscale=micro_w13_scale,
-            w1_alphas=micro_w13_global,
-            a1_gscale=micro_w13_global,
-            a2_gscale=micro_w2_global,
-            inter_fp32=inter_u32[: m * inter_u32_per_m],
-            w2_fp4=prepared.w2.view(torch.uint8),
-            w2_blockscale=micro_w2_scale,
-            w2_alphas=micro_w2_global,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            out=output,
-            barrier_count=barrier_count,
-            barrier_epoch=barrier_epoch,
-            m=m,
-            grid_x=direct_launch.grid_x,
+        torch.ops.b12x.w4a16_small_m_direct_launch(
+            a_input,
+            prepared.w13.view(torch.uint8),
+            micro_w13_scale,
+            micro_w13_global,
+            micro_w2_global,
+            inter_u32[: m * inter_u32_per_m],
+            prepared.w2.view(torch.uint8),
+            micro_w2_scale,
+            topk_ids,
+            topk_weights,
+            output,
+            barrier_count,
+            barrier_epoch,
+            m,
+            hidden_size,
+            intermediate_size,
+            int(prepared.num_experts),
+            topk,
+            activation,
+            bool(fast_math),
+            scale_format,
+            swiglu_limit is not None,
+            float(swiglu_limit or 0.0),
+            w13_layout,
+            int(stream),
         )
         return output
 
@@ -5196,13 +5647,8 @@ def run_w4a16_moe(
     else:
         w13_arg = prepared.w13.view(torch.int32).view(-1)
         w2_arg = prepared.w2.view(torch.int32).view(-1)
-    fused.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            a_input.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
+    torch.ops.b12x.w4a16_fused_moe_launch(
+        a_input,
         w13_arg,
         w2_arg,
         fc1_out,
@@ -5215,32 +5661,40 @@ def run_w4a16_moe(
         packed_route_indices,
         block_expert_ids,
         packed_route_count,
-        make_ptr(
-            cutlass.Float32,
-            topk_weights.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
+        topk_weights,
         fc1_scratch,
         fc2_scratch,
         prepared.workspace,
         m,
-        sms * int(fused.blocks_per_sm),
-        stream,
+        capacity_m,
+        hidden_size,
+        intermediate_size,
+        int(prepared.num_experts),
+        topk,
+        activation,
+        bool(apply_router_weight_on_input),
+        expert_map is not None,
+        block_size_m,
+        int(fused.max_m_blocks),
+        element_dtype,
+        bool(fast_math),
+        sms,
+        max_shared_mem,
+        swiglu_limit is not None,
+        float(swiglu_limit or 0.0),
+        weight_layout,
+        scale_format,
+        w13_layout,
+        bool(use_direct_topk_routes),
+        bool(use_tc_decode),
+        int(stream),
     )
 
     if use_tc_decode:
         # FC2 already wrote the top-k-summed result into `output`.
         return output
 
-    if topk_sum_launch is None:
-        sum_kernel = compile_w4a16_topk_sum(
-            m=m,
-            topk=topk,
-            hidden_size=hidden_size,
-            element_dtype=element_dtype,
-        )
-    else:
+    if topk_sum_launch is not None:
         expected_sum = (topk, hidden_size)
         actual_sum = (
             int(topk_sum_launch.topk),
@@ -5251,22 +5705,14 @@ def run_w4a16_moe(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
                 f"requested={expected_sum}, planned={actual_sum}"
             )
-        sum_kernel = topk_sum_launch
-    sum_kernel.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            fc2_out.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
+    torch.ops.b12x.w4a16_topk_sum_launch(
+        fc2_out,
+        output,
         m,
-        stream,
+        topk,
+        hidden_size,
+        element_dtype,
+        int(stream),
     )
     return output
 
