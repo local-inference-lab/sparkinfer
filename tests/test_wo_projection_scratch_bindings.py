@@ -75,6 +75,11 @@ def test_wo_projection_scratch_plan_binds_live_shape(monkeypatch) -> None:
     source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
     weights = _weights()
 
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not build a workspace")
+
+    monkeypatch.setattr(type(plan), "make_workspace", fail_make_workspace)
+
     binding = plan.bind(scratch=scratch, source_tgd=source, weights=weights)
 
     assert isinstance(binding, WOProjectionBinding)
@@ -131,7 +136,7 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
         calls["x_q_out"] = out
         return out
 
-    def fake_wo_a(x_q, wo_a, *, out, expected_m=None):
+    def fake_wo_a(x_q, wo_a, *, out, expected_m=None, **kwargs):
         calls["x_q"] = x_q
         calls["wo_a"] = wo_a
         calls["tmp_out"] = out
@@ -142,7 +147,7 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
         calls["tmp_q_out"] = out
         return out
 
-    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None):
+    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None, **kwargs):
         calls["tmp_q"] = tmp_q
         calls["wo_b"] = wo_b
         calls["output_out"] = out
@@ -173,6 +178,12 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     positions = torch.empty((3,), dtype=torch.int64)
     cos_sin_cache = torch.empty((16, 32), dtype=torch.bfloat16)
     weights = _weights()
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not build a workspace")
+
+    monkeypatch.setattr(type(plan), "make_workspace", fail_make_workspace)
+
     binding = plan.bind_inv_rope(
         scratch=scratch,
         o=o,
@@ -195,11 +206,13 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
 
     monkeypatch.setattr(wo_impl, "quantize_wo_a_input_inv_rope_mxfp8", fake_quantize_a)
     monkeypatch.setattr(
-        wo_impl, "wo_a_dense_gemm_mxfp8", lambda x_q, wo_a, *, out, expected_m=None: out
+        wo_impl,
+        "wo_a_dense_gemm_mxfp8",
+        lambda x_q, wo_a, *, out, expected_m=None, **kwargs: out,
     )
     monkeypatch.setattr(wo_impl, "quantize_wo_b_input_mxfp8", lambda tmp, *, out: out)
 
-    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None):
+    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None, **kwargs):
         out.zero_()
         return out
 

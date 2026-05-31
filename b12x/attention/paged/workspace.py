@@ -326,7 +326,7 @@ class PagedAttentionArena:
     def required_nbytes(cls, caps: PagedAttentionArenaCaps) -> int:
         return cls._layout(caps).arena_nbytes
 
-    def make_workspace(
+    def _make_workspace_views(
         self,
         contract: PagedAttentionWorkspaceContract,
         *,
@@ -436,6 +436,17 @@ class PagedAttentionArena:
             partial_rows_capacity=contract.max_partial_rows,
         )
         return workspace
+
+    def make_workspace(
+        self,
+        contract: PagedAttentionWorkspaceContract,
+        *,
+        use_cuda_graph: bool = False,
+    ) -> "PagedAttentionWorkspace":
+        return self._make_workspace_views(
+            contract,
+            use_cuda_graph=use_cuda_graph,
+        )
 
 
 @dataclass(kw_only=True)

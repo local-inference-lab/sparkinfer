@@ -120,8 +120,29 @@ def test_attention_scratch_plan_binds_live_tensors(monkeypatch) -> None:
     assert binding.q is q
     assert binding.k is k
     assert binding.v is v
-    assert binding.workspace.output.shape == plan.plan.q_shape
-    assert binding.workspace.lse.shape == (2, 4, 3)
+    assert binding.output.shape == plan.plan.q_shape
+    assert binding.lse.shape == (2, 4, 3)
+
+
+def test_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch) -> None:
+    _patch_attention_validation(monkeypatch)
+    plan = plan_attention_scratch(_attention_plan())
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    q = torch.empty(plan.plan.q_shape, dtype=torch.bfloat16)
+    k = torch.empty(plan.plan.k_shape, dtype=torch.bfloat16)
+    v = torch.empty(plan.plan.v_shape, dtype=torch.bfloat16)
+    sink = torch.empty((4,), dtype=torch.float32)
+
+    def fail_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not build a workspace")
+
+    monkeypatch.setattr(contig, "_attention_workspace_from_scratch_plan", fail_workspace)
+
+    binding = plan.bind(scratch=scratch, q=q, k=k, v=v, attention_sink_bias=sink)
+
+    assert isinstance(binding, AttentionBinding)
+    assert binding.output.shape == plan.plan.q_shape
 
 
 def test_attention_workspace_bind_returns_common_binding_type(monkeypatch) -> None:
@@ -138,7 +159,8 @@ def test_attention_workspace_bind_returns_common_binding_type(monkeypatch) -> No
     binding = workspace.bind(q=q, k=k, v=v, plan=plan.plan, attention_sink_bias=sink)
 
     assert isinstance(binding, AttentionBinding)
-    assert binding.workspace is workspace
+    assert binding.output is workspace.output
+    assert binding.lse is workspace.lse
     assert binding.plan is plan.plan
 
 
@@ -157,15 +179,15 @@ def test_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
 
     out, lse = contig.b12x_attention_forward(binding=binding)
 
-    assert out is binding.workspace.output
-    assert lse is binding.workspace.lse
+    assert out is binding.output
+    assert lse is binding.lse
     assert len(compiled.calls) == 1
     call = compiled.calls[0]
     assert call[0] == q.data_ptr()
     assert call[1] == k.data_ptr()
     assert call[2] == v.data_ptr()
-    assert call[3] == binding.workspace.output.data_ptr()
-    assert call[4] == binding.workspace.lse.data_ptr()
+    assert call[3] == binding.output.data_ptr()
+    assert call[4] == binding.lse.data_ptr()
     assert call[5] == sink.data_ptr()
 
 
@@ -207,8 +229,41 @@ def test_varlen_attention_scratch_plan_binds_live_tensors(monkeypatch) -> None:
     assert isinstance(binding, VarlenAttentionBinding)
     assert binding.cu_seqlens_q is cu_q
     assert binding.cu_seqlens_k is cu_q
-    assert binding.workspace.output.shape == plan.plan.q_shape
-    assert binding.workspace.lse.shape == (4, 5)
+    assert binding.output.shape == plan.plan.q_shape
+    assert binding.lse.shape == (4, 5)
+
+
+def test_varlen_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch) -> None:
+    _patch_varlen_validation(monkeypatch)
+    plan = plan_varlen_attention_scratch(_varlen_plan())
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    q = torch.empty(plan.plan.q_shape, dtype=torch.bfloat16)
+    k = torch.empty(plan.plan.k_shape, dtype=torch.bfloat16)
+    v = torch.empty(plan.plan.v_shape, dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, 2, 5], dtype=torch.int32)
+    sink = torch.empty((4,), dtype=torch.float32)
+
+    def fail_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not build a workspace")
+
+    monkeypatch.setattr(
+        contig,
+        "_varlen_attention_workspace_from_scratch_plan",
+        fail_workspace,
+    )
+
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_q,
+        attention_sink_bias=sink,
+    )
+
+    assert isinstance(binding, VarlenAttentionBinding)
+    assert binding.output.shape == plan.plan.q_shape
 
 
 def test_varlen_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
@@ -236,15 +291,15 @@ def test_varlen_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
 
     out, lse = contig.b12x_varlen_attention_forward(binding=binding)
 
-    assert out is binding.workspace.output
-    assert lse is binding.workspace.lse
+    assert out is binding.output
+    assert lse is binding.lse
     assert len(compiled.calls) == 1
     call = compiled.calls[0]
     assert call[0] == q.data_ptr()
     assert call[1] == k.data_ptr()
     assert call[2] == v.data_ptr()
-    assert call[3] == binding.workspace.output.data_ptr()
-    assert call[4] == binding.workspace.lse.data_ptr()
+    assert call[3] == binding.output.data_ptr()
+    assert call[4] == binding.lse.data_ptr()
     assert call[5] == cu_q.data_ptr()
     assert call[6] == cu_k.data_ptr()
     assert call[7] == sink.data_ptr()

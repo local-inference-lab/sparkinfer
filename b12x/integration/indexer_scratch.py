@@ -344,7 +344,7 @@ class B12XIndexerPagedScratchPlan:
             owner="paged indexer",
         )
         arena = B12XAttentionArena.from_shared_arena(self.arena_caps, arena_storage)
-        workspace = arena.make_workspace(self.contract, use_cuda_graph=False)
+        workspace = arena._make_workspace_views(self.contract, use_cuda_graph=False)
         return build_indexer_paged_binding(
             workspace=workspace,
             real_page_table=real_page_table,
@@ -386,7 +386,7 @@ class B12XIndexerExtendScratchPlan:
             owner="indexer extend",
         )
         arena = B12XAttentionArena.from_shared_arena(self.arena_caps, arena_storage)
-        workspace = arena.make_workspace(self.contract, use_cuda_graph=False)
+        workspace = arena._make_workspace_views(self.contract, use_cuda_graph=False)
         return build_indexer_extend_binding(
             workspace=workspace,
             k_start=k_start,

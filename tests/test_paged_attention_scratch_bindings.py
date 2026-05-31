@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import b12x.attention.paged.api as paged_api
+from b12x.attention.paged.workspace import PagedAttentionArena
 from b12x.integration.attention import (
     B12XPagedAttentionBinding,
     B12XPagedAttentionScratchCaps,
@@ -113,6 +114,50 @@ def test_workspace_bind_paged_attention_returns_common_binding_type(monkeypatch)
     assert calls["page_table"] is page_table
     assert calls["kwargs"]["window_left"] == 7
     assert calls["kwargs"]["active_total_q"] == 2
+
+
+def test_paged_attention_scratch_bind_does_not_call_workspace_factory(
+    monkeypatch,
+) -> None:
+    plan = plan_paged_attention_scratch(_caps())
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    q, k_cache, v_cache, output, page_table, cache_seqlens, cu_seqlens_q = _runtime_tensors()
+    calls = {}
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not call the workspace factory")
+
+    def fake_prepare(self, page_table_arg, cache_seqlens_arg, cu_seqlens_q_arg, **kwargs):
+        calls["page_table"] = page_table_arg
+        calls["cache_seqlens"] = cache_seqlens_arg
+        calls["cu_seqlens_q"] = cu_seqlens_q_arg
+        self.page_table = page_table_arg
+        self.cache_seqlens = cache_seqlens_arg
+        self.cu_seqlens_q = cu_seqlens_q_arg
+        self._plan = object()
+        return self
+
+    monkeypatch.setattr(PagedAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(PagedAttentionWorkspace, "prepare", fake_prepare)
+
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+
+    assert isinstance(binding, B12XPagedAttentionBinding)
+    assert binding.q is q
+    assert binding.output is output
+    assert calls["page_table"] is page_table
+    assert calls["cache_seqlens"] is cache_seqlens
+    assert calls["cu_seqlens_q"] is cu_seqlens_q
 
 
 def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch) -> None:

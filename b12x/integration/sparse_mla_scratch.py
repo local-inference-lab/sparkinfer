@@ -216,7 +216,7 @@ class B12XSparseMLAScratchPlan:
             owner="sparse MLA",
         )
         arena = B12XAttentionArena.from_shared_arena(self.arena_caps, arena_storage)
-        workspace = arena.make_workspace(self.contract, use_cuda_graph=False)
+        workspace = arena._make_workspace_views(self.contract, use_cuda_graph=False)
         return build_sparse_mla_binding(
             workspace=workspace,
             q=q,

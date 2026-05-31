@@ -218,7 +218,7 @@ class B12XPagedAttentionScratchPlan:
             owner="paged attention",
         )
         arena = PagedAttentionArena.from_shared_arena(self.arena_caps, arena_storage)
-        workspace = arena.make_workspace(
+        workspace = arena._make_workspace_views(
             self.contract,
             use_cuda_graph=self.caps.use_cuda_graph,
         )

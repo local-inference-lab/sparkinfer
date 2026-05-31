@@ -5,12 +5,13 @@ import torch
 import b12x.attention.indexer.api as indexer_impl
 import b12x.attention.mla.api as sparse_mla_impl
 import b12x.attention.mla.compressed_api as compressed_mla_impl
+import b12x.attention.workspace as attention_workspace
 import b12x.integration.compressed_indexer as compressed_indexer_impl
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     compressed_mla_page_nbytes,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
+from b12x.attention.workspace import B12XAttentionArena, B12XAttentionWorkspace
 from b12x.integration import (
     B12XCompressedIndexerBinding,
     B12XCompressedIndexerScratchCaps,
@@ -136,6 +137,42 @@ def test_compressed_indexer_scratch_plan_exposes_one_opaque_arena_spec() -> None
     assert plan.arena_caps.reserve_paged_indexer_logits is False
 
 
+def test_compressed_indexer_scratch_bind_does_not_call_workspace_factory(
+    monkeypatch,
+) -> None:
+    plan = plan_compressed_indexer_scratch(
+        B12XCompressedIndexerScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=4,
+            max_page_table_width=16,
+            topk=8,
+            reserve_paged_logits=False,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    real_page_table = torch.empty((4, 16), dtype=torch.int32)
+    cache_seqlens = torch.empty((4,), dtype=torch.int32)
+    active_width = torch.empty((1,), dtype=torch.int32)
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not call the workspace factory")
+
+    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+
+    binding = plan.bind(
+        scratch=scratch,
+        real_page_table=real_page_table,
+        cache_seqlens_int32=cache_seqlens,
+        active_width=active_width,
+    )
+
+    assert isinstance(binding, B12XCompressedIndexerBinding)
+    assert binding.real_page_table is real_page_table
+    assert binding.active_width is active_width
+
+
 def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_indexer_paged_scratch(
         B12XIndexerPagedScratchCaps(
@@ -155,6 +192,41 @@ def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.arena_caps.reserve_paged_indexer_logits is False
+
+
+def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
+    monkeypatch,
+) -> None:
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=4,
+            max_page_table_width=16,
+            reserve_paged_logits=False,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    real_page_table = torch.empty((4, 16), dtype=torch.int32)
+    cache_seqlens = torch.empty((4,), dtype=torch.int32)
+    active_width = torch.empty((1,), dtype=torch.int32)
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not call the workspace factory")
+
+    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+
+    binding = plan.bind(
+        scratch=scratch,
+        real_page_table=real_page_table,
+        cache_seqlens_int32=cache_seqlens,
+        active_width=active_width,
+    )
+
+    assert isinstance(binding, B12XIndexerPagedBinding)
+    assert binding.metadata.real_page_table is real_page_table
+    assert binding.active_width is active_width
 
 
 def test_indexer_extend_scratch_plan_exposes_one_opaque_arena_spec() -> None:
@@ -181,6 +253,44 @@ def test_indexer_extend_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     assert plan.arena_caps.indexer_max_k_rows == 1024
 
 
+def test_indexer_extend_scratch_bind_does_not_call_workspace_factory(
+    monkeypatch,
+) -> None:
+    plan = plan_indexer_extend_scratch(
+        B12XIndexerExtendScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=4,
+            max_k_rows=1024,
+            topk=8,
+            reserve_extend_logits=False,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    k_start = torch.zeros((4,), dtype=torch.int32)
+    k_end = torch.full((4,), 64, dtype=torch.int32)
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not call the workspace factory")
+
+    def fake_tma_descriptor(*args, **kwargs):
+        return torch.empty((16,), dtype=torch.uint64), torch.empty((1,), dtype=torch.int64)
+
+    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(
+        attention_workspace,
+        "_encode_indexer_k_tma_descriptor",
+        fake_tma_descriptor,
+    )
+
+    binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end)
+
+    assert isinstance(binding, B12XIndexerExtendBinding)
+    assert binding.metadata.k_start is k_start
+    assert binding.metadata.k_end is k_end
+
+
 def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
@@ -202,6 +312,46 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.contract.mode == "extend"
+
+
+def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
+    monkeypatch,
+) -> None:
+    plan = plan_sparse_mla_scratch(
+        B12XSparseMLAScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=4,
+            max_width=8,
+            max_page_table_width=16,
+            head_dim=512,
+            v_head_dim=512,
+            mode="extend",
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
+    selected_indices = torch.empty((4, 8), dtype=torch.int32)
+    cache_seqlens = torch.empty((4,), dtype=torch.int32)
+    active_counts = torch.empty((4,), dtype=torch.int32)
+
+    def fail_make_workspace(*args, **kwargs):
+        raise AssertionError("scratch binding must not call the workspace factory")
+
+    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=active_counts,
+    )
+
+    assert isinstance(binding, B12XSparseMLABinding)
+    assert binding.q.data_ptr() == q.data_ptr()
+    assert binding.selected_indices is selected_indices
 
 
 def test_workspace_bind_compressed_mla_returns_common_binding_type() -> None:

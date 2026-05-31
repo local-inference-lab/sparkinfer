@@ -557,7 +557,8 @@ class AttentionBinding:
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    workspace: AttentionWorkspace
+    output: torch.Tensor
+    lse: torch.Tensor
     plan: AttentionPlan
     softmax_scale: float | None = None
     attention_sink_bias: torch.Tensor | None = None
@@ -573,7 +574,8 @@ class VarlenAttentionBinding:
     v: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
-    workspace: VarlenAttentionWorkspace
+    output: torch.Tensor
+    lse: torch.Tensor
     plan: VarlenAttentionPlan
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
@@ -591,6 +593,12 @@ class _AttentionScratchLayout:
     nbytes: int
     output_offset_bytes: int
     lse_offset_bytes: int
+
+
+@dataclass(frozen=True)
+class _AttentionScratchViews:
+    output: torch.Tensor
+    lse: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -615,12 +623,13 @@ class AttentionScratchPlan:
         softmax_scale: float | None = None,
         attention_sink_bias: torch.Tensor | None = None,
     ) -> AttentionBinding:
-        workspace = _attention_workspace_from_scratch_plan(
+        views = _attention_scratch_views_from_scratch_plan(
             self,
             scratch=scratch,
         )
-        return build_attention_binding(
-            workspace=workspace,
+        return _build_attention_binding_from_views(
+            output=views.output,
+            lse=views.lse,
             q=q,
             k=k,
             v=v,
@@ -658,12 +667,13 @@ class VarlenAttentionScratchPlan:
         window_size: int | tuple[int, int] | None = None,
         attention_sink_bias: torch.Tensor | None = None,
     ) -> VarlenAttentionBinding:
-        workspace = _varlen_attention_workspace_from_scratch_plan(
+        views = _varlen_attention_scratch_views_from_scratch_plan(
             self,
             scratch=scratch,
         )
-        return build_varlen_attention_binding(
-            workspace=workspace,
+        return _build_varlen_attention_binding_from_views(
+            output=views.output,
+            lse=views.lse,
             q=q,
             k=k,
             v=v,
@@ -1328,6 +1338,37 @@ def _validate_varlen_workspace(
         )
 
 
+def _validate_attention_output_lse(
+    *,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    plan: AttentionPlan | VarlenAttentionPlan,
+) -> None:
+    if output.shape != plan.q_shape:
+        raise ValueError(
+            f"attention output must have shape {plan.q_shape}, got {tuple(output.shape)}"
+        )
+    if output.device != plan.device:
+        raise ValueError(
+            f"attention output device {output.device} does not match plan device {plan.device}"
+        )
+    if output.dtype != plan.dtype:
+        raise ValueError(
+            f"attention output dtype {output.dtype} does not match plan dtype {plan.dtype}"
+        )
+    expected_lse_shape = _lse_shape(plan.q_shape)
+    if lse.shape != expected_lse_shape:
+        raise ValueError(
+            f"attention lse must have shape {expected_lse_shape}, got {tuple(lse.shape)}"
+        )
+    if lse.device != plan.device:
+        raise ValueError(
+            f"attention lse device {lse.device} does not match plan device {plan.device}"
+        )
+    if lse.dtype != torch.float32:
+        raise ValueError(f"attention lse must have dtype torch.float32, got {lse.dtype}")
+
+
 def _attention_scratch_layout(
     *,
     q_shape: tuple[int, ...],
@@ -1365,18 +1406,7 @@ def _attention_workspace_from_arena(
     layout: _AttentionScratchLayout,
     arena: torch.Tensor,
 ) -> AttentionWorkspace:
-    output = _arena_view(
-        arena,
-        offset_bytes=layout.output_offset_bytes,
-        shape=plan.q_shape,
-        dtype=plan.dtype,
-    )
-    lse = _arena_view(
-        arena,
-        offset_bytes=layout.lse_offset_bytes,
-        shape=_lse_shape(plan.q_shape),
-        dtype=torch.float32,
-    )
+    views = _attention_scratch_views_from_arena(plan, layout=layout, arena=arena)
     return AttentionWorkspace(
         q_shape=plan.q_shape,
         k_shape=plan.k_shape,
@@ -1389,18 +1419,18 @@ def _attention_workspace_from_arena(
         has_attention_sink_bias=plan.has_attention_sink_bias,
         tile_m=plan.tile_m,
         tile_n=plan.tile_n,
-        output=output,
-        lse=lse,
+        output=views.output,
+        lse=views.lse,
         plan_key=getattr(plan, "key", None),
     )
 
 
-def _varlen_attention_workspace_from_arena(
-    plan: VarlenAttentionPlan,
+def _attention_scratch_views_from_arena(
+    plan: AttentionPlan,
     *,
     layout: _AttentionScratchLayout,
     arena: torch.Tensor,
-) -> VarlenAttentionWorkspace:
+) -> _AttentionScratchViews:
     output = _arena_view(
         arena,
         offset_bytes=layout.output_offset_bytes,
@@ -1412,6 +1442,20 @@ def _varlen_attention_workspace_from_arena(
         offset_bytes=layout.lse_offset_bytes,
         shape=_lse_shape(plan.q_shape),
         dtype=torch.float32,
+    )
+    return _AttentionScratchViews(output=output, lse=lse)
+
+
+def _varlen_attention_workspace_from_arena(
+    plan: VarlenAttentionPlan,
+    *,
+    layout: _AttentionScratchLayout,
+    arena: torch.Tensor,
+) -> VarlenAttentionWorkspace:
+    views = _varlen_attention_scratch_views_from_arena(
+        plan,
+        layout=layout,
+        arena=arena,
     )
     return VarlenAttentionWorkspace(
         q_shape=plan.q_shape,
@@ -1429,10 +1473,31 @@ def _varlen_attention_workspace_from_arena(
         tile_n=plan.tile_n,
         max_seqlen_q=plan.max_seqlen_q,
         max_seqlen_k=plan.max_seqlen_k,
-        output=output,
-        lse=lse,
+        output=views.output,
+        lse=views.lse,
         plan_key=getattr(plan, "key", None),
     )
+
+
+def _varlen_attention_scratch_views_from_arena(
+    plan: VarlenAttentionPlan,
+    *,
+    layout: _AttentionScratchLayout,
+    arena: torch.Tensor,
+) -> _AttentionScratchViews:
+    output = _arena_view(
+        arena,
+        offset_bytes=layout.output_offset_bytes,
+        shape=plan.q_shape,
+        dtype=plan.dtype,
+    )
+    lse = _arena_view(
+        arena,
+        offset_bytes=layout.lse_offset_bytes,
+        shape=_lse_shape(plan.q_shape),
+        dtype=torch.float32,
+    )
+    return _AttentionScratchViews(output=output, lse=lse)
 
 
 def _attention_workspace_from_scratch_plan(
@@ -1452,6 +1517,23 @@ def _attention_workspace_from_scratch_plan(
     )
 
 
+def _attention_scratch_views_from_scratch_plan(
+    scratch_plan: AttentionScratchPlan,
+    *,
+    scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+) -> _AttentionScratchViews:
+    arena = scratch_tensor(
+        scratch,
+        scratch_plan._scratch_specs,
+        owner="contiguous attention",
+    )
+    return _attention_scratch_views_from_arena(
+        scratch_plan.plan,
+        layout=scratch_plan._layout,
+        arena=arena,
+    )
+
+
 def _varlen_attention_workspace_from_scratch_plan(
     scratch_plan: VarlenAttentionScratchPlan,
     *,
@@ -1463,6 +1545,23 @@ def _varlen_attention_workspace_from_scratch_plan(
         owner="varlen contiguous attention",
     )
     return _varlen_attention_workspace_from_arena(
+        scratch_plan.plan,
+        layout=scratch_plan._layout,
+        arena=arena,
+    )
+
+
+def _varlen_attention_scratch_views_from_scratch_plan(
+    scratch_plan: VarlenAttentionScratchPlan,
+    *,
+    scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+) -> _AttentionScratchViews:
+    arena = scratch_tensor(
+        scratch,
+        scratch_plan._scratch_specs,
+        owner="varlen contiguous attention",
+    )
+    return _varlen_attention_scratch_views_from_arena(
         scratch_plan.plan,
         layout=scratch_plan._layout,
         arena=arena,
@@ -1522,11 +1621,61 @@ def build_attention_binding(
         plan=plan,
     )
     resolved_workspace = _resolve_attention_workspace(workspace, plan=plan)
+    _validate_attention_output_lse(
+        output=resolved_workspace.output,
+        lse=resolved_workspace.lse,
+        plan=plan,
+    )
+    return _build_attention_binding_from_views(
+        output=resolved_workspace.output,
+        lse=resolved_workspace.lse,
+        q=q,
+        k=k,
+        v=v,
+        plan=plan,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+
+
+def _build_attention_binding_from_views(
+    *,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan: AttentionPlan,
+    softmax_scale: float | None = None,
+    attention_sink_bias: torch.Tensor | None = None,
+) -> AttentionBinding:
+    q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
+    attention_sink_bias = _prepare_attention_sink_bias(
+        attention_sink_bias,
+        q_shape=q_shape,
+        device=device,
+    )
+    has_attention_sink_bias = attention_sink_bias is not None
+    if has_attention_sink_bias != plan.has_attention_sink_bias:
+        raise ValueError(
+            "attention_sink_bias mismatch: "
+            f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
+        )
+    _validate_attention_inputs_against_plan(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        device=device,
+        dtype=dtype,
+        plan=plan,
+    )
+    _validate_attention_output_lse(output=output, lse=lse, plan=plan)
     return AttentionBinding(
         q=q,
         k=k,
         v=v,
-        workspace=resolved_workspace,
+        output=output,
+        lse=lse,
         plan=plan,
         softmax_scale=softmax_scale,
         attention_sink_bias=attention_sink_bias,
@@ -1640,13 +1789,104 @@ def build_varlen_attention_binding(
         plan=plan,
     )
     _validate_varlen_workspace(workspace, plan=plan)
+    _validate_attention_output_lse(output=workspace.output, lse=workspace.lse, plan=plan)
+    return _build_varlen_attention_binding_from_views(
+        output=workspace.output,
+        lse=workspace.lse,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        plan=plan,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        attention_sink_bias=attention_sink_bias,
+    )
+
+
+def _build_varlen_attention_binding_from_views(
+    *,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None = None,
+    plan: VarlenAttentionPlan,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    softmax_scale: float | None = None,
+    causal: bool | None = None,
+    window_size: int | tuple[int, int] | None = None,
+    attention_sink_bias: torch.Tensor | None = None,
+) -> VarlenAttentionBinding:
+    if cu_seqlens_k is None:
+        cu_seqlens_k = cu_seqlens_q
+    (
+        q_shape,
+        k_shape,
+        v_shape,
+        cu_seqlens_q_shape,
+        cu_seqlens_k_shape,
+        device,
+        dtype,
+    ) = _validate_varlen_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    attention_sink_bias = _prepare_attention_sink_bias(
+        attention_sink_bias,
+        q_shape=q_shape,
+        device=device,
+    )
+    has_attention_sink_bias = attention_sink_bias is not None
+    if has_attention_sink_bias != plan.has_attention_sink_bias:
+        raise ValueError(
+            "attention_sink_bias mismatch: "
+            f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
+        )
+    if max_seqlen_q is not None and int(max_seqlen_q) != plan.max_seqlen_q:
+        raise ValueError(
+            f"max_seqlen_q mismatch: plan has {plan.max_seqlen_q}, got {max_seqlen_q}"
+        )
+    if max_seqlen_k is not None and int(max_seqlen_k) != plan.max_seqlen_k:
+        raise ValueError(
+            f"max_seqlen_k mismatch: plan has {plan.max_seqlen_k}, got {max_seqlen_k}"
+        )
+    if causal is not None and bool(causal) != plan.causal:
+        raise ValueError(f"causal mismatch: plan has {plan.causal}, got {causal}")
+    if window_size is not None:
+        window_size_left, window_size_right = _normalize_window_size(window_size)
+        if (
+            window_size_left != plan.window_size_left
+            or window_size_right != plan.window_size_right
+        ):
+            raise ValueError(
+                "window_size mismatch: "
+                f"plan has {(plan.window_size_left, plan.window_size_right)}, "
+                f"got {(window_size_left, window_size_right)}"
+            )
+    _validate_varlen_inputs_against_plan(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        cu_seqlens_q_shape=cu_seqlens_q_shape,
+        cu_seqlens_k_shape=cu_seqlens_k_shape,
+        device=device,
+        dtype=dtype,
+        plan=plan,
+    )
+    _validate_attention_output_lse(output=output, lse=lse, plan=plan)
     return VarlenAttentionBinding(
         q=q,
         k=k,
         v=v,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
-        workspace=workspace,
+        output=output,
+        lse=lse,
         plan=plan,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
@@ -1933,6 +2173,8 @@ def b12x_attention_forward(
     binding: AttentionBinding | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute contiguous self-attention using the restored forward kernel."""
+    output: torch.Tensor | None = None
+    lse: torch.Tensor | None = None
     if binding is not None:
         extras = [
             name
@@ -1951,18 +2193,21 @@ def b12x_attention_forward(
             extras.append("window_size")
         if extras:
             raise ValueError(
-                "attention binding owns runtime tensors, workspace, plan, and options; "
+                "attention binding owns runtime tensors, outputs, plan, and options; "
                 f"do not also pass {', '.join(extras)}"
             )
         q = binding.q
         k = binding.k
         v = binding.v
-        workspace = binding.workspace
+        output = binding.output
+        lse = binding.lse
         plan = binding.plan
         softmax_scale = binding.softmax_scale
         attention_sink_bias = binding.attention_sink_bias
-    if q is None or k is None or v is None or workspace is None:
+    if q is None or k is None or v is None:
         raise TypeError("b12x_attention_forward requires q, k, v, and workspace or binding")
+    if workspace is None and (output is None or lse is None):
+        raise TypeError("b12x_attention_forward requires workspace or binding")
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
     attention_sink_bias = _prepare_attention_sink_bias(
         attention_sink_bias,
@@ -1971,6 +2216,8 @@ def b12x_attention_forward(
     )
     has_attention_sink_bias = attention_sink_bias is not None
     if plan is None:
+        if workspace is None:
+            raise TypeError("workspace is required when plan is omitted")
         if isinstance(workspace, AttentionWorkspacePool):
             raise TypeError("workspace pools require an explicit AttentionPlan")
         if has_attention_sink_bias != workspace.has_attention_sink_bias:
@@ -2018,7 +2265,14 @@ def b12x_attention_forward(
         dtype=dtype,
         plan=resolved_plan,
     )
-    resolved_workspace = _resolve_attention_workspace(workspace, plan=resolved_plan)
+    if output is None or lse is None:
+        if workspace is None:
+            raise TypeError("workspace is required when binding does not provide outputs")
+        resolved_workspace = _resolve_attention_workspace(workspace, plan=resolved_plan)
+        output = resolved_workspace.output
+        lse = resolved_workspace.lse
+    else:
+        _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, _, head_dim = _seq_dims(q_shape)
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
@@ -2031,13 +2285,13 @@ def b12x_attention_forward(
         make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(
             resolved_plan.cutlass_dtype,
-            resolved_workspace.output.data_ptr(),
+            output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
         make_ptr(
             cutlass.Float32,
-            resolved_workspace.lse.data_ptr(),
+            lse.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
@@ -2050,7 +2304,7 @@ def b12x_attention_forward(
         float(softmax_scale),
         current_cuda_stream(),
     )
-    return resolved_workspace.output, resolved_workspace.lse
+    return output, lse
 
 
 def b12x_varlen_attention_forward(
@@ -2071,6 +2325,8 @@ def b12x_varlen_attention_forward(
     binding: VarlenAttentionBinding | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute packed varlen contiguous attention using cu_seqlens metadata."""
+    output: torch.Tensor | None = None
+    lse: torch.Tensor | None = None
     if binding is not None:
         extras = [
             name
@@ -2094,7 +2350,7 @@ def b12x_varlen_attention_forward(
             extras.append("window_size")
         if extras:
             raise ValueError(
-                "varlen attention binding owns runtime tensors, workspace, plan, and options; "
+                "varlen attention binding owns runtime tensors, outputs, plan, and options; "
                 f"do not also pass {', '.join(extras)}"
             )
         q = binding.q
@@ -2102,7 +2358,8 @@ def b12x_varlen_attention_forward(
         v = binding.v
         cu_seqlens_q = binding.cu_seqlens_q
         cu_seqlens_k = binding.cu_seqlens_k
-        workspace = binding.workspace
+        output = binding.output
+        lse = binding.lse
         plan = binding.plan
         max_seqlen_q = binding.max_seqlen_q
         max_seqlen_k = binding.max_seqlen_k
@@ -2110,10 +2367,12 @@ def b12x_varlen_attention_forward(
         causal = binding.causal
         window_size = binding.window_size
         attention_sink_bias = binding.attention_sink_bias
-    if q is None or k is None or v is None or cu_seqlens_q is None or workspace is None:
+    if q is None or k is None or v is None or cu_seqlens_q is None:
         raise TypeError(
             "b12x_varlen_attention_forward requires q, k, v, cu_seqlens_q, and workspace or binding"
         )
+    if workspace is None and (output is None or lse is None):
+        raise TypeError("b12x_varlen_attention_forward requires workspace or binding")
     if cu_seqlens_k is None:
         cu_seqlens_k = cu_seqlens_q
     (
@@ -2132,6 +2391,8 @@ def b12x_varlen_attention_forward(
     )
     has_attention_sink_bias = attention_sink_bias is not None
     if plan is None:
+        if workspace is None:
+            raise TypeError("workspace is required when plan is omitted")
         if has_attention_sink_bias != workspace.has_attention_sink_bias:
             raise ValueError(
                 "attention_sink_bias mismatch: "
@@ -2209,7 +2470,14 @@ def b12x_varlen_attention_forward(
         dtype=dtype,
         plan=resolved_plan,
     )
-    _validate_varlen_workspace(workspace, plan=resolved_plan)
+    if output is None or lse is None:
+        if workspace is None:
+            raise TypeError("workspace is required when binding does not provide outputs")
+        _validate_varlen_workspace(workspace, plan=resolved_plan)
+        output = workspace.output
+        lse = workspace.lse
+    else:
+        _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, head_dim = q_shape
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
@@ -2222,13 +2490,13 @@ def b12x_varlen_attention_forward(
         make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(
             resolved_plan.cutlass_dtype,
-            workspace.output.data_ptr(),
+            output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
         make_ptr(
             cutlass.Float32,
-            workspace.lse.data_ptr(),
+            lse.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
@@ -2253,7 +2521,7 @@ def b12x_varlen_attention_forward(
         float(softmax_scale),
         current_cuda_stream(),
     )
-    return workspace.output, workspace.lse
+    return output, lse
 
 __all__ = [
     'AttentionBinding',

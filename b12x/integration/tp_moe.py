@@ -405,6 +405,8 @@ class TPMoEScratchCaps:
     swiglu_limit: float | None = None
     source_format: str = "modelopt_nvfp4"
     w13_layout: str = "w13"
+    w4a16_weight_layout: str | None = None
+    w4a16_scale_format: str | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -433,6 +435,18 @@ class TPMoEScratchCaps:
             _normalize_fp4_source_format(self.source_format),
         )
         object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+        if self.w4a16_weight_layout is not None:
+            object.__setattr__(
+                self,
+                "w4a16_weight_layout",
+                _normalize_w4a16_weight_layout(self.w4a16_weight_layout),
+            )
+        if self.w4a16_scale_format is not None:
+            object.__setattr__(
+                self,
+                "w4a16_scale_format",
+                _normalize_w4a16_scale_format(self.w4a16_scale_format),
+            )
         object.__setattr__(self, "frozen", bool(self.frozen))
 
 
@@ -448,29 +462,6 @@ class TPMoEScratchPlan:
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
-
-    def _workspace_from_scratch(
-        self,
-        *,
-        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-        a1_gscale: torch.Tensor,
-        a2_gscale: torch.Tensor,
-        input_scales_static: bool,
-    ) -> TPMoEWorkspace | TPW4A16Workspace:
-        scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
-        arena = _materialize_core_arena(
-            self._core_workspace_plan,
-            scratch_storage,
-            offset_bytes=self.layout.route_workspace_nbytes,
-            capacity_nbytes=self.layout.core_workspace_nbytes,
-        )
-        return _materialize_workspace_from_core_arena(
-            self._core_workspace_plan,
-            arena,
-            a1_gscale=a1_gscale,
-            a2_gscale=a2_gscale,
-            input_scales_static=input_scales_static,
-        )
 
     def make_workspace_pool(
         self,
@@ -503,6 +494,8 @@ class TPMoEScratchPlan:
             swiglu_limit=self.caps.swiglu_limit,
             source_format=self.caps.source_format,
             w13_layout=self.caps.w13_layout,
+            w4a16_weight_layout=self.caps.w4a16_weight_layout,
+            w4a16_scale_format=self.caps.w4a16_scale_format,
         )
         if _B12X_TIMING:
             t_done = time.perf_counter()
@@ -568,14 +561,16 @@ class TPMoEScratchPlan:
                 f"top-k {int(topk_ids.shape[1])} does not match TP MoE scratch "
                 f"top-k={int(self.caps.num_topk)}"
             )
-        workspace = self._workspace_from_scratch(
-            scratch=scratch,
-            a1_gscale=a1_gscale,
-            a2_gscale=a2_gscale,
-            input_scales_static=input_scales_static,
+        scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
+        arena = _materialize_core_arena(
+            self._core_workspace_plan,
+            scratch_storage,
+            offset_bytes=self.layout.route_workspace_nbytes,
+            capacity_nbytes=self.layout.core_workspace_nbytes,
         )
-        return build_tp_moe_fp4_binding(
-            workspace=workspace,
+        return _build_tp_moe_fp4_binding_from_core_arena(
+            plan=self._core_workspace_plan,
+            arena=arena,
             a=a,
             a1_gscale=a1_gscale,
             w1_fp4=w1_fp4,
@@ -649,6 +644,29 @@ class TPMoEFP4Binding:
     scale_flat: torch.Tensor | None = None
     packed_a_storage_ptr: object = None
     routed_rows_capacity: int | None = None
+    active_expert_count: torch.Tensor | None = None
+    weight_expert_ids: torch.Tensor | None = None
+    global_to_local_expert: torch.Tensor | None = None
+    compact_topk_ids: torch.Tensor | None = None
+    micro_intermediate: torch.Tensor | None = None
+    physical_tiles_capacity: int | None = None
+    task_capacity: int | None = None
+    expert_write_rows: torch.Tensor | None = None
+    expert_tile_base: torch.Tensor | None = None
+    input_gs: torch.Tensor | None = None
+    down_input_scale: torch.Tensor | None = None
+    pair_head: torch.Tensor | None = None
+    producers_done_count: torch.Tensor | None = None
+    all_work_published: torch.Tensor | None = None
+    task_head: torch.Tensor | None = None
+    task_tail: torch.Tensor | None = None
+    task_ready: torch.Tensor | None = None
+    task_expert: torch.Tensor | None = None
+    task_m_tile: torch.Tensor | None = None
+    task_slice_begin: torch.Tensor | None = None
+    task_slice_count: torch.Tensor | None = None
+    task_valid_rows: torch.Tensor | None = None
+    tile_write_count: torch.Tensor | None = None
     intermediate_cache13: torch.Tensor | None = None
     intermediate_cache2: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
@@ -726,6 +744,15 @@ class _WeightViews:
     down_fp4: object = None
     sfb_w13_ptr: object = None
     sfb_down_ptr: object = None
+
+
+@dataclass(frozen=True)
+class _PackedInputBindingViews:
+    packed_a_view: object
+    sfa_ptr: object
+    packed_a_flat: torch.Tensor
+    scale_flat: torch.Tensor
+    packed_a_storage_ptr: object
 
 
 @dataclass(frozen=True)
@@ -1331,25 +1358,262 @@ def _refresh_dynamic_workspace_scales(
         workspace.down_input_scale_src_ptr = a2_src_ptr if input_scales_static else 0
 
 
-def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
+def _packed_input_binding_views(
+    *,
+    packed_input: torch.Tensor,
+    packed_input_scale: torch.Tensor,
+) -> _PackedInputBindingViews:
     sf_dtype = cutlass.Float8E4M3FN
     # Keep as uint8 — the float4 element type is conveyed to CUTLASS via
     # _gptr / compile-time dtype, and dlpack does not support float4.
-    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
-    workspace.packed_a_flat = workspace.packed_input.view(-1)
-    workspace.scale_flat = workspace.packed_input_scale.view(-1)
-    workspace.sfa_ptr = make_ptr(
-        sf_dtype,
-        workspace.packed_input_scale.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
+    return _PackedInputBindingViews(
+        packed_a_view=packed_input.permute(1, 2, 0),
+        packed_a_flat=packed_input.view(-1),
+        scale_flat=packed_input_scale.view(-1),
+        sfa_ptr=make_ptr(
+            sf_dtype,
+            packed_input_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        packed_a_storage_ptr=make_ptr(
+            cutlass.Uint8,
+            packed_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
     )
-    workspace.packed_a_storage_ptr = make_ptr(
-        cutlass.Uint8,
-        workspace.packed_input.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
+
+
+def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
+    views = _packed_input_binding_views(
+        packed_input=workspace.packed_input,
+        packed_input_scale=workspace.packed_input_scale,
     )
+    workspace.packed_a_view = views.packed_a_view
+    workspace.packed_a_flat = views.packed_a_flat
+    workspace.scale_flat = views.scale_flat
+    workspace.sfa_ptr = views.sfa_ptr
+    workspace.packed_a_storage_ptr = views.packed_a_storage_ptr
+
+
+def _build_tp_moe_fp4_binding_from_core_arena(
+    *,
+    plan: _TPCoreWorkspacePlan,
+    arena: _TPCoreArena,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool | None = None,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    activation: str = "silu",
+    quant_mode: str | None = None,
+    unit_scale_contract: bool = False,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
+    prepared_w4a16: object | None = None,
+    swiglu_limit: float | None = None,
+) -> TPMoEFP4Binding:
+    if a.ndim != 2:
+        raise ValueError(
+            f"expected input activations with rank 2, got {tuple(a.shape)}"
+        )
+    if topk_weights.ndim != 2 or topk_ids.ndim != 2:
+        raise ValueError("topk_weights and topk_ids must be rank-2 tensors")
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights and topk_ids shape mismatch: "
+            f"{tuple(topk_weights.shape)} vs {tuple(topk_ids.shape)}"
+        )
+    if topk_ids.shape[0] != a.shape[0]:
+        raise ValueError(
+            f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
+        )
+
+    quant_mode = _normalize_quant_mode(
+        quant_mode if quant_mode is not None else plan.quant_mode
+    )
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
+    if quant_mode != plan.quant_mode:
+        raise ValueError(
+            f"scratch plan quant_mode={plan.quant_mode!r} cannot bind "
+            f"quant_mode={quant_mode!r}"
+        )
+    plan_activation = activation
+    if quant_mode != "w4a16":
+        plan_activation = _get_activation_kernel_spec(
+            activation,
+            quant_mode=quant_mode,
+        ).activation
+    if plan_activation != plan.activation:
+        raise ValueError(
+            f"scratch plan activation={plan.activation!r} cannot bind "
+            f"activation={activation!r}"
+        )
+
+    m, k = map(int, a.shape)
+    num_topk = int(topk_ids.shape[1])
+    if prepared_w4a16 is not None:
+        weight_E = int(prepared_w4a16.num_experts)
+        n = int(prepared_w4a16.intermediate_size)
+    else:
+        weight_E = int(w1_fp4.shape[0])
+        n = int(w2_fp4.shape[2]) * 2
+    if k != plan.k:
+        raise ValueError(f"scratch plan K={plan.k} cannot bind input K={k}")
+    if num_topk != plan.num_topk:
+        raise ValueError(
+            f"scratch plan top-k={plan.num_topk} cannot bind top-k={num_topk}"
+        )
+    if weight_E != plan.weight_E:
+        raise ValueError(
+            f"scratch plan weight_E={plan.weight_E} cannot bind weight_E={weight_E}"
+        )
+    if n != plan.n:
+        raise ValueError(f"scratch plan N={plan.n} cannot bind N={n}")
+    if m * num_topk > plan.routed_rows:
+        raise ValueError(
+            f"scratch plan routed-row capacity {plan.routed_rows} cannot bind "
+            f"{m * num_topk} routed rows"
+        )
+
+    common_kwargs = dict(
+        a=a,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        implementation=plan.implementation,
+        state_E=plan.state_E,
+        weight_E=plan.weight_E,
+        max_rows=plan.max_rows,
+        k=plan.k,
+        n=plan.n,
+        num_topk=plan.num_topk,
+        device=plan.device,
+        dtype=plan.dtype,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=bool(input_scales_static),
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode=quant_mode,
+        unit_scale_contract=bool(unit_scale_contract),
+        source_format=source_format,
+        w13_layout=w13_layout,
+        prepared_w4a16=prepared_w4a16,
+        swiglu_limit=swiglu_limit,
+    )
+    tensors = arena.tensors
+    if plan.implementation == "w4a16":
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            routed_rows_capacity=plan.routed_rows,
+            intermediate_cache13=tensors["intermediate_cache13"],
+            intermediate_cache2=tensors["intermediate_cache2"],
+            fc1_c_tmp=tensors["fc1_c_tmp"],
+            fc2_c_tmp=tensors["fc2_c_tmp"],
+            packed_route_indices=tensors["packed_route_indices"],
+            block_expert_ids=tensors["block_expert_ids"],
+            packed_route_count=tensors["packed_route_count"],
+            expert_offsets=tensors["expert_offsets"],
+        )
+
+    if plan.implementation == "static":
+        view_kwargs = _packed_input_binding_views(
+            packed_input=tensors["packed_input"],
+            packed_input_scale=tensors["packed_input_scale"],
+        )
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            row_counts=tensors["row_counts"],
+            token_map=tensors["token_map"],
+            token_weights=tensors["token_weights"],
+            packed_input=tensors["packed_input"],
+            packed_input_scale=tensors["packed_input_scale"],
+            barrier_count=tensors["barrier_count"],
+            barrier_epoch=tensors["barrier_epoch"],
+            routed_rows_capacity=plan.routed_rows,
+            packed_a_view=view_kwargs.packed_a_view,
+            sfa_ptr=view_kwargs.sfa_ptr,
+            packed_a_flat=view_kwargs.packed_a_flat,
+            scale_flat=view_kwargs.scale_flat,
+            packed_a_storage_ptr=view_kwargs.packed_a_storage_ptr,
+            active_expert_count=tensors["active_expert_count"],
+            weight_expert_ids=tensors["weight_expert_ids"],
+            global_to_local_expert=tensors["global_to_local_expert"],
+            compact_topk_ids=tensors["compact_topk_ids"],
+            micro_intermediate=tensors["micro_intermediate"],
+        )
+
+    if plan.implementation == "dynamic":
+        if plan.dynamic_physical_tiles is None or plan.dynamic_task_capacity is None:
+            raise RuntimeError("dynamic TP MoE binding plan is missing capacities")
+        tensors["input_gs"].copy_(a1_gscale.expand(plan.weight_E))
+        tensors["down_input_scale"].copy_(a2_gscale.expand(plan.weight_E))
+        view_kwargs = _packed_input_binding_views(
+            packed_input=tensors["packed_input"],
+            packed_input_scale=tensors["packed_input_scale"],
+        )
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            row_counts=tensors["row_counts"],
+            token_map=tensors["token_map"],
+            token_weights=tensors["token_weights"],
+            packed_input=tensors["packed_input"],
+            packed_input_scale=tensors["packed_input_scale"],
+            barrier_count=tensors["barrier_count"],
+            barrier_epoch=tensors["barrier_epoch"],
+            routed_rows_capacity=plan.routed_rows,
+            packed_a_view=view_kwargs.packed_a_view,
+            sfa_ptr=view_kwargs.sfa_ptr,
+            packed_a_flat=view_kwargs.packed_a_flat,
+            scale_flat=view_kwargs.scale_flat,
+            packed_a_storage_ptr=view_kwargs.packed_a_storage_ptr,
+            physical_tiles_capacity=plan.dynamic_physical_tiles,
+            task_capacity=plan.dynamic_task_capacity,
+            expert_write_rows=tensors["expert_write_rows"],
+            expert_tile_base=tensors["expert_tile_base"],
+            input_gs=tensors["input_gs"],
+            down_input_scale=tensors["down_input_scale"],
+            pair_head=tensors["pair_head"],
+            producers_done_count=tensors["producers_done_count"],
+            all_work_published=tensors["all_work_published"],
+            task_head=tensors["task_head"],
+            task_tail=tensors["task_tail"],
+            task_ready=tensors["task_ready"],
+            task_expert=tensors["task_expert"],
+            task_m_tile=tensors["task_m_tile"],
+            task_slice_begin=tensors["task_slice_begin"],
+            task_slice_count=tensors["task_slice_count"],
+            task_valid_rows=tensors["task_valid_rows"],
+            tile_write_count=tensors["tile_write_count"],
+        )
+
+    raise ValueError(f"unsupported TP MoE binding implementation {plan.implementation!r}")
 
 
 def _reset_volatile_launch_state(workspace: TPMoEWorkspace) -> None:
@@ -1391,6 +1655,8 @@ def _plan_core_workspace(
     dynamic_task_capacity: int | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    w4a16_weight_layout: str | None = None,
+    w4a16_scale_format: str | None = None,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
 ) -> _TPCoreWorkspacePlan:
@@ -1405,8 +1671,16 @@ def _plan_core_workspace(
 
         source_format = _normalize_fp4_source_format(source_format)
         w13_layout = _normalize_w13_layout(w13_layout)
-        scale_format = _w4a16_scale_format_for_source(source_format)
-        weight_layout = _w4a16_weight_layout_for_source(source_format)
+        scale_format = (
+            _normalize_w4a16_scale_format(w4a16_scale_format)
+            if w4a16_scale_format is not None
+            else _w4a16_scale_format_for_source(source_format)
+        )
+        weight_layout = (
+            _normalize_w4a16_weight_layout(w4a16_weight_layout)
+            if w4a16_weight_layout is not None
+            else _w4a16_weight_layout_for_source(source_format)
+        )
         routed_capacity = max(int(routed_rows), 1)
         fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
@@ -2890,6 +3164,8 @@ def plan_tp_moe_arena_layout(
     swiglu_limit: float | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    w4a16_weight_layout: str | None = None,
+    w4a16_scale_format: str | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -2945,6 +3221,8 @@ def plan_tp_moe_arena_layout(
             dynamic_task_capacity=plan.dynamic_task_capacity,
             source_format=source_format,
             w13_layout=w13_layout,
+            w4a16_weight_layout=w4a16_weight_layout,
+            w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
         )
@@ -2985,6 +3263,8 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_limit=caps.swiglu_limit,
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
+        w4a16_weight_layout=caps.w4a16_weight_layout,
+        w4a16_scale_format=caps.w4a16_scale_format,
     )
     capacity_tokens = max(layout.core_token_counts or (int(caps.max_tokens),))
     launch_plan = _make_workspace_plan(
@@ -3015,6 +3295,8 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         dynamic_task_capacity=launch_plan.dynamic_task_capacity,
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
+        w4a16_weight_layout=caps.w4a16_weight_layout,
+        w4a16_scale_format=caps.w4a16_scale_format,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         swiglu_limit=caps.swiglu_limit,
     )
@@ -3047,6 +3329,8 @@ def _select_arena_core_workspace_plan(
     swiglu_limit: float | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    w4a16_weight_layout: str | None = None,
+    w4a16_scale_format: str | None = None,
 ) -> tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]:
     source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout(w13_layout)
@@ -3082,6 +3366,8 @@ def _select_arena_core_workspace_plan(
             dynamic_task_capacity=plan.dynamic_task_capacity,
             source_format=source_format,
             w13_layout=w13_layout,
+            w4a16_weight_layout=w4a16_weight_layout,
+            w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
         )
@@ -3353,6 +3639,8 @@ def materialize_tp_moe_arena_workspaces(
     swiglu_limit: float | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    w4a16_weight_layout: str | None = None,
+    w4a16_scale_format: str | None = None,
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
@@ -3363,8 +3651,16 @@ def materialize_tp_moe_arena_workspaces(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    w4a16_scale_format = _w4a16_scale_format_for_source(source_format)
-    w4a16_weight_layout = _w4a16_weight_layout_for_source(source_format)
+    w4a16_scale_format = (
+        _normalize_w4a16_scale_format(w4a16_scale_format)
+        if w4a16_scale_format is not None
+        else _w4a16_scale_format_for_source(source_format)
+    )
+    w4a16_weight_layout = (
+        _normalize_w4a16_weight_layout(w4a16_weight_layout)
+        if w4a16_weight_layout is not None
+        else _w4a16_weight_layout_for_source(source_format)
+    )
 
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
@@ -3409,6 +3705,8 @@ def materialize_tp_moe_arena_workspaces(
             dynamic_task_capacity=plan.dynamic_task_capacity,
             source_format=source_format,
             w13_layout=w13_layout,
+            w4a16_weight_layout=w4a16_weight_layout,
+            w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
         )
@@ -3609,8 +3907,8 @@ def build_tp_moe_fp4_binding(
     m, k = map(int, a.shape)
     num_topk = int(topk_ids.shape[1])
     if prepared_w4a16 is not None:
-        weight_E = int(getattr(prepared_w4a16, "num_experts"))
-        n = int(getattr(prepared_w4a16, "intermediate_size"))
+        weight_E = int(prepared_w4a16.num_experts)
+        n = int(prepared_w4a16.intermediate_size)
     else:
         weight_E = int(w1_fp4.shape[0])
         n = int(w2_fp4.shape[2]) * 2
@@ -3720,6 +4018,81 @@ def build_tp_moe_fp4_binding(
             expert_offsets=workspace.expert_offsets,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+        )
+    if isinstance(workspace, TPCompactStaticWorkspace):
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            implementation=workspace.implementation,
+            state_E=workspace.state_E,
+            weight_E=workspace.weight_E,
+            max_rows=workspace.max_rows,
+            k=workspace.k,
+            n=workspace.n,
+            num_topk=workspace.num_topk,
+            device=workspace.device,
+            dtype=workspace.dtype,
+            row_counts=workspace.row_counts,
+            token_map=workspace.token_map,
+            token_weights=workspace.token_weights,
+            packed_input=workspace.packed_input,
+            packed_input_scale=workspace.packed_input_scale,
+            barrier_count=workspace.barrier_count,
+            barrier_epoch=workspace.barrier_epoch,
+            packed_a_view=workspace.packed_a_view,
+            sfa_ptr=workspace.sfa_ptr,
+            packed_a_flat=workspace.packed_a_flat,
+            scale_flat=workspace.scale_flat,
+            packed_a_storage_ptr=workspace.packed_a_storage_ptr,
+            routed_rows_capacity=workspace.routed_rows_capacity,
+            active_expert_count=workspace.active_expert_count,
+            weight_expert_ids=workspace.weight_expert_ids,
+            global_to_local_expert=workspace.global_to_local_expert,
+            compact_topk_ids=workspace.compact_topk_ids,
+            micro_intermediate=workspace.micro_intermediate,
+        )
+    if isinstance(workspace, TPDynamicWorkspace):
+        return TPMoEFP4Binding(
+            **common_kwargs,
+            implementation=workspace.implementation,
+            state_E=workspace.state_E,
+            weight_E=workspace.weight_E,
+            max_rows=workspace.max_rows,
+            k=workspace.k,
+            n=workspace.n,
+            num_topk=workspace.num_topk,
+            device=workspace.device,
+            dtype=workspace.dtype,
+            row_counts=workspace.row_counts,
+            token_map=workspace.token_map,
+            token_weights=workspace.token_weights,
+            packed_input=workspace.packed_input,
+            packed_input_scale=workspace.packed_input_scale,
+            barrier_count=workspace.barrier_count,
+            barrier_epoch=workspace.barrier_epoch,
+            packed_a_view=workspace.packed_a_view,
+            sfa_ptr=workspace.sfa_ptr,
+            packed_a_flat=workspace.packed_a_flat,
+            scale_flat=workspace.scale_flat,
+            packed_a_storage_ptr=workspace.packed_a_storage_ptr,
+            routed_rows_capacity=workspace.routed_rows_capacity,
+            physical_tiles_capacity=workspace.physical_tiles_capacity,
+            task_capacity=workspace.task_capacity,
+            expert_write_rows=workspace.expert_write_rows,
+            expert_tile_base=workspace.expert_tile_base,
+            input_gs=workspace.input_gs,
+            down_input_scale=workspace.down_input_scale,
+            pair_head=workspace.pair_head,
+            producers_done_count=workspace.producers_done_count,
+            all_work_published=workspace.all_work_published,
+            task_head=workspace.task_head,
+            task_tail=workspace.task_tail,
+            task_ready=workspace.task_ready,
+            task_expert=workspace.task_expert,
+            task_m_tile=workspace.task_m_tile,
+            task_slice_begin=workspace.task_slice_begin,
+            task_slice_count=workspace.task_slice_count,
+            task_valid_rows=workspace.task_valid_rows,
+            tile_write_count=workspace.tile_write_count,
         )
     if not isinstance(workspace, TPMoEWorkspace):
         raise TypeError("expected a materialized TP MoE workspace")
@@ -6088,8 +6461,8 @@ def b12x_moe_fp4(
         w13_layout = binding.w13_layout
         prepared_w4a16 = binding.prepared_w4a16
         swiglu_limit = binding.swiglu_limit
-        if binding.implementation != "w4a16":
-            workspace = TPMoEWorkspace(
+        if binding.implementation == "static":
+            workspace = TPCompactStaticWorkspace(
                 implementation=binding.implementation,
                 quant_mode=_normalize_quant_mode(binding.quant_mode),
                 state_E=binding.state_E,
@@ -6114,6 +6487,87 @@ def b12x_moe_fp4(
                 packed_a_flat=binding.packed_a_flat,
                 scale_flat=binding.scale_flat,
                 packed_a_storage_ptr=binding.packed_a_storage_ptr,
+                routed_rows_capacity=_require_binding_field(
+                    binding, "routed_rows_capacity"
+                ),
+                active_expert_count=_require_binding_field(
+                    binding, "active_expert_count"
+                ),
+                weight_expert_ids=_require_binding_field(
+                    binding, "weight_expert_ids"
+                ),
+                global_to_local_expert=_require_binding_field(
+                    binding, "global_to_local_expert"
+                ),
+                compact_topk_ids=_require_binding_field(binding, "compact_topk_ids"),
+                micro_intermediate=_require_binding_field(
+                    binding, "micro_intermediate"
+                ),
+            )
+        elif binding.implementation == "dynamic":
+            workspace = TPDynamicWorkspace(
+                implementation=binding.implementation,
+                quant_mode=_normalize_quant_mode(binding.quant_mode),
+                state_E=binding.state_E,
+                weight_E=binding.weight_E,
+                max_rows=binding.max_rows,
+                k=binding.k,
+                n=binding.n,
+                num_topk=binding.num_topk,
+                device=binding.device,
+                dtype=binding.dtype,
+                row_counts=_require_binding_field(binding, "row_counts"),
+                token_map=_require_binding_field(binding, "token_map"),
+                token_weights=_require_binding_field(binding, "token_weights"),
+                packed_input=_require_binding_field(binding, "packed_input"),
+                packed_input_scale=_require_binding_field(
+                    binding, "packed_input_scale"
+                ),
+                barrier_count=_require_binding_field(binding, "barrier_count"),
+                barrier_epoch=_require_binding_field(binding, "barrier_epoch"),
+                packed_a_view=binding.packed_a_view,
+                sfa_ptr=binding.sfa_ptr,
+                packed_a_flat=binding.packed_a_flat,
+                scale_flat=binding.scale_flat,
+                packed_a_storage_ptr=binding.packed_a_storage_ptr,
+                routed_rows_capacity=_require_binding_field(
+                    binding, "routed_rows_capacity"
+                ),
+                physical_tiles_capacity=_require_binding_field(
+                    binding, "physical_tiles_capacity"
+                ),
+                task_capacity=_require_binding_field(binding, "task_capacity"),
+                expert_write_rows=_require_binding_field(
+                    binding, "expert_write_rows"
+                ),
+                expert_tile_base=_require_binding_field(binding, "expert_tile_base"),
+                input_gs=_require_binding_field(binding, "input_gs"),
+                down_input_scale=_require_binding_field(binding, "down_input_scale"),
+                pair_head=_require_binding_field(binding, "pair_head"),
+                producers_done_count=_require_binding_field(
+                    binding, "producers_done_count"
+                ),
+                all_work_published=_require_binding_field(
+                    binding, "all_work_published"
+                ),
+                task_head=_require_binding_field(binding, "task_head"),
+                task_tail=_require_binding_field(binding, "task_tail"),
+                task_ready=_require_binding_field(binding, "task_ready"),
+                task_expert=_require_binding_field(binding, "task_expert"),
+                task_m_tile=_require_binding_field(binding, "task_m_tile"),
+                task_slice_begin=_require_binding_field(
+                    binding, "task_slice_begin"
+                ),
+                task_slice_count=_require_binding_field(
+                    binding, "task_slice_count"
+                ),
+                task_valid_rows=_require_binding_field(binding, "task_valid_rows"),
+                tile_write_count=_require_binding_field(binding, "tile_write_count"),
+            )
+        elif binding.implementation != "w4a16":
+            raise TypeError(
+                f"unsupported TP MoE FP4 binding implementation "
+                f"{binding.implementation!r}"
             )
     if (
         a is None
@@ -6147,7 +6601,7 @@ def b12x_moe_fp4(
     if prepared_w4a16 is not None:
         if quant_mode != "w4a16":
             raise ValueError("prepared_w4a16 requires quant_mode='w4a16'")
-        prepared_hidden = int(getattr(prepared_w4a16, "hidden_size"))
+        prepared_hidden = int(prepared_w4a16.hidden_size)
         if prepared_hidden != k:
             raise ValueError(
                 f"prepared_w4a16 hidden_size mismatch: expected {k}, got {prepared_hidden}"
@@ -6157,8 +6611,8 @@ def b12x_moe_fp4(
             raise TypeError(
                 f"prepared_w4a16 was built for {prepared_dtype}, but a has dtype {a.dtype}"
             )
-        weight_E = int(getattr(prepared_w4a16, "num_experts"))
-        n = int(getattr(prepared_w4a16, "intermediate_size"))
+        weight_E = int(prepared_w4a16.num_experts)
+        n = int(prepared_w4a16.intermediate_size)
     else:
         weight_E = w1_fp4.shape[0]
         n = w2_fp4.shape[2] * 2  # intermediate_size

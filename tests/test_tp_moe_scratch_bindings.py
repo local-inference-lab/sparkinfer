@@ -214,6 +214,68 @@ def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
     assert binding.topk_ids is tensors["topk_ids"]
 
 
+def test_tp_moe_fp4_binding_rehydrates_static_workspace_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = plan_tp_moe_scratch(_caps())
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+    output = torch.empty_like(tensors["a"])
+    binding = plan.bind(scratch=scratch, output=output, **tensors)
+    calls = {}
+
+    monkeypatch.setattr(tp_moe_impl, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(tp_moe_impl, "_get_weight_views", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_launch_compact_static",
+        lambda **kwargs: calls.update(kwargs),
+    )
+
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
+
+    assert result is output
+    assert isinstance(calls["workspace"], tp_moe_impl.TPCompactStaticWorkspace)
+    assert calls["workspace"].active_expert_count is binding.active_expert_count
+    assert calls["workspace"].micro_intermediate is binding.micro_intermediate
+
+
+def test_tp_moe_fp4_binding_rehydrates_dynamic_workspace_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caps = TPMoEScratchCaps(
+        device="cpu",
+        max_tokens=400,
+        weight_E=8,
+        k=128,
+        n=64,
+        num_topk=2,
+        dtype=torch.bfloat16,
+        route_num_experts=0,
+    )
+    plan = plan_tp_moe_scratch(caps)
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors(m=400)
+    output = torch.empty_like(tensors["a"])
+    binding = plan.bind(scratch=scratch, output=output, **tensors)
+    calls = {}
+
+    monkeypatch.setattr(tp_moe_impl, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(tp_moe_impl, "_get_weight_views", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_launch_dynamic",
+        lambda **kwargs: calls.update(kwargs),
+    )
+
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
+
+    assert result is output
+    assert isinstance(calls["workspace"], tp_moe_impl.TPDynamicWorkspace)
+    assert calls["workspace"].input_gs is binding.input_gs
+    assert calls["workspace"].task_ready is binding.task_ready
+
+
 def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,6 +290,11 @@ def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
     monkeypatch.setattr(
         tp_moe_impl,
         "_prewarm_w4a16_planned_launches",
+        _fail_materialize,
+    )
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_materialize_workspace_from_core_arena",
         _fail_materialize,
     )
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)

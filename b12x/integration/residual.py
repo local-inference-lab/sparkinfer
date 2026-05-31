@@ -194,6 +194,14 @@ class B12XMHCScratchPlan:
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     ) -> MHCPreWorkspace:
+        partials = self._partials_from_scratch(scratch=scratch)
+        return MHCPreWorkspace(partials=partials, split_k=int(self.caps.split_k))
+
+    def _partials_from_scratch(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    ) -> torch.Tensor:
         scratch_storage = scratch_tensor(
             scratch,
             self._scratch_specs,
@@ -207,7 +215,7 @@ class B12XMHCScratchPlan:
             shape=(max_tokens, split_k, MHC_PARTIALS),
             dtype=torch.float32,
         )
-        return MHCPreWorkspace(partials=partials, split_k=split_k)
+        return partials
 
     def make_workspace(
         self,
@@ -226,13 +234,12 @@ class B12XMHCScratchPlan:
         comb: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> B12XMHCBinding:
-        workspace = self.make_pre_workspace(scratch=scratch)
         live_tokens = int(self.caps.max_tokens) if tokens is None else int(tokens)
         if live_tokens < 0 or live_tokens > int(self.caps.max_tokens):
             raise ValueError(
                 f"tokens={live_tokens} exceeds MHC scratch capacity {self.caps.max_tokens}"
             )
-        partials = workspace.partials[:live_tokens]
+        partials = self._partials_from_scratch(scratch=scratch)[:live_tokens]
         _validate_mhc_binding_views(
             partials=partials,
             y=y,

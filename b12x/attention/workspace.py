@@ -1479,7 +1479,7 @@ class B12XAttentionArena:
             output=output,
         )
 
-    def make_workspace(
+    def _make_workspace_views(
         self,
         contract: B12XAttentionWorkspaceContract,
         *,
@@ -1603,6 +1603,17 @@ class B12XAttentionArena:
         if use_cuda_graph:
             workspace._allocate_paged_indexer_runtime_metadata()
         return workspace
+
+    def make_workspace(
+        self,
+        contract: B12XAttentionWorkspaceContract,
+        *,
+        use_cuda_graph: bool = False,
+    ) -> "B12XAttentionWorkspace":
+        return self._make_workspace_views(
+            contract,
+            use_cuda_graph=use_cuda_graph,
+        )
 
 
 @dataclass(kw_only=True)
