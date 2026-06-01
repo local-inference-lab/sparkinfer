@@ -79,10 +79,19 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     return torch_dtype
 
 
-@functools.cache
+_num_sm_cache: dict[int, int] = {}
+
+
 def get_num_sm(device: torch.device) -> int:
-    # get the compute capability of the device, which would be cached
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    """Return the device SM count without exposing lru_cache to Dynamo."""
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    sm_count = _num_sm_cache.get(index)
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(index).multi_processor_count
+        _num_sm_cache[index] = sm_count
+    return sm_count
 
 
 @torch._dynamo.disable

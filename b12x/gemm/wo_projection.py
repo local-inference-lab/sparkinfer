@@ -716,6 +716,69 @@ def empty_dense_gemm_mnl_view(
     return physical.as_strided((m, n, l), (n, 1, m * n))
 
 
+def empty_mxfp8_rows_bases(
+    m: int,
+    k: int,
+    *,
+    num_groups: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate the three CONTIGUOUS base buffers behind an MXFP8Rows.
+
+    Returns ``(values_base, scale_rows_base_u8, scale_physical_base_u8)`` -- all
+    contiguous. ``mxfp8_rows_from_bases`` rebuilds the (strided/permuted)
+    dense-GEMM views from them. Functional custom ops return these bases instead
+    of the views: an opaque op that *returns a view* surfaces a symbolic-shaped
+    view as a downstream graph input, which trips torch's AOT
+    `merge_view_inputs` synthetic-base path under dynamic shapes. Returning bases
+    keeps op outputs contiguous; the views are rebuilt in normal traced code.
+    """
+    if m <= 0 or k <= 0 or num_groups <= 0:
+        raise ValueError("m, k, and num_groups must be positive")
+    _check_mxfp8_k(k)
+    if num_groups == 1:
+        values_base = torch.empty((m, k), device=device, dtype=torch.float8_e4m3fn)
+    else:
+        # Physical [L, M, K]; mxfp8_rows_from_bases views it as the [M,K,L] mnl layout.
+        values_base = torch.empty(
+            (num_groups, m, k), device=device, dtype=torch.float8_e4m3fn
+        )
+    scale_rows_base = torch.full(
+        (num_groups, m, k // MXFP8_SCALE_VEC_SIZE),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
+    k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
+    scale_physical_base = torch.full(
+        (num_groups, m_tiles, k_tiles, 32, 4, 4),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    return values_base, scale_rows_base, scale_physical_base
+
+
+def mxfp8_rows_from_bases(
+    values_base: torch.Tensor,
+    scale_rows_base: torch.Tensor,
+    scale_physical_base: torch.Tensor,
+    m: int,
+    k: int,
+    *,
+    num_groups: int,
+) -> MXFP8Rows:
+    """Rebuild the dense-GEMM MXFP8Rows views over contiguous bases (pure views)."""
+    if num_groups == 1:
+        values = values_base
+    else:
+        values = values_base.as_strided((m, k, num_groups), (k, 1, m * k))
+    scale_rows = scale_rows_base.view(torch.float8_e8m0fnu)
+    scale_mma = scale_physical_base.view(torch.float8_e8m0fnu).permute(3, 4, 1, 5, 2, 0)
+    return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
+
+
 def empty_mxfp8_rows_for_dense_gemm(
     m: int,
     k: int,
@@ -725,38 +788,11 @@ def empty_mxfp8_rows_for_dense_gemm(
 ) -> MXFP8Rows:
     """Allocate MXFP8 row storage in the layout consumed by `dense_gemm`."""
 
-    if m <= 0 or k <= 0 or num_groups <= 0:
-        raise ValueError("m, k, and num_groups must be positive")
-    _check_mxfp8_k(k)
-    if num_groups == 1:
-        values = torch.empty((m, k), device=device, dtype=torch.float8_e4m3fn)
-    else:
-        values = empty_dense_gemm_mnl_view(
-            m,
-            k,
-            num_groups,
-            device=device,
-            dtype=torch.float8_e4m3fn,
-        )
-    scale_rows_u8 = torch.full(
-        (num_groups, m, k // MXFP8_SCALE_VEC_SIZE),
-        127,
-        dtype=torch.uint8,
-        device=device,
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        m, k, num_groups=num_groups, device=device
     )
-    m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
-    k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
-    scale_physical_u8 = torch.full(
-        (num_groups, m_tiles, k_tiles, 32, 4, 4),
-        127,
-        dtype=torch.uint8,
-        device=device,
-    )
-    scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(3, 4, 1, 5, 2, 0)
-    return MXFP8Rows(
-        values=values,
-        scale_rows=scale_rows_u8.view(torch.float8_e8m0fnu),
-        scale_mma=scale_mma,
+    return mxfp8_rows_from_bases(
+        values_base, scale_rows_base, scale_physical_base, m, k, num_groups=num_groups
     )
 
 
@@ -1229,6 +1265,178 @@ def quantize_wo_a_input_mxfp8(
     return out
 
 
+def _run_wo_a_quant_kernel(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    groups: int,
+    heads_per_group: int,
+    group_width: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> None:
+    out_scale_mma_u8 = out_scale_mma.view(torch.uint8)
+    _quantize_attention_inv_rope_to_tdg_kernel[
+        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
+    ](
+        o,
+        positions,
+        cos_sin_cache,
+        out_values,
+        out_scale_rows.view(torch.uint8),
+        out_scale_mma_u8,
+        tokens,
+        groups,
+        heads_per_group,
+        group_width,
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        cos_sin_cache.stride(0),
+        out_values.stride(0),
+        out_values.stride(1),
+        out_values.stride(2),
+        out_scale_mma.stride(0),
+        out_scale_mma.stride(1),
+        out_scale_mma.stride(2),
+        out_scale_mma.stride(3),
+        out_scale_mma.stride(4),
+        out_scale_mma.stride(5),
+        HEAD_DIM=head_dim,
+        NOPE_DIM=nope_dim,
+        HALF_ROPE_DIM=rope_dim // 2,
+        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
+        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::quantize_wo_a_input_inv_rope_mxfp8_alloc",
+    mutates_args=(),
+)
+def _quantize_wo_a_input_inv_rope_mxfp8_alloc_op(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    tokens: int,
+    groups: int,
+    heads_per_group: int,
+    group_width: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Functional (allocate + return) quantizer. The MXFP8 output views (notably
+    # the permuted scale_mma) are materialized and written INSIDE this opaque op,
+    # so torch.compile never sees a mutation of an as_strided/permute view (which
+    # it bans). Used whenever the caller does not pass a pre-owned `out`.
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens, group_width, num_groups=groups, device=o.device
+    )
+    out = mxfp8_rows_from_bases(
+        values_base, scale_rows_base, scale_physical_base,
+        tokens, group_width, num_groups=groups,
+    )
+    _run_wo_a_quant_kernel(
+        o,
+        positions,
+        cos_sin_cache,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        groups,
+        heads_per_group,
+        group_width,
+        head_dim,
+        nope_dim,
+        rope_dim,
+    )
+    # Return the CONTIGUOUS bases (not the views) -- see empty_mxfp8_rows_bases.
+    return values_base, scale_rows_base, scale_physical_base
+
+
+@_quantize_wo_a_input_inv_rope_mxfp8_alloc_op.register_fake
+def _quantize_wo_a_input_inv_rope_mxfp8_alloc_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    tokens: int,
+    groups: int,
+    heads_per_group: int,
+    group_width: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return empty_mxfp8_rows_bases(
+        tokens, group_width, num_groups=groups, device=o.device
+    )
+
+
+@torch.library.custom_op(
+    "b12x::quantize_wo_a_input_inv_rope_mxfp8_launch",
+    mutates_args=("out_values", "out_scale_rows", "out_scale_mma"),
+)
+def _quantize_wo_a_input_inv_rope_mxfp8_launch_op(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    groups: int,
+    heads_per_group: int,
+    group_width: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> None:
+    # Mutating variant for the eager `out`-provided path (caller owns base
+    # buffers). NOT compile-safe when out_* are strided views; the torch.compile
+    # path uses the _alloc op above instead.
+    _run_wo_a_quant_kernel(
+        o,
+        positions,
+        cos_sin_cache,
+        out_values,
+        out_scale_rows,
+        out_scale_mma,
+        tokens,
+        groups,
+        heads_per_group,
+        group_width,
+        head_dim,
+        nope_dim,
+        rope_dim,
+    )
+
+
+@_quantize_wo_a_input_inv_rope_mxfp8_launch_op.register_fake
+def _quantize_wo_a_input_inv_rope_mxfp8_launch_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    groups: int,
+    heads_per_group: int,
+    group_width: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> None:
+    return None
+
+
 def quantize_wo_a_input_inv_rope_mxfp8(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -1273,48 +1481,159 @@ def quantize_wo_a_input_inv_rope_mxfp8(
     group_width = heads_per_group * head_dim
     _check_mxfp8_k(group_width)
     if out is None:
-        out = empty_mxfp8_rows_for_dense_gemm(
-            tokens,
-            group_width,
-            num_groups=groups,
-            device=o.device,
+        values_base, scale_rows_base, scale_physical_base = (
+            torch.ops.b12x.quantize_wo_a_input_inv_rope_mxfp8_alloc(
+                o,
+                positions,
+                cos_sin_cache,
+                tokens,
+                groups,
+                heads_per_group,
+                group_width,
+                head_dim,
+                nope_dim,
+                rope_dim,
+            )
         )
-    else:
-        _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
+        return mxfp8_rows_from_bases(
+            values_base, scale_rows_base, scale_physical_base,
+            tokens, group_width, num_groups=groups,
+        )
 
-    _quantize_attention_inv_rope_to_tdg_kernel[
-        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
-    ](
+    _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
+    torch.ops.b12x.quantize_wo_a_input_inv_rope_mxfp8_launch(
         o,
         positions,
         cos_sin_cache,
         out.values,
-        out.scale_rows.view(torch.uint8),
-        out.scale_mma.view(torch.uint8),
+        out.scale_rows,
+        out.scale_mma,
         tokens,
         groups,
         heads_per_group,
         group_width,
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        cos_sin_cache.stride(0),
-        out.values.stride(0),
-        out.values.stride(1),
-        out.values.stride(2),
-        out.scale_mma.stride(0),
-        out.scale_mma.stride(1),
-        out.scale_mma.stride(2),
-        out.scale_mma.stride(3),
-        out.scale_mma.stride(4),
-        out.scale_mma.stride(5),
-        HEAD_DIM=head_dim,
-        NOPE_DIM=nope_dim,
-        HALF_ROPE_DIM=rope_dim // 2,
-        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
-        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
+        head_dim,
+        nope_dim,
+        rope_dim,
     )
     return out
+
+
+def _run_wo_b_quant_kernel(
+    source_trg: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    rank: int,
+    groups: int,
+    width: int,
+) -> None:
+    _quantize_group_major_trg_to_tk_kernel[(tokens, width // MXFP8_SCALE_VEC_SIZE)](
+        source_trg,
+        out_values,
+        out_scale_rows.view(torch.uint8),
+        out_scale_mma.view(torch.uint8),
+        tokens,
+        rank,
+        groups,
+        source_trg.stride(0),
+        source_trg.stride(1),
+        source_trg.stride(2),
+        out_scale_mma.stride(0),
+        out_scale_mma.stride(1),
+        out_scale_mma.stride(2),
+        out_scale_mma.stride(3),
+        out_scale_mma.stride(4),
+        out_scale_mma.stride(5),
+        BLOCK=MXFP8_SCALE_VEC_SIZE,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::quantize_wo_b_input_mxfp8_alloc",
+    mutates_args=(),
+)
+def _quantize_wo_b_input_mxfp8_alloc_op(
+    source_trg: torch.Tensor,
+    tokens: int,
+    rank: int,
+    groups: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Functional (allocate + return) quantizer; materializes + writes the MXFP8
+    # output views INSIDE the op, returns the contiguous bases (see WO-A _alloc).
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens, width, num_groups=1, device=source_trg.device
+    )
+    out = mxfp8_rows_from_bases(
+        values_base, scale_rows_base, scale_physical_base, tokens, width, num_groups=1
+    )
+    _run_wo_b_quant_kernel(
+        source_trg,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        rank,
+        groups,
+        width,
+    )
+    return values_base, scale_rows_base, scale_physical_base
+
+
+@_quantize_wo_b_input_mxfp8_alloc_op.register_fake
+def _quantize_wo_b_input_mxfp8_alloc_fake(
+    source_trg: torch.Tensor,
+    tokens: int,
+    rank: int,
+    groups: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return empty_mxfp8_rows_bases(
+        tokens, width, num_groups=1, device=source_trg.device
+    )
+
+
+@torch.library.custom_op(
+    "b12x::quantize_wo_b_input_mxfp8_launch",
+    mutates_args=("out_values", "out_scale_rows", "out_scale_mma"),
+)
+def _quantize_wo_b_input_mxfp8_launch_op(
+    source_trg: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    rank: int,
+    groups: int,
+    width: int,
+) -> None:
+    # Mutating variant for the eager `out`-provided path (see WO-A _launch).
+    _run_wo_b_quant_kernel(
+        source_trg,
+        out_values,
+        out_scale_rows,
+        out_scale_mma,
+        tokens,
+        rank,
+        groups,
+        width,
+    )
+
+
+@_quantize_wo_b_input_mxfp8_launch_op.register_fake
+def _quantize_wo_b_input_mxfp8_launch_fake(
+    source_trg: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    rank: int,
+    groups: int,
+    width: int,
+) -> None:
+    return None
 
 
 def quantize_wo_b_input_mxfp8(
@@ -1333,32 +1652,29 @@ def quantize_wo_b_input_mxfp8(
     width = rank * groups
     _check_mxfp8_k(width)
     if out is None:
-        out = empty_mxfp8_rows_for_dense_gemm(
-            tokens,
-            width,
-            num_groups=1,
-            device=source_trg.device,
+        values_base, scale_rows_base, scale_physical_base = (
+            torch.ops.b12x.quantize_wo_b_input_mxfp8_alloc(
+                source_trg,
+                tokens,
+                rank,
+                groups,
+                width,
+            )
         )
-    else:
-        _check_mxfp8_rows_storage(out, m=tokens, k=width, num_groups=1)
-    _quantize_group_major_trg_to_tk_kernel[(tokens, width // MXFP8_SCALE_VEC_SIZE)](
+        return mxfp8_rows_from_bases(
+            values_base, scale_rows_base, scale_physical_base, tokens, width, num_groups=1
+        )
+
+    _check_mxfp8_rows_storage(out, m=tokens, k=width, num_groups=1)
+    torch.ops.b12x.quantize_wo_b_input_mxfp8_launch(
         source_trg,
         out.values,
-        out.scale_rows.view(torch.uint8),
-        out.scale_mma.view(torch.uint8),
+        out.scale_rows,
+        out.scale_mma,
         tokens,
         rank,
         groups,
-        source_trg.stride(0),
-        source_trg.stride(1),
-        source_trg.stride(2),
-        out.scale_mma.stride(0),
-        out.scale_mma.stride(1),
-        out.scale_mma.stride(2),
-        out.scale_mma.stride(3),
-        out.scale_mma.stride(4),
-        out.scale_mma.stride(5),
-        BLOCK=MXFP8_SCALE_VEC_SIZE,
+        width,
     )
     return out
 
@@ -1837,16 +2153,11 @@ def wo_a_dense_gemm_mxfp8(
             f"WO-A K/groups mismatch: x={tuple(x_tdg.values.shape)} "
             f"wo_a={tuple(wo_a_rdg.values.shape)}"
         )
-    if out is None:
-        out = empty_dense_gemm_mnl_view(
-            x_tdg.values.shape[0],
-            wo_a_rdg.values.shape[0],
-            x_tdg.values.shape[2],
-            device=x_tdg.values.device,
-            dtype=torch.bfloat16,
-        )
-    else:
+    if out is not None:
         _check_dense_gemm_mnl_view("out", out)
+    # When out is None, dense_gemm allocates + returns functionally (no caller
+    # view mutated in the compile graph). The returned [M,N,L] is read downstream
+    # via strides, so its physical layout does not matter.
     mma_tiler_mn = (
         (16, 64)
         if expected_m is not None
@@ -1889,18 +2200,10 @@ def wo_b_dense_gemm_mxfp8(
             f"WO-B K mismatch: tmp={tuple(tmp_tgr_group_major.values.shape)} "
             f"wo_b={tuple(wo_b_hgr.values.shape)}"
         )
-    if out is None:
-        out = torch.empty(
-            (
-                tmp_tgr_group_major.values.shape[0],
-                wo_b_hgr.values.shape[0],
-                1,
-            ),
-            device=tmp_tgr_group_major.values.device,
-            dtype=torch.bfloat16,
-        )
-    else:
+    if out is not None:
         _check_dense_gemm_mnl_view("out", out)
+    # out=None -> dense_gemm allocates + returns functionally (no caller view
+    # mutated in the compile graph).
     return dense_gemm(
         (
             tmp_tgr_group_major.values.reshape(
@@ -2016,6 +2319,83 @@ def wo_projection_mxfp8(
     return output[:, :, 0]
 
 
+@torch.library.custom_op(
+    "b12x::wo_projection_inv_rope_mxfp8_fused",
+    mutates_args=(),
+)
+def _wo_projection_inv_rope_mxfp8_fused_op(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_values: torch.Tensor,
+    wo_a_scale_rows: torch.Tensor,
+    wo_a_scale_mma: torch.Tensor,
+    wo_b_values: torch.Tensor,
+    wo_b_scale_rows: torch.Tensor,
+    wo_b_scale_mma: torch.Tensor,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    expected_m: int,
+) -> torch.Tensor:
+    # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
+    # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
+    # MXFP8 view (x_q, tmp_q) stays internal and never becomes a symbolic-shaped
+    # view graph value (which trips torch AOT merge_view_inputs under dynamic
+    # shapes). Weight views passed in are static-shaped. Returns the contiguous
+    # [tokens, hidden, 1] base.
+    weights = WOProjectionMXFP8Weights(
+        wo_a=MXFP8Rows(values=wo_a_values, scale_rows=wo_a_scale_rows, scale_mma=wo_a_scale_mma),
+        wo_b=MXFP8Rows(values=wo_b_values, scale_rows=wo_b_scale_rows, scale_mma=wo_b_scale_mma),
+        groups=groups,
+        group_width=group_width,
+        rank=rank,
+        hidden=hidden,
+    )
+    alpha_one = _cached_alpha_one(o.device)
+    x_q = quantize_wo_a_input_inv_rope_mxfp8(
+        o,
+        positions,
+        cos_sin_cache,
+        groups=groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
+    tmp = wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, alpha=alpha_one, expected_m=expected_m)
+    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    return wo_b_dense_gemm_mxfp8(
+        tmp_q, weights.wo_b, alpha=alpha_one, expected_m=expected_m
+    )
+
+
+@_wo_projection_inv_rope_mxfp8_fused_op.register_fake
+def _wo_projection_inv_rope_mxfp8_fused_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_values: torch.Tensor,
+    wo_a_scale_rows: torch.Tensor,
+    wo_a_scale_mma: torch.Tensor,
+    wo_b_values: torch.Tensor,
+    wo_b_scale_rows: torch.Tensor,
+    wo_b_scale_mma: torch.Tensor,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    expected_m: int,
+) -> torch.Tensor:
+    return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
+
+
 def wo_projection_inv_rope_mxfp8(
     o: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -2106,41 +2486,29 @@ def wo_projection_inv_rope_mxfp8(
         expected_m = int(tokens)
     if workspace is not None:
         _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
-        x_q = workspace.x_q
-        tmp = workspace.tmp
-        tmp_q = workspace.tmp_q
-        output = workspace.output
-    if x_q is None or tmp is None or tmp_q is None or output is None:
-        raise TypeError(
-            "wo_projection_inv_rope_mxfp8 requires o, positions, cos_sin_cache, "
-            "weights, workspace, and heads_per_group or binding"
-        )
 
-    alpha_one = _cached_alpha_one(o.device)
-    quantize_wo_a_input_inv_rope_mxfp8(
+    # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
+    # gemm chain internally, so the token-shaped activation MXFP8 views never
+    # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any
+    # bound/workspace scratch is intentionally unused here.
+    output = torch.ops.b12x.wo_projection_inv_rope_mxfp8_fused(
         o,
         positions,
         cos_sin_cache,
-        groups=weights.groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        out=x_q,
-    )
-    wo_a_dense_gemm_mxfp8(
-        x_q,
-        weights.wo_a,
-        out=tmp,
-        alpha=alpha_one,
-        expected_m=expected_m,
-    )
-    quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
-    wo_b_dense_gemm_mxfp8(
-        tmp_q,
-        weights.wo_b,
-        out=output,
-        alpha=alpha_one,
-        expected_m=expected_m,
+        weights.wo_a.values,
+        weights.wo_a.scale_rows,
+        weights.wo_a.scale_mma,
+        weights.wo_b.values,
+        weights.wo_b.scale_rows,
+        weights.wo_b.scale_mma,
+        weights.groups,
+        weights.group_width,
+        weights.rank,
+        weights.hidden,
+        heads_per_group,
+        nope_dim,
+        rope_dim,
+        expected_m,
     )
     if return_3d:
         return output

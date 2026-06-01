@@ -22,7 +22,9 @@ from b12x.gemm.wo_projection import (
     _check_mxfp8_k,
     _check_mxfp8_rows_storage,
     empty_dense_gemm_mnl_view,
+    empty_mxfp8_rows_bases,
     empty_mxfp8_rows_for_dense_gemm,
+    mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
 )
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
@@ -562,6 +564,76 @@ def empty_block_fp8_linear_workspace(
     return BlockFP8LinearWorkspace(x_q=x_q, output=output)
 
 
+def _run_block_fp8_quant_kernel(
+    source_tk: torch.Tensor,
+    out_values: torch.Tensor,
+    out_scale_rows: torch.Tensor,
+    out_scale_mma: torch.Tensor,
+    tokens: int,
+    in_features: int,
+) -> None:
+    _quantize_dense_tk_to_tk_kernel[(tokens, in_features // MXFP8_SCALE_VEC_SIZE)](
+        source_tk,
+        out_values,
+        out_scale_rows.view(torch.uint8),
+        out_scale_mma.view(torch.uint8),
+        tokens,
+        source_tk.stride(0),
+        source_tk.stride(1),
+        out_values.stride(0),
+        out_values.stride(1),
+        out_scale_rows.stride(0),
+        out_scale_rows.stride(1),
+        out_scale_rows.stride(2),
+        out_scale_mma.stride(0),
+        out_scale_mma.stride(1),
+        out_scale_mma.stride(2),
+        out_scale_mma.stride(3),
+        out_scale_mma.stride(4),
+        out_scale_mma.stride(5),
+        BLOCK=MXFP8_SCALE_VEC_SIZE,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::quantize_block_fp8_linear_input_mxfp8_alloc",
+    mutates_args=(),
+)
+def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
+    source_tk: torch.Tensor,
+    tokens: int,
+    in_features: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Functional (allocate + return) quantizer: the raw Triton kernel writes the
+    # MXFP8 output views INSIDE this opaque op, so torch.compile never sees a
+    # triton_kernel_wrapper_mutation on 3 caller-visible views. Returns the
+    # CONTIGUOUS bases (not the views) so no symbolic-shaped view output reaches a
+    # downstream subgraph (which trips AOT merge_view_inputs). Used on the no-`out`
+    # (compile) path.
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens, in_features, num_groups=1, device=source_tk.device
+    )
+    out = mxfp8_rows_from_bases(
+        values_base, scale_rows_base, scale_physical_base,
+        tokens, in_features, num_groups=1,
+    )
+    _run_block_fp8_quant_kernel(
+        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
+    )
+    return values_base, scale_rows_base, scale_physical_base
+
+
+@_quantize_block_fp8_linear_input_mxfp8_alloc_op.register_fake
+def _quantize_block_fp8_linear_input_mxfp8_alloc_fake(
+    source_tk: torch.Tensor,
+    tokens: int,
+    in_features: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return empty_mxfp8_rows_bases(
+        tokens, in_features, num_groups=1, device=source_tk.device
+    )
+
+
 def quantize_block_fp8_linear_input_mxfp8(
     source_tk: torch.Tensor,
     *,
@@ -577,37 +649,70 @@ def quantize_block_fp8_linear_input_mxfp8(
         raise ValueError("tokens must be positive")
     _check_mxfp8_k(in_features)
     if out is None:
-        out = empty_mxfp8_rows_for_dense_gemm(
-            tokens,
-            in_features,
-            num_groups=1,
-            device=source_tk.device,
+        values_base, scale_rows_base, scale_physical_base = (
+            torch.ops.b12x.quantize_block_fp8_linear_input_mxfp8_alloc(
+                source_tk, tokens, in_features
+            )
         )
-    else:
-        _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
+        return mxfp8_rows_from_bases(
+            values_base, scale_rows_base, scale_physical_base,
+            tokens, in_features, num_groups=1,
+        )
 
-    _quantize_dense_tk_to_tk_kernel[(tokens, in_features // MXFP8_SCALE_VEC_SIZE)](
-        source_tk,
-        out.values,
-        out.scale_rows.view(torch.uint8),
-        out.scale_mma.view(torch.uint8),
-        tokens,
-        source_tk.stride(0),
-        source_tk.stride(1),
-        out.values.stride(0),
-        out.values.stride(1),
-        out.scale_rows.stride(0),
-        out.scale_rows.stride(1),
-        out.scale_rows.stride(2),
-        out.scale_mma.stride(0),
-        out.scale_mma.stride(1),
-        out.scale_mma.stride(2),
-        out.scale_mma.stride(3),
-        out.scale_mma.stride(4),
-        out.scale_mma.stride(5),
-        BLOCK=MXFP8_SCALE_VEC_SIZE,
+    _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
+    _run_block_fp8_quant_kernel(
+        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
     )
     return out
+
+
+@torch.library.custom_op(
+    "b12x::block_fp8_linear_mxfp8_fused",
+    mutates_args=(),
+)
+def _block_fp8_linear_mxfp8_fused_op(
+    source_2d: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_rows: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+) -> torch.Tensor:
+    # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
+    # one op, so the token-shaped activation MXFP8 views (x_q.values/scale_mma)
+    # are never graph values -- they can't become symbolic-shaped view inputs to
+    # a downstream subgraph (which trips torch AOT merge_view_inputs under dynamic
+    # shapes). The weight views passed in are static-shaped, so they don't hit
+    # that path. Returns a contiguous [tokens, out_features] base.
+    tokens = int(source_2d.shape[0])
+    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    return dense_gemm(
+        (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
+        (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype=_c_dtype_name(source_2d.dtype),
+        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
+        expected_m=expected_m,
+    )[:, :, 0]
+
+
+@_block_fp8_linear_mxfp8_fused_op.register_fake
+def _block_fp8_linear_mxfp8_fused_fake(
+    source_2d: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_rows: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (source_2d.shape[0], out_features),
+        dtype=source_2d.dtype,
+        device=source_2d.device,
+    )
 
 
 def block_fp8_linear_mxfp8(
@@ -664,6 +769,24 @@ def block_fp8_linear_mxfp8(
         )
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
+
+    if binding is None and workspace is None:
+        # No caller-owned buffers (e.g. the torch.compile path): one fully opaque
+        # fused op runs quantize + dense GEMM internally, so the token-shaped
+        # activation MXFP8 views stay inside the op and never reach the graph (see
+        # _block_fp8_linear_mxfp8_fused_op). No is_compiling -- purely caller-intent.
+        output = torch.ops.b12x.block_fp8_linear_mxfp8_fused(
+            source_2d,
+            packed_weight.weight.values,
+            packed_weight.weight.scale_rows,
+            packed_weight.weight.scale_mma,
+            packed_weight.in_features,
+            packed_weight.out_features,
+            int(expected_m) if expected_m is not None else tokens,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.view(*source.shape[:-1], packed_weight.out_features)
 
     if workspace is None:
         if x_q_storage is None or output_storage is None:

@@ -2284,6 +2284,184 @@ def _dense_gemm_launch_fake(
     return None
 
 
+def _empty_dense_gemm_output(
+    m: int,
+    n: int,
+    l: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Allocate an `[M,N,L]` dense-GEMM output in the layout the kernel writes.
+
+    The CuTe dense GEMM hardcodes ``c_major='n'`` and builds the C tensor from
+    the data pointer with order ``(1,0,2)`` -- i.e. it writes the grouped output
+    as physical ``[L,M,N]`` (an ``[M,N,L]`` view with strides ``(N,1,M*N)``) and
+    ignores the runtime tensor's actual strides. A plain contiguous ``(M,N,L)``
+    buffer (strides ``(N*L,L,1)``) would scatter the ``L`` groups to the wrong
+    offsets, so back ``L>1`` with ``[L,M,N]`` physical storage. ``L==1`` is the
+    same either way. Mirrors ``empty_dense_gemm_mnl_view`` in wo_projection.
+    """
+    if l > 1:
+        return torch.empty((l, m, n), dtype=dtype, device=device).as_strided(
+            (m, n, l), (n, 1, m * n)
+        )
+    return torch.empty((m, n, l), dtype=dtype, device=device)
+
+
+@torch.library.custom_op(
+    "b12x::dense_gemm_launch_functional",
+    mutates_args=(),
+)
+def _dense_gemm_launch_functional_op(
+    a_tensor_gpu: torch.Tensor,
+    b_tensor_gpu: torch.Tensor,
+    sfa_tensor_gpu: torch.Tensor,
+    sfb_tensor_gpu: torch.Tensor,
+    alpha_tensor_gpu: torch.Tensor,
+    n: int,
+    k: int,
+    l: int,
+    kernel_c_l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    kernel_c_dtype: str,
+    alpha_dtype: str,
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    cluster_shape_m: int,
+    cluster_shape_n: int,
+    sm_count: int,
+    single_work_tile_per_cta: bool,
+    direct_one_m_tile_scheduler: bool,
+    use_m1_non_tma: bool,
+    split_k_slices: int,
+    split_k_atomic_bf16: bool,
+) -> torch.Tensor:
+    m = int(a_tensor_gpu.shape[0])
+    out = _empty_dense_gemm_output(
+        m,
+        n,
+        l,
+        dtype=cutlass_to_torch_dtype(get_cutlass_dtype(c_dtype)),
+        device=a_tensor_gpu.device,
+    )
+    split_k_output = int(split_k_slices) > 1
+    if split_k_output and split_k_atomic_bf16:
+        c_tensor_gpu = out
+        out.zero_()
+    elif split_k_output:
+        split_storage = torch.empty(
+            (split_k_slices, m, n),
+            dtype=torch.float32,
+            device=a_tensor_gpu.device,
+        )
+        c_tensor_gpu = split_storage.permute(1, 2, 0)
+    else:
+        c_tensor_gpu = out
+
+    _dense_gemm_launch_flat(
+        a_tensor_gpu,
+        b_tensor_gpu,
+        sfa_tensor_gpu,
+        sfb_tensor_gpu,
+        c_tensor_gpu,
+        alpha_tensor_gpu,
+        n,
+        k,
+        l,
+        kernel_c_l,
+        ab_dtype,
+        sf_dtype,
+        kernel_c_dtype,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tile_m,
+        mma_tile_n,
+        cluster_shape_m,
+        cluster_shape_n,
+        sm_count,
+        single_work_tile_per_cta,
+        direct_one_m_tile_scheduler,
+        use_m1_non_tma,
+        split_k_slices,
+        split_k_atomic_bf16,
+    )
+    if split_k_output and not split_k_atomic_bf16:
+        _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
+    return out
+
+
+@_dense_gemm_launch_functional_op.register_fake
+def _dense_gemm_launch_functional_fake(
+    a_tensor_gpu: torch.Tensor,
+    b_tensor_gpu: torch.Tensor,
+    sfa_tensor_gpu: torch.Tensor,
+    sfb_tensor_gpu: torch.Tensor,
+    alpha_tensor_gpu: torch.Tensor,
+    n: int,
+    k: int,
+    l: int,
+    kernel_c_l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    kernel_c_dtype: str,
+    alpha_dtype: str,
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    cluster_shape_m: int,
+    cluster_shape_n: int,
+    sm_count: int,
+    single_work_tile_per_cta: bool,
+    direct_one_m_tile_scheduler: bool,
+    use_m1_non_tma: bool,
+    split_k_slices: int,
+    split_k_atomic_bf16: bool,
+) -> torch.Tensor:
+    del (
+        b_tensor_gpu,
+        sfa_tensor_gpu,
+        sfb_tensor_gpu,
+        alpha_tensor_gpu,
+        k,
+        kernel_c_l,
+        ab_dtype,
+        sf_dtype,
+        kernel_c_dtype,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tile_m,
+        mma_tile_n,
+        cluster_shape_m,
+        cluster_shape_n,
+        sm_count,
+        single_work_tile_per_cta,
+        direct_one_m_tile_scheduler,
+        use_m1_non_tma,
+        split_k_slices,
+        split_k_atomic_bf16,
+    )
+    return _empty_dense_gemm_output(
+        int(a_tensor_gpu.shape[0]),
+        n,
+        l,
+        dtype=cutlass_to_torch_dtype(get_cutlass_dtype(c_dtype)),
+        device=a_tensor_gpu.device,
+    )
+
+
 def _select_default_mma_tiler_mn(
     m: int,
     n: int,
@@ -2448,6 +2626,46 @@ def dense_gemm(
         kernel_c_l = split_k_slices
     else:
         kernel_c_l = l
+    if alpha is None:
+        alpha = torch.ones((1,), dtype=torch.float32, device=a_torch.device)
+    kernel_c_dtype_name = (
+        "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
+    )
+    if out is None:
+        # No caller-owned output buffer: functional launch (allocate + return
+        # inside the opaque op). The compile graph then carries no
+        # auto_functionalized dense node mutating a (possibly strided) caller
+        # view -- which inductor's decompose pass cannot remove. No is_compiling;
+        # purely caller-intent, behaviorally identical to the eager out=None path.
+        return torch.ops.b12x.dense_gemm_launch_functional(
+            a_torch,
+            b_torch,
+            sfa_torch,
+            sfb_torch,
+            alpha,
+            n,
+            k,
+            l,
+            kernel_c_l,
+            ab_dtype,
+            sf_dtype,
+            c_dtype,
+            kernel_c_dtype_name,
+            alpha_dtype,
+            sf_vec_size,
+            mma_k,
+            tile_k,
+            mma_tiler_mn[0],
+            mma_tiler_mn[1],
+            cluster_shape_mn[0],
+            cluster_shape_mn[1],
+            sm_count,
+            policy.single_work_tile_per_cta,
+            policy.direct_one_m_tile_scheduler,
+            policy.use_m1_non_tma,
+            policy.split_k_slices,
+            policy.split_k_atomic_bf16,
+        )
     split_storage = None
     split_scratch = None
     if split_k_output:
