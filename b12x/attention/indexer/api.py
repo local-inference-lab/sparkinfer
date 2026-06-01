@@ -763,6 +763,11 @@ def extend_tiled_topk(
         global_lengths = lengths[:num_q_rows]
         torch.sub(k_end, k_start, out=global_lengths)
     if num_chunks <= 1:
+        # Dead tiles (entirely out of causal/length range) are left UNWRITTEN by
+        # the tiled-output extend kernel (it `pass`es, trusting run_tiled_topk's
+        # k_start/k_end mask). Pre-clear to -inf so any stale value in those slots
+        # of the (reused) scratch can never win the tiled top-k.
+        tile_logits[:chunk_tile_elements].fill_(float("-inf"))
         run_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
@@ -842,6 +847,10 @@ def extend_tiled_topk(
         chunk_tiles = chunk_tile_end - chunk_tile_begin
         chunk_start = chunk_tile_begin * prefill_block_k
         chunk_rows = chunk_tiles * prefill_block_k
+        # tile_logits is reused across chunks; dead tiles are not rewritten by the
+        # kernel, so a stale logit from a previous chunk at the same offset could
+        # otherwise survive into this chunk's tiled top-k. Pre-clear to -inf.
+        tile_logits[: num_q_tiles * chunk_tiles * tile_size].fill_(float("-inf"))
         run_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
