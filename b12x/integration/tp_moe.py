@@ -562,15 +562,24 @@ class TPMoEScratchPlan:
                 f"top-k={int(self.caps.num_topk)}"
             )
         scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
-        arena = _materialize_core_arena(
+        # Eager vLLM bind: MAP caller-owned scratch into per-spec kernel-arg views
+        # and build the binding directly. NEVER construct a workspace/arena object
+        # (no _materialize_core_arena / _TPCoreArena) and never init/allocate -- the
+        # kernel prologue zeros counters/queues, weight_expert_ids is write-first,
+        # and the launch wrapper re-zeros the barrier scalars in-place
+        # (volatile_launch_state=True on the reconstructed workspaces below). This
+        # keeps bind allocation-free / CUDA-graph-capturable, matching the
+        # compressed-MLA views-container discipline.
+        tensors = _map_core_workspace_views(
             self._core_workspace_plan,
             scratch_storage,
             offset_bytes=self.layout.route_workspace_nbytes,
             capacity_nbytes=self.layout.core_workspace_nbytes,
+            do_init=False,
         )
-        return _build_tp_moe_fp4_binding_from_core_arena(
+        return _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
-            arena=arena,
+            tensors=tensors,
             a=a,
             a1_gscale=a1_gscale,
             w1_fp4=w1_fp4,
@@ -1397,10 +1406,10 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     workspace.packed_a_storage_ptr = views.packed_a_storage_ptr
 
 
-def _build_tp_moe_fp4_binding_from_core_arena(
+def _build_tp_moe_fp4_binding_from_views(
     *,
     plan: _TPCoreWorkspacePlan,
-    arena: _TPCoreArena,
+    tensors: Dict[str, torch.Tensor],
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
     w1_fp4: torch.Tensor,
@@ -1527,7 +1536,6 @@ def _build_tp_moe_fp4_binding_from_core_arena(
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
     )
-    tensors = arena.tensors
     if plan.implementation == "w4a16":
         return TPMoEFP4Binding(
             **common_kwargs,
@@ -1951,6 +1959,8 @@ def _allocate_arena_tensor(
     shared_arena: torch.Tensor,
     offset: int,
     spec: _TensorAllocSpec,
+    *,
+    do_init: bool = True,
 ) -> tuple[torch.Tensor, int]:
     alignment = max(16, _dtype_nbytes(spec.dtype))
     offset = align_up(offset, alignment)
@@ -1960,16 +1970,25 @@ def _allocate_arena_tensor(
         tensor = storage.view(spec.shape)
     else:
         tensor = storage.view(spec.dtype).view(spec.shape)
-    if spec.init == "zeros":
-        tensor.zero_()
-    elif spec.init == "arange":
-        tensor.copy_(
-            torch.arange(tensor.numel(), dtype=tensor.dtype, device=tensor.device).view(
-                spec.shape
+    # The vLLM eager-bind path passes do_init=False: a binding must only MAP
+    # caller-owned scratch into views and must never write/allocate (any
+    # allocation -- e.g. the init="arange" temp -- is illegal under CUDA graph
+    # capture). Per-call state is instead owned by the kernel: the persistent MoE
+    # kernel zeros its counters/queues in its Phase-0 prologue and writes
+    # weight_expert_ids/token_map write-first, and the launch wrapper re-zeros the
+    # read-before-write barrier scalars in-place (gated on volatile_launch_state).
+    # The sglang workspace/pool path keeps do_init=True (one-time, pre-capture).
+    if do_init:
+        if spec.init == "zeros":
+            tensor.zero_()
+        elif spec.init == "arange":
+            tensor.copy_(
+                torch.arange(tensor.numel(), dtype=tensor.dtype, device=tensor.device).view(
+                    spec.shape
+                )
             )
-        )
-    elif spec.init != "empty":
-        raise ValueError(f"unsupported tensor init mode {spec.init!r}")
+        elif spec.init != "empty":
+            raise ValueError(f"unsupported tensor init mode {spec.init!r}")
     return tensor, offset + nbytes
 
 
@@ -1991,13 +2010,17 @@ def _emit_core_workspace_stats(
     return
 
 
-def _materialize_core_arena(
+def _map_core_workspace_views(
     plan: _TPCoreWorkspacePlan,
     shared_arena: torch.Tensor,
     *,
     offset_bytes: int = 0,
     capacity_nbytes: int | None = None,
-) -> _TPCoreArena:
+    do_init: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Map caller-owned scratch into the per-spec kernel-arg views (no arena/workspace
+    object). With do_init=False this is the vLLM eager-bind primitive: pure
+    narrow()+view() at computed offsets, zero allocation, zero init writes."""
     arena_nbytes = _core_workspace_nbytes(plan)
     offset_bytes = int(offset_bytes)
     if capacity_nbytes is None:
@@ -2013,9 +2036,31 @@ def _materialize_core_arena(
             shared_arena,
             offset_bytes + relative_offset,
             spec,
+            do_init=do_init,
         )
         tensors[spec.name] = tensor
         relative_offset = absolute_next - offset_bytes
+    return tensors
+
+
+def _materialize_core_arena(
+    plan: _TPCoreWorkspacePlan,
+    shared_arena: torch.Tensor,
+    *,
+    offset_bytes: int = 0,
+    capacity_nbytes: int | None = None,
+) -> _TPCoreArena:
+    # SGLANG workspace/arena materialization (one-time, pre-capture; init writes
+    # allowed). The vLLM eager bind path must NEVER call this -- it maps views via
+    # _map_core_workspace_views and builds the binding directly, never owning or
+    # constructing a workspace/arena object.
+    tensors = _map_core_workspace_views(
+        plan,
+        shared_arena,
+        offset_bytes=offset_bytes,
+        capacity_nbytes=capacity_nbytes,
+        do_init=True,
+    )
     return _TPCoreArena(plan=plan, shared_arena=shared_arena, tensors=tensors)
 
 
@@ -6464,6 +6509,10 @@ def b12x_moe_fp4(
         if binding.implementation == "static":
             workspace = TPCompactStaticWorkspace(
                 implementation=binding.implementation,
+                # Eager-bind maps views only and no longer zeros the read-before-write
+                # barrier scalars; the launch wrapper must re-zero them in-place each
+                # call (gated on volatile_launch_state), like the W4A16 path.
+                volatile_launch_state=True,
                 quant_mode=_normalize_quant_mode(binding.quant_mode),
                 state_E=binding.state_E,
                 weight_E=binding.weight_E,
@@ -6507,6 +6556,10 @@ def b12x_moe_fp4(
         elif binding.implementation == "dynamic":
             workspace = TPDynamicWorkspace(
                 implementation=binding.implementation,
+                # Eager-bind maps views only and no longer zeros the read-before-write
+                # barrier scalars; the launch wrapper must re-zero them in-place each
+                # call (gated on volatile_launch_state), like the W4A16 path.
+                volatile_launch_state=True,
                 quant_mode=_normalize_quant_mode(binding.quant_mode),
                 state_E=binding.state_E,
                 weight_E=binding.weight_E,
@@ -6870,6 +6923,15 @@ def b12x_moe_fp4(
         a2_gscale=a2_gscale,
         input_scales_static=effective_input_scales_static,
     )
+
+    # Re-zero the resident-grid read-before-write barrier scalars in-place when
+    # the workspace was eager-bound (volatile_launch_state=True): the vLLM bind
+    # maps caller-owned scratch as views WITHOUT initializing it (do_init=False),
+    # so without this the FP4 static/dynamic launch reads stale barrier state
+    # from the shared arena -> partially corrupted MoE output. No-op when the
+    # workspace owns/initialized its own scratch. Mirrors the nemotron/W4A16
+    # launch paths, which already call this.
+    _reset_volatile_launch_state(s)
 
     # CUDA graph capture may run on a non-default stream, so the launch stream
     # must be fetched per-call rather than cached per-device.

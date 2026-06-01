@@ -430,6 +430,7 @@ def sparse_mla_decode_forward(
     attn_sink: torch.Tensor | None = None,
     identity_page_table: bool = False,
     backend: str | None = None,
+    forced_num_splits: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -458,6 +459,7 @@ def sparse_mla_decode_forward(
         attn_sink=attn_sink,
         identity_page_table=identity_page_table,
         backend=backend,
+        forced_num_splits=forced_num_splits,
     )
 
 
@@ -519,6 +521,7 @@ def _run_sparse_mla(
     attn_sink: torch.Tensor | None = None,
     identity_page_table: bool = False,
     backend: str | None = None,
+    forced_num_splits: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -700,6 +703,7 @@ def _run_sparse_mla(
             attn_sink=attn_sink,
             return_lse=return_lse,
             lse_scale=lse_scale,
+            forced_num_splits=forced_num_splits,
         )
     sm_scale_tensor = _get_sm_scale_tensor(
         workspace=workspace, device=q_all.device, sm_scale=sm_scale

@@ -111,6 +111,7 @@ from .residual import (
     MHCWorkspace,
     MHCPreWorkspace,
     build_mhc_binding,
+    b12x_mhc_post,
     b12x_mhc_pre,
     b12x_mhc_post_pre,
     empty_mhc_workspace,
