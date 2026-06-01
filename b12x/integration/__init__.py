@@ -18,16 +18,6 @@ from b12x.attention.workspace import (
     B12XAttentionWorkspace,
     B12XAttentionWorkspaceContract,
 )
-from .arena import (
-    B12XExecutionLane,
-    B12XExecutionLaneArena,
-    B12XJointArenaSpec,
-    B12XMoEArenaCaps,
-    ensure_b12x_execution_lane_arena,
-    get_b12x_execution_lane,
-    get_b12x_moe_workspace_pool,
-    set_b12x_execution_lane_arena,
-)
 from .mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
@@ -155,14 +145,6 @@ __all__ = [
     "infer_paged_mode",
     "paged_attention_forward",
     "plan_paged_attention_scratch",
-    "B12XExecutionLane",
-    "B12XExecutionLaneArena",
-    "B12XJointArenaSpec",
-    "B12XMoEArenaCaps",
-    "ensure_b12x_execution_lane_arena",
-    "get_b12x_execution_lane",
-    "get_b12x_moe_workspace_pool",
-    "set_b12x_execution_lane_arena",
     "B12XAttentionArena",
     "B12XAttentionArenaCaps",
     "B12XAttentionWorkspace",
