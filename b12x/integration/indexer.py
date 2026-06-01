@@ -22,24 +22,8 @@ from b12x.attention.indexer import (
     supports_persistent_topk2048,
     uses_paged_mqa_schedule,
 )
-from b12x.integration.indexer_scratch import (
-    B12XIndexerExtendBinding,
-    B12XIndexerExtendScratchCaps,
-    B12XIndexerExtendScratchPlan,
-    B12XIndexerPagedBinding,
-    B12XIndexerPagedScratchCaps,
-    B12XIndexerPagedScratchPlan,
-    plan_indexer_extend_scratch,
-    plan_indexer_paged_scratch,
-)
 
 __all__ = [
-    "B12XIndexerExtendBinding",
-    "B12XIndexerExtendScratchCaps",
-    "B12XIndexerExtendScratchPlan",
-    "B12XIndexerPagedBinding",
-    "B12XIndexerPagedScratchCaps",
-    "B12XIndexerPagedScratchPlan",
     "B12XPersistentTopK2048Binding",
     "B12XPersistentTopK2048ScratchCaps",
     "B12XPersistentTopK2048ScratchPlan",
@@ -58,6 +42,4 @@ __all__ = [
     "run_persistent_topk2048",
     "supports_persistent_topk2048",
     "uses_paged_mqa_schedule",
-    "plan_indexer_extend_scratch",
-    "plan_indexer_paged_scratch",
 ]

@@ -28,12 +28,6 @@ from .mla import (
     sparse_mla_extend_forward,
 )
 from .indexer import (
-    B12XIndexerExtendBinding,
-    B12XIndexerExtendScratchCaps,
-    B12XIndexerExtendScratchPlan,
-    B12XIndexerPagedBinding,
-    B12XIndexerPagedScratchCaps,
-    B12XIndexerPagedScratchPlan,
     B12XPersistentTopK2048Binding,
     B12XPersistentTopK2048ScratchCaps,
     B12XPersistentTopK2048ScratchPlan,
@@ -52,8 +46,6 @@ from .indexer import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
     uses_paged_mqa_schedule,
-    plan_indexer_extend_scratch,
-    plan_indexer_paged_scratch,
 )
 from .compressed_indexer import (
     INDEX_HEAD_DIM,
@@ -158,12 +150,6 @@ __all__ = [
     "sparse_mla_extend_forward",
     "IndexerExtendMetadata",
     "IndexerPagedDecodeMetadata",
-    "B12XIndexerExtendBinding",
-    "B12XIndexerExtendScratchCaps",
-    "B12XIndexerExtendScratchPlan",
-    "B12XIndexerPagedBinding",
-    "B12XIndexerPagedScratchCaps",
-    "B12XIndexerPagedScratchPlan",
     "B12XPersistentTopK2048Binding",
     "B12XPersistentTopK2048ScratchCaps",
     "B12XPersistentTopK2048ScratchPlan",
@@ -180,8 +166,6 @@ __all__ = [
     "run_persistent_topk2048",
     "supports_persistent_topk2048",
     "uses_paged_mqa_schedule",
-    "plan_indexer_extend_scratch",
-    "plan_indexer_paged_scratch",
     "INDEX_HEAD_DIM",
     "COMPRESSED_INDEX_PAGE_SIZE",
     "CompressedIndexerMetadata",
