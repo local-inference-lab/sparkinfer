@@ -2094,11 +2094,7 @@ def _get_compiled_dense_gemm(
                 device=a_tensor_gpu.device,
             )
         if alpha_tensor_gpu is None:
-            alpha_tensor_gpu = torch.ones(
-                (1,),
-                dtype=torch.float32,
-                device=a_tensor_gpu.device,
-            )
+            alpha_tensor_gpu = _cached_alpha_one(a_tensor_gpu.device)
 
         nonlocal compiled_kernel
         compiled_kernel(
@@ -2282,6 +2278,25 @@ def _dense_gemm_launch_fake(
     split_k_atomic_bf16: bool,
 ) -> None:
     return None
+
+
+_ALPHA_ONE_CACHE: dict = {}
+
+
+def _cached_alpha_one(device: torch.device | str) -> torch.Tensor:
+    # Per-device cached scalar-one alpha, to avoid a per-call torch.ones((1,))
+    # host/device alloc on the generic FP8 dense-GEMM path. Mirrors
+    # wo_projection._cached_alpha_one (not imported -- wo_projection imports
+    # dense, so importing back would be circular).
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    key = (resolved.type, resolved.index)
+    alpha = _ALPHA_ONE_CACHE.get(key)
+    if alpha is None or alpha.device != resolved:
+        alpha = torch.ones((1,), dtype=torch.float32, device=resolved)
+        _ALPHA_ONE_CACHE[key] = alpha
+    return alpha
 
 
 def _empty_dense_gemm_output(
@@ -2627,7 +2642,7 @@ def dense_gemm(
     else:
         kernel_c_l = l
     if alpha is None:
-        alpha = torch.ones((1,), dtype=torch.float32, device=a_torch.device)
+        alpha = _cached_alpha_one(a_torch.device)
     kernel_c_dtype_name = (
         "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
     )
@@ -2691,7 +2706,7 @@ def dense_gemm(
             device=a_torch.device,
         )
     if alpha is None:
-        alpha = torch.ones((1,), dtype=torch.float32, device=a_torch.device)
+        alpha = _cached_alpha_one(a_torch.device)
 
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     cache_before = _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None

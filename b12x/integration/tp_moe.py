@@ -1185,7 +1185,10 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
             raise ValueError(
                 f"expected expert scale with {weight_E} elements, got {scale.numel()}"
             )
-        return scale.reshape(weight_E).to(torch.float32).contiguous()
+        # A contiguous [E] scale stays contiguous through reshape + to(float32),
+        # so the trailing .contiguous() was redundant here (kept in the scalar
+        # .expand() branch above, where expand yields a non-contiguous view).
+        return scale.reshape(weight_E).to(torch.float32)
 
 
 def _prepare_expert_scale_vector(
