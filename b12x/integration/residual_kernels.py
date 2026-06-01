@@ -159,6 +159,7 @@ class MHCPostPrePartialKernel:
         tokens: int = _TOKENS,
         compute_gram: bool = False,
         pre_only: bool = False,
+        post_only: bool = False,
     ):
         self.tokens = int(tokens)
         # When True, the partial_group==0 CTAs also reduce the 4x4 Gram of
@@ -168,6 +169,9 @@ class MHCPostPrePartialKernel:
         # partials directly from residual and do not materialize post_pre's
         # residual_out side.
         self.pre_only = bool(pre_only)
+        # When True, this is the standalone post path: materialize residual_out
+        # and skip the fn/residual partial reductions.
+        self.post_only = bool(post_only)
 
     @cute.jit
     def __call__(
@@ -189,9 +193,9 @@ class MHCPostPrePartialKernel:
             raise TypeError("prev_post must be Float32")
         if const_expr((not self.pre_only) and prev_comb.element_type != cutlass.Float32):
             raise TypeError("prev_comb must be Float32")
-        if const_expr(fn.element_type != cutlass.Float32):
+        if const_expr((not self.post_only) and fn.element_type != cutlass.Float32):
             raise TypeError("fn must be Float32")
-        if const_expr(partials.element_type != cutlass.Float32):
+        if const_expr((not self.post_only) and partials.element_type != cutlass.Float32):
             raise TypeError("partials must be Float32")
         if const_expr((not self.pre_only) and out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
@@ -203,17 +207,25 @@ class MHCPostPrePartialKernel:
             raise ValueError("prev_post must have shape (tokens, 4)")
         if const_expr((not self.pre_only) and prev_comb.shape != (self.tokens, _MHC_MULT, _MHC_MULT)):
             raise ValueError("prev_comb must have shape (tokens, 4, 4)")
-        if const_expr(fn.shape != (_MIXES, _TOTAL_K)):
+        if const_expr((not self.post_only) and fn.shape != (_MIXES, _TOTAL_K)):
             raise ValueError("fn must have shape (24, 16384)")
-        if const_expr(partials.shape != (self.tokens, _SPLIT_K, _PARTIALS)):
+        if const_expr(
+            (not self.post_only)
+            and partials.shape != (self.tokens, _SPLIT_K, _PARTIALS)
+        ):
             raise ValueError("partials must have shape (tokens, 64, 25)")
         if const_expr((not self.pre_only) and out.shape != (self.tokens, _MHC_MULT, _HIDDEN)):
             raise ValueError("out must have shape (tokens, 4, 4096)")
 
+        partial_groups = (
+            1
+            if self.post_only
+            else (self.partials + self.partials_per_cta - 1) // self.partials_per_cta
+        )
         self.kernel(x, residual, prev_post, prev_comb, fn, partials, out).launch(
             grid=(
                 self.source_tiles,
-                (self.partials + self.partials_per_cta - 1) // self.partials_per_cta,
+                partial_groups,
                 self.tokens,
             ),
             block=[self.num_threads, 1, 1],
@@ -298,73 +310,74 @@ class MHCPostPrePartialKernel:
             r2 = Float32(o2)
             r3 = Float32(o3)
 
-        # Optional 4x4 Gram of residual_out (only the residual_out-owning group).
-        if const_expr(self.compute_gram):
-            if partial_group == Int32(0):
-                gvals = cute.make_rmem_tensor(
-                    cute.make_layout((_GRAM_PAIRS,), stride=(1,)),
-                    Float32,
-                )
-                gvals[0] = r0 * r0
-                gvals[1] = r1 * r1
-                gvals[2] = r2 * r2
-                gvals[3] = r3 * r3
-                gvals[4] = r0 * r1
-                gvals[5] = r0 * r2
-                gvals[6] = r0 * r3
-                gvals[7] = r1 * r2
-                gvals[8] = r1 * r3
-                gvals[9] = r2 * r3
-                for gp in cutlass.range_constexpr(_GRAM_PAIRS):
-                    gvals[gp] = _warp_allreduce_sum(gvals[gp])
-                if lane == Int32(0):
+        if const_expr(not self.post_only):
+            # Optional 4x4 Gram of residual_out (only the residual_out-owning group).
+            if const_expr(self.compute_gram):
+                if partial_group == Int32(0):
+                    gvals = cute.make_rmem_tensor(
+                        cute.make_layout((_GRAM_PAIRS,), stride=(1,)),
+                        Float32,
+                    )
+                    gvals[0] = r0 * r0
+                    gvals[1] = r1 * r1
+                    gvals[2] = r2 * r2
+                    gvals[3] = r3 * r3
+                    gvals[4] = r0 * r1
+                    gvals[5] = r0 * r2
+                    gvals[6] = r0 * r3
+                    gvals[7] = r1 * r2
+                    gvals[8] = r1 * r3
+                    gvals[9] = r2 * r3
                     for gp in cutlass.range_constexpr(_GRAM_PAIRS):
-                        gram_sums[gp, warp] = gvals[gp]
+                        gvals[gp] = _warp_allreduce_sum(gvals[gp])
+                    if lane == Int32(0):
+                        for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                            gram_sums[gp, warp] = gvals[gp]
 
-        values = cute.make_rmem_tensor(
-            cute.make_layout((_POST_PRE_PARTIALS_PER_CTA,), stride=(1,)),
-            Float32,
-        )
-        for slot in cutlass.range_constexpr(_POST_PRE_PARTIALS_PER_CTA):
-            partial = partial0 + Int32(slot)
-            value = Float32(0.0)
-            if partial == Int32(0):
-                value = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
-            elif partial < Int32(self.partials):
-                mix = partial - Int32(1)
-                value = (
-                    Float32(fn[mix, h]) * r0
-                    + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
-                    + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
-                    + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
-                )
-            values[slot] = _warp_allreduce_sum(value)
-        if lane == Int32(0):
+            values = cute.make_rmem_tensor(
+                cute.make_layout((_POST_PRE_PARTIALS_PER_CTA,), stride=(1,)),
+                Float32,
+            )
             for slot in cutlass.range_constexpr(_POST_PRE_PARTIALS_PER_CTA):
-                warp_sums[slot, warp] = values[slot]
-        cute.arch.sync_threads()
-
-        if tidx == Int32(0):
-            for slot in cutlass.range_constexpr(_POST_PRE_PARTIALS_PER_CTA):
-                total = Float32(0.0)
-                src_warp = Int32(0)
-                while src_warp < Int32(self.num_threads // 32):
-                    total += Float32(warp_sums[slot, src_warp])
-                    src_warp += Int32(1)
                 partial = partial0 + Int32(slot)
-                if partial < Int32(self.partials):
-                    partials[token, hidden_tile, partial] = total
+                value = Float32(0.0)
+                if partial == Int32(0):
+                    value = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+                elif partial < Int32(self.partials):
+                    mix = partial - Int32(1)
+                    value = (
+                        Float32(fn[mix, h]) * r0
+                        + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
+                        + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
+                        + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
+                    )
+                values[slot] = _warp_allreduce_sum(value)
+            if lane == Int32(0):
+                for slot in cutlass.range_constexpr(_POST_PRE_PARTIALS_PER_CTA):
+                    warp_sums[slot, warp] = values[slot]
+            cute.arch.sync_threads()
 
-        if const_expr(self.compute_gram):
-            if partial_group == Int32(0):
-                if tidx == Int32(0):
-                    for gp in cutlass.range_constexpr(_GRAM_PAIRS):
-                        gtotal = Float32(0.0)
-                        src_warp = Int32(0)
-                        while src_warp < Int32(nwarps):
-                            gtotal += Float32(gram_sums[gp, src_warp])
-                            src_warp += Int32(1)
-                        partials[token, Int32(_GRAM_ROW0) + hidden_tile, gp] = gtotal
+            if tidx == Int32(0):
+                for slot in cutlass.range_constexpr(_POST_PRE_PARTIALS_PER_CTA):
+                    total = Float32(0.0)
+                    src_warp = Int32(0)
+                    while src_warp < Int32(self.num_threads // 32):
+                        total += Float32(warp_sums[slot, src_warp])
+                        src_warp += Int32(1)
+                    partial = partial0 + Int32(slot)
+                    if partial < Int32(self.partials):
+                        partials[token, hidden_tile, partial] = total
+
+            if const_expr(self.compute_gram):
+                if partial_group == Int32(0):
+                    if tidx == Int32(0):
+                        for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                            gtotal = Float32(0.0)
+                            src_warp = Int32(0)
+                            while src_warp < Int32(nwarps):
+                                gtotal += Float32(gram_sums[gp, src_warp])
+                                src_warp += Int32(1)
+                            partials[token, Int32(_GRAM_ROW0) + hidden_tile, gp] = gtotal
 
 
 class MHCFinalizeGramKernel:
@@ -754,10 +767,16 @@ class MHCFinalizeGramKernel:
 
 @lru_cache(maxsize=64)
 def _post_pre_partial_kernel(
-    tokens: int, compute_gram: bool = False, pre_only: bool = False
+    tokens: int,
+    compute_gram: bool = False,
+    pre_only: bool = False,
+    post_only: bool = False,
 ) -> MHCPostPrePartialKernel:
     return MHCPostPrePartialKernel(
-        tokens=tokens, compute_gram=compute_gram, pre_only=pre_only
+        tokens=tokens,
+        compute_gram=compute_gram,
+        pre_only=pre_only,
+        post_only=post_only,
     )
 
 
@@ -813,7 +832,7 @@ def _run_mhc_post_pre_partial_launch(
         _tensor_meta_key(out),
     )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, compute_gram, False),
+        _post_pre_partial_kernel(tokens, compute_gram, False, False),
         compile_spec=KernelCompileSpec.from_key(
             "integration.residual.mhc_post_pre_partial_hidden4096_hctile128_all4",
             2,
@@ -892,6 +911,164 @@ def run_mhc_post_pre_partial(
     )
 
 
+@torch.library.custom_op(
+    "b12x::mhc_post_pre_partial_alloc",
+    mutates_args=(),
+)
+def _mhc_post_pre_partial_alloc_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    compute_gram: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Functional (allocate + return) post-pre partial. Allocating BOTH partials
+    # and residual_out internally and returning them gives this op ZERO mutated
+    # args, so it is never auto_functionalized. That avoids the
+    # decompose_auto_functionalized node-count assertion that fires for an
+    # auto_functionalized op carrying TWO mutated args sharing a symbolic dim
+    # (the second clone's as_strided sym_size gets CSE-collapsed on re-trace).
+    # residual_out is allocated contiguous.
+    tokens = int(residual.shape[0])
+    partials = torch.empty(
+        (tokens, _SPLIT_K, _PARTIALS), dtype=torch.float32, device=residual.device
+    )
+    out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
+    _run_mhc_post_pre_partial_launch(
+        x=x,
+        residual=residual,
+        prev_post=prev_post,
+        prev_comb=prev_comb,
+        fn=fn,
+        partials=partials,
+        out=out,
+        compute_gram=compute_gram,
+    )
+    return partials, out
+
+
+@_mhc_post_pre_partial_alloc_op.register_fake
+def _mhc_post_pre_partial_alloc_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    compute_gram: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens = residual.shape[0]
+    partials = torch.empty(
+        (tokens, _SPLIT_K, _PARTIALS), dtype=torch.float32, device=residual.device
+    )
+    out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
+    return partials, out
+
+
+def run_mhc_post_pre_partial_alloc(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    compute_gram: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.b12x.mhc_post_pre_partial_alloc(
+        x, residual, prev_post, prev_comb, fn, bool(compute_gram)
+    )
+
+
+def _run_mhc_post_launch(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    tokens = int(x.shape[0])
+    args = (
+        _to_kernel_tensor(x, cutlass.BFloat16),
+        _to_kernel_tensor(residual, cutlass.BFloat16),
+        _to_kernel_tensor(prev_post, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(prev_comb, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(prev_comb, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(prev_post, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(out, cutlass.BFloat16),
+        current_cuda_stream(),
+    )
+    cache_key = (
+        _tensor_meta_key(x),
+        _tensor_meta_key(residual),
+        _tensor_meta_key(prev_post),
+        _tensor_meta_key(prev_comb),
+        _tensor_meta_key(out),
+    )
+    b12x_launch(
+        _post_pre_partial_kernel(tokens, False, False, True),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.residual.mhc_post_hidden4096_hctile128_all4",
+            1,
+            (
+                ("tokens", tokens),
+                ("post_only", True),
+                cache_key,
+            ),
+        ),
+        compile_args=args,
+        runtime_args=args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::mhc_post_launch",
+    mutates_args=("out",),
+)
+def _mhc_post_launch_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _run_mhc_post_launch(
+        x=x,
+        residual=residual,
+        prev_post=prev_post,
+        prev_comb=prev_comb,
+        out=out,
+    )
+
+
+@_mhc_post_launch_op.register_fake
+def _mhc_post_launch_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    return None
+
+
+def run_mhc_post(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops.b12x.mhc_post_launch(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        out,
+    )
+
+
 def _run_mhc_pre_partial_launch(
     *,
     residual: torch.Tensor,
@@ -917,7 +1094,7 @@ def _run_mhc_pre_partial_launch(
         _tensor_meta_key(partials),
     )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, compute_gram, True),
+        _post_pre_partial_kernel(tokens, compute_gram, True, False),
         compile_spec=KernelCompileSpec.from_key(
             "integration.residual.mhc_pre_partial_hidden4096_hctile128_all4",
             1,
@@ -1119,7 +1296,15 @@ def run_mhc_finalize_gram(
     norm_weight: torch.Tensor | None,
     norm_eps: float,
 ) -> None:
-    norm_weight_for_kernel = norm_weight if norm_weight is not None else y
+    # When norm_weight is None the kernel ignores it (fuse_norm=False), but it
+    # still needs a valid tensor arg. Do NOT alias `y` here: `y` is a mutated arg
+    # of this op, and passing a mutated arg a second time as a read-only arg makes
+    # auto_functionalized's decomposition fail under torch.compile (the
+    # replace_by_example node-count assertion). Use a fresh, non-mutated
+    # placeholder with y's (kernel-proven) shape/dtype instead.
+    norm_weight_for_kernel = (
+        norm_weight if norm_weight is not None else torch.empty_like(y)
+    )
     torch.ops.b12x.mhc_finalize_gram_launch(
         residual,
         partials,
@@ -1137,8 +1322,324 @@ def run_mhc_finalize_gram(
     )
 
 
+@torch.library.custom_op(
+    "b12x::mhc_post_launch_functional",
+    mutates_args=(),
+)
+def _mhc_post_launch_functional_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty_like(residual)
+    if int(x.shape[0]) != 0:
+        _run_mhc_post_launch(
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            out=out,
+        )
+    return out
+
+
+@_mhc_post_launch_functional_op.register_fake
+def _mhc_post_launch_functional_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(residual)
+
+
+def run_mhc_post_functional(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.b12x.mhc_post_launch_functional(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::mhc_pre_launch_functional",
+    mutates_args=(),
+)
+def _mhc_pre_launch_functional_op(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = int(residual.shape[0])
+    hidden_size = int(residual.shape[2])
+    partials = torch.empty(
+        (tokens, _SPLIT_K, _PARTIALS),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, _MHC_MULT, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    if tokens != 0:
+        _run_mhc_pre_partial_launch(
+            residual=residual,
+            fn=fn,
+            partials=partials,
+            compute_gram=fuse_norm,
+        )
+        _run_mhc_finalize_gram_launch(
+            residual=residual,
+            partials=partials,
+            scale=scale,
+            bias=bias,
+            y=y,
+            post=post,
+            comb=comb,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            fuse_norm=fuse_norm,
+        )
+    return y, post, comb
+
+
+@_mhc_pre_launch_functional_op.register_fake
+def _mhc_pre_launch_functional_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = residual.shape[0]
+    hidden_size = residual.shape[2]
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, _MHC_MULT, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    return y, post, comb
+
+
+def run_mhc_pre_functional(
+    *,
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
+    return torch.ops.b12x.mhc_pre_launch_functional(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight_for_kernel,
+        float(rms_eps),
+        float(hc_eps),
+        int(sinkhorn_iters),
+        float(norm_eps),
+        norm_weight is not None,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::mhc_post_pre_launch_functional",
+    mutates_args=(),
+)
+def _mhc_post_pre_launch_functional_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = int(residual.shape[0])
+    hidden_size = int(residual.shape[2])
+    partials = torch.empty(
+        (tokens, _SPLIT_K, _PARTIALS),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    residual_out = torch.empty_like(residual)
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, _MHC_MULT, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    if tokens != 0:
+        _run_mhc_post_pre_partial_launch(
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            fn=fn,
+            partials=partials,
+            out=residual_out,
+            compute_gram=fuse_norm,
+        )
+        _run_mhc_finalize_gram_launch(
+            residual=residual_out,
+            partials=partials,
+            scale=scale,
+            bias=bias,
+            y=y,
+            post=post,
+            comb=comb,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            fuse_norm=fuse_norm,
+        )
+    return residual_out, post, comb, y
+
+
+@_mhc_post_pre_launch_functional_op.register_fake
+def _mhc_post_pre_launch_functional_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = residual.shape[0]
+    hidden_size = residual.shape[2]
+    residual_out = torch.empty_like(residual)
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, _MHC_MULT, _MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    return residual_out, post, comb, y
+
+
+def run_mhc_post_pre_functional(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
+    return torch.ops.b12x.mhc_post_pre_launch_functional(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        scale,
+        bias,
+        norm_weight_for_kernel,
+        float(rms_eps),
+        float(hc_eps),
+        int(sinkhorn_iters),
+        float(norm_eps),
+        norm_weight is not None,
+    )
+
+
 __all__ = [
     "run_mhc_finalize_gram",
+    "run_mhc_post",
+    "run_mhc_post_functional",
+    "run_mhc_pre_functional",
+    "run_mhc_post_pre_functional",
     "run_mhc_pre_partial",
     "run_mhc_post_pre_partial",
+    "run_mhc_post_pre_partial_alloc",
 ]

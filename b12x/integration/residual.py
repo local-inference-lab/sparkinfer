@@ -439,10 +439,6 @@ def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
     )
 
 
-def _capture_active(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-
-
 def _require_contiguous(tensor: torch.Tensor, *, name: str) -> None:
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
@@ -668,6 +664,16 @@ def b12x_mhc_pre(
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # See b12x_mhc_post_pre: caller-owned buffers -> mutating ops; no buffers
+    # (e.g. torch.compile) -> a single functional op (allocate + return) so the
+    # compile graph has zero auto_functionalized mHC nodes. No is_compiling.
+    _caller_owned_buffers = (
+        binding is not None
+        or workspace is not None
+        or y_out is not None
+        or post_out is not None
+        or comb_out is not None
+    )
     if binding is not None:
         extras = [
             name
@@ -708,13 +714,7 @@ def b12x_mhc_pre(
     if block_h <= 0:
         raise ValueError(f"block_h must be positive, got {block_h}")
 
-    capture = _capture_active(residual.device)
     if workspace is None:
-        if capture:
-            raise ValueError(
-                "b12x_mhc_pre requires a caller-owned workspace (partials "
-                "scratch) during CUDA graph capture"
-            )
         partials = torch.empty(
             (tokens, split_k, MHC_PARTIALS),
             dtype=torch.float32,
@@ -761,8 +761,6 @@ def b12x_mhc_pre(
         _require_contiguous(partials, name="workspace partials")
 
     if y_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_pre requires caller-owned y_out during CUDA graph capture")
         y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
     else:
         y_out = _slice_capacity_view(
@@ -774,8 +772,6 @@ def b12x_mhc_pre(
             name="y_out",
         )
     if post_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_pre requires caller-owned post_out during CUDA graph capture")
         post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
     else:
         post_out = _slice_capacity_view(
@@ -787,8 +783,6 @@ def b12x_mhc_pre(
             name="post_out",
         )
     if comb_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_pre requires caller-owned comb_out during CUDA graph capture")
         comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
     else:
         comb_out = _slice_capacity_view(
@@ -825,8 +819,25 @@ def b12x_mhc_pre(
     ):
         from b12x.integration.residual_kernels import (
             run_mhc_finalize_gram,
+            run_mhc_pre_functional,
             run_mhc_pre_partial,
         )
+
+        if not _caller_owned_buffers:
+            # No caller buffers (e.g. torch.compile): one functional op runs the
+            # whole pre (partial + finalize) and returns fresh tensors, so the
+            # compile graph carries ZERO auto_functionalized mHC nodes.
+            return run_mhc_pre_functional(
+                residual=residual,
+                fn=fn,
+                scale=hc_scale,
+                bias=hc_base,
+                rms_eps=float(rms_eps),
+                hc_eps=float(hc_eps),
+                sinkhorn_iters=sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=float(norm_eps),
+            )
 
         run_mhc_pre_partial(
             residual=residual,
@@ -885,6 +896,20 @@ def b12x_mhc_post_pre(
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Whether the caller owns the output/scratch buffers (binding, workspace, or
+    # explicit out tensors). When it does, the post-pre partial writes them in
+    # place (mutating op). When it does not (e.g. the torch.compile path passes
+    # nothing), we use the functional alloc op: it returns partials+residual_out
+    # with ZERO mutated args, avoiding the auto_functionalized 2-mutated-arg
+    # decomposition assertion. No is_compiling -- purely caller-intent.
+    _caller_owned_buffers = (
+        binding is not None
+        or workspace is not None
+        or residual_out is not None
+        or y_out is not None
+        or post_out is not None
+        or comb_out is not None
+    )
     if binding is not None:
         extras = [
             name
@@ -946,16 +971,10 @@ def b12x_mhc_post_pre(
     if block_h <= 0:
         raise ValueError(f"block_h must be positive, got {block_h}")
 
-    capture = _capture_active(residual.device)
     if workspace is None:
         # The Gram post_pre needs a partials scratch buffer (the launch boundary
-        # between the partial pass and the multi-CTA finalize). Callers that
-        # capture CUDA graphs must own it; outside capture we allocate here.
-        if capture:
-            raise ValueError(
-                "b12x_mhc_post_pre requires a caller-owned workspace (partials "
-                "scratch) during CUDA graph capture"
-            )
+        # between the partial pass and the multi-CTA finalize). Allocate it when
+        # the caller does not supply a workspace.
         partials = torch.empty(
             (tokens, split_k, MHC_PARTIALS), dtype=torch.float32, device=residual.device
         )
@@ -999,8 +1018,6 @@ def b12x_mhc_post_pre(
         _require_contiguous(partials, name="workspace partials")
 
     if residual_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_post_pre requires caller-owned residual_out during CUDA graph capture")
         residual_out = torch.empty_like(residual)
     else:
         residual_out = _slice_capacity_view(
@@ -1012,8 +1029,6 @@ def b12x_mhc_post_pre(
             name="residual_out",
         )
     if y_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_post_pre requires caller-owned y_out during CUDA graph capture")
         y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
     else:
         y_out = _slice_capacity_view(
@@ -1025,8 +1040,6 @@ def b12x_mhc_post_pre(
             name="y_out",
         )
     if post_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_post_pre requires caller-owned post_out during CUDA graph capture")
         post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
     else:
         post_out = _slice_capacity_view(
@@ -1038,8 +1051,6 @@ def b12x_mhc_post_pre(
             name="post_out",
         )
     if comb_out is None:
-        if capture:
-            raise ValueError("b12x_mhc_post_pre requires caller-owned comb_out during CUDA graph capture")
         comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
     else:
         comb_out = _slice_capacity_view(
@@ -1086,8 +1097,28 @@ def b12x_mhc_post_pre(
         # Gram + RMSNorm are skipped when there is no fused norm_weight.
         from b12x.integration.residual_kernels import (
             run_mhc_finalize_gram,
+            run_mhc_post_pre_functional,
             run_mhc_post_pre_partial,
         )
+
+        if not _caller_owned_buffers:
+            # No caller buffers (e.g. torch.compile): one functional op runs the
+            # whole post_pre (partial + finalize) and returns fresh tensors, so
+            # the compile graph carries ZERO auto_functionalized mHC nodes.
+            return run_mhc_post_pre_functional(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                fn=fn,
+                scale=hc_scale,
+                bias=hc_base,
+                rms_eps=float(rms_eps),
+                hc_eps=float(hc_eps),
+                sinkhorn_iters=sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=float(norm_eps),
+            )
 
         run_mhc_post_pre_partial(
             x=x,
@@ -1126,6 +1157,96 @@ def b12x_mhc_post_pre(
     )
 
 
+def b12x_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    tokens, hc_mult, hidden_size = residual.shape
+    if hc_mult != MHC_MULT:
+        raise ValueError(f"residual hc dimension must be {MHC_MULT}, got {hc_mult}")
+    if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
+        raise ValueError(
+            f"x and residual must both be torch.bfloat16, got {x.dtype} and "
+            f"{residual.dtype}"
+        )
+    if x.ndim != 2 or tuple(x.shape) != (tokens, hidden_size):
+        raise ValueError(f"x must have shape {(tokens, hidden_size)}, got {tuple(x.shape)}")
+    if x.device != residual.device:
+        raise ValueError("x and residual must be on the same device")
+    prev_post = _canonicalize_post_mix_input(
+        prev_post,
+        tokens=tokens,
+        device=residual.device,
+        name="prev_post",
+    )
+    if (
+        prev_comb.dtype != torch.float32
+        or tuple(prev_comb.shape) != (tokens, MHC_MULT, MHC_MULT)
+    ):
+        raise ValueError(
+            f"prev_comb must be float32 shape {(tokens, MHC_MULT, MHC_MULT)}, "
+            f"got {prev_comb.dtype} {tuple(prev_comb.shape)}"
+        )
+    if prev_comb.device != residual.device:
+        raise ValueError("prev_comb must be on the residual device")
+    _require_contiguous(x, name="x")
+    _require_contiguous(residual, name="residual")
+    _require_contiguous(prev_comb, name="prev_comb")
+
+    if out is None:
+        # No caller buffer (e.g. torch.compile): the functional op allocates and
+        # returns, so the compile graph carries zero auto_functionalized mHC
+        # nodes. No is_compiling -- purely caller-intent.
+        if hidden_size != 4096:
+            raise ValueError(
+                "b12x_mhc_post is served only by the post-only mHC kernel, which "
+                f"supports hidden_size=4096; got hidden_size={hidden_size}"
+            )
+        from b12x.integration.residual_kernels import run_mhc_post_functional
+
+        return run_mhc_post_functional(
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+        )
+
+    out = _slice_capacity_view(
+        out,
+        tokens=tokens,
+        tail_shape=(MHC_MULT, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+        name="out",
+    )
+    if out.shape != residual.shape or out.dtype != residual.dtype or out.device != residual.device:
+        raise ValueError("out must match residual shape, dtype, and device")
+    _require_contiguous(out, name="out")
+
+    if tokens == 0:
+        return out
+    if hidden_size == 4096:
+        from b12x.integration.residual_kernels import run_mhc_post
+
+        run_mhc_post(
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            out=out,
+        )
+        return out
+
+    raise ValueError(
+        "b12x_mhc_post is served only by the post-only mHC kernel, which "
+        f"supports hidden_size=4096; got hidden_size={hidden_size}"
+    )
+
+
 __all__ = [
     "B12XMHCBinding",
     "B12XMHCScratchCaps",
@@ -1139,6 +1260,7 @@ __all__ = [
     "MHCWorkspace",
     "MHCPreWorkspace",
     "build_mhc_binding",
+    "b12x_mhc_post",
     "b12x_mhc_pre",
     "b12x_mhc_post_pre",
     "empty_mhc_workspace",

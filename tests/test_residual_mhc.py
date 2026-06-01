@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from b12x.integration import (
+    b12x_mhc_post,
     b12x_mhc_post_pre,
     empty_mhc_workspace,
 )
@@ -73,6 +74,41 @@ def _make_inputs(
     scale = torch.randn((3,), generator=gen, dtype=torch.float32).to(device) / 3
     bias = torch.randn((24,), generator=gen, dtype=torch.float32).to(device) / 5
     return residual.contiguous(), x.contiguous(), fn.contiguous(), scale.contiguous(), bias.contiguous()
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 8])
+def test_b12x_mhc_post_match_reference(tokens: int) -> None:
+    device = require_sm120()
+    hidden_size = 4096
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_430 + tokens,
+        device=device,
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    out = torch.empty_like(residual)
+
+    residual_cur = b12x_mhc_post(
+        x,
+        residual,
+        prev_post.contiguous(),
+        prev_comb.contiguous(),
+        out=out,
+    )
+    torch.cuda.synchronize(device)
+
+    residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
+    assert residual_cur.untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
@@ -287,5 +323,4 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=4e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
-
 
