@@ -12,9 +12,15 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    tensor_key,
+)
+from b12x.cute.compiler import (
+    launch as b12x_launch,
+)
 from b12x.cute.utils import current_cuda_stream
-
 
 _MHC_MULT = 4
 _TOKENS = 1
@@ -92,10 +98,18 @@ def _to_kernel_tensor(
     dtype: type[cutlass.Numeric],
     *,
     assumed_align: int = 16,
+    dynamic_layout: bool = False,
 ) -> cutlass.cute.Tensor:
     tensor = tensor.detach()
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
+    if dynamic_layout and tensor.ndim >= 1:
+        leading_dim = next(
+            (idx for idx, stride in enumerate(tensor.stride()) if stride == 1),
+            None,
+        )
+        if leading_dim is not None:
+            cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
     return cute_tensor
 
 
@@ -108,6 +122,16 @@ def _tensor_meta_key(
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
+
+
+def _validate_tensor_shape(
+    name: str,
+    tensor: torch.Tensor,
+    expected: tuple[int, ...],
+) -> None:
+    actual = tuple(int(dim) for dim in tensor.shape)
+    if actual != expected:
+        raise ValueError(f"{name} must have shape {expected}, got {actual}")
 
 
 def _norm_weight_kernel_tensor(
@@ -199,14 +223,12 @@ class MHCPostPrePartialKernel:
     def __init__(
         self,
         *,
-        tokens: int = _TOKENS,
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
         compute_gram: bool = False,
         pre_only: bool = False,
         post_only: bool = False,
     ):
-        self.tokens = int(tokens)
         self.hidden_size = int(hidden_size)
         self.total_k = _MHC_MULT * self.hidden_size
         self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
@@ -239,6 +261,7 @@ class MHCPostPrePartialKernel:
         fn: cute.Tensor,
         partials: cute.Tensor,
         out: cute.Tensor,
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         if const_expr((not self.pre_only) and x.element_type != cutlass.BFloat16):
@@ -255,29 +278,6 @@ class MHCPostPrePartialKernel:
             raise TypeError("partials must be Float32")
         if const_expr((not self.pre_only) and out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
-        if const_expr(
-            (not self.pre_only) and x.shape != (self.tokens, self.hidden_size)
-        ):
-            raise ValueError("x must have shape (tokens, hidden_size)")
-        if const_expr(residual.shape != (self.tokens, _MHC_MULT, self.hidden_size)):
-            raise ValueError("residual must have shape (tokens, 4, hidden_size)")
-        if const_expr((not self.pre_only) and prev_post.shape != (self.tokens, _MHC_MULT)):
-            raise ValueError("prev_post must have shape (tokens, 4)")
-        if const_expr((not self.pre_only) and prev_comb.shape != (self.tokens, _MHC_MULT, _MHC_MULT)):
-            raise ValueError("prev_comb must have shape (tokens, 4, 4)")
-        if const_expr((not self.post_only) and fn.shape != (_MIXES, self.total_k)):
-            raise ValueError("fn must have shape (24, 4 * hidden_size)")
-        if const_expr(
-            (not self.post_only)
-            and partials.shape != (self.tokens, self.split_k, _PARTIALS)
-        ):
-            raise ValueError("partials must have shape (tokens, split_k, 25)")
-        if const_expr(
-            (not self.pre_only)
-            and out.shape != (self.tokens, _MHC_MULT, self.hidden_size)
-        ):
-            raise ValueError("out must have shape (tokens, 4, hidden_size)")
-
         partial_groups = (
             1
             if self.post_only
@@ -287,7 +287,7 @@ class MHCPostPrePartialKernel:
             grid=(
                 self.source_tiles,
                 partial_groups,
-                self.tokens,
+                num_tokens,
             ),
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -465,7 +465,6 @@ class MHCFinalizeGramKernel:
     def __init__(
         self,
         *,
-        tokens: int = _TOKENS,
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
         rms_eps: float,
@@ -474,7 +473,6 @@ class MHCFinalizeGramKernel:
         norm_eps: float,
         fuse_norm: bool = True,
     ):
-        self.tokens = int(tokens)
         self.hidden_size = int(hidden_size)
         if self.hidden_size % self.block_h != 0:
             raise ValueError(
@@ -510,6 +508,7 @@ class MHCFinalizeGramKernel:
         post: cute.Tensor,
         comb: cute.Tensor,
         norm_weight: cute.Tensor,
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         if const_expr(residual.element_type != cutlass.BFloat16):
@@ -524,17 +523,8 @@ class MHCFinalizeGramKernel:
             and norm_weight.element_type != cutlass.Float32
         ):
             raise TypeError("norm_weight must be BFloat16 or Float32")
-        if const_expr(residual.shape != (self.tokens, _MHC_MULT, self.hidden_size)):
-            raise ValueError("residual must have shape (tokens, 4, hidden_size)")
-        if const_expr(partials.shape != (self.tokens, self.split_k, _PARTIALS)):
-            raise ValueError("partials must have shape (tokens, split_k, 25)")
-        if const_expr(y.shape != (self.tokens, self.hidden_size)):
-            raise ValueError("y must have shape (tokens, hidden_size)")
-        if const_expr(self.fuse_norm and norm_weight.shape != (self.hidden_size,)):
-            raise ValueError("norm_weight must have shape (hidden_size,)")
-
         self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight).launch(
-            grid=(self.hidden_size // self.block_h, self.tokens, 1),
+            grid=(self.hidden_size // self.block_h, num_tokens, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -932,7 +922,6 @@ class MHCFinalizeGramKernel:
 
 @lru_cache(maxsize=64)
 def _post_pre_partial_kernel(
-    tokens: int,
     hidden_size: int,
     split_k: int,
     compute_gram: bool = False,
@@ -940,7 +929,6 @@ def _post_pre_partial_kernel(
     post_only: bool = False,
 ) -> MHCPostPrePartialKernel:
     return MHCPostPrePartialKernel(
-        tokens=tokens,
         hidden_size=hidden_size,
         split_k=split_k,
         compute_gram=compute_gram,
@@ -951,7 +939,6 @@ def _post_pre_partial_kernel(
 
 @lru_cache(maxsize=64)
 def _finalize_gram_kernel(
-    tokens: int,
     hidden_size: int,
     split_k: int,
     rms_eps: float,
@@ -961,7 +948,6 @@ def _finalize_gram_kernel(
     fuse_norm: bool,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
-        tokens=tokens,
         hidden_size=hidden_size,
         split_k=split_k,
         rms_eps=rms_eps,
@@ -987,25 +973,92 @@ def _run_mhc_post_pre_partial_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
+    _validate_tensor_shape("x", x, (tokens, hidden_size))
+    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+    _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
+    _validate_tensor_shape("prev_comb", prev_comb, (tokens, _MHC_MULT, _MHC_MULT))
+    _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
+    _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
+    _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
     compute_gram = bool(compute_gram)
     args = (
-        _to_kernel_tensor(x, cutlass.BFloat16),
-        _to_kernel_tensor(residual, cutlass.BFloat16),
-        _to_kernel_tensor(prev_post, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(prev_comb, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            prev_post,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            prev_comb,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
         _to_kernel_tensor(fn, cutlass.Float32),
-        _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(out, cutlass.BFloat16),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
+        Int32(tokens),
         current_cuda_stream(),
     )
     cache_key = (
-        _tensor_meta_key(x),
-        _tensor_meta_key(residual),
-        _tensor_meta_key(prev_post),
-        _tensor_meta_key(prev_comb),
-        _tensor_meta_key(fn),
-        _tensor_meta_key(partials),
-        _tensor_meta_key(out),
+        tensor_key(
+            "x",
+            x,
+            dims=(DimKey.dynamic(), DimKey.exact(hidden_size)),
+        ),
+        tensor_key(
+            "residual",
+            residual,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
+        tensor_key(
+            "prev_post",
+            prev_post,
+            dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+        ),
+        tensor_key(
+            "prev_comb",
+            prev_comb,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(_MHC_MULT),
+            ),
+        ),
+        tensor_key(
+            "fn",
+            fn,
+            dims=(DimKey.exact(_MIXES), DimKey.exact(_MHC_MULT * hidden_size)),
+        ),
+        tensor_key(
+            "partials",
+            partials,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(split_k),
+                DimKey.exact(_PARTIALS),
+            ),
+        ),
+        tensor_key(
+            "out",
+            out,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
     )
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
@@ -1013,7 +1066,6 @@ def _run_mhc_post_pre_partial_launch(
             "integration.residual.mhc_post_pre_partial_hidden4096_hctile128_all4"
         )
         compile_key = (
-            ("tokens", tokens),
             ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
             ("compute_gram", compute_gram),
             cache_key,
@@ -1024,7 +1076,6 @@ def _run_mhc_post_pre_partial_launch(
             f"{hidden_specialization}_hctile128_all4"
         )
         compile_key = (
-            ("tokens", tokens),
             ("hidden_size", hidden_size),
             ("split_k", split_k),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
@@ -1034,14 +1085,13 @@ def _run_mhc_post_pre_partial_launch(
         )
     b12x_launch(
         _post_pre_partial_kernel(
-            tokens,
             hidden_size,
             split_k,
             compute_gram,
             False,
             False,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1192,28 +1242,85 @@ def _run_mhc_post_launch(
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
     split_k = _split_k_for_hidden(hidden_size)
+    _validate_tensor_shape("x", x, (tokens, hidden_size))
+    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+    _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
+    _validate_tensor_shape("prev_comb", prev_comb, (tokens, _MHC_MULT, _MHC_MULT))
+    _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
     args = (
-        _to_kernel_tensor(x, cutlass.BFloat16),
-        _to_kernel_tensor(residual, cutlass.BFloat16),
-        _to_kernel_tensor(prev_post, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(prev_comb, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(prev_comb, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(prev_post, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(out, cutlass.BFloat16),
+        _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            prev_post,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            prev_comb,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            prev_comb,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            prev_post,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
+        Int32(tokens),
         current_cuda_stream(),
     )
     cache_key = (
-        _tensor_meta_key(x),
-        _tensor_meta_key(residual),
-        _tensor_meta_key(prev_post),
-        _tensor_meta_key(prev_comb),
-        _tensor_meta_key(out),
+        tensor_key(
+            "x",
+            x,
+            dims=(DimKey.dynamic(), DimKey.exact(hidden_size)),
+        ),
+        tensor_key(
+            "residual",
+            residual,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
+        tensor_key(
+            "prev_post",
+            prev_post,
+            dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+        ),
+        tensor_key(
+            "prev_comb",
+            prev_comb,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(_MHC_MULT),
+            ),
+        ),
+        tensor_key(
+            "out",
+            out,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
     )
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN:
         compile_name = "integration.residual.mhc_post_hidden4096_hctile128_all4"
         compile_key = (
-            ("tokens", tokens),
             ("post_only", True),
             cache_key,
         )
@@ -1223,14 +1330,13 @@ def _run_mhc_post_launch(
             f"{hidden_specialization}_hctile128_all4"
         )
         compile_key = (
-            ("tokens", tokens),
             ("hidden_size", hidden_size),
             ("post_only", True),
             cache_key,
         )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, hidden_size, split_k, False, False, True),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        _post_pre_partial_kernel(hidden_size, split_k, False, False, True),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1295,27 +1401,65 @@ def _run_mhc_pre_partial_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
+    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+    _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
+    _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     compute_gram = bool(compute_gram)
     args = (
-        _to_kernel_tensor(residual, cutlass.BFloat16),
-        _to_kernel_tensor(residual, cutlass.BFloat16),
-        _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
         _to_kernel_tensor(fn, cutlass.Float32),
-        _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(residual, cutlass.BFloat16),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        Int32(tokens),
         current_cuda_stream(),
     )
     cache_key = (
-        _tensor_meta_key(residual),
-        _tensor_meta_key(fn),
-        _tensor_meta_key(partials),
+        tensor_key(
+            "residual",
+            residual,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
+        tensor_key(
+            "fn",
+            fn,
+            dims=(DimKey.exact(_MIXES), DimKey.exact(_MHC_MULT * hidden_size)),
+        ),
+        tensor_key(
+            "partials",
+            partials,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(split_k),
+                DimKey.exact(_PARTIALS),
+            ),
+        ),
     )
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
         compile_name = "integration.residual.mhc_pre_partial_hidden4096_hctile128_all4"
         compile_key = (
-            ("tokens", tokens),
             ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
             ("compute_gram", compute_gram),
             ("pre_only", True),
@@ -1327,7 +1471,6 @@ def _run_mhc_pre_partial_launch(
             f"{hidden_specialization}_hctile128_all4"
         )
         compile_key = (
-            ("tokens", tokens),
             ("hidden_size", hidden_size),
             ("split_k", split_k),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
@@ -1338,14 +1481,13 @@ def _run_mhc_pre_partial_launch(
         )
     b12x_launch(
         _post_pre_partial_kernel(
-            tokens,
             hidden_size,
             split_k,
             compute_gram,
             True,
             False,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1423,16 +1565,50 @@ def _run_mhc_finalize_gram_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
+    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+    _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
+    _validate_tensor_shape("scale", scale, (3,))
+    _validate_tensor_shape("bias", bias, (_MIXES,))
+    _validate_tensor_shape("y", y, (tokens, hidden_size))
+    _validate_tensor_shape("post", post, (tokens, _MHC_MULT))
+    _validate_tensor_shape("comb", comb, (tokens, _MHC_MULT, _MHC_MULT))
+    if fuse_norm:
+        _validate_tensor_shape("norm_weight", norm_weight, (hidden_size,))
     args = (
-        _to_kernel_tensor(residual, cutlass.BFloat16),
-        _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
         _to_kernel_tensor(scale, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(bias, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(y, cutlass.BFloat16),
-        _to_kernel_tensor(post, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(comb, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(y, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            post,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            comb,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
         norm_weight_tensor,
+        Int32(tokens),
         current_cuda_stream(),
+    )
+    norm_weight_key = (
+        tensor_key(
+            "norm_weight",
+            norm_weight,
+            dims=(DimKey.exact(hidden_size),),
+        )
+        if fuse_norm
+        else ("norm_weight", None)
     )
     common_key_tail = (
         ("impl", "finalize_gram_multicta_v2"),
@@ -1442,20 +1618,51 @@ def _run_mhc_finalize_gram_launch(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
-        _tensor_meta_key(residual),
-        _tensor_meta_key(partials),
-        _tensor_meta_key(scale),
-        _tensor_meta_key(bias),
-        _tensor_meta_key(y),
-        _tensor_meta_key(post),
-        _tensor_meta_key(comb),
-        _tensor_meta_key(norm_weight) if norm_weight is not None else None,
+        tensor_key(
+            "residual",
+            residual,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
+            ),
+        ),
+        tensor_key(
+            "partials",
+            partials,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(split_k),
+                DimKey.exact(_PARTIALS),
+            ),
+        ),
+        tensor_key("scale", scale, dims=(DimKey.exact(3),)),
+        tensor_key("bias", bias, dims=(DimKey.exact(_MIXES),)),
+        tensor_key(
+            "y",
+            y,
+            dims=(DimKey.dynamic(), DimKey.exact(hidden_size)),
+        ),
+        tensor_key(
+            "post",
+            post,
+            dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+        ),
+        tensor_key(
+            "comb",
+            comb,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(_MHC_MULT),
+            ),
+        ),
+        norm_weight_key,
     )
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
         compile_name = "integration.residual.mhc_finalize_gram_hidden4096"
         compile_key = (
-            ("tokens", tokens),
             ("block_h", _GRAM_BLOCK_H),
             ("source_tiles", _SOURCE_TILES),
             ("gram_row0", _GRAM_ROW0),
@@ -1467,7 +1674,6 @@ def _run_mhc_finalize_gram_launch(
             f"{hidden_specialization}"
         )
         compile_key = (
-            ("tokens", tokens),
             ("hidden_size", hidden_size),
             ("split_k", split_k),
             ("block_h", _GRAM_BLOCK_H),
@@ -1477,7 +1683,6 @@ def _run_mhc_finalize_gram_launch(
         )
     b12x_launch(
         _finalize_gram_kernel(
-            tokens,
             hidden_size,
             split_k,
             rms_eps,
@@ -1486,7 +1691,7 @@ def _run_mhc_finalize_gram_launch(
             norm_eps,
             fuse_norm,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
         runtime_args=args,
     )

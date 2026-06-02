@@ -54,8 +54,10 @@ from b12x.cute.compiler import (
     DimKey,
     KernelCompileSpec,
     key_field,
-    launch as b12x_launch,
     tensor_key,
+)
+from b12x.cute.compiler import (
+    launch as b12x_launch,
 )
 from b12x.cute.fp4 import shared_ptr_to_u32
 
@@ -74,7 +76,6 @@ from .decode_math import (
 from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import ModelType, infer_model_type, make_unified_traits
-
 
 # BI=64 candidates per chunk (one full/empty KV buffer window). Same as decode.
 _CAND_WINDOW = 64
@@ -127,7 +128,9 @@ class UnifiedPrefillKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, num_tiles,
-                 h_blocks, num_heads, has_sink,
+                 h_blocks, num_heads, q_head_dim, topk, extra_topk, has_sink,
+                 q_stride, indices_stride0, extra_indices_stride0,
+                 output_stride, out_lse_stride,
                  has_extra=False, pbs_extra=1, num_main_tiles=0):
         self.traits = traits
         self.layout = layout
@@ -135,6 +138,19 @@ class UnifiedPrefillKernel:
         self.num_tiles = int(num_tiles)  # ceil(topk / BI), compile-time chunk count.
         self.h_blocks = int(h_blocks)
         self.num_heads = int(num_heads)
+        self.q_head_dim = int(q_head_dim)
+        self.topk = int(topk)
+        self.extra_topk = int(extra_topk)
+        self.q_stride_row = int(q_stride[0])
+        self.q_stride_head = int(q_stride[1])
+        self.q_stride_dim = int(q_stride[2])
+        self.indices_stride_row = int(indices_stride0)
+        self.extra_indices_stride_row = int(extra_indices_stride0)
+        self.output_stride_row = int(output_stride[0])
+        self.output_stride_head = int(output_stride[1])
+        self.output_stride_dim = int(output_stride[2])
+        self.out_lse_stride_row = int(out_lse_stride[0])
+        self.out_lse_stride_head = int(out_lse_stride[1])
         self.has_sink = bool(has_sink)
         # DSV4 dual-cache prefill (P10 3c). When False the extra-section code is
         # const_expr-elided -> no-extra DSV4 / GLM prefill PTX byte-identical. The
@@ -347,7 +363,7 @@ class UnifiedPrefillKernel:
         # PER-TOKEN valid length: this CTA's section_len (the decode mask + io
         # gather boundary). Clamped to [0, topk]. Chunks with g_start >= section_len
         # gather all -1 (io clamps g_end) and S3 masks them -> they add nothing.
-        topk_total = Int32(indices.shape[1])
+        topk_total = Int32(self.topk)
         section_len = Int32(topk_length[token_idx])
         if section_len < Int32(0):
             section_len = Int32(0)
@@ -358,7 +374,7 @@ class UnifiedPrefillKernel:
         # const_expr-elided when has_extra=False so the no-extra trace is unchanged.
         num_main_tiles = Int32(self.num_main_tiles)
         if cutlass.const_expr(has_extra):
-            extra_total = Int32(extra_indices.shape[1])
+            extra_total = Int32(self.extra_topk)
             extra_section_len = Int32(extra_topk_length[token_idx])
             if extra_section_len < Int32(0):
                 extra_section_len = Int32(0)
@@ -380,26 +396,34 @@ class UnifiedPrefillKernel:
             is_empty_row = is_empty_row and (extra_section_len == Int32(0))
 
         # indices for THIS token row (1-D (topk,) slice).
-        topk_row = cute.make_tensor(
-            indices.iterator + token_idx.to(Int64) * Int64(indices.stride[0]),
-            cute.make_layout(indices.shape[1]),
-        )
+        if cutlass.const_expr(self.topk == 0):
+            topk_row = cute.make_tensor(
+                indices.iterator
+                + token_idx.to(Int64) * Int64(self.indices_stride_row),
+                cute.make_layout(1),
+            )
+        else:
+            topk_row = cute.make_tensor(
+                indices.iterator
+                + token_idx.to(Int64) * Int64(self.indices_stride_row),
+                cute.make_layout(self.topk),
+            )
         # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
         # has_extra; const_expr-elided so the no-extra trace never references it.
         if cutlass.const_expr(has_extra):
             extra_row = cute.make_tensor(
                 extra_indices.iterator
-                + token_idx.to(Int64) * Int64(extra_indices.stride[0]),
-                cute.make_layout(extra_indices.shape[1]),
+                + token_idx.to(Int64) * Int64(self.extra_indices_stride_row),
+                cute.make_layout(self.extra_topk),
             )
         else:
             extra_row = topk_row
         # q for THIS token (2-D (heads, D_QK) view; s0 indexes [head_base+h, d]).
         q_token = cute.make_tensor(
-            q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
+            q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
             cute.make_layout(
-                (q_all.shape[1], q_all.shape[2]),
-                stride=(q_all.stride[1], q_all.stride[2]),
+                (self.num_heads, self.q_head_dim),
+                stride=(self.q_stride_head, self.q_stride_dim),
             ),
         )
         warp_first_cand = warp_id * Int32(8)
@@ -680,19 +704,19 @@ class UnifiedPrefillKernel:
             # (token, head_block). output stride = (heads*Dv, Dv, 1).
             out_o = cute.make_tensor(
                 output.iterator
-                + token_idx.to(Int64) * Int64(output.stride[0])
-                + head_base.to(Int64) * Int64(output.stride[1]),
+                + token_idx.to(Int64) * Int64(self.output_stride_row)
+                + head_base.to(Int64) * Int64(self.output_stride_head),
                 cute.make_layout(
                     (t.hpb, t.d_v),
-                    stride=(output.stride[1], output.stride[2]),
+                    stride=(self.output_stride_head, self.output_stride_dim),
                 ),
             )
             # out_lse[token, head_base + h]: (HPB,) view.
             out_lse_v = cute.make_tensor(
                 out_lse.iterator
-                + token_idx.to(Int64) * Int64(out_lse.stride[0])
-                + head_base.to(Int64) * Int64(out_lse.stride[1]),
-                cute.make_layout((t.hpb,), stride=(out_lse.stride[1],)),
+                + token_idx.to(Int64) * Int64(self.out_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.out_lse_stride_head),
+                cute.make_layout((t.hpb,), stride=(self.out_lse_stride_head,)),
             )
             s7_epilogue(
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse_v,
@@ -769,6 +793,14 @@ def _unified_sm120_prefill_flat_launch(
         int(num_tiles),
         h_blocks=h_blocks,
         num_heads=heads,
+        q_head_dim=q_head_dim,
+        topk=topk,
+        extra_topk=extra_topk,
+        q_stride=tuple(q.stride()),
+        indices_stride0=int(topk_indices.stride(0)),
+        extra_indices_stride0=int(extra_indices_t.stride(0)),
+        output_stride=tuple(output.stride()),
+        out_lse_stride=tuple(lse_out.stride()),
         has_sink=bool(has_sink),
         has_extra=bool(has_extra),
         pbs_extra=int(pbs_extra),

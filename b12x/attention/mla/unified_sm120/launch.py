@@ -50,8 +50,10 @@ from b12x.cute.compiler import (
     DimKey,
     KernelCompileSpec,
     key_field,
-    launch as b12x_launch,
     tensor_key,
+)
+from b12x.cute.compiler import (
+    launch as b12x_launch,
 )
 from b12x.cute.fp4 import shared_ptr_to_u32
 
@@ -73,7 +75,6 @@ from .traits import (
     infer_model_type,
     make_unified_traits,
 )
-
 
 # natural-log of 2 (base2 <-> natural LSE conversion).
 _LN2 = math.log(2.0)
@@ -263,7 +264,10 @@ class UnifiedDecodeKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, chunks_per_split,
-                 h_blocks, num_splits, has_extra=False,
+                 h_blocks, num_splits, num_heads, q_head_dim, topk, extra_topk,
+                 q_stride, swa_indices_stride0, extra_indices_stride0,
+                 mid_out_stride, mid_lse_stride,
+                 has_extra=False,
                  pbs_extra=1, valid_hpb=None, head_block_offset=0,
                  per_token_len=False):
         self.traits = traits
@@ -272,6 +276,22 @@ class UnifiedDecodeKernel:
         self.chunks_per_split = int(chunks_per_split)
         self.h_blocks = int(h_blocks)
         self.num_splits = int(num_splits)
+        self.num_heads = int(num_heads)
+        self.q_head_dim = int(q_head_dim)
+        self.topk = int(topk)
+        self.extra_topk = int(extra_topk)
+        self.q_stride_row = int(q_stride[0])
+        self.q_stride_head = int(q_stride[1])
+        self.q_stride_dim = int(q_stride[2])
+        self.swa_indices_stride_row = int(swa_indices_stride0)
+        self.extra_indices_stride_row = int(extra_indices_stride0)
+        self.mid_out_stride_row = int(mid_out_stride[0])
+        self.mid_out_stride_head = int(mid_out_stride[1])
+        self.mid_out_stride_split = int(mid_out_stride[2])
+        self.mid_out_stride_dim = int(mid_out_stride[3])
+        self.mid_lse_stride_row = int(mid_lse_stride[0])
+        self.mid_lse_stride_head = int(mid_lse_stride[1])
+        self.mid_lse_stride_split = int(mid_lse_stride[2])
         # DSV4 dual-cache (P7c). When False the extra-section code is const_expr-
         # elided -> no-extra DSV4 / GLM PTX byte-identical.
         self.has_extra = bool(has_extra)
@@ -506,15 +526,16 @@ class UnifiedDecodeKernel:
 
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         topk_row = cute.make_tensor(
-            swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
-            cute.make_layout(swa_indices.shape[1]),
+            swa_indices.iterator
+            + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
+            cute.make_layout(self.topk),
         )
         # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
         q_token = cute.make_tensor(
-            q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
+            q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
             cute.make_layout(
-                (q_all.shape[1], q_all.shape[2]),
-                stride=(q_all.stride[1], q_all.stride[2]),
+                (self.num_heads, self.q_head_dim),
+                stride=(self.q_stride_head, self.q_stride_dim),
             ),
         )
         warp_first_cand = warp_id * Int32(8)
@@ -703,21 +724,21 @@ class UnifiedDecodeKernel:
             # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
             out_o = cute.make_tensor(
                 mid_out.iterator
-                + token_idx.to(Int64) * Int64(mid_out.stride[0])
-                + head_base.to(Int64) * Int64(mid_out.stride[1])
-                + split_idx.to(Int64) * Int64(mid_out.stride[2]),
+                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
                 cute.make_layout(
                     (t.hpb, t.d_v),
-                    stride=(mid_out.stride[1], mid_out.stride[3]),
+                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
                 ),
             )
             # mid_lse[token, head_base + h, split]: (HPB,) view.
             out_lse = cute.make_tensor(
                 mid_lse.iterator
-                + token_idx.to(Int64) * Int64(mid_lse.stride[0])
-                + head_base.to(Int64) * Int64(mid_lse.stride[1])
-                + split_idx.to(Int64) * Int64(mid_lse.stride[2]),
-                cute.make_layout((t.hpb,), stride=(mid_lse.stride[1],)),
+                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
             )
             s7_epilogue(
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
@@ -903,14 +924,14 @@ class UnifiedDecodeKernel:
         # stays UNIFORM over the MAX topk; this per-token clamp is what masks the
         # over-allocated chunks (their candidates fall past section_len -> S3 -inf).
         if cutlass.const_expr(per_token_len):
-            topk_total = Int32(swa_indices.shape[1])
+            topk_total = Int32(self.topk)
             section_len = Int32(topk_length[token_idx])
             if section_len < Int32(0):
                 section_len = Int32(0)
             if section_len > topk_total:
                 section_len = topk_total
             if cutlass.const_expr(has_extra):
-                extra_total = Int32(extra_indices.shape[1])
+                extra_total = Int32(self.extra_topk)
                 extra_section_len = Int32(extra_topk_length[token_idx])
                 if extra_section_len < Int32(0):
                     extra_section_len = Int32(0)
@@ -919,39 +940,42 @@ class UnifiedDecodeKernel:
 
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
-        # swa_indices.shape[1]==0 means there are NO main chunks (num_main_chunks
+        # self.topk == 0 means there are NO main chunks (num_main_chunks
         # ==0) and the main section is never gathered/scanned. cute.make_layout(0)
         # is illegal (size must be strictly positive), so build a degenerate
         # 1-extent main view instead -- it is never referenced because every
         # ``ci < num_main_chunks(==0)`` branch is unreachable, so the kernel
         # attends ONLY the extra section. This is a const_expr (concrete-shape
         # trace), so the non-zero-main DSV4/GLM traces are byte-identical.
-        if cutlass.const_expr(int(swa_indices.shape[1]) == 0):
+        if cutlass.const_expr(self.topk == 0):
             topk_row = cute.make_tensor(
-                swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
+                swa_indices.iterator
+                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
                 cute.make_layout(1),
             )
         else:
             topk_row = cute.make_tensor(
-                swa_indices.iterator + token_idx.to(Int64) * Int64(swa_indices.stride[0]),
-                cute.make_layout(swa_indices.shape[1]),
+                swa_indices.iterator
+                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
+                cute.make_layout(self.topk),
             )
         # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
         # has_extra (extra_indices is None otherwise); const_expr-elided so the
         # no-extra trace never references the extra tensor.
         if cutlass.const_expr(has_extra):
             extra_row = cute.make_tensor(
-                extra_indices.iterator + token_idx.to(Int64) * Int64(extra_indices.stride[0]),
-                cute.make_layout(extra_indices.shape[1]),
+                extra_indices.iterator
+                + token_idx.to(Int64) * Int64(self.extra_indices_stride_row),
+                cute.make_layout(self.extra_topk),
             )
         else:
             extra_row = topk_row
         # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
         q_token = cute.make_tensor(
-            q_all.iterator + token_idx.to(Int64) * Int64(q_all.stride[0]),
+            q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
             cute.make_layout(
-                (q_all.shape[1], q_all.shape[2]),
-                stride=(q_all.stride[1], q_all.stride[2]),
+                (self.num_heads, self.q_head_dim),
+                stride=(self.q_stride_head, self.q_stride_dim),
             ),
         )
         warp_first_cand = warp_id * Int32(8)
@@ -1206,21 +1230,21 @@ class UnifiedDecodeKernel:
             # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
             out_o = cute.make_tensor(
                 mid_out.iterator
-                + token_idx.to(Int64) * Int64(mid_out.stride[0])
-                + head_base.to(Int64) * Int64(mid_out.stride[1])
-                + split_idx.to(Int64) * Int64(mid_out.stride[2]),
+                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
                 cute.make_layout(
                     (t.hpb, t.d_v),
-                    stride=(mid_out.stride[1], mid_out.stride[3]),
+                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
                 ),
             )
             # mid_lse[token, head_base + h, split]: (HPB,) view.
             out_lse = cute.make_tensor(
                 mid_lse.iterator
-                + token_idx.to(Int64) * Int64(mid_lse.stride[0])
-                + head_base.to(Int64) * Int64(mid_lse.stride[1])
-                + split_idx.to(Int64) * Int64(mid_lse.stride[2]),
-                cute.make_layout((t.hpb,), stride=(mid_lse.stride[1],)),
+                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
             )
             s7_epilogue(
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
@@ -1345,6 +1369,15 @@ def _unified_sm120_decode_grid_flat_launch(
         int(chunks_per_split),
         h_blocks=int(grid_h_blocks),
         num_splits=int(num_splits),
+        num_heads=heads,
+        q_head_dim=q_head_dim,
+        topk=topk,
+        extra_topk=extra_topk,
+        q_stride=tuple(q_all.stride()),
+        swa_indices_stride0=int(swa_indices.stride(0)),
+        extra_indices_stride0=int(extra_indices_t.stride(0)),
+        mid_out_stride=tuple(mid_out.stride()),
+        mid_lse_stride=tuple(mid_lse.stride()),
         has_extra=bool(has_extra),
         pbs_extra=int(pbs_extra),
         valid_hpb=int(valid_hpb),
