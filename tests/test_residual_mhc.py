@@ -253,6 +253,112 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
 
+def test_b12x_mhc_pro_hidden_match_reference() -> None:
+    device = require_sm120()
+    tokens = 1
+    hidden_size = 7168
+    split_k = 112
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_472,
+        device=device,
+    )
+    workspace = empty_mhc_workspace(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+        split_k=split_k,
+        device=device,
+    )
+    norm_gen = torch.Generator(device="cpu")
+    norm_gen.manual_seed(91_473)
+    norm_weight = (
+        torch.randn((hidden_size,), generator=norm_gen, dtype=torch.float32)
+        .to(device)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+
+    residual_post = torch.empty_like(residual)
+    residual_cur = b12x_mhc_post(
+        x,
+        residual,
+        prev_post.contiguous(),
+        prev_comb.contiguous(),
+        out=residual_post,
+    )
+    residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
+
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
+        x,
+        residual,
+        prev_post.contiguous(),
+        prev_comb.contiguous(),
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        workspace=workspace,
+        split_k=split_k,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    torch.cuda.synchronize(device)
+
+    y_raw_ref_fp32, post_ref, comb_ref = _mhc_pre_reference(
+        residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    rms_scale = torch.rsqrt(
+        y_raw_ref_fp32.square().mean(dim=-1, keepdim=True) + 1e-6
+    )
+    y_ref = (
+        y_raw_ref_fp32.to(torch.bfloat16).float() * rms_scale * norm_weight.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
+
+    residual_func, post_func, comb_func, y_func = b12x_mhc_post_pre(
+        x,
+        residual,
+        prev_post.contiguous(),
+        prev_comb.contiguous(),
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        split_k=split_k,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(residual_func, residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(y_func, y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(post_func, post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb_func, comb_ref, rtol=2e-6, atol=1e-5)
+
 
 def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     device = require_sm120()
@@ -323,4 +429,3 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=4e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
-

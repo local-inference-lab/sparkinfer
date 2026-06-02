@@ -26,6 +26,44 @@ MHC_PARTIALS = 1 + MHC_MIXES
 MHC_DEFAULT_SPLIT_K = 64
 MHC_DEFAULT_BLOCK_K = 256
 MHC_DEFAULT_BLOCK_H = 512
+MHC_SOURCE_TILE_H = 128
+MHC_GRAM_BLOCK_H = 1024
+MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
+
+
+def _required_mhc_split_k(hidden_size: int, block_k: int) -> int:
+    total_k = MHC_MULT * int(hidden_size)
+    block_k = int(block_k)
+    if block_k <= 0 or total_k % block_k != 0:
+        return -1
+    return total_k // block_k
+
+
+def _supports_fused_mhc_gram(
+    *,
+    hidden_size: int,
+    split_k: int,
+    block_k: int,
+    block_h: int,
+) -> bool:
+    hidden_size = int(hidden_size)
+    split_k = int(split_k)
+    block_k = int(block_k)
+    block_h = int(block_h)
+    required_split_k = _required_mhc_split_k(hidden_size, block_k)
+    return (
+        hidden_size in MHC_SUPPORTED_HIDDEN_SIZES
+        and block_k == MHC_DEFAULT_BLOCK_K
+        and block_h == MHC_DEFAULT_BLOCK_H
+        and hidden_size % MHC_SOURCE_TILE_H == 0
+        and hidden_size % MHC_GRAM_BLOCK_H == 0
+        and required_split_k > 0
+        and split_k == required_split_k
+    )
+
+
+def _supports_mhc_post_hidden(hidden_size: int) -> bool:
+    return int(hidden_size) in MHC_SUPPORTED_HIDDEN_SIZES
 
 
 @dataclass(frozen=True)
@@ -809,10 +847,12 @@ def b12x_mhc_pre(
 
     if (
         partials is not None
-        and hidden_size == 4096
-        and split_k == MHC_DEFAULT_SPLIT_K
-        and block_k == MHC_DEFAULT_BLOCK_K
-        and block_h == MHC_DEFAULT_BLOCK_H
+        and _supports_fused_mhc_gram(
+            hidden_size=hidden_size,
+            split_k=split_k,
+            block_k=block_k,
+            block_h=block_h,
+        )
         and float(rms_eps) == 1.0e-6
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
@@ -864,7 +904,8 @@ def b12x_mhc_pre(
     raise ValueError(
         "b12x_mhc_pre is served only by the fused Gram kernel, which "
         "supports the decode config "
-        f"(hidden_size=4096, split_k={MHC_DEFAULT_SPLIT_K}, "
+        f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
+        f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
@@ -1080,10 +1121,12 @@ def b12x_mhc_post_pre(
 
     if (
         partials is not None
-        and hidden_size == 4096
-        and split_k == MHC_DEFAULT_SPLIT_K
-        and block_k == MHC_DEFAULT_BLOCK_K
-        and block_h == MHC_DEFAULT_BLOCK_H
+        and _supports_fused_mhc_gram(
+            hidden_size=hidden_size,
+            split_k=split_k,
+            block_k=block_k,
+            block_h=block_h,
+        )
         and float(rms_eps) == 1.0e-6
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
@@ -1149,7 +1192,8 @@ def b12x_mhc_post_pre(
     raise ValueError(
         "b12x_mhc_post_pre is served only by the fused Gram kernel, which "
         "supports the decode config "
-        f"(hidden_size=4096, split_k={MHC_DEFAULT_SPLIT_K}, "
+        f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
+        f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
@@ -1201,10 +1245,11 @@ def b12x_mhc_post(
         # No caller buffer (e.g. torch.compile): the functional op allocates and
         # returns, so the compile graph carries zero auto_functionalized mHC
         # nodes. No is_compiling -- purely caller-intent.
-        if hidden_size != 4096:
+        if not _supports_mhc_post_hidden(hidden_size):
             raise ValueError(
                 "b12x_mhc_post is served only by the post-only mHC kernel, which "
-                f"supports hidden_size=4096; got hidden_size={hidden_size}"
+                f"supports hidden_size in {MHC_SUPPORTED_HIDDEN_SIZES}; "
+                f"got hidden_size={hidden_size}"
             )
         from b12x.integration.residual_kernels import run_mhc_post_functional
 
@@ -1229,7 +1274,7 @@ def b12x_mhc_post(
 
     if tokens == 0:
         return out
-    if hidden_size == 4096:
+    if _supports_mhc_post_hidden(hidden_size):
         from b12x.integration.residual_kernels import run_mhc_post
 
         run_mhc_post(
@@ -1243,7 +1288,8 @@ def b12x_mhc_post(
 
     raise ValueError(
         "b12x_mhc_post is served only by the post-only mHC kernel, which "
-        f"supports hidden_size=4096; got hidden_size={hidden_size}"
+        f"supports hidden_size in {MHC_SUPPORTED_HIDDEN_SIZES}; "
+        f"got hidden_size={hidden_size}"
     )
 
 
@@ -1254,9 +1300,12 @@ __all__ = [
     "MHC_DEFAULT_BLOCK_H",
     "MHC_DEFAULT_BLOCK_K",
     "MHC_DEFAULT_SPLIT_K",
+    "MHC_GRAM_BLOCK_H",
     "MHC_MULT",
     "MHC_MIXES",
     "MHC_PARTIALS",
+    "MHC_SOURCE_TILE_H",
+    "MHC_SUPPORTED_HIDDEN_SIZES",
     "MHCWorkspace",
     "MHCPreWorkspace",
     "build_mhc_binding",

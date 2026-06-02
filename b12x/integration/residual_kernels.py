@@ -23,6 +23,7 @@ _TOTAL_K = _MHC_MULT * _HIDDEN
 _SPLIT_K = 64
 _SOURCE_TILE_H = 128
 _SOURCE_TILES = _HIDDEN // _SOURCE_TILE_H
+_SUPPORTED_HIDDEN_SIZES = (_HIDDEN, 7168)
 _MIXES = 24
 _PARTIALS = 1 + _MIXES
 _PARTIALS_PER_CTA = 2
@@ -44,6 +45,46 @@ _GRAM_PAIRS = 10
 _GRAM_ROW0 = 32  # gram[tile] stored at partials[token, 32 + tile, 0:10]
 # 1024 threads/CTA -> 4 hidden tiles (CTAs); fastest finalize in the sweep.
 _GRAM_BLOCK_H = 1024
+
+
+def _source_tiles_for_hidden(hidden_size: int) -> int:
+    hidden_size = int(hidden_size)
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+    if hidden_size not in _SUPPORTED_HIDDEN_SIZES:
+        raise ValueError(
+            f"hidden_size={hidden_size} is not supported by the mHC kernels; "
+            f"supported hidden sizes are {_SUPPORTED_HIDDEN_SIZES}"
+        )
+    if hidden_size % _SOURCE_TILE_H != 0:
+        raise ValueError(
+            f"hidden_size={hidden_size} must be divisible by source tile "
+            f"{_SOURCE_TILE_H}"
+        )
+    return hidden_size // _SOURCE_TILE_H
+
+
+def _split_k_for_hidden(hidden_size: int) -> int:
+    return 2 * _source_tiles_for_hidden(hidden_size)
+
+
+def _validate_split_k(hidden_size: int, split_k: int) -> None:
+    required = _split_k_for_hidden(hidden_size)
+    if int(split_k) != required:
+        raise ValueError(
+            f"split_k={split_k} does not match hidden_size={hidden_size}; "
+            f"expected {required}"
+        )
+
+
+def _hidden_specialization_name(hidden_size: int) -> str:
+    hidden_size = int(hidden_size)
+    if hidden_size not in _SUPPORTED_HIDDEN_SIZES:
+        raise ValueError(
+            f"hidden_size={hidden_size} is not supported by the mHC kernels; "
+            f"supported hidden sizes are {_SUPPORTED_HIDDEN_SIZES}"
+        )
+    return f"hidden{hidden_size}"
 
 
 def _to_kernel_tensor(
@@ -150,6 +191,8 @@ class MHCPostPrePartialKernel:
     split_k = _SPLIT_K
     source_tile_h = _SOURCE_TILE_H
     source_tiles = _SOURCE_TILES
+    source_warps = (_SOURCE_TILES + 31) // 32
+    gram_row0 = _GRAM_ROW0
     partials = _PARTIALS
     partials_per_cta = _POST_PRE_PARTIALS_PER_CTA
 
@@ -157,11 +200,24 @@ class MHCPostPrePartialKernel:
         self,
         *,
         tokens: int = _TOKENS,
+        hidden_size: int = _HIDDEN,
+        split_k: int | None = None,
         compute_gram: bool = False,
         pre_only: bool = False,
         post_only: bool = False,
     ):
         self.tokens = int(tokens)
+        self.hidden_size = int(hidden_size)
+        self.total_k = _MHC_MULT * self.hidden_size
+        self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
+        self.source_warps = (self.source_tiles + 31) // 32
+        self.split_k = (
+            _split_k_for_hidden(self.hidden_size)
+            if split_k is None
+            else int(split_k)
+        )
+        _validate_split_k(self.hidden_size, self.split_k)
+        self.gram_row0 = self.source_tiles
         # When True, the partial_group==0 CTAs also reduce the 4x4 Gram of
         # residual_out into partials rows [32, 64) for the Gram-trick finalize.
         self.compute_gram = bool(compute_gram)
@@ -199,23 +255,28 @@ class MHCPostPrePartialKernel:
             raise TypeError("partials must be Float32")
         if const_expr((not self.pre_only) and out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
-        if const_expr((not self.pre_only) and x.shape != (self.tokens, _HIDDEN)):
-            raise ValueError("x must have shape (tokens, 4096)")
-        if const_expr(residual.shape != (self.tokens, _MHC_MULT, _HIDDEN)):
-            raise ValueError("residual must have shape (tokens, 4, 4096)")
+        if const_expr(
+            (not self.pre_only) and x.shape != (self.tokens, self.hidden_size)
+        ):
+            raise ValueError("x must have shape (tokens, hidden_size)")
+        if const_expr(residual.shape != (self.tokens, _MHC_MULT, self.hidden_size)):
+            raise ValueError("residual must have shape (tokens, 4, hidden_size)")
         if const_expr((not self.pre_only) and prev_post.shape != (self.tokens, _MHC_MULT)):
             raise ValueError("prev_post must have shape (tokens, 4)")
         if const_expr((not self.pre_only) and prev_comb.shape != (self.tokens, _MHC_MULT, _MHC_MULT)):
             raise ValueError("prev_comb must have shape (tokens, 4, 4)")
-        if const_expr((not self.post_only) and fn.shape != (_MIXES, _TOTAL_K)):
-            raise ValueError("fn must have shape (24, 16384)")
+        if const_expr((not self.post_only) and fn.shape != (_MIXES, self.total_k)):
+            raise ValueError("fn must have shape (24, 4 * hidden_size)")
         if const_expr(
             (not self.post_only)
-            and partials.shape != (self.tokens, _SPLIT_K, _PARTIALS)
+            and partials.shape != (self.tokens, self.split_k, _PARTIALS)
         ):
-            raise ValueError("partials must have shape (tokens, 64, 25)")
-        if const_expr((not self.pre_only) and out.shape != (self.tokens, _MHC_MULT, _HIDDEN)):
-            raise ValueError("out must have shape (tokens, 4, 4096)")
+            raise ValueError("partials must have shape (tokens, split_k, 25)")
+        if const_expr(
+            (not self.pre_only)
+            and out.shape != (self.tokens, _MHC_MULT, self.hidden_size)
+        ):
+            raise ValueError("out must have shape (tokens, 4, hidden_size)")
 
         partial_groups = (
             1
@@ -377,7 +438,7 @@ class MHCPostPrePartialKernel:
                             while src_warp < Int32(nwarps):
                                 gtotal += Float32(gram_sums[gp, src_warp])
                                 src_warp += Int32(1)
-                            partials[token, Int32(_GRAM_ROW0) + hidden_tile, gp] = gtotal
+                            partials[token, Int32(self.gram_row0) + hidden_tile, gp] = gtotal
 
 
 class MHCFinalizeGramKernel:
@@ -393,6 +454,9 @@ class MHCFinalizeGramKernel:
     block_h = _GRAM_BLOCK_H
     hidden_size = _HIDDEN
     source_tiles = _SOURCE_TILES
+    source_warps = (_SOURCE_TILES + 31) // 32
+    total_k = _TOTAL_K
+    split_k = _SPLIT_K
     mixes = _MIXES
     partials = _PARTIALS
     gram_row0 = _GRAM_ROW0
@@ -402,6 +466,8 @@ class MHCFinalizeGramKernel:
         self,
         *,
         tokens: int = _TOKENS,
+        hidden_size: int = _HIDDEN,
+        split_k: int | None = None,
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
@@ -409,6 +475,22 @@ class MHCFinalizeGramKernel:
         fuse_norm: bool = True,
     ):
         self.tokens = int(tokens)
+        self.hidden_size = int(hidden_size)
+        if self.hidden_size % self.block_h != 0:
+            raise ValueError(
+                f"hidden_size={self.hidden_size} must be divisible by "
+                f"finalize block_h={self.block_h}"
+            )
+        self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
+        self.source_warps = (self.source_tiles + 31) // 32
+        self.total_k = _MHC_MULT * self.hidden_size
+        self.split_k = (
+            _split_k_for_hidden(self.hidden_size)
+            if split_k is None
+            else int(split_k)
+        )
+        _validate_split_k(self.hidden_size, self.split_k)
+        self.gram_row0 = self.source_tiles
         self.rms_eps = float(rms_eps)
         self.hc_eps = float(hc_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
@@ -442,14 +524,14 @@ class MHCFinalizeGramKernel:
             and norm_weight.element_type != cutlass.Float32
         ):
             raise TypeError("norm_weight must be BFloat16 or Float32")
-        if const_expr(residual.shape != (self.tokens, _MHC_MULT, _HIDDEN)):
-            raise ValueError("residual must have shape (tokens, 4, 4096)")
-        if const_expr(partials.shape != (self.tokens, _SPLIT_K, _PARTIALS)):
-            raise ValueError("partials must have shape (tokens, 64, 25)")
-        if const_expr(y.shape != (self.tokens, _HIDDEN)):
-            raise ValueError("y must have shape (tokens, 4096)")
-        if const_expr(self.fuse_norm and norm_weight.shape != (_HIDDEN,)):
-            raise ValueError("norm_weight must have shape (4096,)")
+        if const_expr(residual.shape != (self.tokens, _MHC_MULT, self.hidden_size)):
+            raise ValueError("residual must have shape (tokens, 4, hidden_size)")
+        if const_expr(partials.shape != (self.tokens, self.split_k, _PARTIALS)):
+            raise ValueError("partials must have shape (tokens, split_k, 25)")
+        if const_expr(y.shape != (self.tokens, self.hidden_size)):
+            raise ValueError("y must have shape (tokens, hidden_size)")
+        if const_expr(self.fuse_norm and norm_weight.shape != (self.hidden_size,)):
+            raise ValueError("norm_weight must have shape (hidden_size,)")
 
         self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight).launch(
             grid=(self.hidden_size // self.block_h, self.tokens, 1),
@@ -483,20 +565,103 @@ class MHCFinalizeGramKernel:
         gram = cute.make_rmem_tensor(
             cute.make_layout((self.gram_pairs,), stride=(1,)), Float32
         )
-        if tidx < Int32(32):
+        if const_expr(self.source_warps == 1):
+            if tidx < Int32(32):
+                for column in cutlass.range_constexpr(_PARTIALS):
+                    value = Float32(0.0)
+                    if tidx < Int32(self.source_tiles):
+                        value = Float32(partials[token, tidx, column])
+                    sums[column] = _warp_allreduce_sum(value)
+                if const_expr(self.fuse_norm):
+                    for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                        gvalue = Float32(0.0)
+                        if tidx < Int32(self.source_tiles):
+                            gvalue = Float32(
+                                partials[token, Int32(_GRAM_ROW0) + tidx, gp]
+                            )
+                        gram[gp] = _warp_allreduce_sum(gvalue)
+        elif const_expr(self.source_warps == 2):
+            lane = tidx % Int32(32)
+            warp = tidx // Int32(32)
+            source_tile = warp * Int32(32) + lane
+            source_sums = storage.partials.get_tensor(
+                cute.make_layout((self.num_threads,), stride=(1,))
+            )
+            if tidx < Int32(64):
+                for column in cutlass.range_constexpr(_PARTIALS):
+                    value = Float32(0.0)
+                    if source_tile < Int32(self.source_tiles):
+                        value = Float32(partials[token, source_tile, column])
+                    value = _warp_allreduce_sum(value)
+                    if lane == Int32(0):
+                        source_sums[Int32(column * 2) + warp] = value
+                if const_expr(self.fuse_norm):
+                    for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                        gvalue = Float32(0.0)
+                        if source_tile < Int32(self.source_tiles):
+                            gvalue = Float32(
+                                partials[token, Int32(self.gram_row0) + source_tile, gp]
+                            )
+                        gvalue = _warp_allreduce_sum(gvalue)
+                        if lane == Int32(0):
+                            source_sums[Int32((_PARTIALS + gp) * 2) + warp] = gvalue
+            cute.arch.sync_threads()
+            if tidx == Int32(0):
+                for column in cutlass.range_constexpr(_PARTIALS):
+                    sums[column] = (
+                        Float32(source_sums[Int32(column * 2)])
+                        + Float32(source_sums[Int32(column * 2 + 1)])
+                    )
+                if const_expr(self.fuse_norm):
+                    for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                        gram[gp] = (
+                            Float32(source_sums[Int32((_PARTIALS + gp) * 2)])
+                            + Float32(source_sums[Int32((_PARTIALS + gp) * 2 + 1)])
+                        )
+        else:
+            lane = tidx % Int32(32)
+            warp = tidx // Int32(32)
+            source_sums = storage.partials.get_tensor(
+                cute.make_layout((self.num_threads,), stride=(1,))
+            )
+            source_warp_threads = Int32(self.source_warps * 32)
             for column in cutlass.range_constexpr(_PARTIALS):
                 value = Float32(0.0)
-                if tidx < Int32(self.source_tiles):
-                    value = Float32(partials[token, tidx, column])
-                sums[column] = _warp_allreduce_sum(value)
+                if tidx < source_warp_threads:
+                    if tidx < Int32(self.source_tiles):
+                        value = Float32(partials[token, tidx, column])
+                    value = _warp_allreduce_sum(value)
+                    if lane == Int32(0):
+                        source_sums[warp] = value
+                cute.arch.sync_threads()
+                if tidx == Int32(0):
+                    total = Float32(0.0)
+                    src_warp = Int32(0)
+                    while src_warp < Int32(self.source_warps):
+                        total += Float32(source_sums[src_warp])
+                        src_warp += Int32(1)
+                    sums[column] = total
+                cute.arch.sync_threads()
             if const_expr(self.fuse_norm):
                 for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                     gvalue = Float32(0.0)
-                    if tidx < Int32(self.source_tiles):
-                        gvalue = Float32(
-                            partials[token, Int32(self.gram_row0) + tidx, gp]
-                        )
-                    gram[gp] = _warp_allreduce_sum(gvalue)
+                    if tidx < source_warp_threads:
+                        if tidx < Int32(self.source_tiles):
+                            gvalue = Float32(
+                                partials[token, Int32(self.gram_row0) + tidx, gp]
+                            )
+                        gvalue = _warp_allreduce_sum(gvalue)
+                        if lane == Int32(0):
+                            source_sums[warp] = gvalue
+                    cute.arch.sync_threads()
+                    if tidx == Int32(0):
+                        gtotal = Float32(0.0)
+                        src_warp = Int32(0)
+                        while src_warp < Int32(self.source_warps):
+                            gtotal += Float32(source_sums[src_warp])
+                            src_warp += Int32(1)
+                        gram[gp] = gtotal
+                    cute.arch.sync_threads()
 
         if tidx == Int32(0):
             total_sqsum = Float32(sums[0])
@@ -506,7 +671,7 @@ class MHCFinalizeGramKernel:
             for mix in cutlass.range_constexpr(_MIXES):
                 mixes[mix] = Float32(sums[mix + 1])
             inv_rms = cute.math.rsqrt(
-                total_sqsum / Float32(_TOTAL_K) + Float32(self.rms_eps), fastmath=True
+                total_sqsum / Float32(self.total_k) + Float32(self.rms_eps), fastmath=True
             )
             for mix in cutlass.range_constexpr(_MIXES):
                 mixes[mix] = mixes[mix] * inv_rms
@@ -768,12 +933,16 @@ class MHCFinalizeGramKernel:
 @lru_cache(maxsize=64)
 def _post_pre_partial_kernel(
     tokens: int,
+    hidden_size: int,
+    split_k: int,
     compute_gram: bool = False,
     pre_only: bool = False,
     post_only: bool = False,
 ) -> MHCPostPrePartialKernel:
     return MHCPostPrePartialKernel(
         tokens=tokens,
+        hidden_size=hidden_size,
+        split_k=split_k,
         compute_gram=compute_gram,
         pre_only=pre_only,
         post_only=post_only,
@@ -783,6 +952,8 @@ def _post_pre_partial_kernel(
 @lru_cache(maxsize=64)
 def _finalize_gram_kernel(
     tokens: int,
+    hidden_size: int,
+    split_k: int,
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
@@ -791,6 +962,8 @@ def _finalize_gram_kernel(
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         tokens=tokens,
+        hidden_size=hidden_size,
+        split_k=split_k,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
@@ -811,6 +984,9 @@ def _run_mhc_post_pre_partial_launch(
     compute_gram: bool = False,
 ) -> None:
     tokens = int(x.shape[0])
+    hidden_size = int(residual.shape[2])
+    split_k = int(partials.shape[1])
+    _validate_split_k(hidden_size, split_k)
     compute_gram = bool(compute_gram)
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16),
@@ -831,18 +1007,41 @@ def _run_mhc_post_pre_partial_launch(
         _tensor_meta_key(partials),
         _tensor_meta_key(out),
     )
+    hidden_specialization = _hidden_specialization_name(hidden_size)
+    if hidden_size == _HIDDEN and split_k == _SPLIT_K:
+        compile_name = (
+            "integration.residual.mhc_post_pre_partial_hidden4096_hctile128_all4"
+        )
+        compile_key = (
+            ("tokens", tokens),
+            ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
+            ("compute_gram", compute_gram),
+            cache_key,
+        )
+    else:
+        compile_name = (
+            "integration.residual.mhc_post_pre_partial_"
+            f"{hidden_specialization}_hctile128_all4"
+        )
+        compile_key = (
+            ("tokens", tokens),
+            ("hidden_size", hidden_size),
+            ("split_k", split_k),
+            ("source_tiles", hidden_size // _SOURCE_TILE_H),
+            ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
+            ("compute_gram", compute_gram),
+            cache_key,
+        )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, compute_gram, False, False),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.residual.mhc_post_pre_partial_hidden4096_hctile128_all4",
-            2,
-            (
-                ("tokens", tokens),
-                ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
-                ("compute_gram", compute_gram),
-                cache_key,
-            ),
+        _post_pre_partial_kernel(
+            tokens,
+            hidden_size,
+            split_k,
+            compute_gram,
+            False,
+            False,
         ),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -931,8 +1130,10 @@ def _mhc_post_pre_partial_alloc_op(
     # (the second clone's as_strided sym_size gets CSE-collapsed on re-trace).
     # residual_out is allocated contiguous.
     tokens = int(residual.shape[0])
+    hidden_size = int(residual.shape[2])
+    split_k = _split_k_for_hidden(hidden_size)
     partials = torch.empty(
-        (tokens, _SPLIT_K, _PARTIALS), dtype=torch.float32, device=residual.device
+        (tokens, split_k, _PARTIALS), dtype=torch.float32, device=residual.device
     )
     out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
     _run_mhc_post_pre_partial_launch(
@@ -958,8 +1159,9 @@ def _mhc_post_pre_partial_alloc_fake(
     compute_gram: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = residual.shape[0]
+    split_k = residual.shape[2] // (_SOURCE_TILE_H // 2)
     partials = torch.empty(
-        (tokens, _SPLIT_K, _PARTIALS), dtype=torch.float32, device=residual.device
+        (tokens, split_k, _PARTIALS), dtype=torch.float32, device=residual.device
     )
     out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
     return partials, out
@@ -988,6 +1190,8 @@ def _run_mhc_post_launch(
     out: torch.Tensor,
 ) -> None:
     tokens = int(x.shape[0])
+    hidden_size = int(residual.shape[2])
+    split_k = _split_k_for_hidden(hidden_size)
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16),
         _to_kernel_tensor(residual, cutlass.BFloat16),
@@ -1005,17 +1209,28 @@ def _run_mhc_post_launch(
         _tensor_meta_key(prev_comb),
         _tensor_meta_key(out),
     )
+    hidden_specialization = _hidden_specialization_name(hidden_size)
+    if hidden_size == _HIDDEN:
+        compile_name = "integration.residual.mhc_post_hidden4096_hctile128_all4"
+        compile_key = (
+            ("tokens", tokens),
+            ("post_only", True),
+            cache_key,
+        )
+    else:
+        compile_name = (
+            "integration.residual.mhc_post_"
+            f"{hidden_specialization}_hctile128_all4"
+        )
+        compile_key = (
+            ("tokens", tokens),
+            ("hidden_size", hidden_size),
+            ("post_only", True),
+            cache_key,
+        )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, False, False, True),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.residual.mhc_post_hidden4096_hctile128_all4",
-            1,
-            (
-                ("tokens", tokens),
-                ("post_only", True),
-                cache_key,
-            ),
-        ),
+        _post_pre_partial_kernel(tokens, hidden_size, split_k, False, False, True),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1077,6 +1292,9 @@ def _run_mhc_pre_partial_launch(
     compute_gram: bool = False,
 ) -> None:
     tokens = int(residual.shape[0])
+    hidden_size = int(residual.shape[2])
+    split_k = int(partials.shape[1])
+    _validate_split_k(hidden_size, split_k)
     compute_gram = bool(compute_gram)
     args = (
         _to_kernel_tensor(residual, cutlass.BFloat16),
@@ -1093,19 +1311,41 @@ def _run_mhc_pre_partial_launch(
         _tensor_meta_key(fn),
         _tensor_meta_key(partials),
     )
+    hidden_specialization = _hidden_specialization_name(hidden_size)
+    if hidden_size == _HIDDEN and split_k == _SPLIT_K:
+        compile_name = "integration.residual.mhc_pre_partial_hidden4096_hctile128_all4"
+        compile_key = (
+            ("tokens", tokens),
+            ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
+            ("compute_gram", compute_gram),
+            ("pre_only", True),
+            cache_key,
+        )
+    else:
+        compile_name = (
+            "integration.residual.mhc_pre_partial_"
+            f"{hidden_specialization}_hctile128_all4"
+        )
+        compile_key = (
+            ("tokens", tokens),
+            ("hidden_size", hidden_size),
+            ("split_k", split_k),
+            ("source_tiles", hidden_size // _SOURCE_TILE_H),
+            ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
+            ("compute_gram", compute_gram),
+            ("pre_only", True),
+            cache_key,
+        )
     b12x_launch(
-        _post_pre_partial_kernel(tokens, compute_gram, True, False),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.residual.mhc_pre_partial_hidden4096_hctile128_all4",
-            1,
-            (
-                ("tokens", tokens),
-                ("partials_per_cta", _POST_PRE_PARTIALS_PER_CTA),
-                ("compute_gram", compute_gram),
-                ("pre_only", True),
-                cache_key,
-            ),
+        _post_pre_partial_kernel(
+            tokens,
+            hidden_size,
+            split_k,
+            compute_gram,
+            True,
+            False,
         ),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1180,6 +1420,9 @@ def _run_mhc_finalize_gram_launch(
         y,
     )
     tokens = int(residual.shape[0])
+    hidden_size = int(residual.shape[2])
+    split_k = int(partials.shape[1])
+    _validate_split_k(hidden_size, split_k)
     args = (
         _to_kernel_tensor(residual, cutlass.BFloat16),
         _to_kernel_tensor(partials, cutlass.Float32, assumed_align=4),
@@ -1191,12 +1434,8 @@ def _run_mhc_finalize_gram_launch(
         norm_weight_tensor,
         current_cuda_stream(),
     )
-    cache_key = (
-        ("tokens", tokens),
-        ("block_h", _GRAM_BLOCK_H),
-        ("source_tiles", _SOURCE_TILES),
-        ("gram_row0", _GRAM_ROW0),
-        ("impl", "finalize_gram_multicta_v1"),
+    common_key_tail = (
+        ("impl", "finalize_gram_multicta_v2"),
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
         ("norm_eps", norm_eps if fuse_norm else 0.0),
@@ -1212,15 +1451,42 @@ def _run_mhc_finalize_gram_launch(
         _tensor_meta_key(comb),
         _tensor_meta_key(norm_weight) if norm_weight is not None else None,
     )
+    hidden_specialization = _hidden_specialization_name(hidden_size)
+    if hidden_size == _HIDDEN and split_k == _SPLIT_K:
+        compile_name = "integration.residual.mhc_finalize_gram_hidden4096"
+        compile_key = (
+            ("tokens", tokens),
+            ("block_h", _GRAM_BLOCK_H),
+            ("source_tiles", _SOURCE_TILES),
+            ("gram_row0", _GRAM_ROW0),
+            *common_key_tail,
+        )
+    else:
+        compile_name = (
+            "integration.residual.mhc_finalize_gram_"
+            f"{hidden_specialization}"
+        )
+        compile_key = (
+            ("tokens", tokens),
+            ("hidden_size", hidden_size),
+            ("split_k", split_k),
+            ("block_h", _GRAM_BLOCK_H),
+            ("source_tiles", hidden_size // _SOURCE_TILE_H),
+            ("gram_row0", hidden_size // _SOURCE_TILE_H),
+            *common_key_tail,
+        )
     b12x_launch(
         _finalize_gram_kernel(
-            tokens, rms_eps, hc_eps, sinkhorn_iters, norm_eps, fuse_norm
+            tokens,
+            hidden_size,
+            split_k,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            norm_eps,
+            fuse_norm,
         ),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.residual.mhc_finalize_gram_hidden4096",
-            1,
-            cache_key,
-        ),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -1387,8 +1653,9 @@ def _mhc_pre_launch_functional_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = int(residual.shape[0])
     hidden_size = int(residual.shape[2])
+    split_k = _split_k_for_hidden(hidden_size)
     partials = torch.empty(
-        (tokens, _SPLIT_K, _PARTIALS),
+        (tokens, split_k, _PARTIALS),
         dtype=torch.float32,
         device=residual.device,
     )
@@ -1513,8 +1780,9 @@ def _mhc_post_pre_launch_functional_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = int(residual.shape[0])
     hidden_size = int(residual.shape[2])
+    split_k = _split_k_for_hidden(hidden_size)
     partials = torch.empty(
-        (tokens, _SPLIT_K, _PARTIALS),
+        (tokens, split_k, _PARTIALS),
         dtype=torch.float32,
         device=residual.device,
     )
