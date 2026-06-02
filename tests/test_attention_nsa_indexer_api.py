@@ -1034,7 +1034,10 @@ def test_extend_tiled_topk_live_rows_do_not_resolve_new_kernel(
     not torch.cuda.is_available(),
     reason="CUDA required for indexer compile-cache coverage",
 )
-def test_row_topk_live_rows_do_not_resolve_new_kernel(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_row_topk_live_rows_do_not_resolve_new_kernel(
+    tmp_path, monkeypatch, topk: int
+) -> None:
     monkeypatch.setenv("B12X_CUTE_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
 
     device = torch.device("cuda")
@@ -1043,7 +1046,6 @@ def test_row_topk_live_rows_do_not_resolve_new_kernel(tmp_path, monkeypatch) -> 
     clear_compile_cache()
     clear_indexer_caches()
 
-    topk = 512
     width = 1024
 
     def make_inputs(rows: int) -> tuple[torch.Tensor, torch.Tensor]:

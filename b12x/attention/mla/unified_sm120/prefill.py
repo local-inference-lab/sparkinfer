@@ -127,13 +127,12 @@ class UnifiedPrefillKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, num_tiles,
-                 num_tokens, h_blocks, num_heads, has_sink,
+                 h_blocks, num_heads, has_sink,
                  has_extra=False, pbs_extra=1, num_main_tiles=0):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
         self.num_tiles = int(num_tiles)  # ceil(topk / BI), compile-time chunk count.
-        self.num_tokens = int(num_tokens)
         self.h_blocks = int(h_blocks)
         self.num_heads = int(num_heads)
         self.has_sink = bool(has_sink)
@@ -163,6 +162,7 @@ class UnifiedPrefillKernel:
         out_lse: cute.Tensor,        # (T, heads) f32 base-2 LSE
         sm_scale_log2: Float32,
         stride_kv_block: Int64,
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # SINGLE-CACHE entry (DSV4 main OR GLM): EXACTLY the original traced
@@ -174,14 +174,11 @@ class UnifiedPrefillKernel:
             q_all, kv_cache_u8, indices, topk_length, attn_sink,
             output, out_lse, sm_scale_log2, stride_kv_block,
         ).launch(
-            # Grid = (num_tokens, h_blocks, 1), one CTA per (token, HPB head-group).
-            # These launchers trace with CONCRETE-shape tensors (compile_args ==
-            # runtime_args), so the grid token dim is baked at trace time -- the
-            # compile key MUST therefore distinguish ``num_tokens`` (keyed via
-            # DimKey.exact on the q/output row dim + a num_tokens key_field) so a
-            # cached T=1 kernel is NOT reused for a later T>1 call (which would
-            # launch only token 0). h_blocks is keyed via num_heads.
-            grid=(self.num_tokens, self.h_blocks, 1),
+            # Grid = (num_tokens, h_blocks, 1), one CTA per token/head block.
+            # The token count is a live launch-grid value, not kernel binary
+            # identity. The compile key below keeps row dims dynamic and only
+            # specializes model/tile/cache settings.
+            grid=(num_tokens, self.h_blocks, 1),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -202,6 +199,7 @@ class UnifiedPrefillKernel:
         extra_indices: cute.Tensor,      # (T, extra_topk) int32
         extra_topk_length: cute.Tensor,  # (T,) int32 per-token EXTRA valid length
         stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # DUAL-CACHE entry (DSV4 prefill P10 3c): the dispatcher selects this
@@ -216,7 +214,7 @@ class UnifiedPrefillKernel:
             extra_kv_cache_u8, extra_indices, extra_topk_length,
             stride_extra_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, 1),
+            grid=(num_tokens, self.h_blocks, 1),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -710,9 +708,15 @@ class UnifiedPrefillKernel:
 # ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
-def _to_cute(x, dtype, align=16):
+def _to_cute(x, dtype, align=16, dynamic_layout=False):
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
+    if dynamic_layout and x.ndim >= 1:
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if leading_dim is not None:
+            c = c.mark_layout_dynamic(leading_dim=leading_dim)
     return c
 
 
@@ -763,7 +767,6 @@ def _unified_sm120_prefill_flat_launch(
         layout,
         int(page_block_size),
         int(num_tiles),
-        num_tokens=num_tokens,
         h_blocks=h_blocks,
         num_heads=heads,
         has_sink=bool(has_sink),
@@ -774,26 +777,27 @@ def _unified_sm120_prefill_flat_launch(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     base_args = (
-        _to_cute(q, cutlass.BFloat16),
+        _to_cute(q, cutlass.BFloat16, dynamic_layout=True),
         _to_cute(kv_flat, cutlass.Uint8, align=16),
-        _to_cute(topk_indices, cutlass.Int32, align=4),
-        _to_cute(topk_length, cutlass.Int32, align=4),
+        _to_cute(topk_indices, cutlass.Int32, align=4, dynamic_layout=True),
+        _to_cute(topk_length, cutlass.Int32, align=4, dynamic_layout=True),
         _to_cute(attn_sink_t, cutlass.Float32, align=4),
-        _to_cute(output, cutlass.BFloat16, align=16),
-        _to_cute(lse_out, cutlass.Float32, align=4),
+        _to_cute(output, cutlass.BFloat16, align=16, dynamic_layout=True),
+        _to_cute(lse_out, cutlass.Float32, align=4, dynamic_layout=True),
         Float32(float(sm_scale) * LOG2_E),
         Int64(stride_kv_block),
     )
     if has_extra:
         args = base_args + (
             _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-            _to_cute(extra_indices_t, cutlass.Int32, align=4),
-            _to_cute(extra_len_t, cutlass.Int32, align=4),
+            _to_cute(extra_indices_t, cutlass.Int32, align=4, dynamic_layout=True),
+            _to_cute(extra_len_t, cutlass.Int32, align=4, dynamic_layout=True),
             Int64(stride_extra_kv_block),
+            Int32(num_tokens),
             stream,
         )
     else:
-        args = base_args + (stream,)
+        args = base_args + (Int32(num_tokens), stream)
 
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -809,12 +813,11 @@ def _unified_sm120_prefill_flat_launch(
         key_field("has_extra", int(has_extra)),
         key_field("pbs_extra", int(pbs_extra)),
         key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
-        key_field("num_tokens", num_tokens),
         tensor_key(
             "q",
             q,
             dims=(
-                DimKey.exact(num_tokens),
+                DimKey.dynamic(),
                 DimKey.exact(heads),
                 DimKey.exact(q_head_dim),
             ),
@@ -822,17 +825,17 @@ def _unified_sm120_prefill_flat_launch(
         tensor_key(
             "topk_indices",
             topk_indices,
-            dims=(DimKey.exact(num_tokens), DimKey.bucket(topk)),
+            dims=(DimKey.dynamic(), DimKey.bucket(topk)),
         ),
         tensor_key(
             "output",
             output,
-            dims=(DimKey.exact(num_tokens), DimKey.exact(heads), DimKey.exact(d_v)),
+            dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(d_v)),
         ),
         tensor_key(
             "out_lse",
             lse_out,
-            dims=(DimKey.exact(num_tokens), DimKey.exact(heads)),
+            dims=(DimKey.dynamic(), DimKey.exact(heads)),
         ),
     ]
     if has_extra:
@@ -840,12 +843,12 @@ def _unified_sm120_prefill_flat_launch(
             tensor_key(
                 "extra_indices",
                 extra_indices_t,
-                dims=(DimKey.exact(num_tokens), DimKey.bucket(max(extra_topk, 1))),
+                dims=(DimKey.dynamic(), DimKey.bucket(max(extra_topk, 1))),
             )
         )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.unified_sm120.prefill",
-        6,
+        8,
         *spec_fields,
     )
     entry = kernel.call_extra if has_extra else kernel

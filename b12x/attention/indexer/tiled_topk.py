@@ -13,7 +13,6 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -40,7 +39,7 @@ from b12x.cute.utils import current_cuda_stream
 
 _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
-_SUPPORTED_TOPK = (512, 2048)
+_SUPPORTED_TOPK = (512, 1024, 2048)
 _RADIX = 256
 _SMEM_CANDS = 4096
 _SCAN_UNROLL = 4
@@ -366,7 +365,6 @@ class SparseNSATiledTopkKernel:
         )
 
         h0 = shared_ptr_to_u32(storage.hist0.data_ptr())
-        h1 = shared_ptr_to_u32(storage.hist1.data_ptr())
         ctr = shared_ptr_to_u32(storage.counter.data_ptr())
         thr = shared_ptr_to_u32(storage.thr_id.data_ptr())
         ni0 = shared_ptr_to_u32(storage.ni0.data_ptr())

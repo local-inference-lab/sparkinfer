@@ -263,14 +263,13 @@ class UnifiedDecodeKernel:
     """
 
     def __init__(self, traits, layout, page_block_size, chunks_per_split,
-                 num_tokens, h_blocks, num_splits, has_extra=False,
+                 h_blocks, num_splits, has_extra=False,
                  pbs_extra=1, valid_hpb=None, head_block_offset=0,
                  per_token_len=False):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
         self.chunks_per_split = int(chunks_per_split)
-        self.num_tokens = int(num_tokens)
         self.h_blocks = int(h_blocks)
         self.num_splits = int(num_splits)
         # DSV4 dual-cache (P7c). When False the extra-section code is const_expr-
@@ -315,6 +314,7 @@ class UnifiedDecodeKernel:
         sm_scale_log2: Float32,
         section_len: Int32,          # MAIN per-row valid topk length
         stride_kv_block: Int64,      # MAIN per-block byte stride
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # SINGLE-CACHE entry: EXACTLY the v1 traced signature (8 data args +
@@ -326,7 +326,7 @@ class UnifiedDecodeKernel:
             q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
             sm_scale_log2, section_len, stride_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -347,6 +347,7 @@ class UnifiedDecodeKernel:
         extra_section_len: Int32,        # EXTRA per-row valid length
         num_main_chunks: Int32,          # ceil(main_len/BI); chunks >= this read the EXTRA cache
         stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # DUAL-CACHE entry (DSV4 P7c): the dispatcher selects this (func=
@@ -360,7 +361,7 @@ class UnifiedDecodeKernel:
             extra_kv_cache_u8, extra_indices, extra_section_len,
             num_main_chunks, stride_extra_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -376,6 +377,7 @@ class UnifiedDecodeKernel:
         sm_scale_log2: Float32,
         topk_length: cute.Tensor,    # (rows,) int32 per-token MAIN valid length
         stride_kv_block: Int64,      # MAIN per-block byte stride
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # SINGLE-CACHE PER-TOKEN entry (P10b multi-token mixed-length): a DISTINCT
@@ -389,7 +391,7 @@ class UnifiedDecodeKernel:
             q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
             sm_scale_log2, topk_length, stride_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -410,6 +412,7 @@ class UnifiedDecodeKernel:
         extra_topk_length: cute.Tensor,  # (rows,) int32 per-token EXTRA valid length
         num_main_chunks: Int32,          # ceil(MAX main_len/BI); chunks >= this read EXTRA
         stride_extra_kv_block: Int64,
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
         # DUAL-CACHE PER-TOKEN entry (P10b): both the MAIN and EXTRA section lengths
@@ -422,7 +425,7 @@ class UnifiedDecodeKernel:
             extra_kv_cache_u8, extra_indices, extra_topk_length,
             num_main_chunks, stride_extra_kv_block,
         ).launch(
-            grid=(self.num_tokens, self.h_blocks, self.num_splits),
+            grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
             stream=stream,
         )
@@ -1228,9 +1231,15 @@ class UnifiedDecodeKernel:
             )
 
 
-def _to_cute(x, dtype, align=16):
+def _to_cute(x, dtype, align=16, dynamic_layout=False):
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
+    if dynamic_layout and x.ndim >= 1:
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if leading_dim is not None:
+            c = c.mark_layout_dynamic(leading_dim=leading_dim)
     return c
 
 
@@ -1284,33 +1293,34 @@ def _unified_sm120_decode_grid_flat_launch(
 
     if per_token_len:
         pertok_base = (
-            _to_cute(q_all, cutlass.BFloat16),
+            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
-            _to_cute(swa_indices, cutlass.Int32, align=4),
-            _to_cute(mid_out, cutlass.BFloat16, align=16),
-            _to_cute(mid_lse, cutlass.Float32, align=4),
+            _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
+            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
             Float32(float(sm_scale) * LOG2_E),
-            _to_cute(swa_len_t, cutlass.Int32, align=4),
+            _to_cute(swa_len_t, cutlass.Int32, align=4, dynamic_layout=True),
             Int64(stride_kv_block),
         )
         if has_extra:
             args = pertok_base + (
                 _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-                _to_cute(extra_indices_t, cutlass.Int32, align=4),
-                _to_cute(extra_len_t, cutlass.Int32, align=4),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4, dynamic_layout=True),
+                _to_cute(extra_len_t, cutlass.Int32, align=4, dynamic_layout=True),
                 Int32(num_main_chunks),
                 Int64(stride_extra_kv_block),
+                Int32(rows),
                 stream,
             )
         else:
-            args = pertok_base + (stream,)
+            args = pertok_base + (Int32(rows), stream)
     else:
         base_args = (
-            _to_cute(q_all, cutlass.BFloat16),
+            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
-            _to_cute(swa_indices, cutlass.Int32, align=4),
-            _to_cute(mid_out, cutlass.BFloat16, align=16),
-            _to_cute(mid_lse, cutlass.Float32, align=4),
+            _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
+            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
             Float32(float(sm_scale) * LOG2_E),
             Int32(topk),
             Int64(stride_kv_block),
@@ -1318,21 +1328,21 @@ def _unified_sm120_decode_grid_flat_launch(
         if has_extra:
             args = base_args + (
                 _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
-                _to_cute(extra_indices_t, cutlass.Int32, align=4),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4, dynamic_layout=True),
                 Int32(extra_topk),
                 Int32(num_main_chunks),
                 Int64(stride_extra_kv_block),
+                Int32(rows),
                 stream,
             )
         else:
-            args = base_args + (stream,)
+            args = base_args + (Int32(rows), stream)
 
     kernel = UnifiedDecodeKernel(
         traits,
         layout,
         int(swa_page_size),
         int(chunks_per_split),
-        num_tokens=rows,
         h_blocks=int(grid_h_blocks),
         num_splits=int(num_splits),
         has_extra=bool(has_extra),
@@ -1350,6 +1360,7 @@ def _unified_sm120_decode_grid_flat_launch(
         key_field("valid_hpb", int(valid_hpb)),
         key_field("head_block_offset", int(head_block_offset)),
         key_field("grid_h_blocks", int(grid_h_blocks)),
+        key_field("num_splits", int(num_splits)),
         key_field("chunks_per_split", int(chunks_per_split)),
         key_field("page_block_size", int(swa_page_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
@@ -1357,12 +1368,11 @@ def _unified_sm120_decode_grid_flat_launch(
         key_field("pbs_extra", int(pbs_extra)),
         key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         key_field("per_token_len", int(per_token_len)),
-        key_field("num_tokens", rows),
         tensor_key(
             "q_all",
             q_all,
             dims=(
-                DimKey.exact(rows),
+                DimKey.dynamic(),
                 DimKey.exact(heads),
                 DimKey.exact(q_head_dim),
             ),
@@ -1370,13 +1380,13 @@ def _unified_sm120_decode_grid_flat_launch(
         tensor_key(
             "swa_indices",
             swa_indices,
-            dims=(DimKey.exact(rows), DimKey.bucket(topk)),
+            dims=(DimKey.dynamic(), DimKey.bucket(topk)),
         ),
         tensor_key(
             "mid_out",
             mid_out,
             dims=(
-                DimKey.exact(rows),
+                DimKey.dynamic(),
                 DimKey.exact(heads),
                 DimKey.bucket(num_splits),
                 DimKey.exact(d_v),
@@ -1386,7 +1396,7 @@ def _unified_sm120_decode_grid_flat_launch(
             "mid_lse",
             mid_lse,
             dims=(
-                DimKey.exact(rows),
+                DimKey.dynamic(),
                 DimKey.exact(heads),
                 DimKey.bucket(num_splits),
             ),
@@ -1397,24 +1407,24 @@ def _unified_sm120_decode_grid_flat_launch(
             tensor_key(
                 "extra_indices",
                 extra_indices_t,
-                dims=(DimKey.exact(rows), DimKey.bucket(max(extra_topk, 1))),
+                dims=(DimKey.dynamic(), DimKey.bucket(max(extra_topk, 1))),
             )
         )
     if per_token_len:
         spec_fields.append(
-            tensor_key("topk_length", swa_len_t, dims=(DimKey.exact(rows),))
+            tensor_key("topk_length", swa_len_t, dims=(DimKey.dynamic(),))
         )
         if has_extra:
             spec_fields.append(
                 tensor_key(
                     "extra_topk_length",
                     extra_len_t,
-                    dims=(DimKey.exact(rows),),
+                    dims=(DimKey.dynamic(),),
                 )
             )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.unified_sm120.decode",
-        4,
+        6,
         *spec_fields,
     )
     if per_token_len:
