@@ -41,6 +41,8 @@ SCOPE: DSV4, FP8 compute, main cache. DSV4 + GLM DECODE kernels stay byte-identi
 
 from __future__ import annotations
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -1146,6 +1148,30 @@ def run_unified_prefill(
         extra_kv_flat = kv_cache.reshape(-1)  # alias (never read when has_extra=False)
         extra_indices_t = topk_indices        # alias (never read)
         extra_len_t = topk_length             # alias (never read)
+
+    if (
+        os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in ("0", "false", "False", "off")
+        and not has_extra
+        and model_type == ModelType.DSV4
+        and compute_mode == 0
+        and scale_format == 0
+        and heads % (2 * hpb) == 0
+        and topk in (512, 1024, 2048)
+    ):
+        from .prefill_mg import run_unified_prefill_mg
+
+        return run_unified_prefill_mg(
+            q=q,
+            kv_cache=kv_cache,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            page_block_size=page_block_size,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            output=output,
+            lse_out=lse_out,
+            stride_kv_block=stride_kv_block,
+        )
 
     kv_flat = kv_cache.reshape(-1)
     torch.ops.b12x.unified_sm120_prefill(

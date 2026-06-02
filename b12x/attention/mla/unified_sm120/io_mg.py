@@ -1,0 +1,110 @@
+"""DSV4 MG prefill IO helper.
+
+FlashInfer DSV4 prefill bulk-stages only the 448-byte NoPE FP8 payload into
+shared memory. The 64-dim RoPE component is consumed from global/L2 by the math
+warps, while the 8-byte UE8M0 footer is scalar-gathered into a contiguous smem
+scale buffer.
+"""
+
+from __future__ import annotations
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Int64, Uint32
+
+from b12x.cute.fp4 import (
+    cp_async_bulk_g2s_mbar,
+    get_ptr_as_int64,
+    ld_global_nc_v2_u32,
+    shared_ptr_to_u32,
+    st_shared_u32,
+)
+
+
+_DSV4_IO_STRIDE = 576
+_DSV4_NOPE_BYTES = 448
+_DSV4_FOOTER_BYTES = 8
+_IO_THREADS = 128
+
+
+@cute.jit
+def io_issue_gather_dsv4_nope(
+    kv_cache_u8: cute.Tensor,
+    topk_indices: cute.Tensor,
+    kv_fp8_dst_addr: Int32,
+    kv_sc_dst_addr: Int32,
+    token_idx_view: cute.Tensor,
+    full_mbar_ptr,
+    g_start: Int32,
+    g_end: Int32,
+    page_block_size: Int32,
+    stride_kv_block: Int64,
+    io_lane: Int32,
+    *,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    io_threads: cutlass.Constexpr = _IO_THREADS,
+):
+    """Gather one BI=64 DSV4 prefill tile into MG smem.
+
+    This is the DSV4-only equivalent of FlashInfer
+    ``io_gather_scales`` + ``io_bulk_gather_tile`` with
+    ``KV_SMEM_COPY_BYTES == D_NOPE``.
+    """
+    _ios = Int64(_DSV4_IO_STRIDE)
+    _nope = Int32(_DSV4_NOPE_BYTES)
+    _foot = Int32(_DSV4_FOOTER_BYTES)
+
+    eo = Int32(0)
+    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+        entry = eo + io_lane
+        if entry < Int32(bi):
+            cand_pos = g_start + entry
+            idx_raw = Int32(-1)
+            if cand_pos < g_end:
+                idx_raw = Int32(topk_indices[cand_pos])
+            token_idx_view[entry] = idx_raw
+
+            f0 = Uint32(0)
+            f1 = Uint32(0)
+            if idx_raw >= Int32(0):
+                block_idx = idx_raw // page_block_size
+                local_idx = idx_raw - block_idx * page_block_size
+                scale_base_off = (
+                    Int64(block_idx) * stride_kv_block
+                    + Int64(page_block_size) * _ios
+                    + Int64(local_idx) * Int64(_foot)
+                )
+                f0, f1 = ld_global_nc_v2_u32(get_ptr_as_int64(kv_cache_u8, scale_base_off))
+            s_byte = entry * _foot
+            st_shared_u32(kv_sc_dst_addr + s_byte, f0)
+            st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
+        eo += Int32(io_threads)
+
+    cute.arch.fence_acq_rel_cta()
+
+    if io_lane == Int32(0):
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi * _DSV4_NOPE_BYTES))
+
+    full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
+    eo = Int32(0)
+    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+        entry = eo + io_lane
+        if entry < Int32(bi):
+            cand_pos = g_start + entry
+            idx_raw = Int32(-1)
+            if cand_pos < g_end:
+                idx_raw = Int32(topk_indices[cand_pos])
+            idx = idx_raw
+            if idx < Int32(0):
+                idx = Int32(0)
+            block_idx = idx // page_block_size
+            local_idx = idx - block_idx * page_block_size
+            data_base_off = Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
+            cp_async_bulk_g2s_mbar(
+                kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                get_ptr_as_int64(kv_cache_u8, data_base_off),
+                _nope,
+                full_mbar_u32,
+            )
+        eo += Int32(io_threads)
