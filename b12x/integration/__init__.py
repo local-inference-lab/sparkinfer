@@ -55,6 +55,7 @@ from .compressed_indexer import (
     pack_compressed_index_k_cache_reference,
     compressed_index_decode_dense_topk_fp8,
     compressed_index_decode_logits_fp8,
+    compressed_index_decode_supertile_fp8,
     compressed_index_decode_supertile_topk_fp8,
     compressed_index_logits_reference,
     prepare_compressed_indexer_metadata,
@@ -64,6 +65,7 @@ from .compressed_indexer import (
 )
 from .compressed_scratch import (
     B12XCompressedIndexerBinding,
+    B12XCompressedIndexerScratch,
     B12XCompressedIndexerScratchCaps,
     B12XCompressedIndexerScratchPlan,
     B12XCompressedMLABinding,
@@ -173,6 +175,7 @@ __all__ = [
     "pack_compressed_index_k_cache_reference",
     "compressed_index_decode_dense_topk_fp8",
     "compressed_index_decode_logits_fp8",
+    "compressed_index_decode_supertile_fp8",
     "compressed_index_decode_supertile_topk_fp8",
     "compressed_index_logits_reference",
     "prepare_compressed_indexer_metadata",
@@ -180,6 +183,7 @@ __all__ = [
     "resolve_replicated_num_q_heads",
     "unpack_compressed_index_k_cache_reference",
     "B12XCompressedIndexerBinding",
+    "B12XCompressedIndexerScratch",
     "B12XCompressedIndexerScratchCaps",
     "B12XCompressedIndexerScratchPlan",
     "B12XCompressedMLABinding",

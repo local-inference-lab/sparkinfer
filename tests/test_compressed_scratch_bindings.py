@@ -14,6 +14,7 @@ from b12x.attention.mla.compressed_reference import (
 from b12x.attention.workspace import B12XAttentionArena, B12XAttentionWorkspace
 from b12x.integration import (
     B12XCompressedIndexerBinding,
+    B12XCompressedIndexerScratch,
     B12XCompressedIndexerScratchCaps,
     B12XCompressedMLABinding,
     B12XCompressedMLAScratch,
@@ -115,7 +116,7 @@ def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
     assert not hasattr(binding.scratch, "indexer_k_tma_desc_ptrs")
 
 
-def test_compressed_indexer_scratch_plan_exposes_one_opaque_arena_spec() -> None:
+def test_compressed_indexer_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_compressed_indexer_scratch(
         B12XCompressedIndexerScratchCaps(
             device="cpu",
@@ -130,14 +131,15 @@ def test_compressed_indexer_scratch_plan_exposes_one_opaque_arena_spec() -> None
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "compressed_indexer.arena"
+    assert specs[0].name == "compressed_indexer.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
-    assert plan.arena_caps.reserve_paged_indexer_logits is False
+    assert plan.layout.nbytes == specs[0].nbytes
+    assert plan.layout.supertile_tokens == 512
 
 
-def test_compressed_indexer_scratch_bind_does_not_call_workspace_factory(
+def test_compressed_indexer_scratch_bind_does_not_call_workspace_or_arena_factory(
     monkeypatch,
 ) -> None:
     plan = plan_compressed_indexer_scratch(
@@ -156,10 +158,12 @@ def test_compressed_indexer_scratch_bind_does_not_call_workspace_factory(
     cache_seqlens = torch.empty((4,), dtype=torch.int32)
     active_width = torch.empty((1,), dtype=torch.int32)
 
-    def fail_make_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not call the workspace factory")
+    def fail_factory(*args, **kwargs):
+        raise AssertionError("scratch binding must not call workspace/arena factories")
 
-    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_factory)
+    monkeypatch.setattr(B12XAttentionArena, "from_shared_arena", fail_factory)
+    monkeypatch.setattr(B12XAttentionArena, "_make_workspace_views", fail_factory)
 
     binding = plan.bind(
         scratch=scratch,
@@ -169,8 +173,13 @@ def test_compressed_indexer_scratch_bind_does_not_call_workspace_factory(
     )
 
     assert isinstance(binding, B12XCompressedIndexerBinding)
+    assert isinstance(binding.scratch, B12XCompressedIndexerScratch)
+    assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
+    assert binding.scratch.indexer_extend_tile_logits is not None
+    assert binding.scratch.indexer_extend_topk_values is not None
+    assert binding.scratch.indexer_extend_topk_indices is not None
 
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:

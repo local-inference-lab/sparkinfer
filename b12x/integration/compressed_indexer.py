@@ -618,7 +618,7 @@ def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:
     return ((supertile_k + alignment - 1) // alignment) * alignment
 
 
-def compressed_index_decode_supertile_topk_fp8(
+def compressed_index_decode_supertile_fp8(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -626,7 +626,7 @@ def compressed_index_decode_supertile_topk_fp8(
     metadata: CompressedIndexerMetadata | None = None,
     binding=None,
     page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
-    topk: int = 512,
+    topk: int | None = None,
     expected_num_q_heads: int | None = None,
     workspace=None,
     out_indices: torch.Tensor | None = None,
@@ -645,7 +645,6 @@ def compressed_index_decode_supertile_topk_fp8(
             f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
-    topk = int(topk)
     _validate_q_head_contract(
         q_fp8=q_fp8,
         weights=weights,
@@ -657,13 +656,26 @@ def compressed_index_decode_supertile_topk_fp8(
     if q_fp8.device.type != "cuda":
         raise NotImplementedError("compressed index supertile top-k requires CUDA")
     if workspace is None:
-        raise RuntimeError("compressed index supertile top-k requires a b12x workspace")
+        raise RuntimeError(
+            "compressed index supertile top-k requires a binding or workspace"
+        )
     if metadata.real_page_table.device != q_fp8.device:
         raise ValueError("real_page_table must be on the same device as q_fp8")
     if not metadata.real_page_table.is_contiguous():
         raise ValueError("metadata.real_page_table must be contiguous")
 
     q_rows = int(q_fp8.shape[0])
+    if topk is None:
+        if out_indices is not None:
+            topk = int(out_indices.shape[1])
+        else:
+            topk = int(getattr(workspace, "topk", 0))
+            if topk <= 0:
+                raise RuntimeError(
+                    "compressed index supertile top-k requires topk, out_indices, "
+                    "or a bound scratch/workspace with topk capacity"
+                )
+    topk = int(topk)
     if out_indices is not None:
         if out_indices.shape != (q_rows, topk):
             raise ValueError(
@@ -674,6 +686,8 @@ def compressed_index_decode_supertile_topk_fp8(
             raise ValueError("out_indices must be contiguous torch.int32")
 
     page_table_width = int(metadata.real_page_table.shape[1])
+    if supertile_k is None:
+        supertile_k = getattr(workspace, "paged_tile_logits_k_rows", None)
     supertile_tokens = _resolve_supertile_k(supertile_k, page_size=page_size)
     supertile_pages = max(1, supertile_tokens // page_size)
     supertile_k_tiles = supertile_tokens // _COMPRESSED_INDEX_TILE_BLOCK_K
@@ -702,20 +716,28 @@ def compressed_index_decode_supertile_topk_fp8(
     tile_logits = workspace.get_indexer_extend_tile_logits()
     if tile_logits is None:
         raise RuntimeError(
-            "compressed index supertile top-k requires the workspace tiled-logits buffer"
+            "compressed index supertile top-k scratch is missing tiled logits"
         )
     contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
 
-    final_values, workspace_raw_indices = workspace.get_indexer_extend_topk_buffers(
+    workspace_values, workspace_raw_indices = workspace.get_indexer_extend_topk_buffers(
         row_count=q_rows,
     )
-    final_values = final_values[:, :topk]
-    workspace_raw_indices = workspace_raw_indices[:, :topk]
-    final_raw_indices = out_indices if out_indices is not None else workspace_raw_indices
+    final_values = workspace_values[:, :topk]
+    final_raw_indices = out_indices if out_indices is not None else workspace_raw_indices[:, :topk]
     if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (q_rows, topk):
         raise ValueError(
-            f"workspace top-k buffers are smaller than requested C4 top-k {topk}"
+            f"compressed indexer scratch buffers are smaller than requested C4 top-k {topk}"
         )
+    if final_values.dtype != torch.float32 or final_values.device != q_fp8.device:
+        raise ValueError(
+            "compressed indexer top-k values must be a CUDA torch.float32 tensor "
+            "on the q_fp8 device"
+        )
+    if final_raw_indices.dtype != torch.int32 or final_raw_indices.device != q_fp8.device:
+        raise ValueError("out_indices must be a CUDA torch.int32 tensor on the q_fp8 device")
+    if not final_values.is_contiguous() or not final_raw_indices.is_contiguous():
+        raise ValueError("compressed indexer top-k buffers must be contiguous")
     candidate_values = None
     candidate_indices = None
     merge_positions = None
@@ -723,11 +745,23 @@ def compressed_index_decode_supertile_topk_fp8(
         candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
         if candidate_values.shape[0] < num_chunks or candidate_indices.shape[0] < num_chunks:
             raise RuntimeError(
-                "workspace C4 candidate buffers cannot hold all supertile chunks: "
+                "compressed indexer scratch candidate buffers cannot hold all supertile chunks: "
                 f"need={num_chunks}, have={candidate_values.shape[0]}"
             )
         candidate_values = candidate_values[:num_chunks, :q_rows, :topk]
         candidate_indices = candidate_indices[:num_chunks, :q_rows, :topk]
+        if candidate_values.dtype != torch.float32 or candidate_values.device != q_fp8.device:
+            raise ValueError(
+                "compressed indexer candidate values must be a CUDA torch.float32 "
+                "tensor on the q_fp8 device"
+            )
+        if candidate_indices.dtype != torch.int32 or candidate_indices.device != q_fp8.device:
+            raise ValueError(
+                "compressed indexer candidate indices must be a CUDA torch.int32 "
+                "tensor on the q_fp8 device"
+            )
+        if not candidate_values.is_contiguous() or not candidate_indices.is_contiguous():
+            raise ValueError("compressed indexer candidate buffers must be contiguous")
         get_position_buffer = getattr(
             workspace,
             "get_indexer_extend_topk_position_buffer",
@@ -746,7 +780,11 @@ def compressed_index_decode_supertile_topk_fp8(
     )
     page_table_for_kernel = metadata.real_page_table
     lengths_for_kernel = metadata.cache_seqlens_int32
-    shared_prefill_candidate = bool(metadata.shared_page_table) and q_rows >= 1024
+    shared_prefill_candidate = (
+        bool(metadata.shared_page_table)
+        and q_rows >= 1024
+        and hasattr(workspace, "get_indexer_gather_outputs")
+    )
     if shared_prefill_candidate:
         shared_prefill_block_k = resolve_extend_prefill_block_k(
             valid_q_rows=q_rows,
@@ -892,6 +930,12 @@ def compressed_index_decode_supertile_topk_fp8(
     return final_raw_indices
 
 
+def compressed_index_decode_supertile_topk_fp8(**kwargs) -> torch.Tensor:
+    """Compatibility alias for the fused compressed-indexer supertile API."""
+
+    return compressed_index_decode_supertile_fp8(**kwargs)
+
+
 def compressed_index_decode_dense_topk_fp8(
     *,
     q_fp8: torch.Tensor,
@@ -1026,6 +1070,7 @@ compressed_index_logits_reference = paged_decode_logits_reference
 
 from .compressed_scratch import (
     B12XCompressedIndexerBinding,
+    B12XCompressedIndexerScratch,
     B12XCompressedIndexerScratchCaps,
     B12XCompressedIndexerScratchPlan,
     plan_compressed_indexer_scratch,
@@ -1034,6 +1079,7 @@ from .compressed_scratch import (
 
 __all__ = [
     "B12XCompressedIndexerBinding",
+    "B12XCompressedIndexerScratch",
     "B12XCompressedIndexerScratchCaps",
     "B12XCompressedIndexerScratchPlan",
     "INDEX_HEAD_DIM",
@@ -1043,6 +1089,7 @@ __all__ = [
     "pack_compressed_index_k_cache_reference",
     "compressed_index_decode_dense_topk_fp8",
     "compressed_index_decode_logits_fp8",
+    "compressed_index_decode_supertile_fp8",
     "compressed_index_decode_supertile_topk_fp8",
     "compressed_index_logits_reference",
     "prepare_compressed_indexer_metadata",
