@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from b12x.distributed.pcie_oneshot import (
+    IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
     _compute_crossover_size,
@@ -57,6 +58,7 @@ def _make_runtime(
     max_size=8 * 1024 * 1024,
     eager=False,
     ext=None,
+    stream_affine=True,
 ):
     ext = ext or _FakeExt()
     kwargs = {}
@@ -71,6 +73,7 @@ def _make_runtime(
         exchange_group=exchange_group,
         max_size=max_size,
         ext_module=ext,
+        stream_affine=stream_affine,
         **kwargs,
     )
 
@@ -159,6 +162,37 @@ def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
     assert len(ext.all_reduce_calls) == 1
 
 
+def test_world_size_10_is_supported_by_eager_pool():
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(rank=3, world_size=10, eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=3,
+        world_size=10,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+
+    runtime = pool.for_stream()
+
+    assert runtime.world_size == 10
+    assert runtime._ext.init_calls == [
+        ((100, 101, 102, 103, 104, 105, 106, 107, 108, 109), "cpu", 3)
+    ]
+    assert runtime._ext.register_pcie_buffers_calls == [
+        (
+            12345,
+            (200, 201, 202, 203, 204, 205, 206, 207, 208, 209),
+            (300, 301, 302, 303, 304, 305, 306, 307, 308, 309),
+        )
+    ]
+    assert created == [(None, runtime)]
+
+
 def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16)
@@ -174,6 +208,21 @@ def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
 
     with pytest.raises(RuntimeError, match="stream-affine"):
         runtime.all_reduce(inp)
+
+
+def test_runtime_can_disable_stream_affinity(monkeypatch):
+    runtime = _make_runtime(eager=True, stream_affine=False)
+    inp = torch.arange(8, dtype=torch.bfloat16)
+    state = {"stream_key": 11}
+
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: state["stream_key"],
+    )
+
+    runtime.all_reduce(inp)
+    state["stream_key"] = 22
+    runtime.all_reduce(inp)
 
 
 def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
@@ -201,6 +250,161 @@ def test_graph_buffer_api_exposes_explicit_registration_hooks():
     assert ext.register_graph_buffers_calls == [
         (12345, [[1, 2, 3], [4, 5, 6]], [[0, 64], [8, 72]])
     ]
+
+
+def test_allocate_shared_buffer_cleans_up_on_failed_peer_open(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            if handle == b"remote1":
+                raise RuntimeError("open failed")
+            return 2000
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._broadcast_gather_object",
+        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+    )
+
+    with pytest.raises(RuntimeError, match="peer rank 2"):
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=ipc
+        )
+
+    assert ipc.closed == [2000]
+    assert ipc.freed == [1000]
+
+
+def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.malloc_sizes = []
+            self.memsets = []
+            self.opened = []
+
+        def cudaMalloc(self, size):
+            self.malloc_sizes.append(size)
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            self.memsets.append((ptr, value, size))
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            ptr = {b"remote0": 2000, b"remote1": 3000}[handle]
+            self.opened.append(ptr)
+            return ptr
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            raise AssertionError("success path should not close remote ptrs")
+
+        def cudaFree(self, ptr):
+            raise AssertionError("success path should not free local ptr")
+
+    ipc = FakeIPC()
+    signal_bytes = 300
+    eager_bytes = 128
+    eager0_offset = IPC_SLAB_ALIGNMENT * 2
+    eager1_offset = eager0_offset + IPC_SLAB_ALIGNMENT
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._broadcast_gather_object",
+        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+    )
+
+    buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
+        object(),
+        signal_bytes=signal_bytes,
+        eager_buffer_bytes=eager_bytes,
+        ipc=ipc,
+    )
+
+    assert ipc.malloc_sizes == [eager1_offset + eager_bytes]
+    assert ipc.memsets == [(1000, 0, signal_bytes)]
+    assert ipc.opened == [2000, 3000]
+    assert buffers.owned_buffer.local_ptr == 1000
+    assert buffers.owned_buffer.remote_ptrs == (2000, 3000)
+    assert buffers.signal_ptrs == (1000, 2000, 3000)
+    assert buffers.eager0_ptrs == (
+        1000 + eager0_offset,
+        2000 + eager0_offset,
+        3000 + eager0_offset,
+    )
+    assert buffers.eager1_ptrs == (
+        1000 + eager1_offset,
+        2000 + eager1_offset,
+        3000 + eager1_offset,
+    )
+
+
+def test_eager_channel_buffers_cleanup_when_signal_zero_fails(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            raise RuntimeError("memset failed")
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            return {b"remote0": 2000, b"remote1": 3000}[handle]
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._broadcast_gather_object",
+        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+    )
+
+    with pytest.raises(RuntimeError, match="memset failed"):
+        PCIeOneshotAllReduce._allocate_eager_channel_buffers(
+            object(),
+            signal_bytes=300,
+            eager_buffer_bytes=128,
+            ipc=ipc,
+        )
+
+    assert ipc.closed == [2000, 3000]
+    assert ipc.freed == [1000]
 
 
 def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
@@ -299,6 +503,34 @@ def test_pool_creates_distinct_channels_per_stream_key(monkeypatch):
     assert pool.for_stream(8) is ch8
     assert ch7 is not ch8
     assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_pool_reuses_single_channel_across_stream_keys(monkeypatch):
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        single_channel=True,
+        channel_factory=make_channel,
+    )
+
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 7 if stream is None else int(stream),
+    )
+
+    ch7 = pool.for_stream()
+    ch8 = pool.for_stream(8)
+
+    assert ch7 is ch8
+    assert [entry[0] for entry in created] == [None]
 
 
 def test_pool_requires_precreated_channel_during_capture(monkeypatch):

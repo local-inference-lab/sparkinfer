@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -21,12 +21,13 @@ from ._cuda_ipc import CudaRTLibrary
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
 AUTOTUNE_CEILING = 1 * 1024 * 1024
 AUTOTUNE_FINE_STEP = 8 * 1024
+IPC_SLAB_ALIGNMENT = 256
 
 
 def parse_pcie_oneshot_max_size(value: str | int | None) -> Optional[int]:
@@ -75,6 +76,10 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
         return True
     storage = inp.untyped_storage()
     return storage.nbytes() - inp.storage_offset() * inp.element_size() == inp.numel() * inp.element_size()
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
 
 def _resolve_exchange_group(
@@ -130,6 +135,14 @@ class _OwnedSharedBuffer:
     local_ptr: int
     peer_ptrs: tuple[int, ...]
     remote_ptrs: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ChannelSharedBuffers:
+    owned_buffer: _OwnedSharedBuffer
+    signal_ptrs: tuple[int, ...]
+    eager0_ptrs: tuple[int, ...]
+    eager1_ptrs: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -221,6 +234,7 @@ class PCIeOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        stream_affine: bool = True,
     ):
         if world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
@@ -249,6 +263,7 @@ class PCIeOneshotAllReduce:
         self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
         self._owned_buffers = list(owned_buffers or [])
         self._registered_input_ptrs: dict[int, tuple[int, ...]] = {}
+        self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
         self._ext = ext_module or _load_extension()
@@ -286,6 +301,7 @@ class PCIeOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        stream_affine: bool = True,
     ) -> "PCIeOneshotAllReduce":
         return cls(
             rank=rank,
@@ -299,6 +315,7 @@ class PCIeOneshotAllReduce:
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
+            stream_affine=stream_affine,
         )
 
     @classmethod
@@ -311,6 +328,7 @@ class PCIeOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        stream_affine: bool = True,
     ) -> "PCIeOneshotAllReduce":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
@@ -326,41 +344,38 @@ class PCIeOneshotAllReduce:
         ext = ext_module or _load_extension()
 
         owned_buffers: list[_OwnedSharedBuffer] = []
-        signal_buf = cls._allocate_shared_buffer(
-            exchange_group,
-            ext.meta_size(),
-            zero_fill=True,
-            ipc=ipc,
-        )
-        owned_buffers.append(signal_buf)
-        eager0 = cls._allocate_shared_buffer(
-            exchange_group,
-            eager_buffer_bytes,
-            zero_fill=False,
-            ipc=ipc,
-        )
-        eager1 = cls._allocate_shared_buffer(
-            exchange_group,
-            eager_buffer_bytes,
-            zero_fill=False,
-            ipc=ipc,
-        )
-        owned_buffers.extend([eager0, eager1])
+        try:
+            channel_buffers = cls._allocate_eager_channel_buffers(
+                exchange_group,
+                signal_bytes=ext.meta_size(),
+                eager_buffer_bytes=eager_buffer_bytes,
+                ipc=ipc,
+            )
+            owned_buffers.append(channel_buffers.owned_buffer)
 
-        return cls(
-            rank=rank,
-            world_size=world_size,
-            device=device_obj,
-            signal_ptrs=signal_buf.peer_ptrs,
-            eager_buffer_ptrs0=eager0.peer_ptrs,
-            eager_buffer_ptrs1=eager1.peer_ptrs,
-            exchange_group=exchange_group,
-            ipc=ipc,
-            owned_buffers=owned_buffers,
-            max_size=max_size,
-            rank_data_bytes=rank_data_bytes,
-            ext_module=ext,
-        )
+            return cls(
+                rank=rank,
+                world_size=world_size,
+                device=device_obj,
+                signal_ptrs=channel_buffers.signal_ptrs,
+                eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+                eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+                exchange_group=exchange_group,
+                ipc=ipc,
+                owned_buffers=owned_buffers,
+                max_size=max_size,
+                rank_data_bytes=rank_data_bytes,
+                ext_module=ext,
+                stream_affine=stream_affine,
+            )
+        except Exception:
+            for shared in owned_buffers:
+                for ptr in shared.remote_ptrs:
+                    with suppress(Exception):
+                        ipc.cudaIpcCloseMemHandle(ptr)
+                with suppress(Exception):
+                    ipc.cudaFree(shared.local_ptr)
+            raise
 
     @classmethod
     def from_process_group(
@@ -373,6 +388,7 @@ class PCIeOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        stream_affine: bool = True,
     ) -> "PCIeOneshotAllReduce":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -381,6 +397,7 @@ class PCIeOneshotAllReduce:
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
+            stream_affine=stream_affine,
         )
 
     @staticmethod
@@ -401,26 +418,85 @@ class PCIeOneshotAllReduce:
 
         peer_ptrs: list[int] = []
         remote_ptrs: list[int] = []
-        for idx, handle in enumerate(handles):
-            if idx == rank:
-                peer_ptrs.append(local_ptr)
-            else:
-                remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
-                peer_ptrs.append(remote_ptr)
-                remote_ptrs.append(remote_ptr)
-        if len(peer_ptrs) != world_size:
-            raise RuntimeError("failed to gather IPC handles for all ranks")
-        return _OwnedSharedBuffer(
-            local_ptr=local_ptr,
-            peer_ptrs=tuple(peer_ptrs),
-            remote_ptrs=tuple(remote_ptrs),
+        try:
+            for idx, handle in enumerate(handles):
+                if idx == rank:
+                    peer_ptrs.append(local_ptr)
+                else:
+                    try:
+                        remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"failed to open CUDA IPC handle for peer rank {idx}"
+                        ) from exc
+                    peer_ptrs.append(remote_ptr)
+                    remote_ptrs.append(remote_ptr)
+            if len(peer_ptrs) != world_size:
+                raise RuntimeError("failed to gather IPC handles for all ranks")
+            return _OwnedSharedBuffer(
+                local_ptr=local_ptr,
+                peer_ptrs=tuple(peer_ptrs),
+                remote_ptrs=tuple(remote_ptrs),
+            )
+        except Exception:
+            for ptr in remote_ptrs:
+                with suppress(Exception):
+                    ipc.cudaIpcCloseMemHandle(ptr)
+            with suppress(Exception):
+                ipc.cudaFree(local_ptr)
+            raise
+
+    @classmethod
+    def _allocate_eager_channel_buffers(
+        cls,
+        exchange_group: ProcessGroup,
+        *,
+        signal_bytes: int,
+        eager_buffer_bytes: int,
+        ipc: CudaRTLibrary,
+    ) -> _ChannelSharedBuffers:
+        signal_bytes = int(signal_bytes)
+        eager_buffer_bytes = int(eager_buffer_bytes)
+        if signal_bytes <= 0:
+            raise ValueError("signal_bytes must be positive")
+        if eager_buffer_bytes <= 0:
+            raise ValueError("eager_buffer_bytes must be positive")
+
+        signal_offset = 0
+        eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
+        eager1_offset = eager0_offset + _align_up(
+            eager_buffer_bytes, IPC_SLAB_ALIGNMENT
         )
+        slab_bytes = eager1_offset + eager_buffer_bytes
+        slab = cls._allocate_shared_buffer(
+            exchange_group,
+            slab_bytes,
+            zero_fill=False,
+            ipc=ipc,
+        )
+        try:
+            ipc.cudaMemset(slab.local_ptr + signal_offset, 0, signal_bytes)
+            return _ChannelSharedBuffers(
+                owned_buffer=slab,
+                signal_ptrs=tuple(ptr + signal_offset for ptr in slab.peer_ptrs),
+                eager0_ptrs=tuple(ptr + eager0_offset for ptr in slab.peer_ptrs),
+                eager1_ptrs=tuple(ptr + eager1_offset for ptr in slab.peer_ptrs),
+            )
+        except Exception:
+            for ptr in slab.remote_ptrs:
+                with suppress(Exception):
+                    ipc.cudaIpcCloseMemHandle(ptr)
+            with suppress(Exception):
+                ipc.cudaFree(slab.local_ptr)
+            raise
 
     @property
     def signal_ptrs(self) -> tuple[int, ...]:
         return self._signal_ptrs
 
     def _bind_stream_key(self, stream_key: Optional[int]) -> None:
+        if not self._stream_affine:
+            return
         if stream_key is None:
             return
         if self._owner_stream_key is None:
@@ -454,9 +530,7 @@ class PCIeOneshotAllReduce:
             return False
         if inp_bytes % 16 != 0:
             return False
-        if not _is_weak_contiguous(inp):
-            return False
-        return True
+        return _is_weak_contiguous(inp)
 
     def register_buffer(self, peer_input_ptrs: Sequence[int]) -> None:
         if self._closed:
@@ -684,10 +758,8 @@ class PCIeOneshotAllReduce:
         self._registered_input_ptrs.clear()
 
     def __del__(self) -> None:
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 def _is_current_stream_capturing(device: torch.device) -> bool:
@@ -721,6 +793,7 @@ class PCIeOneshotAllReducePool:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         ipc: Optional[CudaRTLibrary] = None,
+        single_channel: bool = False,
         channel_factory: Optional[Callable[[Optional[int]], PCIeOneshotAllReduce]] = None,
     ):
         if world_size not in SUPPORTED_WORLD_SIZES:
@@ -736,6 +809,7 @@ class PCIeOneshotAllReducePool:
         self.eager_buffer_bytes = int(eager_buffer_bytes)
         self.max_size = int(max_size)
         self.rank_data_bytes = int(rank_data_bytes)
+        self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeOneshotAllReduce] = {}
         self._closed = False
@@ -761,6 +835,7 @@ class PCIeOneshotAllReducePool:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        single_channel: bool = False,
     ) -> "PCIeOneshotAllReducePool":
         return cls(
             rank=dist.get_rank(group=exchange_group),
@@ -771,6 +846,7 @@ class PCIeOneshotAllReducePool:
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
+            single_channel=single_channel,
         )
 
     @classmethod
@@ -784,6 +860,7 @@ class PCIeOneshotAllReducePool:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        single_channel: bool = False,
     ) -> "PCIeOneshotAllReducePool":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -792,11 +869,14 @@ class PCIeOneshotAllReducePool:
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
+            single_channel=single_channel,
         )
 
     def _new_channel(self, stream_key: Optional[int]) -> PCIeOneshotAllReduce:
         if self._channel_factory is not None:
             channel = self._channel_factory(stream_key)
+            if self.single_channel:
+                channel._stream_affine = False
             channel._bind_stream_key(stream_key)
             return channel
 
@@ -804,47 +884,58 @@ class PCIeOneshotAllReducePool:
             raise RuntimeError("pool is not configured to allocate channels")
 
         owned_buffers: list[_OwnedSharedBuffer] = []
-        signal_buf = PCIeOneshotAllReduce._allocate_shared_buffer(
-            self.exchange_group,
-            self._ext.meta_size(),
-            zero_fill=True,
-            ipc=self._ipc,
-        )
-        owned_buffers.append(signal_buf)
-        eager0 = PCIeOneshotAllReduce._allocate_shared_buffer(
-            self.exchange_group,
-            self.eager_buffer_bytes,
-            zero_fill=False,
-            ipc=self._ipc,
-        )
-        eager1 = PCIeOneshotAllReduce._allocate_shared_buffer(
-            self.exchange_group,
-            self.eager_buffer_bytes,
-            zero_fill=False,
-            ipc=self._ipc,
-        )
-        owned_buffers.extend([eager0, eager1])
+        try:
+            channel_buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
+                self.exchange_group,
+                signal_bytes=self._ext.meta_size(),
+                eager_buffer_bytes=self.eager_buffer_bytes,
+                ipc=self._ipc,
+            )
+            owned_buffers.append(channel_buffers.owned_buffer)
 
-        channel = PCIeOneshotAllReduce(
-            rank=self.rank,
-            world_size=self.world_size,
-            device=self.device,
-            signal_ptrs=signal_buf.peer_ptrs,
-            eager_buffer_ptrs0=eager0.peer_ptrs,
-            eager_buffer_ptrs1=eager1.peer_ptrs,
-            exchange_group=self.exchange_group,
-            ipc=self._ipc,
-            owned_buffers=owned_buffers,
-            max_size=self.max_size,
-            rank_data_bytes=self.rank_data_bytes,
-            ext_module=self._ext,
-        )
+            channel = PCIeOneshotAllReduce(
+                rank=self.rank,
+                world_size=self.world_size,
+                device=self.device,
+                signal_ptrs=channel_buffers.signal_ptrs,
+                eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+                eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+                exchange_group=self.exchange_group,
+                ipc=self._ipc,
+                owned_buffers=owned_buffers,
+                max_size=self.max_size,
+                rank_data_bytes=self.rank_data_bytes,
+                ext_module=self._ext,
+                stream_affine=not self.single_channel,
+            )
+        except Exception:
+            for shared in owned_buffers:
+                for ptr in shared.remote_ptrs:
+                    with suppress(Exception):
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                with suppress(Exception):
+                    self._ipc.cudaFree(shared.local_ptr)
+            raise
         channel._bind_stream_key(stream_key)
         return channel
 
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
         if self._closed:
             raise RuntimeError("pool is closed")
+        if self.single_channel:
+            channel = self._channels.get(0)
+            if channel is not None:
+                return channel
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "PCIe oneshot pool has no channel to reuse during CUDA graph "
+                    "capture; perform an eager all-reduce (or call for_stream) "
+                    "before capture starts"
+                )
+            channel = self._new_channel(None)
+            self._channels[0] = channel
+            return channel
+
         stream_key = _current_stream_key(self.device, stream)
         channel_key = 0 if stream_key is None else int(stream_key)
         channel = self._channels.get(channel_key)
@@ -900,10 +991,8 @@ class PCIeOneshotAllReducePool:
         self._channels.clear()
 
     def __del__(self) -> None:
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 __all__ = [

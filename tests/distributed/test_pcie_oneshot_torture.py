@@ -77,11 +77,10 @@ def _run_graph_scratch_reuse(
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(stream):
-        with torch.cuda.graph(graph, stream=stream):
-            for layer in range(layers):
-                scratch.copy_(sources[layer])
-                channel.all_reduce(scratch, out=outs[layer])
+    with pool.capture(stream), torch.cuda.graph(graph, stream=stream):
+        for layer in range(layers):
+            scratch.copy_(sources[layer])
+            channel.all_reduce(scratch, out=outs[layer])
     stream.synchronize()
 
     for iteration in range(TORTURE_GRAPH_REPLAYS):
@@ -156,8 +155,8 @@ def test_pcie_oneshot_eager_graph_and_multistream_torture():
         pytest.skip("CUDA is not available")
     available = torch.cuda.device_count()
     requested = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
-    if requested not in (2, 4, 6, 8):
-        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, and 8")
+    if requested not in (2, 4, 6, 8, 10):
+        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if available < requested:
         pytest.skip(f"need {requested} CUDA devices, found {available}")
     mp.spawn(_worker, args=(requested, _free_port()), nprocs=requested, join=True)

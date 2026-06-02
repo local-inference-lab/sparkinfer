@@ -36,22 +36,23 @@
 namespace pcie_allreduce {
 
 constexpr int kMaxBlocks = 36;
+constexpr int kMaxRanks = 16;
 using FlagType = uint32_t;
 
 // 128B stride per rank to avoid PCIe false sharing.
 constexpr int kFlagStride = 32;
 
 struct Signal {
-  alignas(128) FlagType self_counter[kMaxBlocks][8];
-  alignas(128) FlagType peer_counter[2][kMaxBlocks][16 * kFlagStride];
+  alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
+  alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
 };
 
 struct __align__(16) RankData {
-  const void* __restrict__ ptrs[8];
+  const void* __restrict__ ptrs[kMaxRanks];
 };
 
 struct __align__(16) RankSignals {
-  Signal* signals[8];
+  Signal* signals[kMaxRanks];
 };
 
 template <typename T, int sz>
@@ -201,7 +202,7 @@ class PCIeAllreduce {
 
   bool dbuf_enabled_ = false;
   int dbuf_slot_ = 0;
-  void* dbuf_raw_[2][8] = {};
+  void* dbuf_raw_[2][kMaxRanks] = {};
   RankData* dbuf_rd_[2] = {};
 
   PCIeAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
@@ -344,8 +345,11 @@ class PCIeAllreduce {
       case 8:
         KL(8);
         break;
+      case 10:
+        KL(10);
+        break;
       default:
-        throw std::runtime_error("only supports (2,4,6,8) gpus, got " + std::to_string(world_size_));
+        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
     }
 #undef KL
   }
@@ -361,11 +365,12 @@ using fptr_t = int64_t;
 
 static fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank) {
   int world_size = fake_ipc_ptrs.size();
-  if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
+  if (world_size > pcie_allreduce::kMaxRanks)
+    throw std::invalid_argument("world size > " + std::to_string(pcie_allreduce::kMaxRanks) + " is not supported");
   if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported");
   if (rank < 0 || rank >= world_size) throw std::invalid_argument("invalid rank");
 
-  pcie_allreduce::Signal* ipc_ptrs[8];
+  pcie_allreduce::Signal* ipc_ptrs[pcie_allreduce::kMaxRanks];
   for (int i = 0; i < world_size; i++) ipc_ptrs[i] = reinterpret_cast<pcie_allreduce::Signal*>(fake_ipc_ptrs[i]);
   return (fptr_t) new pcie_allreduce::PCIeAllreduce(ipc_ptrs, rank_data.data_ptr(), rank_data.numel(), rank, world_size);
 }
@@ -427,7 +432,7 @@ static int64_t meta_size() {
 static void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == (size_t)fa->world_size_);
-  void* ipc_ptrs[8];
+  void* ipc_ptrs[pcie_allreduce::kMaxRanks];
   for (size_t i = 0; i < fake_ipc_ptrs.size(); i++) ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   fa->register_buffer(ipc_ptrs);
 }
@@ -436,8 +441,8 @@ static void register_pcie_buffers(fptr_t _fa, const std::vector<fptr_t>& ptrs0, 
   auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
   TORCH_CHECK(ptrs0.size() == (size_t)fa->world_size_);
   TORCH_CHECK(ptrs1.size() == (size_t)fa->world_size_);
-  void* p0[8];
-  void* p1[8];
+  void* p0[pcie_allreduce::kMaxRanks];
+  void* p1[pcie_allreduce::kMaxRanks];
   for (size_t i = 0; i < ptrs0.size(); i++) {
     p0[i] = reinterpret_cast<void*>(ptrs0[i]);
     p1[i] = reinterpret_cast<void*>(ptrs1[i]);
