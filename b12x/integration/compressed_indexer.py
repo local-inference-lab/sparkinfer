@@ -613,32 +613,68 @@ def index_topk_fp8(
 
     page_table_width = int(metadata.real_page_table.shape[1])
 
-    # Opt-in fused score+top-k route (default off): single launch, no logits blob.
-    # v1 uses seqlen-based masking (active_width windowing not yet handled), so it is
-    # gated behind B12X_FUSED_INDEXER=1 until the productionized graph/contract-phantom
-    # path lands. Routes via resolve_fused_indexer_path (long-K or few-row).
-    if os.getenv("B12X_FUSED_INDEXER", "0") == "1":
-        from b12x.attention.indexer.fused_indexer import (
-            resolve_fused_indexer_path,
-            run_fused_indexer_c4,
-        )
+    # Fused score+top-k route: single launch, no logits blob. Default-ON for the decode
+    # regime the fused kernel wins -- rows <= FUSED_MAX_ROWS with a supported topk/head
+    # count (HBM-bound it ties at short context and pulls far ahead at long context,
+    # since chunked supertile re-scores per 32k chunk while fused streams once). Supertile
+    # handles everything else. B12X_FUSED_INDEXER=0 is a kill switch. active_width is not
+    # applied here, but the C4 contract sets active_width >= per-row seqlen (the compressed
+    # capacity), so seqlen masking == supertile's min(seqlen, active_width); verified by
+    # the fused-vs-supertile equivalence gate. The cross-CTA merge scratch is workspace-
+    # owned at a FRUGAL FIXED capacity (num_sms*topk; seq-INDEPENDENT, never grows),
+    # allocated once on the workspace and reused.
+    from b12x.attention.indexer.fused_indexer import (
+        FUSED_MAX_ROWS,
+        fused_indexer_scratch_capacity,
+        resolve_fused_indexer_path,
+        run_fused_indexer_c4,
+    )
+    from b12x.attention.indexer.kernel import _num_q_head_tiles as _fused_head_tiles
 
-        if resolve_fused_indexer_path(
+    indexer_heads = int(q_fp8.shape[1])
+    fused_enabled = (
+        os.getenv("B12X_FUSED_INDEXER", "1") != "0"
+        and resolve_fused_indexer_path(
             topk=topk, num_rows=q_rows, width=page_table_width * page_size
+        )
+        and _fused_head_tiles(indexer_heads) in (1, 2, 4)
+    )
+    if fused_enabled:
+        num_sms = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
+        pack_elems, state_words = fused_indexer_scratch_capacity(
+            FUSED_MAX_ROWS, topk, num_sms
+        )
+        cache = getattr(workspace, "_b12x_fused_indexer_scratch", None)
+        if (
+            cache is None
+            or cache[0].numel() < pack_elems
+            or cache[2].numel() < state_words
+            or cache[0].device != q_fp8.device
         ):
-            quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
-            idx, _ = run_fused_indexer_c4(
-                q_bytes=q_fp8.view(torch.uint8),
-                weights=weights,
-                k_quant_bytes=quant,
-                k_scales=scales,
-                real_page_table=metadata.real_page_table,
-                seqlens=metadata.cache_seqlens_int32,
-                num_heads=int(q_fp8.shape[1]),
-                topk=topk,
-                out_indices=out_indices,
+            # Allocate ONCE (reused across calls / graph replays). Must land before
+            # capture -- warmup exercises this path, same as the supertile prewarm.
+            cache = (
+                torch.empty((pack_elems,), dtype=torch.float32, device=q_fp8.device),
+                torch.empty((pack_elems,), dtype=torch.int32, device=q_fp8.device),
+                torch.zeros((state_words,), dtype=torch.int32, device=q_fp8.device),
             )
-            return idx
+            workspace._b12x_fused_indexer_scratch = cache
+        quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
+        idx, _ = run_fused_indexer_c4(
+            q_bytes=q_fp8.view(torch.uint8),
+            weights=weights,
+            k_quant_bytes=quant,
+            k_scales=scales,
+            real_page_table=metadata.real_page_table,
+            seqlens=metadata.cache_seqlens_int32,
+            num_heads=indexer_heads,
+            topk=topk,
+            out_indices=out_indices,
+            pack_values=cache[0],
+            pack_indices=cache[1],
+            merge_state=cache[2],
+        )
+        return idx
 
     if supertile_k is None:
         supertile_k = getattr(workspace, "paged_tile_logits_k_rows", None)
