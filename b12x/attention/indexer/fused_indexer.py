@@ -1514,7 +1514,7 @@ def run_fused_indexer_c4(
     out_indices: torch.Tensor | None = None,
     out_values: torch.Tensor | None = None,
     ctas_per_group: int | None = None,
-    merge_threshold: int = _LAST_CTA_MERGE_MAX,
+    merge_threshold: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """C4 fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
@@ -1532,6 +1532,12 @@ def run_fused_indexer_c4(
         # only add last-CTA merge work + a second wave. Never split below 1 page.
         ctas_per_group = max(1, min(max_pages, num_sms // max(1, rows)))
     ctas_per_group = max(1, int(ctas_per_group))
+    if merge_threshold is None:
+        # Topk-aware crossover: the last-CTA serial select also pays for emitting
+        # topk + refining the threshold bin, so more candidates survive per CTA as
+        # topk grows and coop wins sooner. Measured sm120 rows=1 crossover ~28k
+        # (topk=512) / ~20k (topk=2048); the linear fit below matches both.
+        merge_threshold = max(4096, 32768 - 6 * int(topk))
 
     out_i = (
         torch.empty((rows, topk), dtype=torch.int32, device=dev)
