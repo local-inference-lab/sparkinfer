@@ -1200,6 +1200,7 @@ class UnifiedPrefillMGKernel:
         extra_topk=0,
         extra_indices_stride0=0,
         row_xor=False,
+        head_offset=0,
     ):
         self.traits = traits
         self.layout = layout
@@ -1231,6 +1232,7 @@ class UnifiedPrefillMGKernel:
         self.extra_topk = int(extra_topk)
         self.extra_indices_stride_row = int(extra_indices_stride0)
         self.row_xor = bool(row_xor)
+        self.head_offset = int(head_offset)
         # MG head-group count (1 for heads==16, 2 for heads % 32 == 0). Derived
         # from the layout (heads_per_cta // hpb) and threaded as a compile-time
         # const so every group-1 op const_expr-elides for n_hg==1.
@@ -1417,7 +1419,7 @@ class UnifiedPrefillMGKernel:
         rep_h = Int32(self.replicate_h)
         token_idx = block_x // rep_h
         h_tile = block_x - token_idx * rep_h
-        head_base = h_tile * Int32(L.heads_per_cta)
+        head_base = Int32(self.head_offset) + h_tile * Int32(L.heads_per_cta)
 
         bf16_qk = cutlass.const_expr(t.compute_mode == ComputeMode.BF16)
         # GLM (ARBITRARY_FP32) const_expr arm: post-MMA fp32 QK scale, GLM 2-pass
@@ -2451,12 +2453,32 @@ def _unified_sm120_prefill_mg_flat_launch(
     pbs_extra: int,
     stride_extra_kv_block: int,
     row_xor: bool,
+    *,
+    active_heads: int | None = None,
+    head_offset: int = 0,
 ) -> None:
     traits = make_unified_traits(int(model_type), compute_mode, int(scale_format))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
-    heads = int(q.shape[1])
-    replicate_h = heads // int(layout.heads_per_cta)
+    total_heads = int(q.shape[1])
+    if active_heads is None:
+        active_heads = total_heads
+    active_heads = int(active_heads)
+    head_offset = int(head_offset)
+    heads_per_cta = int(layout.heads_per_cta)
+    if active_heads <= 0:
+        raise ValueError(f"unified_sm120 MG prefill requires active_heads>0, got {active_heads}")
+    if head_offset < 0 or head_offset + active_heads > total_heads:
+        raise ValueError(
+            "unified_sm120 MG prefill head range out of bounds: "
+            f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
+        )
+    if active_heads % heads_per_cta != 0:
+        raise ValueError(
+            "unified_sm120 MG prefill active head range must be divisible by "
+            f"heads_per_cta={heads_per_cta}; got active_heads={active_heads}"
+        )
+    replicate_h = active_heads // heads_per_cta
     # DSV4 dual-cache MG: the union puts tile 0 in the MAIN section, so
     # num_main_tiles MUST be >= 1 (topk==128 => 2). All-extra (num_main_tiles==0)
     # has no extra-prologue arm and is forbidden.
@@ -2471,7 +2493,7 @@ def _unified_sm120_prefill_mg_flat_launch(
         int(page_block_size),
         int(num_tiles),
         replicate_h=replicate_h,
-        num_heads=heads,
+        num_heads=total_heads,
         q_stride=tuple(q.stride()),
         indices_stride0=int(topk_indices.stride(0)),
         output_stride=tuple(output.stride()),
@@ -2484,6 +2506,7 @@ def _unified_sm120_prefill_mg_flat_launch(
         extra_topk=int(extra_topk),
         extra_indices_stride0=int(extra_indices_t.stride(0)),
         row_xor=bool(row_xor),
+        head_offset=head_offset,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     base_args = (
@@ -2514,8 +2537,8 @@ def _unified_sm120_prefill_mg_flat_launch(
         key_field("model_type", int(model_type)),
         key_field("compute_mode", int(compute_mode)),
         key_field("scale_format", int(scale_format)),
-        key_field("num_heads", heads),
-        key_field("heads_per_cta", int(layout.heads_per_cta)),
+        key_field("num_heads", total_heads),
+        key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
         key_field("num_tiles", int(num_tiles)),
         key_field("page_block_size", int(page_block_size)),
@@ -2524,16 +2547,23 @@ def _unified_sm120_prefill_mg_flat_launch(
         tensor_key(
             "q",
             q,
-            dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(q_head_dim)),
+            dims=(DimKey.dynamic(), DimKey.exact(total_heads), DimKey.exact(q_head_dim)),
         ),
         tensor_key("topk_indices", topk_indices, dims=(DimKey.dynamic(), DimKey.bucket(topk))),
         tensor_key(
             "output",
             output,
-            dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(512)),
+            dims=(DimKey.dynamic(), DimKey.exact(total_heads), DimKey.exact(512)),
         ),
-        tensor_key("out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(heads))),
+        tensor_key("out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))),
     ]
+    if active_heads != total_heads or head_offset != 0:
+        spec_fields.extend(
+            [
+                key_field("active_heads", active_heads),
+                key_field("head_offset", head_offset),
+            ]
+        )
     if has_extra:
         # The dual key_fields are appended ONLY for has_extra so the single-cache
         # compile-spec hash is byte-unchanged (decode/no-extra cache key identical).
@@ -2759,6 +2789,8 @@ def run_unified_prefill_mg(
     extra_topk_length: torch.Tensor | None = None,
     extra_page_block_size: int | None = None,
     stride_extra_kv_block: int | None = None,
+    active_heads: int | None = None,
+    head_offset: int = 0,
 ):
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
@@ -2790,16 +2822,27 @@ def run_unified_prefill_mg(
     if int(mg_n_hg) not in (1, 2):
         raise ValueError(f"unified_sm120 MG prefill supports mg_n_hg in {{1, 2}}, got {mg_n_hg}")
     num_tokens, heads, _ = q.shape
+    total_heads = int(heads)
+    if active_heads is None:
+        active_heads = total_heads
+    active_heads = int(active_heads)
+    head_offset = int(head_offset)
+    if active_heads <= 0:
+        raise ValueError(f"unified_sm120 MG prefill requires active_heads>0, got {active_heads}")
+    if head_offset < 0 or head_offset + active_heads > total_heads:
+        raise ValueError(
+            "unified_sm120 MG prefill head range out of bounds: "
+            f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
+        )
     traits = make_unified_traits(model_type, int(compute_mode), scale_format)
-    # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 (heads % 32 == 0, the validated
-    # path) or mg_n_hg==1 (heads == 16, the small-TP shard single-group MG). For
-    # n_hg==2 the gate is heads % 32 == 0; for n_hg==1 heads must be a multiple of
-    # HPB (16); the caller (prefill.py) picks mg_n_hg from the head count.
+    # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
+    # covers a single-group launch, including the 16-head tail of an odd-multiple
+    # dual-cache split. The caller picks mg_n_hg and active head range.
     heads_per_cta = int(mg_n_hg) * int(traits.hpb)
-    if heads % heads_per_cta != 0:
+    if active_heads % heads_per_cta != 0:
         raise ValueError(
             f"unified_sm120 MG prefill (mg_n_hg={mg_n_hg}) requires heads divisible "
-            f"by {heads_per_cta}, got {heads}"
+            f"by {heads_per_cta}, got active_heads={active_heads}"
         )
 
     topk = int(topk_indices.shape[1])
@@ -2851,7 +2894,69 @@ def run_unified_prefill_mg(
             extra_len_t = extra_topk_length.to(
                 device=device, dtype=torch.int32
             ).contiguous()
-        torch.ops.b12x.unified_sm120_prefill_mg_dual(
+        if active_heads == total_heads and head_offset == 0:
+            torch.ops.b12x.unified_sm120_prefill_mg_dual(
+                q,
+                kv_cache.reshape(-1),
+                topk_indices,
+                topk_length,
+                attn_sink_t,
+                output,
+                lse_out,
+                extra_kv_cache.reshape(-1),
+                extra_indices_t,
+                extra_len_t,
+                float(sm_scale),
+                int(page_block_size),
+                int(topk),
+                int(num_tiles),
+                int(stride_kv_block),
+                bool(has_sink),
+                int(compute_mode),
+                int(mg_n_hg),
+                model_type,
+                scale_format,
+                int(extra_topk),
+                int(num_main_tiles),
+                int(pbs_extra),
+                int(stride_extra_kv_block),
+                bool(row_xor),
+            )
+        else:
+            _unified_sm120_prefill_mg_flat_launch(
+                q,
+                kv_cache.reshape(-1),
+                topk_indices,
+                topk_length,
+                attn_sink_t,
+                output,
+                lse_out,
+                extra_kv_cache.reshape(-1),
+                extra_indices_t,
+                extra_len_t,
+                float(sm_scale),
+                int(page_block_size),
+                int(topk),
+                int(num_tiles),
+                int(stride_kv_block),
+                bool(has_sink),
+                int(compute_mode),
+                int(mg_n_hg),
+                model_type,
+                scale_format,
+                True,  # has_extra
+                int(extra_topk),
+                int(num_main_tiles),
+                int(pbs_extra),
+                int(stride_extra_kv_block),
+                bool(row_xor),
+                active_heads=active_heads,
+                head_offset=head_offset,
+            )
+        return output, lse_out
+
+    if active_heads == total_heads and head_offset == 0:
+        torch.ops.b12x.unified_sm120_prefill_mg(
             q,
             kv_cache.reshape(-1),
             topk_indices,
@@ -2859,44 +2964,46 @@ def run_unified_prefill_mg(
             attn_sink_t,
             output,
             lse_out,
-            extra_kv_cache.reshape(-1),
-            extra_indices_t,
-            extra_len_t,
             float(sm_scale),
             int(page_block_size),
             int(topk),
-            int(num_tiles),
+            int(num_main_tiles),
             int(stride_kv_block),
             bool(has_sink),
             int(compute_mode),
             int(mg_n_hg),
             model_type,
             scale_format,
-            int(extra_topk),
-            int(num_main_tiles),
-            int(pbs_extra),
-            int(stride_extra_kv_block),
-            bool(row_xor),
         )
-        return output, lse_out
-
-    torch.ops.b12x.unified_sm120_prefill_mg(
-        q,
-        kv_cache.reshape(-1),
-        topk_indices,
-        topk_length,
-        attn_sink_t,
-        output,
-        lse_out,
-        float(sm_scale),
-        int(page_block_size),
-        int(topk),
-        int(num_main_tiles),
-        int(stride_kv_block),
-        bool(has_sink),
-        int(compute_mode),
-        int(mg_n_hg),
-        model_type,
-        scale_format,
-    )
+    else:
+        _unified_sm120_prefill_mg_flat_launch(
+            q,
+            kv_cache.reshape(-1),
+            topk_indices,
+            topk_length,
+            attn_sink_t,
+            output,
+            lse_out,
+            kv_cache.reshape(-1),  # extra_kv_flat alias (never read)
+            topk_indices,          # extra_indices alias (never read)
+            topk_length,           # extra_len alias (never read)
+            float(sm_scale),
+            int(page_block_size),
+            int(topk),
+            int(num_main_tiles),
+            int(stride_kv_block),
+            bool(has_sink),
+            int(compute_mode),
+            int(mg_n_hg),
+            model_type,
+            scale_format,
+            False,  # has_extra
+            0,      # extra_topk
+            0,      # num_main_tiles
+            1,      # pbs_extra
+            0,      # stride_extra_kv_block
+            False,  # row_xor
+            active_heads=active_heads,
+            head_offset=head_offset,
+        )
     return output, lse_out

@@ -190,8 +190,57 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         )
 
 
+def test_unified_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None:
+    # DSV4 dual-cache heads=80 is a paired 64-head MG prefix plus one 16-head
+    # single-group tail. This is Python dispatch coverage only; the focused CUDA
+    # numerics live in the SM120 test suite.
+    __import__("b12x.attention.mla.unified_sm120.prefill")
+    import b12x.attention.mla.unified_sm120.prefill_mg as prefill_mg
+    from b12x.attention.mla.unified_sm120.prefill import run_unified_prefill
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+
+    topk = 128
+    q = torch.empty((2, 80, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+    extra_kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    extra_indices = torch.zeros((2, 128), dtype=torch.int32)
+
+    output, lse = run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_page_block_size=2,
+    )
+
+    assert len(calls) == 2
+    assert output.shape == (2, 80, 512)
+    assert lse.shape == (2, 80)
+    assert calls[0]["mg_n_hg"] == 2
+    assert calls[0]["active_heads"] == 64
+    assert calls[0]["head_offset"] == 0
+    assert calls[1]["mg_n_hg"] == 1
+    assert calls[1]["active_heads"] == 16
+    assert calls[1]["head_offset"] == 64
+    assert calls[0]["output"] is output
+    assert calls[1]["output"] is output
+    assert calls[0]["lse_out"] is lse
+    assert calls[1]["lse_out"] is lse
+
+
 def test_unified_sm120_prefill_dual_non_eligible_raises() -> None:
-    # DSV4 dual-cache prefill is MG-only (topk==128, heads in {16,32,64,128});
+    # DSV4 dual-cache prefill is MG-only (topk==128, heads divisible by 16);
     # everything else RAISEs (the decode-reuse has_extra fallback was removed).
     # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
     # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).

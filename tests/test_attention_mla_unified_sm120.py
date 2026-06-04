@@ -914,6 +914,58 @@ def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_nu
 
 
 @torch.inference_mode()
+def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> None:
+    """DSV4 dual-cache prefill heads=80 uses the split MG path (64-head paired
+    prefix + 16-head tail) and matches the PyTorch extra-cache oracle."""
+    device = require_sm120_unified()
+    from b12x.attention.mla.unified_sm120.launch import run_unified_prefill
+
+    num_heads = 80
+    topk, extra_topk, pbs_extra = 128, 128, 2
+    main_blocks = 16
+    case = dsv4_extra_ref.make_dsv4_extra_decode_case(
+        num_heads=num_heads, topk=topk, extra_topk=extra_topk, num_tokens=1,
+        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        invalidate_half=False, with_sink=False, device=device, seed=8080,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
+    extra_blocks = case["extra_kv_cache"].shape[0]
+    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    main_idx = case["topk_indices"].contiguous()
+    extra_idx = case["extra_indices"].contiguous()
+    main_len = torch.full((1,), topk, dtype=torch.int32, device=device)
+    extra_len = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
+
+    exp_O, _ = dsv4_extra_ref.dsv4_extra_decode_reference(
+        q, case["kv_cache"], main_idx, case["sm_scale"],
+        case["extra_kv_cache"], extra_idx,
+        page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
+        topk_length=main_len, extra_topk_length=extra_len,
+        main_kv_dequant=case["kv_dequant"], extra_kv_dequant=case["extra_kv_dequant"],
+    )
+
+    O, _ = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=main_idx,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+        topk_length=main_len,
+        extra_kv_cache=idx_cache,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_len,
+        extra_page_block_size=pbs_extra,
+    )
+    torch.cuda.synchronize()
+    got = O[0].float()
+    exp = exp_O[0].float()
+    cos = _cosine(got, exp)
+    assert cos > 0.999, f"DSV4 dual-cache prefill heads=80 O cos={cos}"
+    assert (got - exp).abs().max().item() < 2e-2
+
+
+@torch.inference_mode()
 def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     """extra_topk=0 (no extra cache) must reduce to the single-cache decode: the
     dual reference's concat is a no-op, so the unified main-only path matches."""

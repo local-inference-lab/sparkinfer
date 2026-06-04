@@ -6,11 +6,14 @@ scale traits, normalizes inputs, and routes to the FlashInfer-shaped multi-group
 decode-reuse fallback -- an unsupported shape HARD-FAILS (raise-not-fallback,
 matching upstream).
 
-Supported (MG) shapes: heads in {16, 32, 64, 128};
+Supported (MG) shapes:
+  * DSV4/GLM single-cache: heads==16 or heads % 32 == 0
   * DSV4 single-cache: topk in {512, 1024, 2048} (FP8-QK) or 128 (BF16-QK)
-  * DSV4 dual-cache (extra/indexed tokens): topk==128, pbs_extra in {2, 64} (BF16-QK)
+  * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 16 == 0,
+    pbs_extra in {2, 64} (BF16-QK). Odd 16-head multiples split into a paired
+    MG prefix plus one single-group tail.
   * GLM_NSA: topk in {512, 1024, 2048}
-Anything else (other topk, heads not in the set, GLM dual, etc.) raises ValueError.
+Anything else (other topk, unsupported heads, GLM dual, etc.) raises ValueError.
 DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 """
 
@@ -174,10 +177,9 @@ def run_unified_prefill(
     #     all group-1 (qk1/acc1/...) work const_expr-elides (clean single-group MG,
     #     16 heads/CTA, replicate_h = heads/16 = 1). This replaces the ~48 GB/s
     #     decode-reuse fallback for the heads==16 shard with an MG-class kernel.
-    # Arbitrary multiples-of-16 that are NOT %32 (48, 80, ...) are NOT handled by
-    # MG here -- they would need replicate-over-pairs + a trailing single group,
-    # which is not cheap to express cleanly; they STAY on the decode-reuse path
-    # below (correct, just slower). Scope: heads in {16, 32, 64, 128}.
+    # Arbitrary single-cache multiples-of-16 that are NOT %32 (48, 80, ...) are
+    # not handled by this MG gate. DSV4 dual-cache has a split paired-prefix +
+    # single-group-tail path below because there is no decode-reuse fallback.
     #
     # Within each group count, two FlashInfer-shaped QK specializations route:
     #   * topk in {512, 1024, 2048}  -> FP8-QK MG  (block-scaled E4M3 QK).
@@ -243,7 +245,7 @@ def run_unified_prefill(
     elif _mg_base and heads == hpb:  # heads == 16: single-group MG.
         _mg_n_hg = 1
     else:
-        _mg_n_hg = 0  # not MG-eligible (incl. 48/80 -> decode-reuse).
+        _mg_n_hg = 0  # not MG-eligible for the single-cache gate (incl. 48/80).
     if _mg_n_hg and topk in (512, 1024, 2048):
         from .prefill_mg import run_unified_prefill_mg
 
@@ -280,41 +282,83 @@ def run_unified_prefill(
         )
 
     # ── DSV4 dual-cache (has_extra) -> MG (BF16-QK), with strip-and-raise. ──────
-    # FI ships DSV4 dual-cache as topk==128, BF16-QK only, heads in {16,32,64,128}.
-    # MG-eligible dual routes to the MG dual op; everything else RAISEs (the
+    # FI ships DSV4 dual-cache as topk==128, BF16-QK. Even 32-head multiples use
+    # one paired-head MG launch; odd 16-head multiples (48/80/...) split into a
+    # paired prefix plus one single-group tail. Everything else RAISEs (the
     # decode-reuse has_extra body has been removed -- no fallback).
     if has_extra:
-        if (
-            model_type == ModelType.DSV4
-            and int(topk) == 128
-            and (heads % (2 * hpb) == 0 or heads == hpb)
-        ):
-            mg_n_hg = 2 if heads % (2 * hpb) == 0 else 1
+        if model_type == ModelType.DSV4 and int(topk) == 128:
             from .prefill_mg import run_unified_prefill_mg
 
-            return run_unified_prefill_mg(
-                q=q,
-                kv_cache=kv_cache,
-                topk_indices=topk_indices,
-                sm_scale=sm_scale,
-                page_block_size=page_block_size,
-                topk_length=topk_length,
-                attn_sink=attn_sink,
-                output=output,
-                lse_out=lse_out,
-                stride_kv_block=stride_kv_block,
-                compute_mode=ComputeMode.BF16,
-                mg_n_hg=mg_n_hg,
-                extra_kv_cache=extra_kv_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-                extra_page_block_size=extra_page_block_size,
-                stride_extra_kv_block=stride_extra_kv_block,
-            )
+            if heads % (2 * hpb) == 0 or heads == hpb:
+                mg_n_hg = 2 if heads % (2 * hpb) == 0 else 1
+                return run_unified_prefill_mg(
+                    q=q,
+                    kv_cache=kv_cache,
+                    topk_indices=topk_indices,
+                    sm_scale=sm_scale,
+                    page_block_size=page_block_size,
+                    topk_length=topk_length,
+                    attn_sink=attn_sink,
+                    output=output,
+                    lse_out=lse_out,
+                    stride_kv_block=stride_kv_block,
+                    compute_mode=ComputeMode.BF16,
+                    mg_n_hg=mg_n_hg,
+                    extra_kv_cache=extra_kv_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_length,
+                    extra_page_block_size=extra_page_block_size,
+                    stride_extra_kv_block=stride_extra_kv_block,
+                )
+            if heads > hpb and heads % (2 * hpb) == hpb:
+                paired_heads = heads - hpb
+                run_unified_prefill_mg(
+                    q=q,
+                    kv_cache=kv_cache,
+                    topk_indices=topk_indices,
+                    sm_scale=sm_scale,
+                    page_block_size=page_block_size,
+                    topk_length=topk_length,
+                    attn_sink=attn_sink,
+                    output=output,
+                    lse_out=lse_out,
+                    stride_kv_block=stride_kv_block,
+                    compute_mode=ComputeMode.BF16,
+                    mg_n_hg=2,
+                    extra_kv_cache=extra_kv_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_length,
+                    extra_page_block_size=extra_page_block_size,
+                    stride_extra_kv_block=stride_extra_kv_block,
+                    active_heads=paired_heads,
+                    head_offset=0,
+                )
+                return run_unified_prefill_mg(
+                    q=q,
+                    kv_cache=kv_cache,
+                    topk_indices=topk_indices,
+                    sm_scale=sm_scale,
+                    page_block_size=page_block_size,
+                    topk_length=topk_length,
+                    attn_sink=attn_sink,
+                    output=output,
+                    lse_out=lse_out,
+                    stride_kv_block=stride_kv_block,
+                    compute_mode=ComputeMode.BF16,
+                    mg_n_hg=1,
+                    extra_kv_cache=extra_kv_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_length,
+                    extra_page_block_size=extra_page_block_size,
+                    stride_extra_kv_block=stride_extra_kv_block,
+                    active_heads=hpb,
+                    head_offset=paired_heads,
+                )
         raise ValueError(
             f"DSV4 dual-cache prefill (heads={heads}, topk={topk}, "
             f"pbs_extra={int(extra_page_block_size)}) requires MG dispatch; only "
-            "DSV4 topk==128 heads in {16, 32, 64, 128} are supported. "
+            "DSV4 topk==128 with heads divisible by 16 is supported. "
             "No decode-reuse fallback."
         )
 
@@ -325,8 +369,8 @@ def run_unified_prefill(
         f"(model_type={int(model_type)}, heads={heads}, topk={topk}, "
         f"compute_mode={int(compute_mode)}, scale_format={int(scale_format)}, "
         f"has_extra={has_extra}, B12X_MLA_SM120_PREFILL_MG={'0' if not _mg_enabled else '1'}). "
-        "Supported (MG) shapes: heads in {16, 32, 64, 128}; "
+        "Supported (MG) shapes: single-cache heads==16 or heads%32==0; "
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 (BF16-QK); "
-        "DSV4 dual-cache topk==128 with pbs_extra in {2, 64}; "
+        "DSV4 dual-cache topk==128 with heads%16==0 and pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}. No decode-reuse fallback."
     )
