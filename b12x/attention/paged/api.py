@@ -10,7 +10,7 @@ import cutlass
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
 from b12x.cute.utils import current_cuda_stream
 
 from .forward_paged import (
@@ -204,12 +204,23 @@ def _get_cached_plane_tma_descs(
 
 def _tensor_meta_key(
     tensor: torch.Tensor | None,
-) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]] | None:
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+    dynamic_strides: tuple[int, ...] = (),
+) -> tuple[tuple[object, ...], tuple[object, ...], str, tuple[str, int | None]] | None:
     if tensor is None:
         return None
+    dynamic_dim_set = set(dynamic_dims)
+    dynamic_stride_set = set(dynamic_strides)
     return (
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_dim_set else int(dim)
+            for idx, dim in enumerate(tensor.shape)
+        ),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_stride_set else int(stride)
+            for idx, stride in enumerate(tensor.stride())
+        ),
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
@@ -620,25 +631,31 @@ def paged_attention_forward(
         if use_capacity_contract and workspace._plan_output is not None
         else forward_output
     )
+    forward_lse_dynamic_dims = (0,) if plan.split_kv else (1,)
+    forward_lse_dynamic_strides = () if plan.split_kv else (0,)
     forward_cache_key = [
-        _tensor_meta_key(q_cache_tensor),
+        _tensor_meta_key(q_cache_tensor, dynamic_dims=(0,)),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
-        _tensor_meta_key(page_table),
-        _tensor_meta_key(cache_seqlens),
-        _tensor_meta_key(cu_seqlens_q),
-        _tensor_meta_key(workspace.request_indices),
-        _tensor_meta_key(workspace.qo_tile_indices),
-        _tensor_meta_key(workspace.kv_tile_indices),
-        _tensor_meta_key(workspace.o_indptr),
+        _tensor_meta_key(page_table, dynamic_dims=(0,)),
+        _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
+        _tensor_meta_key(cu_seqlens_q, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.request_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.qo_tile_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.kv_tile_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.o_indptr, dynamic_dims=(0,)),
         _tensor_meta_key(workspace.kv_chunk_size_ptr),
-        _tensor_meta_key(workspace.kv_window_start_tokens),
-        _tensor_meta_key(workspace.block_valid_mask),
+        _tensor_meta_key(workspace.kv_window_start_tokens, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.block_valid_mask, dynamic_dims=(0,)),
         _tensor_meta_key(attention_sink_bias),
-        _tensor_meta_key(output_cache_tensor),
-        _tensor_meta_key(forward_lse),
-        _tensor_meta_key(k_descale),
-        _tensor_meta_key(v_descale),
+        _tensor_meta_key(output_cache_tensor, dynamic_dims=(0,)),
+        _tensor_meta_key(
+            forward_lse,
+            dynamic_dims=forward_lse_dynamic_dims,
+            dynamic_strides=forward_lse_dynamic_strides,
+        ),
+        _tensor_meta_key(k_descale, dynamic_dims=(0,)),
+        _tensor_meta_key(v_descale, dynamic_dims=(0,)),
     ]
     cache_key_labels = [
         "q_contract" if use_capacity_contract else "q",
@@ -772,13 +789,17 @@ def paged_attention_forward(
             total_num_rows_arg,
         )
         merge_cache_key = (
-            _tensor_meta_key(workspace.tmp_output),
-            _tensor_meta_key(workspace.tmp_lse),
-            _tensor_meta_key(workspace.merge_indptr),
-            _tensor_meta_key(cache_seqlens),
+            _tensor_meta_key(workspace.tmp_output, dynamic_dims=(0,)),
+            _tensor_meta_key(workspace.tmp_lse, dynamic_dims=(0,)),
+            _tensor_meta_key(workspace.merge_indptr, dynamic_dims=(0,)),
+            _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
             _tensor_meta_key(workspace.kv_chunk_size_ptr),
-            _tensor_meta_key(output),
-            _tensor_meta_key(workspace.lse),
+            _tensor_meta_key(output, dynamic_dims=(0,)),
+            _tensor_meta_key(
+                workspace.lse,
+                dynamic_dims=(1,),
+                dynamic_strides=(0,),
+            ),
             None
             if merge_regular_decode_graph
             else _tensor_meta_key(workspace.total_num_rows_ptr),

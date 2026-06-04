@@ -243,9 +243,13 @@ def _flat_tensor_compile_key(name, tensor, *, dynamic=False):
     return TensorKey.from_tensor(name, flat, dims=dims)
 
 
-def _tensor_meta_key(tensor):
+def _tensor_meta_key(tensor, *, dynamic_dims=()):
+    dynamic_dim_set = set(dynamic_dims)
     return (
-        tuple(tensor.shape),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_dim_set else int(dim)
+            for idx, dim in enumerate(tensor.shape)
+        ),
         tuple(tensor.stride()),
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),

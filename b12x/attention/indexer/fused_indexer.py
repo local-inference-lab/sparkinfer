@@ -1555,14 +1555,41 @@ def _arg_sig(*tensors: torch.Tensor):
     return tuple((tuple(t.shape), str(t.dtype)) for t in tensors)
 
 
+def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> TensorKey:
+    dynamic_row_names = {
+        "q",
+        "w",
+        "pt",
+        "sl",
+        "kstart",
+        "kend",
+        "oi",
+        "ov",
+        "pv",
+        "pi",
+        "st",
+    }
+    dynamic_dims = (
+        (0,)
+        if name in dynamic_row_names and int(tensor.ndim) >= 1
+        else ()
+    )
+    dynamic_dim_set = set(dynamic_dims)
+    dims = tuple(
+        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
+        for idx, dim in enumerate(tensor.shape)
+    )
+    return TensorKey.from_tensor(name, tensor, dims=dims)
+
+
 def _launch_fused(kernel, cute_args, key_tensors, policy):
     """Graph-safe launch via b12x_launch (compile-once + replayable run_compiled).
 
     Unlike a bare cute.compile()+call, the b12x_launch path is CUDA-graph-capturable
-    (the existing indexer kernels rely on it). key_tensors = [(label, torch_tensor)]
-    keyed with exact dims; policy distinguishes the constexpr variant.
+    (the existing indexer kernels rely on it). Row-bearing key tensors use dynamic
+    row dimensions; policy distinguishes the constexpr variant.
     """
-    cache_key = tuple(TensorKey.from_tensor(name, t) for name, t in key_tensors) + (
+    cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         ("fused_indexer_v2_coop",) + tuple(policy),
     )
     labels = tuple(name for name, _ in key_tensors) + ("policy",)

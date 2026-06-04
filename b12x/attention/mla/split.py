@@ -1629,15 +1629,27 @@ def run_sparse_mla_split_decode_forward(
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32),
+        _tensor_meta_key(_cq if _cq is not None else q_u32, dynamic_dims=(0,)),
         _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
         _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
-        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
+        _tensor_meta_key(
+            _cpt if _cpt is not None else page_table_1,
+            dynamic_dims=(0,),
+        ),
+        _tensor_meta_key(
+            _cnt if _cnt is not None else active_token_counts,
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(kv_chunk_size_ptr),
         _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(_cto if _cto is not None else tmp_output),
-        _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
+        _tensor_meta_key(
+            _cto if _cto is not None else tmp_output,
+            dynamic_dims=(0,),
+        ),
+        _tensor_meta_key(
+            _ctl if _ctl is not None else tmp_lse,
+            dynamic_dims=(0,),
+        ),
         traits,
         int(launch_num_chunks),
         head_tiles,

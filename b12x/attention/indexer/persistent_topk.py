@@ -874,11 +874,11 @@ def run_persistent_topk2048(
         current_cuda_stream(),
     )
     cache_key = (
-        _tensor_meta_key(logits),
-        _tensor_meta_key(lengths),
-        _tensor_meta_key(page_table),
-        _tensor_meta_key(output_indices),
-        _tensor_meta_key(state),
+        _tensor_meta_key(logits, dynamic_dims=(0,)),
+        _tensor_meta_key(lengths, dynamic_dims=(0,)),
+        _tensor_meta_key(page_table, dynamic_dims=(0,)),
+        _tensor_meta_key(output_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(state, dynamic_dims=(0,)),
         (
             "persistent_topk2048_v1",
             launch.chunk_size,

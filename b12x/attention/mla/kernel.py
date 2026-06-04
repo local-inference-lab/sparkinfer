@@ -16,7 +16,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -191,9 +191,15 @@ def _to_kernel_tensor(
 
 def _tensor_meta_key(
     tensor: torch.Tensor,
-) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]]:
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+) -> tuple[tuple[object, ...], tuple[int, ...], str, tuple[str, int | None]]:
+    dynamic_dim_set = set(dynamic_dims)
     return (
-        tuple(tensor.shape),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_dim_set else int(dim)
+            for idx, dim in enumerate(tensor.shape)
+        ),
         tuple(tensor.stride()),
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
@@ -4741,12 +4747,18 @@ def run_sparse_mla_kernel(
     _cnt = getattr(workspace, "_contract_indexer_cache_seqlens", None)
     _co = getattr(workspace, "_contract_output", None)
     cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32),
+        _tensor_meta_key(_cq if _cq is not None else q_u32, dynamic_dims=(0,)),
         _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
         _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
-        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
-        _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(
+            _cpt if _cpt is not None else page_table_1,
+            dynamic_dims=(0,),
+        ),
+        _tensor_meta_key(
+            _cnt if _cnt is not None else active_token_counts,
+            dynamic_dims=(0,),
+        ),
+        _tensor_meta_key(_co if _co is not None else output, dynamic_dims=(0,)),
         traits,
         head_tiles,
         str(output.dtype),
