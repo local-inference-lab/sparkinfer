@@ -99,14 +99,19 @@ KV_LAYOUT_PAGED_C4 = 1
 # so a width gate can't adapt to live context and is the wrong axis. The batch row
 # count IS fixed at capture, so it's the correct gate.
 #
-# Measured fused-vs-supertile crossover (sm120, topk=2048, heads=64, 32k ctx,
-# graph min_us): rows 2/4/8 -> fused 0.91/0.91/0.97x (win); rows 16/24/32 ->
-# 1.06/1.15/1.23x (supertile wins, gap grows). So the fused kernel's niche is
-# small decode batches; supertile owns larger batches AND prefill (m=q-rows, where
-# fused's m=heads degenerates to 1 CTA/row and runs ~7x slower at T=4096). The
-# crossover rises a bit at longer context (more per-row work for fused to split),
-# so 8 is a conservative cut. FUSED_MIN_WIDTH retained only for capacity sizing.
-FUSED_MAX_ROWS = 8           # decode-batch crossover: fused wins rows <= this
+# Measured HBM-bound (L2-flushed, graph min_us, sm120, heads=64) fused-vs-supertile
+# vs the PRODUCTION chunked supertile (supertile_k=32768, num_chunks=ceil(seq/32k)).
+# Earlier L2-hot single-pass numbers were misleading -- with L2 flushed and supertile
+# chunked realistically, fused wins/ties rows<=6 and the win EXPLODES with context
+# because chunked supertile re-scores per 32k chunk while fused streams once:
+#   rows=1: 256k 0.50x, 128k 0.59x, 64k 0.73x, 32k tie
+#   rows=6: 256k 0.87x, 128k 0.89x, 64k 0.94x, 32k ~tie (topk512 +2us, topk2048 -4us)
+#   rows=8: supertile wins (fused's per-row scoring is HBM-bandwidth-starved at
+#           ctas_per_group=num_sms/rows~=23). So 6 is the cut.
+# Small decode batches with long context are exactly fused's niche; supertile owns
+# larger batches AND prefill (m=q-rows, where fused's m=heads degenerates to 1
+# CTA/row). FUSED_MIN_WIDTH retained only for capacity sizing.
+FUSED_MAX_ROWS = 6           # decode-batch crossover: fused wins rows <= this (HBM-bound)
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
 
 
@@ -181,8 +186,10 @@ def _load_flat_k_tile_wide(
 
 @cute.jit
 def _load_permute_k_page_g2s(
-    k_quant_bytes: cute.Tensor,  # [pages, 64, 128] uint8 (contiguous, 16B-aligned base)
+    k_quant_bytes: cute.Tensor,  # [pages, 64, 128] uint8 (16B-aligned base)
     page_id: Int32,
+    page_stride_bytes: Int32,  # dim-0 byte stride; 8192 for contiguous K, 8448 for
+                               # the packed C4 cache (64*128 quant + 64*4 scales / page)
     k_perm_base_addr: Int32,
     tx: Int32,
     n_threads: Int32,
@@ -190,10 +197,13 @@ def _load_permute_k_page_g2s(
     """C4 fused global->shared load + permute: read 16-byte K granules straight
     from global into the ldmatrix-permuted SMEM layout. Replaces the scalar
     linear load + separate SMEM->SMEM repack pass (and its barrier) with one
-    vectorized pass. Granule addresses are 16B-aligned (page*8192 + row*128 +
-    vec*16), so ld.global.v4.u32 is well-formed for any 16B-aligned cache base.
+    vectorized pass. Granule addresses are 16B-aligned (page*page_stride_bytes +
+    row*128 + vec*16); page_stride_bytes MUST be the real dim-0 stride of
+    k_quant_bytes (the packed C4 cache interleaves per-page scales, so its page
+    stride is 8448, not the contiguous 8192) — using a hardcoded stride reads the
+    wrong page for the packed layout. It stays 16B-aligned (8448 = 16*528).
     """
-    page_elem_base = page_id * Int32(_PAGE_SIZE * _INDEX_HEAD_DIM)
+    page_elem_base = page_id * page_stride_bytes
     linear = tx
     total = Int32(_PAGE_SIZE * (_INDEX_HEAD_DIM // 16))
     while linear < total:
@@ -784,12 +794,18 @@ class SparseNSAFusedIndexerKernel:
         paged_output: bool = False,
         ctas_per_group: int = 1,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
+        k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
     ):
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
         self.ctas_per_group = max(1, int(ctas_per_group))
         self.merge_threshold = int(merge_threshold)
+        # dim-0 byte stride of k_quant_bytes for the PAGED_C4 wide load. Defaults to
+        # the contiguous 8192 (64*128); the packed C4 cache interleaves per-page
+        # scales so its real page stride is 8448 -- run_fused_indexer_c4 passes
+        # k_quant_bytes.stride(0) so the load reads the correct page.
+        self.k_quant_page_stride = int(k_quant_page_stride)
         if self.kv_layout not in (KV_LAYOUT_FLAT_MLA, KV_LAYOUT_PAGED_C4):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
@@ -1035,7 +1051,8 @@ class SparseNSAFusedIndexerKernel:
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED_C4):
                     # Fused g2s load + permute (no linear staging, no repack pass).
                     _load_permute_k_page_g2s(
-                        k_quant_bytes, page_id, k_page_perm_base_addr, tx, Int32(_RADIX_THREADS)
+                        k_quant_bytes, page_id, Int32(self.k_quant_page_stride),
+                        k_page_perm_base_addr, tx, Int32(_RADIX_THREADS),
                     )
                     scale_idx = tx
                     while scale_idx < Int32(_PAGE_SIZE):
@@ -1428,6 +1445,7 @@ def _build_fused_indexer_kernel(
     paged_output: bool,
     ctas_per_group: int,
     merge_threshold: int = _LAST_CTA_MERGE_MAX,
+    k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
 ):
     return SparseNSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
@@ -1436,6 +1454,7 @@ def _build_fused_indexer_kernel(
         paged_output=paged_output,
         ctas_per_group=ctas_per_group,
         merge_threshold=merge_threshold,
+        k_quant_page_stride=k_quant_page_stride,
     )
 
 
@@ -1552,9 +1571,13 @@ def run_fused_indexer_c4(
         else out_values
     )
     pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
+    # Real dim-0 byte stride of the K-quant tensor: the packed C4 cache interleaves
+    # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
+    # The wide g2s load must use this, not a hardcoded stride, to read the right page.
+    k_quant_page_stride = int(k_quant_bytes.stride(0))
     kernel = _build_fused_indexer_kernel(
         KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), False, ctas_per_group,
-        merge_threshold=int(merge_threshold),
+        merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
     )
     dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for C4
     args = (
@@ -1580,7 +1603,8 @@ def run_fused_indexer_c4(
     ]
     _launch_fused(
         kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), int(ctas_per_group), int(merge_threshold)),
+        (KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), int(ctas_per_group),
+         int(merge_threshold), k_quant_page_stride),
     )
     return out_i, out_v
 
