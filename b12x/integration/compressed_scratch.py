@@ -134,6 +134,8 @@ class _B12XCompressedIndexerScratchLayout:
     supertile_tokens: int
     max_chunks: int
     tile_logits_elements: int
+    fused_pack_elements: int
+    fused_state_words: int
     tile_logits_offset_bytes: int
     topk_values_offset_bytes: int
     topk_indices_offset_bytes: int
@@ -141,6 +143,9 @@ class _B12XCompressedIndexerScratchLayout:
     candidate_indices_offset_bytes: int
     merge_positions_offset_bytes: int
     active_width_offset_bytes: int
+    fused_pack_values_offset_bytes: int
+    fused_pack_indices_offset_bytes: int
+    fused_merge_state_offset_bytes: int
 
 
 @dataclass(kw_only=True)
@@ -244,6 +249,9 @@ class B12XCompressedIndexerScratch:
     indexer_extend_candidate_indices: torch.Tensor | None = None
     indexer_extend_topk_positions: torch.Tensor | None = None
     paged_indexer_active_width_cap: torch.Tensor | None = None
+    fused_indexer_pack_values: torch.Tensor | None = None
+    fused_indexer_pack_indices: torch.Tensor | None = None
+    fused_indexer_merge_state: torch.Tensor | None = None
     _contract_paged_indexer_q_bytes: torch.Tensor | None = None
     _contract_paged_indexer_weights: torch.Tensor | None = None
     _contract_paged_real_page_table: torch.Tensor | None = None
@@ -329,6 +337,28 @@ class B12XCompressedIndexerScratch:
         if self.paged_indexer_active_width_cap is None:
             raise RuntimeError("compressed indexer scratch is missing active-width cap")
         return self.paged_indexer_active_width_cap
+
+    def get_fused_indexer_scratch(
+        self,
+        *,
+        topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        topk = int(topk)
+        if topk <= 0 or topk > int(self.topk):
+            raise ValueError(
+                f"fused indexer topk must be in [1, {int(self.topk)}], got {topk}"
+            )
+        if (
+            self.fused_indexer_pack_values is None
+            or self.fused_indexer_pack_indices is None
+            or self.fused_indexer_merge_state is None
+        ):
+            raise RuntimeError("compressed indexer scratch is missing fused buffers")
+        return (
+            self.fused_indexer_pack_values,
+            self.fused_indexer_pack_indices,
+            self.fused_indexer_merge_state,
+        )
 
     def get_paged_indexer_contract_phantoms(self) -> dict[str, torch.Tensor]:
         if (
@@ -522,6 +552,8 @@ def _resolve_compressed_indexer_supertile_tokens(raw_tokens: int) -> int:
 def _compressed_indexer_scratch_layout(
     caps: B12XCompressedIndexerScratchCaps,
 ) -> _B12XCompressedIndexerScratchLayout:
+    from b12x.attention.indexer.fused_indexer import fused_indexer_scratch_capacity
+
     max_q_rows = max(int(caps.max_q_rows), 1)
     page_size = max(int(caps.page_size), 1)
     supertile_tokens = _resolve_compressed_indexer_supertile_tokens(
@@ -545,6 +577,16 @@ def _compressed_indexer_scratch_layout(
         * num_k_tiles
         * _COMPRESSED_INDEX_TILE_BLOCK_Q
         * _COMPRESSED_INDEX_TILE_BLOCK_K,
+    )
+    device = torch.device(caps.device)
+    if device.type == "cuda":
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    else:
+        num_sms = 1
+    fused_pack_elements, fused_state_words = fused_indexer_scratch_capacity(
+        max_q_rows,
+        int(caps.topk),
+        int(num_sms),
     )
 
     cursor = 0
@@ -582,11 +624,25 @@ def _compressed_indexer_scratch_layout(
     cursor += _dtype_nbytes(torch.int32)
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
 
+    fused_pack_values_offset_bytes = cursor
+    cursor += fused_pack_elements * _dtype_nbytes(torch.float32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    fused_pack_indices_offset_bytes = cursor
+    cursor += fused_pack_elements * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    fused_merge_state_offset_bytes = cursor
+    cursor += fused_state_words * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
     return _B12XCompressedIndexerScratchLayout(
         nbytes=max(int(cursor), _ARENA_ALIGN_BYTES),
         supertile_tokens=supertile_tokens,
         max_chunks=max_chunks,
         tile_logits_elements=tile_logits_elements,
+        fused_pack_elements=fused_pack_elements,
+        fused_state_words=fused_state_words,
         tile_logits_offset_bytes=tile_logits_offset_bytes,
         topk_values_offset_bytes=topk_values_offset_bytes,
         topk_indices_offset_bytes=topk_indices_offset_bytes,
@@ -594,6 +650,9 @@ def _compressed_indexer_scratch_layout(
         candidate_indices_offset_bytes=candidate_indices_offset_bytes,
         merge_positions_offset_bytes=merge_positions_offset_bytes,
         active_width_offset_bytes=active_width_offset_bytes,
+        fused_pack_values_offset_bytes=fused_pack_values_offset_bytes,
+        fused_pack_indices_offset_bytes=fused_pack_indices_offset_bytes,
+        fused_merge_state_offset_bytes=fused_merge_state_offset_bytes,
     )
 
 
@@ -699,6 +758,24 @@ def _materialize_compressed_indexer_scratch(
         1,
     )
     active_width_cap.fill_(int(width_cap))
+    fused_pack_values, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.fused_pack_values_offset_bytes,
+        shape=(int(layout.fused_pack_elements),),
+        dtype=torch.float32,
+    )
+    fused_pack_indices, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.fused_pack_indices_offset_bytes,
+        shape=(int(layout.fused_pack_elements),),
+        dtype=torch.int32,
+    )
+    fused_merge_state, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.fused_merge_state_offset_bytes,
+        shape=(int(layout.fused_state_words),),
+        dtype=torch.int32,
+    )
 
     scratch = B12XCompressedIndexerScratch(
         shared_scratch=scratch_storage,
@@ -721,6 +798,9 @@ def _materialize_compressed_indexer_scratch(
         indexer_extend_candidate_indices=candidate_indices,
         indexer_extend_topk_positions=merge_positions,
         paged_indexer_active_width_cap=active_width_cap,
+        fused_indexer_pack_values=fused_pack_values,
+        fused_indexer_pack_indices=fused_pack_indices,
+        fused_indexer_merge_state=fused_merge_state,
     )
     _install_compressed_indexer_contract_phantoms(scratch)
     return scratch

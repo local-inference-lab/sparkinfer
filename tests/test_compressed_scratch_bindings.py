@@ -137,6 +137,8 @@ def test_compressed_indexer_scratch_plan_exposes_one_opaque_scratch_spec() -> No
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.layout.nbytes == specs[0].nbytes
     assert plan.layout.supertile_tokens == 512
+    assert plan.layout.fused_pack_elements > 0
+    assert plan.layout.fused_state_words > 0
 
 
 def test_compressed_indexer_scratch_bind_does_not_call_workspace_or_arena_factory(
@@ -180,6 +182,24 @@ def test_compressed_indexer_scratch_bind_does_not_call_workspace_or_arena_factor
     assert binding.scratch.indexer_extend_tile_logits is not None
     assert binding.scratch.indexer_extend_topk_values is not None
     assert binding.scratch.indexer_extend_topk_indices is not None
+    pack_values, pack_indices, merge_state = (
+        binding.scratch.get_fused_indexer_scratch(topk=8)
+    )
+    assert pack_values.dtype == torch.float32
+    assert pack_indices.dtype == torch.int32
+    assert merge_state.dtype == torch.int32
+    assert (
+        pack_values.data_ptr()
+        == binding.scratch.fused_indexer_pack_values.data_ptr()
+    )
+    assert (
+        pack_indices.data_ptr()
+        == binding.scratch.fused_indexer_pack_indices.data_ptr()
+    )
+    assert (
+        merge_state.data_ptr()
+        == binding.scratch.fused_indexer_merge_state.data_ptr()
+    )
 
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
