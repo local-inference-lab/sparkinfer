@@ -109,10 +109,11 @@ def main() -> None:
         help="fused-topk: override ctas_per_group (0 = auto heuristic)",
     )
     parser.add_argument(
-        "--fused-coop",
+        "--fused-merge-threshold",
         type=int,
-        default=1,
-        help="fused-topk: 1=cooperative grid-barrier merge, 0=last-CTA reduction",
+        default=49152,
+        help="fused-topk cross-CTA merge auto-switch: seq_len<=thr uses last-CTA "
+        "reduction, else cooperative radix. 0=force coop, large=force last-CTA.",
     )
     parser.add_argument("--supertile-k", type=int, default=32768)
     parser.add_argument(
@@ -262,7 +263,7 @@ def main() -> None:
                 num_heads=num_heads,
                 topk=topk,
                 ctas_per_group=fused_ctas,
-                coop_merge=bool(args.fused_coop),
+                merge_threshold=int(args.fused_merge_threshold),
             )[0]
         return index_topk_fp8(
             q_fp8=q_fp8,

@@ -311,6 +311,12 @@ def _resolve_fused_launch_config(
 # index i32) for the next CTA in the relay to fold.
 _STATE_WORDS_PER_GROUP = 4  # arrival_counter, output_counter, relay_phase, pad
 
+# Cross-CTA merge auto-switch (ctas_per_group>1): a group whose live row K length
+# seq_len <= this uses the serial last-CTA reduction (no grid barriers); larger
+# rows use the cooperative grid-barrier radix. Measured crossover ~32-64k (sm120,
+# rows=1, topk=512). Both arms are exact, so this only trades perf, not results.
+_LAST_CTA_MERGE_MAX = 49152
+
 
 def _fused_indexer_state_nbytes(launch: _FusedLaunchConfig) -> int:
     return launch.num_groups * _STATE_WORDS_PER_GROUP * 4
@@ -784,13 +790,13 @@ class SparseNSAFusedIndexerKernel:
         kv_layout: int = KV_LAYOUT_PAGED_C4,
         paged_output: bool = False,
         ctas_per_group: int = 1,
-        coop_merge: bool = True,
+        merge_threshold: int = _LAST_CTA_MERGE_MAX,
     ):
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
         self.ctas_per_group = max(1, int(ctas_per_group))
-        self.coop_merge = bool(coop_merge)
+        self.merge_threshold = int(merge_threshold)
         if self.kv_layout not in (KV_LAYOUT_FLAT_MLA, KV_LAYOUT_PAGED_C4):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
@@ -827,13 +833,12 @@ class SparseNSAFusedIndexerKernel:
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
         self.pack_cap = self.ctas_per_group * int(self.topk)
-        # Cooperative merge (default): instead of one last CTA radix-selecting the
-        # full packed slab serially, all ctas_per_group CTAs cooperate via a
-        # per-group GLOBAL histogram (grid barriers) directly over their SMEM
-        # carries — O(slice) per CTA in parallel, not O(total) serial, and no
-        # global pack slab. State = _COOP_STATE_WORDS int32 per group.
-        self.coop = self.merge_in_kernel and self.coop_merge
-        self.state_words_per_group = _COOP_STATE_WORDS if self.coop else 2
+        # Both cross-CTA merge arms are compiled and chosen at runtime per group by
+        # seq_len vs merge_threshold (see the merge dispatch). Both index the
+        # per-group _COOP_STATE_WORDS state block, and the last-CTA arm also needs
+        # the global pack slab, so size state at _COOP_STATE_WORDS whenever the
+        # in-kernel merge is active.
+        self.state_words_per_group = _COOP_STATE_WORDS if self.merge_in_kernel else 2
 
     def _get_shared_storage_cls(self):
         return _fused_indexer_shared_storage_cls(
@@ -1153,21 +1158,34 @@ class SparseNSAFusedIndexerKernel:
                     Int32(s_c0_gindex[i]) if is_valid else Int32(-1)
                 )
                 i += Int32(_RADIX_THREADS)
-        elif cutlass.const_expr(self.coop):
-            # ---- cooperative cross-CTA radix merge ----
-            # All ctas_per_group CTAs cooperate via the per-group GLOBAL histogram
-            # (merge_state) to select the global top-k over their SMEM carries:
-            # O(slice) per CTA in parallel, not O(total) serial in one CTA. Each
-            # CTA keeps its carry in SMEM; nothing is packed to global. The 32-bit
-            # pivot is narrowed over 4 byte rounds (per-round global histogram +
-            # grid barriers), then > pivot is selected and == pivot fills to topk.
+        else:
+            # ---- in-kernel cross-CTA merge: runtime-selected strategy ----
+            # All CTAs in a group share the row's live K length (seq_len, from
+            # metadata), so they pick the SAME arm with no extra barrier:
+            #   seq_len >  merge_threshold -> cooperative grid-barrier radix over
+            #     the SMEM carries (parallel; amortizes the barriers at long K);
+            #   seq_len <= merge_threshold -> serial last-CTA reduction over a
+            #     packed slab (no grid barriers; cheaper for few-row/short-K).
+            # Both arms index the per-group _COOP_STATE_WORDS state block via
+            # _state_offset, so groups taking different arms never collide.
             ctas_pg = Int32(self.ctas_per_group)
             barrier_phase = Int32(0)
-            # Pre-declare every variable assigned inside the dynamic branches below;
-            # cute forbids a None->typed transition inside a dynamic `if` (same
-            # discipline as persistent_topk's radix).
+            cap = Int32(self.pack_cap)
+            slab_base = group_id * cap
+            pack_v_row = cute.make_tensor(
+                pack_values.iterator + slab_base,
+                cute.make_layout((self.pack_cap,), stride=(1,)),
+            )
+            pack_i_row = cute.make_tensor(
+                pack_indices.iterator + slab_base,
+                cute.make_layout((self.pack_cap,), stride=(1,)),
+            )
+            # Pre-declare every variable assigned inside the dynamic arms below;
+            # cute forbids a None->typed transition inside a dynamic `if`.
             i = Int32(0)
             base = Int32(0)
+            off = Int32(0)
+            total = Int32(0)
             key = Uint32(0)
             byte = Int32(0)
             mask = Uint32(0)
@@ -1185,232 +1203,228 @@ class SparseNSAFusedIndexerKernel:
             ordered_pivot = Uint32(0)
             bucket_u32 = Uint32(0)
             c = Int32(0)
-            # group total candidate count (for the degenerate total <= topk path)
-            if tx == Int32(0):
-                atomic_add_global_i32(
-                    _global_state_ptr(merge_state, group_id, Int32(768)), carry_count
-                )
-            barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-            total = Int32(merge_state[_state_offset(group_id, Int32(768))])
-            if total <= topk_static:
-                # every candidate survives: pack contiguously (atomic base) + pad -1
+            if seq_len > Int32(self.merge_threshold):
+                # group total candidate count (for the degenerate total <= topk path)
                 if tx == Int32(0):
-                    s_coop_counters[1] = atomic_add_global_i32(
-                        _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
-                        carry_count,
+                    atomic_add_global_i32(
+                        _global_state_ptr(merge_state, group_id, Int32(768)), carry_count
                     )
-                cute.arch.sync_threads()
-                base = Int32(s_coop_counters[1])
-                i = Int32(tx)
-                while i < carry_count:
-                    out_values[group_id, base + i] = Float32(s_c0_values[i])
-                    out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
-                    i += Int32(_RADIX_THREADS)
                 barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                # pad [total, topk) with -1 (cta0 only, to avoid duplicate writes)
-                i = Int32(tx)
-                while i < topk_static:
-                    if (i >= total) & (cta_in_group == Int32(0)):
-                        out_values[group_id, i] = Float32(float("-inf"))
-                        out_indices[group_id, i] = Int32(-1)
-                    i += Int32(_RADIX_THREADS)
-            else:
-                if tx == Int32(0):
-                    s_coop_scalars[0] = Uint32(0)            # prefix
-                    s_coop_scalars[1] = Uint32(topk_static)  # remaining_k
-                cute.arch.sync_threads()
-                for round_idx in cutlass.range_constexpr(4):
-                    shift = Uint32(24 - round_idx * 8)
-                    prefix = Uint32(s_coop_scalars[0])
-                    remaining_k = Int32(s_coop_scalars[1])
-                    # cta0 zeros the per-group global histogram for this round
-                    if cta_in_group == Int32(0):
-                        i = Int32(tx)
-                        while i < Int32(_RADIX):
-                            merge_state[_state_offset(group_id, i)] = Int32(0)
-                            i += Int32(_RADIX_THREADS)
-                    i = Int32(tx)
-                    while i < Int32(_RADIX):
-                        s_hist0[i] = Int32(0)  # local histogram (reuses hist0)
-                        i += Int32(_RADIX_THREADS)
+                total = Int32(merge_state[_state_offset(group_id, Int32(768))])
+                if total <= topk_static:
+                    # every candidate survives: pack contiguously (atomic base) + pad -1
+                    if tx == Int32(0):
+                        s_coop_counters[1] = atomic_add_global_i32(
+                            _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                            carry_count,
+                        )
                     cute.arch.sync_threads()
-                    barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                    # histogram this CTA's carry entries matching the running prefix
+                    base = Int32(s_coop_counters[1])
                     i = Int32(tx)
                     while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i]))
-                        if cutlass.const_expr(round_idx == 0):
-                            byte = Int32((key >> shift) & Uint32(0xFF))
-                            _smem_red_add(coop_hist_addr, byte, Int32(1))
-                        else:
-                            mask = Uint32(0xFFFFFFFF) << Uint32(32 - round_idx * 8)
-                            if (key & mask) == prefix:
-                                byte = Int32((key >> shift) & Uint32(0xFF))
-                                _smem_red_add(coop_hist_addr, byte, Int32(1))
-                        i += Int32(_RADIX_THREADS)
-                    cute.arch.sync_threads()
-                    # local histogram -> per-group global histogram (atomics)
-                    i = Int32(tx)
-                    while i < Int32(_RADIX):
-                        c = Int32(s_hist0[i])
-                        if c > Int32(0):
-                            atomic_add_global_i32(
-                                _global_state_ptr(merge_state, group_id, i), c
-                            )
+                        out_values[group_id, base + i] = Float32(s_c0_values[i])
+                        out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
                     barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                    # read global histogram -> suffix sum (count_ge per bin)
-                    i = Int32(tx)
-                    while i < Int32(_RADIX):
-                        s_coop_suffix[i] = Int32(merge_state[_state_offset(group_id, i)])
-                        i += Int32(_RADIX_THREADS)
-                    cute.arch.sync_threads()
-                    for stage in cutlass.range_constexpr(8):
-                        stride_s = Int32(1 << stage)
-                        scan_val = Int32(0)
-                        if tx < Int32(_RADIX):
-                            scan_val = Int32(s_coop_suffix[tx])
-                            if tx < Int32(_RADIX) - stride_s:
-                                scan_val = scan_val + Int32(s_coop_suffix[tx + stride_s])
-                        cute.arch.sync_threads()
-                        if tx < Int32(_RADIX):
-                            s_coop_suffix[tx] = scan_val
-                        cute.arch.sync_threads()
-                    # pivot bin: count_ge >= remaining_k and count_gt < remaining_k
-                    if tx == Int32(0):
-                        s_coop_scalars[2] = Uint32(0)
-                        s_coop_scalars[3] = Uint32(remaining_k)
-                    cute.arch.sync_threads()
-                    if tx < Int32(_RADIX):
-                        count_ge = Int32(s_coop_suffix[tx])
-                        count_gt = Int32(0)
-                        if tx + Int32(1) < Int32(_RADIX):
-                            count_gt = Int32(s_coop_suffix[tx + Int32(1)])
-                        if (count_ge >= remaining_k) & (count_gt < remaining_k):
-                            s_coop_scalars[2] = Uint32(tx)
-                            s_coop_scalars[3] = Uint32(remaining_k - count_gt)
-                    cute.arch.sync_threads()
-                    if tx == Int32(0):
-                        bucket_u32 = Uint32(s_coop_scalars[2])
-                        s_coop_scalars[0] = prefix | (bucket_u32 << shift)
-                        s_coop_scalars[1] = Uint32(s_coop_scalars[3])
-                    cute.arch.sync_threads()
-                    barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                ordered_pivot = Uint32(s_coop_scalars[0])
-                # > pivot: definite winners, written at a per-CTA atomic base
-                if tx == Int32(0):
-                    s_coop_counters[0] = Int32(0)
-                cute.arch.sync_threads()
-                i = Int32(tx)
-                while i < carry_count:
-                    key = _convert_to_uint32(Float32(s_c0_values[i]))
-                    if key > ordered_pivot:
-                        _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
-                    i += Int32(_RADIX_THREADS)
-                cute.arch.sync_threads()
-                local_gt = Int32(s_coop_counters[0])
-                if tx == Int32(0):
-                    gt_base = Int32(0)
-                    if local_gt > Int32(0):
-                        gt_base = atomic_add_global_i32(
-                            _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
-                            local_gt,
-                        )
-                    s_coop_counters[0] = Int32(0)
-                    s_coop_counters[1] = gt_base
-                cute.arch.sync_threads()
-                i = Int32(tx)
-                while i < carry_count:
-                    key = _convert_to_uint32(Float32(s_c0_values[i]))
-                    if key > ordered_pivot:
-                        lp = _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
-                        pos = Int32(s_coop_counters[1]) + lp
-                        out_values[group_id, pos] = Float32(s_c0_values[i])
-                        out_indices[group_id, pos] = Int32(s_c0_gindex[i])
-                    i += Int32(_RADIX_THREADS)
-                barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                # == pivot: fill the remaining slots up to topk (ties at the boundary)
-                i = Int32(tx)
-                while i < carry_count:
-                    key = _convert_to_uint32(Float32(s_c0_values[i]))
-                    if key == ordered_pivot:
-                        pos = atomic_add_global_i32(
-                            _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
-                            Int32(1),
-                        )
-                        if pos < topk_static:
-                            out_values[group_id, pos] = Float32(s_c0_values[i])
-                            out_indices[group_id, pos] = Int32(s_c0_gindex[i])
-                    i += Int32(_RADIX_THREADS)
-        else:
-            # ---- in-kernel cross-CTA merge (relay) ----
-            # Each CTA atomically packs its carry_count REAL candidates into the
-            # per-group global slab; the last-arriving CTA radix-selects the final
-            # top-k over the packed reals and writes the row (no host merge launch).
-            cap = Int32(self.pack_cap)
-            base = group_id * cap
-            # 1. reserve a contiguous slot for this CTA's real candidates
-            if tx == Int32(0):
-                woff_ptr = get_ptr_as_int64(merge_state, group_id * Int32(2))
-                s_relay[0] = atomic_add_global_i32(woff_ptr, carry_count)
-            cute.arch.sync_threads()
-            off = Int32(s_relay[0])
-            # 2. publish carry0[0:carry_count] into pack[base+off : base+off+carry_count]
-            i = Int32(tx)
-            while i < carry_count:
-                pack_values[base + off + i] = Float32(s_c0_values[i])
-                pack_indices[base + off + i] = Int32(s_c0_gindex[i])
-                i += Int32(_RADIX_THREADS)
-            cute.arch.sync_threads()
-            # 3. release the writes, then bump arrival; old==ctas-1 => I am last
-            if tx == Int32(0):
-                threadfence()
-                arr_ptr = get_ptr_as_int64(merge_state, group_id * Int32(2) + Int32(1))
-                s_relay[1] = atomic_add_global_i32(arr_ptr, Int32(1))
-            cute.arch.sync_threads()
-            # Pre-declare before the dynamic last-CTA `if` (cute forbids a
-            # None->typed transition inside a dynamic if). The make_tensor views
-            # only depend on `base`, so hoisting them is free.
-            total = Int32(0)
-            pack_v_row = cute.make_tensor(
-                pack_values.iterator + base,
-                cute.make_layout((self.pack_cap,), stride=(1,)),
-            )
-            pack_i_row = cute.make_tensor(
-                pack_indices.iterator + base,
-                cute.make_layout((self.pack_cap,), stride=(1,)),
-            )
-            if Int32(s_relay[1]) == (Int32(self.ctas_per_group) - Int32(1)):
-                threadfence()  # acquire: observe every producer's packed writes
-                total = Int32(merge_state[group_id * Int32(2)])
-                if total > topk_static:
-                    _fused_radix_select(
-                        pack_v_row, pack_i_row, s_c1_values, s_c1_gindex,
-                        total, topk_static, self.cands, tx,
-                        s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                        h0, ctr, thr, ni0, ni1, lr,
-                    )
-                    cute.arch.sync_threads()
+                    # pad [total, topk) with -1 (cta0 only, to avoid duplicate writes)
                     i = Int32(tx)
                     while i < topk_static:
-                        out_values[group_id, i] = Float32(s_c1_values[i])
-                        out_indices[group_id, i] = Int32(s_c1_gindex[i])
-                        i += Int32(_RADIX_THREADS)
-                else:
-                    i = Int32(tx)
-                    while i < topk_static:
-                        if i < total:
-                            out_values[group_id, i] = Float32(pack_v_row[i])
-                            out_indices[group_id, i] = Int32(pack_i_row[i])
-                        else:
+                        if (i >= total) & (cta_in_group == Int32(0)):
                             out_values[group_id, i] = Float32(float("-inf"))
                             out_indices[group_id, i] = Int32(-1)
                         i += Int32(_RADIX_THREADS)
-                # reset the group's counters so the next launch / graph replay starts clean
-                cute.arch.sync_threads()
+                else:
+                    if tx == Int32(0):
+                        s_coop_scalars[0] = Uint32(0)            # prefix
+                        s_coop_scalars[1] = Uint32(topk_static)  # remaining_k
+                    cute.arch.sync_threads()
+                    for round_idx in cutlass.range_constexpr(4):
+                        shift = Uint32(24 - round_idx * 8)
+                        prefix = Uint32(s_coop_scalars[0])
+                        remaining_k = Int32(s_coop_scalars[1])
+                        # cta0 zeros the per-group global histogram for this round
+                        if cta_in_group == Int32(0):
+                            i = Int32(tx)
+                            while i < Int32(_RADIX):
+                                merge_state[_state_offset(group_id, i)] = Int32(0)
+                                i += Int32(_RADIX_THREADS)
+                        i = Int32(tx)
+                        while i < Int32(_RADIX):
+                            s_hist0[i] = Int32(0)  # local histogram (reuses hist0)
+                            i += Int32(_RADIX_THREADS)
+                        cute.arch.sync_threads()
+                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                        # histogram this CTA's carry entries matching the running prefix
+                        i = Int32(tx)
+                        while i < carry_count:
+                            key = _convert_to_uint32(Float32(s_c0_values[i]))
+                            if cutlass.const_expr(round_idx == 0):
+                                byte = Int32((key >> shift) & Uint32(0xFF))
+                                _smem_red_add(coop_hist_addr, byte, Int32(1))
+                            else:
+                                mask = Uint32(0xFFFFFFFF) << Uint32(32 - round_idx * 8)
+                                if (key & mask) == prefix:
+                                    byte = Int32((key >> shift) & Uint32(0xFF))
+                                    _smem_red_add(coop_hist_addr, byte, Int32(1))
+                            i += Int32(_RADIX_THREADS)
+                        cute.arch.sync_threads()
+                        # local histogram -> per-group global histogram (atomics)
+                        i = Int32(tx)
+                        while i < Int32(_RADIX):
+                            c = Int32(s_hist0[i])
+                            if c > Int32(0):
+                                atomic_add_global_i32(
+                                    _global_state_ptr(merge_state, group_id, i), c
+                                )
+                            i += Int32(_RADIX_THREADS)
+                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                        # read global histogram -> suffix sum (count_ge per bin)
+                        i = Int32(tx)
+                        while i < Int32(_RADIX):
+                            s_coop_suffix[i] = Int32(merge_state[_state_offset(group_id, i)])
+                            i += Int32(_RADIX_THREADS)
+                        cute.arch.sync_threads()
+                        for stage in cutlass.range_constexpr(8):
+                            stride_s = Int32(1 << stage)
+                            scan_val = Int32(0)
+                            if tx < Int32(_RADIX):
+                                scan_val = Int32(s_coop_suffix[tx])
+                                if tx < Int32(_RADIX) - stride_s:
+                                    scan_val = scan_val + Int32(s_coop_suffix[tx + stride_s])
+                            cute.arch.sync_threads()
+                            if tx < Int32(_RADIX):
+                                s_coop_suffix[tx] = scan_val
+                            cute.arch.sync_threads()
+                        # pivot bin: count_ge >= remaining_k and count_gt < remaining_k
+                        if tx == Int32(0):
+                            s_coop_scalars[2] = Uint32(0)
+                            s_coop_scalars[3] = Uint32(remaining_k)
+                        cute.arch.sync_threads()
+                        if tx < Int32(_RADIX):
+                            count_ge = Int32(s_coop_suffix[tx])
+                            count_gt = Int32(0)
+                            if tx + Int32(1) < Int32(_RADIX):
+                                count_gt = Int32(s_coop_suffix[tx + Int32(1)])
+                            if (count_ge >= remaining_k) & (count_gt < remaining_k):
+                                s_coop_scalars[2] = Uint32(tx)
+                                s_coop_scalars[3] = Uint32(remaining_k - count_gt)
+                        cute.arch.sync_threads()
+                        if tx == Int32(0):
+                            bucket_u32 = Uint32(s_coop_scalars[2])
+                            s_coop_scalars[0] = prefix | (bucket_u32 << shift)
+                            s_coop_scalars[1] = Uint32(s_coop_scalars[3])
+                        cute.arch.sync_threads()
+                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                    ordered_pivot = Uint32(s_coop_scalars[0])
+                    # > pivot: definite winners, written at a per-CTA atomic base
+                    if tx == Int32(0):
+                        s_coop_counters[0] = Int32(0)
+                    cute.arch.sync_threads()
+                    i = Int32(tx)
+                    while i < carry_count:
+                        key = _convert_to_uint32(Float32(s_c0_values[i]))
+                        if key > ordered_pivot:
+                            _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
+                        i += Int32(_RADIX_THREADS)
+                    cute.arch.sync_threads()
+                    local_gt = Int32(s_coop_counters[0])
+                    if tx == Int32(0):
+                        gt_base = Int32(0)
+                        if local_gt > Int32(0):
+                            gt_base = atomic_add_global_i32(
+                                _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                local_gt,
+                            )
+                        s_coop_counters[0] = Int32(0)
+                        s_coop_counters[1] = gt_base
+                    cute.arch.sync_threads()
+                    i = Int32(tx)
+                    while i < carry_count:
+                        key = _convert_to_uint32(Float32(s_c0_values[i]))
+                        if key > ordered_pivot:
+                            lp = _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
+                            pos = Int32(s_coop_counters[1]) + lp
+                            out_values[group_id, pos] = Float32(s_c0_values[i])
+                            out_indices[group_id, pos] = Int32(s_c0_gindex[i])
+                        i += Int32(_RADIX_THREADS)
+                    barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                    # == pivot: fill the remaining slots up to topk (ties at the boundary)
+                    i = Int32(tx)
+                    while i < carry_count:
+                        key = _convert_to_uint32(Float32(s_c0_values[i]))
+                        if key == ordered_pivot:
+                            pos = atomic_add_global_i32(
+                                _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                Int32(1),
+                            )
+                            if pos < topk_static:
+                                out_values[group_id, pos] = Float32(s_c0_values[i])
+                                out_indices[group_id, pos] = Int32(s_c0_gindex[i])
+                        i += Int32(_RADIX_THREADS)
+            else:
+                # ---- in-kernel cross-CTA merge (relay) ----
+                # Each CTA atomically packs its carry_count REAL candidates into the
+                # per-group global slab; the last-arriving CTA radix-selects the final
+                # top-k over the packed reals and writes the row (no host merge launch).
+                # 1. reserve a contiguous slab slot for this CTA's real candidates.
+                #    woff/arrival live in this group's coop-state block (via
+                #    _STATE_OUTPUT_COUNTER / _STATE_ARRIVAL_COUNTER), so a group on
+                #    this arm never collides with a sibling group on the coop arm.
                 if tx == Int32(0):
-                    merge_state[group_id * Int32(2)] = Int32(0)
-                    merge_state[group_id * Int32(2) + Int32(1)] = Int32(0)
+                    woff_ptr = _global_state_ptr(
+                        merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                    )
+                    s_relay[0] = atomic_add_global_i32(woff_ptr, carry_count)
+                cute.arch.sync_threads()
+                off = Int32(s_relay[0])
+                # 2. publish carry0[0:carry_count] into slab[slab_base+off : +count]
+                i = Int32(tx)
+                while i < carry_count:
+                    pack_values[slab_base + off + i] = Float32(s_c0_values[i])
+                    pack_indices[slab_base + off + i] = Int32(s_c0_gindex[i])
+                    i += Int32(_RADIX_THREADS)
+                cute.arch.sync_threads()
+                # 3. release the writes, then bump arrival; old==ctas-1 => I am last
+                if tx == Int32(0):
+                    threadfence()
+                    arr_ptr = _global_state_ptr(
+                        merge_state, group_id, Int32(_STATE_ARRIVAL_COUNTER)
+                    )
+                    s_relay[1] = atomic_add_global_i32(arr_ptr, Int32(1))
+                cute.arch.sync_threads()
+                if Int32(s_relay[1]) == (ctas_pg - Int32(1)):
+                    threadfence()  # acquire: observe every producer's packed writes
+                    total = Int32(
+                        merge_state[_state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))]
+                    )
+                    if total > topk_static:
+                        _fused_radix_select(
+                            pack_v_row, pack_i_row, s_c1_values, s_c1_gindex,
+                            total, topk_static, self.cands, tx,
+                            s_hist0, s_hist1, s_out, s_cand0, s_cand1,
+                            h0, ctr, thr, ni0, ni1, lr,
+                        )
+                        cute.arch.sync_threads()
+                        i = Int32(tx)
+                        while i < topk_static:
+                            out_values[group_id, i] = Float32(s_c1_values[i])
+                            out_indices[group_id, i] = Int32(s_c1_gindex[i])
+                            i += Int32(_RADIX_THREADS)
+                    else:
+                        i = Int32(tx)
+                        while i < topk_static:
+                            if i < total:
+                                out_values[group_id, i] = Float32(pack_v_row[i])
+                                out_indices[group_id, i] = Int32(pack_i_row[i])
+                            else:
+                                out_values[group_id, i] = Float32(float("-inf"))
+                                out_indices[group_id, i] = Int32(-1)
+                            i += Int32(_RADIX_THREADS)
+                    # reset the group's counters so the next launch / graph replay starts clean
+                    cute.arch.sync_threads()
+                    if tx == Int32(0):
+                        merge_state[_state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))] = Int32(0)
+                        merge_state[_state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))] = Int32(0)
 
 
 @lru_cache(maxsize=64)
@@ -1420,7 +1434,7 @@ def _build_fused_indexer_kernel(
     topk: int,
     paged_output: bool,
     ctas_per_group: int,
-    coop_merge: bool = True,
+    merge_threshold: int = _LAST_CTA_MERGE_MAX,
 ):
     return SparseNSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
@@ -1428,7 +1442,7 @@ def _build_fused_indexer_kernel(
         kv_layout=kv_layout,
         paged_output=paged_output,
         ctas_per_group=ctas_per_group,
-        coop_merge=coop_merge,
+        merge_threshold=merge_threshold,
     )
 
 
@@ -1455,30 +1469,26 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     )
 
 
-def _alloc_merge_scratch(rows: int, topk: int, ctas_per_group: int, dev, *, coop: bool = True):
-    """Per-group merge state (+ optional pack slab) for the in-kernel merge.
+def _alloc_merge_scratch(rows: int, topk: int, ctas_per_group: int, dev):
+    """Per-group merge state + pack slab for the in-kernel cross-CTA merge.
 
-    ctas_per_group == 1 takes no merge path -> minimal dummies. For the
-    cooperative merge (default), the per-group state holds the global histogram +
-    barrier/output/total counters (_COOP_STATE_WORDS int32) and no pack slab is
-    needed (each CTA works from its SMEM carry). For the serial fallback, the
-    state is 2 words (woff, arrival) and a pack slab holds the packed candidates.
-    state is zeroed each call; under CUDA-graph capture the memset is captured and
-    replays clean (the host zero is the per-launch reset for the cooperative path).
+    ctas_per_group == 1 takes no merge path -> minimal dummies. Otherwise the
+    runtime auto-switch can take either arm per group, so allocate BOTH: the
+    per-group state at _COOP_STATE_WORDS int32 (cooperative histogram/barrier/
+    output/total counters, which the last-CTA arm reuses for its woff/arrival
+    words) and the global pack slab (rows * ctas_per_group * topk) the last-CTA
+    arm packs into. State is zeroed each call; under CUDA-graph capture the memset
+    is captured and replays clean (the per-launch reset).
     """
     if ctas_per_group <= 1:
         pack_v = torch.empty((1,), dtype=torch.float32, device=dev)
         pack_i = torch.empty((1,), dtype=torch.int32, device=dev)
         state = torch.zeros((2,), dtype=torch.int32, device=dev)
-    elif coop:
-        pack_v = torch.empty((1,), dtype=torch.float32, device=dev)
-        pack_i = torch.empty((1,), dtype=torch.int32, device=dev)
-        state = torch.zeros((rows * _COOP_STATE_WORDS,), dtype=torch.int32, device=dev)
     else:
         cap = rows * ctas_per_group * int(topk)
         pack_v = torch.empty((cap,), dtype=torch.float32, device=dev)
         pack_i = torch.empty((cap,), dtype=torch.int32, device=dev)
-        state = torch.zeros((rows * 2,), dtype=torch.int32, device=dev)
+        state = torch.zeros((rows * _COOP_STATE_WORDS,), dtype=torch.int32, device=dev)
     return pack_v, pack_i, state
 
 
@@ -1504,14 +1514,15 @@ def run_fused_indexer_c4(
     out_indices: torch.Tensor | None = None,
     out_values: torch.Tensor | None = None,
     ctas_per_group: int | None = None,
-    coop_merge: bool = True,
+    merge_threshold: int = _LAST_CTA_MERGE_MAX,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """C4 fused indexer. ctas_per_group>1 = relay (each CTA tops-k a page-slice of
-    the row in parallel; per-CTA partials merged on the host). Returns (indices, values).
+    """C4 fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
+    Returns (indices, values).
 
-    coop_merge selects the cross-CTA merge: True = cooperative grid-barrier radix
-    (amortizes at large context/batch); False = last-CTA reduction over a packed
-    candidate slab (no grid barriers; cheaper for the few-row/small-K regime)."""
+    merge_threshold drives the per-group runtime cross-CTA merge auto-switch: a row
+    whose live seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
+    barriers; faster for few-row/short-K); larger rows use the cooperative
+    grid-barrier radix. 0 forces cooperative; a very large value forces last-CTA."""
     rows = int(q_bytes.shape[0])
     dev = q_bytes.device
     max_pages = int(real_page_table.shape[1])
@@ -1532,12 +1543,10 @@ def run_fused_indexer_c4(
         if out_values is None
         else out_values
     )
-    pack_v, pack_i, state = _alloc_merge_scratch(
-        rows, topk, ctas_per_group, dev, coop=coop_merge
-    )
+    pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
     kernel = _build_fused_indexer_kernel(
         KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), False, ctas_per_group,
-        coop_merge=coop_merge,
+        merge_threshold=int(merge_threshold),
     )
     dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for C4
     args = (
@@ -1563,7 +1572,7 @@ def run_fused_indexer_c4(
     ]
     _launch_fused(
         kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), int(ctas_per_group), int(coop_merge)),
+        (KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), int(ctas_per_group), int(merge_threshold)),
     )
     return out_i, out_v
 
