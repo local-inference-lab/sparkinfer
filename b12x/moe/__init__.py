@@ -1,5 +1,6 @@
-from .fused import MoEStaticKernel
+from .fused import MoEDynamicKernel, MoEMicroKernel
 
 __all__ = [
-    "MoEStaticKernel",
+    "MoEDynamicKernel",
+    "MoEMicroKernel",
 ]

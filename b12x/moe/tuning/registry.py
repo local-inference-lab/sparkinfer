@@ -33,7 +33,7 @@ def register_max_active_clusters_policy(
 ) -> None:
     if not regime:
         raise ValueError("regime must be non-empty")
-    if backend not in {"micro", "static", "dynamic"}:
+    if backend not in {"micro", "dynamic"}:
         raise ValueError(f"unsupported backend {backend!r}")
     _validate_ladder(ladder=ladder)
     MAX_ACTIVE_CLUSTERS_POLICY[(str(regime), str(backend))] = MaxActiveClustersPolicy(

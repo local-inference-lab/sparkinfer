@@ -1,10 +1,9 @@
 """
 MoEDynamicKernel — queue-driven routed NVFP4 MoE kernel for SM120.
 
-This is the first dynamic fused control-plane kernel derived from the current
-static implementation. It keeps the proven FC1 / SiLU / quant / FC2 / scatter
-compute body, but replaces the resident-grid route/pack -> compute barrier
-with a global ready-task queue.
+A queue-driven fused control-plane kernel. It keeps the proven FC1 / SiLU /
+quant / FC2 / scatter compute body, but replaces a resident-grid route/pack ->
+compute barrier with a global ready-task queue.
 
 Execution model
   Phase 0: cooperative init / clear scratch state
@@ -22,23 +21,22 @@ Execution model
 
 This is intentionally conservative:
   - still one CTA per SM
-  - still the static per-slice microkernel, now executed sequentially for a
-    small grouped slice task
+  - the per-slice microkernel runs sequentially for a small grouped slice task
   - still one initial resident-grid barrier after init
 
-What changes relative to the static path
+Control-plane design
   - no global route/pack -> compute barrier
-  - no static scheduler in the compute steady state
+  - no resident-grid scheduler in the compute steady state
   - route/pack is warp-private instead of CTA-broadcast
   - compute work is driven by a global append-only ready-task queue
 
-This file is a first implementation pass, not a compiled or profiled artifact.
-It is meant as a concrete CuTeDSL starting point for the next iteration.
+It spans the full M-tile set {16,32,64,128} x 128, so a single dynamic kernel
+covers the decode and prefill bands.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -51,15 +49,8 @@ from cutlass.cutlass_dsl import (
     Int32, Int64, Uint8, Uint32, Uint64, T,
     dsl_user_op, extract_mlir_values, new_from_mlir_values,
 )
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
-
-from b12x.cute.utils import (
-    get_num_sm,
-    get_max_active_clusters,
-    make_ptr,
-)
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
     fabs_f32,
@@ -268,11 +259,36 @@ class MoEDynamicKernelBackend:
         self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
+        # Scale-factor tiles are 128-row atoms in hardware. For sub-128 MMA
+        # tiles (e.g. tile_m=64) one SF atom backs several MMA tiles, so the
+        # TMA atom + smem are built at max(128, tile) and the kernel offsets
+        # into the shared block by `*_tiles_per_block` (mirrors dense.py).
+        self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
+        self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
+        self.sfa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
+        self.sfa_tiles_per_block = self.sfa_tile_shape_mk[0] // mma_tiler_mn[0]
+        self.sfb_tile_shape_nk = (max(128, mma_tiler_mn[1]), tile_k)
+        self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)
         self.cluster_shape_mn = (1, 1)
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
         self.occupancy = 1
-        self.num_mma_warps = 4
+        # Per-tile atom layout / MMA-warp count (dense's table). Keep dynamic's
+        # proven (2,2,1)/4-warp config for the 128 tile; smaller tiles need the
+        # matching atom shape so the SF smem layout + V-map are consistent.
+        _tm = mma_tiler_mn[0]
+        if _tm == 128:
+            self.atom_shape = (2, 2, 1)
+            self.num_mma_warps = 4
+        elif _tm == 16:
+            self.atom_shape = (1, 2, 1)
+            self.num_mma_warps = 2
+        elif _tm == 32:
+            self.atom_shape = (2, 2, 1)
+            self.num_mma_warps = 4
+        else:  # 64
+            self.atom_shape = (4, 2, 1)
+            self.num_mma_warps = 8
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -306,7 +322,7 @@ class MoEDynamicKernelBackend:
         mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
             self.a_dtype, self.acc_dtype, self.sf_dtype,
         )
-        atom_layout = cute.make_layout((2, 2, 1))
+        atom_layout = cute.make_layout(self.atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk, self.sf_vec_size, False,
         )
@@ -315,8 +331,8 @@ class MoEDynamicKernelBackend:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * self.atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
         sfa_smem = sm120_make_smem_layout_sfa(
@@ -331,8 +347,29 @@ class MoEDynamicKernelBackend:
             sfa_smem, sfb_smem, self.epi_tile, cutlass.BFloat16,
             self.smem_capacity, self.occupancy,
         )
-        # ab_stage must divide k_tile_cnt (K/tile_K = 4096/128 = 32) evenly.
-        # _compute_stages returns the max that fits in smem (e.g. 3), but
+        # dense._compute_stages assumes a single B/SFB buffer, but the gated
+        # path keeps two (sB+sB_up, sSFB+sSFB_up) plus a third mbar pipeline.
+        # For sub-128 MMA tiles its smaller A inflates the suggested stage
+        # count past what dynamic's doubled buffers fit, so cap to the real
+        # per-stage footprint before rounding to a divisor of 32.
+        nb = 2 if self.is_gated else 1
+        n_pipe = 3 if self.is_gated else 2
+        # sA smem is the 128-row atom for sub-128 tiles, so size from
+        # sa_tile_shape_mk (= tile_m at tile_m>=128).
+        a_bytes = self.sa_tile_shape_mk[0] * self.sa_tile_shape_mk[1] * self.a_dtype.width // 8
+        b_bytes = cute.size(cute.slice_(self.tile_shape_mnk, (0, None, None))) * self.b_dtype.width // 8
+        sfa_bytes = cute.size(cute.filter_zeros(sfa_smem).shape) * self.sf_dtype.width // 8
+        sfb_bytes = cute.size(cute.filter_zeros(sfb_smem).shape) * self.sf_dtype.width // 8
+        per_stage = a_bytes + nb * b_bytes + sfa_bytes + nb * sfb_bytes + n_pipe * 2 * 8
+        fixed = (
+            self.tile_shape_mnk[0] * self.tile_shape_mnk[1] * 2  # sC (bf16 epi)
+            + 2 * (self.num_mma_warps + 1) * 32 * 4              # route caches
+            + self.tile_shape_mnk[0] * 8                         # scatter caches
+            + 8 * 8 + 1024 + 8 * 1024                            # ctrl/mbar/align slack
+        )
+        max_fit = max(1, (self.smem_capacity - fixed) // per_stage)
+        self.ab_stage = min(self.ab_stage, max_fit)
+        # ab_stage must divide k_tile_cnt (K/tile_K = 4096/128 = 32) evenly;
         # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
         while self.ab_stage > 1 and 32 % self.ab_stage != 0:
             self.ab_stage -= 1
@@ -351,6 +388,28 @@ class MoEDynamicKernelBackend:
             cutlass.BFloat16, self.c_layout,
             self.epi_stage,
             self.sf_vec_size, self.tiled_mma,
+        )
+        # The A operand needs the 128-major swizzle atom for sub-128 MMA tiles
+        # (the LdMatrix/MMA path); dense builds it at tile_m. Override with the
+        # 128-atom layout (see _make_a_smem_layout). Identity when
+        # tile_m>=128 (sa_tiles_per_block==1), so the 128 path is untouched.
+        if cutlass.const_expr(self.sa_tiles_per_block > 1):
+            self.a_smem_layout_staged = self._make_a_smem_layout(self.ab_stage)
+
+    def _make_a_smem_layout(self, ab_stage: int):
+        import cutlass.utils.hopper_helpers as sm90_utils
+        a_is_k_major = self.a_layout.is_k_major_a()
+        a_major_mode_size = self.sa_tile_shape_mk[1 if a_is_k_major else 0]
+        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            sm90_utils.get_smem_layout_atom(
+                self.a_layout, self.a_dtype, a_major_mode_size,
+            ),
+            self.a_dtype,
+        )
+        return cute.tile_to_shape(
+            a_smem_layout_atom,
+            cute.append(self.sa_tile_shape_mk, ab_stage),
+            order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
         )
 
     @cute.jit
@@ -511,11 +570,11 @@ class MoEDynamicKernelBackend:
         # TMA descriptors
         tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
             packed_a, self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), 1,
+            self.sa_tile_shape_mk, 1,
         )
         tma_sfa, gSFA = self._dense_cls._make_tma_atoms_and_tensors(
             sfa_tensor, self.sfa_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), 1,
+            self.sfa_tile_shape_mk, 1,
             internal_type=cutlass.Int16,
         )
         # Single TMA descriptor over FC1 weights. Gated activation packs
@@ -526,7 +585,7 @@ class MoEDynamicKernelBackend:
         )
         tma_sfb_w13, gSFB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_w13_tensor, self.sfb_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), 1,
+            self.sfb_tile_shape_nk, 1,
             internal_type=cutlass.Int16,
         )
         # B_down TMA
@@ -538,7 +597,7 @@ class MoEDynamicKernelBackend:
         )
         tma_sfb_down, gSFB_down = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_down_tensor, self.sfb_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), 1,
+            self.sfb_tile_shape_nk, 1,
             internal_type=cutlass.Int16,
         )
 
@@ -729,15 +788,9 @@ class MoEDynamicKernelBackend:
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
         sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
         sB_up = storage.sB_up.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
-        sA_in_u8 = cute.recast_tensor(sA, cutlass.Uint8)
-        sB_u8 = cute.recast_tensor(sB, cutlass.Uint8)
-        sB_up_u8 = cute.recast_tensor(sB_up, cutlass.Uint8)
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
         sSFB_up = storage.sSFB_up.get_tensor(sfb_smem_staged)
-        sSFA_u8 = cute.recast_tensor(sSFA, cutlass.Uint8)
-        sSFB_u8 = cute.recast_tensor(sSFB, cutlass.Uint8)
-        sSFB_up_u8 = cute.recast_tensor(sSFB_up, cutlass.Uint8)
         sC = storage.sC.get_tensor(
             epi_smem_staged.outer, swizzle=epi_smem_staged.inner,
         )
@@ -758,7 +811,6 @@ class MoEDynamicKernelBackend:
         output_bytes_per_row = cols // Int32(2)
         cols_u32 = cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
-        max_rows = Int32(token_map.shape[0])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
@@ -915,13 +967,16 @@ class MoEDynamicKernelBackend:
                             for cache_slot in cutlass.range_constexpr(8):
                                 slot = route_slot_base + Int32(cache_slot)
                                 phys_row = _ld_shared_i32(route_phys_rows_addr + slot * Int32(4))
-                                phys_tile = phys_row // Int32(self.tile_shape_mnk[0])
-                                tile_row = phys_row - phys_tile * Int32(self.tile_shape_mnk[0])
                                 route_output_base[cache_slot] = phys_row * output_bytes_per_row
+                                # scale_storage uses 128-row SF atoms: index by the
+                                # 128-atom (phys_row>>7) + row-within-atom, not the
+                                # MMA tile. Identity at tile_m==128.
+                                sf_atom = phys_row >> Int32(7)
+                                sf_row = phys_row & Int32(127)
                                 route_scale_base[cache_slot] = (
-                                    phys_tile * num_k_tiles * Int32(32 * 4 * 4)
-                                    + (tile_row % Int32(32)) * Int32(4 * 4)
-                                    + ((tile_row % Int32(32 * 4)) // Int32(32)) * Int32(4)
+                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                                    + (sf_row % Int32(32)) * Int32(4 * 4)
+                                    + (sf_row // Int32(32)) * Int32(4)
                                 )
 
                             sf_idx = lane_id
@@ -969,17 +1024,21 @@ class MoEDynamicKernelBackend:
                                 while topk_slot < num_topk:
                                     slot = route_slot_base + topk_slot
                                     phys_row = _ld_shared_i32(route_phys_rows_addr + slot * Int32(4))
-                                    phys_tile = phys_row // Int32(self.tile_shape_mnk[0])
-                                    tile_row = phys_row - phys_tile * Int32(self.tile_shape_mnk[0])
                                     output_offset = phys_row * output_bytes_per_row + sf_idx * Int32(8)
                                     st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
 
+                                    # scale_storage uses 128-row SF atoms
+                                    # (tile_atom_to_shape_SF); index by the 128-atom
+                                    # (phys_row>>7) + row-within-atom, NOT the MMA
+                                    # tile (which may be 64). Identity at tile_m==128.
                                     k_tile_idx = sf_idx // Int32(4)
-                                    outer_m_idx = tile_row % Int32(32)
-                                    inner_m_idx = (tile_row % Int32(32 * 4)) // Int32(32)
+                                    sf_atom = phys_row >> Int32(7)
+                                    sf_row = phys_row & Int32(127)
+                                    outer_m_idx = sf_row % Int32(32)
+                                    inner_m_idx = sf_row // Int32(32)
                                     inner_k_idx = sf_idx % Int32(4)
                                     scale_offset = (
-                                        phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
                                         + k_tile_idx * Int32(32 * 4 * 4)
                                         + outer_m_idx * Int32(4 * 4)
                                         + inner_m_idx * Int32(4)
@@ -1067,14 +1126,21 @@ class MoEDynamicKernelBackend:
                                 st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
 
                                 k_tile_idx = sf_idx // Int32(4)
-                                outer_m_idx = row % Int32(32)
-                                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
                                 inner_k_idx = sf_idx % Int32(4)
+                                # scale_storage uses 128-row SF atoms: index by the
+                                # 128-atom + row-within-atom, not the MMA tile.
+                                # Identity at tile_m==128.
+                                phys_row = (
+                                    phys_tile * Int32(self.tile_shape_mnk[0])
+                                    + row % Int32(self.tile_shape_mnk[0])
+                                )
+                                sf_atom = phys_row >> Int32(7)
+                                sf_row = phys_row & Int32(127)
                                 scale_offset = (
-                                    phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
                                     + k_tile_idx * Int32(32 * 4 * 4)
-                                    + outer_m_idx * Int32(4 * 4)
-                                    + inner_m_idx * Int32(4)
+                                    + (sf_row % Int32(32)) * Int32(4 * 4)
+                                    + (sf_row // Int32(32)) * Int32(4)
                                     + inner_k_idx
                                 )
                                 scale_storage[scale_offset] = scale_byte
@@ -1177,14 +1243,16 @@ class MoEDynamicKernelBackend:
                     Int32(1),
                 )
 
-        gA = cute.local_tile(mA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
+        gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
         # Single tiled view over concatenated w13 [2*I_tp, K, E].
         # W13 is packed as [up, gate] across the concatenated N dimension.
         # Up tiles: N-indices 0..gate_tile_cnt-1
         # Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
         gB_w13_tiled = cute.local_tile(mB_w13, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
-        gSFA = cute.local_tile(mSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
-        gSFB_w13_tiled = cute.local_tile(mSFB_w13, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
+        # SF tiles use the 128-row atom shape; for sub-128 MMA tiles one SF
+        # block backs `sfa_tiles_per_block` MMA tiles (offset applied below).
+        gSFA = cute.local_tile(mSFA, self.sfa_tile_shape_mk, (None, None, None))
+        gSFB_w13_tiled = cute.local_tile(mSFB_w13, self.sfb_tile_shape_nk, (None, None, None))
         thr_mma = tiled_mma.get_slice(tidx)
 
         a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
@@ -1228,9 +1296,29 @@ class MoEDynamicKernelBackend:
         tBgSFB_down = cute.filter_zeros(tBgSFB_down)
 
         # MMA fragment partitions
-        tCsA = thr_mma.partition_A(sA)
+        # sA is the 128-major atom for sub-128 tiles; slice to the tile_m sub-tile
+        # the V-map expects (offset applied per-task at consumption). Identity at
+        # tile_m>=128.
+        if cutlass.const_expr(self.sa_tiles_per_block > 1):
+            sA_part = cute.local_tile(
+                sA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                (Int32(0), 0, None),
+            )
+        else:
+            sA_part = sA
+        tCsA = thr_mma.partition_A(sA_part)
         tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
-        tCrSFA = self._dense_cls._partition_fragment_SFA(self, sSFA[None, None, 0], thr_mma, tidx)
+        # sSFA holds a full 128-row SF atom; for sub-128 MMA tiles slice it to the
+        # tile_m-row sub-tile the V-map expects. Identity when
+        # tile_m>=128 (sfa_tiles_per_block==1) so the 128 path is byte-identical.
+        if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+            sSFA_part = cute.local_tile(
+                sSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                (Int32(0), 0, None),
+            )
+        else:
+            sSFA_part = sSFA
+        tCrSFA = self._dense_cls._partition_fragment_SFA(self, sSFA_part[None, None, 0], thr_mma, tidx)
         tCsB = thr_mma.partition_B(sB)
         tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
         tCrSFB = self._dense_cls._partition_fragment_SFB(self, sSFB[None, None, 0], thr_mma, tidx)
@@ -1284,7 +1372,7 @@ class MoEDynamicKernelBackend:
 
         thr_ld_A = smem_copy_A.get_slice(tidx)
         thr_ld_B = smem_copy_B.get_slice(tidx)
-        csA = thr_ld_A.partition_S(sA)
+        csA = thr_ld_A.partition_S(sA_part)
         crA = thr_ld_A.retile(tCrA)
         csB = thr_ld_B.partition_S(sB)
         csB_up = thr_ld_B.partition_S(sB_up)
@@ -1292,7 +1380,7 @@ class MoEDynamicKernelBackend:
 
         thr_ld_SFA = smem_copy_SFA.get_slice(tidx)
         thr_ld_SFB = smem_copy_SFB.get_slice(tidx)
-        csSFA = thr_ld_SFA.partition_S(sSFA)
+        csSFA = thr_ld_SFA.partition_S(sSFA_part)
         crSFA = thr_ld_SFA.retile(tCrSFA)
         csSFB = thr_ld_SFB.partition_S(sSFB)
         csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
@@ -1390,7 +1478,32 @@ class MoEDynamicKernelBackend:
 
                 alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
                 valid_rows = task_valid_rows_val
-                tile_m_base = task_m_tile_idx * Int32(self.tile_shape_mnk[0])
+
+                # In-loop SFA partition for sub-128 tiles. FC1 reads the
+                # TMA-loaded activation SF, whose rows sit at offset
+                # (task_m_tile_idx % sfa_tiles_per_block) within the shared
+                # 128-row atom. (FC2 re-slices at offset 0 before phase B, since
+                # its intermediate SF is quant-written to the atom's first half.)
+                if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                    _fc1_off = task_m_tile_idx % Int32(self.sfa_tiles_per_block)
+                    _sA_il = cute.local_tile(
+                        sA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (_fc1_off, 0, None),
+                    )
+                    tCrA = tiled_mma.make_fragment_A(
+                        thr_mma.partition_A(_sA_il)[None, None, None, 0]
+                    )
+                    csA = thr_ld_A.partition_S(_sA_il)
+                    crA = thr_ld_A.retile(tCrA)
+                    _sSFA_il = cute.local_tile(
+                        sSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (_fc1_off, 0, None),
+                    )
+                    tCrSFA = self._dense_cls._partition_fragment_SFA(
+                        self, _sSFA_il[None, None, 0], thr_mma, tidx,
+                    )
+                    csSFA = thr_ld_SFA.partition_S(_sSFA_il)
+                    crSFA = thr_ld_SFA.retile(tCrSFA)
 
                 _is_m_major = self.c_layout.is_m_major_c()
                 copy_atom_r2s = cute.make_copy_atom(
@@ -1725,6 +1838,30 @@ class MoEDynamicKernelBackend:
                     warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
                     warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
 
+                    # FC2's intermediate A/SF were quant-written to the first
+                    # half of the shared 128-row atom, so phase B reads offset 0
+                    # (vs FC1's per-task offset). Re-slice both. Identity at
+                    # tile_m==128.
+                    if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                        _sA_p2 = cute.local_tile(
+                            sA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (Int32(0), 0, None),
+                        )
+                        tCrA = tiled_mma.make_fragment_A(
+                            thr_mma.partition_A(_sA_p2)[None, None, None, 0]
+                        )
+                        csA = thr_ld_A.partition_S(_sA_p2)
+                        crA = thr_ld_A.retile(tCrA)
+                        _sSFA_p2 = cute.local_tile(
+                            sSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (Int32(0), 0, None),
+                        )
+                        tCrSFA = self._dense_cls._partition_fragment_SFA(
+                            self, _sSFA_p2[None, None, 0], thr_mma, tidx,
+                        )
+                        csSFA = thr_ld_SFA.partition_S(_sSFA_p2)
+                        crSFA = thr_ld_SFA.retile(tCrSFA)
+
                     csA_phase2 = csA[None, None, None, 0]
                     csSFA_phase2 = csSFA[None, None, None, 0]
 
@@ -1877,8 +2014,14 @@ class MoEDynamicKernelBackend:
                 task_slice_begin_idx = _ld_shared_i32(ctrl_base_addr + Int32(16))
                 task_slice_count_val = _ld_shared_i32(ctrl_base_addr + Int32(20))
 
-                tAgA_mk = tAgA[(None, task_m_tile_idx, None, Int32(0))]
-                tAgSFA_mk = tAgSFA[(None, task_m_tile_idx, None, Int32(0))]
+                # gA and gSFA are tiled in 128-row atoms; a sub-128 MMA tile maps
+                # to block (task_m_tile_idx // tiles_per_block). The within-block
+                # half is selected in the fragment partition. Identity when
+                # tile_m>=128 (tiles_per_block==1).
+                sa_block_idx = task_m_tile_idx // Int32(self.sa_tiles_per_block)
+                tAgA_mk = tAgA[(None, sa_block_idx, None, Int32(0))]
+                sfa_block_idx = task_m_tile_idx // Int32(self.sfa_tiles_per_block)
+                tAgSFA_mk = tAgSFA[(None, sfa_block_idx, None, Int32(0))]
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
                     intermediate_slice = task_slice_begin_idx + slice_idx

@@ -1,8 +1,7 @@
 from .dynamic import MoEDynamicKernelBackend
 from .micro import MoEMicroKernelBackend
-from .relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2, MoEStaticKernelRelu2
-from .silu import MoEDynamicKernelSilu, MoEMicroKernelSilu, MoEStaticKernelSilu
-from .static import MoEStaticKernelBackend
+from .relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2
+from .silu import MoEDynamicKernelSilu, MoEMicroKernelSilu
 from .reference import (
     MoERouteTrace,
     OracleMetrics,
@@ -14,7 +13,6 @@ from .reference import (
 
 MoEDynamicKernel = MoEDynamicKernelSilu
 MoEMicroKernel = MoEMicroKernelSilu
-MoEStaticKernel = MoEStaticKernelSilu
 
 __all__ = [
     "MoEDynamicKernelBackend",
@@ -25,10 +23,6 @@ __all__ = [
     "MoEMicroKernel",
     "MoEMicroKernelRelu2",
     "MoEMicroKernelSilu",
-    "MoEStaticKernelBackend",
-    "MoEStaticKernel",
-    "MoEStaticKernelRelu2",
-    "MoEStaticKernelSilu",
     "MoERouteTrace",
     "OracleMetrics",
     "compare_to_reference",

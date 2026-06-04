@@ -564,7 +564,10 @@ class MoEMicroKernelBackend:
         num_topk: int,
         weight_E: int,
     ) -> bool:
-        if m not in (1, 2, 4, 8):
+        # Micro keeps the m tokens' activations resident; 8 is the register
+        # budget ceiling. The FC1 task decode and FC2 are generic in m, so any
+        # 1<=m<=8 is correct (not just powers of two).
+        if not (1 <= m <= 8):
             return False
         if k <= 0 or k % _BLOCK_SIZE != 0 or k % 128 != 0:
             return False
@@ -801,13 +804,23 @@ class MoEMicroKernelBackend:
             for nc in cutlass.range_constexpr(cfg.fc2_n_chunks):
                 chunk_base = Int32(nc) * Int32(128)
                 kk_off = Int32(kk) * n_u32_per_expert + chunk_base
-                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
-
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
+                # If the last 256-wide chunk overhangs a non-256-aligned n
+                # (e.g. n=384), lanes past num_cb index the uninitialized
+                # intermediate tail. The weight there is already masked to 0,
+                # but 0 * NaN = NaN, so mask the activation read too. Gated by
+                # constexpr so 256-aligned shapes emit no extra runtime work.
+                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                    xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                else:
+                    xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
                 u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + Int64(chunk_base) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
                 if cutlass.const_expr(self.scale_format_e8m0_k32):
                     ebase_w2p = Int64(eid) * Int64((cfg.n // 32) * cfg.k_dim)
@@ -1149,10 +1162,18 @@ class MoEMicroKernelBackend:
                         prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off2)
                         prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off3)
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
-                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                # See _m1_fc2_rowpair_wide: mask the intermediate tail read for
+                # non-256-aligned n (0 weight * NaN tail = NaN). constexpr-gated.
+                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                    xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                    xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane]) if w_valid > Int32(0) else Uint32(0)
+                else:
+                    xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
                 u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + Int64(chunk_base) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
                 if cutlass.const_expr(self.scale_format_e8m0_k32):
                     ebase_w2p = Int64(eid) * Int64((cfg.n // 32) * cfg.k_dim)

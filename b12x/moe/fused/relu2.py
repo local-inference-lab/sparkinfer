@@ -6,7 +6,6 @@ from typing import Tuple
 
 from b12x.moe.fused.dynamic import MoEDynamicKernelBackend
 from b12x.moe.fused.micro import MoEMicroKernelBackend
-from b12x.moe.fused.static import MoEStaticKernelBackend
 
 
 class MoEMicroKernelRelu2(MoEMicroKernelBackend):
@@ -46,34 +45,6 @@ class MoEMicroKernelRelu2(MoEMicroKernelBackend):
         return super().is_supported(m, k, n, num_topk, weight_E)
 
 
-class MoEStaticKernelRelu2(MoEStaticKernelBackend):
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        output_tile_count_n: int,
-        *,
-        exact_mma_m_tiles: bool = False,
-        fast_math: bool = False,
-        single_token: bool = False,
-        share_input_across_experts: bool = False,
-        share_expert_scales: bool = False,
-        dynamic_down_scale: bool = False,
-    ):
-        super().__init__(
-            sf_vec_size,
-            mma_tiler_mn,
-            output_tile_count_n,
-            exact_mma_m_tiles=exact_mma_m_tiles,
-            fast_math=fast_math,
-            activation="relu2",
-            single_token=single_token,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            dynamic_down_scale=dynamic_down_scale,
-        )
-
-
 class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
     def __init__(
         self,
@@ -97,5 +68,4 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
 __all__ = [
     "MoEDynamicKernelRelu2",
     "MoEMicroKernelRelu2",
-    "MoEStaticKernelRelu2",
 ]
