@@ -543,6 +543,117 @@ def test_w4a16_e8m0_native_large_m_uses_main_gemm(
     _assert_matches_oracle(actual, expected, activation=activation)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["silu", "relu2"])
+def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
+    activation: str,
+) -> None:
+    """Native E8M0 supports compact FC2 K tails without padding I to 32."""
+    experts, hidden_size = 4, 128
+    intermediate_size = 312 if activation == "silu" else 112
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    topk, m = 2, 24
+    assert intermediate_size % 8 == 0
+    assert intermediate_size % 32 != 0
+    torch.manual_seed(20260610)
+    w13 = torch.randint(
+        0, 256, (experts, rows, hidden_size // 2), dtype=torch.uint8, device="cuda"
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale_cols = (intermediate_size + 31) // 32
+    w2_scale = _pattern_e8m0((experts, hidden_size, w2_scale_cols), offset=1)
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+
+    assert not _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout="w31",
+        scale_format="e8m0_k32",
+    )
+
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    assert prepared.weight_layout == "modelopt"
+    assert prepared.scale_format == "e8m0_k32"
+    padded_w13_scale_rows = ((rows + 63) // 64) * 64
+    assert tuple(prepared.w13_scale.shape) == (
+        experts,
+        hidden_size // 32,
+        padded_w13_scale_rows,
+    )
+    assert tuple(prepared.w2_scale.shape) == (experts, w2_scale_cols, hidden_size)
+
+    buffers = make_w4a16_buffers(
+        prepared, m=m, topk=topk, dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(0, experts, (m, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        swiglu_limit=None,
+        w13_layout="w31",
+    )
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(actual).all().item())
+    assert bool((actual != 0).any().item())
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
 def test_micro_scale_format_distinguishes_compile_cache_key() -> None:
     """E8M0 vs E4M3 micro kernels must not collide in the compile cache."""
     common = dict(

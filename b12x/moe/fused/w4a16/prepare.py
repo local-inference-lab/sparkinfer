@@ -25,6 +25,7 @@ _SOURCE_FORMATS = {
     "compressed_tensors": "compressed_tensors",
 }
 _E8M0_K32_BF16_MAX_SCALE_BYTE = 247
+_E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 # Canonical W13 layout names are "w13"/"w31"; accept the physical FC1-half
 # spellings as aliases. Logical checkpoint order "w13" arrives up/gate and
 # needs a swap before the kernel's SwiGLU; "w31" is already kernel-native
@@ -74,6 +75,7 @@ class W4A16ModelOptWeights:
     params_dtype: torch.dtype
     source_format: str = "modelopt_nvfp4"
     weight_layout: str = "modelopt"
+    scale_format: str = "e4m3_k16"
     micro_w13_scale: torch.Tensor | None = None
     micro_w13_global_scale: torch.Tensor | None = None
     micro_w2_scale: torch.Tensor | None = None
@@ -106,18 +108,64 @@ def _scale_perms() -> tuple[list[int], list[int]]:
     return scale_perm, scale_perm_single
 
 
+def _e8m0_logical_tail_scale_n(size_n: int) -> int:
+    return (
+        (int(size_n) + _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT - 1)
+        // _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT
+    ) * _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT
+
+
 def _permute_packed_scales(
     scales: torch.Tensor,
     *,
     size_k: int,
     size_n: int,
     group_size: int,
+    output_size_n: int | None = None,
 ) -> torch.Tensor:
     scale_perm, scale_perm_single = _scale_perms()
     if group_size < size_k and group_size != -1:
-        scales = scales.reshape((-1, len(scale_perm)))[:, scale_perm]
+        block = len(scale_perm)
+        if output_size_n is not None or int(size_n) % block != 0:
+            padded_n = (
+                ((int(size_n) + block - 1) // block) * block
+                if output_size_n is None
+                else int(output_size_n)
+            )
+            if padded_n < int(size_n) or padded_n % block != 0:
+                raise ValueError(
+                    f"output_size_n must be a multiple of {block} and >= size_n"
+                )
+            padded = scales.new_zeros((int(scales.shape[0]), padded_n))
+            padded[:, : int(size_n)] = scales
+            scales = padded.reshape((int(scales.shape[0]), -1, block))
+            scales = scales[:, :, scale_perm].reshape((int(scales.shape[0]), padded_n))
+            if output_size_n is None:
+                scales = scales[:, : int(size_n)]
+            return scales.contiguous()
+        scales = scales.reshape((-1, block))[:, scale_perm]
     else:
-        scales = scales.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+        block = len(scale_perm_single)
+        if output_size_n is not None or int(size_n) % block != 0:
+            padded_n = (
+                ((int(size_n) + block - 1) // block) * block
+                if output_size_n is None
+                else int(output_size_n)
+            )
+            if padded_n < int(size_n) or padded_n % block != 0:
+                raise ValueError(
+                    f"output_size_n must be a multiple of {block} and >= size_n"
+                )
+            padded = scales.new_zeros((int(scales.shape[0]), padded_n))
+            padded[:, : int(size_n)] = scales
+            scales = padded.reshape((int(scales.shape[0]), -1, block))
+            scales = scales[:, :, scale_perm_single].reshape(
+                (int(scales.shape[0]), padded_n)
+            )
+            if output_size_n is None:
+                scales = scales[:, : int(size_n)]
+            return scales.contiguous()
+        scales = scales.reshape((-1, block))[:, scale_perm_single]
     return scales.reshape((-1, size_n)).contiguous()
 
 
@@ -214,13 +262,24 @@ def _validate_e8m0_k32_scales(
     rows: int,
     cols: int,
     name: str,
+    allow_k_tail: bool = False,
 ) -> torch.Tensor:
     """Validate source E8M0 K/32 scale tensor shape and dtype."""
     if scales.ndim != 3:
-        raise ValueError(f"{name} must be [E, N, K/32], got {tuple(scales.shape)}")
-    if int(cols) % 32 != 0:
+        raise ValueError(
+            f"{name} must be [E, N, ceil(K/32)], got {tuple(scales.shape)}"
+        )
+    if allow_k_tail:
+        if int(cols) % 8 != 0:
+            raise ValueError(
+                f"{name} compact E8M0 K-tail requires K divisible by 8, got "
+                f"{int(cols)}"
+            )
+        expected_cols = (int(cols) + 31) // 32
+    elif int(cols) % 32 != 0:
         raise ValueError(f"{name} requires K divisible by 32, got {int(cols)}")
-    expected_cols = int(cols) // 32
+    else:
+        expected_cols = int(cols) // 32
     if tuple(scales.shape[1:]) != (int(rows), expected_cols):
         raise ValueError(
             f"{name} must have shape [E, {int(rows)}, {expected_cols}] for "
@@ -241,28 +300,49 @@ def _pack_e8m0_k32_scales(
     size_n: int,
     row_rotation: int | None = None,
     reuse_input_storage: bool = False,
+    allow_k_tail: bool = False,
+    padded_size_n: int | None = None,
 ) -> torch.Tensor:
-    if int(size_k) % 32 != 0:
+    if allow_k_tail:
+        if int(size_k) % 8 != 0:
+            raise ValueError(
+                f"compact E8M0 K-tail requires K divisible by 8, got {size_k}"
+            )
+        scale_cols = (int(size_k) + 31) // 32
+    elif int(size_k) % 32 != 0:
         raise ValueError(f"E8M0 K/32 scales require K divisible by 32, got {size_k}")
-    if tuple(scales.shape[1:]) != (int(size_n), int(size_k) // 32):
+    else:
+        scale_cols = int(size_k) // 32
+    if tuple(scales.shape[1:]) != (int(size_n), scale_cols):
         raise ValueError(
-            f"expected E8M0 scale shape [E, {int(size_n)}, {int(size_k) // 32}], "
+            f"expected E8M0 scale shape [E, {int(size_n)}, {scale_cols}], "
             f"got {tuple(scales.shape)}"
+        )
+    output_size_n = int(size_n) if padded_size_n is None else int(padded_size_n)
+    if output_size_n < int(size_n):
+        raise ValueError(
+            f"padded_size_n must be >= size_n, got {output_size_n} < {int(size_n)}"
         )
     source = scales.view(torch.uint8)
     if reuse_input_storage:
+        if output_size_n != int(size_n):
+            raise ValueError("reuse_input_storage requires unpadded E8M0 scales")
+        if allow_k_tail:
+            raise ValueError(
+                "reuse_input_storage is not supported for compact E8M0 K-tail scales"
+            )
         if not source.is_contiguous():
             raise ValueError("reuse_input_storage requires contiguous E8M0 scales")
         source.clamp_(max=_E8M0_K32_BF16_MAX_SCALE_BYTE)
         packed = source.reshape(
             int(source.shape[0]),
-            int(size_k) // 32,
-            int(size_n),
+            scale_cols,
+            output_size_n,
         )
     else:
         source = source.clamp(max=_E8M0_K32_BF16_MAX_SCALE_BYTE)
         packed = torch.empty(
-            (int(source.shape[0]), int(size_k) // 32, int(size_n)),
+            (int(source.shape[0]), scale_cols, output_size_n),
             dtype=torch.uint8,
             device=scales.device,
         )
@@ -278,6 +358,7 @@ def _pack_e8m0_k32_scales(
             size_k=size_k,
             size_n=size_n,
             group_size=32,
+            output_size_n=output_size_n,
         )
         expert_packed = (
             expert_packed.view(-1, 4)[:, [0, 2, 1, 3]]
@@ -797,6 +878,10 @@ def prepare_w4a16_e8m0_native_weights(
     intermediate_size = shape.intermediate_size
     w13_rows = shape.w13_rows
     is_gated = shape.is_gated
+    allow_w2_k_tail = intermediate_size % 32 != 0
+    padded_w13_scale_n = (
+        _e8m0_logical_tail_scale_n(w13_rows) if allow_w2_k_tail else w13_rows
+    )
 
     w13_scale = _validate_e8m0_k32_scales(
         w13_e8m0_scale,
@@ -809,6 +894,7 @@ def prepare_w4a16_e8m0_native_weights(
         rows=hidden_size,
         cols=intermediate_size,
         name="w2_e8m0_scale",
+        allow_k_tail=allow_w2_k_tail,
     )
     # Main-GEMM (med/large M) packed E8M0 scales. The "w13" (up_gate) layout
     # needs the FC1 half-swap folded into the scale grid; the kernel applies the
@@ -820,11 +906,13 @@ def prepare_w4a16_e8m0_native_weights(
         size_k=hidden_size,
         size_n=w13_rows,
         row_rotation=w13_row_rotation,
+        padded_size_n=padded_w13_scale_n,
     )
     packed_w2_scale = _pack_e8m0_k32_scales(
         w2_scale,
         size_k=intermediate_size,
         size_n=hidden_size,
+        allow_k_tail=allow_w2_k_tail,
     )
     # Storage-compatible single grid: micro reads the SAME packed _pack_e8m0_k32
     # scales the main GEMM reads (no separate K/16 micro grid).
@@ -844,6 +932,7 @@ def prepare_w4a16_e8m0_native_weights(
         is_gated=is_gated,
         params_dtype=params_dtype,
         source_format="fp4_e8m0_k32",
+        scale_format="e8m0_k32",
         micro_w13_scale=packed_w13_scale,
         micro_w13_global_scale=w13_global,
         micro_w2_scale=packed_w2_scale,

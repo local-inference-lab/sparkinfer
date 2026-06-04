@@ -31,6 +31,7 @@ from b12x.cute.fp4 import (
     get_ptr_as_int64,
     half2_mul,
     ld_global_acquire_i32,
+    ld_global_nc_u32,
     ld_global_v4_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
@@ -58,6 +59,7 @@ from b12x.cute.fp4 import (
     st_shared_i32,
     st_shared_u32,
     st_shared_v4_f32,
+    st_shared_v4_u32,
     threadfence,
 )
 from b12x.cute.utils import current_cuda_stream, make_ptr
@@ -79,6 +81,7 @@ from b12x.moe.fused.micro import MoEMicroKernelBackend, _direct_k_segments_for_k
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
 _STAGES = 4
+_E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed", "modelopt"}
@@ -151,6 +154,13 @@ _LARGE_BATCH_TILE_CONFIGS = (
 
 def _covering_count(total: int, quantum: int) -> int:
     return (total + quantum - 1) // quantum
+
+
+def _e8m0_logical_tail_scale_n(size_n: int) -> int:
+    return (
+        (int(size_n) + _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT - 1)
+        // _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT
+    ) * _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT
 
 
 def _normalize_swiglu_limit(swiglu_limit: float | None) -> float | None:
@@ -272,13 +282,26 @@ def _candidate_tile_fits(
     cta_threads: int,
     max_shared_mem: int,
     scale_format: str = "e4m3_k16",
+    allow_logical_tail: bool = False,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
-    if int(problem_k) % int(tile_k) != 0 or int(problem_n) % int(tile_n) != 0:
-        return False
     scale_group_size = _scale_group_size(scale_format)
-    if int(problem_k) % scale_group_size != 0 or int(tile_k) % scale_group_size != 0:
+    exact_n = int(problem_n) % int(tile_n) == 0
+    exact_k = int(problem_k) % int(tile_k) == 0
+    exact_scale_k = int(problem_k) % scale_group_size == 0
+    if not allow_logical_tail:
+        if not exact_n or not exact_k:
+            return False
+        if not exact_scale_k or int(tile_k) % scale_group_size != 0:
+            return False
+    elif (
+        _normalize_scale_format(scale_format) != "e8m0_k32"
+        or int(problem_n) % 16 != 0
+        or int(problem_k) % 8 != 0
+        or int(tile_n) % 16 != 0
+        or int(tile_k) % scale_group_size != 0
+    ):
         return False
     if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
         return False
@@ -302,6 +325,7 @@ def _select_tile_config(
     max_shared_mem: int,
     required_cta_threads: int | None = None,
     scale_format: str = "e4m3_k16",
+    allow_logical_tail: bool = False,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -324,11 +348,17 @@ def _select_tile_config(
             cta_threads=cta_threads,
             max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
+            allow_logical_tail=allow_logical_tail,
         ):
             continue
+        occupancy_problem_n = (
+            _covering_count(int(problem_n), int(tile_n)) * int(tile_n)
+            if allow_logical_tail
+            else int(problem_n)
+        )
         blocks_per_sm_limit = _determine_blocks_per_sm(
             problem_m=problem_m,
-            problem_n=problem_n,
+            problem_n=occupancy_problem_n,
             top_k=top_k,
             cta_threads=cta_threads,
             cta_m_blocks=cta_m_blocks,
@@ -551,14 +581,44 @@ class W4A16GemmKernel:
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
             )
-        if size_n % tile_n != 0:
-            raise ValueError("size_n must be divisible by tile_n")
-        if size_k % tile_k != 0:
-            raise ValueError("size_k must be divisible by tile_k")
         if tile_n % 16 != 0 or tile_k % 16 != 0:
             raise ValueError("tile_n/tile_k must be multiples of 16")
-        if scale_format == "e8m0_k32" and (size_k % 32 != 0 or tile_k % 32 != 0):
-            raise ValueError("E8M0 K/32 W4A16 scales require size_k/tile_k multiples of 32")
+        scale_group_size = _scale_group_size(scale_format)
+        has_n_tile_tail = int(size_n) % int(tile_n) != 0
+        has_k_tile_tail = int(size_k) % int(tile_k) != 0
+        has_scale_k_tail = int(size_k) % scale_group_size != 0
+        has_logical_tail = (
+            has_n_tile_tail or has_k_tile_tail or has_scale_k_tail
+        )
+        if has_logical_tail:
+            if weight_layout != "modelopt" or scale_format != "e8m0_k32":
+                raise ValueError(
+                    "W4A16 logical tail tiles are only supported for native "
+                    "E8M0 K/32 weights"
+                )
+            if int(size_n) % 16 != 0:
+                raise ValueError(
+                    "native E8M0 W4A16 tail tiles require size_n % 16 == 0"
+                )
+            if int(size_k) % 8 != 0:
+                raise ValueError(
+                    "native E8M0 W4A16 tail tiles require size_k % 8 == 0"
+                )
+            if int(tile_k) % scale_group_size != 0:
+                raise ValueError(
+                    "native E8M0 W4A16 tail tiles require tile_k multiples of 32"
+                )
+        else:
+            if size_n % tile_n != 0:
+                raise ValueError("size_n must be divisible by tile_n")
+            if size_k % tile_k != 0:
+                raise ValueError("size_k must be divisible by tile_k")
+            if scale_format == "e8m0_k32" and (
+                size_k % 32 != 0 or tile_k % 32 != 0
+            ):
+                raise ValueError(
+                    "E8M0 K/32 W4A16 scales require size_k/tile_k multiples of 32"
+                )
         if moe_block_size not in _ALLOWED_ROUTED_SIZES:
             raise ValueError(f"unsupported moe_block_size {moe_block_size}")
         if moe_block_size != 8 and moe_block_size % 16 != 0:
@@ -584,6 +644,22 @@ class W4A16GemmKernel:
         self.weight_layout = weight_layout
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
+        self.scale_group_size = int(scale_group_size)
+        self.scale_k_groups = _covering_count(self.size_k, self.scale_group_size)
+        self.n_tiles = _covering_count(self.size_n, self.tile_n)
+        self.k_tiles = _covering_count(self.size_k, self.tile_k)
+        self.covered_size_n = self.n_tiles * self.tile_n
+        self.covered_size_k = self.k_tiles * self.tile_k
+        self.has_n_tile_tail = bool(has_n_tile_tail)
+        self.has_k_tile_tail = bool(has_k_tile_tail)
+        self.has_scale_k_tail = bool(has_scale_k_tail)
+        self.has_logical_tail = bool(has_logical_tail)
+        self.scale_size_n = (
+            _e8m0_logical_tail_scale_n(self.size_n)
+            if self.scale_format_e8m0_k32 and self.has_n_tile_tail
+            else self.size_n
+        )
+        self.scale_n_groups = self.scale_size_n // 16
         self.w13_layout = w13_layout
         self.source_n_rotation = int(source_n_rotation)
         self.single_token_route_fast_path = bool(single_token_route_fast_path)
@@ -608,7 +684,7 @@ class W4A16GemmKernel:
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
-            problem_n=self.size_n,
+            problem_n=self.covered_size_n,
             top_k=self.top_k,
             cta_threads=self.cta_threads,
             cta_m_blocks=self.cta_m_blocks,
@@ -671,6 +747,10 @@ class W4A16GemmKernel:
         return (
             self.size_n,
             self.size_k,
+            self.covered_size_n,
+            self.covered_size_k,
+            self.scale_k_groups,
+            self.has_logical_tail,
             self.num_experts,
             self.top_k,
             self.mul_topk_weights,
@@ -917,13 +997,13 @@ class W4A16GemmKernel:
         grid_x: Int32,
         active_size_m: Int32,
     ):
-        n_tiles = Int32(self.size_n // self.tile_n)
+        n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
         if cutlass.const_expr(not self.direct_topk_routes):
             route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
                 self.moe_block_size
             )
-        k_tiles = Int32(self.size_k // self.tile_k)
+        k_tiles = Int32(self.k_tiles)
         global_mn_tiles = route_blocks * n_tiles
 
         tail_mn_tiles = global_mn_tiles
@@ -1328,9 +1408,12 @@ class W4A16GemmKernel:
     def _tile_stream_offsets(self, tid: Int32, expert_idx: Int32, output_n_tile: Int32):
         a_gl_stride = Int32(self.size_k // 8)
         b_gl_stride = Int32(16 * self.size_n // (_PACK_FACTOR * 4))
-        s_gl_stride = Int32(self.size_n // 16)
+        s_gl_stride = Int32(self.scale_n_groups)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
-            scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
+            if cutlass.const_expr(self.has_logical_tail):
+                scales_expert_stride = Int32(self.scale_k_groups * self.scale_n_groups)
+            else:
+                scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
         else:
             scales_expert_stride = Int32((self.size_n * self.size_k) // (16 * 16))
         b_expert_off = (
@@ -2414,16 +2497,45 @@ class W4A16GemmKernel:
         logical_n = output_n_tile * Int32(self.tile_n) + local_n
         source_n = self._source_n_from_logical(logical_n)
         packed_cols = Int32(self.size_k // 2)
+        tile_byte = tile_idx * Int32(self.tile_k // 2) + local_k_vec * Int32(16)
         byte_offset = (
             Int64(expert_idx) * Int64(self.size_n * (self.size_k // 2))
             + Int64(source_n) * Int64(packed_cols)
-            + Int64(tile_idx * Int32(self.tile_k // 2))
-            + Int64(local_k_vec * Int32(16))
+            + Int64(tile_byte)
         )
-        cp_async4_shared_global(
-            smem_addr,
-            get_ptr_as_int64(b_u8_flat, byte_offset),
-        )
+        if cutlass.const_expr(self.has_logical_tail):
+            valid_n = logical_n < Int32(self.size_n)
+            valid_bytes = packed_cols - tile_byte
+            if valid_bytes > Int32(16):
+                valid_bytes = Int32(16)
+            if valid_n and valid_bytes >= Int32(16) and cutlass.const_expr(
+                not self.has_scale_k_tail
+            ):
+                cp_async4_shared_global(
+                    smem_addr,
+                    get_ptr_as_int64(b_u8_flat, byte_offset),
+                )
+            else:
+                v0 = Uint32(0)
+                v1 = Uint32(0)
+                v2 = Uint32(0)
+                v3 = Uint32(0)
+                if valid_n and valid_bytes > Int32(0):
+                    src = get_ptr_as_int64(b_u8_flat, byte_offset)
+                    if valid_bytes >= Int32(4):
+                        v0 = ld_global_nc_u32(src)
+                    if valid_bytes >= Int32(8):
+                        v1 = ld_global_nc_u32(src + Int64(4))
+                    if valid_bytes >= Int32(12):
+                        v2 = ld_global_nc_u32(src + Int64(8))
+                    if valid_bytes >= Int32(16):
+                        v3 = ld_global_nc_u32(src + Int64(12))
+                st_shared_v4_u32(smem_addr, v0, v1, v2, v3)
+        else:
+            cp_async4_shared_global(
+                smem_addr,
+                get_ptr_as_int64(b_u8_flat, byte_offset),
+            )
 
     @cute.jit
     def _load_modelopt_shared_byte(
@@ -2572,11 +2684,23 @@ class W4A16GemmKernel:
                     Int32(i * self.a_sh_wr_delta) + a_sh_wr
                 ),
             )
-            cp_async4_shared_global_pred(
-                a_dst,
-                get_ptr_as_int64(a_bf16_flat, a_int4 * Int32(8)),
-                (row < block_valid_rows).to(Int32),
-            )
+            if cutlass.const_expr(self.has_k_tile_tail):
+                a_k_int4 = tile_idx * Int32(self.a_gl_rd_delta_o) + a_gl_rd_col0
+                if row < block_valid_rows and a_k_int4 < a_gl_stride:
+                    cp_async4_shared_global(
+                        a_dst,
+                        get_ptr_as_int64(a_bf16_flat, a_int4 * Int32(8)),
+                    )
+                else:
+                    st_shared_v4_u32(
+                        a_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+            else:
+                cp_async4_shared_global_pred(
+                    a_dst,
+                    get_ptr_as_int64(a_bf16_flat, a_int4 * Int32(8)),
+                    (row < block_valid_rows).to(Int32),
+                )
 
         for i in cutlass.range_constexpr(self.b_sh_wr_iters):
             b_src_int4 = (
@@ -2607,21 +2731,34 @@ class W4A16GemmKernel:
                 )
 
         if tid < Int32(self.s_sh_stage):
-            s_src_int4 = (
-                scales_expert_off
-                + s_gl_stride
-                * (tile_idx * Int32(self.s_tb_groups) + tid // Int32(self.s_sh_stride))
-                + Int32(self.s_sh_stride) * output_n_tile
-                + (tid % Int32(self.s_sh_stride))
+            s_k_group = tile_idx * Int32(self.s_tb_groups) + tid // Int32(
+                self.s_sh_stride
             )
+            s_n_group = Int32(self.s_sh_stride) * output_n_tile + (
+                tid % Int32(self.s_sh_stride)
+            )
+            s_src_int4 = scales_expert_off + s_gl_stride * s_k_group + s_n_group
             s_dst = self._int4_addr(
                 smem_base,
                 Int32(self.sh_s_off) + pipe * Int32(self.s_sh_stage) + tid,
             )
-            cp_async4_shared_global(
-                s_dst,
-                get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
-            )
+            if cutlass.const_expr(self.has_logical_tail):
+                if s_k_group < Int32(self.scale_k_groups) and s_n_group < Int32(
+                    self.scale_n_groups
+                ):
+                    cp_async4_shared_global(
+                        s_dst,
+                        get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
+                    )
+                else:
+                    st_shared_v4_u32(
+                        s_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+            else:
+                cp_async4_shared_global(
+                    s_dst,
+                    get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
+                )
 
         cute.arch.cp_async_commit_group()
 
@@ -2864,7 +3001,9 @@ class W4A16GemmKernel:
         c_gl_stride = Int32(self.size_n // 8)
         c_sh_stride = Int32(2 * self.cta_n_blocks + 1)
         c_gl_wr_delta = c_gl_stride * Int32(self.cta_threads // (2 * self.cta_n_blocks))
-        c_sh_rd_delta = c_sh_stride * Int32(self.cta_threads // (2 * self.cta_n_blocks))
+        c_sh_rd_delta = c_sh_stride * Int32(
+            self.cta_threads // (2 * self.cta_n_blocks)
+        )
         c_gl_wr = (
             c_gl_stride * (tid // Int32(2 * self.cta_n_blocks))
             + (tid % Int32(2 * self.cta_n_blocks))
@@ -2874,6 +3013,33 @@ class W4A16GemmKernel:
             tid % Int32(2 * self.cta_n_blocks)
         )
         return c_gl_stride, c_sh_stride, c_gl_wr_delta, c_sh_rd_delta, c_gl_wr, c_sh_rd
+
+    @cute.jit
+    def _output_store_cursor_tail(self, tid: Int32, output_n_tile: Int32):
+        c_gl_stride = Int32(self.size_n // 8)
+        c_gl_stride_covered = Int32(self.covered_size_n // 8)
+        c_sh_stride = Int32(2 * self.cta_n_blocks + 1)
+        c_gl_wr_delta = c_gl_stride_covered * Int32(
+            self.cta_threads // (2 * self.cta_n_blocks)
+        )
+        c_sh_rd_delta = c_sh_stride * Int32(self.cta_threads // (2 * self.cta_n_blocks))
+        c_gl_wr = (
+            c_gl_stride_covered * (tid // Int32(2 * self.cta_n_blocks))
+            + (tid % Int32(2 * self.cta_n_blocks))
+            + Int32(2 * self.cta_n_blocks) * output_n_tile
+        )
+        c_sh_rd = c_sh_stride * (tid // Int32(2 * self.cta_n_blocks)) + (
+            tid % Int32(2 * self.cta_n_blocks)
+        )
+        return (
+            c_gl_stride,
+            c_gl_stride_covered,
+            c_sh_stride,
+            c_gl_wr_delta,
+            c_sh_rd_delta,
+            c_gl_wr,
+            c_sh_rd,
+        )
 
     @cute.jit
     def _drain_output_smem(
@@ -2937,6 +3103,64 @@ class W4A16GemmKernel:
         cute.arch.sync_threads()
 
     @cute.jit
+    def _drain_output_smem_tail(
+        self,
+        c_bf16_flat: cute.Tensor,
+        smem_base: Int32,
+        c_gl_stride: Int32,
+        c_gl_stride_covered: Int32,
+        c_gl_wr: Int32,
+        c_gl_wr_delta: Int32,
+        c_sh_rd: Int32,
+        c_sh_rd_delta: Int32,
+        block_valid_rows: Int32,
+        store_iters: cutlass.Constexpr[int],
+    ):
+        for _ in cutlass.range_constexpr(store_iters):
+            row = c_gl_wr // c_gl_stride_covered
+            col_word = c_gl_wr - row * c_gl_stride_covered
+            if row < block_valid_rows and col_word < c_gl_stride:
+                route_index = ld_shared_i32_relaxed(
+                    smem_base + Int32(self.sh_route_off * 16) + row * Int32(4)
+                )
+                true_idx = route_index * c_gl_stride + col_word
+                q0, q1, q2, q3 = ld_shared_v4_u32(
+                    self._int4_addr(smem_base, Int32(self.sh_red_off) + c_sh_rd)
+                )
+                if cutlass.const_expr(self.mul_topk_weights):
+                    scale_bf2 = ld_shared_u32(
+                        smem_base + Int32(self.sh_topk_off * 16) + row * Int32(4)
+                    )
+                    q0 = self._elem2_mul(q0, scale_bf2)
+                    q1 = self._elem2_mul(q1, scale_bf2)
+                    q2 = self._elem2_mul(q2, scale_bf2)
+                    q3 = self._elem2_mul(q3, scale_bf2)
+                if cutlass.const_expr(self.epilogue_relu2):
+                    q0 = self._relu2_elem2(q0)
+                    q1 = self._relu2_elem2(q1)
+                    q2 = self._relu2_elem2(q2)
+                    q3 = self._relu2_elem2(q3)
+                if cutlass.const_expr(self.fused_topk_sum):
+                    token_idx = route_index // Int32(self.fused_sum_topk)
+                    out_idx = token_idx * c_gl_stride + col_word
+                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int32(8))
+                    red_add_global_bf16x2(out_addr, q0)
+                    red_add_global_bf16x2(out_addr + Int64(4), q1)
+                    red_add_global_bf16x2(out_addr + Int64(8), q2)
+                    red_add_global_bf16x2(out_addr + Int64(12), q3)
+                else:
+                    st_global_v4_u32(
+                        get_ptr_as_int64(c_bf16_flat, true_idx * Int32(8)),
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                    )
+            c_gl_wr += c_gl_wr_delta
+            c_sh_rd += c_sh_rd_delta
+        cute.arch.sync_threads()
+
+    @cute.jit
     def _store_tile_m8(
         self,
         acc: cute.Tensor,
@@ -2947,9 +3171,26 @@ class W4A16GemmKernel:
         block_valid_rows: Int32,
         global_scale_f32: cutlass.Float32,
     ):
-        c_gl_stride, c_sh_stride, c_gl_wr_delta, c_sh_rd_delta, c_gl_wr, c_sh_rd = (
-            self._output_store_cursor(tid, output_n_tile)
-        )
+        if cutlass.const_expr(self.has_n_tile_tail):
+            (
+                c_gl_stride,
+                c_gl_stride_covered,
+                c_sh_stride,
+                c_gl_wr_delta,
+                c_sh_rd_delta,
+                c_gl_wr,
+                c_sh_rd,
+            ) = self._output_store_cursor_tail(tid, output_n_tile)
+        else:
+            (
+                c_gl_stride,
+                c_sh_stride,
+                c_gl_wr_delta,
+                c_sh_rd_delta,
+                c_gl_wr,
+                c_sh_rd,
+            ) = self._output_store_cursor(tid, output_n_tile)
+            c_gl_stride_covered = c_gl_stride
         c_sh_wr = (
             Int32(8) * c_sh_stride * (((tid & Int32(31)) % Int32(4)) * Int32(2))
             + (tid & Int32(31)) // Int32(4)
@@ -2986,18 +3227,34 @@ class W4A16GemmKernel:
                 )
         cute.arch.sync_threads()
 
-        store_iters = _covering_count(16, self.cta_threads // (2 * self.cta_n_blocks))
-        self._drain_output_smem(
-            c_bf16_flat,
-            smem_base,
-            c_gl_stride,
-            c_gl_wr,
-            c_gl_wr_delta,
-            c_sh_rd,
-            c_sh_rd_delta,
-            block_valid_rows,
-            store_iters,
+        store_iters = _covering_count(
+            16, self.cta_threads // (2 * self.cta_n_blocks)
         )
+        if cutlass.const_expr(self.has_n_tile_tail):
+            self._drain_output_smem_tail(
+                c_bf16_flat,
+                smem_base,
+                c_gl_stride,
+                c_gl_stride_covered,
+                c_gl_wr,
+                c_gl_wr_delta,
+                c_sh_rd,
+                c_sh_rd_delta,
+                block_valid_rows,
+                store_iters,
+            )
+        else:
+            self._drain_output_smem(
+                c_bf16_flat,
+                smem_base,
+                c_gl_stride,
+                c_gl_wr,
+                c_gl_wr_delta,
+                c_sh_rd,
+                c_sh_rd_delta,
+                block_valid_rows,
+                store_iters,
+            )
 
     @cute.jit
     def _fold_cta_partials_large_m(
@@ -3107,9 +3364,26 @@ class W4A16GemmKernel:
         block_valid_rows: Int32,
         global_scale_f32: cutlass.Float32,
     ):
-        c_gl_stride, c_sh_stride, c_gl_wr_delta, c_sh_rd_delta, c_gl_wr, c_sh_rd = (
-            self._output_store_cursor(tid, output_n_tile)
-        )
+        if cutlass.const_expr(self.has_n_tile_tail):
+            (
+                c_gl_stride,
+                c_gl_stride_covered,
+                c_sh_stride,
+                c_gl_wr_delta,
+                c_sh_rd_delta,
+                c_gl_wr,
+                c_sh_rd,
+            ) = self._output_store_cursor_tail(tid, output_n_tile)
+        else:
+            (
+                c_gl_stride,
+                c_sh_stride,
+                c_gl_wr_delta,
+                c_sh_rd_delta,
+                c_gl_wr,
+                c_sh_rd,
+            ) = self._output_store_cursor(tid, output_n_tile)
+            c_gl_stride_covered = c_gl_stride
         c_sh_wr = (
             Int32(4) * c_sh_stride * ((tid & Int32(31)) // Int32(4))
             + (tid & Int32(31)) % Int32(4)
@@ -3158,17 +3432,31 @@ class W4A16GemmKernel:
             16 * self.cta_m_blocks,
             self.cta_threads // (2 * self.cta_n_blocks),
         )
-        self._drain_output_smem(
-            c_bf16_flat,
-            smem_base,
-            c_gl_stride,
-            c_gl_wr,
-            c_gl_wr_delta,
-            c_sh_rd,
-            c_sh_rd_delta,
-            block_valid_rows,
-            store_iters,
-        )
+        if cutlass.const_expr(self.has_n_tile_tail):
+            self._drain_output_smem_tail(
+                c_bf16_flat,
+                smem_base,
+                c_gl_stride,
+                c_gl_stride_covered,
+                c_gl_wr,
+                c_gl_wr_delta,
+                c_sh_rd,
+                c_sh_rd_delta,
+                block_valid_rows,
+                store_iters,
+            )
+        else:
+            self._drain_output_smem(
+                c_bf16_flat,
+                smem_base,
+                c_gl_stride,
+                c_gl_wr,
+                c_gl_wr_delta,
+                c_sh_rd,
+                c_sh_rd_delta,
+                block_valid_rows,
+                store_iters,
+            )
 
 
 class W4A16FusedMoeKernel:
@@ -3842,14 +4130,28 @@ def _scale_fake_int32_elements(
     size_k: int,
     size_n: int,
     scale_format: str,
+    allow_k_tail: bool = False,
+    allow_n_tail: bool = False,
 ) -> int:
     group_size = _scale_group_size(scale_format)
-    if int(size_k) % group_size != 0:
+    if int(size_n) % 16 != 0:
+        raise ValueError(
+            f"W4A16 {scale_format} scales require size_n divisible by 16"
+        )
+    if int(size_k) % group_size != 0 and not allow_k_tail:
         raise ValueError(
             f"W4A16 {scale_format} scales require size_k divisible by {group_size}, "
             f"got {size_k}"
         )
-    return int(num_experts) * (int(size_k) // group_size) * (int(size_n) // 4)
+    groups_k = (
+        _covering_count(int(size_k), group_size)
+        if allow_k_tail
+        else int(size_k) // group_size
+    )
+    scale_size_n = (
+        _e8m0_logical_tail_scale_n(int(size_n)) if allow_n_tail else int(size_n)
+    )
+    return int(num_experts) * groups_k * (scale_size_n // 4)
 
 
 def _cutlass_element_dtype(element_dtype: str):
@@ -4213,6 +4515,11 @@ def compile_w4a16_fused_moe(
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
+    allow_native_logical_tail = (
+        weight_layout == "modelopt"
+        and scale_format == "e8m0_k32"
+        and int(intermediate_size) % 32 != 0
+    )
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
         problem_m=size_m,
         problem_n=fc1_cols,
@@ -4222,6 +4529,7 @@ def compile_w4a16_fused_moe(
         sms=sms,
         max_shared_mem=max_shared_mem,
         scale_format=scale_format,
+        allow_logical_tail=allow_native_logical_tail,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
         problem_m=routed_rows,
@@ -4232,6 +4540,7 @@ def compile_w4a16_fused_moe(
         sms=sms,
         max_shared_mem=max_shared_mem,
         scale_format=scale_format,
+        allow_logical_tail=allow_native_logical_tail,
     )
     if fc1_cta_threads != fc2_cta_threads:
         common_cta_threads = min(fc1_cta_threads, fc2_cta_threads)
@@ -4245,6 +4554,7 @@ def compile_w4a16_fused_moe(
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
             scale_format=scale_format,
+            allow_logical_tail=allow_native_logical_tail,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
             problem_m=routed_rows,
@@ -4256,6 +4566,7 @@ def compile_w4a16_fused_moe(
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
             scale_format=scale_format,
+            allow_logical_tail=allow_native_logical_tail,
         )
         if fc1_cta_threads != fc2_cta_threads:
             raise ValueError(
@@ -4508,6 +4819,7 @@ def compile_w4a16_fused_moe(
                 size_k=hidden_size,
                 size_n=fc1_cols,
                 scale_format=scale_format,
+                allow_n_tail=allow_native_logical_tail,
             ),
         ),
         assumed_align=16,
@@ -4520,6 +4832,7 @@ def compile_w4a16_fused_moe(
                 size_k=intermediate_size,
                 size_n=hidden_size,
                 scale_format=scale_format,
+                allow_k_tail=allow_native_logical_tail,
             ),
         ),
         assumed_align=16,

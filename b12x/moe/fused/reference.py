@@ -168,9 +168,18 @@ def _apply_block_scales(
     *,
     block_size: int,
 ) -> torch.Tensor:
-    n_blocks = cols // block_size
+    n_blocks = (int(cols) + int(block_size) - 1) // int(block_size)
     sf = sf_f32[:rows, :n_blocks]
-    return raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(rows, cols)
+    padded_cols = n_blocks * int(block_size)
+    if padded_cols != int(cols):
+        padded = raw.new_zeros((int(rows), padded_cols))
+        padded[:, : int(cols)] = raw
+        raw = padded
+    scaled = raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(
+        rows,
+        padded_cols,
+    )
+    return scaled[:, : int(cols)]
 
 
 def _e8m0_scales_to_float(scales: torch.Tensor) -> torch.Tensor:
@@ -880,11 +889,15 @@ def moe_reference_w4a16_fp4_e8m0_k32(
         raise ValueError("swiglu_limit requires a gated W4A16 activation")
 
     block_size = 32
-    if int(K) % block_size != 0 or int(I_tp) % block_size != 0:
-        raise ValueError(f"E8M0 K/32 oracle requires K and I_tp divisible by 32, got K={K}, I_tp={I_tp}")
+    if int(K) % block_size != 0:
+        raise ValueError(f"E8M0 K/32 oracle requires K divisible by 32, got K={K}")
+    if int(I_tp) % 8 != 0:
+        raise ValueError(
+            f"E8M0 K/32 oracle requires compact I_tp divisible by 8, got I_tp={I_tp}"
+        )
     w1_rows = 2 * int(I_tp) if is_gated else int(I_tp)
     expected_w1_scale = (int(E), w1_rows, int(K) // block_size)
-    expected_w2_scale = (int(E), int(K), int(I_tp) // block_size)
+    expected_w2_scale = (int(E), int(K), (int(I_tp) + block_size - 1) // block_size)
     if tuple(w1_e8m0_scale.shape) != expected_w1_scale:
         raise ValueError(
             f"w1_e8m0_scale must have shape {expected_w1_scale}, got {tuple(w1_e8m0_scale.shape)}"
