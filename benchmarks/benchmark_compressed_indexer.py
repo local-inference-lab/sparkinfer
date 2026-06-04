@@ -43,23 +43,48 @@ def _make_page_table(
     return table.contiguous()
 
 
-def _event_time_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
+def _make_l2_flush(enabled: bool):
+    """Evict L2 between timed replays so each measures HBM-bound (serving) speed,
+    not L2-resident speed. Mirrors benchmark_moe: a 2x-L2 buffer, bitwise_not_ to
+    write it through. Without this, replaying the same graph on the same inputs
+    leaves the K-cache/page-table hot in L2 (128MB here) and inflates throughput."""
+    if not enabled:
+        return None
+    try:
+        from b12x.cute.utils import get_hardware_info
+
+        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
+    except Exception:
+        l2_bytes = 0
+    flush_bytes = (l2_bytes * 2) if l2_bytes > 0 else (128 << 20)
+    buffer = torch.empty(flush_bytes, dtype=torch.uint8, device="cuda")
+
+    def flush() -> None:
+        buffer.bitwise_not_()
+
+    return flush
+
+
+def _event_time_us(fn, *, warmup: int, iters: int, l2_flush=None) -> tuple[float, float]:
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         fn()
     torch.cuda.synchronize()
-    samples = []
-    start_evt = torch.cuda.Event(enable_timing=True)
-    stop_evt = torch.cuda.Event(enable_timing=True)
-    for _ in range(iters):
-        start_evt.record()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        if l2_flush is not None:
+            l2_flush()
+        starts[i].record()
         fn()
-        stop_evt.record()
-        torch.cuda.synchronize()
-        samples.append(float(start_evt.elapsed_time(stop_evt)) * 1000.0)
+        ends[i].record()
+    torch.cuda.synchronize()
+    samples = [starts[i].elapsed_time(ends[i]) * 1000.0 for i in range(iters)]
     return statistics.median(samples), min(samples)
 
 
-def _graph_time_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
+def _graph_time_us(fn, *, warmup: int, iters: int, l2_flush=None) -> tuple[float, float]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -68,18 +93,24 @@ def _graph_time_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
         fn()
     torch.cuda.synchronize()
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         graph.replay()
     torch.cuda.synchronize()
 
-    samples = []
-    start_evt = torch.cuda.Event(enable_timing=True)
-    stop_evt = torch.cuda.Event(enable_timing=True)
-    for _ in range(iters):
-        start_evt.record()
+    # Flush L2 BEFORE start.record() each iter (stream-ordered, so excluded from the
+    # timed interval); record all events and synchronize once (vs per-iter sync, which
+    # serializes launches and adds its own jitter).
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        if l2_flush is not None:
+            l2_flush()
+        starts[i].record()
         graph.replay()
-        stop_evt.record()
-        torch.cuda.synchronize()
-        samples.append(float(start_evt.elapsed_time(stop_evt)) * 1000.0)
+        ends[i].record()
+    torch.cuda.synchronize()
+    samples = [starts[i].elapsed_time(ends[i]) * 1000.0 for i in range(iters)]
     return statistics.median(samples), min(samples)
 
 
@@ -126,6 +157,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--eager", action="store_true", help="time eager launches instead of graph replay")
+    parser.add_argument(
+        "--no-l2-flush",
+        action="store_true",
+        help="disable the 2x-L2 flush between timed replays (default: flush, "
+        "for HBM-bound serving-realistic timings instead of L2-hot)",
+    )
     parser.add_argument("--seed", type=int, default=91_100)
     args = parser.parse_args()
 
@@ -283,11 +320,12 @@ def main() -> None:
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
+    l2_flush = _make_l2_flush(not args.no_l2_flush)
     if args.eager:
-        median_us, min_us = _event_time_us(run, warmup=args.warmup, iters=args.iters)
+        median_us, min_us = _event_time_us(run, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush)
         timing_mode = "eager"
     else:
-        median_us, min_us = _graph_time_us(run, warmup=args.warmup, iters=args.iters)
+        median_us, min_us = _graph_time_us(run, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush)
         timing_mode = "graph"
 
     print(
