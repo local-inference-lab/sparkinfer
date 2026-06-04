@@ -131,6 +131,67 @@ def _load_topk_input_from_row_base(
 
 
 @cute.jit
+def _load_value_virtual(
+    input_tensor,
+    carry_values,
+    row_base: Int32,
+    row_start: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    vidx: Int32,
+    block_q: cutlass.Constexpr[int],
+    block_k: cutlass.Constexpr[int],
+    is_tiled: cutlass.Constexpr[bool],
+    is_first: cutlass.Constexpr[bool],
+) -> Float32:
+    """Load a candidate's logit by virtual index.
+
+    vidx in [0, chunk_len) reads this chunk's tiled logits; vidx >= chunk_len reads
+    the carried running-topk value at slot (vidx - chunk_len). When is_first there is
+    no carry range, so the carry branch is compiled away.
+    """
+    value = Float32(0.0)
+    if cutlass.const_expr(is_first):
+        value = _load_topk_input_from_row_base(
+            input_tensor, row_base, row_start + vidx, block_q, block_k, is_tiled
+        )
+    else:
+        if vidx < chunk_len:
+            value = _load_topk_input_from_row_base(
+                input_tensor, row_base, row_start + vidx, block_q, block_k, is_tiled
+            )
+        else:
+            value = Float32(carry_values[carry_base + (vidx - chunk_len)])
+    return value
+
+
+@cute.jit
+def _emit_global_index_virtual(
+    carry_indices,
+    row_start: Int32,
+    output_index_offset: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    vidx: Int32,
+    is_first: cutlass.Constexpr[bool],
+) -> Int32:
+    """Map a virtual index to a final global K-index.
+
+    Local elements reconstruct as row_start + vidx + output_index_offset; carried
+    elements pass their already-global index through verbatim (never re-offset).
+    """
+    gidx = Int32(0)
+    if cutlass.const_expr(is_first):
+        gidx = row_start + vidx + output_index_offset
+    else:
+        if vidx < chunk_len:
+            gidx = row_start + vidx + output_index_offset
+        else:
+            gidx = Int32(carry_indices[carry_base + (vidx - chunk_len)])
+    return gidx
+
+
+@cute.jit
 def _convert_to_uint8(x: Float32) -> Uint32:
     h_bits = _cvt_rn_f16_f32(x)
     bits16 = h_bits & Uint32(0xFFFF)
@@ -222,12 +283,19 @@ class SparseNSATiledTopkKernel:
         block_k: int = 1,
         topk: int = _DEFAULT_TOPK,
         zero_row_start: bool = False,
+        is_first: bool = True,
     ):
         self.is_tiled = is_tiled
         self.block_q = int(block_q)
         self.block_k = int(block_k)
         self.topk = int(topk)
         self.zero_row_start = bool(zero_row_start)
+        # When is_first the carry buffers are unread (the running-topk fold has no
+        # predecessor for the first supertile chunk). There is no `is_last`: the
+        # kernel always emits (value, global index) topk into values/indices; the
+        # orchestrator decides whether that tensor is the next chunk's carry buffer
+        # or the user's final output.
+        self.is_first = bool(is_first)
 
     @cute.jit
     def __call__(
@@ -237,6 +305,8 @@ class SparseNSATiledTopkKernel:
         lengths,
         values,
         indices,
+        carry_values,
+        carry_indices,
         batch_size,
         input_stride,
         num_k_tiles,
@@ -255,6 +325,8 @@ class SparseNSATiledTopkKernel:
             lengths,
             values,
             indices,
+            carry_values,
+            carry_indices,
             batch_size,
             input_stride,
             num_k_tiles,
@@ -279,6 +351,8 @@ class SparseNSATiledTopkKernel:
         lengths: cute.Tensor,
         values: cute.Tensor,
         indices: cute.Tensor,
+        carry_values: cute.Tensor,
+        carry_indices: cute.Tensor,
         batch_size: Int32,
         input_stride: Int32,
         num_k_tiles: Int32,
@@ -371,26 +445,47 @@ class SparseNSATiledTopkKernel:
         ni1 = shared_ptr_to_u32(storage.ni1.data_ptr())
         lr = shared_ptr_to_u32(storage.last_rem.data_ptr())
 
-        need_radix = length > topk_static
+        # Virtual candidate range: local logits in [0, length) plus, for fold chunks
+        # (not is_first), the topk carried running-topk slots in [length, length+topk).
+        total_len = length
+        if not cutlass.const_expr(self.is_first):
+            total_len = length + topk_static
+
+        need_radix = total_len > topk_static
 
         if not need_radix:
             i = Int32(tx)
             while i < topk_static:
-                is_valid = i < length
+                is_valid = i < total_len
                 values[out_base + i] = (
-                    _load_topk_input_from_row_base(
+                    _load_value_virtual(
                         input_tensor,
+                        carry_values,
                         row_base,
-                        row_start + i,
+                        row_start,
+                        out_base,
+                        length,
+                        i,
                         self.block_q,
                         self.block_k,
                         self.is_tiled,
+                        self.is_first,
                     )
                     if is_valid
                     else Float32(float("-inf"))
                 )
                 indices[out_base + i] = (
-                    row_start + i + output_index_offset if is_valid else Int32(-1)
+                    _emit_global_index_virtual(
+                        carry_indices,
+                        row_start,
+                        output_index_offset,
+                        out_base,
+                        length,
+                        i,
+                        self.is_first,
+                    )
+                    if is_valid
+                    else Int32(-1)
                 )
                 i = i + Int32(_THREADS_PER_CTA)
 
@@ -402,29 +497,39 @@ class SparseNSATiledTopkKernel:
             cute.arch.sync_threads()
 
             idx_base = Int32(tx)
-            full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+            full_scan_limit = total_len - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
             while idx_base < full_scan_limit:
                 for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                     idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
-                    val = _load_topk_input_from_row_base(
+                    val = _load_value_virtual(
                         input_tensor,
+                        carry_values,
                         row_base,
-                        row_start + idx,
+                        row_start,
+                        out_base,
+                        length,
+                        idx,
                         self.block_q,
                         self.block_k,
                         self.is_tiled,
+                        self.is_first,
                     )
                     bin8 = _convert_to_uint8(val)
                     _smem_red_add(h0, Int32(bin8), Int32(1))
                 idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
-            while idx_base < length:
-                val = _load_topk_input_from_row_base(
+            while idx_base < total_len:
+                val = _load_value_virtual(
                     input_tensor,
+                    carry_values,
                     row_base,
-                    row_start + idx_base,
+                    row_start,
+                    out_base,
+                    length,
+                    idx_base,
                     self.block_q,
                     self.block_k,
                     self.is_tiled,
+                    self.is_first,
                 )
                 bin8 = _convert_to_uint8(val)
                 _smem_red_add(h0, Int32(bin8), Int32(1))
@@ -464,31 +569,41 @@ class SparseNSATiledTopkKernel:
 
             if topk == Int32(0):
                 idx_base = Int32(tx)
-                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = total_len - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                         idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
-                        val = _load_topk_input_from_row_base(
+                        val = _load_value_virtual(
                             input_tensor,
+                            carry_values,
                             row_base,
-                            row_start + idx,
+                            row_start,
+                            out_base,
+                            length,
+                            idx,
                             self.block_q,
                             self.block_k,
                             self.is_tiled,
+                            self.is_first,
                         )
                         bin8 = _convert_to_uint8(val)
                         if Int32(bin8) > threshold_bin:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
                             s_out[pos] = idx
                     idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
-                while idx_base < length:
-                    val = _load_topk_input_from_row_base(
+                while idx_base < total_len:
+                    val = _load_value_virtual(
                         input_tensor,
+                        carry_values,
                         row_base,
-                        row_start + idx_base,
+                        row_start,
+                        out_base,
+                        length,
+                        idx_base,
                         self.block_q,
                         self.block_k,
                         self.is_tiled,
+                        self.is_first,
                     )
                     bin8 = _convert_to_uint8(val)
                     if Int32(bin8) > threshold_bin:
@@ -504,17 +619,22 @@ class SparseNSATiledTopkKernel:
                 cute.arch.sync_threads()
 
                 idx_base = Int32(tx)
-                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = total_len - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                         idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
-                        raw_input = _load_topk_input_from_row_base(
+                        raw_input = _load_value_virtual(
                             input_tensor,
+                            carry_values,
                             row_base,
-                            row_start + idx,
+                            row_start,
+                            out_base,
+                            length,
+                            idx,
                             self.block_q,
                             self.block_k,
                             self.is_tiled,
+                            self.is_first,
                         )
                         bin8 = _convert_to_uint8(raw_input)
                         if Int32(bin8) > threshold_bin:
@@ -529,14 +649,19 @@ class SparseNSATiledTopkKernel:
                                     sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
                                     _smem_red_add(h0, Int32(sub_bin), Int32(1))
                     idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
-                while idx_base < length:
-                    raw_input = _load_topk_input_from_row_base(
+                while idx_base < total_len:
+                    raw_input = _load_value_virtual(
                         input_tensor,
+                        carry_values,
                         row_base,
-                        row_start + idx_base,
+                        row_start,
+                        out_base,
+                        length,
+                        idx_base,
                         self.block_q,
                         self.block_k,
                         self.is_tiled,
+                        self.is_first,
                     )
                     bin8 = _convert_to_uint8(raw_input)
                     if Int32(bin8) > threshold_bin:
@@ -614,13 +739,18 @@ class SparseNSATiledTopkKernel:
                                     else Int32(s_cand1[i])
                                 )
                                 offset = Int32(24 - round_idx * 8)
-                                raw_val = _load_topk_input_from_row_base(
+                                raw_val = _load_value_virtual(
                                     input_tensor,
+                                    carry_values,
                                     row_base,
-                                    row_start + c_idx,
+                                    row_start,
+                                    out_base,
+                                    length,
+                                    c_idx,
                                     self.block_q,
                                     self.block_k,
                                     self.is_tiled,
+                                    self.is_first,
                                 )
                                 key32 = _convert_to_uint32(raw_val)
                                 bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
@@ -645,13 +775,18 @@ class SparseNSATiledTopkKernel:
                                     if cutlass.const_expr(r_idx_is_0)
                                     else Int32(s_cand1[i])
                                 )
-                                raw_val = _load_topk_input_from_row_base(
+                                raw_val = _load_value_virtual(
                                     input_tensor,
+                                    carry_values,
                                     row_base,
-                                    row_start + c_idx,
+                                    row_start,
+                                    out_base,
+                                    length,
+                                    c_idx,
                                     self.block_q,
                                     self.block_k,
                                     self.is_tiled,
+                                    self.is_first,
                                 )
                                 offset = Int32(24 - round_idx * 8)
                                 key32 = _convert_to_uint32(raw_val)
@@ -695,32 +830,62 @@ class SparseNSATiledTopkKernel:
             idx0 = Int32(tx)
             if idx0 < topk_static:
                 selected0 = Int32(s_out[idx0])
-                values[out_base + idx0] = _load_topk_input_from_row_base(
+                values[out_base + idx0] = _load_value_virtual(
                     input_tensor,
+                    carry_values,
                     row_base,
-                    row_start + selected0,
+                    row_start,
+                    out_base,
+                    length,
+                    selected0,
                     self.block_q,
                     self.block_k,
                     self.is_tiled,
+                    self.is_first,
                 )
-                indices[out_base + idx0] = row_start + selected0 + output_index_offset
+                indices[out_base + idx0] = _emit_global_index_virtual(
+                    carry_indices,
+                    row_start,
+                    output_index_offset,
+                    out_base,
+                    length,
+                    selected0,
+                    self.is_first,
+                )
             idx1 = idx0 + Int32(_THREADS_PER_CTA)
             if idx1 < topk_static:
                 selected1 = Int32(s_out[idx1])
-                values[out_base + idx1] = _load_topk_input_from_row_base(
+                values[out_base + idx1] = _load_value_virtual(
                     input_tensor,
+                    carry_values,
                     row_base,
-                    row_start + selected1,
+                    row_start,
+                    out_base,
+                    length,
+                    selected1,
                     self.block_q,
                     self.block_k,
                     self.is_tiled,
+                    self.is_first,
                 )
-                indices[out_base + idx1] = row_start + selected1 + output_index_offset
+                indices[out_base + idx1] = _emit_global_index_virtual(
+                    carry_indices,
+                    row_start,
+                    output_index_offset,
+                    out_base,
+                    length,
+                    selected1,
+                    self.is_first,
+                )
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=64)
 def _build_tiled_topk_kernel(
-    block_q: int, block_k: int, topk: int, zero_row_start: bool = False
+    block_q: int,
+    block_k: int,
+    topk: int,
+    zero_row_start: bool = False,
+    is_first: bool = True,
 ):
     return SparseNSATiledTopkKernel(
         is_tiled=True,
@@ -728,6 +893,7 @@ def _build_tiled_topk_kernel(
         block_k=block_k,
         topk=topk,
         zero_row_start=zero_row_start,
+        is_first=is_first,
     )
 
 
@@ -773,6 +939,9 @@ def run_tiled_topk(
     input_extent: int = 0,
     output_index_offset: int = 0,
     zero_row_start: bool = False,
+    carry_values: torch.Tensor | None = None,
+    carry_indices: torch.Tensor | None = None,
+    is_first: bool = True,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk = _validate_supported_topk(topk, caller="run_tiled_topk")
@@ -839,12 +1008,62 @@ def run_tiled_topk(
             raise ValueError("output_values must be contiguous")
         topk_values = output_values
 
+    # Carry buffers hold the previous supertile chunk's running top-k (value, global
+    # index) that this launch folds in. When is_first there is no predecessor, so the
+    # kernel never reads them (the read path is constexpr-elided) — but a real tensor
+    # of the right shape must still be passed, so allocate a throwaway if none given.
+    if not is_first:
+        if carry_values is None or carry_indices is None:
+            raise ValueError(
+                "run_tiled_topk requires carry_values and carry_indices when is_first is False"
+            )
+        if carry_values.shape != (num_q_rows, topk):
+            raise ValueError(
+                f"carry_values must have shape {(num_q_rows, topk)}, got {tuple(carry_values.shape)}"
+            )
+        if carry_indices.shape != (num_q_rows, topk):
+            raise ValueError(
+                f"carry_indices must have shape {(num_q_rows, topk)}, got {tuple(carry_indices.shape)}"
+            )
+        if carry_values.dtype != torch.float32:
+            raise ValueError(f"carry_values must be float32, got {carry_values.dtype}")
+        if carry_indices.dtype != torch.int32:
+            raise ValueError(f"carry_indices must be int32, got {carry_indices.dtype}")
+        if not carry_values.is_contiguous() or not carry_indices.is_contiguous():
+            raise ValueError("carry_values and carry_indices must be contiguous")
+        if (
+            carry_values.device != tile_logits.device
+            or carry_indices.device != tile_logits.device
+        ):
+            raise ValueError("carry buffers must be on the tile_logits device")
+        # carry-IN is read throughout selection; the output (carry-OUT for non-final
+        # chunks) is written. They must be physically distinct to avoid an
+        # intra-launch read/write race — the orchestrator ping-pongs two buffers.
+        if carry_values.data_ptr() == topk_values.data_ptr():
+            raise ValueError("carry_values must not alias the output values buffer")
+        if carry_indices.data_ptr() == topk_indices.data_ptr():
+            raise ValueError("carry_indices must not alias the output indices buffer")
+    else:
+        # is_first: carry is never read (the read path is constexpr-elided). Reuse the
+        # output buffers as the throwaway carry tensors so the hot single-chunk /
+        # first-chunk path allocates nothing (safe under CUDA-graph capture). The
+        # kernel only writes `values`/`indices`, so aliasing them as the unread carry
+        # is harmless.
+        if carry_values is None:
+            carry_values = topk_values
+        if carry_indices is None:
+            carry_indices = topk_indices
+
     input_stride = Int32(0)
     flat_input = tile_logits.reshape(-1)
     flat_values = topk_values.reshape(-1).contiguous()
     flat_indices = topk_indices.reshape(-1).contiguous()
+    flat_carry_values = carry_values.reshape(-1).contiguous()
+    flat_carry_indices = carry_indices.reshape(-1).contiguous()
 
-    kernel = _build_tiled_topk_kernel(block_q, block_k, topk, bool(zero_row_start))
+    kernel = _build_tiled_topk_kernel(
+        block_q, block_k, topk, bool(zero_row_start), bool(is_first)
+    )
     input_key_tensor = _contract_tensor(
         contract_phantoms,
         "tile_logits",
@@ -880,12 +1099,26 @@ def run_tiled_topk(
         "extend_topk_indices",
         fallback=topk_indices,
     )
+    carry_values_key_tensor = _contract_tensor(
+        contract_phantoms,
+        "carry_values",
+        "extend_carry_values",
+        fallback=carry_values,
+    )
+    carry_indices_key_tensor = _contract_tensor(
+        contract_phantoms,
+        "carry_indices",
+        "extend_carry_indices",
+        fallback=carry_indices,
+    )
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_start, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(flat_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_indices, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
         Int32(num_q_rows),
         input_stride,
         Int32(num_k_tiles),
@@ -904,17 +1137,22 @@ def run_tiled_topk(
         _tensor_compile_key("lengths", lengths_key_tensor, dynamic_dims=(0,)),
         _flat_tensor_compile_key("topk_values", values_key_tensor, dynamic=True),
         _flat_tensor_compile_key("topk_indices", indices_key_tensor, dynamic=True),
+        _flat_tensor_compile_key("carry_values", carry_values_key_tensor, dynamic=True),
+        _flat_tensor_compile_key(
+            "carry_indices", carry_indices_key_tensor, dynamic=True
+        ),
         (
-            "tiled_topk_v18",
+            "tiled_topk_v19",
             topk,
             block_q,
             block_k,
             bool(zero_row_start),
+            bool(is_first),
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.tiled_topk",
-        2,
+        3,
         cache_key,
         labels=(
             "input",
@@ -922,6 +1160,8 @@ def run_tiled_topk(
             "lengths",
             "topk_values",
             "topk_indices",
+            "carry_values",
+            "carry_indices",
             "policy",
         ),
     )
@@ -999,6 +1239,16 @@ def run_row_topk(
     flat_input = row_logits.reshape(-1)
     flat_values = topk_values.reshape(-1).contiguous()
     flat_indices = topk_indices.reshape(-1).contiguous()
+    # Row top-k is always a single-chunk (is_first) selection — carry is unread, but
+    # the shared kernel signature still requires the tensors.
+    carry_values = torch.empty(
+        (num_q_rows, topk), dtype=torch.float32, device=row_logits.device
+    )
+    carry_indices = torch.empty(
+        (num_q_rows, topk), dtype=torch.int32, device=row_logits.device
+    )
+    flat_carry_values = carry_values.reshape(-1)
+    flat_carry_indices = carry_indices.reshape(-1)
     kernel = _build_row_topk_kernel(topk)
     input_key_tensor = _contract_tensor(
         contract_phantoms,
@@ -1025,12 +1275,26 @@ def run_row_topk(
         "extend_topk_indices",
         fallback=topk_indices,
     )
+    carry_values_key_tensor = _contract_tensor(
+        contract_phantoms,
+        "carry_values",
+        "extend_carry_values",
+        fallback=carry_values,
+    )
+    carry_indices_key_tensor = _contract_tensor(
+        contract_phantoms,
+        "carry_indices",
+        "extend_carry_indices",
+        fallback=carry_indices,
+    )
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(flat_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_indices, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
         Int32(num_q_rows),
         Int32(width),
         Int32(0),
@@ -1048,20 +1312,26 @@ def run_row_topk(
         _tensor_compile_key("lengths", lengths_key_tensor, dynamic_dims=(0,)),
         _flat_tensor_compile_key("topk_values", values_key_tensor, dynamic=True),
         _flat_tensor_compile_key("topk_indices", indices_key_tensor, dynamic=True),
+        _flat_tensor_compile_key("carry_values", carry_values_key_tensor, dynamic=True),
+        _flat_tensor_compile_key(
+            "carry_indices", carry_indices_key_tensor, dynamic=True
+        ),
         (
-            "row_topk_v2",
+            "row_topk_v3",
             topk,
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.row_topk",
-        2,
+        3,
         cache_key,
         labels=(
             "logits",
             "lengths",
             "topk_values",
             "topk_indices",
+            "carry_values",
+            "carry_indices",
             "policy",
         ),
     )
@@ -1242,11 +1512,20 @@ def run_tiled_supertile_topk(
             block_k=block_k,
         )
 
-    candidate_values = torch.empty(
-        (num_chunks, num_q_rows, topk), dtype=torch.float32, device=tile_logits.device
+    # Streaming fold: each chunk folds the previous chunk's running top-k (carry) into
+    # its own selection. Two (M, topk) carry halves ping-pong (read prev, write next);
+    # the final chunk writes the user output. No (num_chunks, ...) slab, no merge.
+    carry_buf_values = torch.empty(
+        (2, num_q_rows, topk), dtype=torch.float32, device=tile_logits.device
     )
-    candidate_indices = torch.empty(
-        (num_chunks, num_q_rows, topk), dtype=torch.int32, device=tile_logits.device
+    carry_buf_indices = torch.empty(
+        (2, num_q_rows, topk), dtype=torch.int32, device=tile_logits.device
+    )
+    out_values = torch.empty(
+        (num_q_rows, topk), dtype=torch.float32, device=tile_logits.device
+    )
+    out_indices = torch.empty(
+        (num_q_rows, topk), dtype=torch.int32, device=tile_logits.device
     )
     global_lengths = (k_end - k_start).contiguous()
 
@@ -1255,6 +1534,12 @@ def run_tiled_supertile_topk(
         chunk_tile_end = min(chunk_tile_begin + supertile_tiles, int(num_k_tiles))
         chunk_start = chunk_tile_begin * block_k
         chunk_rows = (chunk_tile_end - chunk_tile_begin) * block_k
+        is_first = chunk_idx == 0
+        is_last = chunk_idx == num_chunks - 1
+        carry_values = carry_buf_values[(chunk_idx - 1) % 2]
+        carry_indices = carry_buf_indices[(chunk_idx - 1) % 2]
+        out_v = out_values if is_last else carry_buf_values[chunk_idx % 2]
+        out_i = out_indices if is_last else carry_buf_indices[chunk_idx % 2]
         run_tiled_topk(
             tile_logits=tile_logits,
             k_start=k_start,
@@ -1262,17 +1547,16 @@ def run_tiled_supertile_topk(
             topk=topk,
             block_q=block_q,
             block_k=block_k,
-            output_values=candidate_values[chunk_idx],
-            output_indices=candidate_indices[chunk_idx],
+            output_values=out_v,
+            output_indices=out_i,
             num_k_tiles=int(num_k_tiles),
             tile_k_offset=chunk_tile_begin,
             input_index_offset=chunk_start,
             input_extent=chunk_rows,
             output_index_offset=chunk_start,
+            carry_values=carry_values,
+            carry_indices=carry_indices,
+            is_first=is_first,
         )
 
-    return merge_tiled_topk_candidates(
-        candidate_values=candidate_values,
-        candidate_indices=candidate_indices,
-        topk=topk,
-    )
+    return out_values, out_indices

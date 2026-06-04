@@ -1001,19 +1001,17 @@ class B12XAttentionArena:
                 paged_tile_candidate_chunks,
             )
         candidate_chunks = max(extend_candidate_chunks, paged_candidate_chunks)
+        # Streaming-fold carry double-buffer: when more than one supertile chunk is
+        # possible the fold needs exactly two (M, topk) carry halves to ping-pong;
+        # otherwise no carry buffer is needed. This replaces the old map+merge slab
+        # (candidate_chunks halves) and its merge_positions int64 buffer.
+        fold_carry_chunks = 2 if int(candidate_chunks) > 1 else 0
+        # merge_positions is gone with the merge step; keep the field at zero bytes.
         indexer_extend_topk_position_offset_bytes = extend_offset
         extend_topk_position_nbytes = 0
-        if candidate_chunks > 1:
-            extend_topk_position_nbytes = (
-                indexer_q_rows
-                * indexer_topk
-                * _dtype_nbytes(torch.int64)
-            )
-            extend_offset += extend_topk_position_nbytes
-            extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_extend_candidate_values_offset_bytes = extend_offset
         extend_candidate_values_nbytes = (
-            int(candidate_chunks)
+            int(fold_carry_chunks)
             * indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.float32)
@@ -1022,7 +1020,7 @@ class B12XAttentionArena:
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_extend_candidate_indices_offset_bytes = extend_offset
         extend_candidate_indices_nbytes = (
-            int(candidate_chunks)
+            int(fold_carry_chunks)
             * indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.int32)
@@ -2920,6 +2918,29 @@ class B12XAttentionWorkspace:
                     tile_logits=tile_logits,
                     supertile_k=k_rows,
                 )
+            # Warm the streaming-fold (is_first=False) kernel variant by forcing more
+            # than one supertile chunk on the largest case, so chunked prefill traffic
+            # never compiles during CUDA-graph capture.
+            fold_k_rows = max(warm_cases)
+            fold_supertile_k = max(int(self.topk), fold_k_rows // 2)
+            if fold_supertile_k < fold_k_rows:
+                self.indexer_k_quant_bytes[:fold_k_rows].zero_()
+                self.indexer_k_scales[:fold_k_rows].fill_(1.0)
+                k_start.zero_()
+                k_end.fill_(fold_k_rows)
+                extend_tiled_topk(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    kv_fp8=(
+                        self.indexer_k_quant_bytes[:fold_k_rows].view(fp8_dtype),
+                        self.indexer_k_scales[:fold_k_rows],
+                    ),
+                    metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
+                    topk=int(self.topk),
+                    contract_phantoms=phantoms,
+                    tile_logits=tile_logits,
+                    supertile_k=fold_supertile_k,
+                )
             torch.cuda.synchronize(self.device)
 
         self._indexer_extend_tiled_topk_prewarmed = True
@@ -2977,6 +2998,40 @@ class B12XAttentionWorkspace:
                 zero_row_start=True,
                 contract_phantoms=self.get_paged_indexer_contract_phantoms(),
             )
+            # Warm the streaming-fold (is_first=False) kernel variant too, so chunked
+            # decode traffic never compiles during CUDA-graph capture. Fresh
+            # contiguous carry/output tensors keep the (dynamic-flat) cache key
+            # identical to the serving kernel.
+            if self.indexer_extend_candidate_values is not None:
+                warm_carry_values = torch.empty(
+                    (plan.q_rows, topk), dtype=torch.float32, device=self.device
+                )
+                warm_carry_indices = torch.empty(
+                    (plan.q_rows, topk), dtype=torch.int32, device=self.device
+                )
+                warm_out_values = torch.empty(
+                    (plan.q_rows, topk), dtype=torch.float32, device=self.device
+                )
+                warm_out_indices = torch.empty(
+                    (plan.q_rows, topk), dtype=torch.int32, device=self.device
+                )
+                run_tiled_topk(
+                    tile_logits=self.indexer_extend_tile_logits,
+                    k_start=None,
+                    lengths=lengths,
+                    topk=topk,
+                    block_q=block_q,
+                    block_k=block_k,
+                    output_values=warm_out_values,
+                    output_indices=warm_out_indices,
+                    num_k_tiles=plan.num_k_tiles,
+                    input_extent=plan.num_k_tiles * block_k,
+                    zero_row_start=True,
+                    carry_values=warm_carry_values,
+                    carry_indices=warm_carry_indices,
+                    is_first=False,
+                    contract_phantoms=self.get_paged_indexer_contract_phantoms(),
+                )
             torch.cuda.synchronize(self.device)
 
         self._paged_indexer_tiled_topk_plan = plan

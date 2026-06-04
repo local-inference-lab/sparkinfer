@@ -35,7 +35,7 @@ from b12x.integration import (
     clear_indexer_caches,
     clear_mla_caches,
     compressed_index_logits_reference,
-    compressed_index_decode_supertile_topk_fp8,
+    index_topk_fp8,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
     pack_compressed_index_k_cache_reference,
@@ -513,7 +513,7 @@ def run_c4_indexer_dense_equivalence(args: argparse.Namespace, device: torch.dev
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
-        return compressed_index_decode_supertile_topk_fp8(
+        return index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,
@@ -618,7 +618,7 @@ def run_c4_indexer_random_decode(args: argparse.Namespace, device: torch.device)
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
-        return compressed_index_decode_supertile_topk_fp8(
+        return index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,
@@ -711,7 +711,7 @@ def run_c4_indexer_shared_prefill_needles(args: argparse.Namespace, device: torc
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
-        return compressed_index_decode_supertile_topk_fp8(
+        return index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,

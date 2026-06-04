@@ -12,9 +12,7 @@ from b12x.integration import (
     B12XAttentionWorkspace,
     clear_indexer_caches,
     pack_compressed_index_k_cache_reference,
-    compressed_index_decode_dense_topk_fp8,
-    compressed_index_decode_logits_fp8,
-    compressed_index_decode_supertile_topk_fp8,
+    index_topk_fp8,
     compressed_index_logits_reference,
     prepare_compressed_indexer_metadata,
     resolve_replicated_num_q_heads,
@@ -93,7 +91,7 @@ def test_resolve_replicated_num_q_heads_for_tensor_parallel() -> None:
         resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=0)
 
 
-def test_compressed_index_decode_logits_fp8_hard_fails_on_cpu() -> None:
+def test_index_topk_fp8_hard_fails_on_cpu() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(91_001)
@@ -122,12 +120,13 @@ def test_compressed_index_decode_logits_fp8_hard_fails_on_cpu() -> None:
         build_schedule=True,
         schedule_num_sms=4,
     )
-    with pytest.raises(NotImplementedError, match="production CUDA FP8 kernel contract"):
-        compressed_index_decode_logits_fp8(
+    with pytest.raises(NotImplementedError, match="requires CUDA"):
+        index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
             metadata=metadata,
+            topk=512,
         )
 
 
@@ -155,11 +154,12 @@ def test_compressed_index_decode_rejects_sharded_selector_heads() -> None:
     )
 
     with pytest.raises(ValueError, match="expected indexer head count 64"):
-        compressed_index_decode_logits_fp8(
+        index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
             metadata=metadata,
+            topk=512,
         )
 
 
@@ -175,238 +175,6 @@ def test_compressed_index_metadata_rejects_clamp_to_one_lengths() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_logits_fp8_graph_workspace_matches_reference() -> None:
-    device = torch.device("cuda")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(91_003)
-
-    rows = 2
-    local_heads = 32
-    width_blocks = 1024
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    graph_real_page_table = torch.full(
-        (rows, width_blocks),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
-    graph_schedule = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
-
-    q_fp8 = _rand_fp8_q((rows, local_heads, 128), gen=gen, device=device)
-    weights = torch.randn((rows, local_heads), generator=gen, dtype=torch.float32).to(device=device)
-    index_k_cache = pack_compressed_index_k_cache_reference(
-        torch.randn((1200 * 64, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=local_heads,
-        indexer_num_q_heads=local_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=512,
-        max_page_table_width=width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=index_k_cache.shape[0] * 64,
-        page_size=64,
-        use_cuda_graph=True,
-    )
-
-    def prepare(page_starts: list[int], seqlens_list: list[int]):
-        live_table = _make_real_page_table(
-            page_starts=page_starts,
-            seqlens=seqlens_list,
-            width_blocks=width_blocks,
-            device=device,
-        )
-        graph_real_page_table.copy_(live_table)
-        graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
-        return prepare_compressed_indexer_metadata(
-            real_page_table=graph_real_page_table,
-            cache_seqlens_int32=graph_seqlens,
-            expected_num_q_heads=local_heads,
-            schedule_out=graph_schedule,
-        )
-
-    clear_indexer_caches()
-    metadata = prepare([2, 900], [2048, 2304])
-    compressed_index_decode_logits_fp8(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=metadata,
-        workspace=workspace,
-    )
-    torch.cuda.synchronize(device)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_out = compressed_index_decode_logits_fp8(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            metadata=metadata,
-            workspace=workspace,
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    actual0 = captured_out.clone()
-    expected0 = compressed_index_logits_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        query_row_to_batch=torch.arange(rows, dtype=torch.int32, device=device),
-        seqlens_per_query=graph_seqlens,
-    )
-    torch.testing.assert_close(actual0, expected0, atol=1e-4, rtol=1e-4)
-
-    prepare([4, 920], [65, 128])
-    graph.replay()
-    torch.cuda.synchronize(device)
-    actual1 = captured_out.clone()
-    expected1 = compressed_index_logits_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        query_row_to_batch=torch.arange(rows, dtype=torch.int32, device=device),
-        seqlens_per_query=graph_seqlens,
-    )
-    torch.testing.assert_close(actual1, expected1, atol=1e-4, rtol=1e-4)
-    assert torch.isneginf(actual1[:, 128:]).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_dense_topk_fp8_graph_matches_reference() -> None:
-    device = torch.device("cuda")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(91_006)
-
-    rows = 2
-    num_heads = 64
-    width_blocks = 16
-    topk = 512
-    graph_real_page_table = torch.full(
-        (rows, width_blocks),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
-    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
-    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
-        device=device
-    )
-    api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
-        torch.randn((80 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
-        / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=True,
-        paged_indexer_logits_q_rows=rows,
-        paged_indexer_logits_k_rows=width_blocks * 64,
-        paged_indexer_tile_logits_k_rows=0,
-    )
-    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
-
-    def prepare(page_starts: list[int], seqlens_list: list[int]):
-        live_table = _make_real_page_table(
-            page_starts=page_starts,
-            seqlens=seqlens_list,
-            width_blocks=width_blocks,
-            device=device,
-        )
-        graph_real_page_table.copy_(live_table)
-        graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
-        return prepare_compressed_indexer_metadata(
-            real_page_table=graph_real_page_table,
-            cache_seqlens_int32=graph_seqlens,
-            expected_num_q_heads=num_heads,
-            build_schedule=False,
-        )
-
-    clear_indexer_caches()
-    metadata = prepare([2, 40], [900, 960])
-    compressed_index_decode_dense_topk_fp8(
-        q_fp8=q_fp8,
-        weights=api_weights,
-        index_k_cache=index_k_cache,
-        metadata=metadata,
-        topk=topk,
-        expected_num_q_heads=num_heads,
-        workspace=workspace,
-        out_indices=actual,
-    )
-    torch.cuda.synchronize(device)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        compressed_index_decode_dense_topk_fp8(
-            q_fp8=q_fp8,
-            weights=api_weights,
-            index_k_cache=index_k_cache,
-            metadata=metadata,
-            topk=topk,
-            expected_num_q_heads=num_heads,
-            workspace=workspace,
-            out_indices=actual,
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    expected_raw0 = _expected_compressed_index_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        seqlens=graph_seqlens,
-        topk=topk,
-    )
-    assert torch.equal(
-        torch.sort(actual, dim=1).values,
-        torch.sort(expected_raw0, dim=1).values,
-    )
-
-    prepare([4, 8], [640, 768])
-    graph.replay()
-    torch.cuda.synchronize(device)
-    expected_raw1 = _expected_compressed_index_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        seqlens=graph_seqlens,
-        topk=topk,
-    )
-    assert torch.equal(
-        torch.sort(actual, dim=1).values,
-        torch.sort(expected_raw1, dim=1).values,
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
 def test_compressed_index_decode_stage_keeps_contiguous_metadata_aliases() -> None:
     device = torch.device("cuda")
     rows = 1
@@ -459,224 +227,7 @@ def test_compressed_index_decode_stage_keeps_contiguous_metadata_aliases() -> No
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_dense_topk_fp8_compacts_padded_page_table() -> None:
-    device = torch.device("cuda")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(91_007)
-
-    rows = 2
-    num_heads = 64
-    full_width_blocks = 4097
-    workspace_width_blocks = 384
-    topk = 512
-    graph_real_page_table = torch.full(
-        (rows, full_width_blocks),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
-    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
-    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
-        device=device
-    )
-    api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
-        torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
-        / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=workspace_width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=True,
-        paged_indexer_logits_q_rows=rows,
-        paged_indexer_logits_k_rows=workspace_width_blocks * 64,
-        paged_indexer_tile_logits_k_rows=0,
-    )
-    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
-
-    def prepare(page_starts: list[int], seqlens_list: list[int]):
-        live_table = _make_real_page_table(
-            page_starts=page_starts,
-            seqlens=seqlens_list,
-            width_blocks=full_width_blocks,
-            device=device,
-        )
-        graph_real_page_table.copy_(live_table)
-        graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
-        return prepare_compressed_indexer_metadata(
-            real_page_table=graph_real_page_table,
-            cache_seqlens_int32=graph_seqlens,
-            expected_num_q_heads=num_heads,
-            build_schedule=False,
-        )
-
-    clear_indexer_caches()
-    metadata = prepare([2, 40], [900, 960])
-    compressed_index_decode_dense_topk_fp8(
-        q_fp8=q_fp8,
-        weights=api_weights,
-        index_k_cache=index_k_cache,
-        metadata=metadata,
-        topk=topk,
-        expected_num_q_heads=num_heads,
-        workspace=workspace,
-        out_indices=actual,
-    )
-    torch.cuda.synchronize(device)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        compressed_index_decode_dense_topk_fp8(
-            q_fp8=q_fp8,
-            weights=api_weights,
-            index_k_cache=index_k_cache,
-            metadata=metadata,
-            topk=topk,
-            expected_num_q_heads=num_heads,
-            workspace=workspace,
-            out_indices=actual,
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    expected_raw0 = _expected_compressed_index_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        seqlens=graph_seqlens,
-        topk=topk,
-    )
-    assert torch.equal(
-        torch.sort(actual, dim=1).values,
-        torch.sort(expected_raw0, dim=1).values,
-    )
-
-    prepare([4, 8], [640, 768])
-    graph.replay()
-    torch.cuda.synchronize(device)
-    expected_raw1 = _expected_compressed_index_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        seqlens=graph_seqlens,
-        topk=topk,
-    )
-    assert torch.equal(
-        torch.sort(actual, dim=1).values,
-        torch.sort(expected_raw1, dim=1).values,
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_compressed_index_decode_dense_topk_fp8_rekeys_compact_page_widths() -> None:
-    device = torch.device("cuda")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(91_009)
-
-    rows = 1
-    num_heads = 64
-    first_width_blocks = 8
-    second_width_blocks = 16
-    workspace_width_blocks = 64
-    topk = 512
-    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
-    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
-        device=device
-    )
-    api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
-        torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
-        / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=workspace_width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        reserve_paged_indexer_logits=True,
-    )
-    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
-
-    def run(width_blocks: int, seqlen: int) -> torch.Tensor:
-        page_table = _make_real_page_table(
-            page_starts=[2],
-            seqlens=[seqlen],
-            width_blocks=width_blocks,
-            device=device,
-        )
-        seqlens = torch.tensor([seqlen], dtype=torch.int32, device=device)
-        metadata = prepare_compressed_indexer_metadata(
-            real_page_table=page_table,
-            cache_seqlens_int32=seqlens,
-            expected_num_q_heads=num_heads,
-            build_schedule=False,
-        )
-        return compressed_index_decode_dense_topk_fp8(
-            q_fp8=q_fp8,
-            weights=api_weights,
-            index_k_cache=index_k_cache,
-            metadata=metadata,
-            topk=topk,
-            expected_num_q_heads=num_heads,
-            workspace=workspace,
-            out_indices=actual,
-        ).clone()
-
-    clear_indexer_caches()
-    first = run(first_width_blocks, 1)
-    torch.cuda.synchronize(device)
-    assert int(first[0, 0]) == 0
-
-    second = run(second_width_blocks, 900)
-    torch.cuda.synchronize(device)
-    expected = _expected_compressed_index_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=_make_real_page_table(
-            page_starts=[2],
-            seqlens=[900],
-            width_blocks=second_width_blocks,
-            device=device,
-        ),
-        seqlens=torch.tensor([900], dtype=torch.int32, device=device),
-        topk=topk,
-    )
-    assert torch.equal(
-        torch.sort(second, dim=1).values,
-        torch.sort(expected, dim=1).values,
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_supertile_topk_fp8_graph_matches_reference(
+def test_index_topk_fp8_graph_matches_reference(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("B12X_COMPRESSED_INDEX_SUPERTILE_K", "512")
@@ -756,7 +307,7 @@ def test_compressed_index_decode_supertile_topk_fp8_graph_matches_reference(
     monkeypatch.setattr(workspace, "stage_indexer_paged_tiled_decode", fail_runtime_staging)
 
     metadata = prepare([2, 40], [900, 960])
-    compressed_index_decode_supertile_topk_fp8(
+    index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
@@ -771,7 +322,7 @@ def test_compressed_index_decode_supertile_topk_fp8_graph_matches_reference(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        compressed_index_decode_supertile_topk_fp8(
+        index_topk_fp8(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,
@@ -929,7 +480,7 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
 
     metadata = prepare(3, 4096, shared_page_table=True)
     reference_metadata = prepare(3, 4096, shared_page_table=False)
-    compressed_index_decode_supertile_topk_fp8(
+    index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
@@ -940,7 +491,7 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         out_indices=expected,
         supertile_k=supertile_k,
     )
-    compressed_index_decode_supertile_topk_fp8(
+    index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
@@ -955,7 +506,7 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        compressed_index_decode_supertile_topk_fp8(
+        index_topk_fp8(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,
@@ -975,7 +526,7 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
 
     metadata = prepare(24, 3584, shared_page_table=True)
     reference_metadata = prepare(24, 3584, shared_page_table=False)
-    compressed_index_decode_supertile_topk_fp8(
+    index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
@@ -1000,7 +551,11 @@ def test_compressed_index_supertile_workspace_sizes_candidate_chunks() -> None:
     page_size = 256
     page_table_width = 1056
     supertile_k = 8192
-    expected_chunks = (page_table_width * page_size + supertile_k - 1) // supertile_k
+    # The streaming fold replaced the old map+merge candidate slab (one half per
+    # supertile chunk) with a fixed two-half carry double-buffer (read prev / write
+    # next), so the candidate buffer no longer scales with the chunk count.
+    chunk_count = (page_table_width * page_size + supertile_k - 1) // supertile_k
+    assert chunk_count > 2  # this config is genuinely multi-chunk
 
     arena = B12XAttentionArena.allocate(
         B12XAttentionArenaCaps(
@@ -1040,8 +595,9 @@ def test_compressed_index_supertile_workspace_sizes_candidate_chunks() -> None:
     )
 
     candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
-    assert candidate_values.shape[0] >= expected_chunks
-    assert candidate_indices.shape[0] >= expected_chunks
+    # Fold carry double-buffer: exactly two halves, decoupled from chunk_count.
+    assert candidate_values.shape[0] == 2
+    assert candidate_indices.shape[0] == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
@@ -1106,7 +662,7 @@ def test_compressed_index_supertile_workspace_requires_prewarmed_launch_contract
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_supertile_topk_fp8_graph_unaligned_single_chunk(
+def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("B12X_COMPRESSED_INDEX_SUPERTILE_K", "1536")
@@ -1181,7 +737,7 @@ def test_compressed_index_decode_supertile_topk_fp8_graph_unaligned_single_chunk
         width_tokens=1536,
     )
     metadata = prepare([2, 48], [960, 1024])
-    compressed_index_decode_supertile_topk_fp8(
+    index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
@@ -1196,7 +752,7 @@ def test_compressed_index_decode_supertile_topk_fp8_graph_unaligned_single_chunk
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        compressed_index_decode_supertile_topk_fp8(
+        index_topk_fp8(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,

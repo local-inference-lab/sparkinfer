@@ -593,42 +593,6 @@ def test_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None
     assert out.shape == (1, 2, 512)
 
 
-def test_compressed_indexer_logits_binding_supplies_metadata(monkeypatch) -> None:
-    workspace = _workspace(indexer_num_q_heads=2, max_paged_q_rows=3, max_page_table_width=5)
-    real_page_table = torch.zeros((3, 5), dtype=torch.int32)
-    cache_seqlens = torch.zeros((3,), dtype=torch.int32)
-    active_width = torch.tensor([320], dtype=torch.int32)
-    binding = workspace.bind_compressed_indexer(
-        real_page_table=real_page_table,
-        cache_seqlens_int32=cache_seqlens,
-        active_width=active_width,
-        expected_num_q_heads=2,
-    )
-    q_fp8 = torch.empty((3, 2, 128), dtype=torch.uint8)
-    weights = torch.empty((3, 2), dtype=torch.float32)
-    index_k_cache = torch.empty((8, 64 * (128 + 4)), dtype=torch.uint8)
-    calls = {}
-
-    def fake_paged_decode_logits(**kwargs):
-        calls.update(kwargs)
-        return torch.empty((3, 320), dtype=torch.float32)
-
-    monkeypatch.setattr(compressed_indexer_impl, "paged_decode_logits", fake_paged_decode_logits)
-
-    logits = compressed_indexer_impl.compressed_index_decode_logits_fp8(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        binding=binding,
-    )
-
-    assert calls["metadata"].real_page_table is real_page_table
-    assert calls["metadata"].cache_seqlens_int32 is cache_seqlens
-    assert calls["workspace"] is workspace
-    assert calls["active_width_override"] is active_width
-    assert logits.shape == (3, 320)
-
-
 def test_indexer_paged_decode_binding_supplies_metadata(monkeypatch) -> None:
     workspace = _workspace(indexer_num_q_heads=2, max_paged_q_rows=3, max_page_table_width=5)
     real_page_table = torch.zeros((3, 5), dtype=torch.int32)

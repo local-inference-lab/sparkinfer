@@ -561,17 +561,22 @@ def _compressed_indexer_scratch_layout(
     cursor += max_q_rows * int(caps.topk) * _dtype_nbytes(torch.int32)
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
 
+    # Streaming-fold carry double-buffer: two (M, topk) halves ping-pong across
+    # supertile chunks (replaces the old max_chunks-deep candidate slab and the
+    # merge_positions buffer, both of which the merge step required).
+    fold_carry_chunks = 2 if int(max_chunks) > 1 else 0
+
     candidate_values_offset_bytes = cursor
-    cursor += max_chunks * max_q_rows * int(caps.topk) * _dtype_nbytes(torch.float32)
+    cursor += fold_carry_chunks * max_q_rows * int(caps.topk) * _dtype_nbytes(torch.float32)
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
 
     candidate_indices_offset_bytes = cursor
-    cursor += max_chunks * max_q_rows * int(caps.topk) * _dtype_nbytes(torch.int32)
+    cursor += fold_carry_chunks * max_q_rows * int(caps.topk) * _dtype_nbytes(torch.int32)
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
 
+    # merge_positions is gone with the merge step; keep the offset for layout
+    # compatibility but reserve no bytes.
     merge_positions_offset_bytes = cursor
-    cursor += max_q_rows * int(caps.topk) * _dtype_nbytes(torch.int64)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
 
     active_width_offset_bytes = cursor
     cursor += _dtype_nbytes(torch.int32)
@@ -662,24 +667,26 @@ def _materialize_compressed_indexer_scratch(
         shape=(max_q_rows, topk),
         dtype=torch.int32,
     )
-    candidate_values, _ = _materialize_arena_view(
-        scratch_storage,
-        offset_bytes=layout.candidate_values_offset_bytes,
-        shape=(int(layout.max_chunks), max_q_rows, topk),
-        dtype=torch.float32,
-    )
-    candidate_indices, _ = _materialize_arena_view(
-        scratch_storage,
-        offset_bytes=layout.candidate_indices_offset_bytes,
-        shape=(int(layout.max_chunks), max_q_rows, topk),
-        dtype=torch.int32,
-    )
-    merge_positions, _ = _materialize_arena_view(
-        scratch_storage,
-        offset_bytes=layout.merge_positions_offset_bytes,
-        shape=(max_q_rows, topk),
-        dtype=torch.int64,
-    )
+    # Streaming-fold carry double-buffer (two halves) when chunking is possible;
+    # otherwise no carry buffer. merge_positions is gone with the merge step.
+    fold_carry_chunks = 2 if int(layout.max_chunks) > 1 else 0
+    if fold_carry_chunks:
+        candidate_values, _ = _materialize_arena_view(
+            scratch_storage,
+            offset_bytes=layout.candidate_values_offset_bytes,
+            shape=(fold_carry_chunks, max_q_rows, topk),
+            dtype=torch.float32,
+        )
+        candidate_indices, _ = _materialize_arena_view(
+            scratch_storage,
+            offset_bytes=layout.candidate_indices_offset_bytes,
+            shape=(fold_carry_chunks, max_q_rows, topk),
+            dtype=torch.int32,
+        )
+    else:
+        candidate_values = None
+        candidate_indices = None
+    merge_positions = None
     active_width_cap, _ = _materialize_arena_view(
         scratch_storage,
         offset_bytes=layout.active_width_offset_bytes,

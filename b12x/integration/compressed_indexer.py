@@ -13,12 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.workspace import B12XIndexerTopKPositionBufferUnavailable
 from b12x.attention.indexer import (
-    IndexerPagedDecodeMetadata,
     build_paged_mqa_schedule_metadata,
-    make_indexer_contract_phantoms,
-    paged_decode_logits,
     uses_paged_mqa_schedule,
 )
 from b12x.attention.indexer.extend_kernel import (
@@ -26,11 +22,10 @@ from b12x.attention.indexer.extend_kernel import (
     run_extend_logits_kernel,
 )
 from b12x.attention.indexer.kernel import (
+    _split_index_k_cache_runtime_views,
     run_paged_windowed_tiled_logits_kernel,
 )
 from b12x.attention.indexer.tiled_topk import (
-    merge_tiled_topk_candidates,
-    run_row_topk,
     run_tiled_topk,
 )
 from b12x.attention.indexer.reference import (
@@ -177,25 +172,6 @@ def resolve_local_num_q_heads(
             f"tensor_parallel_size={tensor_parallel_size}"
         )
     return global_num_q_heads // tensor_parallel_size
-
-
-def make_compressed_indexer_contract_phantoms(
-    *,
-    max_q_rows: int,
-    num_heads: int,
-    max_pages: int,
-    page_size: int,
-    device: torch.device | str,
-) -> dict[str, torch.Tensor]:
-    """Create fixed-shape phantoms for the compressed indexer launcher cache."""
-
-    return make_indexer_contract_phantoms(
-        max_q_rows=max_q_rows,
-        num_heads=num_heads,
-        max_pages=max_pages,
-        page_size=page_size,
-        device=device,
-    )
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
@@ -378,14 +354,6 @@ def prepare_compressed_indexer_metadata(
     )
 
 
-def _metadata_to_indexer(metadata: CompressedIndexerMetadata) -> IndexerPagedDecodeMetadata:
-    return IndexerPagedDecodeMetadata(
-        real_page_table=metadata.real_page_table,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        paged_mqa_schedule_metadata=metadata.schedule_metadata,
-    )
-
-
 def _resolve_binding_metadata(
     *,
     binding,
@@ -546,57 +514,6 @@ def _weights_as_2d(weights: torch.Tensor) -> torch.Tensor:
     return weights
 
 
-def compressed_index_decode_logits_fp8(
-    *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    metadata: CompressedIndexerMetadata | None = None,
-    binding=None,
-    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
-    expected_num_q_heads: int | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
-    preinitialize_invalid_logits: bool = True,
-    active_width_override: torch.Tensor | None = None,
-    allow_partial_rows: bool = False,
-) -> torch.Tensor:
-    """Compute paged FP8 MQA indexer logits with an explicit head contract."""
-
-    metadata, workspace, active_width_override = _resolve_binding_metadata(
-        binding=binding,
-        metadata=metadata,
-        workspace=workspace,
-        active_width_override=active_width_override,
-    )
-    page_size = int(page_size)
-    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
-        raise ValueError(
-            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
-            f"got {page_size}"
-        )
-    _validate_q_head_contract(
-        q_fp8=q_fp8,
-        weights=weights,
-        metadata=metadata,
-        expected_num_q_heads=expected_num_q_heads,
-        allow_partial_rows=allow_partial_rows,
-    )
-    weights = _weights_as_2d(weights)
-    logits = paged_decode_logits(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=_metadata_to_indexer(metadata),
-        page_size=page_size,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
-        preinitialize_invalid_logits=preinitialize_invalid_logits,
-        active_width_override=active_width_override,
-    )
-    return logits
-
-
 def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:
     if supertile_k is None:
         raw = os.environ.get(_COMPRESSED_INDEX_SUPERTILE_K_ENV)
@@ -618,7 +535,7 @@ def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:
     return ((supertile_k + alignment - 1) // alignment) * alignment
 
 
-def compressed_index_decode_supertile_fp8(
+def index_topk_fp8(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -632,7 +549,16 @@ def compressed_index_decode_supertile_fp8(
     out_indices: torch.Tensor | None = None,
     supertile_k: int | None = None,
 ) -> torch.Tensor:
-    """Score paged C4 supertiles and select top-k with the shared indexer top-k core."""
+    """Indexer top-k selection over the paged FP8 index cache.
+
+    Phase- and compression-agnostic: serves DSV4 (compress_ratio>1) and GLM
+    (compress_ratio==1) — the byte layout the kernel reads is identical — and
+    spans both the few-row decode regime and the large-row shared-prefill
+    regime (q_rows>=1024 via run_extend_logits_kernel). Routes the few-row
+    decode case onto the fused score+select kernel (no external top-k blob) and
+    otherwise scores into a tiled-logits supertile and folds the shared
+    `run_tiled_topk` selector. Returns top-k indices per query row.
+    """
 
     metadata, workspace, binding_active_width = _resolve_binding_metadata(
         binding=binding,
@@ -686,6 +612,34 @@ def compressed_index_decode_supertile_fp8(
             raise ValueError("out_indices must be contiguous torch.int32")
 
     page_table_width = int(metadata.real_page_table.shape[1])
+
+    # Opt-in fused score+top-k route (default off): single launch, no logits blob.
+    # v1 uses seqlen-based masking (active_width windowing not yet handled), so it is
+    # gated behind B12X_FUSED_INDEXER=1 until the productionized graph/contract-phantom
+    # path lands. Routes via resolve_fused_indexer_path (long-K or few-row).
+    if os.getenv("B12X_FUSED_INDEXER", "0") == "1":
+        from b12x.attention.indexer.fused_indexer import (
+            resolve_fused_indexer_path,
+            run_fused_indexer_c4,
+        )
+
+        if resolve_fused_indexer_path(
+            topk=topk, num_rows=q_rows, width=page_table_width * page_size
+        ):
+            quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
+            idx, _ = run_fused_indexer_c4(
+                q_bytes=q_fp8.view(torch.uint8),
+                weights=weights,
+                k_quant_bytes=quant,
+                k_scales=scales,
+                real_page_table=metadata.real_page_table,
+                seqlens=metadata.cache_seqlens_int32,
+                num_heads=int(q_fp8.shape[1]),
+                topk=topk,
+                out_indices=out_indices,
+            )
+            return idx
+
     if supertile_k is None:
         supertile_k = getattr(workspace, "paged_tile_logits_k_rows", None)
     supertile_tokens = _resolve_supertile_k(supertile_k, page_size=page_size)
@@ -738,40 +692,32 @@ def compressed_index_decode_supertile_fp8(
         raise ValueError("out_indices must be a CUDA torch.int32 tensor on the q_fp8 device")
     if not final_values.is_contiguous() or not final_raw_indices.is_contiguous():
         raise ValueError("compressed indexer top-k buffers must be contiguous")
-    candidate_values = None
-    candidate_indices = None
-    merge_positions = None
+    # Streaming-fold carry double-buffer (2, M, topk): chunk j reads the running top-k
+    # written by chunk j-1 and writes the next half; the final chunk writes the user
+    # output. Only needed when there is more than one supertile chunk.
+    carry_buf_values = None
+    carry_buf_indices = None
     if num_chunks > 1:
-        candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
-        if candidate_values.shape[0] < num_chunks or candidate_indices.shape[0] < num_chunks:
+        carry_buf_values, carry_buf_indices = workspace.get_indexer_extend_candidate_buffers()
+        if carry_buf_values.shape[0] < 2 or carry_buf_indices.shape[0] < 2:
             raise RuntimeError(
-                "compressed indexer scratch candidate buffers cannot hold all supertile chunks: "
-                f"need={num_chunks}, have={candidate_values.shape[0]}"
+                "compressed indexer scratch carry buffers need a first dim of at least 2: "
+                f"have={carry_buf_values.shape[0]}"
             )
-        candidate_values = candidate_values[:num_chunks, :q_rows, :topk]
-        candidate_indices = candidate_indices[:num_chunks, :q_rows, :topk]
-        if candidate_values.dtype != torch.float32 or candidate_values.device != q_fp8.device:
+        carry_buf_values = carry_buf_values[:2, :q_rows, :topk]
+        carry_buf_indices = carry_buf_indices[:2, :q_rows, :topk]
+        if carry_buf_values.dtype != torch.float32 or carry_buf_values.device != q_fp8.device:
             raise ValueError(
-                "compressed indexer candidate values must be a CUDA torch.float32 "
+                "compressed indexer carry values must be a CUDA torch.float32 "
                 "tensor on the q_fp8 device"
             )
-        if candidate_indices.dtype != torch.int32 or candidate_indices.device != q_fp8.device:
+        if carry_buf_indices.dtype != torch.int32 or carry_buf_indices.device != q_fp8.device:
             raise ValueError(
-                "compressed indexer candidate indices must be a CUDA torch.int32 "
+                "compressed indexer carry indices must be a CUDA torch.int32 "
                 "tensor on the q_fp8 device"
             )
-        if not candidate_values.is_contiguous() or not candidate_indices.is_contiguous():
-            raise ValueError("compressed indexer candidate buffers must be contiguous")
-        get_position_buffer = getattr(
-            workspace,
-            "get_indexer_extend_topk_position_buffer",
-            None,
-        )
-        if get_position_buffer is not None:
-            try:
-                merge_positions = get_position_buffer(row_count=q_rows)[:, :topk]
-            except B12XIndexerTopKPositionBufferUnavailable:
-                merge_positions = None
+        if not carry_buf_values.is_contiguous() or not carry_buf_indices.is_contiguous():
+            raise ValueError("compressed indexer carry buffers must be contiguous")
 
     active_width = (
         binding_active_width
@@ -893,11 +839,21 @@ def compressed_index_decode_supertile_fp8(
         if not logits.is_contiguous():
             raise RuntimeError("C4 supertile scorer returned non-contiguous tiled logits")
 
-        out_values = final_values
-        out_indices = final_raw_indices
-        if candidate_values is not None and candidate_indices is not None:
-            out_values = candidate_values[chunk_idx]
-            out_indices = candidate_indices[chunk_idx]
+        is_first = chunk_idx == 0
+        is_last = chunk_idx == num_chunks - 1
+        if carry_buf_values is not None:
+            carry_values = carry_buf_values[(chunk_idx - 1) % 2]
+            carry_indices = carry_buf_indices[(chunk_idx - 1) % 2]
+            out_values = final_values if is_last else carry_buf_values[chunk_idx % 2]
+            out_indices = (
+                final_raw_indices if is_last else carry_buf_indices[chunk_idx % 2]
+            )
+        else:
+            # Single chunk: is_first folds nothing and writes straight to the output.
+            carry_values = None
+            carry_indices = None
+            out_values = final_values
+            out_indices = final_raw_indices
         run_tiled_topk(
             tile_logits=tile_logits,
             k_start=None,
@@ -912,154 +868,11 @@ def compressed_index_decode_supertile_fp8(
             input_extent=chunk_width_tokens,
             output_index_offset=chunk_start_token,
             zero_row_start=True,
+            carry_values=carry_values,
+            carry_indices=carry_indices,
+            is_first=is_first,
             contract_phantoms=paged_contract_phantoms,
         )
-
-    if candidate_values is not None and candidate_indices is not None:
-        merged_values, merged_indices = merge_tiled_topk_candidates(
-            candidate_values=candidate_values,
-            candidate_indices=candidate_indices,
-            topk=topk,
-            output_values=final_values,
-            output_indices=final_raw_indices,
-            merge_positions=merge_positions,
-        )
-        final_values = merged_values
-        final_raw_indices = merged_indices
-
-    return final_raw_indices
-
-
-def compressed_index_decode_supertile_topk_fp8(**kwargs) -> torch.Tensor:
-    """Compatibility alias for the fused compressed-indexer supertile API."""
-
-    return compressed_index_decode_supertile_fp8(**kwargs)
-
-
-def compressed_index_decode_dense_topk_fp8(
-    *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    metadata: CompressedIndexerMetadata | None = None,
-    binding=None,
-    page_size: int = COMPRESSED_INDEX_PAGE_SIZE,
-    topk: int = 512,
-    expected_num_q_heads: int | None = None,
-    workspace=None,
-    out_indices: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Score the full paged C4 row and select top-k with the dense top-k core."""
-
-    metadata, workspace, binding_active_width = _resolve_binding_metadata(
-        binding=binding,
-        metadata=metadata,
-        workspace=workspace,
-    )
-    page_size = int(page_size)
-    if page_size != COMPRESSED_INDEX_PAGE_SIZE:
-        raise ValueError(
-            f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
-            f"got {page_size}"
-        )
-    topk = int(topk)
-    _validate_q_head_contract(
-        q_fp8=q_fp8,
-        weights=weights,
-        metadata=metadata,
-        expected_num_q_heads=expected_num_q_heads,
-        allow_partial_rows=False,
-    )
-    weights = _weights_as_2d(weights)
-    if q_fp8.device.type != "cuda":
-        raise NotImplementedError("compressed index dense top-k requires CUDA")
-    if metadata.real_page_table.device != q_fp8.device:
-        raise ValueError("real_page_table must be on the same device as q_fp8")
-    if not metadata.real_page_table.is_contiguous():
-        raise ValueError("metadata.real_page_table must be contiguous")
-
-    q_rows = int(q_fp8.shape[0])
-    if out_indices is not None:
-        if out_indices.shape != (q_rows, topk):
-            raise ValueError(
-                f"out_indices must have shape {(q_rows, topk)}, got "
-                f"{tuple(out_indices.shape)}"
-            )
-        if out_indices.dtype != torch.int32 or not out_indices.is_contiguous():
-            raise ValueError("out_indices must be contiguous torch.int32")
-
-    scorer_metadata = metadata
-    workspace_page_width = (
-        int(getattr(workspace, "max_page_table_width", 0) or 0)
-        if workspace is not None
-        else 0
-    )
-    if 0 < workspace_page_width < int(metadata.real_page_table.shape[1]):
-        compact_page_table = metadata.real_page_table[:, :workspace_page_width]
-        if not bool(getattr(workspace, "use_cuda_graph", False)) and not compact_page_table.is_contiguous():
-            raise RuntimeError(
-                "compressed index dense top-k requires a CUDA-graph workspace when "
-                "scoring a compact view of a padded page table"
-            )
-        scorer_metadata = CompressedIndexerMetadata(
-            real_page_table=compact_page_table,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            schedule_metadata=metadata.schedule_metadata,
-            expected_num_q_heads=metadata.expected_num_q_heads,
-        )
-
-    active_width = None
-    if binding_active_width is not None:
-        active_width = binding_active_width
-    elif workspace is not None and hasattr(workspace, "get_paged_indexer_active_width_cap"):
-        active_width = workspace.get_paged_indexer_active_width_cap()
-
-    logits = compressed_index_decode_logits_fp8(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=scorer_metadata,
-        page_size=page_size,
-        expected_num_q_heads=expected_num_q_heads,
-        workspace=workspace,
-        preinitialize_invalid_logits=False,
-        active_width_override=active_width,
-    )
-    contract_phantoms = (
-        workspace.get_paged_indexer_contract_phantoms()
-        if workspace is not None
-        else None
-    )
-    if workspace is not None:
-        final_values, workspace_raw_indices = workspace.get_indexer_extend_topk_buffers(
-            row_count=q_rows,
-        )
-        final_values = final_values[:, :topk]
-        workspace_raw_indices = workspace_raw_indices[:, :topk]
-    else:
-        final_values = torch.empty(
-            (q_rows, topk),
-            dtype=torch.float32,
-            device=q_fp8.device,
-        )
-        workspace_raw_indices = torch.empty(
-            (q_rows, topk),
-            dtype=torch.int32,
-            device=q_fp8.device,
-        )
-    final_raw_indices = out_indices if out_indices is not None else workspace_raw_indices
-    if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (q_rows, topk):
-        raise ValueError(
-            f"dense C4 top-k buffers are smaller than requested top-k {topk}"
-        )
-    run_row_topk(
-        row_logits=logits,
-        lengths=metadata.cache_seqlens_int32,
-        topk=topk,
-        output_values=final_values,
-        output_indices=final_raw_indices,
-        contract_phantoms=contract_phantoms,
-    )
 
     return final_raw_indices
 
@@ -1085,13 +898,9 @@ __all__ = [
     "INDEX_HEAD_DIM",
     "COMPRESSED_INDEX_PAGE_SIZE",
     "CompressedIndexerMetadata",
-    "make_compressed_indexer_contract_phantoms",
     "pack_compressed_index_k_cache_reference",
-    "compressed_index_decode_dense_topk_fp8",
-    "compressed_index_decode_logits_fp8",
-    "compressed_index_decode_supertile_fp8",
-    "compressed_index_decode_supertile_topk_fp8",
     "compressed_index_logits_reference",
+    "index_topk_fp8",
     "prepare_compressed_indexer_metadata",
     "plan_compressed_indexer_scratch",
     "resolve_local_num_q_heads",

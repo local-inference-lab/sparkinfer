@@ -959,6 +959,77 @@ def test_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
+)
+def test_extend_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
+    # Force >= 3 supertile chunks so the fold exercises the middle (is_first=False)
+    # kernel specialization and the full carry ping-pong (not just the 2-chunk
+    # first+last pair). k_rows / supertile_k = 5 chunks regardless of block_k.
+    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "2048")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(20_260_603)
+
+    q_rows = 128
+    num_heads = 8
+    k_rows = 10240
+    topk = 512
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
+        / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 3
+    )
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    # Non-uniform per-row windows exercise clipping + carry padding across chunks
+    # while keeping every row's range >= topk so the result is fully determined.
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.randint(
+        topk + 1, k_rows + 1, (q_rows,), generator=gen, dtype=torch.int32
+    ).to(device=device)
+    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
+
+    actual = extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        topk=topk,
+    )
+    logits = extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        preinitialize_invalid_logits=False,
+    )
+    expected = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(
+        torch.int32
+    )
+
+    torch.cuda.synchronize(device)
+    assert actual.shape == (q_rows, topk)
+    # Correctness invariant under ties: fp8-derived logits contain many equal
+    # values, so the exact top-k set is ambiguous at the rank-`topk` boundary and
+    # the radix kernel may pick different tied indices than torch.topk. The
+    # tie-robust check is that the selected logit-VALUE multiset matches the
+    # reference per row — that proves the fold returned a valid exact top-k.
+    actual_values = torch.sort(torch.gather(logits, 1, actual.long()), dim=1).values
+    expected_values = torch.sort(
+        torch.gather(logits, 1, expected.long()), dim=1
+    ).values
+    assert torch.equal(actual_values, expected_values)
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA required for indexer compile-cache coverage",
 )

@@ -16,9 +16,7 @@ from b12x.integration import (
     B12XAttentionWorkspace,
     clear_indexer_caches,
     pack_compressed_index_k_cache_reference,
-    compressed_index_decode_dense_topk_fp8,
-    compressed_index_decode_logits_fp8,
-    compressed_index_decode_supertile_topk_fp8,
+    index_topk_fp8,
     prepare_compressed_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
@@ -100,10 +98,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("logits", "dense-topk", "supertile-logits", "supertile-topk"),
+        choices=("supertile-logits", "supertile-topk", "fused-topk"),
         default="supertile-topk",
     )
     parser.add_argument("--topk", type=int, default=512)
+    parser.add_argument(
+        "--fused-ctas",
+        type=int,
+        default=0,
+        help="fused-topk: override ctas_per_group (0 = auto heuristic)",
+    )
+    parser.add_argument(
+        "--fused-coop",
+        type=int,
+        default=1,
+        help="fused-topk: 1=cooperative grid-barrier merge, 0=last-CTA reduction",
+    )
     parser.add_argument("--supertile-k", type=int, default=32768)
     parser.add_argument(
         "--persistent-ctas",
@@ -156,7 +166,7 @@ def main() -> None:
     bench_mode = str(args.mode)
     topk = int(args.topk)
     supertile_k = int(args.supertile_k)
-    reserve_dense_logits = bench_mode in {"logits", "dense-topk"}
+    reserve_dense_logits = False  # dense logits/top-k paths removed; unified entry is supertile/fused
     workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
@@ -217,24 +227,6 @@ def main() -> None:
         )
 
     def run() -> torch.Tensor:
-        if bench_mode == "logits":
-            return compressed_index_decode_logits_fp8(
-                q_fp8=q_fp8,
-                weights=weights,
-                index_k_cache=index_k_cache,
-                metadata=metadata,
-                workspace=workspace,
-            )
-        if bench_mode == "dense-topk":
-            return compressed_index_decode_dense_topk_fp8(
-                q_fp8=q_fp8,
-                weights=weights,
-                index_k_cache=index_k_cache,
-                metadata=metadata,
-                topk=topk,
-                expected_num_q_heads=num_heads,
-                workspace=workspace,
-            )
         if bench_mode == "supertile-logits":
             tile_logits = workspace.get_indexer_extend_tile_logits()
             if tile_logits is None:
@@ -254,7 +246,25 @@ def main() -> None:
                 contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
                 stage_runtime_metadata=False,
             )
-        return compressed_index_decode_supertile_topk_fp8(
+        if bench_mode == "fused-topk":
+            from b12x.attention.indexer.kernel import _split_index_k_cache_runtime_views
+            from b12x.attention.indexer.fused_indexer import run_fused_indexer_c4
+
+            quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
+            fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
+            return run_fused_indexer_c4(
+                q_bytes=q_fp8.view(torch.uint8),
+                weights=weights,
+                k_quant_bytes=quant,
+                k_scales=scales,
+                real_page_table=page_table,
+                seqlens=seqlens,
+                num_heads=num_heads,
+                topk=topk,
+                ctas_per_group=fused_ctas,
+                coop_merge=bool(args.fused_coop),
+            )[0]
+        return index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,

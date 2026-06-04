@@ -33,7 +33,6 @@ from .schedule_metadata import (
 from .tiled_topk import (
     _resolve_supertile_k,
     clear_tiled_topk_kernel_cache,
-    merge_tiled_topk_candidates,
     run_tiled_topk,
 )
 from .persistent_topk import clear_persistent_topk2048_kernel_cache
@@ -149,44 +148,6 @@ def uses_paged_mqa_schedule(
         q_rows=q_rows,
         max_pages=max_pages,
     )
-
-
-def make_indexer_contract_phantoms(
-    *,
-    max_q_rows: int,
-    num_heads: int,
-    max_pages: int,
-    page_size: int,
-    device: torch.device | str,
-) -> dict[str, torch.Tensor]:
-    """Create phantom tensors for stable NSA indexer host-launcher cache keys.
-
-    Pass the returned dict as ``contract_phantoms`` to
-    ``paged_decode_logits`` to avoid CUTLASS recompilation
-    when batch size varies in eager mode.
-    """
-    device = torch.device(device)
-    base_u8 = torch.empty(1, dtype=torch.uint8, device=device)
-    base_u32 = torch.empty(1, dtype=torch.uint32, device=device)
-    base_f32 = torch.empty(1, dtype=torch.float32, device=device)
-    base_i32 = torch.empty(1, dtype=torch.int32, device=device)
-    z = (0,)
-    width_tokens = max_pages * page_size
-    padded_width_tokens = ((width_tokens + 63) // 64) * 64
-    return {
-        "q_bytes": base_u8.as_strided((max_q_rows, num_heads, _INDEX_HEAD_DIM), z * 3),
-        "weights": base_f32.as_strided((max_q_rows, num_heads), z * 2),
-        "real_page_table": base_i32.as_strided((max_q_rows, max_pages), z * 2),
-        "seqlens_per_query": base_i32.as_strided((max_q_rows,), z),
-        "logits": base_f32.as_strided((max_q_rows, width_tokens), z * 2),
-        "extend_q_u32": base_u32.as_strided((max_q_rows, num_heads, _INDEX_HEAD_DIM // 4), z * 3),
-        "extend_weights": base_f32.as_strided((max_q_rows, num_heads), z * 2),
-        "extend_k_quant": base_u8.as_strided((padded_width_tokens, _INDEX_HEAD_DIM), z * 2),
-        "extend_k_scale": base_f32.as_strided((padded_width_tokens,), z),
-        "extend_k_start": base_i32.as_strided((max_q_rows,), z),
-        "extend_k_end": base_i32.as_strided((max_q_rows,), z),
-        "extend_logits": base_f32.as_strided((max_q_rows, padded_width_tokens), z * 2),
-    }
 
 
 def _normalize_weights(weights: torch.Tensor, *, q_rows: int, num_heads: int) -> torch.Tensor:
@@ -796,16 +757,21 @@ def extend_tiled_topk(
         )
         return topk_indices
 
+    # Streaming fold over K-supertiles: each chunk folds the previous chunk's running
+    # top-k (carry) into its own radix selection, so the final chunk's output is the
+    # exact global top-k. The reused candidate_values/candidate_indices buffers serve
+    # as a (2, M, topk) carry double-buffer (read prev half, write next half); the
+    # final chunk writes the user output. No (num_chunks, ...) slab, no merge.
     if (candidate_values is None) != (candidate_indices is None):
         raise ValueError("candidate_values and candidate_indices must be provided together")
     if candidate_values is None:
         candidate_values = torch.empty(
-            (num_chunks, num_q_rows, topk),
+            (2, num_q_rows, topk),
             dtype=torch.float32,
             device=q_fp8.device,
         )
         candidate_indices = torch.empty(
-            (num_chunks, num_q_rows, topk),
+            (2, num_q_rows, topk),
             dtype=torch.int32,
             device=q_fp8.device,
         )
@@ -813,24 +779,24 @@ def extend_tiled_topk(
         assert candidate_indices is not None
         if candidate_values.ndim != 3 or candidate_indices.ndim != 3:
             raise ValueError(
-                "candidate buffers must have shape at least "
-                f"({num_chunks}, {num_q_rows}, {topk})"
+                "carry buffers must have shape at least "
+                f"(2, {num_q_rows}, {topk})"
             )
-        if candidate_values.shape[0] < num_chunks or candidate_values.shape[1] < num_q_rows:
+        if candidate_values.shape[0] < 2 or candidate_values.shape[1] < num_q_rows:
             raise ValueError(
                 "candidate_values shape "
                 f"{tuple(candidate_values.shape)} is smaller than required "
-                f"({num_chunks}, {num_q_rows}, {topk})"
+                f"(2, {num_q_rows}, {topk})"
             )
-        if candidate_indices.shape[0] < num_chunks or candidate_indices.shape[1] < num_q_rows:
+        if candidate_indices.shape[0] < 2 or candidate_indices.shape[1] < num_q_rows:
             raise ValueError(
                 "candidate_indices shape "
                 f"{tuple(candidate_indices.shape)} is smaller than required "
-                f"({num_chunks}, {num_q_rows}, {topk})"
+                f"(2, {num_q_rows}, {topk})"
             )
         if candidate_values.shape[2] != topk or candidate_indices.shape[2] != topk:
             raise ValueError(
-                "candidate buffer top-k dimension must match requested topk "
+                "carry buffer top-k dimension must match requested topk "
                 f"{topk}, got {candidate_values.shape[2]} and {candidate_indices.shape[2]}"
             )
         if candidate_values.dtype != torch.float32:
@@ -838,9 +804,11 @@ def extend_tiled_topk(
         if candidate_indices.dtype != torch.int32:
             raise ValueError(f"candidate_indices must have dtype torch.int32, got {candidate_indices.dtype}")
         if candidate_values.device != q_fp8.device or candidate_indices.device != q_fp8.device:
-            raise ValueError("candidate buffer devices must match q_fp8")
-        candidate_values = candidate_values[:num_chunks, :num_q_rows, :]
-        candidate_indices = candidate_indices[:num_chunks, :num_q_rows, :]
+            raise ValueError("carry buffer devices must match q_fp8")
+    carry_buf_values = candidate_values[:2, :num_q_rows, :]
+    carry_buf_indices = candidate_indices[:2, :num_q_rows, :]
+
+    topk_indices = output_indices
     for chunk_idx in range(num_chunks):
         chunk_tile_begin = chunk_idx * supertile_tiles
         chunk_tile_end = min(chunk_tile_begin + supertile_tiles, num_k_tiles)
@@ -865,27 +833,28 @@ def extend_tiled_topk(
             tile_k_offset=chunk_tile_begin,
             tile_num_k_tiles=chunk_tiles,
         )
-        run_tiled_topk(
+        is_first = chunk_idx == 0
+        is_last = chunk_idx == num_chunks - 1
+        carry_values = carry_buf_values[(chunk_idx - 1) % 2]
+        carry_indices = carry_buf_indices[(chunk_idx - 1) % 2]
+        out_v = output_values if is_last else carry_buf_values[chunk_idx % 2]
+        out_i = output_indices if is_last else carry_buf_indices[chunk_idx % 2]
+        _, topk_indices = run_tiled_topk(
             tile_logits=tile_logits,
             k_start=k_start,
             lengths=global_lengths,
             topk=topk,
             block_q=block_q,
             block_k=prefill_block_k,
-            output_values=candidate_values[chunk_idx],
-            output_indices=candidate_indices[chunk_idx],
+            output_values=out_v,
+            output_indices=out_i,
             num_k_tiles=chunk_tiles,
             input_index_offset=chunk_start,
             input_extent=chunk_rows,
             output_index_offset=chunk_start,
+            carry_values=carry_values,
+            carry_indices=carry_indices,
+            is_first=is_first,
             contract_phantoms=contract_phantoms,
         )
-    _, topk_indices = merge_tiled_topk_candidates(
-        candidate_values=candidate_values,
-        candidate_indices=candidate_indices,
-        topk=topk,
-        output_values=output_values,
-        output_indices=output_indices,
-        merge_positions=merge_positions,
-    )
     return topk_indices
