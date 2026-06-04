@@ -624,8 +624,6 @@ def index_topk_fp8(
     # owned at a FRUGAL FIXED capacity (num_sms*topk; seq-INDEPENDENT, never grows),
     # allocated once on the workspace and reused.
     from b12x.attention.indexer.fused_indexer import (
-        FUSED_MAX_ROWS,
-        fused_indexer_scratch_capacity,
         resolve_fused_indexer_path,
         run_fused_indexer_c4,
     )
@@ -640,25 +638,10 @@ def index_topk_fp8(
         and _fused_head_tiles(indexer_heads) in (1, 2, 4)
     )
     if fused_enabled:
-        num_sms = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
-        pack_elems, state_words = fused_indexer_scratch_capacity(
-            FUSED_MAX_ROWS, topk, num_sms
-        )
-        cache = getattr(workspace, "_b12x_fused_indexer_scratch", None)
-        if (
-            cache is None
-            or cache[0].numel() < pack_elems
-            or cache[2].numel() < state_words
-            or cache[0].device != q_fp8.device
-        ):
-            # Allocate ONCE (reused across calls / graph replays). Must land before
-            # capture -- warmup exercises this path, same as the supertile prewarm.
-            cache = (
-                torch.empty((pack_elems,), dtype=torch.float32, device=q_fp8.device),
-                torch.empty((pack_elems,), dtype=torch.int32, device=q_fp8.device),
-                torch.zeros((state_words,), dtype=torch.int32, device=q_fp8.device),
-            )
-            workspace._b12x_fused_indexer_scratch = cache
+        # Workspace-owned merge scratch, reserved EAGERLY at workspace construction at a
+        # FIXED constant capacity (num_sms*topk; seq-/batch-independent) -- never allocated
+        # on a live step, so it can't grow past lock_workspace()/graph capture.
+        cache = workspace.get_fused_indexer_scratch(topk=topk)
         quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
         idx, _ = run_fused_indexer_c4(
             q_bytes=q_fp8.view(torch.uint8),

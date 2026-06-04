@@ -1600,6 +1600,9 @@ class B12XAttentionArena:
         workspace._allocate_contract_phantoms()
         if use_cuda_graph:
             workspace._allocate_paged_indexer_runtime_metadata()
+        # Reserve the fused-indexer decode merge scratch now, at construction (before any
+        # lock/capture), so the rows<=FUSED_MAX_ROWS fused route never allocates live.
+        workspace._reserve_fused_indexer_scratch()
         return workspace
 
     def make_workspace(
@@ -1734,6 +1737,11 @@ class B12XAttentionWorkspace:
     _contract_paged_indexer_tile_logits: torch.Tensor | None = None
     _contract_paged_indexer_topk_values: torch.Tensor | None = None
     _contract_paged_indexer_topk_indices: torch.Tensor | None = None
+    # Fused-indexer cross-CTA merge scratch (pack_v, pack_i, state). Reserved EAGERLY at
+    # construction at a FIXED, seq-/batch-independent capacity (num_sms*topk pack +
+    # FUSED_MAX_ROWS*state) so a live rows<=FUSED_MAX_ROWS decode never allocates after
+    # lock_workspace()/graph capture.
+    _b12x_fused_indexer_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     _indexer_extend_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_plan: _PagedIndexerTiledTopKPlan | None = None
@@ -1920,6 +1928,66 @@ class B12XAttentionWorkspace:
             max_chunks_per_row=max_chunks_per_row,
         )
         return arena.make_workspace(contract, use_cuda_graph=use_cuda_graph)
+
+    def _reserve_fused_indexer_scratch(self) -> None:
+        """Eagerly allocate the fused-indexer cross-CTA merge scratch at a FIXED capacity.
+
+        Sized once at construction from the workspace constants -- pack = num_sms * topk
+        (seq- AND batch-independent: the merge candidate count is capped by per-CTA top-k
+        trimming, not seq/max_model_len), state = FUSED_MAX_ROWS * _COOP_STATE_WORDS. This
+        is allocated BEFORE lock_workspace()/graph capture so the rows<=FUSED_MAX_ROWS
+        fused decode route never grows the workspace on a live step (the failure the
+        prefill cap fix chased). ~0.75 MB at topk=512. Idempotent; no-op off CUDA."""
+        if self._b12x_fused_indexer_scratch is not None:
+            return
+        if self.device is None or self.device.type != "cuda":
+            return
+        topk = int(self.topk)
+        if topk <= 0:
+            return
+        from b12x.attention.indexer.fused_indexer import (
+            FUSED_MAX_ROWS,
+            fused_indexer_scratch_capacity,
+        )
+
+        num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        pack_elems, state_words = fused_indexer_scratch_capacity(
+            FUSED_MAX_ROWS, topk, num_sms
+        )
+        self._b12x_fused_indexer_scratch = (
+            torch.empty((pack_elems,), dtype=torch.float32, device=self.device),
+            torch.empty((pack_elems,), dtype=torch.int32, device=self.device),
+            torch.zeros((state_words,), dtype=torch.int32, device=self.device),
+        )
+
+    def get_fused_indexer_scratch(
+        self, *, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the eagerly-reserved fused merge scratch (pack_v, pack_i, state).
+
+        Reserves on first call as a fallback, but the normal construction path reserves it
+        up front, so in serving this never allocates after the workspace is locked."""
+        self._reserve_fused_indexer_scratch()
+        cache = self._b12x_fused_indexer_scratch
+        if cache is None:
+            raise RuntimeError(
+                "fused indexer scratch unavailable (non-CUDA workspace or topk<=0)"
+            )
+        from b12x.attention.indexer.fused_indexer import (
+            FUSED_MAX_ROWS,
+            fused_indexer_scratch_capacity,
+        )
+
+        num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        need_pack, need_state = fused_indexer_scratch_capacity(
+            FUSED_MAX_ROWS, int(topk), num_sms
+        )
+        if cache[0].numel() < need_pack or cache[2].numel() < need_state:
+            raise RuntimeError(
+                f"fused indexer scratch reserved for topk<={self.topk} but call needs "
+                f"topk={topk}: pack have={cache[0].numel()} need={need_pack}"
+            )
+        return cache
 
     def _allocate_paged_indexer_runtime_metadata(self) -> None:
         if self.paged_indexer_real_page_table_runtime is None:
