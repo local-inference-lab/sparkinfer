@@ -1627,7 +1627,11 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
     device = require_sm120_unified()
     from b12x.attention.mla.unified_sm120.launch import run_unified_prefill
 
-    topk = 257  # off-64-boundary width (ceil(257/64)=5 tiles), like the failing test
+    # MG-eligible GLM width (topk in {512,1024,2048}); the off-64-boundary
+    # partial-last-tile + zero-row coverage now comes from the MIXED per-token
+    # lengths below (not multiples of 64), not from topk itself. (The decode-reuse
+    # fallback that handled arbitrary topk was removed -- unsupported topk RAISEs.)
+    topk = 512
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
         num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,

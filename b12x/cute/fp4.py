@@ -3136,6 +3136,64 @@ def cvt_e4m3_to_f32_via_f16(
 
 
 @dsl_user_op
+def dequant_kv_e4m3_pair_to_bf16x2(
+    p0: Uint32, p1: Uint32, scale_f: Float32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """FP8 -> BF16 K dequant for the BF16-QK m16n8k16 B operand.
+
+    Byte-for-byte mirror of FlashInfer's sparse_mla prefill BF16-QK inline
+    sequence (prefill_kernel.cuh:240-251): two ``cvt.rn.f16x2.e4m3x2`` decode
+    the two e4m3 byte-pairs ``p0``/``p1`` (each a u16 holding two consecutive
+    e4m3 K-dims), multiply the four resulting f16 lanes by the per-(token,blk)
+    UE8M0 ``scale_f`` in f32, then two ``cvt.rn.bf16x2.f32`` pack them back to
+    the bf16x2 ``b0``/``b1`` MMA operands. NON-saturating cvt (matches the
+    reference; the K magnitudes are bounded by the e4m3 range so satfinite is a
+    no-op, and the ref emits plain ``cvt.rn.bf16x2.f32``)."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [
+            Uint32(p0).ir_value(loc=loc, ip=ip),
+            Uint32(p1).ir_value(loc=loc, ip=ip),
+            Float32(scale_f).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 pp0, pp1;
+            .reg .b32 h2_0, h2_1;
+            .reg .b16 l0, h0, l1, h1;
+            .reg .f32 fk0, fk1, fk2, fk3;
+            cvt.u16.u32 pp0, $2;
+            cvt.u16.u32 pp1, $3;
+            cvt.rn.f16x2.e4m3x2 h2_0, pp0;
+            cvt.rn.f16x2.e4m3x2 h2_1, pp1;
+            mov.b32 {l0, h0}, h2_0;
+            mov.b32 {l1, h1}, h2_1;
+            cvt.f32.f16 fk0, l0;
+            cvt.f32.f16 fk1, h0;
+            cvt.f32.f16 fk2, l1;
+            cvt.f32.f16 fk3, h1;
+            mul.f32 fk0, fk0, $4;
+            mul.f32 fk1, fk1, $4;
+            mul.f32 fk2, fk2, $4;
+            mul.f32 fk3, fk3, $4;
+            cvt.rn.bf16x2.f32 $0, fk1, fk0;
+            cvt.rn.bf16x2.f32 $1, fk3, fk2;
+        }
+        """,
+        "=r,=r,r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def cvt_e8m0_to_f32(e8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert a single E8M0 scale byte to its true f32 value 2**(byte-127).
 

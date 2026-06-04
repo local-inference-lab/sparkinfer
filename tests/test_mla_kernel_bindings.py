@@ -69,6 +69,10 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
     # Import modules for registration side effects.
     __import__("b12x.attention.mla.unified_sm120.launch")
     __import__("b12x.attention.mla.unified_sm120.prefill")
+    # prefill_mg registers the single-cache MG op + the new dual-cache MG op
+    # (unified_sm120_prefill_mg_dual). prefill.py imports it lazily, so import it
+    # explicitly here for the binding/fake-dispatch coverage.
+    __import__("b12x.attention.mla.unified_sm120.prefill_mg")
 
     with FakeTensorMode():
         q_all = torch.empty((2, 2, 512), dtype=torch.bfloat16)
@@ -154,31 +158,63 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         )
 
         prefill_lse = torch.empty((2, 2), dtype=torch.float32)
-        torch.ops.b12x.unified_sm120_prefill(
-            q_all,
-            cache,
-            indices,
-            lengths,
-            attn_sink,
-            output,
-            prefill_lse,
-            cache,
-            indices,
-            lengths,
-            0.1,
-            0,
-            0,
-            0,
-            64,
-            4,
-            4,
-            1,
-            1,
-            1024,
-            64,
-            1024,
-            True,
-            True,
+        # The single-cache decode-reuse prefill op was REMOVED (no fallback kernel
+        # in prefill.py); the only prefill op is the MG dual-cache op below.
+        # DUAL-CACHE MG prefill op (the new op DSV4 has_extra routes through).
+        torch.ops.b12x.unified_sm120_prefill_mg_dual(
+            q_all,        # q
+            cache,        # kv_flat (MAIN)
+            indices,      # topk_indices
+            lengths,      # topk_length
+            attn_sink,    # attn_sink_t
+            output,       # output
+            prefill_lse,  # lse_out
+            cache,        # extra_kv_flat
+            indices,      # extra_indices_t
+            lengths,      # extra_len_t
+            0.1,          # sm_scale
+            64,           # page_block_size
+            4,            # topk
+            2,            # num_tiles
+            1024,         # stride_kv_block
+            True,         # has_sink
+            1,            # compute_mode (BF16)
+            2,            # mg_n_hg
+            0,            # model_type (DSV4)
+            0,            # scale_format
+            4,            # extra_topk
+            1,            # num_main_tiles
+            2,            # pbs_extra
+            1024,         # stride_extra_kv_block
+            True,         # row_xor
+        )
+
+
+def test_unified_sm120_prefill_dual_non_eligible_raises() -> None:
+    # DSV4 dual-cache prefill is MG-only (topk==128, heads in {16,32,64,128});
+    # everything else RAISEs (the decode-reuse has_extra fallback was removed).
+    # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
+    # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).
+    __import__("b12x.attention.mla.unified_sm120.prefill")
+    from b12x.attention.mla.unified_sm120.prefill import run_unified_prefill
+
+    topk = 64  # != 128 -> non-eligible dual
+    q = torch.empty((2, 32, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+    extra_kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    extra_indices = torch.zeros((2, 64), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="requires MG dispatch"):
+        run_unified_prefill(
+            q=q,
+            kv_cache=kv_cache,
+            topk_indices=topk_indices,
+            sm_scale=0.1,
+            page_block_size=64,
+            extra_kv_cache=extra_kv_cache,
+            extra_indices=extra_indices,
+            extra_page_block_size=2,
         )
 
 
