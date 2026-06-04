@@ -110,43 +110,6 @@ FUSED_MAX_ROWS = 8           # decode-batch crossover: fused wins rows <= this
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
 
 
-# --- SMEM-sourced virtual loaders --------------------------------------------
-# The fused radix-fold sees, per sub-tile, a virtual candidate range
-#   [0, n_new)              -> this sub-tile's freshly-scored logits (SMEM staging)
-#   [n_new, n_new + carry)  -> the running top-k carried from prior sub-tiles (SMEM)
-# These mirror tiled_topk._load_value_virtual / _emit_global_index_virtual but read
-# from SMEM tensors. The first sub-tile has carry == 0, so vidx < n_new always holds
-# and the carry branch is never taken — no is_first constexpr required.
-@cute.jit
-def _fused_load_value(
-    s_stage_values: cute.Tensor,
-    s_carry_values: cute.Tensor,
-    n_new: Int32,
-    vidx: Int32,
-) -> Float32:
-    value = Float32(0.0)
-    if vidx < n_new:
-        value = Float32(s_stage_values[vidx])
-    else:
-        value = Float32(s_carry_values[vidx - n_new])
-    return value
-
-
-@cute.jit
-def _fused_load_gindex(
-    s_stage_gindex: cute.Tensor,
-    s_carry_gindex: cute.Tensor,
-    n_new: Int32,
-    vidx: Int32,
-) -> Int32:
-    gidx = Int32(0)
-    if vidx < n_new:
-        gidx = Int32(s_stage_gindex[vidx])
-    else:
-        gidx = Int32(s_carry_gindex[vidx - n_new])
-    return gidx
-
-
 @cute.jit
 def _load_flat_k_tile_scalar(
     k_quant_flat: cute.Tensor,  # [k_rows, 128] uint8
@@ -316,6 +279,10 @@ _STATE_WORDS_PER_GROUP = 4  # arrival_counter, output_counter, relay_phase, pad
 # rows use the cooperative grid-barrier radix. Measured crossover ~32-64k (sm120,
 # rows=1, topk=512). Both arms are exact, so this only trades perf, not results.
 _LAST_CTA_MERGE_MAX = 49152
+# Sentinel "never coop" threshold: larger than any live seq_len, so the per-group
+# auto-switch always takes the serial last-CTA arm (used when ctas_per_group*topk is
+# too small for coop's grid barriers to ever pay off -- see run_fused_indexer_c4).
+_FORCE_LAST_CTA = 1 << 30
 
 
 def _fused_indexer_state_nbytes(launch: _FusedLaunchConfig) -> int:
@@ -593,10 +560,19 @@ def _fused_radix_select(
     if tx < Int32(257):
         s_hist0[tx] = Int32(0)
     cute.arch.sync_threads()
+    # Single contiguous source: read vin_v[idx] directly (no virtual-index branch)
+    # and unroll the full-length scan by _SCAN_UNROLL for memory-level parallelism,
+    # mirroring tiled_topk's select (this is the rows=1 last-CTA merge hot loop).
     idx_base = Int32(tx)
+    full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * _RADIX_THREADS)
+    while idx_base < full_scan_limit:
+        for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+            sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
+            bin8 = _convert_to_uint8(Float32(vin_v[sidx]))
+            _smem_red_add(h0, Int32(bin8), Int32(1))
+        idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
     while idx_base < n_total:
-        val = _fused_load_value(vin_v, vin_v, n_total, idx_base)
-        bin8 = _convert_to_uint8(val)
+        bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
         _smem_red_add(h0, Int32(bin8), Int32(1))
         idx_base += Int32(_RADIX_THREADS)
     cute.arch.sync_threads()
@@ -629,8 +605,7 @@ def _fused_radix_select(
     if topk == Int32(0):
         idx_base = Int32(tx)
         while idx_base < n_total:
-            val = _fused_load_value(vin_v, vin_v, n_total, idx_base)
-            bin8 = _convert_to_uint8(val)
+            bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
                 s_out[pos] = idx_base
@@ -642,8 +617,26 @@ def _fused_radix_select(
             s_hist0[tx] = Int32(0)
         cute.arch.sync_threads()
         idx_base = Int32(tx)
+        full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * _RADIX_THREADS)
+        while idx_base < full_scan_limit:
+            for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+                sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
+                raw_input = Float32(vin_v[sidx])
+                bin8 = _convert_to_uint8(raw_input)
+                if Int32(bin8) > threshold_bin:
+                    pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                    s_out[pos] = sidx
+                else:
+                    if Int32(bin8) == threshold_bin:
+                        cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
+                        if cand_pos < Int32(cands):
+                            s_cand0[cand_pos] = sidx
+                            key32 = _convert_to_uint32(raw_input)
+                            sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                            _smem_red_add(h0, Int32(sub_bin), Int32(1))
+            idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
         while idx_base < n_total:
-            raw_input = _fused_load_value(vin_v, vin_v, n_total, idx_base)
+            raw_input = Float32(vin_v[idx_base])
             bin8 = _convert_to_uint8(raw_input)
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -711,7 +704,7 @@ def _fused_radix_select(
                             else Int32(s_cand1[i])
                         )
                         offset = Int32(24 - round_idx * 8)
-                        raw_val = _fused_load_value(vin_v, vin_v, n_total, c_idx)
+                        raw_val = Float32(vin_v[c_idx])
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
                         if Int32(bin) > sub_threshold:
@@ -732,7 +725,7 @@ def _fused_radix_select(
                             if cutlass.const_expr(r_idx_is_0)
                             else Int32(s_cand1[i])
                         )
-                        raw_val = _fused_load_value(vin_v, vin_v, n_total, c_idx)
+                        raw_val = Float32(vin_v[c_idx])
                         offset = Int32(24 - round_idx * 8)
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
@@ -767,8 +760,8 @@ def _fused_radix_select(
     i = Int32(tx)
     while i < topk_static:
         sel = Int32(s_out[i])
-        vout_v[i] = _fused_load_value(vin_v, vin_v, n_total, sel)
-        vout_g[i] = _fused_load_gindex(vin_g, vin_g, n_total, sel)
+        vout_v[i] = Float32(vin_v[sel])
+        vout_g[i] = Int32(vin_g[sel])
         i += Int32(_RADIX_THREADS)
 
 
@@ -1533,11 +1526,20 @@ def run_fused_indexer_c4(
         ctas_per_group = max(1, min(max_pages, num_sms // max(1, rows)))
     ctas_per_group = max(1, int(ctas_per_group))
     if merge_threshold is None:
-        # Topk-aware crossover: the last-CTA serial select also pays for emitting
-        # topk + refining the threshold bin, so more candidates survive per CTA as
-        # topk grows and coop wins sooner. Measured sm120 rows=1 crossover ~28k
-        # (topk=512) / ~20k (topk=2048); the linear fit below matches both.
-        merge_threshold = max(4096, 32768 - 6 * int(topk))
+        # Cross-CTA merge auto-switch, candidate-count model (sm120, graph; refit after
+        # the last-CTA select was unrolled/de-branched to match tiled_topk). The
+        # per-group merge sees min(seq_len, ctas_per_group*topk) candidates -- each CTA
+        # trims its local top-k to topk, so ctas_per_group*topk caps the count. Coop's
+        # grid-barrier radix only amortizes its fixed barrier cost (which GROWS with
+        # ctas_per_group) above a crossover candidate count C; below it the now-fast
+        # serial last-CTA select wins. Measured crossover (rows 1/2 -> ctas_pg 188/94,
+        # topk 512/1024/2048): C ~= 22000 + 117*ctas_per_group - 13*(topk-512). When the
+        # cap ctas_per_group*topk <= C (small ctas_pg, i.e. rows>=4) coop can never reach
+        # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
+        # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
+        crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (int(topk) - 512))
+        cap = ctas_per_group * int(topk)
+        merge_threshold = crossover if cap > crossover else _FORCE_LAST_CTA
 
     out_i = (
         torch.empty((rows, topk), dtype=torch.int32, device=dev)
