@@ -611,6 +611,9 @@ def _fused_radix_select(
     cute.arch.sync_threads()
     threshold_bin = _smem_ld(thr, Int32(0))
     topk = topk - Int32(s_hist0[threshold_bin + Int32(1)])
+    # Captured below (refine-setup) = true #candidates in the coarse threshold bin; used
+    # to detect candidate-buffer overflow and fall back to an exact re-scan radix.
+    bin_count = Int32(0)
 
     if topk == Int32(0):
         idx_base = Int32(tx)
@@ -661,6 +664,9 @@ def _fused_radix_select(
                         _smem_red_add(h0, Int32(sub_bin), Int32(1))
             idx_base += Int32(_RADIX_THREADS)
         cute.arch.sync_threads()
+        # ni0 now holds the FULL threshold-bin candidate count: the xadd ran for every
+        # bin-matching key, even past `cands`. Capture it to detect refine overflow.
+        bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
         for round_idx in cutlass.range_constexpr(4):
             if topk != Int32(-1):
@@ -766,6 +772,93 @@ def _fused_radix_select(
                         i += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
 
+    # ---- exact overflow fallback ----
+    # The buffered coarse+refine above drops winners when more than `cands` candidates
+    # share the coarse threshold bucket (clustered scores; the cross-CTA merge can pack
+    # up to ctas_per_group*topk candidates). When that happens, redo the selection
+    # EXACTLY with a 4-round 8-bit MSD radix that RE-SCANS vin each round filtered by the
+    # locked key prefix -- no candidate buffer, so no overflow. Same convention as the
+    # cooperative arm (_convert_to_uint32 monotone key, byte=(key>>shift)&0xFF). Slower
+    # (re-scans n_total per round on one CTA) but only taken on the rare clustered case;
+    # it overwrites s_out[0:topk]. Scalars: ni0=prefix, thr=remaining_k, ni1=bucket,
+    # lr=next remaining_k, ctr=output counter.
+    if bin_count > Int32(cands):
+        if tx == Int32(0):
+            _smem_st(ni0, Int32(0), Int32(0))
+            _smem_st(thr, Int32(0), topk_static)
+        cute.arch.sync_threads()
+        for ex_round in cutlass.range_constexpr(4):
+            ex_shift = Uint32(24 - ex_round * 8)
+            ex_prefix = Uint32(_smem_ld(ni0, Int32(0)))
+            ex_remaining = Int32(_smem_ld(thr, Int32(0)))
+            if tx < Int32(256):
+                s_hist0[tx] = Int32(0)
+            cute.arch.sync_threads()
+            idx_base = Int32(tx)
+            while idx_base < n_total:
+                ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
+                if cutlass.const_expr(ex_round == 0):
+                    _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
+                else:
+                    ex_mask = Uint32(0xFFFFFFFF) << Uint32(32 - ex_round * 8)
+                    if (ex_key & ex_mask) == ex_prefix:
+                        _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
+                idx_base += Int32(_RADIX_THREADS)
+            cute.arch.sync_threads()
+            for ex_stage in cutlass.range_constexpr(8):
+                ex_j = Int32(1 << ex_stage)
+                if tx < Int32(256):
+                    if (ex_stage & 1) == 0:
+                        ex_v = Int32(s_hist0[tx])
+                        if tx < Int32(256) - ex_j:
+                            ex_v = ex_v + Int32(s_hist0[tx + ex_j])
+                        s_hist1[tx] = ex_v
+                    else:
+                        ex_v = Int32(s_hist1[tx])
+                        if tx < Int32(256) - ex_j:
+                            ex_v = ex_v + Int32(s_hist1[tx + ex_j])
+                        s_hist0[tx] = ex_v
+                cute.arch.sync_threads()
+            if tx == Int32(0):
+                _smem_st(ni1, Int32(0), Int32(0))
+                _smem_st(lr, Int32(0), ex_remaining)
+            cute.arch.sync_threads()
+            if tx < Int32(256):
+                ex_cge = Int32(s_hist0[tx])
+                ex_cgt = Int32(0)
+                if tx + Int32(1) < Int32(256):
+                    ex_cgt = Int32(s_hist0[tx + Int32(1)])
+                if (ex_cge >= ex_remaining) & (ex_cgt < ex_remaining):
+                    _smem_st(ni1, Int32(0), Int32(tx))
+                    _smem_st(lr, Int32(0), ex_remaining - ex_cgt)
+            cute.arch.sync_threads()
+            if tx == Int32(0):
+                ex_bucket = Uint32(_smem_ld(ni1, Int32(0)))
+                _smem_st(ni0, Int32(0), Int32(ex_prefix | (ex_bucket << ex_shift)))
+                _smem_st(thr, Int32(0), _smem_ld(lr, Int32(0)))
+            cute.arch.sync_threads()
+        ex_pivot = Uint32(_smem_ld(ni0, Int32(0)))
+        if tx == Int32(0):
+            _smem_st(ctr, Int32(0), Int32(0))
+        cute.arch.sync_threads()
+        idx_base = Int32(tx)
+        while idx_base < n_total:
+            ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
+            if ex_key > ex_pivot:
+                ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                if ex_pos < topk_static:
+                    s_out[ex_pos] = idx_base
+            idx_base += Int32(_RADIX_THREADS)
+        cute.arch.sync_threads()
+        idx_base = Int32(tx)
+        while idx_base < n_total:
+            ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
+            if ex_key == ex_pivot:
+                ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                if ex_pos < topk_static:
+                    s_out[ex_pos] = idx_base
+            idx_base += Int32(_RADIX_THREADS)
+        cute.arch.sync_threads()
     cute.arch.sync_threads()
     i = Int32(tx)
     while i < topk_static:
