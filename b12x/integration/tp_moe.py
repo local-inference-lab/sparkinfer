@@ -4675,6 +4675,16 @@ def _get_dynamic_kernel(
     dynamic_down_scale = _dynamic_down_scale_enabled()
     # Tile planner (same routed_rows as the scratch plan -> consistent choice).
     mma_tiler_mn = _select_dynamic_tile_mn(m * num_topk, n, quant_mode)
+    # Gated FC1 swap_ab: a non-128 (but 32-aligned) per-shard intermediate needs
+    # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
+    # inside one SF atom (env override for dev: B12X_DYNAMIC_SWAP_AB=0/1).
+    swap_ab = bool(
+        quant_mode == "nvfp4" and activation == "silu"
+        and int(n) % 128 != 0 and int(n) % 32 == 0
+    )
+    _swap_env = os.environ.get("B12X_DYNAMIC_SWAP_AB")
+    if _swap_env is not None:
+        swap_ab = _swap_env != "0"
 
     global _LAST_KERNEL
     cache_key = (
@@ -4690,6 +4700,7 @@ def _get_dynamic_kernel(
         activation,
         dynamic_down_scale,
         share_input_across_experts,
+        swap_ab,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -4719,6 +4730,7 @@ def _get_dynamic_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+    kernel_kwargs["swap_ab"] = swap_ab
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
