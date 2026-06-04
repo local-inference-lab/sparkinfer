@@ -1597,6 +1597,28 @@ def _alloc_merge_scratch(rows: int, topk: int, ctas_per_group: int, dev):
     return pack_v, pack_i, state
 
 
+def fused_indexer_scratch_capacity(
+    max_rows: int, topk: int, num_sms: int
+) -> tuple[int, int]:
+    """Frugal FIXED capacity for the fused cross-CTA merge scratch -- for a workspace to
+    allocate ONCE and reuse, never grow.
+
+    The merge packs each cooperating CTA's local top-k (already trimmed to `topk`) into a
+    per-group slab slot. With ctas_per_group = num_sms // rows, the total packed
+    candidates = rows * ctas_per_group * topk <= num_sms * topk for ANY rows in
+    [1, num_sms]. So the pack slab is bounded by num_sms * topk -- INDEPENDENT of batch
+    size AND sequence length (the candidate count is capped by per-CTA top-k trimming,
+    not seq_len). This is the whole point: unlike a per-seq gather buffer, the fused merge
+    scratch never scales with context/max_model_len, so the frugal constant cap is exact.
+
+    Returns (pack_elems, state_words): pack_values and pack_indices each need pack_elems
+    (f32 / i32); merge_state needs state_words int32.
+    """
+    pack_elems = max(1, int(num_sms)) * int(topk)
+    state_words = max(1, int(max_rows)) * _COOP_STATE_WORDS
+    return pack_elems, state_words
+
+
 def _to_kernel_tensor(tensor: torch.Tensor, dtype, *, assumed_align: int = 16):
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
@@ -1620,9 +1642,18 @@ def run_fused_indexer_c4(
     out_values: torch.Tensor | None = None,
     ctas_per_group: int | None = None,
     merge_threshold: int | None = None,
+    pack_values: torch.Tensor | None = None,
+    pack_indices: torch.Tensor | None = None,
+    merge_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """C4 fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
+
+    pack_values/pack_indices/merge_state: optional caller-owned (workspace) scratch for
+    serving. Size them with fused_indexer_scratch_capacity(max_rows, topk, num_sms) ONCE
+    (fixed capacity, never grows -- the merge scratch is seq-independent). When omitted,
+    scratch is allocated per call (benchmarks/tests). merge_state is zeroed here each
+    call (cheap, graph-capturable); the kernel also self-resets its per-group counters.
 
     merge_threshold drives the per-group runtime cross-CTA merge auto-switch: a row
     whose live seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
@@ -1663,7 +1694,29 @@ def run_fused_indexer_c4(
         if out_values is None
         else out_values
     )
-    pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
+    if pack_values is not None and pack_indices is not None and merge_state is not None:
+        # Workspace-owned fixed-capacity scratch. Slice to this launch's need and zero the
+        # state (the per-group counters; cheap and graph-capturable). Capacity is validated
+        # against fused_indexer_scratch_capacity by the workspace at allocation time.
+        pack_need = rows * ctas_per_group * int(topk)
+        state_need = rows * _COOP_STATE_WORDS
+        if pack_values.numel() < pack_need or pack_indices.numel() < pack_need:
+            raise ValueError(
+                f"fused indexer pack scratch too small: need {pack_need}, have "
+                f"{min(pack_values.numel(), pack_indices.numel())} "
+                f"(size via fused_indexer_scratch_capacity)"
+            )
+        if merge_state.numel() < state_need:
+            raise ValueError(
+                f"fused indexer merge_state too small: need {state_need}, have "
+                f"{merge_state.numel()} (size via fused_indexer_scratch_capacity)"
+            )
+        pack_v = pack_values[:pack_need]
+        pack_i = pack_indices[:pack_need]
+        state = merge_state[:state_need]
+        state.zero_()
+    else:
+        pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
     # Real dim-0 byte stride of the K-quant tensor: the packed C4 cache interleaves
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
