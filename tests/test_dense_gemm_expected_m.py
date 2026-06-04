@@ -26,11 +26,11 @@ def test_expected_m_decode_regime_selects_32x128():
         assert _tile(64, expected_m=em) == (32, 128), em
 
 
-def test_expected_m_tiny_m_decode_selects_16x128():
-    # Tiny-M decode (expected_m<=8) -> 16x128, mirroring the no-hint m<=8
-    # specialization. Callers like vLLM set expected_m == live m per capture, so
-    # decode batches <=8 must get the decode tile, not the 32x128 bucket.
-    for em in (1, 2, 4, 8):
+def test_expected_m_tiny_m_decode_selects_probe_tiles():
+    # Exact single-token decode uses the flushed common-shape winner (16x64).
+    # The broader tiny-M regime keeps the prior 16x128 specialization.
+    assert _tile(64, expected_m=1) == (16, 64)
+    for em in (2, 4, 8):
         assert _tile(64, expected_m=em) == (16, 128), em
 
 
@@ -44,28 +44,39 @@ def test_expected_m_is_independent_of_live_m():
     # one warmed kernel serves every live M in the regime. For a fixed
     # expected_m, the selected tile must be identical across wildly different
     # live M (16, 512, 4096).
-    for em, want in ((64, (32, 128)), (1, (16, 128)), (2048, (64, 128))):
+    for em, want in ((64, (32, 128)), (1, (16, 64)), (2048, (64, 128))):
         tiles = {_tile(live_m, expected_m=em) for live_m in (1, 16, 128, 512, 4096)}
         assert tiles == {want}, (em, tiles)
 
 
 def test_no_hint_preserves_graft_a_default():
     # expected_m=None preserves the M-independent Graft A behavior outside the
-    # tiny standalone decode range: m=1..8 -> 16x128, and
-    # m>=16 -> 64x128.
-    assert _tile(1, expected_m=None) == (16, 128)
+    # tiny standalone decode range: m=1 -> 16x64, m=2..8 -> 16x128,
+    # and m>=16 -> 64x128.
+    assert _tile(1, expected_m=None) == (16, 64)
     for m in (2, 4, 8):
         assert _tile(m, expected_m=None) == (16, 128), m
     for m in (16, 32, 64, 128, 256, 4096):
         assert _tile(m, expected_m=None) == (64, 128), m
 
 
-def test_expected_m_ignored_for_narrow_n():
-    # The hint only governs the wide-N (n>1536) MXFP8 path; narrow-N keeps the
-    # existing occupancy heuristic regardless of expected_m.
+def test_expected_m_prefill_hint_for_narrow_n():
+    # Narrow-N has its own occupancy heuristic. Exact M=1 uses the common-shape
+    # decode winner, while declared prefill still moves to the prefill tile.
     narrow = 1024
     base = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True)
-    hinted = _select_default_mma_tiler_mn(
+    decode = _select_default_mma_tiler_mn(
+        64, narrow, SM, is_mxfp8=True, expected_m=1
+    )
+    small = _select_default_mma_tiler_mn(
         64, narrow, SM, is_mxfp8=True, expected_m=64
     )
-    assert base == hinted
+    prefill = _select_default_mma_tiler_mn(
+        64, narrow, SM, is_mxfp8=True, expected_m=512
+    )
+    no_hint_decode = _select_default_mma_tiler_mn(1, narrow, SM, is_mxfp8=True)
+    assert base == (64, 64)
+    assert decode == (16, 64)
+    assert small == base
+    assert prefill == (64, 128)
+    assert no_hint_decode == (16, 64)

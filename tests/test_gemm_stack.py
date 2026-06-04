@@ -5,10 +5,16 @@ import sys
 
 import pytest
 import torch
+import cutlass
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
-from b12x.gemm.dense import _select_default_mma_tiler_mn, dense_gemm
+from b12x.gemm.dense import (
+    DenseGemmKernel,
+    _select_default_dense_gemm_plan,
+    _select_default_mma_tiler_mn,
+    dense_gemm,
+)
 
 _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
@@ -63,6 +69,9 @@ def _run_dense_gemm(
     *,
     c_dtype_str: str = "bfloat16",
     out: torch.Tensor | None = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
+    load_path: str = "tma",
+    swap_ab: bool = False,
 ) -> torch.Tensor:
     alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
     return dense_gemm(
@@ -74,6 +83,9 @@ def _run_dense_gemm(
         sf_dtype="float8_e4m3fn",
         c_dtype=c_dtype_str,
         sf_vec_size=16,
+        mma_tiler_mn=mma_tiler_mn,
+        load_path=load_path,
+        swap_ab=swap_ab,
     )
 
 
@@ -134,6 +146,127 @@ def test_dense_gemm_matches_flashinfer_cudnn(
     )
 
     torch.testing.assert_close(dense_out[:, :, 0], cudnn_out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mma_tiler_mn", [(64, 32), (64, 16)])
+@pytest.mark.parametrize("load_path", ["tma", "cpasync"])
+def test_dense_gemm_fp4_swap_ab_small_tilen_matches_flashinfer_cudnn(
+    mma_tiler_mn: tuple[int, int],
+    load_path: str,
+) -> None:
+    require_sm120()
+    mm_fp4 = _require_cudnn_fp4()
+    torch.manual_seed(7)
+
+    M, N, K = 32, 64, 128
+    lhs, lhs_scale = _make_quantized_operand((1, M, K), dtype=torch.bfloat16)
+    rhs, rhs_scale = _make_quantized_operand((1, N, K), dtype=torch.bfloat16)
+    alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
+
+    dense_out = dense_gemm(
+        lhs,
+        rhs,
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        mma_tiler_mn=mma_tiler_mn,
+        load_path=load_path,
+        swap_ab=True,
+    )
+
+    packed_a, sfa = lhs
+    packed_b, sfb = rhs
+    cudnn_out = mm_fp4(
+        packed_a[:, :, 0].contiguous(),
+        packed_b[:, :, 0].contiguous().T,
+        convert_sf_from_mma_layout(sfa, m=M, k=K, num_groups=1),
+        convert_sf_from_mma_layout(sfb, m=N, k=K, num_groups=1).T,
+        alpha,
+        torch.bfloat16,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="cudnn",
+        use_nvfp4=True,
+    )
+
+    torch.testing.assert_close(dense_out[:, :, 0], cudnn_out, rtol=0, atol=0)
+
+
+def test_dense_gemm_fp4_small_tilen_support_matrix() -> None:
+    base = dict(
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        c_dtype=cutlass.BFloat16,
+        cluster_shape_mn=(1, 1),
+        n=64,
+        k=128,
+        l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+    )
+
+    assert not DenseGemmKernel.can_implement(
+        **base,
+        mma_tiler_mn=(64, 32),
+        load_path="tma",
+        swap_ab=False,
+    )
+    for tile in ((64, 32), (64, 16)):
+        for load_path in ("tma", "cpasync"):
+            assert DenseGemmKernel.can_implement(
+                **base,
+                mma_tiler_mn=tile,
+                load_path=load_path,
+                swap_ab=True,
+            )
+
+
+def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
+    base = dict(
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float8E8M0FNU,
+        sf_vec_size=32,
+        c_dtype=cutlass.BFloat16,
+        cluster_shape_mn=(1, 1),
+        n=1024,
+        k=4096,
+        l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+    )
+
+    for tile in ((16, 64), (16, 128), (32, 64), (32, 128)):
+        assert DenseGemmKernel.can_implement(
+            **base,
+            mma_tiler_mn=tile,
+            load_path="tma",
+            swap_ab=False,
+        )
+
+    assert not DenseGemmKernel.can_implement(
+        **base,
+        mma_tiler_mn=(64, 32),
+        load_path="tma",
+        swap_ab=False,
+    )
+    for tile in ((64, 32), (64, 16), (128, 32), (128, 16)):
+        assert DenseGemmKernel.can_implement(
+            **base,
+            mma_tiler_mn=tile,
+            load_path="tma",
+            swap_ab=True,
+        )
+        assert not DenseGemmKernel.can_implement(
+            **base,
+            mma_tiler_mn=tile,
+            load_path="cpasync",
+            swap_ab=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -212,3 +345,63 @@ def test_default_dense_tile_selector_handles_small_m_wide_n(
     expected: tuple[int, int],
 ) -> None:
     assert _select_default_mma_tiler_mn(m, n, sm_count, is_mxfp8=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "expected_tile", "expected_swap"),
+    [
+        (1, 4096, 5376, (64, 128), False),
+        (1, 2048, 5376, (64, 128), False),
+        (1, 1536, 4096, (64, 128), False),
+        (1, 1024, 5376, (64, 64), False),
+        (1, 512, 5376, (64, 32), True),
+        (1, 512, 4096, (64, 32), True),
+        (1, 512, 1024, (64, 64), False),
+        (2, 512, 5376, (64, 64), False),
+    ],
+)
+def test_default_dense_fp4_plan_handles_m1_probe_regimes(
+    m: int,
+    n: int,
+    k: int,
+    expected_tile: tuple[int, int],
+    expected_swap: bool,
+) -> None:
+    plan = _select_default_dense_gemm_plan(
+        m,
+        n,
+        k,
+        188,
+        is_mxfp8=False,
+    )
+    assert plan.mma_tiler_mn == expected_tile
+    assert plan.load_path == "tma"
+    assert plan.swap_ab is expected_swap
+
+
+@pytest.mark.parametrize(
+    ("n", "k"),
+    [
+        (4096, 5376),
+        (2048, 5376),
+        (1024, 5376),
+        (512, 5376),
+        (1536, 4096),
+        (16384, 1024),
+        (1024, 4096),
+        (4096, 4096),
+        (6144, 1536),
+        (7168, 512),
+    ],
+)
+def test_default_dense_fp8_plan_handles_m1_known_shapes(n: int, k: int) -> None:
+    plan = _select_default_dense_gemm_plan(
+        1,
+        n,
+        k,
+        188,
+        is_mxfp8=True,
+    )
+    assert plan.mma_tiler_mn == (16, 64)
+    assert plan.load_path == "tma"
+    assert plan.swap_ab is False

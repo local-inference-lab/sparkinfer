@@ -11,9 +11,11 @@ Run:  CUDA_VISIBLE_DEVICES=0 .../vllm-other/.venv/bin/python \
 """
 from __future__ import annotations
 
+import argparse
 import pathlib
 import statistics
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -25,129 +27,265 @@ from benchmark_dense_gemm import (
     cosine_similarity,
     make_l2_flush_fn,
     make_mxfp8_operand,
+    resolve_l2_flush_bytes,
 )
-from b12x.gemm.dense import DenseGemmKernel, dense_gemm
+from b12x.gemm.dense import DenseGemmKernel, _select_default_mma_tiler_mn, dense_gemm
 
 import cutlass
 
-# Nemotron 3 Super shared-expert down-proj (the benchmark's FP8 shape).
-# Shape: default = Nemotron down-proj; override via argv "N K" to sweep other
-# n>1536 shapes (e.g. GLM5 dense-down 6144 1536, a wo_b-like 7168 512).
-if len(sys.argv) >= 3:
-    N = int(sys.argv[1])
-    K = int(sys.argv[2])
-else:
-    K = 5376
-    N = 4096
-# Extended to large M to find where the small-tile win ends and (128,128) (the
-# compute-bound large-M regime) takes back over -- the benchmark only covers
-# M<=256, but prefill goes higher and the heuristic must not regress there.
-M_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048]
+@dataclass(frozen=True)
+class ShapeCase:
+    name: str
+    n: int
+    k: int
+    note: str
+
+    def label(self) -> str:
+        return f"{self.name}: N={self.n} K={self.k}"
+
+
+@dataclass(frozen=True)
+class Candidate:
+    tile: tuple[int, int]
+    swap_ab: bool = False
+
+    def label(self) -> str:
+        suffix = "/swap" if self.swap_ab else "/normal"
+        return f"{self.tile}{suffix}"
+
+
+# Extended to large M to find where the small-tile win ends and (128,128) takes
+# back over. The common-shape path below can be restricted to M=1 for decode.
+DEFAULT_M_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048]
 
 # Candidate tiles. can_implement allows tile_m%64==0 & tile_n%64==0, plus the
 # FP8-only small-M tiles {16,32}x{64,128}. tile_n>128 does not compile on this
 # kernel (BLOCK_N capped at 128), so only the compiling survivors are probed.
 # Small-N (x64) tiles give 2x the column tiles -> more CTAs at tiny M.
 TILES = [
-    (128, 128),  # current heuristic pin (baseline)
-    (64, 128),
-    (64, 64),
-    (32, 128),
-    (32, 64),
-    (16, 128),
-    (16, 64),
+    Candidate((128, 128)),  # current heuristic pin (baseline)
+    Candidate((64, 128)),
+    Candidate((64, 64)),
+    Candidate((32, 128)),
+    Candidate((32, 64)),
+    Candidate((16, 128)),
+    Candidate((16, 64)),
+    Candidate((128, 32), True),
+    Candidate((128, 16), True),
+    Candidate((64, 32), True),
+    Candidate((64, 16), True),
 ]
 
-WARMUP = 10
-ITERS = 50
+COMMON_SHAPES = (
+    ShapeCase(
+        "nemotron_shared_down_full",
+        4096,
+        5376,
+        "benchmark_dense_gemm shared expert down",
+    ),
+    ShapeCase(
+        "nemotron_shared_down_n2048",
+        2048,
+        5376,
+        "shared-down output shard proxy",
+    ),
+    ShapeCase(
+        "nemotron_shared_down_n1024",
+        1024,
+        5376,
+        "shared-down output shard proxy",
+    ),
+    ShapeCase(
+        "nemotron_shared_down_n512",
+        512,
+        5376,
+        "shared-down output shard proxy",
+    ),
+    ShapeCase(
+        "deepseek_qkv_a_down",
+        1536,
+        4096,
+        "benchmark_dense_fp8_vs_deepgemm projection shape",
+    ),
+    ShapeCase(
+        "deepseek_q_b_up",
+        16384,
+        1024,
+        "benchmark_dense_fp8_vs_deepgemm projection shape",
+    ),
+    ShapeCase(
+        "deepseek_wo_a",
+        1024,
+        4096,
+        "benchmark_dense_fp8_vs_deepgemm projection shape",
+    ),
+    ShapeCase(
+        "deepseek_wo_b",
+        4096,
+        4096,
+        "benchmark_dense_fp8_vs_deepgemm projection shape",
+    ),
+    ShapeCase(
+        "glm5_dense_down",
+        6144,
+        1536,
+        "shape called out by the original FP8 probe comment",
+    ),
+    ShapeCase(
+        "wo_b_like_n7168_k512",
+        7168,
+        512,
+        "shape called out by the original FP8 probe comment",
+    ),
+)
 
 
-def _supported(tile, m):
+def _parse_m_list(raw: str) -> list[int]:
+    values = [int(item) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("--m-list must contain at least one value")
+    return values
+
+
+def _shape_cases(args: argparse.Namespace) -> list[ShapeCase]:
+    if args.shape_set == "single":
+        return [ShapeCase("single", args.n, args.k, "CLI shape")]
+    return list(COMMON_SHAPES)
+
+
+def _supported(candidate: Candidate, *, n: int, k: int):
     return DenseGemmKernel.can_implement(
         cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, cutlass.BFloat16,
-        tile, (1, 1), N, K, 1, "k", "k", "n",
+        candidate.tile, (1, 1), n, k, 1, "k", "k", "n",
+        swap_ab=candidate.swap_ab,
     )
 
 
 def main():
-    torch.manual_seed(42)
-    l2_flush = make_l2_flush_fn(enabled=True, bytes_hint=0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("legacy_n", type=int, nargs="?")
+    parser.add_argument("legacy_k", type=int, nargs="?")
+    parser.add_argument("--n", type=int, default=4096)
+    parser.add_argument("--k", type=int, default=5376)
+    parser.add_argument("--shape-set", choices=("single", "common"), default="single")
+    parser.add_argument("--list-common-shapes", action="store_true")
+    parser.add_argument("--m-list", type=_parse_m_list, default=DEFAULT_M_LIST)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--no-l2-flush", action="store_true")
+    args = parser.parse_args()
+    if args.legacy_n is not None:
+        args.n = args.legacy_n
+    if args.legacy_k is not None:
+        args.k = args.legacy_k
+    if args.list_common_shapes:
+        for shape in COMMON_SHAPES:
+            print(f"{shape.label()}  # {shape.note}")
+        return
+
+    l2_flush = make_l2_flush_fn(enabled=not args.no_l2_flush, bytes_hint=0)
+    l2_flush_bytes = resolve_l2_flush_bytes(0) if l2_flush is not None else 0
     sm = torch.cuda.get_device_properties(0).multi_processor_count
-    print(f"device SMs={sm}  shape N={N} K={K}  warmup={WARMUP} iters={ITERS}")
+    shapes = _shape_cases(args)
+    print(f"device SMs={sm}  shape_set={args.shape_set} shapes={len(shapes)}  warmup={args.warmup} iters={args.iters}")
+    if l2_flush is not None:
+        print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
+    else:
+        print("L2 flush: off")
 
     # best[(metric)] tracking for the single-tile-across-M summary
     per_tile_ratiosum = {t: [] for t in TILES}
+    best_rows = []
 
-    for M in M_LIST:
-        a_q, a_sf, a_sf_mma, _ = make_mxfp8_operand(M, K)
-        b_q, b_sf, b_sf_mma, _ = make_mxfp8_operand(N, K)
+    for shape in shapes:
+        print(f"\n######## {shape.label()} ########")
+        print(f"note: {shape.note}")
+        for M in args.m_list:
+            torch.manual_seed(42 + M + shape.n + shape.k)
+            a_q, a_sf, a_sf_mma, _ = make_mxfp8_operand(M, shape.k)
+            b_q, b_sf, b_sf_mma, _ = make_mxfp8_operand(shape.n, shape.k)
 
-        # Known-good reference = (128,128) output (baseline validated cos=1.0 vs CUTLASS).
-        ref_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
+            # Known-good reference = (128,128) output.
+            ref_out = torch.empty((M, shape.n, 1), device="cuda", dtype=torch.bfloat16)
 
-        def make_launch(tile, out):
-            def launch():
-                dense_gemm(
-                    (a_q.view(M, K, 1), a_sf_mma),
-                    (b_q.view(N, K, 1), b_sf_mma),
-                    ab_dtype="float8_e4m3fn",
-                    sf_dtype="float8_e8m0fnu",
-                    c_dtype="bfloat16",
-                    sf_vec_size=32,
-                    out=out,
-                    mma_tiler_mn=tile,
-                )
-            return launch
+            def make_launch(candidate, out):
+                def launch():
+                    dense_gemm(
+                        (a_q.view(M, shape.k, 1), a_sf_mma),
+                        (b_q.view(shape.n, shape.k, 1), b_sf_mma),
+                        ab_dtype="float8_e4m3fn",
+                        sf_dtype="float8_e8m0fnu",
+                        c_dtype="bfloat16",
+                        sf_vec_size=32,
+                        out=out,
+                        mma_tiler_mn=candidate.tile,
+                        swap_ab=candidate.swap_ab,
+                    )
+                return launch
 
-        # reference first
-        make_launch((128, 128), ref_out)()
-        torch.cuda.synchronize()
+            # reference first
+            make_launch(Candidate((128, 128)), ref_out)()
+            torch.cuda.synchronize()
 
-        print(f"\n=== M={M} ===")
-        print(f"  {'tile':>10}  {'median_us':>10}  {'min_us':>8}  {'cos_vs_128':>11}  {'maxabs':>9}")
-        rows = []
-        for tile in TILES:
-            if not _supported(tile, M):
-                print(f"  {str(tile):>10}  {'unsupported':>10}")
-                per_tile_ratiosum[tile].append(None)
-                continue
-            try:
-                out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
-                replay = capture_graph_replay(make_launch(tile, out))
-                t = bench_events(replay, warmup=WARMUP, iters=ITERS, l2_flush=l2_flush)
-                med = statistics.median(t) * 1000
-                mn = min(t) * 1000
-                cos = cosine_similarity(out[:, :, 0], ref_out[:, :, 0])
-                maxabs = (out.float() - ref_out.float()).abs().max().item()
-                rows.append((tile, med, cos))
-                per_tile_ratiosum[tile].append(med)
-                print(f"  {str(tile):>10}  {med:10.1f}  {mn:8.1f}  {cos:11.8f}  {maxabs:9.5f}")
-            except Exception as exc:
-                per_tile_ratiosum[tile].append(None)
-                msg = str(exc).splitlines()[0][:60]
-                print(f"  {str(tile):>10}  FAIL: {msg}")
-        if rows:
-            best = min(rows, key=lambda r: r[1])
-            base = next((r for r in rows if r[0] == (128, 128)), None)
-            spd = (base[1] / best[1]) if base else float("nan")
-            print(f"  -> best M={M}: tile={best[0]} {best[1]:.1f}us"
-                  + (f"  ({spd:.2f}x vs (128,128) {base[1]:.1f}us)" if base else ""))
+            default_tile = _select_default_mma_tiler_mn(
+                M,
+                shape.n,
+                sm,
+                is_mxfp8=True,
+            )
+            print(f"\n=== {shape.name} M={M} default={default_tile} ===")
+            print(f"  {'candidate':>20}  {'median_us':>10}  {'min_us':>8}  {'cos_vs_128':>11}  {'maxabs':>9}")
+            rows = []
+            for candidate in TILES:
+                if not _supported(candidate, n=shape.n, k=shape.k):
+                    print(f"  {candidate.label():>20}  {'unsupported':>10}")
+                    continue
+                try:
+                    out = torch.empty((M, shape.n, 1), device="cuda", dtype=torch.bfloat16)
+                    replay = capture_graph_replay(make_launch(candidate, out))
+                    t = bench_events(replay, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush)
+                    med = statistics.median(t) * 1000
+                    mn = min(t) * 1000
+                    cos = cosine_similarity(out[:, :, 0], ref_out[:, :, 0])
+                    maxabs = (out.float() - ref_out.float()).abs().max().item()
+                    rows.append((candidate, med, cos))
+                    per_tile_ratiosum[candidate].append(med)
+                    print(f"  {candidate.label():>20}  {med:10.1f}  {mn:8.1f}  {cos:11.8f}  {maxabs:9.5f}")
+                except Exception as exc:
+                    msg = str(exc).splitlines()[0][:60]
+                    print(f"  {candidate.label():>20}  FAIL: {msg}")
+            if rows:
+                best = min(rows, key=lambda r: r[1])
+                base = next((r for r in rows if r[0] == Candidate((128, 128))), None)
+                default = next((r for r in rows if r[0] == Candidate(default_tile)), None)
+                spd = (base[1] / best[1]) if base else float("nan")
+                default_ratio = (default[1] / best[1]) if default else float("nan")
+                best_rows.append((shape, M, best[0], best[1], default_tile, default_ratio))
+                print(f"  -> best {shape.name} M={M}: candidate={best[0].label()} {best[1]:.1f}us"
+                      + (f"  ({spd:.2f}x vs (128,128) {base[1]:.1f}us)" if base else "")
+                      + (f"  default/best={default_ratio:.2f}x" if default else ""))
 
     # Single durable tile: geomean of median_us across M (lower better)
     print("\n=== single-tile-across-M (geomean median_us, lower=better) ===")
     scored = []
-    for tile, vals in per_tile_ratiosum.items():
+    for candidate, vals in per_tile_ratiosum.items():
         good = [v for v in vals if v is not None]
-        if len(good) != len([m for m in M_LIST]):
-            # only consider tiles valid for all M
+        if not good:
             continue
         g = 1.0
         for v in good:
             g *= v
         g **= 1.0 / len(good)
-        scored.append((tile, g))
-    for tile, g in sorted(scored, key=lambda x: x[1]):
-        print(f"  {str(tile):>10}  geomean_us={g:8.1f}")
+        scored.append((candidate, g))
+    for candidate, g in sorted(scored, key=lambda x: x[1]):
+        print(f"  {candidate.label():>20}  geomean_us={g:8.1f}")
+    if best_rows:
+        print("\n=== winners ===")
+        for shape, M, candidate, med, default_tile, default_ratio in best_rows:
+            print(
+                f"  {shape.name:>28}  M={M:<4}  best={candidate.label():>20}  "
+                f"{med:8.1f}us  default={default_tile}  default/best={default_ratio:.2f}x"
+            )
 
 
 if __name__ == "__main__":
