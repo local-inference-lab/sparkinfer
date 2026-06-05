@@ -386,6 +386,12 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         dtype=torch.int32,
         device=device,
     )
+    graph_shared_page_table = torch.full(
+        (1, width_blocks),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
     graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
     q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
     weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
@@ -447,10 +453,15 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
             width_blocks=width_blocks,
             device=device,
         )
-        graph_real_page_table.copy_(base_table.expand(rows, -1))
+        if shared_page_table:
+            graph_shared_page_table.copy_(base_table)
+            real_page_table = graph_shared_page_table.expand(rows, -1)
+        else:
+            graph_real_page_table.copy_(base_table.expand(rows, -1))
+            real_page_table = graph_real_page_table
         graph_seqlens.fill_(seq_len)
         return prepare_compressed_indexer_metadata(
-            real_page_table=graph_real_page_table,
+            real_page_table=real_page_table,
             cache_seqlens_int32=graph_seqlens,
             expected_num_q_heads=num_heads,
             build_schedule=False,

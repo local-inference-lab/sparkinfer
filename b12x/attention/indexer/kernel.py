@@ -302,6 +302,15 @@ def _to_kernel_tensor(
     return cute_tensor
 
 
+def _is_row_shared_i32_matrix(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.ndim == 2
+        and tensor.dtype == torch.int32
+        and int(tensor.stride(0)) == 0
+        and int(tensor.stride(1)) == 1
+    )
+
+
 def _tensor_meta_key(
     tensor: torch.Tensor,
 ) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]]:
@@ -338,6 +347,8 @@ def _contract_key_tensor(
     if phantom is None:
         return actual
     if tuple(phantom.shape) != tuple(actual.shape):
+        return actual
+    if tuple(phantom.stride()) != tuple(actual.stride()):
         return actual
     return phantom
 
@@ -2364,7 +2375,9 @@ def _run_paged_tiled_logits_kernel_common(
             raise ValueError("paged tiled logits requires contiguous q_fp8")
         if not weights.is_contiguous():
             raise ValueError("paged tiled logits requires contiguous weights")
-        if not real_page_table.is_contiguous():
+        if not real_page_table.is_contiguous() and not _is_row_shared_i32_matrix(
+            real_page_table
+        ):
             raise ValueError("paged tiled logits requires contiguous real_page_table")
         if not seqlens_per_query.is_contiguous():
             raise ValueError("paged tiled logits requires contiguous seqlens_per_query")

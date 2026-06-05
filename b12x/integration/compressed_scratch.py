@@ -1607,12 +1607,19 @@ def build_compressed_indexer_binding(
     elif workspace is not None and workspace is not scratch:
         raise ValueError("scratch and workspace refer to different compressed indexer resources")
 
-    _validate_i32_contiguous(
-        real_page_table,
-        scratch=scratch,
-        name="real_page_table",
-        ndim=2,
-    )
+    if bool(shared_page_table) and _is_row_shared_i32_matrix(real_page_table):
+        if real_page_table.dtype != torch.int32:
+            raise ValueError(
+                f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
+            )
+        _validate_device(real_page_table, scratch=scratch, name="real_page_table")
+    else:
+        _validate_i32_contiguous(
+            real_page_table,
+            scratch=scratch,
+            name="real_page_table",
+            ndim=2,
+        )
     _validate_i32_contiguous(
         cache_seqlens_int32,
         scratch=scratch,

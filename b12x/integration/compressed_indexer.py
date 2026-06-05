@@ -192,6 +192,15 @@ def _validate_i32_contiguous(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _is_row_shared_i32_matrix(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.ndim == 2
+        and tensor.dtype == torch.int32
+        and int(tensor.stride(0)) == 0
+        and int(tensor.stride(1)) == 1
+    )
+
+
 def _validate_raw_page_lengths(
     *,
     real_page_table: torch.Tensor,
@@ -286,7 +295,10 @@ def prepare_compressed_indexer_metadata(
             f"compressed indexer currently supports page_size={COMPRESSED_INDEX_PAGE_SIZE}, "
             f"got {page_size}"
         )
-    _validate_i32_contiguous(real_page_table, name="real_page_table", ndim=2)
+    if bool(shared_page_table) and _is_row_shared_i32_matrix(real_page_table):
+        pass
+    else:
+        _validate_i32_contiguous(real_page_table, name="real_page_table", ndim=2)
     _validate_i32_contiguous(cache_seqlens_int32, name="cache_seqlens_int32", ndim=1)
     if real_page_table.shape[0] != cache_seqlens_int32.shape[0]:
         raise ValueError(
@@ -587,7 +599,10 @@ def index_topk_fp8(
         )
     if metadata.real_page_table.device != q_fp8.device:
         raise ValueError("real_page_table must be on the same device as q_fp8")
-    if not metadata.real_page_table.is_contiguous():
+    if not metadata.real_page_table.is_contiguous() and not (
+        metadata.shared_page_table
+        and _is_row_shared_i32_matrix(metadata.real_page_table)
+    ):
         raise ValueError("metadata.real_page_table must be contiguous")
 
     q_rows = int(q_fp8.shape[0])
@@ -632,6 +647,7 @@ def index_topk_fp8(
     indexer_heads = int(q_fp8.shape[1])
     fused_enabled = (
         os.getenv("B12X_FUSED_INDEXER", "1") != "0"
+        and not bool(metadata.shared_page_table)
         and resolve_fused_indexer_path(
             topk=topk, num_rows=q_rows, width=page_table_width * page_size
         )
