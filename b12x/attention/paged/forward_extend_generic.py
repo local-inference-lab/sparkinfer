@@ -112,22 +112,7 @@ def _cp_async_bulk_tensor_2d(
     loc=None,
     ip=None,
 ):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
-            Int32(coord0).ir_value(loc=loc, ip=ip),
-            Int32(coord1).ir_value(loc=loc, ip=ip),
-            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
-        "[$0], [$1, {$2, $3}], [$4];",
-        "r,l,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    raise RuntimeError("raw tensor-map TMA issue is disabled; use CuTe atom TMA")
 
 
 @cute.jit
@@ -2251,7 +2236,7 @@ class PagedForwardKernel:
         self.use_paged_k_tma = self.use_paged_kv_tma_exact_plane_bf16_layout
         self.use_paged_v_tma = self.use_paged_kv_tma_exact_plane_bf16_layout
         self.use_paged_kv_tma = self.use_paged_kv_tma_exact_plane_bf16_layout
-        self.use_paged_kv_tma_fp8_raw_issue = self.kv_is_fp8 and self.use_paged_kv_tma
+        self.use_paged_kv_tma_fp8_raw_issue = False
         tma_debug_dump = os.environ.get("B12X_PAGED_KV_TMA_DEBUG_DUMP", "")
         paged_debug_dump = os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "")
         self.debug_dump_paged_kv_tma_k = self.use_paged_kv_tma and tma_debug_dump == "K"
@@ -5171,6 +5156,7 @@ class PagedForwardKernel:
 
 class PagedFp8RawPlaneDumpKernel:
     def __init__(self):
+        raise RuntimeError("raw tensor-map TMA issue is disabled; use CuTe atom TMA")
         self.page_size = 64
         self.stage_tile_rows = 64
         self.kv_tma_plane_head_dim = 128
@@ -5299,6 +5285,7 @@ class PagedFp8RawPlaneDumpKernel:
 
 class PagedFp8ExtendRawForwardKernel:
     def __init__(self, *, split_kv: bool):
+        raise RuntimeError("raw tensor-map TMA issue is disabled; use CuTe atom TMA")
         self.split_kv = split_kv
         self.cta_tile_q = 64
         self.stage_tile_rows = 64
@@ -5319,7 +5306,7 @@ class PagedFp8ExtendRawForwardKernel:
         self.use_paged_k_tma = True
         self.use_paged_v_tma = True
         self.use_paged_kv_tma = True
-        self.use_paged_kv_tma_fp8_raw_issue = True
+        self.use_paged_kv_tma_fp8_raw_issue = False
         self.kv_tma_plane_head_dim = 128
         self.kv_tma_plane_count = 2
         self.q_bytes = self.cta_tile_q * self.head_dim_qk * 2

@@ -2677,7 +2677,7 @@ class B12XAttentionWorkspace:
         include_lengths: bool = True,
         include_merge_positions: bool = True,
     ):
-        from b12x.integration.indexer_scratch import build_indexer_extend_binding
+        from b12x.integration.compressed_scratch import build_indexer_extend_binding
 
         return build_indexer_extend_binding(
             workspace=self,

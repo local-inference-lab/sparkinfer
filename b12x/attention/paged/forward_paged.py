@@ -297,22 +297,7 @@ def _cp_async_bulk_tensor_2d(
     loc=None,
     ip=None,
 ):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
-            Int32(coord0).ir_value(loc=loc, ip=ip),
-            Int32(coord1).ir_value(loc=loc, ip=ip),
-            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
-        "[$0], [$1, {$2, $3}], [$4];",
-        "r,l,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    raise RuntimeError("raw tensor-map TMA issue is disabled; use CuTe atom TMA")
 
 
 @cute.jit

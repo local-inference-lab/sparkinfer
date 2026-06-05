@@ -11,6 +11,7 @@ import torch
 from b12x.attention.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
+from b12x.attention.indexer.api import IndexerExtendMetadata
 from b12x.attention.mla.compressed_reference import COMPRESSED_MLA_HEAD_DIM
 from b12x.attention.workspace import (
     _ARENA_ALIGN_BYTES,
@@ -34,6 +35,12 @@ _COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _COMPRESSED_INDEX_TILE_BLOCK_Q = 32
 _COMPRESSED_INDEX_TILE_BLOCK_K = 512
 _COMPRESSED_INDEX_HEAD_DIM = 128
+_INDEXER_EXTEND_BLOCK_Q = 32
+_INDEXER_EXTEND_PREFILL_BLOCK_K = 256
+_INDEXER_EXTEND_DECODE_BLOCK_K = 64
+_INDEXER_EXTEND_HEAD_DIM = 128
+_INDEXER_EXTEND_SCALE_BYTES = 4
+_INDEXER_EXTEND_TMA_DESC_WORDS = 16
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,6 +124,46 @@ class B12XCompressedIndexerScratchCaps:
 
 
 @dataclass(frozen=True, kw_only=True)
+class B12XIndexerExtendScratchCaps:
+    device: torch.device | str
+    num_q_heads: int
+    max_q_rows: int
+    max_k_rows: int
+    topk: int
+    k_dtype: torch.dtype = torch.float8_e4m3fn
+    supertile_k: int = 32768
+    prefill_block_k: int = _INDEXER_EXTEND_PREFILL_BLOCK_K
+
+    def __post_init__(self) -> None:
+        device = torch.device(self.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
+        object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
+        max_k_rows = max(int(self.max_k_rows), 1)
+        max_k_rows = (
+            (max_k_rows + _INDEXER_EXTEND_DECODE_BLOCK_K - 1)
+            // _INDEXER_EXTEND_DECODE_BLOCK_K
+        ) * _INDEXER_EXTEND_DECODE_BLOCK_K
+        object.__setattr__(self, "max_k_rows", max_k_rows)
+        object.__setattr__(self, "topk", max(int(self.topk), 1))
+        supertile_k = max(int(self.supertile_k), int(self.prefill_block_k), 1)
+        prefill_block_k = int(self.prefill_block_k)
+        if prefill_block_k != _INDEXER_EXTEND_PREFILL_BLOCK_K:
+            raise ValueError(
+                "indexer extend scratch currently supports "
+                f"prefill_block_k={_INDEXER_EXTEND_PREFILL_BLOCK_K}, got "
+                f"{prefill_block_k}"
+            )
+        supertile_k = (
+            (supertile_k + prefill_block_k - 1) // prefill_block_k
+        ) * prefill_block_k
+        object.__setattr__(self, "supertile_k", supertile_k)
+        object.__setattr__(self, "prefill_block_k", prefill_block_k)
+
+
+@dataclass(frozen=True, kw_only=True)
 class _B12XCompressedMLAScratchLayout:
     nbytes: int
     max_q_chunks: int
@@ -146,6 +193,29 @@ class _B12XCompressedIndexerScratchLayout:
     fused_pack_values_offset_bytes: int
     fused_pack_indices_offset_bytes: int
     fused_merge_state_offset_bytes: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class _B12XIndexerExtendScratchLayout:
+    nbytes: int
+    max_k_rows: int
+    max_chunk_tiles: int
+    tile_logits_elements: int
+    k_quant_offset_bytes: int
+    k_scale_offset_bytes: int
+    dummy_logits_offset_bytes: int
+    tile_logits_offset_bytes: int
+    lengths_offset_bytes: int
+    topk_values_offset_bytes: int
+    topk_indices_offset_bytes: int
+    candidate_values_offset_bytes: int
+    candidate_indices_offset_bytes: int
+    metadata_k_start_offset_bytes: int
+    metadata_k_end_offset_bytes: int
+    k_tma_desc_offset_bytes: int
+    k_tma_desc_ptrs_offset_bytes: int
+    k_tma_prefill_desc_offset_bytes: int
+    k_tma_prefill_desc_ptrs_offset_bytes: int
 
 
 @dataclass(kw_only=True)
@@ -382,6 +452,100 @@ class B12XCompressedIndexerScratch:
         }
 
 
+@dataclass(kw_only=True)
+class B12XIndexerExtendScratch:
+    """Extend-indexer scratch views over caller-owned storage."""
+
+    shared_scratch: torch.Tensor
+    device: torch.device
+    num_q_heads: int
+    max_q_rows: int
+    max_k_rows: int
+    topk: int
+    supertile_k: int
+    prefill_block_k: int
+    k_quant: torch.Tensor
+    k_scale_bytes: torch.Tensor
+    k_scale: torch.Tensor
+    dummy_logits: torch.Tensor
+    tile_logits: torch.Tensor
+    lengths: torch.Tensor
+    topk_values: torch.Tensor
+    topk_indices: torch.Tensor
+    candidate_values: torch.Tensor
+    candidate_indices: torch.Tensor
+    metadata_k_start: torch.Tensor
+    metadata_k_end: torch.Tensor
+    k_tma_desc_ptrs: torch.Tensor
+    k_tma_prefill_desc_ptrs: torch.Tensor
+    _contract_q_u32: torch.Tensor | None = None
+    _contract_q_bytes: torch.Tensor | None = None
+    _contract_weights: torch.Tensor | None = None
+    _contract_k_quant: torch.Tensor | None = None
+    _contract_k_scale: torch.Tensor | None = None
+    _contract_k_start: torch.Tensor | None = None
+    _contract_k_end: torch.Tensor | None = None
+    _contract_lengths: torch.Tensor | None = None
+    _contract_logits: torch.Tensor | None = None
+    _contract_tile_logits: torch.Tensor | None = None
+    _contract_topk_values: torch.Tensor | None = None
+    _contract_topk_indices: torch.Tensor | None = None
+    _contract_carry_values: torch.Tensor | None = None
+    _contract_carry_indices: torch.Tensor | None = None
+
+    def get_contract_phantoms(self) -> dict[str, torch.Tensor]:
+        if (
+            self._contract_q_u32 is None
+            or self._contract_q_bytes is None
+            or self._contract_weights is None
+            or self._contract_k_quant is None
+            or self._contract_k_scale is None
+            or self._contract_k_start is None
+            or self._contract_k_end is None
+            or self._contract_lengths is None
+            or self._contract_logits is None
+            or self._contract_tile_logits is None
+            or self._contract_topk_values is None
+            or self._contract_topk_indices is None
+            or self._contract_carry_values is None
+            or self._contract_carry_indices is None
+        ):
+            raise RuntimeError("indexer extend scratch is missing contract phantoms")
+        return {
+            "extend_q_u32": self._contract_q_u32,
+            "extend_q_bytes": self._contract_q_bytes,
+            "extend_weights": self._contract_weights,
+            "extend_k_quant": self._contract_k_quant,
+            "extend_k_scale": self._contract_k_scale,
+            "extend_k_start": self._contract_k_start,
+            "extend_k_end": self._contract_k_end,
+            "extend_lengths": self._contract_lengths,
+            "extend_logits": self._contract_logits,
+            "extend_tile_logits": self._contract_tile_logits,
+            "extend_topk_values": self._contract_topk_values,
+            "extend_topk_indices": self._contract_topk_indices,
+            "extend_carry_values": self._contract_carry_values,
+            "extend_carry_indices": self._contract_carry_indices,
+        }
+
+    def prepare_k_padding(self, *, k_rows: int) -> None:
+        k_rows = int(k_rows)
+        if k_rows < 0:
+            raise ValueError(f"k_rows must be non-negative, got {k_rows}")
+        if k_rows > int(self.max_k_rows):
+            raise ValueError(
+                f"k_rows {k_rows} exceed extend scratch capacity {self.max_k_rows}"
+            )
+        padded_rows = (
+            (max(k_rows, 1) + int(self.prefill_block_k) - 1)
+            // int(self.prefill_block_k)
+        ) * int(self.prefill_block_k)
+        padded_rows = min(padded_rows, int(self.max_k_rows))
+        if padded_rows > k_rows:
+            self.k_quant[k_rows:padded_rows].zero_()
+            self.k_scale_bytes[k_rows:padded_rows].zero_()
+
+
 @dataclass(frozen=True, kw_only=True)
 class B12XCompressedMLABinding:
     scratch: object
@@ -402,6 +566,24 @@ class B12XCompressedIndexerBinding:
     schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
     shared_page_table: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XIndexerExtendBinding:
+    scratch: object
+    metadata: IndexerExtendMetadata
+    topk: int | None = None
+    contract_phantoms: dict[str, torch.Tensor] | None = None
+    tile_logits: torch.Tensor | None = None
+    lengths: torch.Tensor | None = None
+    output_values: torch.Tensor | None = None
+    output_indices: torch.Tensor | None = None
+    candidate_values: torch.Tensor | None = None
+    candidate_indices: torch.Tensor | None = None
+    merge_positions: torch.Tensor | None = None
+    prefill_block_k: int | None = None
+    supertile_k: int | None = None
+    strict: bool = False
 
 
 def _compressed_mla_scratch_layout(
@@ -656,6 +838,120 @@ def _compressed_indexer_scratch_layout(
     )
 
 
+def _indexer_extend_scratch_layout(
+    caps: B12XIndexerExtendScratchCaps,
+) -> _B12XIndexerExtendScratchLayout:
+    max_q_rows = max(int(caps.max_q_rows), 1)
+    max_k_rows = max(int(caps.max_k_rows), 1)
+    topk = max(int(caps.topk), 1)
+    prefill_block_k = int(caps.prefill_block_k)
+    supertile_tiles = max(1, int(caps.supertile_k) // prefill_block_k)
+    num_q_tiles = (
+        max_q_rows + _INDEXER_EXTEND_BLOCK_Q - 1
+    ) // _INDEXER_EXTEND_BLOCK_Q
+    num_k_tiles = (max_k_rows + prefill_block_k - 1) // prefill_block_k
+    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
+    tile_logits_elements = max(
+        1,
+        num_q_tiles
+        * max_chunk_tiles
+        * _INDEXER_EXTEND_BLOCK_Q
+        * prefill_block_k,
+    )
+
+    cursor = 0
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+    k_quant_offset_bytes = cursor
+    cursor += (
+        max_k_rows
+        * _INDEXER_EXTEND_HEAD_DIM
+        * _dtype_nbytes(caps.k_dtype)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    k_scale_offset_bytes = cursor
+    cursor += (
+        max_k_rows
+        * _INDEXER_EXTEND_SCALE_BYTES
+        * _dtype_nbytes(torch.uint8)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    dummy_logits_offset_bytes = cursor
+    cursor += _dtype_nbytes(torch.float32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tile_logits_offset_bytes = cursor
+    cursor += tile_logits_elements * _dtype_nbytes(torch.float32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    lengths_offset_bytes = cursor
+    cursor += max_q_rows * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    topk_values_offset_bytes = cursor
+    cursor += max_q_rows * topk * _dtype_nbytes(torch.float32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    topk_indices_offset_bytes = cursor
+    cursor += max_q_rows * topk * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    candidate_values_offset_bytes = cursor
+    cursor += 2 * max_q_rows * topk * _dtype_nbytes(torch.float32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    candidate_indices_offset_bytes = cursor
+    cursor += 2 * max_q_rows * topk * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    metadata_k_start_offset_bytes = cursor
+    cursor += max_q_rows * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    metadata_k_end_offset_bytes = cursor
+    cursor += max_q_rows * _dtype_nbytes(torch.int32)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    k_tma_desc_offset_bytes = cursor
+    cursor += _INDEXER_EXTEND_TMA_DESC_WORDS * _dtype_nbytes(torch.uint64)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    k_tma_desc_ptrs_offset_bytes = cursor
+    cursor += _dtype_nbytes(torch.int64)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    k_tma_prefill_desc_offset_bytes = cursor
+    cursor += _INDEXER_EXTEND_TMA_DESC_WORDS * _dtype_nbytes(torch.uint64)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    k_tma_prefill_desc_ptrs_offset_bytes = cursor
+    cursor += _dtype_nbytes(torch.int64)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    return _B12XIndexerExtendScratchLayout(
+        nbytes=max(int(cursor), _ARENA_ALIGN_BYTES),
+        max_k_rows=max_k_rows,
+        max_chunk_tiles=max_chunk_tiles,
+        tile_logits_elements=tile_logits_elements,
+        k_quant_offset_bytes=k_quant_offset_bytes,
+        k_scale_offset_bytes=k_scale_offset_bytes,
+        dummy_logits_offset_bytes=dummy_logits_offset_bytes,
+        tile_logits_offset_bytes=tile_logits_offset_bytes,
+        lengths_offset_bytes=lengths_offset_bytes,
+        topk_values_offset_bytes=topk_values_offset_bytes,
+        topk_indices_offset_bytes=topk_indices_offset_bytes,
+        candidate_values_offset_bytes=candidate_values_offset_bytes,
+        candidate_indices_offset_bytes=candidate_indices_offset_bytes,
+        metadata_k_start_offset_bytes=metadata_k_start_offset_bytes,
+        metadata_k_end_offset_bytes=metadata_k_end_offset_bytes,
+        k_tma_desc_offset_bytes=k_tma_desc_offset_bytes,
+        k_tma_desc_ptrs_offset_bytes=k_tma_desc_ptrs_offset_bytes,
+        k_tma_prefill_desc_offset_bytes=k_tma_prefill_desc_offset_bytes,
+        k_tma_prefill_desc_ptrs_offset_bytes=k_tma_prefill_desc_ptrs_offset_bytes,
+    )
+
+
 def _install_compressed_indexer_contract_phantoms(
     scratch: B12XCompressedIndexerScratch,
 ) -> None:
@@ -697,6 +993,90 @@ def _install_compressed_indexer_contract_phantoms(
     scratch._contract_paged_indexer_topk_indices = _shape_only_scratch_tensor(
         storage,
         (int(scratch.max_paged_q_rows), int(scratch.topk)),
+        dtype=torch.int32,
+    )
+
+
+def _install_indexer_extend_contract_phantoms(
+    scratch: B12XIndexerExtendScratch,
+) -> None:
+    storage = scratch.shared_scratch
+    scratch._contract_q_u32 = _shape_only_scratch_tensor(
+        storage,
+        (
+            int(scratch.max_q_rows),
+            int(scratch.num_q_heads),
+            _INDEXER_EXTEND_HEAD_DIM // 4,
+        ),
+        dtype=torch.uint32,
+    )
+    scratch._contract_q_bytes = _shape_only_scratch_tensor(
+        storage,
+        (
+            int(scratch.max_q_rows),
+            int(scratch.num_q_heads),
+            _INDEXER_EXTEND_HEAD_DIM,
+        ),
+        dtype=torch.uint8,
+    )
+    scratch._contract_weights = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows), int(scratch.num_q_heads)),
+        dtype=torch.float32,
+    )
+    scratch._contract_k_quant = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_k_rows), _INDEXER_EXTEND_HEAD_DIM),
+        dtype=torch.uint8,
+    )
+    scratch._contract_k_scale = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_k_rows),),
+        dtype=torch.float32,
+    )
+    scratch._contract_k_start = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows),),
+        dtype=torch.int32,
+    )
+    scratch._contract_k_end = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows),),
+        dtype=torch.int32,
+    )
+    scratch._contract_lengths = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows),),
+        dtype=torch.int32,
+    )
+    scratch._contract_logits = _shape_only_scratch_tensor(
+        storage,
+        (1, 1),
+        dtype=torch.float32,
+    )
+    scratch._contract_tile_logits = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.tile_logits.numel()),),
+        dtype=torch.float32,
+    )
+    scratch._contract_topk_values = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows), int(scratch.topk)),
+        dtype=torch.float32,
+    )
+    scratch._contract_topk_indices = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows), int(scratch.topk)),
+        dtype=torch.int32,
+    )
+    scratch._contract_carry_values = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows), int(scratch.topk)),
+        dtype=torch.float32,
+    )
+    scratch._contract_carry_indices = _shape_only_scratch_tensor(
+        storage,
+        (int(scratch.max_q_rows), int(scratch.topk)),
         dtype=torch.int32,
     )
 
@@ -803,6 +1183,155 @@ def _materialize_compressed_indexer_scratch(
         fused_indexer_merge_state=fused_merge_state,
     )
     _install_compressed_indexer_contract_phantoms(scratch)
+    return scratch
+
+
+def _materialize_indexer_extend_scratch(
+    caps: B12XIndexerExtendScratchCaps,
+    scratch_storage: torch.Tensor,
+    layout: _B12XIndexerExtendScratchLayout,
+) -> B12XIndexerExtendScratch:
+    max_q_rows = max(int(caps.max_q_rows), 1)
+    max_k_rows = max(int(layout.max_k_rows), 1)
+    topk = max(int(caps.topk), 1)
+    k_quant, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_quant_offset_bytes,
+        shape=(max_k_rows, _INDEXER_EXTEND_HEAD_DIM),
+        dtype=caps.k_dtype,
+    )
+    k_scale_bytes, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_scale_offset_bytes,
+        shape=(max_k_rows, _INDEXER_EXTEND_SCALE_BYTES),
+        dtype=torch.uint8,
+    )
+    k_scale = k_scale_bytes.view(torch.float32).flatten()
+    dummy_logits, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.dummy_logits_offset_bytes,
+        shape=(1, 1),
+        dtype=torch.float32,
+    )
+    tile_logits, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.tile_logits_offset_bytes,
+        shape=(int(layout.tile_logits_elements),),
+        dtype=torch.float32,
+    )
+    lengths, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.lengths_offset_bytes,
+        shape=(max_q_rows,),
+        dtype=torch.int32,
+    )
+    topk_values, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.topk_values_offset_bytes,
+        shape=(max_q_rows, topk),
+        dtype=torch.float32,
+    )
+    topk_indices, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.topk_indices_offset_bytes,
+        shape=(max_q_rows, topk),
+        dtype=torch.int32,
+    )
+    candidate_values, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.candidate_values_offset_bytes,
+        shape=(2, max_q_rows, topk),
+        dtype=torch.float32,
+    )
+    candidate_indices, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.candidate_indices_offset_bytes,
+        shape=(2, max_q_rows, topk),
+        dtype=torch.int32,
+    )
+    metadata_k_start, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.metadata_k_start_offset_bytes,
+        shape=(max_q_rows,),
+        dtype=torch.int32,
+    )
+    metadata_k_end, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.metadata_k_end_offset_bytes,
+        shape=(max_q_rows,),
+        dtype=torch.int32,
+    )
+    k_tma_desc, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_tma_desc_offset_bytes,
+        shape=(_INDEXER_EXTEND_TMA_DESC_WORDS,),
+        dtype=torch.uint64,
+    )
+    k_tma_desc_ptrs, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_tma_desc_ptrs_offset_bytes,
+        shape=(1,),
+        dtype=torch.int64,
+    )
+    k_tma_prefill_desc, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_tma_prefill_desc_offset_bytes,
+        shape=(_INDEXER_EXTEND_TMA_DESC_WORDS,),
+        dtype=torch.uint64,
+    )
+    k_tma_prefill_desc_ptrs, _ = _materialize_arena_view(
+        scratch_storage,
+        offset_bytes=layout.k_tma_prefill_desc_ptrs_offset_bytes,
+        shape=(1,),
+        dtype=torch.int64,
+    )
+    k_quant_bytes = k_quant.view(torch.uint8)
+    if k_quant.device.type == "cuda":
+        from b12x.attention.indexer.extend_kernel import (
+            _encode_extend_k_tma_descriptor_into,
+        )
+
+        _encode_extend_k_tma_descriptor_into(
+            k_quant_bytes,
+            k_tma_desc,
+            k_tma_desc_ptrs,
+            block_k=_INDEXER_EXTEND_DECODE_BLOCK_K,
+        )
+        _encode_extend_k_tma_descriptor_into(
+            k_quant_bytes,
+            k_tma_prefill_desc,
+            k_tma_prefill_desc_ptrs,
+            block_k=_INDEXER_EXTEND_PREFILL_BLOCK_K,
+        )
+    else:
+        k_tma_desc_ptrs.fill_(int(k_tma_desc.data_ptr()))
+        k_tma_prefill_desc_ptrs.fill_(int(k_tma_prefill_desc.data_ptr()))
+
+    scratch = B12XIndexerExtendScratch(
+        shared_scratch=scratch_storage,
+        device=caps.device,
+        num_q_heads=caps.num_q_heads,
+        max_q_rows=max_q_rows,
+        max_k_rows=max_k_rows,
+        topk=topk,
+        supertile_k=caps.supertile_k,
+        prefill_block_k=caps.prefill_block_k,
+        k_quant=k_quant,
+        k_scale_bytes=k_scale_bytes,
+        k_scale=k_scale,
+        dummy_logits=dummy_logits,
+        tile_logits=tile_logits,
+        lengths=lengths,
+        topk_values=topk_values,
+        topk_indices=topk_indices,
+        candidate_values=candidate_values,
+        candidate_indices=candidate_indices,
+        metadata_k_start=metadata_k_start,
+        metadata_k_end=metadata_k_end,
+        k_tma_desc_ptrs=k_tma_desc_ptrs,
+        k_tma_prefill_desc_ptrs=k_tma_prefill_desc_ptrs,
+    )
+    _install_indexer_extend_contract_phantoms(scratch)
     return scratch
 
 
@@ -1139,6 +1668,140 @@ def build_compressed_indexer_binding(
     )
 
 
+def build_indexer_extend_binding(
+    *,
+    scratch: object | None = None,
+    workspace: B12XAttentionWorkspace | None = None,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    gather_rows: int | None = None,
+    topk: int | None = None,
+    include_topk_buffers: bool = True,
+    include_candidate_buffers: bool = True,
+    include_lengths: bool = True,
+    include_merge_positions: bool = True,
+    strict: bool = False,
+) -> B12XIndexerExtendBinding:
+    if scratch is None:
+        if workspace is None:
+            raise TypeError("build_indexer_extend_binding requires scratch or workspace")
+        scratch = workspace
+    elif workspace is not None and workspace is not scratch:
+        raise ValueError("scratch and workspace refer to different indexer resources")
+
+    _validate_i32_contiguous(
+        k_start,
+        scratch=scratch,
+        name="k_start",
+        ndim=1,
+    )
+    _validate_i32_contiguous(
+        k_end,
+        scratch=scratch,
+        name="k_end",
+        ndim=1,
+    )
+    if k_start.shape != k_end.shape:
+        raise ValueError(
+            f"k_start and k_end must have the same shape, got "
+            f"{tuple(k_start.shape)} and {tuple(k_end.shape)}"
+        )
+    row_count = int(k_start.shape[0])
+    max_rows = int(getattr(scratch, "max_q_rows", getattr(scratch, "max_total_q", row_count)))
+    if row_count > max_rows:
+        raise ValueError(
+            f"k_start rows {row_count} exceed indexer extend capacity {max_rows}"
+        )
+    if gather_rows is not None:
+        gather_rows = int(gather_rows)
+        max_k_rows = int(getattr(scratch, "max_k_rows", gather_rows))
+        if gather_rows < 0:
+            raise ValueError(f"gather_rows must be non-negative, got {gather_rows}")
+        if gather_rows > max_k_rows:
+            raise ValueError(
+                f"gather_rows {gather_rows} exceed indexer extend K capacity "
+                f"{max_k_rows}"
+            )
+
+    if topk is None:
+        topk = int(getattr(scratch, "topk", getattr(scratch, "indexer_topk", 0)))
+    topk = int(topk)
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+
+    tile_logits = getattr(scratch, "tile_logits", None)
+    if tile_logits is None and hasattr(scratch, "get_indexer_extend_tile_logits"):
+        tile_logits = scratch.get_indexer_extend_tile_logits()
+    if tile_logits is None:
+        tile_logits = getattr(scratch, "indexer_extend_tile_logits", None)
+
+    output_values = None
+    output_indices = None
+    if include_topk_buffers:
+        if hasattr(scratch, "topk_values") and hasattr(scratch, "topk_indices"):
+            output_values = scratch.topk_values[:row_count, :topk]
+            output_indices = scratch.topk_indices[:row_count, :topk]
+        else:
+            output_values, output_indices = scratch.get_indexer_extend_topk_buffers(
+                row_count=row_count
+            )
+            output_values = output_values[:, :topk]
+            output_indices = output_indices[:, :topk]
+
+    candidate_values = None
+    candidate_indices = None
+    if include_candidate_buffers:
+        if hasattr(scratch, "candidate_values") and hasattr(scratch, "candidate_indices"):
+            candidate_values = scratch.candidate_values[:, :row_count, :topk]
+            candidate_indices = scratch.candidate_indices[:, :row_count, :topk]
+        else:
+            candidate_values, candidate_indices = scratch.get_indexer_extend_candidate_buffers()
+            candidate_values = candidate_values[:, :row_count, :topk]
+            candidate_indices = candidate_indices[:, :row_count, :topk]
+
+    lengths = None
+    if include_lengths:
+        if hasattr(scratch, "lengths"):
+            lengths = scratch.lengths[:row_count]
+        else:
+            lengths = scratch.get_indexer_extend_lengths(row_count=row_count)
+
+    merge_positions = None
+    if include_merge_positions and not strict:
+        try:
+            merge_positions = scratch.get_indexer_extend_topk_position_buffer(
+                row_count=row_count
+            )[:, :topk]
+        except B12XIndexerTopKPositionBufferUnavailable:
+            merge_positions = None
+        except AttributeError:
+            merge_positions = getattr(scratch, "indexer_extend_topk_positions", None)
+            if merge_positions is not None:
+                merge_positions = merge_positions[:row_count, :topk]
+
+    contract_phantoms = (
+        scratch.get_contract_phantoms()
+        if strict and hasattr(scratch, "get_contract_phantoms")
+        else None
+    )
+    return B12XIndexerExtendBinding(
+        scratch=scratch,
+        metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
+        topk=topk,
+        contract_phantoms=contract_phantoms,
+        tile_logits=tile_logits,
+        lengths=lengths,
+        output_values=output_values,
+        output_indices=output_indices,
+        candidate_values=candidate_values,
+        candidate_indices=candidate_indices,
+        merge_positions=merge_positions,
+        prefill_block_k=getattr(scratch, "prefill_block_k", None),
+        supertile_k=getattr(scratch, "supertile_k", None),
+        strict=bool(strict),
+    )
+
+
 @dataclass(frozen=True)
 class B12XCompressedMLAScratchPlan:
     caps: B12XCompressedMLAScratchCaps
@@ -1227,6 +1890,55 @@ class B12XCompressedIndexerScratchPlan:
         )
 
 
+@dataclass(frozen=True)
+class B12XIndexerExtendScratchPlan:
+    caps: B12XIndexerExtendScratchCaps
+    layout: _B12XIndexerExtendScratchLayout
+    _scratch_specs: tuple[B12XScratchBufferSpec, ...]
+
+    def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
+        return self._scratch_specs
+
+    def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        k_start: torch.Tensor | None = None,
+        k_end: torch.Tensor | None = None,
+        gather_rows: int | None = None,
+        topk: int | None = None,
+    ) -> B12XIndexerExtendBinding:
+        scratch_storage = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="indexer extend",
+        )
+        scratch_views = _materialize_indexer_extend_scratch(
+            self.caps,
+            scratch_storage,
+            self.layout,
+        )
+        if k_start is None:
+            k_start = scratch_views.metadata_k_start
+        if k_end is None:
+            k_end = scratch_views.metadata_k_end
+        return build_indexer_extend_binding(
+            scratch=scratch_views,
+            k_start=k_start,
+            k_end=k_end,
+            gather_rows=gather_rows,
+            topk=self.caps.topk if topk is None else topk,
+            include_topk_buffers=True,
+            include_candidate_buffers=True,
+            include_lengths=True,
+            include_merge_positions=False,
+            strict=True,
+        )
+
+
 def plan_compressed_mla_scratch(
     caps: B12XCompressedMLAScratchCaps,
 ) -> B12XCompressedMLAScratchPlan:
@@ -1261,6 +1973,23 @@ def plan_compressed_indexer_scratch(
     )
 
 
+def plan_indexer_extend_scratch(
+    caps: B12XIndexerExtendScratchCaps,
+) -> B12XIndexerExtendScratchPlan:
+    layout = _indexer_extend_scratch_layout(caps)
+    return B12XIndexerExtendScratchPlan(
+        caps=caps,
+        layout=layout,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "indexer_extend.arena",
+                nbytes=int(layout.nbytes),
+                device=caps.device,
+            ),
+        ),
+    )
+
+
 __all__ = [
     "B12XScratchBufferSpec",
     "B12XCompressedIndexerBinding",
@@ -1271,8 +2000,14 @@ __all__ = [
     "B12XCompressedMLAScratch",
     "B12XCompressedMLAScratchCaps",
     "B12XCompressedMLAScratchPlan",
+    "B12XIndexerExtendBinding",
+    "B12XIndexerExtendScratch",
+    "B12XIndexerExtendScratchCaps",
+    "B12XIndexerExtendScratchPlan",
     "build_compressed_indexer_binding",
     "build_compressed_mla_binding",
+    "build_indexer_extend_binding",
     "plan_compressed_indexer_scratch",
+    "plan_indexer_extend_scratch",
     "plan_compressed_mla_scratch",
 ]

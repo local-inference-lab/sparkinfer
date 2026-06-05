@@ -11,11 +11,14 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Boolean, Float32, Int32, Uint8, Uint32
+from cutlass import Boolean, Float32, Int32, Uint32
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.core import make_swizzle
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Int64, T
 
+from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import (
@@ -27,16 +30,13 @@ from b12x.cute.compiler import (
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
-    ld_shared_bf16_to_f32,
     ld_shared_v4_u32,
-    pack_f32x2_to_bfloat2,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_global_v2_f32,
     st_global_v4_f32,
-    st_shared_v4_u32,
 )
 from b12x.cute.utils import current_cuda_stream
 
@@ -89,6 +89,46 @@ _NSA_EXTEND_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
 _PREFILL512_MIN_Q_ROWS = 1024
 _PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
+_EXTEND_TMA_DESC_WORDS = 16
+
+
+def _assume_extend_k_tma_source_aligned(t: cute.Tensor) -> cute.Tensor:
+    divby = 128 // t.element_type.width
+    strides = []
+    for dim, stride in enumerate(t.stride):
+        if dim == 1 or isinstance(stride, int):
+            strides.append(stride)
+        else:
+            strides.append(cute.assume(stride, divby=divby))
+    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=tuple(strides)))
+
+
+def _make_extend_k_tma_source(k_quant_bytes: cute.Tensor) -> cute.Tensor:
+    return _assume_extend_k_tma_source_aligned(k_quant_bytes)
+
+
+def _make_extend_k_tma_smem_layout(block_k: int) -> cute.Layout:
+    return cute.make_composed_layout(
+        make_swizzle(3, 4, 3),
+        0,
+        cute.make_layout(
+            (block_k, _INDEX_HEAD_DIM),
+            stride=(_INDEX_HEAD_DIM, 1),
+        ),
+    )
+
+
+def _make_extend_k_tma_smem_stage_layout(block_k: int) -> cute.Layout:
+    return cute.tile_to_shape(
+        _make_extend_k_tma_smem_layout(block_k),
+        (block_k, _INDEX_HEAD_DIM, 1),
+        (0, 1, 2),
+    )
+
+
+@lru_cache(maxsize=16)
+def _dummy_extend_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
+    return torch.zeros((1,), dtype=torch.int64, device=torch.device("cuda", device_index))
 
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
@@ -118,6 +158,18 @@ class IndexerExtendLogitsKernelBinding:
     tile_logits: torch.Tensor | None = None
     tile_k_offset: int = 0
     tile_num_k_tiles: int | None = None
+    prefill_block_k: int | None = None
+    q_u32: torch.Tensor | None = None
+    q_bytes: torch.Tensor | None = None
+    weights_kernel: torch.Tensor | None = None
+    k_quant_bytes: torch.Tensor | None = None
+    k_scale_kernel: torch.Tensor | None = None
+    k_start_kernel: torch.Tensor | None = None
+    k_end_kernel: torch.Tensor | None = None
+    out_kernel: torch.Tensor | None = None
+    out_view: torch.Tensor | None = None
+    k_tma_desc_ptrs: torch.Tensor | None = None
+    k_tma_prefill_desc_ptrs: torch.Tensor | None = None
 
     def run(self) -> torch.Tensor:
         return run_extend_logits_kernel(binding=self)
@@ -137,6 +189,18 @@ def build_indexer_extend_logits_kernel_binding(
     tile_logits: torch.Tensor | None = None,
     tile_k_offset: int = 0,
     tile_num_k_tiles: int | None = None,
+    prefill_block_k: int | None = None,
+    q_u32: torch.Tensor | None = None,
+    q_bytes: torch.Tensor | None = None,
+    weights_kernel: torch.Tensor | None = None,
+    k_quant_bytes: torch.Tensor | None = None,
+    k_scale_kernel: torch.Tensor | None = None,
+    k_start_kernel: torch.Tensor | None = None,
+    k_end_kernel: torch.Tensor | None = None,
+    out_kernel: torch.Tensor | None = None,
+    out_view: torch.Tensor | None = None,
+    k_tma_desc_ptrs: torch.Tensor | None = None,
+    k_tma_prefill_desc_ptrs: torch.Tensor | None = None,
 ) -> IndexerExtendLogitsKernelBinding:
     return IndexerExtendLogitsKernelBinding(
         q_fp8=q_fp8,
@@ -151,6 +215,18 @@ def build_indexer_extend_logits_kernel_binding(
         tile_logits=tile_logits,
         tile_k_offset=int(tile_k_offset),
         tile_num_k_tiles=None if tile_num_k_tiles is None else int(tile_num_k_tiles),
+        prefill_block_k=None if prefill_block_k is None else int(prefill_block_k),
+        q_u32=q_u32,
+        q_bytes=q_bytes,
+        weights_kernel=weights_kernel,
+        k_quant_bytes=k_quant_bytes,
+        k_scale_kernel=k_scale_kernel,
+        k_start_kernel=k_start_kernel,
+        k_end_kernel=k_end_kernel,
+        out_kernel=out_kernel,
+        out_view=out_view,
+        k_tma_desc_ptrs=k_tma_desc_ptrs,
+        k_tma_prefill_desc_ptrs=k_tma_prefill_desc_ptrs,
     )
 
 
@@ -244,6 +320,149 @@ def _view_last_dim_as_u32(tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"last dim must be divisible by 4, got {tensor.shape[-1]}")
     out_shape = (*tensor.shape[:-1], tensor.shape[-1] // 4)
     return tensor.view(torch.uint32).view(out_shape)
+
+
+@lru_cache(maxsize=1)
+def get_sparse_nsa_extend_shared_storage_cls():
+    class SharedStorage:
+        pass
+
+    SharedStorage.__annotations__ = {
+        "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
+        "tile_live": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, 1],
+            16,
+        ],
+        "k_perm": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, _BLOCK_K * _INDEX_HEAD_DIM],
+            1024,
+        ],
+        "scales": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _BLOCK_K],
+            16,
+        ],
+        "k_start": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _BLOCK_Q],
+            16,
+        ],
+        "k_end": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _BLOCK_Q],
+            16,
+        ],
+    }
+
+    return cute.struct(SharedStorage)
+
+
+@lru_cache(maxsize=1)
+def get_sparse_nsa_extend_prefill_shared_storage_cls():
+    class SharedStorage:
+        pass
+
+    SharedStorage.__annotations__ = {
+        "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
+        "tile_live": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, 1],
+            16,
+        ],
+        "k_perm": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, _PREFILL_BLOCK_K * _INDEX_HEAD_DIM],
+            1024,
+        ],
+        "q_bytes_smem": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Uint8,
+                _PREFILL_Q_STAGE_ROWS
+                * _PREFILL_Q_STAGE_COLS
+                * _PREFILL_Q_HEADS_BATCH,
+            ],
+            1024,
+        ],
+        "w_smem": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_Q * _MAX_Q_HEADS],
+            1024,
+        ],
+        "scales": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_K],
+            16,
+        ],
+        "k_start": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
+            16,
+        ],
+        "k_end": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
+            16,
+        ],
+    }
+
+    return cute.struct(SharedStorage)
+
+
+def _encode_extend_k_tma_descriptor_into(
+    k_quant_bytes: torch.Tensor,
+    desc: torch.Tensor,
+    desc_ptrs: torch.Tensor,
+    *,
+    block_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_quant_bytes.ndim != 2 or k_quant_bytes.shape[1] != _INDEX_HEAD_DIM:
+        raise ValueError(
+            f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), "
+            f"got {tuple(k_quant_bytes.shape)}"
+        )
+    if k_quant_bytes.dtype != torch.uint8:
+        raise TypeError(
+            f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}"
+        )
+    if desc.shape != (_EXTEND_TMA_DESC_WORDS,) or desc.dtype != torch.uint64:
+        raise ValueError(
+            "desc must be a uint64 tensor with shape "
+            f"({_EXTEND_TMA_DESC_WORDS},), got {tuple(desc.shape)} "
+            f"and {desc.dtype}"
+        )
+    if desc_ptrs.shape != (1,) or desc_ptrs.dtype != torch.int64:
+        raise ValueError(
+            "desc_ptrs must be an int64 tensor with shape (1,), got "
+            f"{tuple(desc_ptrs.shape)} and {desc_ptrs.dtype}"
+        )
+    if desc.device != k_quant_bytes.device or desc_ptrs.device != k_quant_bytes.device:
+        raise ValueError("descriptor tensors must be on the K tensor device")
+
+    U64 = cuda.cuuint64_t
+    U32 = cuda.cuuint32_t
+    row_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
+    base_ptr = int(k_quant_bytes.data_ptr())
+    total_rows = int(k_quant_bytes.shape[0])
+
+    result, tensor_map = cuda.cuTensorMapEncodeTiled(
+        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2,
+        base_ptr,
+        [U64(_INDEX_HEAD_DIM), U64(total_rows)],
+        [U64(row_bytes)],
+        [U32(_INDEX_HEAD_DIM), U32(int(block_k))],
+        [U32(1), U32(1)],
+        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
+
+    desc.copy_(
+        torch.tensor(
+            [int(word) for word in tensor_map.opaque],
+            dtype=torch.uint64,
+        ),
+        non_blocking=True,
+    )
+    desc_ptrs.copy_(
+        torch.tensor([int(desc.data_ptr())], dtype=torch.int64),
+        non_blocking=True,
+    )
+    return desc, desc_ptrs
 
 
 def _encode_extend_k_tma_descriptor(
@@ -461,33 +680,35 @@ def _get_cached_extend_k_tma_descriptor_prefill512(
     return desc
 
 
-@dsl_user_op
-def _cp_async_bulk_tensor_2d(
-    dst_smem_addr: Int32,
-    tensor_map_ptr: Int64,
-    coord0: Int32,
-    coord1: Int32,
-    mbar_smem_addr: Int32,
-    *,
-    loc=None,
-    ip=None,
+@cute.jit
+def _issue_extend_k_tma_copy(
+    load_tma,
+    producer_state,
+    mbar_ptr,
+    expected_bytes,
+    k_tile_idx,
 ):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
-            Int32(coord0).ir_value(loc=loc, ip=ip),
-            Int32(coord1).ir_value(loc=loc, ip=ip),
-            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
-        "[$0], [$1, {$2, $3}], [$4];",
-        "r,l,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    full_mbar_ptr = mbar_ptr + producer_state.index
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
+    load_tma(src_idx=k_tile_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+
+
+@cute.jit
+def _issue_extend_k_tma_copy_pair(
+    load_tma0,
+    load_tma1,
+    producer_state,
+    mbar_ptr,
+    expected_bytes,
+    k_tile_idx0,
+    k_tile_idx1,
+):
+    full_mbar_ptr = mbar_ptr + producer_state.index
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
+    load_tma0(src_idx=k_tile_idx0, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    load_tma1(src_idx=k_tile_idx1, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 @cute.jit
@@ -692,10 +913,20 @@ class SparseNSAExtendLogitsKernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
+        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            k_tma_source,
+            _make_extend_k_tma_smem_layout(_BLOCK_K),
+            (_BLOCK_K, _INDEX_HEAD_DIM),
+            1,
+        )
+        SharedStorage = get_sparse_nsa_extend_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
             k_quant_bytes,
+            tma_tensor_k,
             k_tma_desc_ptrs,
             k_scales,
             k_start,
@@ -707,6 +938,7 @@ class SparseNSAExtendLogitsKernel:
             k_tile_offset,
             output_num_k_tiles,
             write_invalid_logits,
+            tma_atom_k,
         ).launch(
             grid=(
                 (valid_q_rows + _BLOCK_Q - 1) // _BLOCK_Q,
@@ -714,6 +946,7 @@ class SparseNSAExtendLogitsKernel:
                 1,
             ),
             block=[_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -723,6 +956,7 @@ class SparseNSAExtendLogitsKernel:
         q_u32: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
+        k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
         k_scales: cute.Tensor,
         k_start: cute.Tensor,
@@ -734,6 +968,7 @@ class SparseNSAExtendLogitsKernel:
         k_tile_offset: Int32,
         output_num_k_tiles: Int32,
         write_invalid_logits: Int32,
+        tma_atom_k: cute.CopyAtom,
     ):
         tx, _, _ = cute.arch.thread_idx()
         q_tile_idx, local_k_tile_idx, _ = cute.arch.block_idx()
@@ -751,35 +986,23 @@ class SparseNSAExtendLogitsKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            tile_live: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 1],
-                16,
-            ]
-            k_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _BLOCK_K * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _BLOCK_K],
-                16,
-            ]
-            k_start: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _BLOCK_Q],
-                16,
-            ]
-            k_end: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _BLOCK_Q],
-                16,
-            ]
-
+        SharedStorage = get_sparse_nsa_extend_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
+        )
+        s_k_tma_stage = cute.make_tensor(
+            s_k_perm_bytes.iterator,
+            _make_extend_k_tma_smem_stage_layout(_BLOCK_K),
+        )
+        load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            cute.local_tile(k_tma_tensor, (_BLOCK_K, _INDEX_HEAD_DIM), (None, 0)),
+            s_k_tma_stage,
         )
         s_scales = storage.scales.get_tensor(cute.make_layout((_BLOCK_K,), stride=(1,)))
         s_k_start = storage.k_start.get_tensor(
@@ -824,19 +1047,15 @@ class SparseNSAExtendLogitsKernel:
             producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
-                full_mbar_ptr = mbar_ptr_k + producer_state.index
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full_mbar_ptr,
-                        Int32(_BLOCK_K * _INDEX_HEAD_DIM),
-                    )
-                    _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_perm_bytes.iterator),
-                        Int64(k_tma_desc_ptrs[Int32(0)]),
-                        Int32(0),
-                        k_tile_base,
-                        shared_ptr_to_u32(full_mbar_ptr),
-                    )
+                cpasync.prefetch_descriptor(tma_atom_k)
+            if warp_idx == Int32(0):
+                _issue_extend_k_tma_copy(
+                    load_k_tma,
+                    producer_state,
+                    mbar_ptr_k,
+                    Int32(_BLOCK_K * _INDEX_HEAD_DIM),
+                    k_tile_idx,
+                )
             cute.arch.mbarrier_wait(
                 mbar_ptr_k + consumer_state.index,
                 phase=consumer_state.phase,
@@ -1232,10 +1451,20 @@ class SparseNSAExtendLogitsPrefillKernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
+        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            k_tma_source,
+            _make_extend_k_tma_smem_layout(_PREFILL_BLOCK_K),
+            (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
+            1,
+        )
+        SharedStorage = get_sparse_nsa_extend_prefill_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
             k_quant_bytes,
+            tma_tensor_k,
             k_tma_desc_ptrs,
             k_scales,
             k_start,
@@ -1247,6 +1476,7 @@ class SparseNSAExtendLogitsPrefillKernel:
             k_tile_offset,
             output_num_k_tiles,
             write_invalid_logits,
+            tma_atom_k,
         ).launch(
             grid=(
                 (valid_q_rows + _PREFILL_BLOCK_Q - 1) // _PREFILL_BLOCK_Q,
@@ -1254,6 +1484,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                 1,
             ),
             block=[_PREFILL_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1263,6 +1494,7 @@ class SparseNSAExtendLogitsPrefillKernel:
         q_u32: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
+        k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
         k_scales: cute.Tensor,
         k_start: cute.Tensor,
@@ -1274,6 +1506,7 @@ class SparseNSAExtendLogitsPrefillKernel:
         k_tile_offset: Int32,
         output_num_k_tiles: Int32,
         write_invalid_logits: Int32,
+        tma_atom_k: cute.CopyAtom,
     ):
         tx, _, _ = cute.arch.thread_idx()
         q_tile_idx, local_k_tile_idx, _ = cute.arch.block_idx()
@@ -1292,49 +1525,23 @@ class SparseNSAExtendLogitsPrefillKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            tile_live: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 1],
-                16,
-            ]
-            k_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PREFILL_BLOCK_K * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            q_bytes_smem: cute.struct.Align[
-                # Batch _PREFILL_Q_HEADS_BATCH Q heads in smem (no double-buffering needed).
-                cute.struct.MemRange[
-                    cutlass.Uint8,
-                    _PREFILL_Q_STAGE_ROWS
-                    * _PREFILL_Q_STAGE_COLS
-                    * _PREFILL_Q_HEADS_BATCH,
-                ],
-                1024,
-            ]
-            w_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_Q * _MAX_Q_HEADS],
-                1024,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_K],
-                16,
-            ]
-            k_start: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
-                16,
-            ]
-            k_end: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
-                16,
-            ]
-
+        SharedStorage = get_sparse_nsa_extend_prefill_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_PREFILL_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
+        )
+        s_k_tma_stage = cute.make_tensor(
+            s_k_perm_bytes.iterator,
+            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+        )
+        load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            cute.local_tile(k_tma_tensor, (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM), (None, 0)),
+            s_k_tma_stage,
         )
         s_scales = storage.scales.get_tensor(
             cute.make_layout((_PREFILL_BLOCK_K,), stride=(1,))
@@ -1389,19 +1596,15 @@ class SparseNSAExtendLogitsPrefillKernel:
             producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
-                full_mbar_ptr = mbar_ptr_k + producer_state.index
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full_mbar_ptr,
-                        Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
-                    )
-                    _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_perm_bytes.iterator),
-                        Int64(k_tma_desc_ptrs[Int32(0)]),
-                        Int32(0),
-                        k_tile_base,
-                        shared_ptr_to_u32(full_mbar_ptr),
-                    )
+                cpasync.prefetch_descriptor(tma_atom_k)
+            if warp_idx == Int32(0):
+                _issue_extend_k_tma_copy(
+                    load_k_tma,
+                    producer_state,
+                    mbar_ptr_k,
+                    Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
+                    k_tile_idx,
+                )
             cute.arch.mbarrier_wait(
                 mbar_ptr_k + consumer_state.index,
                 phase=consumer_state.phase,
@@ -1693,10 +1896,22 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
+        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            k_tma_source,
+            _make_extend_k_tma_smem_layout(_PREFILL_BLOCK_K),
+            (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
+            1,
+        )
+        SharedStorage = get_sparse_nsa_prefill512_shared_storage_cls(
+            self._q_heads_batch,
+        )
         self.kernel(
             q_u32,
             weights,
             k_quant_bytes,
+            tma_tensor_k,
             k_tma_desc_ptrs,
             k_scales,
             k_start,
@@ -1708,6 +1923,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             k_tile_offset,
             output_num_k_tiles,
             write_invalid_logits,
+            tma_atom_k,
         ).launch(
             grid=(
                 (valid_q_rows + _PREFILL512_BLOCK_Q - 1) // _PREFILL512_BLOCK_Q,
@@ -1715,6 +1931,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 1,
             ),
             block=[_PREFILL512_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1724,6 +1941,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         q_u32: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
+        k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
         k_scales: cute.Tensor,
         k_start: cute.Tensor,
@@ -1735,6 +1953,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         k_tile_offset: Int32,
         output_num_k_tiles: Int32,
         write_invalid_logits: Int32,
+        tma_atom_k: cute.CopyAtom,
     ):
         tx, _, _ = cute.arch.thread_idx()
         q_tile_idx, local_k_tile_idx, _ = cute.arch.block_idx()
@@ -1762,6 +1981,33 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
+        )
+        s_k_tma_stage0 = cute.make_tensor(
+            s_k_perm_bytes.iterator,
+            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+        )
+        s_k_tma_stage1 = cute.make_tensor(
+            s_k_perm_bytes.iterator + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
+            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+        )
+        g_k_tma_tile = cute.local_tile(
+            k_tma_tensor,
+            (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
+            (None, 0),
+        )
+        load_k_tma0, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            g_k_tma_tile,
+            s_k_tma_stage0,
+        )
+        load_k_tma1, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            g_k_tma_tile,
+            s_k_tma_stage1,
         )
         s_scales = storage.scales.get_tensor(
             cute.make_layout((_PREFILL512_BLOCK_K,), stride=(1,))
@@ -1823,27 +2069,18 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
-                full_mbar_ptr = mbar_ptr_k + producer_state.index
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full_mbar_ptr,
-                        Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM),
-                    )
-                    _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_perm_bytes.iterator),
-                        Int64(k_tma_desc_ptrs[Int32(0)]),
-                        Int32(0),
-                        k_tile_base,
-                        shared_ptr_to_u32(full_mbar_ptr),
-                    )
-                    _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_perm_bytes.iterator)
-                        + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
-                        Int64(k_tma_desc_ptrs[Int32(0)]),
-                        Int32(0),
-                        k_tile_base + Int32(_PREFILL_BLOCK_K),
-                        shared_ptr_to_u32(full_mbar_ptr),
-                    )
+                cpasync.prefetch_descriptor(tma_atom_k)
+            if warp_idx == Int32(0):
+                k_subtile_idx = k_tile_idx * Int32(2)
+                _issue_extend_k_tma_copy_pair(
+                    load_k_tma0,
+                    load_k_tma1,
+                    producer_state,
+                    mbar_ptr_k,
+                    Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM),
+                    k_subtile_idx,
+                    k_subtile_idx + Int32(1),
+                )
             # Exp40: weight staging removed — weights read from gmem directly (hidden by QK MMA latency).
             # Only stage scales while the K TMA copy is in flight.
             scale_linear = tx
@@ -2314,8 +2551,10 @@ def run_extend_logits_kernel(
     tile_logits: torch.Tensor | None = None,
     tile_k_offset: int | None = None,
     tile_num_k_tiles: int | None = None,
+    prefill_block_k: int | None = None,
     binding: IndexerExtendLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
+    staged_binding = binding
     if binding is not None:
         extras = [
             name
@@ -2332,6 +2571,7 @@ def run_extend_logits_kernel(
                 ("tile_logits", tile_logits),
                 ("tile_k_offset", tile_k_offset),
                 ("tile_num_k_tiles", tile_num_k_tiles),
+                ("prefill_block_k", prefill_block_k),
             )
             if value is not None
         ]
@@ -2349,6 +2589,7 @@ def run_extend_logits_kernel(
         tile_logits = binding.tile_logits
         tile_k_offset = binding.tile_k_offset
         tile_num_k_tiles = binding.tile_num_k_tiles
+        prefill_block_k = binding.prefill_block_k
 
     q_fp8 = _require_bound_arg(q_fp8, api_name="run_extend_logits_kernel", name="q_fp8")
     weights = _require_bound_arg(
@@ -2395,11 +2636,20 @@ def run_extend_logits_kernel(
     # Dispatch: use prefill kernels for large q_len, decode kernel otherwise.
     # BK=512 is deliberately limited to target-ish long-prefill shapes; other
     # shapes keep the validated BK=256 prefill tile.
-    _prefill_block_k = resolve_extend_prefill_block_k(
-        valid_q_rows=valid_q_rows,
-        k_rows=k_rows,
-        num_heads=int(q_fp8.shape[1]),
-    )
+    if prefill_block_k is None:
+        _prefill_block_k = resolve_extend_prefill_block_k(
+            valid_q_rows=valid_q_rows,
+            k_rows=k_rows,
+            num_heads=int(q_fp8.shape[1]),
+        )
+    else:
+        _prefill_block_k = int(prefill_block_k)
+        if _prefill_block_k not in (_PREFILL_BLOCK_K, _PREFILL512_BLOCK_K):
+            raise ValueError(
+                "prefill_block_k must be "
+                f"{_PREFILL_BLOCK_K} or {_PREFILL512_BLOCK_K}, "
+                f"got {_prefill_block_k}"
+            )
     if tile_logits is not None and _prefill_block_k is None:
         # Tiled output is only produced by the prefill scorer. The threshold
         # resolver may prefer the decode scorer for small q batches, but callers
@@ -2463,7 +2713,33 @@ def run_extend_logits_kernel(
         tile_logits._b12x_block_k = _prefill_block_k
         preinitialize_invalid_logits = True
 
-    if workspace is not None:
+    if staged_binding is not None and staged_binding.q_u32 is not None:
+        required_staged = {
+            "q_bytes": staged_binding.q_bytes,
+            "weights_kernel": staged_binding.weights_kernel,
+            "k_quant_bytes": staged_binding.k_quant_bytes,
+            "k_scale_kernel": staged_binding.k_scale_kernel,
+            "k_start_kernel": staged_binding.k_start_kernel,
+            "k_end_kernel": staged_binding.k_end_kernel,
+            "out_kernel": staged_binding.out_kernel,
+            "out_view": staged_binding.out_view,
+        }
+        missing = [name for name, value in required_staged.items() if value is None]
+        if missing:
+            raise ValueError(
+                "staged indexer extend binding is missing "
+                + ", ".join(missing)
+            )
+        q_u32 = staged_binding.q_u32
+        q_bytes_kernel = staged_binding.q_bytes
+        weights_kernel = staged_binding.weights_kernel
+        k_quant_bytes = staged_binding.k_quant_bytes
+        k_scale_kernel = staged_binding.k_scale_kernel
+        k_start_kernel = staged_binding.k_start_kernel
+        k_end_kernel = staged_binding.k_end_kernel
+        out_kernel = staged_binding.out_kernel
+        out_view = staged_binding.out_view
+    elif workspace is not None:
         staged = workspace.stage_indexer_extend(
             q_fp8=q_fp8,
             weights=weights,
@@ -2475,7 +2751,13 @@ def run_extend_logits_kernel(
             requires_full_logits=not (_tiled_output and _use_prefill),
         )
         q_u32 = staged["q_u32"]
-        q_bytes_kernel = q_fp8.contiguous().view(torch.uint8)
+        q_bytes_kernel = staged.get("q_bytes")
+        if q_bytes_kernel is None:
+            if not q_fp8.is_contiguous():
+                raise ValueError(
+                    "workspace-backed indexer extend requires contiguous q_fp8"
+                )
+            q_bytes_kernel = q_fp8.view(torch.uint8)
         weights_kernel = staged["weights"]
         k_quant_bytes = staged["k_quant_bytes"]
         k_scale_kernel = staged["k_scales"]
@@ -2483,8 +2765,6 @@ def run_extend_logits_kernel(
         k_end_kernel = staged["k_end"]
         out_kernel = staged["logits"]
         out_view = staged["logits_view"]
-        workspace_k_tma_desc_ptrs = staged.get("k_tma_desc_ptrs")
-        workspace_k_tma_prefill_desc_ptrs = staged.get("k_tma_prefill_desc_ptrs")
         if contract_phantoms is None:
             contract_phantoms = workspace.get_indexer_contract_phantoms()
     else:
@@ -2520,31 +2800,12 @@ def run_extend_logits_kernel(
         k_scale_kernel = k_scale_padded.contiguous()
         k_start_kernel = k_start.contiguous()
         k_end_kernel = k_end.contiguous()
-        workspace_k_tma_desc_ptrs = None
-        workspace_k_tma_prefill_desc_ptrs = None
 
     if valid_q_rows == 0 or k_rows == 0:
         return out_view
 
-    if _prefill_block_k == _PREFILL512_BLOCK_K:
-        if workspace_k_tma_prefill_desc_ptrs is not None:
-            k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
-        else:
-            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill512(
-                k_quant_bytes
-            )
-    elif _use_prefill:
-        if workspace_k_tma_prefill_desc_ptrs is not None:
-            k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
-        else:
-            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(
-                k_quant_bytes
-            )
-    else:
-        if workspace_k_tma_desc_ptrs is not None:
-            k_tma_desc_ptrs = workspace_k_tma_desc_ptrs
-        else:
-            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
+    device_index = q_fp8.device.index or 0
+    k_tma_desc_ptrs = _dummy_extend_k_tma_desc_ptrs(device_index)
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
         kernel = _build_sparse_nsa_extend_prefill512_kernel(

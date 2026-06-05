@@ -67,8 +67,14 @@ from .compressed_scratch import (
     B12XCompressedMLAScratch,
     B12XCompressedMLAScratchCaps,
     B12XCompressedMLAScratchPlan,
+    B12XIndexerExtendBinding,
+    B12XIndexerExtendScratch,
+    B12XIndexerExtendScratchCaps,
+    B12XIndexerExtendScratchPlan,
+    build_indexer_extend_binding,
     plan_compressed_indexer_scratch,
     plan_compressed_mla_scratch,
+    plan_indexer_extend_scratch,
 )
 from .scratch import B12XScratchBufferSpec
 from .sparse_mla_scratch import (
@@ -180,6 +186,12 @@ __all__ = [
     "B12XCompressedMLAScratch",
     "B12XCompressedMLAScratchCaps",
     "B12XCompressedMLAScratchPlan",
+    "B12XIndexerExtendBinding",
+    "B12XIndexerExtendScratch",
+    "B12XIndexerExtendScratchCaps",
+    "B12XIndexerExtendScratchPlan",
+    "build_indexer_extend_binding",
+    "plan_indexer_extend_scratch",
     "B12XSparseMLABinding",
     "B12XSparseMLAScratchCaps",
     "B12XSparseMLAScratchPlan",
