@@ -9,6 +9,8 @@ matching upstream).
 Supported (MG) shapes:
   * DSV4/GLM single-cache: heads==16 or heads % 32 == 0
   * DSV4 single-cache: topk in {512, 1024, 2048} (FP8-QK) or 128 (BF16-QK)
+    topk==128 also supports odd 16-head multiples by splitting one paired-head
+    MG prefix plus one single-group tail.
   * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 16 == 0,
     pbs_extra in {2, 64} (BF16-QK). Odd 16-head multiples split into a paired
     MG prefix plus one single-group tail.
@@ -280,6 +282,42 @@ def run_unified_prefill(
             compute_mode=ComputeMode.BF16,
             mg_n_hg=_mg_n_hg,
         )
+    if _mg_base and topk == 128 and heads > hpb and heads % (2 * hpb) == hpb:
+        from .prefill_mg import run_unified_prefill_mg
+
+        paired_heads = heads - hpb
+        run_unified_prefill_mg(
+            q=q,
+            kv_cache=kv_cache,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            page_block_size=page_block_size,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            output=output,
+            lse_out=lse_out,
+            stride_kv_block=stride_kv_block,
+            compute_mode=ComputeMode.BF16,
+            mg_n_hg=2,
+            active_heads=paired_heads,
+            head_offset=0,
+        )
+        return run_unified_prefill_mg(
+            q=q,
+            kv_cache=kv_cache,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            page_block_size=page_block_size,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            output=output,
+            lse_out=lse_out,
+            stride_kv_block=stride_kv_block,
+            compute_mode=ComputeMode.BF16,
+            mg_n_hg=1,
+            active_heads=hpb,
+            head_offset=paired_heads,
+        )
 
     # ── DSV4 dual-cache (has_extra) -> MG (BF16-QK), with strip-and-raise. ──────
     # FI ships DSV4 dual-cache as topk==128, BF16-QK. Even 32-head multiples use
@@ -370,7 +408,8 @@ def run_unified_prefill(
         f"compute_mode={int(compute_mode)}, scale_format={int(scale_format)}, "
         f"has_extra={has_extra}, B12X_MLA_SM120_PREFILL_MG={'0' if not _mg_enabled else '1'}). "
         "Supported (MG) shapes: single-cache heads==16 or heads%32==0; "
-        "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 (BF16-QK); "
+        "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
+        "(BF16-QK, heads%16==0); "
         "DSV4 dual-cache topk==128 with heads%16==0 and pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}. No decode-reuse fallback."
     )
