@@ -26,10 +26,7 @@ from b12x.cute.fp4 import (
     cvt_e8m0x4_to_f32x4,
     cvt_f32_to_e4m3,
     fmax_f32,
-    fp4_dot4_sum,
     fp4_dot4_sum_f32acc,
-    fp4_dot8_dual_sum,
-    fp4_dot8_sum,
     fp4_dot8_sum_f32acc,
     get_ptr_as_int64,
     ld_global_acquire_i32,
@@ -193,43 +190,6 @@ def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig
 
 
 @cute.jit
-def _block_dot_hfma2(
-    u_a: Uint32, u_b: Uint32, smem_xh: cute.Tensor, xh_base: Int32,
-) -> Float32:
-    xh0 = Uint32(smem_xh[xh_base + Int32(0)])
-    xh1 = Uint32(smem_xh[xh_base + Int32(1)])
-    xh2 = Uint32(smem_xh[xh_base + Int32(2)])
-    xh3 = Uint32(smem_xh[xh_base + Int32(3)])
-    xh4 = Uint32(smem_xh[xh_base + Int32(4)])
-    xh5 = Uint32(smem_xh[xh_base + Int32(5)])
-    xh6 = Uint32(smem_xh[xh_base + Int32(6)])
-    xh7 = Uint32(smem_xh[xh_base + Int32(7)])
-    return fp4_dot8_sum(u_a, u_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
-
-
-@cute.jit
-def _block_dot_hfma2_pair(
-    up_a: Uint32,
-    up_b: Uint32,
-    gate_a: Uint32,
-    gate_b: Uint32,
-    smem_xh: cute.Tensor,
-    xh_base: Int32,
-) -> Tuple[Float32, Float32]:
-    xh0 = Uint32(smem_xh[xh_base + Int32(0)])
-    xh1 = Uint32(smem_xh[xh_base + Int32(1)])
-    xh2 = Uint32(smem_xh[xh_base + Int32(2)])
-    xh3 = Uint32(smem_xh[xh_base + Int32(3)])
-    xh4 = Uint32(smem_xh[xh_base + Int32(4)])
-    xh5 = Uint32(smem_xh[xh_base + Int32(5)])
-    xh6 = Uint32(smem_xh[xh_base + Int32(6)])
-    xh7 = Uint32(smem_xh[xh_base + Int32(7)])
-    up = fp4_dot8_sum(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
-    gate = fp4_dot8_sum(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
-    return up, gate
-
-
-@cute.jit
 def _block_dot_hfma2_f32acc(
     u_a: Uint32, u_b: Uint32, smem_xh: cute.Tensor, xh_base: Int32,
 ) -> Float32:
@@ -263,33 +223,6 @@ def _block_dot_hfma2_pair_f32acc(
     xh7 = Uint32(smem_xh[xh_base + Int32(7)])
     up = fp4_dot8_sum_f32acc(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
     gate = fp4_dot8_sum_f32acc(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
-    return up, gate
-
-
-@cute.jit
-def _block_dot4(
-    u_val: Uint32, smem_xh: cute.Tensor, xh_base: Int32,
-) -> Float32:
-    xh0 = Uint32(smem_xh[xh_base + Int32(0)])
-    xh1 = Uint32(smem_xh[xh_base + Int32(1)])
-    xh2 = Uint32(smem_xh[xh_base + Int32(2)])
-    xh3 = Uint32(smem_xh[xh_base + Int32(3)])
-    return fp4_dot4_sum(u_val, xh0, xh1, xh2, xh3)
-
-
-@cute.jit
-def _block_dot4_pair(
-    up_val: Uint32,
-    gate_val: Uint32,
-    smem_xh: cute.Tensor,
-    xh_base: Int32,
-) -> Tuple[Float32, Float32]:
-    xh0 = Uint32(smem_xh[xh_base + Int32(0)])
-    xh1 = Uint32(smem_xh[xh_base + Int32(1)])
-    xh2 = Uint32(smem_xh[xh_base + Int32(2)])
-    xh3 = Uint32(smem_xh[xh_base + Int32(3)])
-    up = fp4_dot4_sum(up_val, xh0, xh1, xh2, xh3)
-    gate = fp4_dot4_sum(gate_val, xh0, xh1, xh2, xh3)
     return up, gate
 
 
@@ -393,7 +326,7 @@ class MoEMicroKernelBackend:
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.sf_vec_size = sf_vec_size
-        self.fast_math = fast_math
+        del fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
         self.share_input_across_experts = share_input_across_experts
@@ -411,7 +344,6 @@ class MoEMicroKernelBackend:
     def __cache_key__(self):
         return (
             self.sf_vec_size,
-            self.fast_math,
             self.activation,
             self.share_input_across_experts,
             self.share_expert_scales,
@@ -437,8 +369,6 @@ class MoEMicroKernelBackend:
         x2: Uint32,
         x3: Uint32,
     ) -> Float32:
-        if cutlass.const_expr(self.fast_math):
-            return fp4_dot4_sum(u_packed, x0, x1, x2, x3)
         return fp4_dot4_sum_f32acc(u_packed, x0, x1, x2, x3)
 
     @cute.jit
@@ -485,8 +415,6 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Float32:
-        if cutlass.const_expr(self.fast_math):
-            return _block_dot_hfma2(u_a, u_b, smem_xh, xh_base)
         return _block_dot_hfma2_f32acc(u_a, u_b, smem_xh, xh_base)
 
     @cute.jit
@@ -499,8 +427,6 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Tuple[Float32, Float32]:
-        if cutlass.const_expr(self.fast_math):
-            return _block_dot_hfma2_pair(up_a, up_b, gate_a, gate_b, smem_xh, xh_base)
         return _block_dot_hfma2_pair_f32acc(up_a, up_b, gate_a, gate_b, smem_xh, xh_base)
 
     @cute.jit
@@ -519,15 +445,7 @@ class MoEMicroKernelBackend:
         xh6: Uint32,
         xh7: Uint32,
     ) -> Tuple[Float32, Float32]:
-        """Paired up/gate fp4_dot8 over pre-loaded activation registers (no smem
-        read). Identical math to _block_dot_hfma2_pair_for_math but the 8 shared
-        activation words are passed by register so they are read from smem only
-        once per warp-task instead of once per FC1 output row."""
-        if cutlass.const_expr(self.fast_math):
-            return fp4_dot8_dual_sum(
-                up_a, up_b, gate_a, gate_b,
-                xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7,
-            )
+        """Paired up/gate fp4_dot8 over pre-loaded activation registers."""
         up = fp4_dot8_sum_f32acc(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
         gate = fp4_dot8_sum_f32acc(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
         return up, gate
@@ -539,8 +457,6 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Float32:
-        if cutlass.const_expr(self.fast_math):
-            return _block_dot4(u_val, smem_xh, xh_base)
         return _block_dot4_f32acc(u_val, smem_xh, xh_base)
 
     @cute.jit
@@ -551,8 +467,6 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Tuple[Float32, Float32]:
-        if cutlass.const_expr(self.fast_math):
-            return _block_dot4_pair(up_val, gate_val, smem_xh, xh_base)
         return _block_dot4_pair_f32acc(up_val, gate_val, smem_xh, xh_base)
 
     @classmethod

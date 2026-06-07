@@ -767,6 +767,104 @@ def test_micro_uniform10_edge_sizes_match_oracle() -> None:
         _assert_oracle_match(metrics, label=f"micro edge size m={m}", min_cos=0.99)
 
 
+def test_micro_glm_k6144_shape_matches_oracle() -> None:
+    device = require_sm120()
+    clear_tp_moe_caches()
+
+    torch.manual_seed(6144)
+    hidden_size = 6144
+    intermediate_size_per_tp = 256
+    num_experts = 8
+    top_k = 8
+    weight_scale = torch.ones(num_experts, device=device, dtype=torch.float32)
+
+    w13 = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size_per_tp,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 80
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_tp,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 80
+    )
+    w13_fp4, w13_blockscale = _quantize_moe_weight_storage(w13, weight_scale)
+    w2_fp4, w2_blockscale = _quantize_moe_weight_storage(w2, weight_scale)
+    w13_alphas = torch.ones(num_experts, device=device, dtype=torch.float32)
+    w2_alphas = torch.ones(num_experts, device=device, dtype=torch.float32)
+    a1_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
+    a2_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
+    topk_ids_base = torch.arange(top_k, dtype=torch.int32, device=device)
+
+    for m in (1, 2, 4):
+        x = torch.randn(m, hidden_size, device=device, dtype=torch.bfloat16) / 5
+        topk_ids = topk_ids_base.expand(m, -1).contiguous()
+        topk_logits = torch.randn(m, top_k, device=device, dtype=torch.float32)
+        topk_weights = torch.softmax(topk_logits, dim=-1).contiguous()
+
+        workspace = allocate_tp_moe_workspace(
+            x,
+            a1_gscale,
+            w13_fp4,
+            a2_gscale,
+            w2_fp4,
+            topk_ids,
+            input_scales_static=True,
+        )
+        actual = b12x_moe_fp4(
+            x,
+            a1_gscale,
+            w13_fp4,
+            w13_blockscale,
+            w13_alphas,
+            a2_gscale,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            topk_weights,
+            topk_ids,
+            workspace=workspace,
+            input_scales_static=True,
+            fast_math=True,
+        )
+        reference = moe_reference_nvfp4(
+            x,
+            w13_fp4,
+            w13_blockscale,
+            w13_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            a1_gscale,
+            a2_gscale,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_tp,
+        )
+        torch.cuda.synchronize(device)
+
+        metrics = compare_to_reference(actual, reference)
+        assert isinstance(workspace, tp_moe.TPCompactStaticWorkspace)
+        _assert_oracle_match(
+            metrics,
+            label=f"micro GLM K=6144 shape m={m}",
+            max_abs=2e-3,
+            min_cos=0.99,
+        )
+
+
 @pytest.mark.parametrize("m", [65, 96, 127])
 def test_dynamic_uniform10_edge_sizes_match_oracle(m: int) -> None:
     require_sm120()
