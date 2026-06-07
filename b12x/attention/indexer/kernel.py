@@ -57,7 +57,7 @@ _BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES = 128 * 1024
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
-        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"{api_name} binding owns runtime tensors and kernel options; "
         f"do not also pass {', '.join(extras)}"
     )
 
@@ -77,8 +77,6 @@ class IndexerPagedLogitsKernelBinding:
     seqlens_per_query: torch.Tensor
     schedule_metadata: torch.Tensor | None = None
     active_width: torch.Tensor | None = None
-    contract_phantoms: dict[str, torch.Tensor] | None = None
-    workspace: object | None = None
     page_size: int = _PAGE_SIZE
     preinitialize_invalid_logits: bool = True
 
@@ -95,8 +93,6 @@ class IndexerPagedTiledLogitsKernelBinding:
     seqlens_per_query: torch.Tensor
     active_width: torch.Tensor
     tile_logits: torch.Tensor
-    contract_phantoms: dict[str, torch.Tensor] | None = None
-    workspace: object | None = None
     page_size: int = _PAGE_SIZE
     tile_block_q: int = _PAGED_TILED_BLOCK_Q
     tile_block_k: int = _PAGED_TILED_BLOCK_K
@@ -107,7 +103,7 @@ class IndexerPagedTiledLogitsKernelBinding:
 
 
 @dataclass(frozen=True, kw_only=True)
-class IndexerPagedWindowedTiledLogitsKernelBinding:
+class IndexerPagedSupertileLogitsKernelBinding:
     q_fp8: torch.Tensor
     weights: torch.Tensor
     index_k_cache: torch.Tensor
@@ -117,16 +113,13 @@ class IndexerPagedWindowedTiledLogitsKernelBinding:
     tile_logits: torch.Tensor
     source_page_offset: int
     output_width_tokens: int
-    contract_phantoms: dict[str, torch.Tensor] | None = None
-    workspace: object | None = None
     page_size: int = _PAGE_SIZE
     tile_block_q: int = _PAGED_TILED_BLOCK_Q
     tile_block_k: int = _PAGED_TILED_BLOCK_K
     preinitialize_tile_logits: bool = True
-    stage_runtime_metadata: bool = True
 
     def run(self) -> torch.Tensor:
-        return run_paged_windowed_tiled_logits_kernel(binding=self)
+        return run_paged_supertile_logits_kernel(binding=self)
 
 
 def build_indexer_paged_logits_kernel_binding(
@@ -138,8 +131,6 @@ def build_indexer_paged_logits_kernel_binding(
     seqlens_per_query: torch.Tensor,
     schedule_metadata: torch.Tensor | None = None,
     active_width: torch.Tensor | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace: object | None = None,
     page_size: int = _PAGE_SIZE,
     preinitialize_invalid_logits: bool = True,
 ) -> IndexerPagedLogitsKernelBinding:
@@ -151,8 +142,6 @@ def build_indexer_paged_logits_kernel_binding(
         seqlens_per_query=seqlens_per_query,
         schedule_metadata=schedule_metadata,
         active_width=active_width,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         page_size=int(page_size),
         preinitialize_invalid_logits=bool(preinitialize_invalid_logits),
     )
@@ -167,8 +156,6 @@ def build_indexer_paged_tiled_logits_kernel_binding(
     seqlens_per_query: torch.Tensor,
     active_width: torch.Tensor,
     tile_logits: torch.Tensor,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace: object | None = None,
     page_size: int = _PAGE_SIZE,
     tile_block_q: int = _PAGED_TILED_BLOCK_Q,
     tile_block_k: int = _PAGED_TILED_BLOCK_K,
@@ -182,8 +169,6 @@ def build_indexer_paged_tiled_logits_kernel_binding(
         seqlens_per_query=seqlens_per_query,
         active_width=active_width,
         tile_logits=tile_logits,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         page_size=int(page_size),
         tile_block_q=int(tile_block_q),
         tile_block_k=int(tile_block_k),
@@ -191,7 +176,7 @@ def build_indexer_paged_tiled_logits_kernel_binding(
     )
 
 
-def build_indexer_paged_windowed_tiled_logits_kernel_binding(
+def build_indexer_paged_supertile_logits_kernel_binding(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -202,15 +187,12 @@ def build_indexer_paged_windowed_tiled_logits_kernel_binding(
     tile_logits: torch.Tensor,
     source_page_offset: int,
     output_width_tokens: int,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace: object | None = None,
     page_size: int = _PAGE_SIZE,
     tile_block_q: int = _PAGED_TILED_BLOCK_Q,
     tile_block_k: int = _PAGED_TILED_BLOCK_K,
     preinitialize_tile_logits: bool = True,
-    stage_runtime_metadata: bool = True,
-) -> IndexerPagedWindowedTiledLogitsKernelBinding:
-    return IndexerPagedWindowedTiledLogitsKernelBinding(
+) -> IndexerPagedSupertileLogitsKernelBinding:
+    return IndexerPagedSupertileLogitsKernelBinding(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -220,13 +202,10 @@ def build_indexer_paged_windowed_tiled_logits_kernel_binding(
         tile_logits=tile_logits,
         source_page_offset=int(source_page_offset),
         output_width_tokens=int(output_width_tokens),
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         page_size=int(page_size),
         tile_block_q=int(tile_block_q),
         tile_block_k=int(tile_block_k),
         preinitialize_tile_logits=bool(preinitialize_tile_logits),
-        stage_runtime_metadata=bool(stage_runtime_metadata),
     )
 
 
@@ -334,23 +313,6 @@ def _tensor_compile_key(
         for idx, dim in enumerate(tensor.shape)
     )
     return TensorKey.from_tensor(name, tensor, dims=dims)
-
-
-def _contract_key_tensor(
-    contract_phantoms: dict[str, torch.Tensor],
-    name: str,
-    actual: torch.Tensor,
-) -> torch.Tensor:
-    """Use fixed-capacity phantoms only when the compiled tensor shape is fixed."""
-
-    phantom = contract_phantoms.get(name)
-    if phantom is None:
-        return actual
-    if tuple(phantom.shape) != tuple(actual.shape):
-        return actual
-    if tuple(phantom.stride()) != tuple(actual.stride()):
-        return actual
-    return phantom
 
 
 def _assume_paged_k_tma_source_aligned(t: cute.Tensor):
@@ -933,12 +895,12 @@ class SparseNSAPagedLogitsKernel:
                 work_idx += Int32(self.persistent_ctas)
 
 
-class SparseNSAPagedWindowedTiledLogitsKernel(SparseNSAPagedLogitsKernel):
-    """C4 supertile adapter over a full paged table.
+class SparseNSAPagedSupertileLogitsKernel(SparseNSAPagedLogitsKernel):
+    """Paged supertile adapter over a full paged table.
 
-    The shared paged NSA scorer keeps its historical public ABI.  This wrapper
-    exposes the extra page offset/window scalars only to compressed-indexer
-    supertile callers.
+    The shared paged NSA scorer keeps its historical public ABI. This wrapper
+    exposes the extra page offset and width scalars only to paged supertile
+    callers.
     """
 
     @cute.jit
@@ -1625,13 +1587,13 @@ def _build_sparse_nsa_paged_tiled_kernel(
 
 
 @lru_cache(maxsize=32)
-def _build_sparse_nsa_paged_windowed_tiled_kernel(
+def _build_sparse_nsa_paged_supertile_kernel(
     persistent_ctas: int,
     num_heads_static: int,
     tile_block_q: int,
     tile_block_k: int,
-) -> SparseNSAPagedWindowedTiledLogitsKernel:
-    return SparseNSAPagedWindowedTiledLogitsKernel(
+) -> SparseNSAPagedSupertileLogitsKernel:
+    return SparseNSAPagedSupertileLogitsKernel(
         persistent_ctas,
         num_heads_static,
         tiled_output=True,
@@ -1741,8 +1703,6 @@ def run_paged_logits_kernel(
     schedule_metadata: torch.Tensor | None = None,
     active_width: torch.Tensor | None = None,
     page_size: int | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     preinitialize_invalid_logits: bool | None = None,
     binding: IndexerPagedLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
@@ -1758,8 +1718,6 @@ def run_paged_logits_kernel(
                 ("schedule_metadata", schedule_metadata),
                 ("active_width", active_width),
                 ("page_size", page_size),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("preinitialize_invalid_logits", preinitialize_invalid_logits),
             )
             if value is not None
@@ -1774,8 +1732,6 @@ def run_paged_logits_kernel(
         schedule_metadata = binding.schedule_metadata
         active_width = binding.active_width
         page_size = binding.page_size
-        contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
         preinitialize_invalid_logits = binding.preinitialize_invalid_logits
 
     q_fp8 = _require_bound_arg(q_fp8, api_name="run_paged_logits_kernel", name="q_fp8")
@@ -1838,45 +1794,22 @@ def run_paged_logits_kernel(
         int(use_scalar_k_load),
         device_index,
     )
-    if workspace is not None:
-        staged = workspace.stage_indexer_paged_decode(
-            q_fp8=q_fp8,
-            weights=weights,
-            real_page_table=real_page_table,
-            seqlens_per_query=seqlens_per_query,
-            active_width=active_width,
-            schedule_metadata=schedule_metadata,
-            width_tokens=width_tokens,
-            preinitialize_invalid_logits=preinitialize_invalid_logits,
+    q_bytes = q_fp8.contiguous().view(torch.uint8)
+    weights_kernel = weights.contiguous()
+    real_page_table_kernel = real_page_table.contiguous()
+    seqlens_per_query_kernel = seqlens_per_query.contiguous()
+    active_width_kernel = active_width.contiguous()
+    schedule_metadata_kernel = None
+    if preinitialize_invalid_logits:
+        logits = torch.full(
+            (rows, width_tokens),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
         )
-        q_bytes = staged["q_bytes"]
-        weights_kernel = staged["weights"]
-        real_page_table_kernel = staged["real_page_table"]
-        seqlens_per_query_kernel = staged["seqlens_per_query"]
-        active_width_kernel = staged["active_width"]
-        schedule_metadata_kernel = staged["schedule_metadata"]
-        logits = staged["logits"]
-        logits_view = staged["logits_view"]
-        if contract_phantoms is None:
-            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
     else:
-        q_bytes = q_fp8.contiguous().view(torch.uint8)
-        weights_kernel = weights.contiguous()
-        real_page_table_kernel = real_page_table.contiguous()
-        seqlens_per_query_kernel = seqlens_per_query.contiguous()
-        active_width_kernel = active_width.contiguous()
-        schedule_metadata_kernel = None
-        if preinitialize_invalid_logits:
-            logits = torch.full(
-                (rows, width_tokens),
-                float("-inf"),
-                dtype=torch.float32,
-                device=q_fp8.device,
-            )
-        else:
-            logits = torch.empty((rows, width_tokens), dtype=torch.float32, device=q_fp8.device)
-        logits_view = logits
-    _cp = contract_phantoms or {}
+        logits = torch.empty((rows, width_tokens), dtype=torch.float32, device=q_fp8.device)
+    logits_view = logits
     common_args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
@@ -1891,12 +1824,12 @@ def run_paged_logits_kernel(
         q_fp8.shape[1],
         _tensor_compile_key(
             "q_bytes",
-            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            q_bytes,
             dynamic_dims=(0,),
         ),
         _tensor_compile_key(
             "weights",
-            _contract_key_tensor(_cp, "weights", weights_kernel),
+            weights_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_meta_key(k_quant_bytes),
@@ -1905,27 +1838,23 @@ def run_paged_logits_kernel(
         _tensor_meta_key(k_scales),
         _tensor_compile_key(
             "real_page_table",
-            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            real_page_table_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_compile_key(
             "seqlens_per_query",
-            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            seqlens_per_query_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_meta_key(active_width_kernel),
         _tensor_compile_key(
             "logits",
-            _contract_key_tensor(_cp, "logits", logits),
+            logits,
             dynamic_dims=(0,),
         ),
     )
     max_pages = int(real_page_table.shape[1])
     if schedule_metadata is not None and schedule_metadata_kernel is None:
-        if workspace is not None and not schedule_metadata.is_contiguous():
-            raise ValueError(
-                "workspace-backed paged decode requires contiguous schedule_metadata"
-            )
         schedule_metadata_kernel = (
             schedule_metadata
             if schedule_metadata.is_contiguous()
@@ -2022,8 +1951,6 @@ def run_paged_tiled_logits_kernel(
     page_size: int | None = None,
     tile_block_q: int | None = None,
     tile_block_k: int | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     preinitialize_tile_logits: bool | None = None,
     binding: IndexerPagedTiledLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
@@ -2041,8 +1968,6 @@ def run_paged_tiled_logits_kernel(
                 ("page_size", page_size),
                 ("tile_block_q", tile_block_q),
                 ("tile_block_k", tile_block_k),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("preinitialize_tile_logits", preinitialize_tile_logits),
             )
             if value is not None
@@ -2059,8 +1984,6 @@ def run_paged_tiled_logits_kernel(
         page_size = binding.page_size
         tile_block_q = binding.tile_block_q
         tile_block_k = binding.tile_block_k
-        contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
         preinitialize_tile_logits = binding.preinitialize_tile_logits
 
     q_fp8 = _require_bound_arg(q_fp8, api_name="run_paged_tiled_logits_kernel", name="q_fp8")
@@ -2108,16 +2031,14 @@ def run_paged_tiled_logits_kernel(
         page_size=page_size,
         tile_block_q=tile_block_q,
         tile_block_k=tile_block_k,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         preinitialize_tile_logits=preinitialize_tile_logits,
         source_page_offset=0,
         output_width_tokens=None,
-        windowed=False,
+        supertile=False,
     )
 
 
-def run_paged_windowed_tiled_logits_kernel(
+def run_paged_supertile_logits_kernel(
     *,
     q_fp8: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
@@ -2131,11 +2052,8 @@ def run_paged_windowed_tiled_logits_kernel(
     page_size: int | None = None,
     tile_block_q: int | None = None,
     tile_block_k: int | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     preinitialize_tile_logits: bool | None = None,
-    stage_runtime_metadata: bool | None = None,
-    binding: IndexerPagedWindowedTiledLogitsKernelBinding | None = None,
+    binding: IndexerPagedSupertileLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     if binding is not None:
         extras = [
@@ -2153,15 +2071,12 @@ def run_paged_windowed_tiled_logits_kernel(
                 ("page_size", page_size),
                 ("tile_block_q", tile_block_q),
                 ("tile_block_k", tile_block_k),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("preinitialize_tile_logits", preinitialize_tile_logits),
-                ("stage_runtime_metadata", stage_runtime_metadata),
             )
             if value is not None
         ]
         if extras:
-            _raise_binding_extras("run_paged_windowed_tiled_logits_kernel", extras)
+            _raise_binding_extras("run_paged_supertile_logits_kernel", extras)
         q_fp8 = binding.q_fp8
         weights = binding.weights
         index_k_cache = binding.index_k_cache
@@ -2174,54 +2089,51 @@ def run_paged_windowed_tiled_logits_kernel(
         page_size = binding.page_size
         tile_block_q = binding.tile_block_q
         tile_block_k = binding.tile_block_k
-        contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
         preinitialize_tile_logits = binding.preinitialize_tile_logits
-        stage_runtime_metadata = binding.stage_runtime_metadata
 
     q_fp8 = _require_bound_arg(
         q_fp8,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="q_fp8",
     )
     weights = _require_bound_arg(
         weights,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="weights",
     )
     index_k_cache = _require_bound_arg(
         index_k_cache,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="index_k_cache",
     )
     real_page_table = _require_bound_arg(
         real_page_table,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="real_page_table",
     )
     seqlens_per_query = _require_bound_arg(
         seqlens_per_query,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="seqlens_per_query",
     )
     active_width = _require_bound_arg(
         active_width,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="active_width",
     )
     tile_logits = _require_bound_arg(
         tile_logits,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="tile_logits",
     )
     source_page_offset = _require_bound_arg(
         source_page_offset,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="source_page_offset",
     )
     output_width_tokens = _require_bound_arg(
         output_width_tokens,
-        api_name="run_paged_windowed_tiled_logits_kernel",
+        api_name="run_paged_supertile_logits_kernel",
         name="output_width_tokens",
     )
     page_size = _PAGE_SIZE if page_size is None else int(page_size)
@@ -2230,10 +2142,6 @@ def run_paged_windowed_tiled_logits_kernel(
     preinitialize_tile_logits = (
         True if preinitialize_tile_logits is None else bool(preinitialize_tile_logits)
     )
-    stage_runtime_metadata = (
-        True if stage_runtime_metadata is None else bool(stage_runtime_metadata)
-    )
-
     return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
@@ -2245,13 +2153,10 @@ def run_paged_windowed_tiled_logits_kernel(
         page_size=page_size,
         tile_block_q=tile_block_q,
         tile_block_k=tile_block_k,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         preinitialize_tile_logits=preinitialize_tile_logits,
         source_page_offset=source_page_offset,
         output_width_tokens=output_width_tokens,
-        windowed=True,
-        stage_runtime_metadata=stage_runtime_metadata,
+        supertile=True,
     )
 
 
@@ -2267,13 +2172,10 @@ def _run_paged_tiled_logits_kernel_common(
     page_size: int,
     tile_block_q: int,
     tile_block_k: int,
-    contract_phantoms: dict[str, torch.Tensor] | None,
-    workspace,
     preinitialize_tile_logits: bool,
     source_page_offset: int = 0,
     output_width_tokens: int | None = None,
-    windowed: bool,
-    stage_runtime_metadata: bool = True,
+    supertile: bool,
 ) -> torch.Tensor:
     if page_size != _PAGE_SIZE:
         raise ValueError(f"paged tiled logits kernel requires page_size={_PAGE_SIZE}, got {page_size}")
@@ -2315,9 +2217,9 @@ def _run_paged_tiled_logits_kernel_common(
             "source_page_offset exceeds real_page_table width: "
             f"offset={source_page_offset}, width={int(real_page_table.shape[1])}"
         )
-    if windowed:
+    if supertile:
         if output_width_tokens is None:
-            raise ValueError("windowed paged tiled logits require output_width_tokens")
+            raise ValueError("paged supertile logits require output_width_tokens")
         width_tokens = int(output_width_tokens)
     else:
         width_tokens = source_width_tokens
@@ -2348,54 +2250,28 @@ def _run_paged_tiled_logits_kernel_common(
         int(use_scalar_k_load),
         device_index,
     )
-    if workspace is not None and stage_runtime_metadata:
-        staged = workspace.stage_indexer_paged_tiled_decode(
-            q_fp8=q_fp8,
-            weights=weights,
-            real_page_table=real_page_table,
-            seqlens_per_query=seqlens_per_query,
-            active_width=active_width,
-            width_tokens=width_tokens,
-            tile_logits=tile_logits,
-            tile_block_q=int(tile_block_q),
-            tile_block_k=int(tile_block_k),
-            preinitialize_tile_logits=bool(preinitialize_tile_logits),
-        )
-        q_bytes = staged["q_bytes"]
-        weights_kernel = staged["weights"]
-        real_page_table_kernel = staged["real_page_table"]
-        seqlens_per_query_kernel = staged["seqlens_per_query"]
-        active_width_kernel = staged["active_width"]
-        logits = staged["tile_logits"]
-        logits_view = staged["tile_logits_view"]
-        if contract_phantoms is None:
-            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
-    else:
-        if not q_fp8.is_contiguous():
-            raise ValueError("paged tiled logits requires contiguous q_fp8")
-        if not weights.is_contiguous():
-            raise ValueError("paged tiled logits requires contiguous weights")
-        if not real_page_table.is_contiguous() and not _is_row_shared_i32_matrix(
-            real_page_table
-        ):
-            raise ValueError("paged tiled logits requires contiguous real_page_table")
-        if not seqlens_per_query.is_contiguous():
-            raise ValueError("paged tiled logits requires contiguous seqlens_per_query")
-        if not active_width.is_contiguous():
-            raise ValueError("paged tiled logits requires contiguous active_width")
-        q_bytes = q_fp8.view(torch.uint8)
-        weights_kernel = weights
-        real_page_table_kernel = real_page_table
-        seqlens_per_query_kernel = seqlens_per_query
-        active_width_kernel = active_width
-        logits = tile_logits
-        logits_view = tile_logits[:required_elements]
-        if preinitialize_tile_logits:
-            logits_view.fill_(float("-inf"))
-        if workspace is not None and contract_phantoms is None:
-            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
+    if not q_fp8.is_contiguous():
+        raise ValueError("paged tiled logits requires contiguous q_fp8")
+    if not weights.is_contiguous():
+        raise ValueError("paged tiled logits requires contiguous weights")
+    if not real_page_table.is_contiguous() and not _is_row_shared_i32_matrix(
+        real_page_table
+    ):
+        raise ValueError("paged tiled logits requires contiguous real_page_table")
+    if not seqlens_per_query.is_contiguous():
+        raise ValueError("paged tiled logits requires contiguous seqlens_per_query")
+    if not active_width.is_contiguous():
+        raise ValueError("paged tiled logits requires contiguous active_width")
+    q_bytes = q_fp8.view(torch.uint8)
+    weights_kernel = weights
+    real_page_table_kernel = real_page_table
+    seqlens_per_query_kernel = seqlens_per_query
+    active_width_kernel = active_width
+    logits = tile_logits
+    logits_view = tile_logits[:required_elements]
+    if preinitialize_tile_logits:
+        logits_view.fill_(float("-inf"))
 
-    _cp = contract_phantoms or {}
     common_args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
@@ -2410,12 +2286,12 @@ def _run_paged_tiled_logits_kernel_common(
         q_fp8.shape[1],
         _tensor_compile_key(
             "q_bytes",
-            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            q_bytes,
             dynamic_dims=(0,),
         ),
         _tensor_compile_key(
             "weights",
-            _contract_key_tensor(_cp, "weights", weights_kernel),
+            weights_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_meta_key(k_quant_bytes),
@@ -2424,40 +2300,27 @@ def _run_paged_tiled_logits_kernel_common(
         _tensor_meta_key(k_scales),
         _tensor_compile_key(
             "real_page_table",
-            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            real_page_table_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_compile_key(
             "seqlens_per_query",
-            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            seqlens_per_query_kernel,
             dynamic_dims=(0,),
         ),
         _tensor_meta_key(active_width_kernel),
         _tensor_compile_key(
             "tile_logits",
-            _contract_key_tensor(
-                _cp,
-                "tile_logits" if "tile_logits" in _cp else "logits",
-                logits,
-            ),
+            logits,
             dynamic_dims=(0,),
         ),
     )
-    workspace_persistent_ctas = (
-        workspace.get_paged_indexer_persistent_ctas()
-        if workspace is not None and hasattr(workspace, "get_paged_indexer_persistent_ctas")
-        else None
+    persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
+        device_index=device_index,
+        q_rows=rows,
     )
-    persistent_ctas = (
-        int(workspace_persistent_ctas)
-        if workspace_persistent_ctas is not None
-        else _resolve_sparse_nsa_persistent_ctas(
-            device_index=device_index,
-            q_rows=rows,
-        )
-    )
-    if windowed:
-        kernel = _build_sparse_nsa_paged_windowed_tiled_kernel(
+    if supertile:
+        kernel = _build_sparse_nsa_paged_supertile_kernel(
             persistent_ctas,
             q_fp8.shape[1],
             int(tile_block_q),
@@ -2472,7 +2335,7 @@ def _run_paged_tiled_logits_kernel_common(
             current_cuda_stream(),
         )
         cache_key = (
-            "persistent_windowed_tiled",
+            "persistent_supertile",
             persistent_ctas,
             int(tile_block_q),
             int(tile_block_k),

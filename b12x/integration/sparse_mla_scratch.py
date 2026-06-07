@@ -20,13 +20,15 @@ from typing import Literal
 import torch
 
 from b12x.attention.workspace import (
-    _ARENA_ALIGN_BYTES,
-    _align_up,
-    _dtype_nbytes,
-    _materialize_arena_strided_view,
-    _materialize_arena_view,
     _split_output_buffer_from_tmp,
     _split_tmp_output_stride,
+)
+from b12x.integration.scratch_layout import (
+    SCRATCH_ALIGN_BYTES,
+    align_up,
+    dtype_nbytes,
+    materialize_scratch_strided_view,
+    materialize_scratch_view,
 )
 from b12x.integration.scratch import (
     B12XScratchBufferSpec,
@@ -308,7 +310,7 @@ def _sparse_mla_scratch_layout(
     kv_chunk_size_offset_bytes = 0
     num_chunks_offset_bytes = 0
     if split:
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         tmp_output_offset_bytes = cursor
         # output_buffer aliases tmp_output[:, :, 0, :] (chunk-major stride), so no
         # separate output allocation is needed for decode.
@@ -318,35 +320,35 @@ def _sparse_mla_scratch_layout(
             * max_chunks_per_row
             * num_q_heads
             * v_head_dim
-            * _dtype_nbytes(caps.dtype)
+            * dtype_nbytes(caps.dtype)
         )
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         tmp_lse_offset_bytes = cursor
         cursor += (
-            max_total_q * max_chunks_per_row * num_q_heads * _dtype_nbytes(torch.float32)
+            max_total_q * max_chunks_per_row * num_q_heads * dtype_nbytes(torch.float32)
         )
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         final_lse_offset_bytes = cursor
-        cursor += max_total_q * num_q_heads * _dtype_nbytes(torch.float32)
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor += max_total_q * num_q_heads * dtype_nbytes(torch.float32)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         kv_chunk_size_offset_bytes = cursor
-        cursor += _dtype_nbytes(torch.int32)
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor += dtype_nbytes(torch.int32)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         num_chunks_offset_bytes = cursor
-        cursor += _dtype_nbytes(torch.int32)
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor += dtype_nbytes(torch.int32)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
     else:
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         output_offset_bytes = cursor
-        cursor += max_total_q * num_q_heads * v_head_dim * _dtype_nbytes(caps.dtype)
-        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.dtype)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     sm_scale_offset_bytes = cursor
-    cursor += _dtype_nbytes(torch.float32)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+    cursor += dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     return _B12XSparseMLAScratchLayout(
-        nbytes=max(int(cursor), _ARENA_ALIGN_BYTES),
+        nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
         split=split,
         output_offset_bytes=output_offset_bytes,
         tmp_output_offset_bytes=tmp_output_offset_bytes,
@@ -374,7 +376,7 @@ def _materialize_sparse_mla_scratch(
     kv_chunk_size_ptr = None
     num_chunks_ptr = None
     if layout.split:
-        tmp_output, _ = _materialize_arena_strided_view(
+        tmp_output, _ = materialize_scratch_strided_view(
             scratch_storage,
             offset_bytes=layout.tmp_output_offset_bytes,
             shape=(max_total_q, num_q_heads, max_chunks_per_row, v_head_dim),
@@ -387,39 +389,39 @@ def _materialize_sparse_mla_scratch(
             dtype=caps.dtype,
         )
         output_buffer = _split_output_buffer_from_tmp(tmp_output)
-        tmp_lse, _ = _materialize_arena_view(
+        tmp_lse, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.tmp_lse_offset_bytes,
             shape=(max_total_q, num_q_heads, max_chunks_per_row),
             dtype=torch.float32,
         )
-        final_lse, _ = _materialize_arena_view(
+        final_lse, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.final_lse_offset_bytes,
             shape=(max_total_q, num_q_heads),
             dtype=torch.float32,
         )
-        kv_chunk_size_ptr, _ = _materialize_arena_view(
+        kv_chunk_size_ptr, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.kv_chunk_size_offset_bytes,
             shape=(1,),
             dtype=torch.int32,
         )
-        num_chunks_ptr, _ = _materialize_arena_view(
+        num_chunks_ptr, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.num_chunks_offset_bytes,
             shape=(1,),
             dtype=torch.int32,
         )
     else:
-        output_buffer, _ = _materialize_arena_view(
+        output_buffer, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.output_offset_bytes,
             shape=(max_total_q, num_q_heads, v_head_dim),
             dtype=caps.dtype,
         )
 
-    sm_scale_tensor, _ = _materialize_arena_view(
+    sm_scale_tensor, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=layout.sm_scale_offset_bytes,
         shape=(1,),

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import b12x.attention.indexer.persistent_topk as persistent_topk_impl
-from b12x.integration import (
+from b12x.attention.indexer import (
     B12XPersistentTopK2048Binding,
     B12XPersistentTopK2048ScratchCaps,
     plan_persistent_topk2048_scratch,

@@ -232,7 +232,7 @@ def paged_decode_logits_reference(
     return logits_out
 
 
-def extend_logits_reference(
+def contiguous_logits_reference(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -240,7 +240,7 @@ def extend_logits_reference(
     k_start: torch.Tensor,
     k_end: torch.Tensor,
 ) -> torch.Tensor:
-    """Return dense ragged logits from the non-paged extend contract."""
+    """Return dense ragged logits from the contiguous non-paged contract."""
 
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")

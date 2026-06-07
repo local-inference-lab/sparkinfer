@@ -3,7 +3,7 @@
 
 This is intentionally a standalone opt-in verifier rather than a normal pytest
 test.  It targets the long-context surfaces that are easy to miss in short unit
-tests: C4 indexer multi-supertile selection, shared-page-table prefill scoring,
+tests: paged indexer multi-supertile selection, shared-page-table prefill scoring,
 and compressed MLA over far C4/C128 page positions under CUDA graph replay.
 """
 
@@ -32,15 +32,19 @@ from b12x.attention.mla.compressed_reference import (
 )
 from b12x.integration import (
     B12XAttentionWorkspace,
-    clear_indexer_caches,
     clear_mla_caches,
-    compressed_index_logits_reference,
-    index_topk_fp8,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
-    pack_compressed_index_k_cache_reference,
-    prepare_compressed_indexer_metadata,
-    unpack_compressed_index_k_cache_reference,
+)
+from b12x.attention.indexer import (
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    clear_indexer_caches,
+    index_topk_fp8,
+    pack_paged_index_k_cache_reference,
+    paged_index_logits_reference,
+    plan_indexer_scratch,
+    unpack_paged_index_k_cache_reference,
 )
 
 
@@ -168,7 +172,7 @@ def _deepgemm_style_paged_index_logits(
     if width_tokens == 0:
         return logits
 
-    k_dequant = unpack_compressed_index_k_cache_reference(
+    k_dequant = unpack_paged_index_k_cache_reference(
         index_k_cache,
         num_tokens=int(index_k_cache.shape[0]) * int(page_size),
         page_size=page_size,
@@ -255,35 +259,43 @@ def _make_index_q_weights(
     return q.to(torch.float8_e4m3fn).contiguous(), weights.contiguous()
 
 
-def _make_index_workspace(
+def _make_index_binding(
     *,
     device: torch.device,
     rows: int,
     page_table_width: int,
     supertile_k: int,
     topk: int,
-    use_cuda_graph: bool,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=INDEX_HEADS,
-        indexer_num_q_heads=INDEX_HEADS,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=page_table_width,
-        max_total_q=max(rows, 1),
-        max_batch=max(rows, 1),
-        max_paged_q_rows=max(rows, 1),
-        max_kv_rows=0,
-        indexer_max_k_rows=supertile_k,
-        page_size=INDEX_PAGE_SIZE,
-        use_cuda_graph=use_cuda_graph,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=supertile_k,
+    page_table: torch.Tensor,
+    seqlens: torch.Tensor,
+    shared_page_table: bool,
+    route: str = "auto",
+):
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=INDEX_HEADS,
+            max_q_rows=max(rows, 1),
+            max_page_table_width=page_table_width,
+            topk=topk,
+            page_size=INDEX_PAGE_SIZE,
+            supertile_k=supertile_k,
+            mode="prefill" if shared_page_table else "decode",
+            shared_page_table=shared_page_table,
+            route=route,
+        )
+    )
+    scratch = [
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    ]
+    return plan.bind(
+        scratch=scratch,
+        real_page_table=page_table,
+        cache_seqlens_int32=seqlens,
+        expected_num_q_heads=INDEX_HEADS,
+        shared_page_table=shared_page_table,
     )
 
 
@@ -355,7 +367,7 @@ def _streaming_index_topk_reference(
     rows = int(q_fp8.shape[0])
     page_table_width = int(real_page_table.shape[1])
     max_tokens = page_table_width * INDEX_PAGE_SIZE
-    k_dequant = unpack_compressed_index_k_cache_reference(
+    k_dequant = unpack_paged_index_k_cache_reference(
         index_k_cache,
         num_tokens=int(index_k_cache.shape[0]) * INDEX_PAGE_SIZE,
     )
@@ -400,10 +412,10 @@ def run_deepgemm_reference_alignment(args: argparse.Namespace, device: torch.dev
 
     physical_pages = rows * page_table_width
     k = torch.randn((physical_pages * INDEX_PAGE_SIZE, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32, device=device) / 3
-    packed_loop = pack_compressed_index_k_cache_reference(k, page_size=INDEX_PAGE_SIZE)
+    packed_loop = pack_paged_index_k_cache_reference(k, page_size=INDEX_PAGE_SIZE)
     packed_vectorized = _pack_index_k_cache_vectorized(k)
     if not torch.equal(packed_loop, packed_vectorized):
-        raise AssertionError("compressed index K-cache packers disagree")
+        raise AssertionError("paged index K-cache packers disagree")
 
     q_fp8, weights = _make_index_q_weights(rows=rows, seed=args.seed + 102, device=device, needle_mode=False)
     q_fp8 = q_fp8[:, :heads].contiguous()
@@ -428,7 +440,7 @@ def run_deepgemm_reference_alignment(args: argparse.Namespace, device: torch.dev
     page_table[7, -3:] = -1
     page_table = page_table.contiguous()
 
-    b12x_ref = compressed_index_logits_reference(
+    b12x_ref = paged_index_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=packed_loop,
@@ -489,27 +501,17 @@ def run_c4_indexer_dense_equivalence(args: argparse.Namespace, device: torch.dev
         device=device,
     ) / 4
     index_k_cache = _pack_index_k_cache_vectorized(k)
-    workspace = _make_index_workspace(
+    binding = _make_index_binding(
         device=device,
         rows=rows,
         page_table_width=page_table_width,
         supertile_k=supertile_k,
         topk=topk,
-        use_cuda_graph=True,
-    )
-    clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=supertile_k,
-    )
-    metadata = prepare_compressed_indexer_metadata(
-        real_page_table=page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=INDEX_HEADS,
-        build_schedule=False,
+        page_table=page_table,
+        seqlens=seqlens,
         shared_page_table=True,
     )
+    clear_indexer_caches()
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
@@ -517,12 +519,10 @@ def run_c4_indexer_dense_equivalence(args: argparse.Namespace, device: torch.dev
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,
-            metadata=metadata,
+            binding=binding,
             topk=topk,
             expected_num_q_heads=INDEX_HEADS,
-            workspace=workspace,
             out_indices=actual,
-            supertile_k=supertile_k,
         )
 
     out = _capture_and_replay(run)
@@ -537,7 +537,7 @@ def run_c4_indexer_dense_equivalence(args: argparse.Namespace, device: torch.dev
     _assert_topk_sets_equal(
         out,
         expected,
-        label=f"c4-indexer-shared-prefill-dense-deepgemm-graph rows={rows} width={page_table_width * INDEX_PAGE_SIZE}",
+        label=f"paged-indexer-shared-prefill-dense-deepgemm-graph rows={rows} width={page_table_width * INDEX_PAGE_SIZE}",
     )
 
 
@@ -568,7 +568,7 @@ def _assert_needles_present(
         present = set(int(v) for v in actual_cpu[row].tolist())
         missing = sorted(expected - present)
         if missing:
-            raise AssertionError(f"{label}: row {row} missing planted C4 needles {missing[:32]}")
+            raise AssertionError(f"{label}: row {row} missing planted paged-index needles {missing[:32]}")
     print(f"{label}: all planted needles present in rows {rows_to_check}")
 
 
@@ -594,27 +594,18 @@ def run_c4_indexer_random_decode(args: argparse.Namespace, device: torch.device)
         device=device,
     ) / 3
     index_k_cache = _pack_index_k_cache_vectorized(k)
-    workspace = _make_index_workspace(
+    binding = _make_index_binding(
         device=device,
         rows=rows,
         page_table_width=page_table_width,
         supertile_k=int(args.supertile_k),
         topk=topk,
-        use_cuda_graph=True,
+        page_table=page_table,
+        seqlens=seqlens,
+        shared_page_table=False,
+        route="paged_tiled",
     )
     clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=int(args.supertile_k),
-    )
-    metadata = prepare_compressed_indexer_metadata(
-        real_page_table=page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=INDEX_HEADS,
-        build_schedule=False,
-        shared_page_table=False,
-    )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
@@ -622,12 +613,10 @@ def run_c4_indexer_random_decode(args: argparse.Namespace, device: torch.device)
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,
-            metadata=metadata,
+            binding=binding,
             topk=topk,
             expected_num_q_heads=INDEX_HEADS,
-            workspace=workspace,
             out_indices=actual,
-            supertile_k=int(args.supertile_k),
         )
 
     start = time.perf_counter()
@@ -641,8 +630,8 @@ def run_c4_indexer_random_decode(args: argparse.Namespace, device: torch.device)
         topk=topk,
         chunk_tokens=int(args.reference_chunk_tokens),
     )
-    _assert_topk_sets_equal(out, expected, label="c4-indexer-random-decode-graph")
-    print(f"c4-indexer-random-decode-graph: elapsed={time.perf_counter() - start:.2f}s")
+    _assert_topk_sets_equal(out, expected, label="paged-indexer-random-decode-graph")
+    print(f"paged-indexer-random-decode-graph: elapsed={time.perf_counter() - start:.2f}s")
 
 
 def run_c4_indexer_shared_prefill_needles(args: argparse.Namespace, device: torch.device) -> None:
@@ -687,27 +676,17 @@ def run_c4_indexer_shared_prefill_needles(args: argparse.Namespace, device: torc
         physical_page = int(page_table[0, page_col].item())
         k[physical_page * INDEX_PAGE_SIZE + page_off, 0] = 64.0 + rank
     index_k_cache = _pack_index_k_cache_vectorized(k)
-    workspace = _make_index_workspace(
+    binding = _make_index_binding(
         device=device,
         rows=rows,
         page_table_width=page_table_width,
         supertile_k=supertile_k,
         topk=topk,
-        use_cuda_graph=True,
-    )
-    clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=supertile_k,
-    )
-    metadata = prepare_compressed_indexer_metadata(
-        real_page_table=page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=INDEX_HEADS,
-        build_schedule=False,
+        page_table=page_table,
+        seqlens=seqlens,
         shared_page_table=True,
     )
+    clear_indexer_caches()
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     def run() -> torch.Tensor:
@@ -715,12 +694,10 @@ def run_c4_indexer_shared_prefill_needles(args: argparse.Namespace, device: torc
             q_fp8=q_fp8,
             weights=weights.unsqueeze(-1),
             index_k_cache=index_k_cache,
-            metadata=metadata,
+            binding=binding,
             topk=topk,
             expected_num_q_heads=INDEX_HEADS,
-            workspace=workspace,
             out_indices=actual,
-            supertile_k=supertile_k,
         )
 
     start = time.perf_counter()
@@ -730,10 +707,10 @@ def run_c4_indexer_shared_prefill_needles(args: argparse.Namespace, device: torc
         out,
         needle_positions=needle_positions,
         seqlens=seqlens,
-        label="c4-indexer-shared-prefill-needles-graph",
+        label="paged-indexer-shared-prefill-needles-graph",
         rows_to_check=rows_to_check,
     )
-    print(f"c4-indexer-shared-prefill-needles-graph: elapsed={time.perf_counter() - start:.2f}s")
+    print(f"paged-indexer-shared-prefill-needles-graph: elapsed={time.perf_counter() - start:.2f}s")
 
 
 def _make_compressed_mla_q(rows: int, seed: int, device: torch.device) -> torch.Tensor:

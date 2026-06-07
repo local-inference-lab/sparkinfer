@@ -30,7 +30,7 @@ from b12x.attention.mla.reference import (  # noqa: E402
     sparse_mla_reference,
 )
 from b12x.attention.indexer.reference import (  # noqa: E402
-    extend_logits_reference,
+    contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
@@ -41,13 +41,13 @@ from b12x.integration.mla import (  # noqa: E402
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.integration.indexer import (  # noqa: E402
-    IndexerExtendMetadata,
+from b12x.attention.indexer import (  # noqa: E402
+    IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
     paged_decode_logits,
-    extend_logits,
+    contiguous_logits,
 )
 
 
@@ -989,7 +989,7 @@ def _build_extend_compact_layout(
     }
 
 
-def _run_indexer_extend_eager(case: IndexerExtendCase, device: torch.device) -> dict[str, float | int]:
+def _run_indexer_contiguous_eager(case: IndexerExtendCase, device: torch.device) -> dict[str, float | int]:
     layout = _build_extend_compact_layout(
         request_shapes=case.request_shapes,
         topk=case.topk,
@@ -1010,11 +1010,11 @@ def _run_indexer_extend_eager(case: IndexerExtendCase, device: torch.device) -> 
         mla_heads=1,
         index_heads=case.index_heads,
     )
-    metadata = IndexerExtendMetadata(
+    metadata = IndexerContiguousMetadata(
         k_start=layout["k_start"],
         k_end=layout["k_end"],
     )
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=layout["q_fp8"],
         weights=layout["weights"],
         kv_fp8=(layout["k_quant"], layout["k_scale"]),
@@ -1023,7 +1023,7 @@ def _run_indexer_extend_eager(case: IndexerExtendCase, device: torch.device) -> 
         workspace=workspace,
         preinitialize_invalid_logits=case.preinitialize_invalid_logits,
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=layout["q_fp8"],
         weights=layout["weights"],
         kv_fp8=(layout["k_quant"], layout["k_scale"]),
@@ -1673,8 +1673,8 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         mla_heads=case.mla_heads,
         index_heads=case.index_heads,
     )
-    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
-    logits = extend_logits(
+    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+    logits = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
@@ -1683,7 +1683,7 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         workspace=indexer_workspace,
         preinitialize_invalid_logits=False,
     )
-    expected_logits = extend_logits_reference(
+    expected_logits = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
@@ -2450,16 +2450,16 @@ def _run_sglang_ragged_eager(
         device=device,
         structured=True,
     )
-    logits = extend_logits(
+    logits = contiguous_logits(
         q_fp8=q_fp8[:q_rows],
         weights=weights[:q_rows],
         kv_fp8=(k_gather, s_gather),
-        metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
+        metadata=IndexerContiguousMetadata(k_start=k_start, k_end=k_end),
         contract_phantoms=workspace.get_indexer_contract_phantoms(),
         workspace=workspace,
         preinitialize_invalid_logits=False,
     )
-    expected_logits = extend_logits_reference(
+    expected_logits = contiguous_logits_reference(
         q_fp8=q_fp8[:q_rows],
         weights=weights[:q_rows],
         kv_fp8=(k_gather, s_gather),
@@ -2649,7 +2649,7 @@ def _indexer_paged_cases() -> list[IndexerPagedCase]:
     ]
 
 
-def _indexer_extend_cases() -> list[IndexerExtendCase]:
+def _indexer_contiguous_cases() -> list[IndexerExtendCase]:
     return [
         IndexerExtendCase(
             name="extend-prefill-boundaries",
@@ -3014,13 +3014,13 @@ class BatteryRunner:
                 fn=lambda case=case: _run_indexer_paged_graph(case, self.device),
             )
 
-        for case in _indexer_extend_cases():
+        for case in _indexer_contiguous_cases():
             self.run_case(
                 name=case.name,
                 tier=case.tier,
                 mode="indexer",
                 execution="eager",
-                fn=lambda case=case: _run_indexer_extend_eager(case, self.device),
+                fn=lambda case=case: _run_indexer_contiguous_eager(case, self.device),
             )
 
         for case in _mla_cases():

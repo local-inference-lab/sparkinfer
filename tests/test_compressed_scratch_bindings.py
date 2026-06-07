@@ -1,34 +1,40 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 import b12x.attention.indexer.api as indexer_impl
 import b12x.attention.mla.api as sparse_mla_impl
 import b12x.attention.mla.compressed_api as compressed_mla_impl
-import b12x.attention.workspace as attention_workspace
-import b12x.integration.compressed_indexer as compressed_indexer_impl
+import b12x.attention.indexer.paged as paged_indexer_impl
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     compressed_mla_page_nbytes,
 )
 from b12x.attention.workspace import B12XAttentionArena, B12XAttentionWorkspace
+from b12x.attention.indexer import (
+    B12XIndexerContiguousBinding,
+    B12XIndexerPagedBinding,
+    B12XIndexerPagedScratch,
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    plan_indexer_scratch,
+)
+from b12x.attention.indexer.scratch import (
+    B12XIndexerContiguousScratchCaps,
+    B12XIndexerPagedScratchCaps,
+    plan_indexer_contiguous_scratch,
+    plan_indexer_paged_scratch,
+)
 from b12x.integration import (
-    B12XCompressedIndexerBinding,
-    B12XCompressedIndexerScratch,
-    B12XCompressedIndexerScratchCaps,
     B12XCompressedMLABinding,
     B12XCompressedMLAScratch,
     B12XCompressedMLAScratchCaps,
-    B12XIndexerExtendBinding,
-    B12XIndexerExtendScratchCaps,
-    B12XIndexerPagedBinding,
-    B12XIndexerPagedScratchCaps,
     B12XSparseMLABinding,
     B12XSparseMLAScratchCaps,
-    plan_compressed_indexer_scratch,
     plan_compressed_mla_scratch,
-    plan_indexer_extend_scratch,
-    plan_indexer_paged_scratch,
     plan_sparse_mla_scratch,
 )
 
@@ -61,6 +67,11 @@ def _workspace(
         fixed_capacity=True,
         max_chunks_per_row=4,
     )
+
+
+def _one_scratch(plan):
+    (spec,) = plan.scratch_specs()
+    return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
 
 
 def test_compressed_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
@@ -116,9 +127,9 @@ def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
     assert not hasattr(binding.scratch, "indexer_k_tma_desc_ptrs")
 
 
-def test_compressed_indexer_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
-    plan = plan_compressed_indexer_scratch(
-        B12XCompressedIndexerScratchCaps(
+def test_indexer_paged_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -131,21 +142,22 @@ def test_compressed_indexer_scratch_plan_exposes_one_opaque_scratch_spec() -> No
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "compressed_indexer.scratch"
+    assert specs[0].name == "paged_indexer.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.layout.nbytes == specs[0].nbytes
     assert plan.layout.supertile_tokens == 512
-    assert plan.layout.fused_pack_elements > 0
-    assert plan.layout.fused_state_words > 0
+    assert plan.layout.route == "paged_tiled"
+    assert plan.layout.fused_pack_elements == 0
+    assert plan.layout.fused_state_words == 0
 
 
-def test_compressed_indexer_scratch_bind_does_not_call_workspace_or_arena_factory(
+def test_indexer_paged_scratch_bind_does_not_call_workspace_or_arena_factory(
     monkeypatch,
 ) -> None:
-    plan = plan_compressed_indexer_scratch(
-        B12XCompressedIndexerScratchCaps(
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -174,32 +186,102 @@ def test_compressed_indexer_scratch_bind_does_not_call_workspace_or_arena_factor
         active_width=active_width,
     )
 
-    assert isinstance(binding, B12XCompressedIndexerBinding)
-    assert isinstance(binding.scratch, B12XCompressedIndexerScratch)
+    assert isinstance(binding, B12XIndexerPagedBinding)
+    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
     assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
-    assert binding.scratch.indexer_extend_tile_logits is not None
-    assert binding.scratch.indexer_extend_topk_values is not None
-    assert binding.scratch.indexer_extend_topk_indices is not None
-    pack_values, pack_indices, merge_state = (
-        binding.scratch.get_fused_indexer_scratch(topk=8)
+    assert binding.scratch.indexer_contiguous_tile_logits is not None
+    assert binding.scratch.indexer_contiguous_topk_values is not None
+    assert binding.scratch.indexer_contiguous_topk_indices is not None
+    assert binding.scratch.route == "paged_tiled"
+    assert binding.scratch.fused_indexer_pack_values is None
+    assert binding.scratch.fused_indexer_pack_indices is None
+    assert binding.scratch.fused_indexer_merge_state is None
+
+
+def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
+    paged_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=2,
+            max_q_rows=4,
+            max_page_table_width=16,
+            topk=8,
+            mode="decode",
+        )
     )
-    assert pack_values.dtype == torch.float32
-    assert pack_indices.dtype == torch.int32
-    assert merge_state.dtype == torch.int32
-    assert (
-        pack_values.data_ptr()
-        == binding.scratch.fused_indexer_pack_values.data_ptr()
+    contiguous_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+            num_q_heads=2,
+            max_q_rows=4,
+            max_k_rows=1024,
+            topk=8,
+        )
     )
-    assert (
-        pack_indices.data_ptr()
-        == binding.scratch.fused_indexer_pack_indices.data_ptr()
+
+    assert paged_plan.source_layout == INDEXER_SOURCE_LAYOUT_PAGED
+    assert paged_plan.layout.route in {"paged_tiled", "paged_fused"}
+    assert contiguous_plan.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS
+    assert contiguous_plan.layout.max_k_rows == 1024
+
+
+def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
+    context_tokens = 256 * 1024
+    supertile_context_tokens = 32 * 1024
+    c4_tokens_per_k = 4
+
+    glm_k_rows = context_tokens
+    c4_k_rows = (context_tokens + c4_tokens_per_k - 1) // c4_tokens_per_k
+    glm_supertile_k_rows = supertile_context_tokens
+    c4_supertile_k_rows = (
+        supertile_context_tokens + c4_tokens_per_k - 1
+    ) // c4_tokens_per_k
+
+    glm_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=4,
+            max_q_rows=128,
+            max_k_rows=glm_k_rows,
+            topk=8,
+            supertile_k=glm_supertile_k_rows,
+            mode="prefill",
+            shared_page_table=True,
+        )
     )
-    assert (
-        merge_state.data_ptr()
-        == binding.scratch.fused_indexer_merge_state.data_ptr()
+    c4_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=4,
+            max_q_rows=128,
+            max_k_rows=c4_k_rows,
+            topk=8,
+            supertile_k=c4_supertile_k_rows,
+            mode="prefill",
+            shared_page_table=True,
+        )
     )
+
+    assert glm_plan.layout.route == "packed_contiguous"
+    assert c4_plan.layout.route == "packed_contiguous"
+    assert glm_plan.layout.max_chunks == (
+        (glm_k_rows + glm_supertile_k_rows - 1) // glm_supertile_k_rows
+    )
+    assert c4_plan.layout.max_chunks == (
+        (c4_k_rows + c4_supertile_k_rows - 1) // c4_supertile_k_rows
+    )
+    assert glm_plan.layout.gather_k_rows == glm_supertile_k_rows
+    assert c4_plan.layout.gather_k_rows == c4_supertile_k_rows
+    assert c4_plan.layout.gather_k_rows * c4_tokens_per_k == (
+        glm_plan.layout.gather_k_rows
+    )
+    assert c4_plan.layout.max_chunks == glm_plan.layout.max_chunks
 
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
@@ -209,6 +291,7 @@ def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
             num_q_heads=2,
             max_q_rows=4,
             max_page_table_width=16,
+            topk=8,
             reserve_paged_logits=False,
             paged_tile_logits_k_rows=512,
         )
@@ -216,11 +299,12 @@ def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "indexer_paged.arena"
+    assert specs[0].name == "paged_indexer.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
-    assert plan.arena_caps.reserve_paged_indexer_logits is False
+    assert plan.layout.nbytes == specs[0].nbytes
+    assert plan.layout.supertile_tokens == 512
 
 
 def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
@@ -232,6 +316,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
             num_q_heads=2,
             max_q_rows=4,
             max_page_table_width=16,
+            topk=8,
             reserve_paged_logits=False,
         )
     )
@@ -254,45 +339,44 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
     )
 
     assert isinstance(binding, B12XIndexerPagedBinding)
+    assert binding.real_page_table is real_page_table
     assert binding.metadata.real_page_table is real_page_table
+    assert binding.metadata.cache_seqlens_int32 is cache_seqlens
     assert binding.active_width is active_width
 
 
-def test_indexer_extend_scratch_plan_exposes_one_opaque_arena_spec() -> None:
-    plan = plan_indexer_extend_scratch(
-        B12XIndexerExtendScratchCaps(
+def test_indexer_contiguous_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
             max_k_rows=1024,
             topk=8,
-            reserve_extend_logits=False,
-            extend_tile_logits_k_rows=512,
         )
     )
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "indexer_extend.arena"
+    assert specs[0].name == "indexer_contiguous.arena"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
-    assert plan.contract.mode == "extend"
-    assert plan.arena_caps.reserve_extend_indexer_logits is False
-    assert plan.arena_caps.indexer_max_k_rows == 1024
+    assert plan.layout.nbytes == specs[0].nbytes
+    assert plan.layout.max_k_rows == 1024
+    assert plan.layout.tile_logits_elements > 0
 
 
-def test_indexer_extend_scratch_bind_does_not_call_workspace_factory(
+def test_indexer_contiguous_scratch_bind_does_not_call_workspace_factory(
     monkeypatch,
 ) -> None:
-    plan = plan_indexer_extend_scratch(
-        B12XIndexerExtendScratchCaps(
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
             max_k_rows=1024,
             topk=8,
-            reserve_extend_logits=False,
         )
     )
     (spec,) = plan.scratch_specs()
@@ -303,19 +387,11 @@ def test_indexer_extend_scratch_bind_does_not_call_workspace_factory(
     def fail_make_workspace(*args, **kwargs):
         raise AssertionError("scratch binding must not call the workspace factory")
 
-    def fake_tma_descriptor(*args, **kwargs):
-        return torch.empty((16,), dtype=torch.uint64), torch.empty((1,), dtype=torch.int64)
-
     monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
-    monkeypatch.setattr(
-        attention_workspace,
-        "_encode_indexer_k_tma_descriptor",
-        fake_tma_descriptor,
-    )
 
     binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end)
 
-    assert isinstance(binding, B12XIndexerExtendBinding)
+    assert isinstance(binding, B12XIndexerContiguousBinding)
     assert binding.metadata.k_start is k_start
     assert binding.metadata.k_end is k_end
 
@@ -336,11 +412,11 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "sparse_mla.arena"
+    assert specs[0].name == "sparse_mla.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
-    assert plan.contract.mode == "extend"
+    assert plan.layout.nbytes == specs[0].nbytes
 
 
 def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
@@ -451,14 +527,27 @@ def test_workspace_bind_sparse_mla_returns_common_binding_type() -> None:
     assert binding.cache_seqlens_int32 is cache_seqlens
 
 
-def test_workspace_bind_compressed_indexer_returns_common_binding_type() -> None:
-    workspace = _workspace(indexer_num_q_heads=3, max_paged_q_rows=4, max_page_table_width=7)
+def test_indexer_paged_plan_bind_returns_common_binding_type() -> None:
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device="cpu",
+            num_q_heads=3,
+            max_q_rows=4,
+            max_page_table_width=7,
+            topk=8,
+            reserve_paged_logits=False,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+    scratch = _one_scratch(plan)
     real_page_table = torch.empty((4, 7), dtype=torch.int32)
     cache_seqlens = torch.empty((4,), dtype=torch.int32)
     active_width = torch.empty((1,), dtype=torch.int32)
     schedule = torch.empty((2, 2), dtype=torch.int32)
 
-    binding = workspace.bind_compressed_indexer(
+    binding = plan.bind(
+        scratch=scratch,
         real_page_table=real_page_table,
         cache_seqlens_int32=cache_seqlens,
         active_width=active_width,
@@ -467,63 +556,76 @@ def test_workspace_bind_compressed_indexer_returns_common_binding_type() -> None
         shared_page_table=True,
     )
 
-    assert isinstance(binding, B12XCompressedIndexerBinding)
+    assert isinstance(binding, B12XIndexerPagedBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is workspace
+    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
     assert binding.expected_num_q_heads == 3
     assert binding.shared_page_table is True
 
 
-def test_workspace_bind_indexer_paged_decode_returns_common_binding_type() -> None:
-    workspace = _workspace(indexer_num_q_heads=3, max_paged_q_rows=4, max_page_table_width=7)
+def test_indexer_paged_decode_plan_bind_returns_common_binding_type() -> None:
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device="cpu",
+            num_q_heads=3,
+            max_q_rows=4,
+            max_page_table_width=7,
+            topk=8,
+            reserve_paged_logits=False,
+            route="paged_tiled",
+        )
+    )
+    scratch = _one_scratch(plan)
     real_page_table = torch.empty((4, 7), dtype=torch.int32)
     cache_seqlens = torch.empty((4,), dtype=torch.int32)
     active_width = torch.empty((1,), dtype=torch.int32)
     schedule = torch.empty((2, 2), dtype=torch.int32)
 
-    binding = workspace.bind_indexer_paged_decode(
+    binding = plan.bind(
+        scratch=scratch,
         real_page_table=real_page_table,
         cache_seqlens_int32=cache_seqlens,
         active_width=active_width,
-        paged_mqa_schedule_metadata=schedule,
+        schedule_metadata=schedule,
     )
 
     assert isinstance(binding, B12XIndexerPagedBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is workspace
+    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
     assert binding.metadata.real_page_table is real_page_table
     assert binding.metadata.paged_mqa_schedule_metadata is schedule
     assert binding.active_width is active_width
 
 
-def test_workspace_bind_indexer_extend_returns_common_binding_type() -> None:
-    workspace = _workspace(indexer_num_q_heads=3, max_total_q=4, topk=8)
-    workspace.indexer_extend_tile_logits = torch.empty((2048,), dtype=torch.float32)
-    workspace.indexer_extend_topk_values = torch.empty((4, 8), dtype=torch.float32)
-    workspace.indexer_extend_topk_indices = torch.empty((4, 8), dtype=torch.int32)
-    workspace.indexer_extend_candidate_values = torch.empty((2, 4, 8), dtype=torch.float32)
-    workspace.indexer_extend_candidate_indices = torch.empty((2, 4, 8), dtype=torch.int32)
-    workspace.indexer_extend_topk_positions = torch.empty((4, 8), dtype=torch.int64)
-    workspace.indexer_extend_lengths = torch.empty((4,), dtype=torch.int32)
+def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
+            device="cpu",
+            num_q_heads=3,
+            max_q_rows=4,
+            max_k_rows=64,
+            topk=8,
+        )
+    )
+    scratch = _one_scratch(plan)
     k_start = torch.zeros((3,), dtype=torch.int32)
     k_end = torch.full((3,), 64, dtype=torch.int32)
 
-    binding = workspace.bind_indexer_extend(k_start=k_start, k_end=k_end, topk=3)
+    binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end, topk=3)
 
-    assert isinstance(binding, B12XIndexerExtendBinding)
+    assert isinstance(binding, B12XIndexerContiguousBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is workspace
     assert binding.metadata.k_start is k_start
     assert binding.metadata.k_end is k_end
     assert binding.topk == 3
-    assert binding.tile_logits is workspace.indexer_extend_tile_logits
+    assert binding.tile_logits is not None
     assert binding.output_values.shape == (3, 3)
     assert binding.output_indices.shape == (3, 3)
     assert binding.candidate_values.shape == (2, 3, 3)
     assert binding.candidate_indices.shape == (2, 3, 3)
-    assert binding.merge_positions.shape == (3, 3)
+    assert binding.merge_positions is None
     assert binding.lengths.shape == (3,)
 
 
@@ -614,11 +716,23 @@ def test_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None
 
 
 def test_indexer_paged_decode_binding_supplies_metadata(monkeypatch) -> None:
-    workspace = _workspace(indexer_num_q_heads=2, max_paged_q_rows=3, max_page_table_width=5)
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=3,
+            max_page_table_width=5,
+            topk=4,
+            reserve_paged_logits=False,
+            route="paged_tiled",
+        )
+    )
+    scratch = _one_scratch(plan)
     real_page_table = torch.zeros((3, 5), dtype=torch.int32)
     cache_seqlens = torch.zeros((3,), dtype=torch.int32)
     active_width = torch.tensor([0], dtype=torch.int32)
-    binding = workspace.bind_indexer_paged_decode(
+    binding = plan.bind(
+        scratch=scratch,
         real_page_table=real_page_table,
         cache_seqlens_int32=cache_seqlens,
         active_width=active_width,
@@ -652,15 +766,24 @@ def test_indexer_paged_decode_binding_supplies_metadata(monkeypatch) -> None:
     assert calls["real_page_table"] is real_page_table
     assert calls["seqlens_per_query"] is cache_seqlens
     assert calls["active_width"] is active_width
-    assert calls["workspace"] is workspace
+    assert "workspace" not in calls
     assert logits.shape == (3, 320)
 
 
-def test_indexer_extend_logits_binding_supplies_metadata(monkeypatch) -> None:
-    workspace = _workspace(indexer_num_q_heads=2, max_total_q=3, topk=4)
+def test_indexer_contiguous_logits_binding_supplies_metadata(monkeypatch) -> None:
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=3,
+            max_k_rows=64,
+            topk=4,
+        )
+    )
+    scratch = _one_scratch(plan)
     k_start = torch.zeros((3,), dtype=torch.int32)
     k_end = torch.full((3,), 64, dtype=torch.int32)
-    binding = workspace.bind_indexer_extend(k_start=k_start, k_end=k_end, topk=2)
+    binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end, topk=2)
     q_fp8 = torch.empty((3, 2, 128), dtype=torch.uint8)
     weights = torch.empty((3, 2), dtype=torch.float32)
     k_quant = torch.empty((64, 128), dtype=torch.uint8)
@@ -674,10 +797,10 @@ def test_indexer_extend_logits_binding_supplies_metadata(monkeypatch) -> None:
         calls.update(kwargs)
         return torch.empty((3, 64), dtype=torch.float32)
 
-    monkeypatch.setattr(indexer_impl, "supports_extend_logits_kernel", fake_supports)
-    monkeypatch.setattr(indexer_impl, "run_extend_logits_kernel", fake_run_kernel)
+    monkeypatch.setattr(indexer_impl, "supports_contiguous_logits_kernel", fake_supports)
+    monkeypatch.setattr(indexer_impl, "run_contiguous_logits_kernel", fake_run_kernel)
 
-    logits = indexer_impl.extend_logits(
+    logits = indexer_impl.contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
@@ -686,16 +809,28 @@ def test_indexer_extend_logits_binding_supplies_metadata(monkeypatch) -> None:
 
     assert calls["k_start"] is k_start
     assert calls["k_end"] is k_end
-    assert calls["workspace"] is workspace
-    assert calls["contract_phantoms"] is None
+    assert "workspace" not in calls
+    assert "contract_phantoms" not in calls
     assert logits.shape == (3, 64)
 
 
-def test_indexer_extend_tiled_topk_binding_supplies_topk_and_metadata(monkeypatch) -> None:
-    workspace = _workspace(indexer_num_q_heads=2, max_total_q=3, topk=4)
+def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(monkeypatch) -> None:
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
+            device="cpu",
+            num_q_heads=2,
+            max_q_rows=3,
+            max_k_rows=4,
+            topk=4,
+        )
+    )
+    scratch = _one_scratch(plan)
     k_start = torch.zeros((3,), dtype=torch.int32)
     k_end = torch.full((3,), 4, dtype=torch.int32)
-    binding = workspace.bind_indexer_extend(k_start=k_start, k_end=k_end, topk=2)
+    binding = replace(
+        plan.bind(scratch=scratch, k_start=k_start, k_end=k_end, topk=2),
+        strict=False,
+    )
     q_fp8 = torch.empty((3, 2, 128), dtype=torch.uint8)
     weights = torch.empty((3, 2), dtype=torch.float32)
     k_quant = torch.empty((4, 128), dtype=torch.uint8)
@@ -717,10 +852,10 @@ def test_indexer_extend_tiled_topk_binding_supplies_topk_and_metadata(monkeypatc
         calls.update(kwargs)
         return logits
 
-    monkeypatch.setattr(indexer_impl, "supports_extend_logits_kernel", fake_supports)
-    monkeypatch.setattr(indexer_impl, "extend_logits_reference", fake_reference)
+    monkeypatch.setattr(indexer_impl, "supports_contiguous_logits_kernel", fake_supports)
+    monkeypatch.setattr(indexer_impl, "contiguous_logits_reference", fake_reference)
 
-    indices = indexer_impl.extend_tiled_topk(
+    indices = indexer_impl.contiguous_tiled_topk(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),

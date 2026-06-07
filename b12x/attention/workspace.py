@@ -127,7 +127,7 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def _resolve_extend_topk_supertile_k(value: int) -> int:
+def _resolve_contiguous_topk_supertile_k(value: int) -> int:
     value = int(value)
     if value <= 0:
         return 0
@@ -451,7 +451,7 @@ class B12XAttentionArenaCaps:
         object.__setattr__(
             self,
             "extend_indexer_tile_logits_k_rows",
-            _resolve_extend_topk_supertile_k(self.extend_indexer_tile_logits_k_rows),
+            _resolve_contiguous_topk_supertile_k(self.extend_indexer_tile_logits_k_rows),
         )
         paged_indexer_logits_q_rows = int(self.paged_indexer_logits_q_rows)
         if paged_indexer_logits_q_rows <= 0:
@@ -470,7 +470,7 @@ class B12XAttentionArenaCaps:
         object.__setattr__(
             self,
             "paged_indexer_logits_k_rows",
-            _resolve_extend_topk_supertile_k(self.paged_indexer_logits_k_rows),
+            _resolve_contiguous_topk_supertile_k(self.paged_indexer_logits_k_rows),
         )
         object.__setattr__(
             self,
@@ -663,17 +663,17 @@ class _B12XAttentionArenaLayout:
     compressed_page_table_stage_nbytes: int
     compressed_lengths_stage_nbytes: int
     indexer_logits_nbytes: int
-    indexer_extend_logits_nbytes: int
-    indexer_extend_tile_logits_nbytes: int
-    indexer_extend_topk_indices_nbytes: int
-    indexer_extend_topk_values_nbytes: int
-    indexer_extend_topk_scratch_indices_nbytes: int
-    indexer_extend_topk_scratch_values_nbytes: int
-    indexer_extend_topk_position_nbytes: int
-    indexer_extend_candidate_values_nbytes: int
-    indexer_extend_candidate_indices_nbytes: int
-    indexer_extend_lengths_nbytes: int
-    indexer_extend_mapped_indices_nbytes: int
+    indexer_contiguous_logits_nbytes: int
+    indexer_contiguous_tile_logits_nbytes: int
+    indexer_contiguous_topk_indices_nbytes: int
+    indexer_contiguous_topk_values_nbytes: int
+    indexer_contiguous_topk_scratch_indices_nbytes: int
+    indexer_contiguous_topk_scratch_values_nbytes: int
+    indexer_contiguous_topk_position_nbytes: int
+    indexer_contiguous_candidate_values_nbytes: int
+    indexer_contiguous_candidate_indices_nbytes: int
+    indexer_contiguous_lengths_nbytes: int
+    indexer_contiguous_mapped_indices_nbytes: int
     indexer_paged_logits_nbytes: int
     mhc_nbytes: int
     mhc_partials_nbytes: int
@@ -695,17 +695,17 @@ class _B12XAttentionArenaLayout:
     compressed_indexed_page_table_stage_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
-    indexer_extend_logits_offset_bytes: int
-    indexer_extend_tile_logits_offset_bytes: int
-    indexer_extend_topk_indices_offset_bytes: int
-    indexer_extend_topk_values_offset_bytes: int
-    indexer_extend_topk_scratch_indices_offset_bytes: int
-    indexer_extend_topk_scratch_values_offset_bytes: int
-    indexer_extend_topk_position_offset_bytes: int
-    indexer_extend_candidate_values_offset_bytes: int
-    indexer_extend_candidate_indices_offset_bytes: int
-    indexer_extend_lengths_offset_bytes: int
-    indexer_extend_mapped_indices_offset_bytes: int
+    indexer_contiguous_logits_offset_bytes: int
+    indexer_contiguous_tile_logits_offset_bytes: int
+    indexer_contiguous_topk_indices_offset_bytes: int
+    indexer_contiguous_topk_values_offset_bytes: int
+    indexer_contiguous_topk_scratch_indices_offset_bytes: int
+    indexer_contiguous_topk_scratch_values_offset_bytes: int
+    indexer_contiguous_topk_position_offset_bytes: int
+    indexer_contiguous_candidate_values_offset_bytes: int
+    indexer_contiguous_candidate_indices_offset_bytes: int
+    indexer_contiguous_lengths_offset_bytes: int
+    indexer_contiguous_mapped_indices_offset_bytes: int
     indexer_paged_logits_offset_bytes: int
     mhc_partials_offset_bytes: int
     mhc_y_offset_bytes: int
@@ -734,17 +734,17 @@ class B12XAttentionArena:
     compressed_page_table_stage_nbytes: int
     compressed_lengths_stage_nbytes: int
     indexer_logits_nbytes: int
-    indexer_extend_logits_nbytes: int
-    indexer_extend_tile_logits_nbytes: int
-    indexer_extend_topk_indices_nbytes: int
-    indexer_extend_topk_values_nbytes: int
-    indexer_extend_topk_scratch_indices_nbytes: int
-    indexer_extend_topk_scratch_values_nbytes: int
-    indexer_extend_topk_position_nbytes: int
-    indexer_extend_candidate_values_nbytes: int
-    indexer_extend_candidate_indices_nbytes: int
-    indexer_extend_lengths_nbytes: int
-    indexer_extend_mapped_indices_nbytes: int
+    indexer_contiguous_logits_nbytes: int
+    indexer_contiguous_tile_logits_nbytes: int
+    indexer_contiguous_topk_indices_nbytes: int
+    indexer_contiguous_topk_values_nbytes: int
+    indexer_contiguous_topk_scratch_indices_nbytes: int
+    indexer_contiguous_topk_scratch_values_nbytes: int
+    indexer_contiguous_topk_position_nbytes: int
+    indexer_contiguous_candidate_values_nbytes: int
+    indexer_contiguous_candidate_indices_nbytes: int
+    indexer_contiguous_lengths_nbytes: int
+    indexer_contiguous_mapped_indices_nbytes: int
     indexer_paged_logits_nbytes: int
     mhc_nbytes: int
     mhc_partials_nbytes: int
@@ -766,17 +766,17 @@ class B12XAttentionArena:
     compressed_indexed_page_table_stage_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
-    indexer_extend_logits_offset_bytes: int
-    indexer_extend_tile_logits_offset_bytes: int
-    indexer_extend_topk_indices_offset_bytes: int
-    indexer_extend_topk_values_offset_bytes: int
-    indexer_extend_topk_scratch_indices_offset_bytes: int
-    indexer_extend_topk_scratch_values_offset_bytes: int
-    indexer_extend_topk_position_offset_bytes: int
-    indexer_extend_candidate_values_offset_bytes: int
-    indexer_extend_candidate_indices_offset_bytes: int
-    indexer_extend_lengths_offset_bytes: int
-    indexer_extend_mapped_indices_offset_bytes: int
+    indexer_contiguous_logits_offset_bytes: int
+    indexer_contiguous_tile_logits_offset_bytes: int
+    indexer_contiguous_topk_indices_offset_bytes: int
+    indexer_contiguous_topk_values_offset_bytes: int
+    indexer_contiguous_topk_scratch_indices_offset_bytes: int
+    indexer_contiguous_topk_scratch_values_offset_bytes: int
+    indexer_contiguous_topk_position_offset_bytes: int
+    indexer_contiguous_candidate_values_offset_bytes: int
+    indexer_contiguous_candidate_indices_offset_bytes: int
+    indexer_contiguous_lengths_offset_bytes: int
+    indexer_contiguous_mapped_indices_offset_bytes: int
     indexer_paged_logits_offset_bytes: int
     mhc_partials_offset_bytes: int
     mhc_y_offset_bytes: int
@@ -907,24 +907,24 @@ class B12XAttentionArena:
         indexer_k_scale_offset_bytes = extend_offset
         extend_offset += indexer_k_rows * _dtype_nbytes(torch.float32)
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_logits_offset_bytes = extend_offset
+        indexer_contiguous_logits_offset_bytes = extend_offset
         if caps.reserve_extend_indexer_logits:
-            extend_logits_nbytes = (
+            contiguous_logits_nbytes = (
                 int(caps.extend_max_total_q)
                 * indexer_k_rows
                 * _dtype_nbytes(torch.float32)
             )
         else:
-            extend_logits_nbytes = 0
-        extend_offset += extend_logits_nbytes
+            contiguous_logits_nbytes = 0
+        extend_offset += contiguous_logits_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_tile_logits_offset_bytes = extend_offset
-        extend_tile_logits_k_rows = min(
+        indexer_contiguous_tile_logits_offset_bytes = extend_offset
+        contiguous_tile_logits_k_rows = min(
             indexer_k_rows,
-            _resolve_extend_topk_supertile_k(caps.extend_indexer_tile_logits_k_rows),
+            _resolve_contiguous_topk_supertile_k(caps.extend_indexer_tile_logits_k_rows),
         )
         paged_tile_logits_k_rows = int(paged_tile_logits_width_tokens)
-        extend_tile_logits_q_rows = _align_up(
+        contiguous_tile_logits_q_rows = _align_up(
             int(caps.extend_max_total_q),
             _INDEXER_TILE_BLOCK_Q,
         )
@@ -932,59 +932,59 @@ class B12XAttentionArena:
             max_paged_q_rows,
             _INDEXER_TILE_BLOCK_Q,
         )
-        extend_tile_logits_nbytes = 0
-        if extend_tile_logits_k_rows:
-            extend_tile_logits_nbytes = max(
-                extend_tile_logits_nbytes,
-                extend_tile_logits_q_rows
-                * extend_tile_logits_k_rows
+        contiguous_tile_logits_nbytes = 0
+        if contiguous_tile_logits_k_rows:
+            contiguous_tile_logits_nbytes = max(
+                contiguous_tile_logits_nbytes,
+                contiguous_tile_logits_q_rows
+                * contiguous_tile_logits_k_rows
                 * _dtype_nbytes(torch.float32),
             )
             extend_candidate_chunks = (
-                indexer_k_rows + extend_tile_logits_k_rows - 1
-            ) // extend_tile_logits_k_rows
+                indexer_k_rows + contiguous_tile_logits_k_rows - 1
+            ) // contiguous_tile_logits_k_rows
         else:
             extend_candidate_chunks = 0
         if paged_tile_logits_k_rows:
-            extend_tile_logits_nbytes = max(
-                extend_tile_logits_nbytes,
+            contiguous_tile_logits_nbytes = max(
+                contiguous_tile_logits_nbytes,
                 paged_tile_logits_q_rows
                 * paged_tile_logits_k_rows
                 * _dtype_nbytes(torch.float32),
             )
-        extend_offset += extend_tile_logits_nbytes
+        extend_offset += contiguous_tile_logits_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_topk_indices_offset_bytes = extend_offset
-        extend_topk_indices_nbytes = (
+        indexer_contiguous_topk_indices_offset_bytes = extend_offset
+        contiguous_topk_indices_nbytes = (
             indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.int32)
         )
-        extend_offset += extend_topk_indices_nbytes
+        extend_offset += contiguous_topk_indices_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_topk_values_offset_bytes = extend_offset
-        extend_topk_values_nbytes = (
+        indexer_contiguous_topk_values_offset_bytes = extend_offset
+        contiguous_topk_values_nbytes = (
             indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.float32)
         )
-        extend_offset += extend_topk_values_nbytes
+        extend_offset += contiguous_topk_values_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_topk_scratch_indices_offset_bytes = extend_offset
-        extend_topk_scratch_indices_nbytes = (
+        indexer_contiguous_topk_scratch_indices_offset_bytes = extend_offset
+        contiguous_topk_scratch_indices_nbytes = (
             indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.int32)
         )
-        extend_offset += extend_topk_scratch_indices_nbytes
+        extend_offset += contiguous_topk_scratch_indices_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_topk_scratch_values_offset_bytes = extend_offset
-        extend_topk_scratch_values_nbytes = (
+        indexer_contiguous_topk_scratch_values_offset_bytes = extend_offset
+        contiguous_topk_scratch_values_nbytes = (
             indexer_q_rows
             * indexer_topk
             * _dtype_nbytes(torch.float32)
         )
-        extend_offset += extend_topk_scratch_values_nbytes
+        extend_offset += contiguous_topk_scratch_values_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         paged_candidate_chunks = (
             (paged_width_tokens + paged_logits_width_tokens - 1)
@@ -1007,9 +1007,9 @@ class B12XAttentionArena:
         # (candidate_chunks halves) and its merge_positions int64 buffer.
         fold_carry_chunks = 2 if int(candidate_chunks) > 1 else 0
         # merge_positions is gone with the merge step; keep the field at zero bytes.
-        indexer_extend_topk_position_offset_bytes = extend_offset
-        extend_topk_position_nbytes = 0
-        indexer_extend_candidate_values_offset_bytes = extend_offset
+        indexer_contiguous_topk_position_offset_bytes = extend_offset
+        contiguous_topk_position_nbytes = 0
+        indexer_contiguous_candidate_values_offset_bytes = extend_offset
         extend_candidate_values_nbytes = (
             int(fold_carry_chunks)
             * indexer_q_rows
@@ -1018,7 +1018,7 @@ class B12XAttentionArena:
         )
         extend_offset += extend_candidate_values_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_candidate_indices_offset_bytes = extend_offset
+        indexer_contiguous_candidate_indices_offset_bytes = extend_offset
         extend_candidate_indices_nbytes = (
             int(fold_carry_chunks)
             * indexer_q_rows
@@ -1027,11 +1027,11 @@ class B12XAttentionArena:
         )
         extend_offset += extend_candidate_indices_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_lengths_offset_bytes = extend_offset
-        extend_lengths_nbytes = indexer_q_rows * _dtype_nbytes(torch.int32)
-        extend_offset += extend_lengths_nbytes
+        indexer_contiguous_lengths_offset_bytes = extend_offset
+        contiguous_lengths_nbytes = indexer_q_rows * _dtype_nbytes(torch.int32)
+        extend_offset += contiguous_lengths_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
-        indexer_extend_mapped_indices_offset_bytes = extend_offset
+        indexer_contiguous_mapped_indices_offset_bytes = extend_offset
         extend_mapped_indices_nbytes = (
             indexer_q_rows
             * indexer_topk
@@ -1132,30 +1132,30 @@ class B12XAttentionArena:
             compressed_page_table_stage_nbytes=compressed_page_table_stage_nbytes,
             compressed_lengths_stage_nbytes=compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=max(
-                extend_logits_nbytes,
-                extend_tile_logits_nbytes,
-                extend_topk_indices_nbytes,
-                extend_topk_values_nbytes,
-                extend_topk_scratch_indices_nbytes,
-                extend_topk_scratch_values_nbytes,
-                extend_topk_position_nbytes,
+                contiguous_logits_nbytes,
+                contiguous_tile_logits_nbytes,
+                contiguous_topk_indices_nbytes,
+                contiguous_topk_values_nbytes,
+                contiguous_topk_scratch_indices_nbytes,
+                contiguous_topk_scratch_values_nbytes,
+                contiguous_topk_position_nbytes,
                 extend_candidate_values_nbytes,
                 extend_candidate_indices_nbytes,
-                extend_lengths_nbytes,
+                contiguous_lengths_nbytes,
                 extend_mapped_indices_nbytes,
                 paged_logits_nbytes,
             ),
-            indexer_extend_logits_nbytes=extend_logits_nbytes,
-            indexer_extend_tile_logits_nbytes=extend_tile_logits_nbytes,
-            indexer_extend_topk_indices_nbytes=extend_topk_indices_nbytes,
-            indexer_extend_topk_values_nbytes=extend_topk_values_nbytes,
-            indexer_extend_topk_scratch_indices_nbytes=extend_topk_scratch_indices_nbytes,
-            indexer_extend_topk_scratch_values_nbytes=extend_topk_scratch_values_nbytes,
-            indexer_extend_topk_position_nbytes=extend_topk_position_nbytes,
-            indexer_extend_candidate_values_nbytes=extend_candidate_values_nbytes,
-            indexer_extend_candidate_indices_nbytes=extend_candidate_indices_nbytes,
-            indexer_extend_lengths_nbytes=extend_lengths_nbytes,
-            indexer_extend_mapped_indices_nbytes=extend_mapped_indices_nbytes,
+            indexer_contiguous_logits_nbytes=contiguous_logits_nbytes,
+            indexer_contiguous_tile_logits_nbytes=contiguous_tile_logits_nbytes,
+            indexer_contiguous_topk_indices_nbytes=contiguous_topk_indices_nbytes,
+            indexer_contiguous_topk_values_nbytes=contiguous_topk_values_nbytes,
+            indexer_contiguous_topk_scratch_indices_nbytes=contiguous_topk_scratch_indices_nbytes,
+            indexer_contiguous_topk_scratch_values_nbytes=contiguous_topk_scratch_values_nbytes,
+            indexer_contiguous_topk_position_nbytes=contiguous_topk_position_nbytes,
+            indexer_contiguous_candidate_values_nbytes=extend_candidate_values_nbytes,
+            indexer_contiguous_candidate_indices_nbytes=extend_candidate_indices_nbytes,
+            indexer_contiguous_lengths_nbytes=contiguous_lengths_nbytes,
+            indexer_contiguous_mapped_indices_nbytes=extend_mapped_indices_nbytes,
             indexer_paged_logits_nbytes=paged_logits_nbytes,
             mhc_nbytes=mhc_nbytes,
             mhc_partials_nbytes=mhc_partials_nbytes,
@@ -1177,17 +1177,17 @@ class B12XAttentionArena:
             compressed_indexed_page_table_stage_offset_bytes=compressed_indexed_page_table_stage_offset_bytes,
             indexer_k_quant_offset_bytes=indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=indexer_k_scale_offset_bytes,
-            indexer_extend_logits_offset_bytes=indexer_extend_logits_offset_bytes,
-            indexer_extend_tile_logits_offset_bytes=indexer_extend_tile_logits_offset_bytes,
-            indexer_extend_topk_indices_offset_bytes=indexer_extend_topk_indices_offset_bytes,
-            indexer_extend_topk_values_offset_bytes=indexer_extend_topk_values_offset_bytes,
-            indexer_extend_topk_scratch_indices_offset_bytes=indexer_extend_topk_scratch_indices_offset_bytes,
-            indexer_extend_topk_scratch_values_offset_bytes=indexer_extend_topk_scratch_values_offset_bytes,
-            indexer_extend_topk_position_offset_bytes=indexer_extend_topk_position_offset_bytes,
-            indexer_extend_candidate_values_offset_bytes=indexer_extend_candidate_values_offset_bytes,
-            indexer_extend_candidate_indices_offset_bytes=indexer_extend_candidate_indices_offset_bytes,
-            indexer_extend_lengths_offset_bytes=indexer_extend_lengths_offset_bytes,
-            indexer_extend_mapped_indices_offset_bytes=indexer_extend_mapped_indices_offset_bytes,
+            indexer_contiguous_logits_offset_bytes=indexer_contiguous_logits_offset_bytes,
+            indexer_contiguous_tile_logits_offset_bytes=indexer_contiguous_tile_logits_offset_bytes,
+            indexer_contiguous_topk_indices_offset_bytes=indexer_contiguous_topk_indices_offset_bytes,
+            indexer_contiguous_topk_values_offset_bytes=indexer_contiguous_topk_values_offset_bytes,
+            indexer_contiguous_topk_scratch_indices_offset_bytes=indexer_contiguous_topk_scratch_indices_offset_bytes,
+            indexer_contiguous_topk_scratch_values_offset_bytes=indexer_contiguous_topk_scratch_values_offset_bytes,
+            indexer_contiguous_topk_position_offset_bytes=indexer_contiguous_topk_position_offset_bytes,
+            indexer_contiguous_candidate_values_offset_bytes=indexer_contiguous_candidate_values_offset_bytes,
+            indexer_contiguous_candidate_indices_offset_bytes=indexer_contiguous_candidate_indices_offset_bytes,
+            indexer_contiguous_lengths_offset_bytes=indexer_contiguous_lengths_offset_bytes,
+            indexer_contiguous_mapped_indices_offset_bytes=indexer_contiguous_mapped_indices_offset_bytes,
             indexer_paged_logits_offset_bytes=indexer_paged_logits_offset_bytes,
             mhc_partials_offset_bytes=mhc_partials_offset_bytes,
             mhc_y_offset_bytes=mhc_y_offset_bytes,
@@ -1238,17 +1238,17 @@ class B12XAttentionArena:
             compressed_page_table_stage_nbytes=layout.compressed_page_table_stage_nbytes,
             compressed_lengths_stage_nbytes=layout.compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=layout.indexer_logits_nbytes,
-            indexer_extend_logits_nbytes=layout.indexer_extend_logits_nbytes,
-            indexer_extend_tile_logits_nbytes=layout.indexer_extend_tile_logits_nbytes,
-            indexer_extend_topk_indices_nbytes=layout.indexer_extend_topk_indices_nbytes,
-            indexer_extend_topk_values_nbytes=layout.indexer_extend_topk_values_nbytes,
-            indexer_extend_topk_scratch_indices_nbytes=layout.indexer_extend_topk_scratch_indices_nbytes,
-            indexer_extend_topk_scratch_values_nbytes=layout.indexer_extend_topk_scratch_values_nbytes,
-            indexer_extend_topk_position_nbytes=layout.indexer_extend_topk_position_nbytes,
-            indexer_extend_candidate_values_nbytes=layout.indexer_extend_candidate_values_nbytes,
-            indexer_extend_candidate_indices_nbytes=layout.indexer_extend_candidate_indices_nbytes,
-            indexer_extend_lengths_nbytes=layout.indexer_extend_lengths_nbytes,
-            indexer_extend_mapped_indices_nbytes=layout.indexer_extend_mapped_indices_nbytes,
+            indexer_contiguous_logits_nbytes=layout.indexer_contiguous_logits_nbytes,
+            indexer_contiguous_tile_logits_nbytes=layout.indexer_contiguous_tile_logits_nbytes,
+            indexer_contiguous_topk_indices_nbytes=layout.indexer_contiguous_topk_indices_nbytes,
+            indexer_contiguous_topk_values_nbytes=layout.indexer_contiguous_topk_values_nbytes,
+            indexer_contiguous_topk_scratch_indices_nbytes=layout.indexer_contiguous_topk_scratch_indices_nbytes,
+            indexer_contiguous_topk_scratch_values_nbytes=layout.indexer_contiguous_topk_scratch_values_nbytes,
+            indexer_contiguous_topk_position_nbytes=layout.indexer_contiguous_topk_position_nbytes,
+            indexer_contiguous_candidate_values_nbytes=layout.indexer_contiguous_candidate_values_nbytes,
+            indexer_contiguous_candidate_indices_nbytes=layout.indexer_contiguous_candidate_indices_nbytes,
+            indexer_contiguous_lengths_nbytes=layout.indexer_contiguous_lengths_nbytes,
+            indexer_contiguous_mapped_indices_nbytes=layout.indexer_contiguous_mapped_indices_nbytes,
             indexer_paged_logits_nbytes=layout.indexer_paged_logits_nbytes,
             mhc_nbytes=layout.mhc_nbytes,
             mhc_partials_nbytes=layout.mhc_partials_nbytes,
@@ -1270,17 +1270,17 @@ class B12XAttentionArena:
             compressed_indexed_page_table_stage_offset_bytes=layout.compressed_indexed_page_table_stage_offset_bytes,
             indexer_k_quant_offset_bytes=layout.indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=layout.indexer_k_scale_offset_bytes,
-            indexer_extend_logits_offset_bytes=layout.indexer_extend_logits_offset_bytes,
-            indexer_extend_tile_logits_offset_bytes=layout.indexer_extend_tile_logits_offset_bytes,
-            indexer_extend_topk_indices_offset_bytes=layout.indexer_extend_topk_indices_offset_bytes,
-            indexer_extend_topk_values_offset_bytes=layout.indexer_extend_topk_values_offset_bytes,
-            indexer_extend_topk_scratch_indices_offset_bytes=layout.indexer_extend_topk_scratch_indices_offset_bytes,
-            indexer_extend_topk_scratch_values_offset_bytes=layout.indexer_extend_topk_scratch_values_offset_bytes,
-            indexer_extend_topk_position_offset_bytes=layout.indexer_extend_topk_position_offset_bytes,
-            indexer_extend_candidate_values_offset_bytes=layout.indexer_extend_candidate_values_offset_bytes,
-            indexer_extend_candidate_indices_offset_bytes=layout.indexer_extend_candidate_indices_offset_bytes,
-            indexer_extend_lengths_offset_bytes=layout.indexer_extend_lengths_offset_bytes,
-            indexer_extend_mapped_indices_offset_bytes=layout.indexer_extend_mapped_indices_offset_bytes,
+            indexer_contiguous_logits_offset_bytes=layout.indexer_contiguous_logits_offset_bytes,
+            indexer_contiguous_tile_logits_offset_bytes=layout.indexer_contiguous_tile_logits_offset_bytes,
+            indexer_contiguous_topk_indices_offset_bytes=layout.indexer_contiguous_topk_indices_offset_bytes,
+            indexer_contiguous_topk_values_offset_bytes=layout.indexer_contiguous_topk_values_offset_bytes,
+            indexer_contiguous_topk_scratch_indices_offset_bytes=layout.indexer_contiguous_topk_scratch_indices_offset_bytes,
+            indexer_contiguous_topk_scratch_values_offset_bytes=layout.indexer_contiguous_topk_scratch_values_offset_bytes,
+            indexer_contiguous_topk_position_offset_bytes=layout.indexer_contiguous_topk_position_offset_bytes,
+            indexer_contiguous_candidate_values_offset_bytes=layout.indexer_contiguous_candidate_values_offset_bytes,
+            indexer_contiguous_candidate_indices_offset_bytes=layout.indexer_contiguous_candidate_indices_offset_bytes,
+            indexer_contiguous_lengths_offset_bytes=layout.indexer_contiguous_lengths_offset_bytes,
+            indexer_contiguous_mapped_indices_offset_bytes=layout.indexer_contiguous_mapped_indices_offset_bytes,
             indexer_paged_logits_offset_bytes=layout.indexer_paged_logits_offset_bytes,
             mhc_partials_offset_bytes=layout.mhc_partials_offset_bytes,
             mhc_y_offset_bytes=layout.mhc_y_offset_bytes,
@@ -1582,17 +1582,17 @@ class B12XAttentionArena:
             compressed_page_table_stage_nbytes=self.compressed_page_table_stage_nbytes,
             compressed_lengths_stage_nbytes=self.compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=self.indexer_logits_nbytes,
-            indexer_extend_logits_nbytes=self.indexer_extend_logits_nbytes,
-            indexer_extend_tile_logits_nbytes=self.indexer_extend_tile_logits_nbytes,
-            indexer_extend_topk_indices_nbytes=self.indexer_extend_topk_indices_nbytes,
-            indexer_extend_topk_values_nbytes=self.indexer_extend_topk_values_nbytes,
-            indexer_extend_topk_scratch_indices_nbytes=self.indexer_extend_topk_scratch_indices_nbytes,
-            indexer_extend_topk_scratch_values_nbytes=self.indexer_extend_topk_scratch_values_nbytes,
-            indexer_extend_topk_position_nbytes=self.indexer_extend_topk_position_nbytes,
-            indexer_extend_candidate_values_nbytes=self.indexer_extend_candidate_values_nbytes,
-            indexer_extend_candidate_indices_nbytes=self.indexer_extend_candidate_indices_nbytes,
-            indexer_extend_lengths_nbytes=self.indexer_extend_lengths_nbytes,
-            indexer_extend_mapped_indices_nbytes=self.indexer_extend_mapped_indices_nbytes,
+            indexer_contiguous_logits_nbytes=self.indexer_contiguous_logits_nbytes,
+            indexer_contiguous_tile_logits_nbytes=self.indexer_contiguous_tile_logits_nbytes,
+            indexer_contiguous_topk_indices_nbytes=self.indexer_contiguous_topk_indices_nbytes,
+            indexer_contiguous_topk_values_nbytes=self.indexer_contiguous_topk_values_nbytes,
+            indexer_contiguous_topk_scratch_indices_nbytes=self.indexer_contiguous_topk_scratch_indices_nbytes,
+            indexer_contiguous_topk_scratch_values_nbytes=self.indexer_contiguous_topk_scratch_values_nbytes,
+            indexer_contiguous_topk_position_nbytes=self.indexer_contiguous_topk_position_nbytes,
+            indexer_contiguous_candidate_values_nbytes=self.indexer_contiguous_candidate_values_nbytes,
+            indexer_contiguous_candidate_indices_nbytes=self.indexer_contiguous_candidate_indices_nbytes,
+            indexer_contiguous_lengths_nbytes=self.indexer_contiguous_lengths_nbytes,
+            indexer_contiguous_mapped_indices_nbytes=self.indexer_contiguous_mapped_indices_nbytes,
             indexer_paged_logits_nbytes=self.indexer_paged_logits_nbytes,
         )
         workspace._allocate_fixed_capacity_views()
@@ -1673,17 +1673,17 @@ class B12XAttentionWorkspace:
     compressed_page_table_stage_nbytes: int = 0
     compressed_lengths_stage_nbytes: int = 0
     indexer_logits_nbytes: int = 0
-    indexer_extend_logits_nbytes: int = 0
-    indexer_extend_tile_logits_nbytes: int = 0
-    indexer_extend_topk_indices_nbytes: int = 0
-    indexer_extend_topk_values_nbytes: int = 0
-    indexer_extend_topk_scratch_indices_nbytes: int = 0
-    indexer_extend_topk_scratch_values_nbytes: int = 0
-    indexer_extend_topk_position_nbytes: int = 0
-    indexer_extend_candidate_values_nbytes: int = 0
-    indexer_extend_candidate_indices_nbytes: int = 0
-    indexer_extend_lengths_nbytes: int = 0
-    indexer_extend_mapped_indices_nbytes: int = 0
+    indexer_contiguous_logits_nbytes: int = 0
+    indexer_contiguous_tile_logits_nbytes: int = 0
+    indexer_contiguous_topk_indices_nbytes: int = 0
+    indexer_contiguous_topk_values_nbytes: int = 0
+    indexer_contiguous_topk_scratch_indices_nbytes: int = 0
+    indexer_contiguous_topk_scratch_values_nbytes: int = 0
+    indexer_contiguous_topk_position_nbytes: int = 0
+    indexer_contiguous_candidate_values_nbytes: int = 0
+    indexer_contiguous_candidate_indices_nbytes: int = 0
+    indexer_contiguous_lengths_nbytes: int = 0
+    indexer_contiguous_mapped_indices_nbytes: int = 0
     indexer_paged_logits_nbytes: int = 0
     indexer_k_quant_bytes: torch.Tensor | None = None
     indexer_k_scales: torch.Tensor | None = None
@@ -1691,17 +1691,17 @@ class B12XAttentionWorkspace:
     indexer_k_tma_desc_ptrs: torch.Tensor | None = None
     indexer_k_tma_prefill_desc: torch.Tensor | None = None
     indexer_k_tma_prefill_desc_ptrs: torch.Tensor | None = None
-    indexer_extend_logits: torch.Tensor | None = None
-    indexer_extend_tile_logits: torch.Tensor | None = None
-    indexer_extend_topk_indices: torch.Tensor | None = None
-    indexer_extend_topk_values: torch.Tensor | None = None
-    indexer_extend_topk_scratch_indices: torch.Tensor | None = None
-    indexer_extend_topk_scratch_values: torch.Tensor | None = None
-    indexer_extend_topk_positions: torch.Tensor | None = None
-    indexer_extend_candidate_values: torch.Tensor | None = None
-    indexer_extend_candidate_indices: torch.Tensor | None = None
-    indexer_extend_lengths: torch.Tensor | None = None
-    indexer_extend_mapped_indices: torch.Tensor | None = None
+    indexer_contiguous_logits: torch.Tensor | None = None
+    indexer_contiguous_tile_logits: torch.Tensor | None = None
+    indexer_contiguous_topk_indices: torch.Tensor | None = None
+    indexer_contiguous_topk_values: torch.Tensor | None = None
+    indexer_contiguous_topk_scratch_indices: torch.Tensor | None = None
+    indexer_contiguous_topk_scratch_values: torch.Tensor | None = None
+    indexer_contiguous_topk_positions: torch.Tensor | None = None
+    indexer_contiguous_candidate_values: torch.Tensor | None = None
+    indexer_contiguous_candidate_indices: torch.Tensor | None = None
+    indexer_contiguous_lengths: torch.Tensor | None = None
+    indexer_contiguous_mapped_indices: torch.Tensor | None = None
     indexer_paged_logits: torch.Tensor | None = None
     compressed_mla_q_stage: torch.Tensor | None = None
     compressed_mla_swa_indices_stage: torch.Tensor | None = None
@@ -1718,31 +1718,12 @@ class B12XAttentionWorkspace:
     _contract_output: torch.Tensor | None = None
     _contract_tmp_output: torch.Tensor | None = None
     _contract_tmp_lse: torch.Tensor | None = None
-    _contract_indexer_q_bytes: torch.Tensor | None = None
-    _contract_indexer_q_u32: torch.Tensor | None = None
-    _contract_indexer_weights: torch.Tensor | None = None
-    _contract_indexer_k_quant: torch.Tensor | None = None
-    _contract_indexer_k_scale: torch.Tensor | None = None
-    _contract_indexer_k_start: torch.Tensor | None = None
-    _contract_indexer_k_end: torch.Tensor | None = None
-    _contract_indexer_logits: torch.Tensor | None = None
-    _contract_indexer_tile_logits: torch.Tensor | None = None
-    _contract_indexer_topk_values: torch.Tensor | None = None
-    _contract_indexer_topk_indices: torch.Tensor | None = None
-    _contract_paged_indexer_q_bytes: torch.Tensor | None = None
-    _contract_paged_indexer_weights: torch.Tensor | None = None
-    _contract_paged_real_page_table: torch.Tensor | None = None
-    _contract_paged_indexer_cache_seqlens: torch.Tensor | None = None
-    _contract_paged_indexer_logits: torch.Tensor | None = None
-    _contract_paged_indexer_tile_logits: torch.Tensor | None = None
-    _contract_paged_indexer_topk_values: torch.Tensor | None = None
-    _contract_paged_indexer_topk_indices: torch.Tensor | None = None
     # Fused-indexer cross-CTA merge scratch (pack_v, pack_i, state). Reserved EAGERLY at
     # construction at a FIXED, seq-/batch-independent capacity (num_sms*topk pack +
     # FUSED_MAX_ROWS*state) so a live rows<=FUSED_MAX_ROWS decode never allocates after
     # lock_workspace()/graph capture.
     _b12x_fused_indexer_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-    _indexer_extend_tiled_topk_prewarmed: bool = False
+    _indexer_contiguous_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_plan: _PagedIndexerTiledTopKPlan | None = None
     _paged_indexer_tiled_scorer_prewarmed: bool = False
@@ -2063,17 +2044,17 @@ class B12XAttentionWorkspace:
         self.compressed_page_table_stage_nbytes = self.arena.compressed_page_table_stage_nbytes
         self.compressed_lengths_stage_nbytes = self.arena.compressed_lengths_stage_nbytes
         self.paged_logits_q_rows = self.arena.paged_logits_q_rows
-        self.indexer_extend_logits_nbytes = self.arena.indexer_extend_logits_nbytes
-        self.indexer_extend_tile_logits_nbytes = self.arena.indexer_extend_tile_logits_nbytes
-        self.indexer_extend_topk_indices_nbytes = self.arena.indexer_extend_topk_indices_nbytes
-        self.indexer_extend_topk_values_nbytes = self.arena.indexer_extend_topk_values_nbytes
-        self.indexer_extend_topk_scratch_indices_nbytes = self.arena.indexer_extend_topk_scratch_indices_nbytes
-        self.indexer_extend_topk_scratch_values_nbytes = self.arena.indexer_extend_topk_scratch_values_nbytes
-        self.indexer_extend_topk_position_nbytes = self.arena.indexer_extend_topk_position_nbytes
-        self.indexer_extend_candidate_values_nbytes = self.arena.indexer_extend_candidate_values_nbytes
-        self.indexer_extend_candidate_indices_nbytes = self.arena.indexer_extend_candidate_indices_nbytes
-        self.indexer_extend_lengths_nbytes = self.arena.indexer_extend_lengths_nbytes
-        self.indexer_extend_mapped_indices_nbytes = self.arena.indexer_extend_mapped_indices_nbytes
+        self.indexer_contiguous_logits_nbytes = self.arena.indexer_contiguous_logits_nbytes
+        self.indexer_contiguous_tile_logits_nbytes = self.arena.indexer_contiguous_tile_logits_nbytes
+        self.indexer_contiguous_topk_indices_nbytes = self.arena.indexer_contiguous_topk_indices_nbytes
+        self.indexer_contiguous_topk_values_nbytes = self.arena.indexer_contiguous_topk_values_nbytes
+        self.indexer_contiguous_topk_scratch_indices_nbytes = self.arena.indexer_contiguous_topk_scratch_indices_nbytes
+        self.indexer_contiguous_topk_scratch_values_nbytes = self.arena.indexer_contiguous_topk_scratch_values_nbytes
+        self.indexer_contiguous_topk_position_nbytes = self.arena.indexer_contiguous_topk_position_nbytes
+        self.indexer_contiguous_candidate_values_nbytes = self.arena.indexer_contiguous_candidate_values_nbytes
+        self.indexer_contiguous_candidate_indices_nbytes = self.arena.indexer_contiguous_candidate_indices_nbytes
+        self.indexer_contiguous_lengths_nbytes = self.arena.indexer_contiguous_lengths_nbytes
+        self.indexer_contiguous_mapped_indices_nbytes = self.arena.indexer_contiguous_mapped_indices_nbytes
         self.indexer_paged_logits_nbytes = self.arena.indexer_paged_logits_nbytes
         self.indexer_logits_nbytes = self.arena.indexer_logits_nbytes
 
@@ -2186,111 +2167,111 @@ class B12XAttentionWorkspace:
             self.indexer_k_tma_desc_ptrs = None
             self.indexer_k_tma_prefill_desc = None
             self.indexer_k_tma_prefill_desc_ptrs = None
-        if self.indexer_extend_logits_nbytes:
-            self.indexer_extend_logits, _ = _materialize_arena_view(
+        if self.indexer_contiguous_logits_nbytes:
+            self.indexer_contiguous_logits, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_logits_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_logits_offset_bytes,
                 shape=(max_total_q * indexer_k_rows,),
                 dtype=torch.float32,
             )
         else:
-            self.indexer_extend_logits = None
-        if self.indexer_extend_tile_logits_nbytes:
-            self.indexer_extend_tile_logits, _ = _materialize_arena_view(
+            self.indexer_contiguous_logits = None
+        if self.indexer_contiguous_tile_logits_nbytes:
+            self.indexer_contiguous_tile_logits, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_tile_logits_offset_bytes,
-                shape=(self.indexer_extend_tile_logits_nbytes // _dtype_nbytes(torch.float32),),
+                offset_bytes=self.arena.indexer_contiguous_tile_logits_offset_bytes,
+                shape=(self.indexer_contiguous_tile_logits_nbytes // _dtype_nbytes(torch.float32),),
                 dtype=torch.float32,
             )
         else:
-            self.indexer_extend_tile_logits = None
-        if self.indexer_extend_topk_indices_nbytes:
-            self.indexer_extend_topk_indices, _ = _materialize_arena_view(
+            self.indexer_contiguous_tile_logits = None
+        if self.indexer_contiguous_topk_indices_nbytes:
+            self.indexer_contiguous_topk_indices, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_topk_indices_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_topk_indices_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.int32,
             )
         else:
-            self.indexer_extend_topk_indices = None
-        if self.indexer_extend_topk_values_nbytes:
-            self.indexer_extend_topk_values, _ = _materialize_arena_view(
+            self.indexer_contiguous_topk_indices = None
+        if self.indexer_contiguous_topk_values_nbytes:
+            self.indexer_contiguous_topk_values, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_topk_values_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_topk_values_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.float32,
             )
         else:
-            self.indexer_extend_topk_values = None
-        if self.indexer_extend_topk_scratch_indices_nbytes:
-            self.indexer_extend_topk_scratch_indices, _ = _materialize_arena_view(
+            self.indexer_contiguous_topk_values = None
+        if self.indexer_contiguous_topk_scratch_indices_nbytes:
+            self.indexer_contiguous_topk_scratch_indices, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_topk_scratch_indices_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_topk_scratch_indices_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.int32,
             )
         else:
-            self.indexer_extend_topk_scratch_indices = None
-        if self.indexer_extend_topk_scratch_values_nbytes:
-            self.indexer_extend_topk_scratch_values, _ = _materialize_arena_view(
+            self.indexer_contiguous_topk_scratch_indices = None
+        if self.indexer_contiguous_topk_scratch_values_nbytes:
+            self.indexer_contiguous_topk_scratch_values, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_topk_scratch_values_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_topk_scratch_values_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.float32,
             )
         else:
-            self.indexer_extend_topk_scratch_values = None
-        if self.indexer_extend_topk_position_nbytes:
-            self.indexer_extend_topk_positions, _ = _materialize_arena_view(
+            self.indexer_contiguous_topk_scratch_values = None
+        if self.indexer_contiguous_topk_position_nbytes:
+            self.indexer_contiguous_topk_positions, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_topk_position_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_topk_position_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.int64,
             )
         else:
-            self.indexer_extend_topk_positions = None
-        if self.indexer_extend_candidate_values_nbytes:
-            candidate_chunks = self.indexer_extend_candidate_values_nbytes // (
+            self.indexer_contiguous_topk_positions = None
+        if self.indexer_contiguous_candidate_values_nbytes:
+            candidate_chunks = self.indexer_contiguous_candidate_values_nbytes // (
                 indexer_q_rows * int(self.indexer_topk) * _dtype_nbytes(torch.float32)
             )
-            self.indexer_extend_candidate_values, _ = _materialize_arena_view(
+            self.indexer_contiguous_candidate_values, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_candidate_values_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_candidate_values_offset_bytes,
                 shape=(candidate_chunks, indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.float32,
             )
         else:
-            self.indexer_extend_candidate_values = None
-        if self.indexer_extend_candidate_indices_nbytes:
-            candidate_chunks = self.indexer_extend_candidate_indices_nbytes // (
+            self.indexer_contiguous_candidate_values = None
+        if self.indexer_contiguous_candidate_indices_nbytes:
+            candidate_chunks = self.indexer_contiguous_candidate_indices_nbytes // (
                 indexer_q_rows * int(self.indexer_topk) * _dtype_nbytes(torch.int32)
             )
-            self.indexer_extend_candidate_indices, _ = _materialize_arena_view(
+            self.indexer_contiguous_candidate_indices, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_candidate_indices_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_candidate_indices_offset_bytes,
                 shape=(candidate_chunks, indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.int32,
             )
         else:
-            self.indexer_extend_candidate_indices = None
-        if self.indexer_extend_lengths_nbytes:
-            self.indexer_extend_lengths, _ = _materialize_arena_view(
+            self.indexer_contiguous_candidate_indices = None
+        if self.indexer_contiguous_lengths_nbytes:
+            self.indexer_contiguous_lengths, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_lengths_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_lengths_offset_bytes,
                 shape=(indexer_q_rows,),
                 dtype=torch.int32,
             )
         else:
-            self.indexer_extend_lengths = None
-        if self.indexer_extend_mapped_indices_nbytes:
-            self.indexer_extend_mapped_indices, _ = _materialize_arena_view(
+            self.indexer_contiguous_lengths = None
+        if self.indexer_contiguous_mapped_indices_nbytes:
+            self.indexer_contiguous_mapped_indices, _ = _materialize_arena_view(
                 self.shared_arena,
-                offset_bytes=self.arena.indexer_extend_mapped_indices_offset_bytes,
+                offset_bytes=self.arena.indexer_contiguous_mapped_indices_offset_bytes,
                 shape=(indexer_q_rows, int(self.indexer_topk)),
                 dtype=torch.int32,
             )
         else:
-            self.indexer_extend_mapped_indices = None
+            self.indexer_contiguous_mapped_indices = None
         if self.indexer_paged_logits_nbytes and max_paged_q_rows <= int(self.paged_logits_q_rows):
             self.indexer_paged_logits, _ = _materialize_arena_view(
                 self.shared_arena,
@@ -2436,155 +2417,6 @@ class B12XAttentionWorkspace:
         # workspace capacity instead of the live ragged row count for this prefill.
         return buffer
 
-    def get_indexer_contract_phantoms(self) -> dict[str, torch.Tensor]:
-        if (
-            self._contract_indexer_q_u32 is None
-            or self._contract_indexer_q_bytes is None
-            or self._contract_indexer_weights is None
-            or self._contract_indexer_k_quant is None
-            or self._contract_indexer_k_scale is None
-            or self._contract_indexer_k_start is None
-            or self._contract_indexer_k_end is None
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing indexer phantoms")
-        phantoms = {
-            "extend_q_u32": self._contract_indexer_q_u32,
-            "extend_q_bytes": self._contract_indexer_q_bytes,
-            "extend_weights": self._contract_indexer_weights,
-            "extend_k_quant": self._contract_indexer_k_quant,
-            "extend_k_scale": self._contract_indexer_k_scale,
-            "extend_k_start": self._contract_indexer_k_start,
-            "extend_k_end": self._contract_indexer_k_end,
-        }
-        if self._contract_indexer_logits is not None:
-            phantoms["extend_logits"] = self._contract_indexer_logits
-        if self._contract_indexer_tile_logits is not None:
-            phantoms["extend_tile_logits"] = self._contract_indexer_tile_logits
-        if self._contract_indexer_topk_values is not None:
-            phantoms["extend_topk_values"] = self._contract_indexer_topk_values
-            phantoms["topk_values"] = self._contract_indexer_topk_values
-        if self._contract_indexer_topk_indices is not None:
-            phantoms["extend_topk_indices"] = self._contract_indexer_topk_indices
-            phantoms["topk_indices"] = self._contract_indexer_topk_indices
-        return phantoms
-
-    def get_indexer_extend_tile_logits(self) -> torch.Tensor | None:
-        return self.indexer_extend_tile_logits
-
-    def get_indexer_extend_topk_buffers(
-        self,
-        *,
-        row_count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.indexer_extend_topk_values is None or self.indexer_extend_topk_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k buffers")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.indexer_extend_topk_indices.shape[0]:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds workspace top-k capacity {self.indexer_extend_topk_indices.shape[0]}"
-            )
-        return (
-            self.indexer_extend_topk_values[:row_count],
-            self.indexer_extend_topk_indices[:row_count],
-        )
-
-    def get_indexer_extend_topk_scratch_buffers(
-        self,
-        *,
-        row_count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            self.indexer_extend_topk_scratch_values is None
-            or self.indexer_extend_topk_scratch_indices is None
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k scratch buffers")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.indexer_extend_topk_scratch_indices.shape[0]:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds workspace top-k scratch capacity "
-                f"{self.indexer_extend_topk_scratch_indices.shape[0]}"
-            )
-        return (
-            self.indexer_extend_topk_scratch_values[:row_count],
-            self.indexer_extend_topk_scratch_indices[:row_count],
-        )
-
-    def get_indexer_extend_topk_position_buffer(self, *, row_count: int) -> torch.Tensor:
-        if self.indexer_extend_topk_positions is None:
-            raise B12XIndexerTopKPositionBufferUnavailable(
-                "fixed-capacity workspace is missing indexer extend top-k position buffer"
-            )
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        capacity_rows = int(self.indexer_extend_topk_positions.shape[0])
-        if row_count > capacity_rows:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds workspace top-k position capacity {capacity_rows}"
-            )
-        return self.indexer_extend_topk_positions[:row_count]
-
-    def get_indexer_extend_candidate_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            self.indexer_extend_candidate_values is None
-            or self.indexer_extend_candidate_indices is None
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing indexer extend candidate buffers")
-        return self.indexer_extend_candidate_values, self.indexer_extend_candidate_indices
-
-    def get_indexer_extend_lengths(self, *, row_count: int) -> torch.Tensor:
-        if self.indexer_extend_lengths is None:
-            raise RuntimeError("fixed-capacity workspace is missing indexer extend length buffer")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.indexer_extend_lengths.shape[0]:
-            raise ValueError(
-                f"row_count {row_count} exceeds workspace length capacity {self.indexer_extend_lengths.shape[0]}"
-            )
-        return self.indexer_extend_lengths[:row_count]
-
-    def get_paged_indexer_runtime_lengths(self, *, row_count: int) -> torch.Tensor:
-        self._allocate_paged_indexer_runtime_metadata()
-        if self.paged_indexer_seqlens_per_query_runtime is None:
-            raise RuntimeError("fixed-capacity workspace is missing paged indexer length buffer")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.paged_indexer_seqlens_per_query_runtime.shape[0]:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds paged indexer length capacity "
-                f"{self.paged_indexer_seqlens_per_query_runtime.shape[0]}"
-            )
-        return self.paged_indexer_seqlens_per_query_runtime[:row_count]
-
-    def get_indexer_extend_topk_result(self, *, row_count: int) -> torch.Tensor:
-        if self.indexer_extend_topk_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing indexer extend top-k result buffer")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.indexer_extend_topk_indices.shape[0]:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds workspace top-k capacity {self.indexer_extend_topk_indices.shape[0]}"
-            )
-        return self.indexer_extend_topk_indices[:row_count]
-
-    def get_paged_indexer_active_width_cap(self) -> torch.Tensor:
-        self._allocate_paged_indexer_runtime_metadata()
-        if self.paged_indexer_active_width_cap is None:
-            raise RuntimeError("fixed-capacity workspace is missing paged indexer active-width cap")
-        return self.paged_indexer_active_width_cap
-
     def bind_compressed_mla(
         self,
         *,
@@ -2618,1170 +2450,12 @@ class B12XAttentionWorkspace:
         from b12x.integration.sparse_mla_scratch import build_sparse_mla_binding
 
         return build_sparse_mla_binding(
-            workspace=self,
+            scratch=self,
             q=q,
             selected_indices=selected_indices,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
         )
-
-    def bind_compressed_indexer(
-        self,
-        *,
-        real_page_table: torch.Tensor,
-        cache_seqlens_int32: torch.Tensor,
-        active_width: torch.Tensor | None = None,
-        schedule_metadata: torch.Tensor | None = None,
-        expected_num_q_heads: int | None = None,
-        shared_page_table: bool = False,
-    ):
-        from b12x.integration.compressed_scratch import build_compressed_indexer_binding
-
-        return build_compressed_indexer_binding(
-            workspace=self,
-            real_page_table=real_page_table,
-            cache_seqlens_int32=cache_seqlens_int32,
-            active_width=active_width,
-            schedule_metadata=schedule_metadata,
-            expected_num_q_heads=expected_num_q_heads,
-            shared_page_table=shared_page_table,
-        )
-
-    def bind_indexer_paged_decode(
-        self,
-        *,
-        real_page_table: torch.Tensor,
-        cache_seqlens_int32: torch.Tensor,
-        active_width: torch.Tensor | None = None,
-        paged_mqa_schedule_metadata: torch.Tensor | None = None,
-    ):
-        from b12x.integration.indexer_scratch import build_indexer_paged_binding
-
-        return build_indexer_paged_binding(
-            workspace=self,
-            real_page_table=real_page_table,
-            cache_seqlens_int32=cache_seqlens_int32,
-            active_width=active_width,
-            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
-        )
-
-    def bind_indexer_extend(
-        self,
-        *,
-        k_start: torch.Tensor,
-        k_end: torch.Tensor,
-        gather_rows: int | None = None,
-        topk: int | None = None,
-        include_topk_buffers: bool = True,
-        include_candidate_buffers: bool = True,
-        include_lengths: bool = True,
-        include_merge_positions: bool = True,
-    ):
-        from b12x.integration.compressed_scratch import build_indexer_extend_binding
-
-        return build_indexer_extend_binding(
-            workspace=self,
-            k_start=k_start,
-            k_end=k_end,
-            gather_rows=gather_rows,
-            topk=self.indexer_topk if topk is None else topk,
-            include_topk_buffers=include_topk_buffers,
-            include_candidate_buffers=include_candidate_buffers,
-            include_lengths=include_lengths,
-            include_merge_positions=include_merge_positions,
-        )
-
-    def get_paged_indexer_persistent_ctas(self) -> int:
-        return _resolve_paged_indexer_persistent_ctas(
-            device=self.device,
-            q_rows=int(self.max_paged_q_rows),
-        )
-
-    def _make_paged_indexer_tiled_topk_plan(
-        self,
-        *,
-        topk: int,
-        block_q: int,
-        block_k: int,
-    ) -> _PagedIndexerTiledTopKPlan:
-        if (
-            self.indexer_extend_tile_logits is None
-            or self.indexer_extend_topk_values is None
-            or self.indexer_extend_topk_indices is None
-            or self.max_paged_q_rows <= 0
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing paged tiled top-k buffers")
-        topk = int(topk)
-        block_q = int(block_q)
-        block_k = int(block_k)
-        if topk <= 0 or block_q <= 0 or block_k <= 0:
-            raise ValueError(
-                f"topk and tile blocks must be positive, got topk={topk}, "
-                f"block_q={block_q}, block_k={block_k}"
-            )
-        if block_k != _PAGED_INDEXER_TILE_BLOCK_K:
-            raise ValueError(
-                f"paged tiled top-k requires block_k={_PAGED_INDEXER_TILE_BLOCK_K}, got {block_k}"
-            )
-
-        q_rows = min(
-            int(self.max_paged_q_rows),
-            int(self.indexer_extend_topk_values.shape[0]),
-            int(self.indexer_extend_topk_indices.shape[0]),
-        )
-        if q_rows <= 0:
-            raise RuntimeError("paged tiled top-k workspace has zero q-row capacity")
-        num_q_tiles = (q_rows + block_q - 1) // block_q
-        max_num_k_tiles = int(self.indexer_extend_tile_logits.numel()) // (
-            max(num_q_tiles, 1) * block_q * block_k
-        )
-        min_num_k_tiles = (topk + block_k - 1) // block_k
-        if max_num_k_tiles < max(min_num_k_tiles, 1):
-            raise RuntimeError(
-                "paged tiled top-k workspace is too small for the preplanned launch: "
-                f"q_rows={q_rows}, topk={topk}, block_q={block_q}, "
-                f"block_k={block_k}, num_k_tiles={max_num_k_tiles}"
-            )
-        return _PagedIndexerTiledTopKPlan(
-            topk=topk,
-            block_q=block_q,
-            block_k=block_k,
-            q_rows=q_rows,
-            num_k_tiles=max_num_k_tiles,
-        )
-
-    def require_paged_indexer_tiled_topk_plan(
-        self,
-        *,
-        topk: int,
-        block_q: int,
-        block_k: int,
-        num_k_tiles: int,
-    ) -> None:
-        plan = self._paged_indexer_tiled_topk_plan
-        if not self._paged_indexer_tiled_topk_prewarmed or plan is None:
-            raise RuntimeError(
-                "paged C4 tiled top-k was not prewarmed for this fixed workspace; "
-                "initialize the workspace launch contract before runtime execution"
-            )
-        if (
-            int(topk) != plan.topk
-            or int(block_q) != plan.block_q
-            or int(block_k) != plan.block_k
-            or int(num_k_tiles) != plan.num_k_tiles
-        ):
-            raise RuntimeError(
-                "paged C4 tiled top-k launch does not match the preplanned workspace "
-                "contract: "
-                f"requested=(topk={int(topk)}, block_q={int(block_q)}, "
-                f"block_k={int(block_k)}, num_k_tiles={int(num_k_tiles)}), "
-                f"planned=(topk={plan.topk}, block_q={plan.block_q}, "
-                f"block_k={plan.block_k}, num_k_tiles={plan.num_k_tiles})"
-            )
-
-    def _make_paged_indexer_tiled_scorer_plan(
-        self,
-        *,
-        block_q: int,
-        block_k: int,
-        width_tokens: int | None = None,
-    ) -> _PagedIndexerTiledScorerPlan:
-        if self.indexer_extend_tile_logits is None or self.max_paged_q_rows <= 0:
-            raise RuntimeError("fixed-capacity workspace is missing paged tiled scorer buffers")
-        block_q = int(block_q)
-        block_k = int(block_k)
-        if block_q <= 0 or block_k <= 0:
-            raise ValueError(
-                f"tile blocks must be positive, got block_q={block_q}, block_k={block_k}"
-            )
-        if block_k != _PAGED_INDEXER_TILE_BLOCK_K:
-            raise ValueError(
-                f"paged tiled scorer requires block_k={_PAGED_INDEXER_TILE_BLOCK_K}, got {block_k}"
-            )
-
-        q_rows = max(1, int(self.max_paged_q_rows))
-        num_q_tiles = (q_rows + block_q - 1) // block_q
-        max_num_k_tiles = int(self.indexer_extend_tile_logits.numel()) // (
-            max(num_q_tiles, 1) * block_q * block_k
-        )
-        if max_num_k_tiles <= 0:
-            raise RuntimeError(
-                "paged tiled scorer workspace is too small for the preplanned launch: "
-                f"q_rows={q_rows}, block_q={block_q}, block_k={block_k}"
-            )
-        if width_tokens is None:
-            width_tokens = max_num_k_tiles * block_k
-        width_tokens = int(width_tokens)
-        if width_tokens <= 0 or width_tokens % block_k != 0:
-            raise ValueError(
-                f"width_tokens must be a positive multiple of block_k={block_k}, got {width_tokens}"
-            )
-        num_k_tiles = width_tokens // block_k
-        if num_k_tiles > max_num_k_tiles:
-            raise RuntimeError(
-                "paged tiled scorer workspace is too small for the requested launch: "
-                f"q_rows={q_rows}, width_tokens={width_tokens}, block_q={block_q}, "
-                f"block_k={block_k}, max_num_k_tiles={max_num_k_tiles}"
-            )
-        return _PagedIndexerTiledScorerPlan(
-            block_q=block_q,
-            block_k=block_k,
-            q_rows=q_rows,
-            width_tokens=width_tokens,
-            source_page_width=int(self.max_page_table_width),
-        )
-
-    def require_paged_indexer_tiled_scorer_plan(
-        self,
-        *,
-        block_q: int,
-        block_k: int,
-        width_tokens: int,
-        source_page_width: int,
-    ) -> None:
-        plan = self._paged_indexer_tiled_scorer_plan
-        if not self._paged_indexer_tiled_scorer_prewarmed or plan is None:
-            raise RuntimeError(
-                "paged C4 tiled scorer was not prewarmed for this fixed workspace; "
-                "initialize the workspace launch contract before runtime execution"
-            )
-        if (
-            int(block_q) != plan.block_q
-            or int(block_k) != plan.block_k
-            or int(width_tokens) != plan.width_tokens
-            or int(source_page_width) > plan.source_page_width
-        ):
-            raise RuntimeError(
-                "paged C4 tiled scorer launch does not match the preplanned workspace "
-                "contract: "
-                f"requested=(block_q={int(block_q)}, block_k={int(block_k)}, "
-                f"width_tokens={int(width_tokens)}, source_page_width={int(source_page_width)}), "
-                f"planned=(block_q={plan.block_q}, block_k={plan.block_k}, "
-                f"width_tokens={plan.width_tokens}, source_page_width={plan.source_page_width})"
-            )
-
-    def get_indexer_extend_mapped_indices(self, *, row_count: int, width: int) -> torch.Tensor:
-        if self.indexer_extend_mapped_indices is None:
-            raise RuntimeError("fixed-capacity workspace is missing indexer mapped-index buffer")
-        row_count = int(row_count)
-        width = int(width)
-        if row_count < 0 or width < 0:
-            raise ValueError(f"row_count and width must be non-negative, got {row_count}, {width}")
-        if row_count > self.indexer_extend_mapped_indices.shape[0]:
-            raise ValueError(
-                "row_count "
-                f"{row_count} exceeds workspace mapped-index capacity {self.indexer_extend_mapped_indices.shape[0]}"
-            )
-        if width > self.indexer_extend_mapped_indices.shape[1]:
-            raise ValueError(
-                f"width {width} exceeds workspace mapped-index width {self.indexer_extend_mapped_indices.shape[1]}"
-            )
-        return self.indexer_extend_mapped_indices[:row_count, :width]
-
-    def prewarm_indexer_extend_tiled_topk(self) -> None:
-        """Compile the arena-backed extend scorer/topk variants before serving.
-
-        The production extend path uses fixed-capacity phantom tensors so live
-        K lengths do not change the host-launcher cache key.  There are still
-        two intentional scorer variants today: BK=256 and BK=512.  This warmup
-        runs representative single-supertile calls for both, when supported by
-        the workspace capacity, so chunked prefill traffic does not pay the CuTe
-        compile cost at the first request that reaches each variant.
-        """
-
-        if self._indexer_extend_tiled_topk_prewarmed:
-            return
-        if self.mode != "extend":
-            return
-        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
-            return
-        if (
-            self.indexer_extend_tile_logits is None
-            or self.indexer_k_quant_bytes is None
-            or self.indexer_k_scales is None
-            or self.max_total_q < 256
-            or self.topk <= 0
-        ):
-            return
-
-        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            return
-
-        from b12x.attention.indexer.api import (
-            IndexerExtendMetadata,
-            extend_tiled_topk,
-        )
-        from b12x.attention.indexer.extend_kernel import (
-            _PREFILL512_BLOCK_K,
-            _PREFILL512_BLOCK_Q,
-            _PREFILL_BLOCK_Q,
-            resolve_extend_prefill_block_k,
-        )
-
-        q_rows = min(int(self.max_total_q), 4096)
-        heads = int(self.indexer_num_q_heads)
-        warm_cases: list[int] = []
-        for requested_k_rows in (4096, 32768):
-            if requested_k_rows > int(self.max_kv_rows):
-                continue
-            if requested_k_rows < int(self.topk):
-                continue
-            block_k = resolve_extend_prefill_block_k(
-                valid_q_rows=q_rows,
-                k_rows=requested_k_rows,
-                num_heads=heads,
-            )
-            if block_k is None:
-                continue
-            block_q = (
-                _PREFILL512_BLOCK_Q
-                if block_k == _PREFILL512_BLOCK_K
-                else _PREFILL_BLOCK_Q
-            )
-            num_q_tiles = (q_rows + block_q - 1) // block_q
-            num_k_tiles = (requested_k_rows + block_k - 1) // block_k
-            required_tile_logits = num_q_tiles * num_k_tiles * block_q * block_k
-            if int(self.indexer_extend_tile_logits.numel()) < required_tile_logits:
-                continue
-            warm_cases.append(requested_k_rows)
-
-        if not warm_cases:
-            return
-
-        with torch.cuda.device(self.device):
-            q_fp8 = torch.empty(
-                (q_rows, heads, _INDEX_HEAD_DIM),
-                dtype=fp8_dtype,
-                device=self.device,
-            )
-            weights = torch.empty(
-                (q_rows, heads),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            k_start = torch.empty((q_rows,), dtype=torch.int32, device=self.device)
-            k_end = torch.empty((q_rows,), dtype=torch.int32, device=self.device)
-            q_fp8.zero_()
-            weights.fill_(1.0)
-
-            phantoms = self.get_indexer_contract_phantoms()
-            tile_logits = self.get_indexer_extend_tile_logits()
-            assert tile_logits is not None
-            for k_rows in warm_cases:
-                self.indexer_k_quant_bytes[:k_rows].zero_()
-                self.indexer_k_scales[:k_rows].fill_(1.0)
-                k_start.zero_()
-                k_end.fill_(k_rows)
-                extend_tiled_topk(
-                    q_fp8=q_fp8,
-                    weights=weights,
-                    kv_fp8=(
-                        self.indexer_k_quant_bytes[:k_rows].view(fp8_dtype),
-                        self.indexer_k_scales[:k_rows],
-                    ),
-                    metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
-                    topk=int(self.topk),
-                    contract_phantoms=phantoms,
-                    tile_logits=tile_logits,
-                    supertile_k=k_rows,
-                )
-            # Warm the streaming-fold (is_first=False) kernel variant by forcing more
-            # than one supertile chunk on the largest case, so chunked prefill traffic
-            # never compiles during CUDA-graph capture.
-            fold_k_rows = max(warm_cases)
-            fold_supertile_k = max(int(self.topk), fold_k_rows // 2)
-            if fold_supertile_k < fold_k_rows:
-                self.indexer_k_quant_bytes[:fold_k_rows].zero_()
-                self.indexer_k_scales[:fold_k_rows].fill_(1.0)
-                k_start.zero_()
-                k_end.fill_(fold_k_rows)
-                extend_tiled_topk(
-                    q_fp8=q_fp8,
-                    weights=weights,
-                    kv_fp8=(
-                        self.indexer_k_quant_bytes[:fold_k_rows].view(fp8_dtype),
-                        self.indexer_k_scales[:fold_k_rows],
-                    ),
-                    metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
-                    topk=int(self.topk),
-                    contract_phantoms=phantoms,
-                    tile_logits=tile_logits,
-                    supertile_k=fold_supertile_k,
-                )
-            torch.cuda.synchronize(self.device)
-
-        self._indexer_extend_tiled_topk_prewarmed = True
-
-    def prewarm_paged_indexer_tiled_topk(self) -> None:
-        """Compile the fixed-capacity paged C4 tiled top-k launcher."""
-
-        if self._paged_indexer_tiled_topk_prewarmed:
-            return
-        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
-            return
-        if (
-            self.indexer_extend_tile_logits is None
-            or self.indexer_extend_topk_values is None
-            or self.indexer_extend_topk_indices is None
-            or self.max_paged_q_rows <= 0
-            or self.topk <= 0
-        ):
-            return
-
-        from b12x.attention.indexer.tiled_topk import run_tiled_topk
-
-        block_q = _INDEXER_TILE_BLOCK_Q
-        block_k = _PAGED_INDEXER_TILE_BLOCK_K
-        topk = int(self.indexer_topk)
-        plan = self._make_paged_indexer_tiled_topk_plan(
-            topk=topk,
-            block_q=block_q,
-            block_k=block_k,
-        )
-
-        self._allocate_paged_indexer_runtime_metadata()
-        if self.paged_indexer_seqlens_per_query_runtime is None:
-            return
-
-        with torch.cuda.device(self.device):
-            num_q_tiles = (plan.q_rows + block_q - 1) // block_q
-            tile_elements = num_q_tiles * block_q * plan.num_k_tiles * block_k
-            self.indexer_extend_tile_logits[:tile_elements].zero_()
-            lengths = self.paged_indexer_seqlens_per_query_runtime[:plan.q_rows]
-            lengths.fill_(plan.num_k_tiles * block_k)
-            output_values = self.indexer_extend_topk_values[:plan.q_rows, :topk]
-            output_indices = self.indexer_extend_topk_indices[:plan.q_rows, :topk]
-            run_tiled_topk(
-                tile_logits=self.indexer_extend_tile_logits,
-                k_start=None,
-                lengths=lengths,
-                topk=topk,
-                block_q=block_q,
-                block_k=block_k,
-                output_values=output_values,
-                output_indices=output_indices,
-                num_k_tiles=plan.num_k_tiles,
-                input_extent=plan.num_k_tiles * block_k,
-                zero_row_start=True,
-                contract_phantoms=self.get_paged_indexer_contract_phantoms(),
-            )
-            # Warm the streaming-fold (is_first=False) kernel variant too, so chunked
-            # decode traffic never compiles during CUDA-graph capture. Fresh
-            # contiguous carry/output tensors keep the (dynamic-flat) cache key
-            # identical to the serving kernel.
-            if self.indexer_extend_candidate_values is not None:
-                warm_carry_values = torch.empty(
-                    (plan.q_rows, topk), dtype=torch.float32, device=self.device
-                )
-                warm_carry_indices = torch.empty(
-                    (plan.q_rows, topk), dtype=torch.int32, device=self.device
-                )
-                warm_out_values = torch.empty(
-                    (plan.q_rows, topk), dtype=torch.float32, device=self.device
-                )
-                warm_out_indices = torch.empty(
-                    (plan.q_rows, topk), dtype=torch.int32, device=self.device
-                )
-                run_tiled_topk(
-                    tile_logits=self.indexer_extend_tile_logits,
-                    k_start=None,
-                    lengths=lengths,
-                    topk=topk,
-                    block_q=block_q,
-                    block_k=block_k,
-                    output_values=warm_out_values,
-                    output_indices=warm_out_indices,
-                    num_k_tiles=plan.num_k_tiles,
-                    input_extent=plan.num_k_tiles * block_k,
-                    zero_row_start=True,
-                    carry_values=warm_carry_values,
-                    carry_indices=warm_carry_indices,
-                    is_first=False,
-                    contract_phantoms=self.get_paged_indexer_contract_phantoms(),
-                )
-            torch.cuda.synchronize(self.device)
-
-        self._paged_indexer_tiled_topk_plan = plan
-        self._paged_indexer_tiled_topk_prewarmed = True
-
-    def prewarm_paged_indexer_tiled_scorer(
-        self,
-        *,
-        index_k_cache: torch.Tensor,
-        width_tokens: int | None = None,
-    ) -> None:
-        """Compile the fixed-capacity paged C4 scorer launcher.
-
-        The paged scorer's host launcher depends on the real index-K cache
-        layout.  SGLang has that cache at backend setup time, so warm the scorer
-        there and make live prefill chunks consume this fixed launch contract.
-        """
-
-        if self._paged_indexer_tiled_scorer_prewarmed:
-            return
-        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
-            return
-        if (
-            self.indexer_extend_tile_logits is None
-            or self.max_paged_q_rows <= 0
-            or self.max_page_table_width <= 0
-        ):
-            return
-        if index_k_cache.device != self.device:
-            raise ValueError(
-                f"index_k_cache device {index_k_cache.device} does not match workspace device {self.device}"
-            )
-
-        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            return
-
-        from b12x.attention.indexer.kernel import (
-            run_paged_windowed_tiled_logits_kernel,
-        )
-        from b12x.attention.indexer.extend_kernel import (
-            resolve_extend_prefill_block_k,
-            run_extend_logits_kernel,
-        )
-        from b12x.integration.compressed_indexer import (
-            _prepare_shared_compressed_supertile,
-        )
-
-        block_q = _INDEXER_TILE_BLOCK_Q
-        block_k = _PAGED_INDEXER_TILE_BLOCK_K
-        plan = self._make_paged_indexer_tiled_scorer_plan(
-            block_q=block_q,
-            block_k=block_k,
-            width_tokens=width_tokens,
-        )
-
-        self._allocate_paged_indexer_runtime_metadata()
-        if (
-            self.paged_indexer_real_page_table_runtime is None
-            or self.paged_indexer_seqlens_per_query_runtime is None
-        ):
-            return
-
-        with torch.cuda.device(self.device):
-            q_fp8 = torch.empty(
-                (plan.q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM),
-                dtype=fp8_dtype,
-                device=self.device,
-            )
-            weights = torch.empty(
-                (plan.q_rows, self.indexer_num_q_heads),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            weights.fill_(1.0)
-
-            page_table = self.paged_indexer_real_page_table_runtime[
-                : plan.q_rows, : plan.source_page_width
-            ]
-            lengths = self.paged_indexer_seqlens_per_query_runtime[: plan.q_rows]
-            page_table.fill_(-1)
-            lengths.fill_(plan.width_tokens)
-
-            run_paged_windowed_tiled_logits_kernel(
-                q_fp8=q_fp8,
-                weights=weights,
-                index_k_cache=index_k_cache,
-                real_page_table=page_table,
-                seqlens_per_query=lengths,
-                active_width=self.get_paged_indexer_active_width_cap(),
-                tile_logits=self.indexer_extend_tile_logits,
-                source_page_offset=0,
-                output_width_tokens=plan.width_tokens,
-                page_size=int(self.page_size),
-                tile_block_q=plan.block_q,
-                tile_block_k=plan.block_k,
-                contract_phantoms=self.get_paged_indexer_contract_phantoms(),
-                workspace=self,
-                preinitialize_tile_logits=False,
-            )
-            if (
-                self.indexer_k_quant_bytes is not None
-                and plan.q_rows >= 1024
-                and plan.width_tokens <= int(self.indexer_k_quant_bytes.shape[0])
-                and resolve_extend_prefill_block_k(
-                    valid_q_rows=plan.q_rows,
-                    k_rows=plan.width_tokens,
-                    num_heads=self.indexer_num_q_heads,
-                )
-                == block_k
-            ):
-                page_table.fill_(0)
-                lengths.fill_(plan.width_tokens)
-                k_quant, k_scale, k_start, k_end = _prepare_shared_compressed_supertile(
-                    index_k_cache=index_k_cache,
-                    real_page_table=page_table,
-                    seqlens_per_query=lengths,
-                    workspace=self,
-                    q_rows=plan.q_rows,
-                    page_table_width=plan.source_page_width,
-                    page_begin=0,
-                    supertile_tokens=plan.width_tokens,
-                )
-                run_extend_logits_kernel(
-                    q_fp8=q_fp8,
-                    weights=weights,
-                    k_quant=k_quant,
-                    k_scale=k_scale,
-                    k_start=k_start,
-                    k_end=k_end,
-                    contract_phantoms=self.get_indexer_contract_phantoms(),
-                    workspace=self,
-                    tile_logits=self.indexer_extend_tile_logits,
-                    tile_k_offset=0,
-                    tile_num_k_tiles=plan.width_tokens // plan.block_k,
-                )
-            torch.cuda.synchronize(self.device)
-
-        self._paged_indexer_tiled_scorer_plan = plan
-        self._paged_indexer_tiled_scorer_prewarmed = True
-
-    def get_paged_indexer_contract_phantoms(self) -> dict[str, torch.Tensor]:
-        if (
-            self._contract_paged_indexer_q_bytes is None
-            or self._contract_paged_indexer_weights is None
-            or self._contract_paged_real_page_table is None
-            or self._contract_paged_indexer_cache_seqlens is None
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing paged indexer phantoms")
-        phantoms = {
-            "q_bytes": self._contract_paged_indexer_q_bytes,
-            "weights": self._contract_paged_indexer_weights,
-            "real_page_table": self._contract_paged_real_page_table,
-            "seqlens_per_query": self._contract_paged_indexer_cache_seqlens,
-        }
-        if self._contract_paged_indexer_logits is not None:
-            phantoms["logits"] = self._contract_paged_indexer_logits
-        if self._contract_paged_indexer_tile_logits is not None:
-            phantoms["tile_logits"] = self._contract_paged_indexer_tile_logits
-        if self._contract_paged_indexer_topk_values is not None:
-            phantoms["topk_values"] = self._contract_paged_indexer_topk_values
-        if self._contract_paged_indexer_topk_indices is not None:
-            phantoms["topk_indices"] = self._contract_paged_indexer_topk_indices
-        if "logits" not in phantoms and "tile_logits" not in phantoms:
-            raise RuntimeError("fixed-capacity workspace is missing paged indexer output phantoms")
-        return phantoms
-
-    def get_indexer_gather_outputs(
-        self,
-        *,
-        row_count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.indexer_k_quant_bytes is None or self.indexer_k_scales is None:
-            raise RuntimeError("fixed-capacity workspace is missing indexer gather buffers")
-        row_count = int(row_count)
-        if row_count < 0:
-            raise ValueError(f"row_count must be non-negative, got {row_count}")
-        if row_count > self.indexer_k_quant_bytes.shape[0]:
-            raise ValueError(
-                f"row_count {row_count} exceeds workspace gather capacity {self.indexer_k_quant_bytes.shape[0]}"
-            )
-        k_scale_bytes = self.indexer_k_scales.view(torch.uint8).view(
-            self.indexer_k_scales.shape[0], 4
-        )
-        return self.indexer_k_quant_bytes[:row_count], k_scale_bytes[:row_count]
-
-    def stage_indexer_extend(
-        self,
-        *,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        k_quant: torch.Tensor,
-        k_scale: torch.Tensor,
-        k_start: torch.Tensor,
-        k_end: torch.Tensor,
-        preinitialize_invalid_logits: bool = True,
-        requires_full_logits: bool = True,
-    ) -> dict[str, torch.Tensor]:
-        if (
-            self.indexer_k_quant_bytes is None
-            or self.indexer_k_scales is None
-            or (requires_full_logits and self.indexer_extend_logits is None)
-        ):
-            raise RuntimeError("fixed-capacity workspace is missing indexer buffers")
-        if not q_fp8.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous q_fp8")
-        if not weights.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous weights")
-        if not k_quant.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous k_quant")
-        if not k_scale.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous k_scale")
-        if not k_start.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous k_start")
-        if not k_end.is_contiguous():
-            raise ValueError("workspace-backed indexer extend requires contiguous k_end")
-
-        q_rows_total = int(q_fp8.shape[0])
-        valid_q_rows = int(k_start.shape[0])
-        k_rows = int(k_quant.shape[0])
-        padded_k_rows = _align_up(max(k_rows, 1), _INDEXER_BLOCK_K)
-        if not preinitialize_invalid_logits and valid_q_rows != q_rows_total:
-            raise ValueError(
-                "preinitialize_invalid_logits=False requires all q rows to be valid; "
-                f"got q_rows={q_rows_total} and valid_q_rows={valid_q_rows}"
-            )
-
-        q_row_capacity = (
-            max(int(self.max_total_q), int(self.max_paged_q_rows))
-            if not requires_full_logits
-            else int(self.max_total_q)
-        )
-        if q_rows_total > q_row_capacity:
-            raise ValueError(
-                f"q rows {q_rows_total} exceed workspace indexer capacity {q_row_capacity}"
-            )
-        if padded_k_rows > self.indexer_k_quant_bytes.shape[0]:
-            raise ValueError(
-                f"k rows {k_rows} exceed workspace indexer capacity {self.indexer_k_quant_bytes.shape[0]}"
-            )
-        if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
-            raise ValueError(
-                "q_fp8 must have shape "
-                f"(q_rows, {self.indexer_num_q_heads}, {_INDEX_HEAD_DIM}), got {tuple(q_fp8.shape)}"
-            )
-        if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-            raise ValueError(
-                f"q_fp8 trailing dimension must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
-            )
-        if weights.ndim != 2 or weights.shape != (q_rows_total, self.indexer_num_q_heads):
-            raise ValueError(
-                "weights must have shape "
-                f"({q_rows_total}, {self.indexer_num_q_heads}), got {tuple(weights.shape)}"
-            )
-
-        q_bytes = q_fp8.view(torch.uint8)
-        q_u32 = q_bytes.view(torch.uint32).view(
-            q_rows_total,
-            int(self.indexer_num_q_heads),
-            _INDEX_HEAD_DIM // 4,
-        )
-
-        k_quant_bytes = k_quant.view(torch.uint8)
-        k_quant_aliases_workspace = (
-            k_quant_bytes.data_ptr() == self.indexer_k_quant_bytes.data_ptr()
-            and k_quant_bytes.storage_offset() == self.indexer_k_quant_bytes.storage_offset()
-        )
-        k_scale_aliases_workspace = (
-            k_scale.data_ptr() == self.indexer_k_scales.data_ptr()
-            and k_scale.storage_offset() == self.indexer_k_scales.storage_offset()
-        )
-        if k_quant_aliases_workspace:
-            k_quant_kernel = self.indexer_k_quant_bytes[:padded_k_rows]
-            k_scale_kernel = self.indexer_k_scales[:padded_k_rows]
-            if padded_k_rows > k_rows:
-                self.indexer_k_quant_bytes[k_rows:padded_k_rows].zero_()
-                self.indexer_k_scales[k_rows:padded_k_rows].zero_()
-        else:
-            if padded_k_rows != k_rows:
-                raise ValueError(
-                    "workspace-backed indexer extend requires pre-padded K/scale rows "
-                    "or workspace gather outputs; refusing an implicit pad copy"
-                )
-            k_quant_kernel = k_quant_bytes
-            k_scale_kernel = k_scale
-        if k_quant_aliases_workspace != k_scale_aliases_workspace:
-            raise ValueError(
-                "workspace-backed indexer extend requires k_quant and k_scale to either "
-                "both alias the workspace gather buffers or both use live storage"
-            )
-
-        if requires_full_logits:
-            assert self.indexer_extend_logits is not None
-            logits_view = self.indexer_extend_logits.narrow(0, 0, q_rows_total * k_rows).view(
-                q_rows_total, k_rows
-            )
-            if preinitialize_invalid_logits and q_rows_total != 0 and k_rows != 0:
-                logits_view.fill_(float("-inf"))
-        else:
-            if self.indexer_extend_tile_logits is None:
-                raise RuntimeError("fixed-capacity workspace is missing indexer tiled-logits buffer")
-            logits_view = self.indexer_extend_tile_logits.narrow(0, 0, 1).view(1, 1)
-        return {
-            "q_u32": q_u32,
-            "weights": weights,
-            "k_quant_bytes": k_quant_kernel,
-            "k_scales": k_scale_kernel,
-            "k_start": k_start,
-            "k_end": k_end,
-            "logits": logits_view,
-            "logits_view": logits_view,
-            "k_tma_desc_ptrs": self.indexer_k_tma_desc_ptrs if k_quant_aliases_workspace else None,
-            "k_tma_prefill_desc_ptrs": (
-                self.indexer_k_tma_prefill_desc_ptrs if k_quant_aliases_workspace else None
-            ),
-        }
-
-    def stage_indexer_paged_decode(
-        self,
-        *,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        real_page_table: torch.Tensor,
-        seqlens_per_query: torch.Tensor,
-        active_width: torch.Tensor,
-        schedule_metadata: torch.Tensor | None = None,
-        width_tokens: int,
-        preinitialize_invalid_logits: bool = True,
-    ) -> dict[str, torch.Tensor]:
-        if self.indexer_paged_logits is None:
-            raise RuntimeError("fixed-capacity workspace is missing paged indexer buffers")
-        if q_fp8.device != self.device:
-            raise ValueError(f"q_fp8 device {q_fp8.device} does not match workspace device {self.device}")
-        if weights.device != self.device:
-            raise ValueError(
-                f"weights device {weights.device} does not match workspace device {self.device}"
-            )
-        if real_page_table.device != self.device:
-            raise ValueError(
-                "real_page_table device "
-                f"{real_page_table.device} does not match workspace device {self.device}"
-            )
-        if seqlens_per_query.device != self.device:
-            raise ValueError(
-                "seqlens_per_query device "
-                f"{seqlens_per_query.device} does not match workspace device {self.device}"
-            )
-        if active_width.device != self.device:
-            raise ValueError(
-                f"active_width device {active_width.device} does not match workspace device {self.device}"
-            )
-        if not q_fp8.is_contiguous():
-            raise ValueError("workspace-backed paged decode requires contiguous q_fp8")
-        if not weights.is_contiguous():
-            raise ValueError("workspace-backed paged decode requires contiguous weights")
-        if not real_page_table.is_contiguous() and not self.use_cuda_graph:
-            raise ValueError("workspace-backed paged decode requires contiguous real_page_table")
-        if not seqlens_per_query.is_contiguous():
-            raise ValueError("workspace-backed paged decode requires contiguous seqlens_per_query")
-        if not active_width.is_contiguous():
-            raise ValueError("workspace-backed paged decode requires contiguous active_width")
-        if schedule_metadata is not None and not schedule_metadata.is_contiguous():
-            raise ValueError("workspace-backed paged decode requires contiguous schedule_metadata")
-
-        q_rows = int(q_fp8.shape[0])
-        width_tokens = int(width_tokens)
-        if q_rows > self.max_paged_q_rows:
-            raise ValueError(
-                f"q rows {q_rows} exceed workspace indexer paged capacity {self.max_paged_q_rows}"
-            )
-        if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
-            raise ValueError(
-                "q_fp8 must have shape "
-                f"(q_rows, {self.indexer_num_q_heads}, {_INDEX_HEAD_DIM}), got "
-                f"{tuple(q_fp8.shape)}"
-            )
-        if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-            raise ValueError(
-                f"q_fp8 trailing dimension must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
-            )
-        if weights.ndim != 2 or weights.shape != (q_rows, self.indexer_num_q_heads):
-            raise ValueError(
-                "weights must have shape "
-                f"({q_rows}, {self.indexer_num_q_heads}), got {tuple(weights.shape)}"
-            )
-        if real_page_table.ndim != 2:
-            raise ValueError(
-                f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}"
-            )
-        if real_page_table.shape[0] != q_rows:
-            raise ValueError(
-                f"real_page_table rows {real_page_table.shape[0]} do not match q rows {q_rows}"
-            )
-        if real_page_table.shape[1] > self.max_page_table_width:
-            raise ValueError(
-                "real_page_table width "
-                f"{real_page_table.shape[1]} exceeds workspace page-table capacity "
-                f"{self.max_page_table_width}"
-            )
-        if real_page_table.dtype != torch.int32:
-            raise ValueError(
-                f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
-            )
-        if seqlens_per_query.ndim != 1 or seqlens_per_query.shape[0] != q_rows:
-            raise ValueError(
-                "seqlens_per_query must be rank-1 with q_rows entries, got "
-                f"{tuple(seqlens_per_query.shape)} for q_rows={q_rows}"
-            )
-        if seqlens_per_query.dtype != torch.int32:
-            raise ValueError(
-                "seqlens_per_query must have dtype torch.int32, got "
-                f"{seqlens_per_query.dtype}"
-            )
-        if active_width.shape != (1,):
-            raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
-        if active_width.dtype != torch.int32:
-            raise ValueError(
-                f"active_width must have dtype torch.int32, got {active_width.dtype}"
-            )
-        if schedule_metadata is not None:
-            if schedule_metadata.device != self.device:
-                raise ValueError(
-                    "schedule_metadata device "
-                    f"{schedule_metadata.device} does not match workspace device {self.device}"
-                )
-            if schedule_metadata.ndim != 2 or schedule_metadata.shape[1] != 2:
-                raise ValueError(
-                    "schedule_metadata must have shape (num_sms + 1, 2), got "
-                    f"{tuple(schedule_metadata.shape)}"
-                )
-            if schedule_metadata.dtype != torch.int32:
-                raise ValueError(
-                    "schedule_metadata must have dtype torch.int32, got "
-                    f"{schedule_metadata.dtype}"
-                )
-        if width_tokens < 0:
-            raise ValueError(f"width_tokens must be non-negative, got {width_tokens}")
-        max_width_tokens = max(
-            int(self.indexer_paged_logits.numel()) // max(int(self.max_paged_q_rows), 1),
-            1,
-        )
-        if width_tokens > max_width_tokens:
-            raise ValueError(
-                f"width_tokens {width_tokens} exceed workspace logits capacity {max_width_tokens}"
-            )
-
-        q_bytes = q_fp8.view(torch.uint8)
-        logits_view = self.indexer_paged_logits.narrow(0, 0, q_rows * width_tokens).view(
-            q_rows, width_tokens
-        )
-        if preinitialize_invalid_logits and q_rows != 0 and width_tokens != 0:
-            logits_view.fill_(float("-inf"))
-        real_page_table_kernel = real_page_table
-        seqlens_per_query_kernel = seqlens_per_query
-        active_width_kernel = active_width
-        schedule_metadata_kernel = schedule_metadata
-        if self.use_cuda_graph and not real_page_table.is_contiguous():
-            self._allocate_paged_indexer_runtime_metadata()
-            assert self.paged_indexer_real_page_table_runtime is not None
-            rows, page_width = real_page_table.shape
-            page_table_target = self.paged_indexer_real_page_table_runtime[
-                :rows, :page_width
-            ]
-            page_table_target.copy_(real_page_table)
-            real_page_table_kernel = self.paged_indexer_real_page_table_runtime[
-                :rows, :page_width
-            ]
-        return {
-            "q_bytes": q_bytes,
-            "weights": weights,
-            "real_page_table": real_page_table_kernel,
-            "seqlens_per_query": seqlens_per_query_kernel,
-            "active_width": active_width_kernel,
-            "schedule_metadata": schedule_metadata_kernel,
-            "logits": logits_view,
-            "logits_view": logits_view,
-        }
-
-    def stage_indexer_paged_tiled_decode(
-        self,
-        *,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        real_page_table: torch.Tensor,
-        seqlens_per_query: torch.Tensor,
-        active_width: torch.Tensor,
-        width_tokens: int,
-        tile_logits: torch.Tensor,
-        tile_block_q: int,
-        tile_block_k: int,
-        preinitialize_tile_logits: bool = True,
-    ) -> dict[str, torch.Tensor]:
-        if self.indexer_extend_tile_logits is None:
-            raise RuntimeError("fixed-capacity workspace is missing paged tiled-indexer logits")
-        if q_fp8.device != self.device:
-            raise ValueError(f"q_fp8 device {q_fp8.device} does not match workspace device {self.device}")
-        if weights.device != self.device:
-            raise ValueError(
-                f"weights device {weights.device} does not match workspace device {self.device}"
-            )
-        if real_page_table.device != self.device:
-            raise ValueError(
-                "real_page_table device "
-                f"{real_page_table.device} does not match workspace device {self.device}"
-            )
-        if seqlens_per_query.device != self.device:
-            raise ValueError(
-                "seqlens_per_query device "
-                f"{seqlens_per_query.device} does not match workspace device {self.device}"
-            )
-        if active_width.device != self.device:
-            raise ValueError(
-                f"active_width device {active_width.device} does not match workspace device {self.device}"
-            )
-        if tile_logits.device != self.device:
-            raise ValueError(
-                f"tile_logits device {tile_logits.device} does not match workspace device {self.device}"
-            )
-        if not q_fp8.is_contiguous():
-            raise ValueError("workspace-backed paged tiled decode requires contiguous q_fp8")
-        if not weights.is_contiguous():
-            raise ValueError("workspace-backed paged tiled decode requires contiguous weights")
-        if not real_page_table.is_contiguous() and not self.use_cuda_graph:
-            raise ValueError("workspace-backed paged tiled decode requires contiguous real_page_table")
-        if not seqlens_per_query.is_contiguous():
-            raise ValueError("workspace-backed paged tiled decode requires contiguous seqlens_per_query")
-        if not active_width.is_contiguous():
-            raise ValueError("workspace-backed paged tiled decode requires contiguous active_width")
-        if tile_logits.dtype != torch.float32 or not tile_logits.is_contiguous():
-            raise ValueError("workspace-backed paged tiled decode requires contiguous float32 tile_logits")
-
-        q_rows = int(q_fp8.shape[0])
-        width_tokens = int(width_tokens)
-        tile_block_q = int(tile_block_q)
-        tile_block_k = int(tile_block_k)
-        if tile_block_q <= 0 or tile_block_k <= 0:
-            raise ValueError(
-                f"tile blocks must be positive, got block_q={tile_block_q}, block_k={tile_block_k}"
-            )
-        if tile_block_k != _PAGED_INDEXER_TILE_BLOCK_K:
-            raise ValueError(
-                f"paged tiled decode requires block_k={_PAGED_INDEXER_TILE_BLOCK_K}, got {tile_block_k}"
-            )
-        if width_tokens < 0:
-            raise ValueError(f"width_tokens must be non-negative, got {width_tokens}")
-        if width_tokens % tile_block_k != 0:
-            raise ValueError(
-                f"width_tokens {width_tokens} must be divisible by tile_block_k={tile_block_k}"
-            )
-        if q_rows > self.max_paged_q_rows:
-            raise ValueError(
-                f"q rows {q_rows} exceed workspace indexer paged capacity {self.max_paged_q_rows}"
-            )
-        if q_fp8.ndim != 3 or q_fp8.shape[1] != self.indexer_num_q_heads:
-            raise ValueError(
-                "q_fp8 must have shape "
-                f"(q_rows, {self.indexer_num_q_heads}, {_INDEX_HEAD_DIM}), got "
-                f"{tuple(q_fp8.shape)}"
-            )
-        if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-            raise ValueError(
-                f"q_fp8 trailing dimension must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
-            )
-        if weights.ndim != 2 or weights.shape != (q_rows, self.indexer_num_q_heads):
-            raise ValueError(
-                "weights must have shape "
-                f"({q_rows}, {self.indexer_num_q_heads}), got {tuple(weights.shape)}"
-            )
-        if real_page_table.ndim != 2:
-            raise ValueError(
-                f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}"
-            )
-        if real_page_table.shape[0] != q_rows:
-            raise ValueError(
-                f"real_page_table rows {real_page_table.shape[0]} do not match q rows {q_rows}"
-            )
-        if real_page_table.shape[1] > self.max_page_table_width:
-            raise ValueError(
-                "real_page_table width "
-                f"{real_page_table.shape[1]} exceeds workspace page-table capacity "
-                f"{self.max_page_table_width}"
-            )
-        if real_page_table.dtype != torch.int32:
-            raise ValueError(
-                f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
-            )
-        if seqlens_per_query.ndim != 1 or seqlens_per_query.shape[0] != q_rows:
-            raise ValueError(
-                "seqlens_per_query must be rank-1 with q_rows entries, got "
-                f"{tuple(seqlens_per_query.shape)} for q_rows={q_rows}"
-            )
-        if seqlens_per_query.dtype != torch.int32:
-            raise ValueError(
-                "seqlens_per_query must have dtype torch.int32, got "
-                f"{seqlens_per_query.dtype}"
-            )
-        if active_width.shape != (1,):
-            raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
-        if active_width.dtype != torch.int32:
-            raise ValueError(
-                f"active_width must have dtype torch.int32, got {active_width.dtype}"
-            )
-
-        num_q_tiles = (q_rows + tile_block_q - 1) // tile_block_q
-        num_k_tiles = width_tokens // tile_block_k
-        required_tile_logits = num_q_tiles * num_k_tiles * tile_block_q * tile_block_k
-        tile_logits_buffer = self.indexer_extend_tile_logits
-        if int(tile_logits_buffer.numel()) < required_tile_logits:
-            raise ValueError(
-                f"workspace paged tiled logits has {int(tile_logits_buffer.numel())} elements, "
-                f"expected at least {required_tile_logits}"
-            )
-        if int(tile_logits.numel()) < required_tile_logits:
-            raise ValueError(
-                f"tile_logits has {int(tile_logits.numel())} elements, expected at least "
-                f"{required_tile_logits}"
-            )
-        if (
-            tile_logits.data_ptr() != tile_logits_buffer.data_ptr()
-            or tile_logits.storage_offset() != tile_logits_buffer.storage_offset()
-        ):
-            raise ValueError(
-                "workspace-backed paged tiled decode requires tile_logits to alias "
-                "the fixed-capacity workspace buffer"
-            )
-
-        q_bytes = q_fp8.view(torch.uint8)
-        tile_logits_view = tile_logits_buffer.narrow(0, 0, required_tile_logits)
-        if preinitialize_tile_logits and required_tile_logits:
-            tile_logits_view.fill_(float("-inf"))
-
-        real_page_table_kernel = real_page_table
-        seqlens_per_query_kernel = seqlens_per_query
-        active_width_kernel = active_width
-        if self.use_cuda_graph:
-            self._allocate_paged_indexer_runtime_metadata()
-            assert self.paged_indexer_real_page_table_runtime is not None
-            assert self.paged_indexer_seqlens_per_query_runtime is not None
-            assert self.paged_indexer_active_width_runtime is not None
-            rows, page_width = real_page_table.shape
-            page_table_target = self.paged_indexer_real_page_table_runtime[
-                :rows, :page_width
-            ]
-            if (
-                page_table_target.data_ptr() != real_page_table.data_ptr()
-                or page_table_target.storage_offset() != real_page_table.storage_offset()
-            ):
-                page_table_target.copy_(real_page_table)
-            seqlens_target = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
-            if (
-                seqlens_target.data_ptr() != seqlens_per_query.data_ptr()
-                or seqlens_target.storage_offset() != seqlens_per_query.storage_offset()
-            ):
-                seqlens_target.copy_(seqlens_per_query)
-            use_active_width_cap = self.paged_indexer_active_width_cap is not None and (
-                self.paged_indexer_active_width_cap.data_ptr() == active_width.data_ptr()
-                and self.paged_indexer_active_width_cap.storage_offset()
-                == active_width.storage_offset()
-            )
-            if use_active_width_cap:
-                active_width_kernel = self.paged_indexer_active_width_cap
-            elif (
-                self.paged_indexer_active_width_runtime.data_ptr() != active_width.data_ptr()
-                or self.paged_indexer_active_width_runtime.storage_offset()
-                != active_width.storage_offset()
-            ):
-                self.paged_indexer_active_width_runtime.copy_(active_width)
-            real_page_table_kernel = self.paged_indexer_real_page_table_runtime[
-                :rows, :page_width
-            ]
-            seqlens_per_query_kernel = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
-            if not use_active_width_cap:
-                active_width_kernel = self.paged_indexer_active_width_runtime
-        return {
-            "q_bytes": q_bytes,
-            "weights": weights,
-            "real_page_table": real_page_table_kernel,
-            "seqlens_per_query": seqlens_per_query_kernel,
-            "active_width": active_width_kernel,
-            "tile_logits": tile_logits_buffer,
-            "tile_logits_view": tile_logits_view,
-        }
 
     def contract_kv_tensors_for(
         self,
@@ -3864,117 +2538,3 @@ class B12XAttentionWorkspace:
             )
         if self.ragged_kv_cache is not None:
             self._refresh_ragged_kv_contracts()
-        indexer_q_rows = max(int(self.max_total_q), int(self.max_paged_q_rows), 1)
-        self._contract_indexer_q_u32 = _shape_only_cuda_tensor(
-            (indexer_q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM // 4),
-            dtype=torch.uint32,
-            device=self.device,
-        )
-        self._contract_indexer_q_bytes = _shape_only_cuda_tensor(
-            (indexer_q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-        self._contract_indexer_weights = _shape_only_cuda_tensor(
-            (indexer_q_rows, self.indexer_num_q_heads),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        if self.indexer_k_quant_bytes is not None:
-            self._contract_indexer_k_quant = _shape_only_cuda_tensor(
-                tuple(int(dim) for dim in self.indexer_k_quant_bytes.shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-        if self.indexer_k_scales is not None:
-            self._contract_indexer_k_scale = _shape_only_cuda_tensor(
-                tuple(int(dim) for dim in self.indexer_k_scales.shape),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        self._contract_indexer_k_start = _shape_only_cuda_tensor(
-            (indexer_q_rows,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._contract_indexer_k_end = _shape_only_cuda_tensor(
-            (indexer_q_rows,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        if self.indexer_extend_logits is not None and self.indexer_k_quant_bytes is not None:
-            self._contract_indexer_logits = _shape_only_cuda_tensor(
-                (self.max_total_q, int(self.indexer_k_quant_bytes.shape[0])),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        if self.indexer_extend_tile_logits is not None:
-            self._contract_indexer_tile_logits = _shape_only_cuda_tensor(
-                tuple(int(dim) for dim in self.indexer_extend_tile_logits.shape),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        if self.indexer_extend_topk_values is not None:
-            self._contract_indexer_topk_values = _shape_only_cuda_tensor(
-                tuple(int(dim) for dim in self.indexer_extend_topk_values.shape),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        if self.indexer_extend_topk_indices is not None:
-            self._contract_indexer_topk_indices = _shape_only_cuda_tensor(
-                tuple(int(dim) for dim in self.indexer_extend_topk_indices.shape),
-                dtype=torch.int32,
-                device=self.device,
-            )
-        if self.indexer_paged_logits is not None or self.indexer_extend_tile_logits is not None:
-            paged_width_tokens = max(
-                int(self.indexer_paged_logits.numel())
-                // max(int(self.max_paged_q_rows), 1),
-                1,
-            ) if self.indexer_paged_logits is not None else (
-                int(self.max_page_table_width) * int(self.page_size)
-            )
-            self._contract_paged_indexer_q_bytes = _shape_only_cuda_tensor(
-                (self.max_paged_q_rows, self.indexer_num_q_heads, _INDEX_HEAD_DIM),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            self._contract_paged_indexer_weights = _shape_only_cuda_tensor(
-                (self.max_paged_q_rows, self.indexer_num_q_heads),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self._contract_paged_real_page_table = _shape_only_cuda_tensor(
-                (self.max_paged_q_rows, self.max_page_table_width),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self._contract_paged_indexer_cache_seqlens = _shape_only_cuda_tensor(
-                (self.max_paged_q_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self.indexer_paged_logits is not None:
-                self._contract_paged_indexer_logits = _shape_only_cuda_tensor(
-                    (self.max_paged_q_rows, paged_width_tokens),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-            if self.indexer_extend_tile_logits is not None:
-                self._contract_paged_indexer_tile_logits = _shape_only_cuda_tensor(
-                    tuple(int(dim) for dim in self.indexer_extend_tile_logits.shape),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-            if self.indexer_extend_topk_values is not None:
-                self._contract_paged_indexer_topk_values = _shape_only_cuda_tensor(
-                    tuple(int(dim) for dim in self.indexer_extend_topk_values.shape),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-            if self.indexer_extend_topk_indices is not None:
-                self._contract_paged_indexer_topk_indices = _shape_only_cuda_tensor(
-                    tuple(int(dim) for dim in self.indexer_extend_topk_indices.shape),
-                    dtype=torch.int32,
-                    device=self.device,
-                )

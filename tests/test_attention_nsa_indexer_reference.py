@@ -4,7 +4,7 @@ import torch
 
 from b12x.attention.indexer.reference import (
     pack_index_k_cache_reference,
-    extend_logits_reference,
+    contiguous_logits_reference,
     paged_decode_logits_reference,
     unpack_index_k_cache_reference,
 )
@@ -73,7 +73,7 @@ def _quantize_rows_to_kv_fp8(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return quant, scale.to(torch.float32)
 
 
-def _manual_extend_logits(
+def _manual_contiguous_logits(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -133,7 +133,7 @@ def _scalar_paged_logits_oracle(
     return out
 
 
-def _scalar_extend_logits_oracle(
+def _scalar_contiguous_logits_oracle(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -223,7 +223,7 @@ def test_paged_decode_logits_reference_matches_manual() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_extend_logits_reference_matches_manual() -> None:
+def test_contiguous_logits_reference_matches_manual() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_002)
@@ -240,14 +240,14 @@ def test_extend_logits_reference_matches_manual() -> None:
     k_start = torch.tensor([0, 4, 12, 40, 40], dtype=torch.int32, device=device)
     k_end = torch.tensor([8, 20, 20, 56, 40], dtype=torch.int32, device=device)
 
-    actual = extend_logits_reference(
+    actual = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
         k_start=k_start,
         k_end=k_end,
     )
-    expected = _manual_extend_logits(
+    expected = _manual_contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         k_matrix=kv_fp8[0].to(torch.float32) * kv_fp8[1].unsqueeze(1),
@@ -304,7 +304,7 @@ def test_paged_decode_logits_reference_matches_scalar_oracle_for_expanded_querie
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_extend_logits_reference_matches_scalar_oracle_for_clamped_ranges() -> None:
+def test_contiguous_logits_reference_matches_scalar_oracle_for_clamped_ranges() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_004)
@@ -322,14 +322,14 @@ def test_extend_logits_reference_matches_scalar_oracle_for_clamped_ranges() -> N
     k_start = torch.tensor([-3, 0, 7, 18], dtype=torch.int32, device=device)
     k_end = torch.tensor([2, 0, 99, 18], dtype=torch.int32, device=device)
 
-    actual = extend_logits_reference(
+    actual = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
         k_start=k_start,
         k_end=k_end,
     )
-    expected = _scalar_extend_logits_oracle(
+    expected = _scalar_contiguous_logits_oracle(
         q_fp8=q_fp8,
         weights=weights,
         k_dequant=k_dequant,

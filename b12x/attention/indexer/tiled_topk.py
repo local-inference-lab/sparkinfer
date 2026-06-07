@@ -43,7 +43,7 @@ _SUPPORTED_TOPK = (512, 1024, 2048)
 _RADIX = 256
 _SMEM_CANDS = 4096
 _SCAN_UNROLL = 4
-_SUPERTILE_K_ENV = "B12X_NSA_EXTEND_TOPK_SUPERTILE_K"
+_SUPERTILE_K_ENV = "B12X_NSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
 
 
@@ -263,19 +263,6 @@ def _flat_tensor_meta_key(tensor):
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
-
-
-def _contract_tensor(
-    contract_phantoms: dict[str, torch.Tensor] | None,
-    *names: str,
-    fallback: torch.Tensor,
-) -> torch.Tensor:
-    if contract_phantoms is not None:
-        for name in names:
-            tensor = contract_phantoms.get(name)
-            if tensor is not None:
-                return tensor
-    return fallback
 
 
 class SparseNSATiledTopkKernel:
@@ -946,7 +933,6 @@ def run_tiled_topk(
     carry_values: torch.Tensor | None = None,
     carry_indices: torch.Tensor | None = None,
     is_first: bool = True,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk = _validate_supported_topk(topk, caller="run_tiled_topk")
     if k_end is None and lengths is None:
@@ -1068,53 +1054,15 @@ def run_tiled_topk(
     kernel = _build_tiled_topk_kernel(
         block_q, block_k, topk, bool(zero_row_start), bool(is_first)
     )
-    input_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "tile_logits",
-        "extend_tile_logits",
-        fallback=tile_logits,
-    )
-    lengths_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "lengths",
-        "seqlens_per_query",
-        "extend_lengths",
-        "extend_k_end",
-        fallback=lengths,
-    )
-    row_start_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "row_starts",
-        "k_start",
-        "extend_k_start",
-        fallback=k_start,
-    )
+    input_key_tensor = tile_logits
+    lengths_key_tensor = lengths
+    row_start_key_tensor = k_start
     if zero_row_start:
         row_start_key_tensor = lengths_key_tensor
-    values_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "topk_values",
-        "extend_topk_values",
-        fallback=topk_values,
-    )
-    indices_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "topk_indices",
-        "extend_topk_indices",
-        fallback=topk_indices,
-    )
-    carry_values_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "carry_values",
-        "extend_carry_values",
-        fallback=carry_values,
-    )
-    carry_indices_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "carry_indices",
-        "extend_carry_indices",
-        fallback=carry_indices,
-    )
+    values_key_tensor = topk_values
+    indices_key_tensor = topk_indices
+    carry_values_key_tensor = carry_values
+    carry_indices_key_tensor = carry_indices
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_start, cutlass.Int32, assumed_align=4),
@@ -1186,7 +1134,6 @@ def run_row_topk(
     output_values: torch.Tensor | None = None,
     output_indices: torch.Tensor | None = None,
     output_index_offset: int = 0,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact row-wise topk over a dense row-major logits tile."""
     topk = _validate_supported_topk(topk, caller="run_row_topk")
@@ -1254,43 +1201,12 @@ def run_row_topk(
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
     kernel = _build_row_topk_kernel(topk)
-    input_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "logits",
-        "extend_logits",
-        fallback=row_logits,
-    )
-    lengths_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "lengths",
-        "seqlens_per_query",
-        "extend_lengths",
-        fallback=lengths,
-    )
-    values_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "topk_values",
-        "extend_topk_values",
-        fallback=topk_values,
-    )
-    indices_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "topk_indices",
-        "extend_topk_indices",
-        fallback=topk_indices,
-    )
-    carry_values_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "carry_values",
-        "extend_carry_values",
-        fallback=carry_values,
-    )
-    carry_indices_key_tensor = _contract_tensor(
-        contract_phantoms,
-        "carry_indices",
-        "extend_carry_indices",
-        fallback=carry_indices,
-    )
+    input_key_tensor = row_logits
+    lengths_key_tensor = lengths
+    values_key_tensor = topk_values
+    indices_key_tensor = topk_indices
+    carry_values_key_tensor = carry_values
+    carry_indices_key_tensor = carry_indices
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),

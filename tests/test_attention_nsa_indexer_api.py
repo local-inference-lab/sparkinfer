@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 
 import pytest
 import torch
@@ -10,24 +11,30 @@ from b12x.attention.indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
     run_paged_tiled_logits_kernel,
-    run_paged_windowed_tiled_logits_kernel,
+    run_paged_supertile_logits_kernel,
 )
 from b12x.attention.indexer.tiled_topk import run_row_topk
 from b12x.attention.indexer.reference import (
-    extend_logits_reference,
+    contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.integration.indexer import (
-    IndexerExtendMetadata,
-    IndexerPagedDecodeMetadata,
+from b12x.attention.indexer import (
+    IndexerContiguousMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
-    resolve_extend_prefill_block_k,
+    resolve_contiguous_prefill_block_k,
     paged_decode_logits,
-    extend_logits,
-    extend_tiled_topk,
+    contiguous_logits,
+    contiguous_tiled_topk,
     uses_paged_mqa_schedule,
+)
+from b12x.attention.indexer.scratch import (
+    B12XIndexerContiguousScratchCaps,
+    B12XIndexerPagedScratchCaps,
+    INDEXER_PAGED_ROUTE_TILED,
+    plan_indexer_contiguous_scratch,
+    plan_indexer_paged_scratch,
 )
 from b12x.cute.compiler import clear_compile_cache, compile_cache_info
 
@@ -75,6 +82,82 @@ def _quantize_rows_to_kv_fp8(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 
 def _assert_logits_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def _one_scratch(plan):
+    (spec,) = plan.scratch_specs()
+    return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+
+
+def _bind_paged_decode(
+    *,
+    real_page_table: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    num_q_heads: int,
+    schedule_metadata: torch.Tensor | None = None,
+    active_width: torch.Tensor | None = None,
+    topk: int = 1,
+):
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device=real_page_table.device,
+            num_q_heads=int(num_q_heads),
+            max_q_rows=int(real_page_table.shape[0]),
+            max_page_table_width=int(real_page_table.shape[1]),
+            topk=int(topk),
+            reserve_paged_logits=False,
+            route=INDEXER_PAGED_ROUTE_TILED,
+        )
+    )
+    return plan.bind(
+        scratch=_one_scratch(plan),
+        real_page_table=real_page_table,
+        cache_seqlens_int32=cache_seqlens_int32,
+        active_width=active_width,
+        schedule_metadata=schedule_metadata,
+        expected_num_q_heads=int(num_q_heads),
+    )
+
+
+def _bind_contiguous_topk(
+    *,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    num_q_heads: int,
+    topk: int,
+    q_rows: int | None = None,
+    supertile_k: int = 32768,
+    strict: bool = True,
+):
+    k_quant, k_scale = kv_fp8
+    max_q_rows = int(q_rows) if q_rows is not None else int(k_start.shape[0])
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
+            device=k_quant.device,
+            num_q_heads=int(num_q_heads),
+            max_q_rows=max_q_rows,
+            max_k_rows=int(k_quant.shape[0]),
+            topk=int(topk),
+            supertile_k=int(supertile_k),
+        )
+    )
+    binding = plan.bind(
+        scratch=_one_scratch(plan),
+        k_start=k_start,
+        k_end=k_end,
+        gather_rows=int(k_quant.shape[0]),
+        topk=int(topk),
+    )
+    scratch = binding.scratch
+    scratch.k_quant[: int(k_quant.shape[0])].copy_(k_quant)
+    scratch.k_scale[: int(k_scale.shape[0])].copy_(k_scale)
+    if not strict:
+        binding = replace(binding, strict=False)
+    return binding, (
+        scratch.k_quant[: int(k_quant.shape[0])],
+        scratch.k_scale[: int(k_scale.shape[0])],
+    )
 
 
 def _paged_mqa_schedule_reference(
@@ -138,9 +221,9 @@ def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
     assert scale_bytes[1, 2, 0].item() == index_k_cache[1, data_bytes + 2 * 4].item()
 
 
-def test_extend_prefill512_policy_allows_padded_k_rows() -> None:
+def test_contiguous_prefill512_policy_allows_padded_k_rows() -> None:
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=1536,
             k_rows=5001,
             num_heads=32,
@@ -149,14 +232,14 @@ def test_extend_prefill512_policy_allows_padded_k_rows() -> None:
     )
 
 
-def test_paged_nsa_glm_front_door_does_not_expose_c4_window_contract() -> None:
+def test_paged_nsa_glm_front_door_does_not_expose_paged_window_contract() -> None:
     glm_params = inspect.signature(run_paged_tiled_logits_kernel).parameters
-    c4_params = inspect.signature(run_paged_windowed_tiled_logits_kernel).parameters
+    paged_params = inspect.signature(run_paged_supertile_logits_kernel).parameters
 
     assert "source_page_offset" not in glm_params
     assert "output_width_tokens" not in glm_params
-    assert "source_page_offset" in c4_params
-    assert "output_width_tokens" in c4_params
+    assert "source_page_offset" in paged_params
+    assert "output_width_tokens" in paged_params
 
 
 def test_build_paged_mqa_schedule_metadata_matches_deepgemm_partitioning() -> None:
@@ -187,14 +270,14 @@ def test_uses_paged_mqa_schedule_only_for_long_rows() -> None:
     assert uses_paged_mqa_schedule(q_rows=8, max_pages=2048)
 
 
-def test_sparse_nsa_extend_prefill_block_k_auto_targets_long_bs1_prefill(
+def test_sparse_nsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", raising=False)
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", raising=False)
 
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
             k_rows=65536,
             num_heads=32,
@@ -202,7 +285,7 @@ def test_sparse_nsa_extend_prefill_block_k_auto_targets_long_bs1_prefill(
         == 512
     )
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=512,
             k_rows=65536,
             num_heads=64,
@@ -210,7 +293,7 @@ def test_sparse_nsa_extend_prefill_block_k_auto_targets_long_bs1_prefill(
         == 256
     )
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=128,
             k_rows=65536,
             num_heads=64,
@@ -219,11 +302,11 @@ def test_sparse_nsa_extend_prefill_block_k_auto_targets_long_bs1_prefill(
     )
 
 
-def test_sparse_nsa_extend_prefill_block_k_env_overrides(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "256")
+def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "256")
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
             k_rows=65536,
             num_heads=32,
@@ -231,9 +314,9 @@ def test_sparse_nsa_extend_prefill_block_k_env_overrides(monkeypatch) -> None:
         == 256
     )
 
-    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "512")
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
     assert (
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
             k_rows=65536,
             num_heads=32,
@@ -241,15 +324,15 @@ def test_sparse_nsa_extend_prefill_block_k_env_overrides(monkeypatch) -> None:
         == 512
     )
     with pytest.raises(ValueError, match="unsupported"):
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=512,
             k_rows=65536,
             num_heads=64,
         )
 
-    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "bad")
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "bad")
     with pytest.raises(ValueError, match="auto, 256, or 512"):
-        resolve_extend_prefill_block_k(
+        resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
             k_rows=65536,
             num_heads=64,
@@ -292,20 +375,19 @@ def test_paged_decode_logits_cpu_hard_fails_without_fallback() -> None:
         / 3
     )
 
-    with pytest.raises(
-        NotImplementedError, match="refusing to run the reference fallback"
-    ):
+    binding = _bind_paged_decode(
+        real_page_table=real_page_table,
+        cache_seqlens_int32=seqlens,
+        num_q_heads=num_heads,
+        schedule_metadata=build_paged_mqa_schedule_metadata(seqlens, 64, 8),
+    )
+
+    with pytest.raises(NotImplementedError, match="refusing to run the reference fallback"):
         paged_decode_logits(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=IndexerPagedDecodeMetadata(
-                real_page_table=real_page_table,
-                cache_seqlens_int32=seqlens,
-                paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
-                    seqlens, 64, 8
-                ),
-            ),
+            binding=binding,
         )
 
 
@@ -344,17 +426,18 @@ def test_paged_decode_logits_cuda_kernel_matches_reference() -> None:
         / 3
     )
 
+    binding = _bind_paged_decode(
+        real_page_table=real_page_table,
+        cache_seqlens_int32=seqlens,
+        num_q_heads=num_heads,
+        schedule_metadata=build_paged_mqa_schedule_metadata(seqlens, 64, 8),
+    )
+
     actual = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=IndexerPagedDecodeMetadata(
-            real_page_table=real_page_table,
-            cache_seqlens_int32=seqlens,
-            paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
-                seqlens, 64, 8
-            ),
-        ),
+        binding=binding,
     )
     expected = paged_decode_logits_reference(
         q_fp8=q_fp8,
@@ -405,17 +488,18 @@ def test_paged_decode_logits_cuda_schedule_kernel_matches_reference() -> None:
         / 3
     )
 
+    binding = _bind_paged_decode(
+        real_page_table=real_page_table,
+        cache_seqlens_int32=seqlens,
+        num_q_heads=num_heads,
+        schedule_metadata=build_paged_mqa_schedule_metadata(seqlens, 64, 8),
+    )
+
     actual = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=IndexerPagedDecodeMetadata(
-            real_page_table=real_page_table,
-            cache_seqlens_int32=seqlens,
-            paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
-                seqlens, 64, 8
-            ),
-        ),
+        binding=binding,
     )
     expected = paged_decode_logits_reference(
         q_fp8=q_fp8,
@@ -481,18 +565,24 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
     )
     graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
     graph_schedule_metadata = torch.empty((9, 2), dtype=torch.int32, device=device)
+    graph_active_width = torch.empty((1,), dtype=torch.int32, device=device)
 
     def prepare(page_table: torch.Tensor, seqlens: torch.Tensor) -> None:
         graph_real_page_table[:, :live_width_blocks].copy_(page_table)
         graph_seqlens.copy_(seqlens)
+        graph_active_width.copy_(
+            torch.clamp(graph_seqlens.amax().reshape(1), min=0, max=graph_width_blocks * 64)
+        )
         build_paged_mqa_schedule_metadata(
             graph_seqlens, 64, 8, out=graph_schedule_metadata
         )
 
-    metadata = IndexerPagedDecodeMetadata(
+    binding = _bind_paged_decode(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
-        paged_mqa_schedule_metadata=graph_schedule_metadata,
+        num_q_heads=num_heads,
+        schedule_metadata=graph_schedule_metadata,
+        active_width=graph_active_width,
     )
 
     clear_indexer_caches()
@@ -504,7 +594,7 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
+        binding=binding,
     )
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
@@ -513,7 +603,7 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
+            binding=binding,
         )
     graph.replay()
     torch.cuda.synchronize(device)
@@ -551,7 +641,7 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
     [torch.device("cpu")]
     + ([torch.device("cuda")] if torch.cuda.is_available() else []),
 )
-def test_extend_logits_matches_reference(device: torch.device) -> None:
+def test_contiguous_logits_matches_reference(device: torch.device) -> None:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(72_103)
 
@@ -575,16 +665,16 @@ def test_extend_logits_matches_reference(device: torch.device) -> None:
     k_start = torch.tensor([0, 5, 12, 12, 40], dtype=torch.int32, device=device)
     k_end = torch.tensor([8, 16, 20, 12, 55], dtype=torch.int32, device=device)
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -601,7 +691,7 @@ def test_extend_logits_matches_reference(device: torch.device) -> None:
     [torch.device("cpu")]
     + ([torch.device("cuda")] if torch.cuda.is_available() else []),
 )
-def test_extend_logits_matches_reference_for_sparse_tile_ranges(
+def test_contiguous_logits_matches_reference_for_sparse_tile_ranges(
     device: torch.device,
 ) -> None:
     gen = torch.Generator(device="cpu")
@@ -627,16 +717,16 @@ def test_extend_logits_matches_reference_for_sparse_tile_ranges(
     k_start = torch.tensor(([0] * 32) + ([128] * 8), dtype=torch.int32, device=device)
     k_end = torch.tensor(([32] * 32) + ([130] * 8), dtype=torch.int32, device=device)
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -650,10 +740,10 @@ def test_extend_logits_matches_reference_for_sparse_tile_ranges(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage"
+    not torch.cuda.is_available(), reason="CUDA required for contiguous kernel coverage"
 )
 @pytest.mark.parametrize("num_heads", [16, 32, 64])
-def test_extend_logits_cuda_matches_reference_for_large_head_counts(
+def test_contiguous_logits_cuda_matches_reference_for_large_head_counts(
     num_heads: int,
 ) -> None:
     device = torch.device("cuda")
@@ -687,16 +777,16 @@ def test_extend_logits_cuda_matches_reference_for_large_head_counts(
         device=device,
     )
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -712,7 +802,7 @@ def test_extend_logits_cuda_matches_reference_for_large_head_counts(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage"
+    not torch.cuda.is_available(), reason="CUDA required for contiguous kernel coverage"
 )
 @pytest.mark.parametrize(
     "q_rows, k_rows",
@@ -722,7 +812,7 @@ def test_extend_logits_cuda_matches_reference_for_large_head_counts(
         (1024, 3072),  # many Q-tiles, mid-length K.
     ],
 )
-def test_extend_logits_cuda_matches_reference_for_long_prefill(
+def test_contiguous_logits_cuda_matches_reference_for_long_prefill(
     q_rows: int, k_rows: int
 ) -> None:
     device = torch.device("cuda")
@@ -751,26 +841,26 @@ def test_extend_logits_cuda_matches_reference_for_long_prefill(
     k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
     k_end = torch.clamp(positions + 1, max=k_rows).to(torch.int32)
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
     )
-    actual_no_fill = extend_logits(
+    actual_no_fill = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
         preinitialize_invalid_logits=False,
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -794,7 +884,7 @@ def test_extend_logits_cuda_matches_reference_for_long_prefill(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage"
+    not torch.cuda.is_available(), reason="CUDA required for contiguous kernel coverage"
 )
 @pytest.mark.parametrize(
     "q_rows, k_rows",
@@ -803,7 +893,7 @@ def test_extend_logits_cuda_matches_reference_for_long_prefill(
         (256, 8192),  # well past it — exercises full K-grid scaling.
     ],
 )
-def test_extend_logits_cuda_matches_reference_for_dense_long_prefill(
+def test_contiguous_logits_cuda_matches_reference_for_dense_long_prefill(
     q_rows: int, k_rows: int
 ) -> None:
     """Dense (non-causal) long-K prefill: every q row sees every k row.
@@ -834,13 +924,13 @@ def test_extend_logits_cuda_matches_reference_for_dense_long_prefill(
     k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
     k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
+        metadata=IndexerContiguousMetadata(k_start=k_start, k_end=k_end),
     )
-    expected = extend_logits_reference(
+    expected = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -853,7 +943,7 @@ def test_extend_logits_cuda_matches_reference_for_dense_long_prefill(
     assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
 
 
-def test_extend_tiled_topk_cpu_matches_reference() -> None:
+def test_contiguous_tiled_topk_cpu_matches_reference() -> None:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(72_610)
 
@@ -869,20 +959,24 @@ def test_extend_tiled_topk_cpu_matches_reference() -> None:
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
     k_start = torch.tensor([0, 2, 7, 16], dtype=torch.int32)
     k_end = torch.tensor([9, 12, 17, 17], dtype=torch.int32)
-    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
-    lengths = torch.empty((q_rows,), dtype=torch.int32)
-    output_indices = torch.empty((q_rows, topk), dtype=torch.int32)
+    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+    binding, bound_kv_fp8 = _bind_contiguous_topk(
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+        num_q_heads=num_heads,
+        topk=topk,
+        q_rows=q_rows,
+        strict=False,
+    )
 
-    actual = extend_tiled_topk(
+    actual = contiguous_tiled_topk(
         q_fp8=q_fp8,
         weights=weights,
-        kv_fp8=kv_fp8,
-        metadata=metadata,
-        topk=topk,
-        lengths=lengths,
-        output_indices=output_indices,
+        kv_fp8=bound_kv_fp8,
+        binding=binding,
     )
-    logits = extend_logits(
+    logits = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -896,16 +990,18 @@ def test_extend_tiled_topk_cpu_matches_reference() -> None:
         torch.full_like(topk_pos, -1, dtype=torch.int32),
     )
 
-    assert actual.data_ptr() == output_indices.data_ptr()
+    assert binding.output_indices is not None
+    assert binding.lengths is not None
+    assert actual.data_ptr() == binding.output_indices.data_ptr()
     assert torch.equal(actual, expected)
-    assert torch.equal(lengths, k_end - k_start)
+    assert torch.equal(binding.lengths[:q_rows], k_end - k_start)
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
 )
-def test_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "3072")
+def test_contiguous_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "3072")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -931,16 +1027,24 @@ def test_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
     k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
     k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
-    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
+    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+    binding, bound_kv_fp8 = _bind_contiguous_topk(
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+        num_q_heads=num_heads,
+        topk=topk,
+        q_rows=q_rows,
+        supertile_k=3072,
+    )
 
-    actual = extend_tiled_topk(
+    actual = contiguous_tiled_topk(
         q_fp8=q_fp8,
         weights=weights,
-        kv_fp8=kv_fp8,
-        metadata=metadata,
-        topk=topk,
+        kv_fp8=bound_kv_fp8,
+        binding=binding,
     )
-    logits = extend_logits(
+    logits = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -961,11 +1065,11 @@ def test_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
 )
-def test_extend_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
+def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     # Force >= 3 supertile chunks so the fold exercises the middle (is_first=False)
     # kernel specialization and the full carry ping-pong (not just the 2-chunk
     # first+last pair). k_rows / supertile_k = 5 chunks regardless of block_k.
-    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "2048")
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "2048")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -995,16 +1099,24 @@ def test_extend_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     k_end = torch.randint(
         topk + 1, k_rows + 1, (q_rows,), generator=gen, dtype=torch.int32
     ).to(device=device)
-    metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
+    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+    binding, bound_kv_fp8 = _bind_contiguous_topk(
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+        num_q_heads=num_heads,
+        topk=topk,
+        q_rows=q_rows,
+        supertile_k=2048,
+    )
 
-    actual = extend_tiled_topk(
+    actual = contiguous_tiled_topk(
         q_fp8=q_fp8,
         weights=weights,
-        kv_fp8=kv_fp8,
-        metadata=metadata,
-        topk=topk,
+        kv_fp8=bound_kv_fp8,
+        binding=binding,
     )
-    logits = extend_logits(
+    logits = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -1033,11 +1145,11 @@ def test_extend_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     not torch.cuda.is_available(),
     reason="CUDA required for indexer compile-cache coverage",
 )
-def test_extend_tiled_topk_live_rows_do_not_resolve_new_kernel(
+def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setenv("B12X_CUTE_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
-    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768")
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "32768")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1067,31 +1179,38 @@ def test_extend_tiled_topk_live_rows_do_not_resolve_new_kernel(
         kv_fp8 = _quantize_rows_to_kv_fp8(k)
         k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
         k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
-        metadata = IndexerExtendMetadata(k_start=k_start, k_end=k_end)
-        return q_fp8, weights, kv_fp8, metadata
+        metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+        binding, bound_kv_fp8 = _bind_contiguous_topk(
+            kv_fp8=kv_fp8,
+            k_start=k_start,
+            k_end=k_end,
+            num_q_heads=num_heads,
+            topk=topk,
+            q_rows=q_rows,
+            supertile_k=32768,
+        )
+        return q_fp8, weights, bound_kv_fp8, binding, metadata
 
-    warm_q, warm_weights, warm_kv, warm_metadata = make_inputs(2048, 4096)
-    extend_tiled_topk(
+    warm_q, warm_weights, warm_kv, warm_binding, _ = make_inputs(2048, 4096)
+    contiguous_tiled_topk(
         q_fp8=warm_q,
         weights=warm_weights,
         kv_fp8=warm_kv,
-        metadata=warm_metadata,
-        topk=topk,
+        binding=warm_binding,
     )
     torch.cuda.synchronize(device)
     warm_misses = compile_cache_info()["compile_misses"]
 
-    live_q, live_weights, live_kv, live_metadata = make_inputs(1536, 5001)
+    live_q, live_weights, live_kv, live_binding, _ = make_inputs(1536, 5001)
     freeze_kernel_resolution(
-        "indexer extend live rows and padded K rows should be runtime"
+        "indexer contiguous live rows and padded K rows should be runtime"
     )
     try:
-        actual = extend_tiled_topk(
+        actual = contiguous_tiled_topk(
             q_fp8=live_q,
             weights=live_weights,
             kv_fp8=live_kv,
-            metadata=live_metadata,
-            topk=topk,
+            binding=live_binding,
         )
         torch.cuda.synchronize(device)
     finally:
@@ -1163,8 +1282,8 @@ def test_row_topk_live_rows_do_not_resolve_new_kernel(
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage"
 )
-def test_extend_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "512")
+def test_contiguous_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1202,11 +1321,11 @@ def test_extend_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
         k_start[q_idx] = start
         k_end[q_idx] = end
 
-    actual = extend_logits(
+    actual = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
+        metadata=IndexerContiguousMetadata(k_start=k_start, k_end=k_end),
     )
     torch.cuda.synchronize(device)
 

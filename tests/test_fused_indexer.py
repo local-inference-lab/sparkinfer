@@ -1,4 +1,4 @@
-"""Parity tests for the unified fused indexer kernel (score + top-k, C4 path).
+"""Parity tests for the unified fused indexer kernel (score + top-k, paged path).
 
 The fused kernel scores q·k via the paged mxfp8 MMA and selects the row-wise
 top-k in one launch (no global logits blob). Golden = the exact scorer math
@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from b12x.attention.indexer.fused_indexer import (
-    run_fused_indexer_c4,
+    run_fused_paged_indexer,
     run_fused_indexer_mla,
 )
 
@@ -50,7 +50,7 @@ def _golden_topk(q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("rows,seqlen", [(1, 4096), (2, 4096), (4, 8192)])
-def test_fused_indexer_c4_matches_reference(topk, rows, seqlen, monkeypatch):
+def test_fused_indexer_paged_matches_reference(topk, rows, seqlen, monkeypatch):
     if seqlen <= topk:
         seqlen = topk * 2  # ensure the radix path (not just no-selection copy) engages
     device = torch.device("cuda")
@@ -58,7 +58,7 @@ def test_fused_indexer_c4_matches_reference(topk, rows, seqlen, monkeypatch):
     q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
         rows, heads, seqlen, topk, seed=7, device=device
     )
-    idx, val = run_fused_indexer_c4(
+    idx, val = run_fused_paged_indexer(
         q_bytes=q_fp8.view(torch.uint8),
         weights=weights,
         k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
@@ -85,7 +85,7 @@ def test_fused_indexer_c4_matches_reference(topk, rows, seqlen, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("seqlen", [4101, 8255, 5377])
-def test_fused_indexer_c4_partial_last_page(seqlen):
+def test_fused_indexer_paged_partial_last_page(seqlen):
     # seqlen % 64 != 0 -> the last page is partial (valid_slots < 64). Exercises
     # the masked-tail path (no partial-logits pre-zero must still be exact).
     device = torch.device("cuda")
@@ -93,7 +93,7 @@ def test_fused_indexer_c4_partial_last_page(seqlen):
     q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
         rows, heads, seqlen, topk, seed=23, device=device
     )
-    idx, val = run_fused_indexer_c4(
+    idx, val = run_fused_paged_indexer(
         q_bytes=q_fp8.view(torch.uint8), weights=weights,
         k_quant_bytes=k_fp8.view(torch.uint8).contiguous(), k_scales=k_scales,
         real_page_table=page_table, seqlens=seqlens, num_heads=heads, topk=topk,
@@ -109,14 +109,14 @@ def test_fused_indexer_c4_partial_last_page(seqlen):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
-def test_fused_indexer_c4_short_context_no_radix():
+def test_fused_indexer_paged_short_context_no_radix():
     # seqlen <= topk: every token is selected (the no-selection fold path).
     device = torch.device("cuda")
     rows, heads, topk, seqlen = 2, 16, 512, 64
     q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
         rows, heads, seqlen, topk, seed=11, device=device
     )
-    idx, val = run_fused_indexer_c4(
+    idx, val = run_fused_paged_indexer(
         q_bytes=q_fp8.view(torch.uint8),
         weights=weights,
         k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
@@ -136,7 +136,7 @@ def test_fused_indexer_c4_short_context_no_radix():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("ctas_per_group", [96, 188])
-def test_fused_indexer_c4_long_context_merge_exact(ctas_per_group):
+def test_fused_indexer_paged_long_context_merge_exact(ctas_per_group):
     # Long context + many CTAs stresses the in-kernel last-CTA merge: each CTA's
     # local top-k is a cluster of high values, so the merged radix threshold bin
     # is the worst case for the bounded SMEM candidate buffer. Must stay exact.
@@ -145,7 +145,7 @@ def test_fused_indexer_c4_long_context_merge_exact(ctas_per_group):
     q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
         rows, heads, seqlen, topk, seed=3, device=device
     )
-    idx, val = run_fused_indexer_c4(
+    idx, val = run_fused_paged_indexer(
         q_bytes=q_fp8.view(torch.uint8),
         weights=weights,
         k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),

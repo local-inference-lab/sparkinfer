@@ -7,11 +7,11 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x.attention.workspace import (
-    _ARENA_ALIGN_BYTES,
-    _align_up,
-    _dtype_nbytes,
-    _materialize_arena_view,
+from b12x.integration.scratch_layout import (
+    SCRATCH_ALIGN_BYTES,
+    align_up,
+    dtype_nbytes,
+    materialize_scratch_view,
 )
 from b12x.integration.scratch import (
     B12XScratchBufferSpec,
@@ -247,7 +247,7 @@ class B12XMHCScratchPlan:
         )
         max_tokens = int(self.caps.max_tokens)
         split_k = int(self.caps.split_k)
-        partials, _ = _materialize_arena_view(
+        partials, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=self.layout.partials_offset_bytes,
             shape=(max_tokens, split_k, MHC_PARTIALS),
@@ -448,8 +448,8 @@ def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
 
     def reserve(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[int, int]:
         nonlocal cursor
-        offset = _align_up(cursor, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
-        cursor = offset + _shape_numel(shape) * _dtype_nbytes(dtype)
+        offset = align_up(cursor, max(SCRATCH_ALIGN_BYTES, dtype_nbytes(dtype)))
+        cursor = offset + _shape_numel(shape) * dtype_nbytes(dtype)
         return offset, cursor
 
     partials_offset_bytes, _ = reserve(

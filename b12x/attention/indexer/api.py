@@ -1,4 +1,4 @@
-"""NSA indexer API for paged and extend logits contracts."""
+"""NSA indexer API for paged and contiguous logits contracts."""
 
 from __future__ import annotations
 
@@ -16,17 +16,17 @@ from .kernel import (
     run_paged_logits_kernel,
     supports_paged_logits_kernel,
 )
-from .extend_kernel import (
+from .contiguous_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_K,
     _PREFILL_BLOCK_Q,
-    build_indexer_extend_logits_kernel_binding,
-    resolve_extend_prefill_block_k,
-    run_extend_logits_kernel,
-    supports_extend_logits_kernel,
+    build_indexer_contiguous_logits_kernel_binding,
+    resolve_contiguous_prefill_block_k,
+    run_contiguous_logits_kernel,
+    supports_contiguous_logits_kernel,
 )
-from .reference import extend_logits_reference
+from .reference import contiguous_logits_reference
 from .schedule_metadata import (
     build_paged_mqa_schedule_metadata_torch,
     build_paged_mqa_schedule_metadata_triton,
@@ -55,7 +55,7 @@ class IndexerPagedDecodeMetadata:
 
 
 @dataclass(frozen=True)
-class IndexerExtendMetadata:
+class IndexerContiguousMetadata:
     k_start: torch.Tensor
     k_end: torch.Tensor
 
@@ -170,7 +170,7 @@ def _normalize_weights(
         raise ValueError(f"weights shape must be {(q_rows, num_heads)}, got {tuple(weights.shape)}")
     if require_float32 and weights.dtype != torch.float32:
         raise ValueError(
-            f"strict indexer extend requires torch.float32 weights, got {weights.dtype}"
+            f"strict indexer contiguous requires torch.float32 weights, got {weights.dtype}"
         )
     return weights.to(torch.float32)
 
@@ -284,8 +284,6 @@ def paged_decode_logits(
     index_k_cache: torch.Tensor,
     metadata: IndexerPagedDecodeMetadata | None = None,
     page_size: int = 64,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     preinitialize_invalid_logits: bool = True,
     active_width_override: torch.Tensor | None = None,
     binding=None,
@@ -295,7 +293,6 @@ def paged_decode_logits(
             name
             for name, value in (
                 ("metadata", metadata),
-                ("workspace", workspace),
                 ("active_width_override", active_width_override),
             )
             if value is not None
@@ -306,7 +303,6 @@ def paged_decode_logits(
                 f"do not also pass {', '.join(extras)}"
             )
         metadata = binding.metadata
-        workspace = binding.scratch
         active_width_override = binding.active_width
     if metadata is None:
         raise TypeError("paged_decode_logits requires metadata or binding")
@@ -330,19 +326,7 @@ def paged_decode_logits(
             device=q_fp8.device,
         )
 
-    if workspace is not None:
-        if not metadata.cache_seqlens_int32.is_contiguous():
-            raise ValueError(
-                "workspace-backed paged decode requires contiguous cache_seqlens_int32"
-            )
-        if valid_q_rows != full_q_rows:
-            raise ValueError(
-                "workspace-backed paged decode requires q_fp8 rows to match "
-                f"real_page_table rows, got q_rows={full_q_rows} vs valid_q_rows={valid_q_rows}"
-            )
-        seqlens_valid = metadata.cache_seqlens_int32
-    else:
-        seqlens_valid = metadata.cache_seqlens_int32.contiguous()
+    seqlens_valid = metadata.cache_seqlens_int32.contiguous()
     if active_width_override is None:
         active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
     else:
@@ -428,8 +412,6 @@ def paged_decode_logits(
         schedule_metadata=schedule_metadata,
         active_width=active_width,
         page_size=page_size,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         preinitialize_invalid_logits=preinitialize_invalid_logits,
     )
     if valid_q_rows == full_q_rows:
@@ -445,14 +427,12 @@ def paged_decode_logits(
     return logits
 
 
-def extend_logits(
+def contiguous_logits(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: IndexerExtendMetadata | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
+    metadata: IndexerContiguousMetadata | None = None,
     preinitialize_invalid_logits: bool = True,
     tile_logits: torch.Tensor | None = None,
     binding=None,
@@ -463,24 +443,20 @@ def extend_logits(
             name
             for name, value in (
                 ("metadata", metadata),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("tile_logits", tile_logits),
             )
             if value is not None
         ]
         if extras:
             raise ValueError(
-                "indexer extend binding owns metadata, contract phantoms, scratch, "
+                "indexer contiguous binding owns metadata, scratch, "
                 f"and tile logits; do not also pass {', '.join(extras)}"
             )
         strict_binding = bool(getattr(binding, "strict", False))
         metadata = binding.metadata
-        contract_phantoms = binding.contract_phantoms
-        workspace = None if strict_binding else binding.scratch
         tile_logits = binding.tile_logits
     if metadata is None:
-        raise TypeError("extend_logits requires metadata or binding")
+        raise TypeError("contiguous_logits requires metadata or binding")
     k_start = metadata.k_start
     k_end = metadata.k_end
     if q_fp8.ndim != 3:
@@ -506,7 +482,7 @@ def extend_logits(
         require_float32=strict_binding,
     )
     k_quant, k_scale = kv_fp8
-    if supports_extend_logits_kernel(
+    if supports_contiguous_logits_kernel(
         q_fp8=q_fp8,
         weights=weights_f,
         k_quant=k_quant,
@@ -514,21 +490,19 @@ def extend_logits(
         k_start=k_start,
         k_end=k_end,
     ):
-        result = run_extend_logits_kernel(
+        result = run_contiguous_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,
             k_scale=k_scale,
             k_start=k_start,
             k_end=k_end,
-            contract_phantoms=contract_phantoms,
-            workspace=workspace,
             preinitialize_invalid_logits=preinitialize_invalid_logits,
             tile_logits=tile_logits,
         )
         return result
 
-    return extend_logits_reference(
+    return contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights_f,
         kv_fp8=kv_fp8,
@@ -587,15 +561,13 @@ def _reference_topk_indices_from_logits(
     return result
 
 
-def extend_tiled_topk(
+def contiguous_tiled_topk(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: IndexerExtendMetadata | None = None,
+    metadata: IndexerContiguousMetadata | None = None,
     topk: int | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     tile_logits: torch.Tensor | None = None,
     lengths: torch.Tensor | None = None,
     output_values: torch.Tensor | None = None,
@@ -614,8 +586,6 @@ def extend_tiled_topk(
             name
             for name, value in (
                 ("metadata", metadata),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("tile_logits", tile_logits),
                 ("lengths", lengths),
                 ("output_values", output_values),
@@ -628,7 +598,7 @@ def extend_tiled_topk(
         ]
         if extras:
             raise ValueError(
-                "indexer extend binding owns metadata, contract phantoms, scratch, "
+                "indexer contiguous binding owns metadata, scratch, "
                 "and top-k scratch buffers; do not also pass "
                 f"{', '.join(extras)}"
             )
@@ -640,8 +610,6 @@ def extend_tiled_topk(
             )
         strict_binding = bool(getattr(binding, "strict", False))
         metadata = binding.metadata
-        contract_phantoms = binding.contract_phantoms
-        workspace = None if strict_binding else binding.scratch
         tile_logits = binding.tile_logits
         lengths = binding.lengths
         output_values = binding.output_values
@@ -652,9 +620,9 @@ def extend_tiled_topk(
         if binding.supertile_k is not None:
             supertile_k = int(binding.supertile_k)
     if metadata is None:
-        raise TypeError("extend_tiled_topk requires metadata or binding")
+        raise TypeError("contiguous_tiled_topk requires metadata or binding")
     if topk is None:
-        raise TypeError("extend_tiled_topk requires topk or a binding with topk")
+        raise TypeError("contiguous_tiled_topk requires topk or a binding with topk")
     topk = int(topk)
     if topk < 0:
         raise ValueError(f"topk must be non-negative, got {topk}")
@@ -666,7 +634,7 @@ def extend_tiled_topk(
         raise ValueError("tiled topk requires matching rank-1 k_start and k_end tensors")
     weights_f = _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
     k_quant, k_scale = kv_fp8
-    if not supports_extend_logits_kernel(
+    if not supports_contiguous_logits_kernel(
         q_fp8=q_fp8,
         weights=weights_f,
         k_quant=k_quant,
@@ -676,7 +644,7 @@ def extend_tiled_topk(
     ):
         if strict_binding:
             raise RuntimeError(
-                "strict indexer extend binding requires the CUDA FP8 scorer "
+                "strict indexer contiguous binding requires the CUDA FP8 scorer "
                 "contract; reference logits fallback is disabled"
             )
         if lengths is not None:
@@ -689,7 +657,7 @@ def extend_tiled_topk(
             if lengths.device != q_fp8.device:
                 raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
             torch.sub(k_end, k_start, out=lengths[: int(k_start.shape[0])])
-        logits = extend_logits_reference(
+        logits = contiguous_logits_reference(
             q_fp8=q_fp8,
             weights=weights_f,
             kv_fp8=kv_fp8,
@@ -705,7 +673,7 @@ def extend_tiled_topk(
     prefill_block_k = (
         int(binding.prefill_block_k)
         if binding is not None and binding.prefill_block_k is not None
-        else resolve_extend_prefill_block_k(
+        else resolve_contiguous_prefill_block_k(
             valid_q_rows=int(k_start.shape[0]),
             k_rows=int(k_quant.shape[0]),
             num_heads=int(q_fp8.shape[1]),
@@ -730,7 +698,7 @@ def extend_tiled_topk(
 
     if tile_logits is None:
         if strict_binding:
-            raise RuntimeError("strict indexer extend binding is missing tile_logits")
+            raise RuntimeError("strict indexer contiguous binding is missing tile_logits")
         tile_logits = torch.empty(
             (chunk_tile_elements,),
             dtype=torch.float32,
@@ -744,7 +712,7 @@ def extend_tiled_topk(
 
     if lengths is None:
         if strict_binding:
-            raise RuntimeError("strict indexer extend binding is missing lengths")
+            raise RuntimeError("strict indexer contiguous binding is missing lengths")
         global_lengths = (k_end - k_start).contiguous()
     else:
         if lengths.ndim != 1 or lengths.shape[0] < num_q_rows:
@@ -761,24 +729,22 @@ def extend_tiled_topk(
         torch.sub(k_end, k_start, out=global_lengths)
     if strict_binding and (output_values is None or output_indices is None):
         raise RuntimeError(
-            "strict indexer extend binding is missing output top-k buffers"
+            "strict indexer contiguous binding is missing output top-k buffers"
         )
 
-    def _run_extend_scorer(
+    def _run_contiguous_scorer(
         *,
         tile_k_offset: int,
         tile_num_k_tiles: int,
     ) -> None:
         if not strict_binding:
-            run_extend_logits_kernel(
+            run_contiguous_logits_kernel(
                 q_fp8=q_fp8,
                 weights=weights_f,
                 k_quant=k_quant,
                 k_scale=k_scale,
                 k_start=k_start,
                 k_end=k_end,
-                contract_phantoms=contract_phantoms,
-                workspace=workspace,
                 preinitialize_invalid_logits=True,
                 tile_logits=tile_logits,
                 tile_k_offset=tile_k_offset,
@@ -788,41 +754,40 @@ def extend_tiled_topk(
             return
 
         if binding is None:
-            raise RuntimeError("strict indexer extend path requires a binding")
+            raise RuntimeError("strict indexer contiguous path requires a binding")
         scratch = binding.scratch
         if tile_logits is None:
-            raise RuntimeError("strict indexer extend binding is missing tile logits")
+            raise RuntimeError("strict indexer contiguous binding is missing tile logits")
         if not hasattr(scratch, "prepare_k_padding"):
             raise RuntimeError(
-                "strict indexer extend binding requires plan-owned scratch"
+                "strict indexer contiguous binding requires plan-owned scratch"
             )
         if not q_fp8.is_contiguous():
-            raise ValueError("strict indexer extend requires contiguous q_fp8")
+            raise ValueError("strict indexer contiguous requires contiguous q_fp8")
         if not weights_f.is_contiguous():
-            raise ValueError("strict indexer extend requires contiguous weights")
+            raise ValueError("strict indexer contiguous requires contiguous weights")
         if not k_quant.is_contiguous() or not k_scale.is_contiguous():
-            raise ValueError("strict indexer extend requires contiguous K tensors")
+            raise ValueError("strict indexer contiguous requires contiguous K tensors")
         scratch.prepare_k_padding(k_rows=int(k_quant.shape[0]))
         scratch_k_quant = scratch.k_quant
         scratch_k_scale = scratch.k_scale
         if k_quant.data_ptr() != scratch_k_quant.data_ptr():
-            raise ValueError("strict indexer extend K values must be a scratch prefix")
+            raise ValueError("strict indexer contiguous K values must be a scratch prefix")
         if k_scale.data_ptr() != scratch_k_scale.data_ptr():
-            raise ValueError("strict indexer extend K scales must be a scratch prefix")
+            raise ValueError("strict indexer contiguous K scales must be a scratch prefix")
         q_bytes = q_fp8.view(torch.uint8)
         q_u32 = q_bytes.view(torch.uint32).view(
             int(q_fp8.shape[0]),
             int(q_fp8.shape[1]),
             _INDEX_HEAD_DIM // 4,
         )
-        kernel_binding = build_indexer_extend_logits_kernel_binding(
+        kernel_binding = build_indexer_contiguous_logits_kernel_binding(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,
             k_scale=k_scale,
             k_start=k_start,
             k_end=k_end,
-            contract_phantoms=contract_phantoms,
             preinitialize_invalid_logits=True,
             tile_logits=tile_logits,
             tile_k_offset=tile_k_offset,
@@ -840,15 +805,15 @@ def extend_tiled_topk(
             k_tma_desc_ptrs=scratch.k_tma_desc_ptrs,
             k_tma_prefill_desc_ptrs=scratch.k_tma_prefill_desc_ptrs,
         )
-        run_extend_logits_kernel(binding=kernel_binding)
+        run_contiguous_logits_kernel(binding=kernel_binding)
 
     if num_chunks <= 1:
         # Dead tiles (entirely out of causal/length range) are left UNWRITTEN by
-        # the tiled-output extend kernel (it `pass`es, trusting run_tiled_topk's
+        # the tiled-output contiguous kernel (it `pass`es, trusting run_tiled_topk's
         # k_start/k_end mask). Pre-clear to -inf so any stale value in those slots
         # of the (reused) scratch can never win the tiled top-k.
         tile_logits[:chunk_tile_elements].fill_(float("-inf"))
-        _run_extend_scorer(
+        _run_contiguous_scorer(
             tile_k_offset=0,
             tile_num_k_tiles=num_k_tiles,
         )
@@ -862,7 +827,6 @@ def extend_tiled_topk(
             output_values=output_values,
             output_indices=output_indices,
             num_k_tiles=num_k_tiles,
-            contract_phantoms=contract_phantoms,
         )
         return topk_indices
 
@@ -876,7 +840,7 @@ def extend_tiled_topk(
     if candidate_values is None:
         if strict_binding:
             raise RuntimeError(
-                "strict indexer extend binding is missing carry buffers"
+                "strict indexer contiguous binding is missing carry buffers"
             )
         candidate_values = torch.empty(
             (2, num_q_rows, topk),
@@ -932,7 +896,7 @@ def extend_tiled_topk(
         # kernel, so a stale logit from a previous chunk at the same offset could
         # otherwise survive into this chunk's tiled top-k. Pre-clear to -inf.
         tile_logits[: num_q_tiles * chunk_tiles * tile_size].fill_(float("-inf"))
-        _run_extend_scorer(
+        _run_contiguous_scorer(
             tile_k_offset=chunk_tile_begin,
             tile_num_k_tiles=chunk_tiles,
         )
@@ -958,6 +922,5 @@ def extend_tiled_topk(
             carry_values=carry_values,
             carry_indices=carry_indices,
             is_first=is_first,
-            contract_phantoms=contract_phantoms,
         )
     return topk_indices

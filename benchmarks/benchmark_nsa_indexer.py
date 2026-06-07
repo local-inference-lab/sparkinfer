@@ -16,17 +16,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention.indexer.reference import (
-    extend_logits_reference,
+    contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.integration.indexer import (
-    IndexerExtendMetadata,
-    IndexerPagedDecodeMetadata,
+from b12x.attention.indexer import (
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+    INDEXER_SOURCE_LAYOUT_PAGED,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
     paged_decode_logits,
-    extend_logits,
+    contiguous_logits,
+    plan_indexer_scratch,
     uses_paged_mqa_schedule,
 )
 
@@ -59,6 +61,13 @@ class GLMNSAConfig:
 
 def _align_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+def _allocate_plan_scratch(plan):
+    return [
+        torch.empty(shape, dtype=dtype, device=plan.caps.device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    ]
 
 
 @functools.lru_cache(maxsize=1)
@@ -314,10 +323,24 @@ def _run_decode_case(
             )
 
     prepare_decode_graph()
-    metadata = IndexerPagedDecodeMetadata(
+    decode_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=cfg.num_heads,
+            max_q_rows=q_rows,
+            max_page_table_width=int(graph_real_page_table.shape[1]),
+            topk=topk,
+            page_size=cfg.page_size,
+            mode="decode",
+        )
+    )
+    decode_binding = decode_plan.bind(
+        scratch=_allocate_plan_scratch(decode_plan),
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
-        paged_mqa_schedule_metadata=graph_schedule_metadata,
+        schedule_metadata=graph_schedule_metadata,
+        expected_num_q_heads=cfg.num_heads,
     )
 
     def run():
@@ -325,7 +348,7 @@ def _run_decode_case(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
+            binding=decode_binding,
             page_size=cfg.page_size,
         )
         return _select_paged_topk_from_logits(
@@ -444,7 +467,7 @@ def _run_extend_case(
         seq_lens=seq_lens,
         page_size=cfg.page_size,
     )
-    extend_lengths = [q_len] * batch
+    contiguous_lengths = [q_len] * batch
     batch_offsets = torch.arange(batch, dtype=torch.int32, device=device) * valid_per_row
     k_start = torch.repeat_interleave(batch_offsets, q_len)
     per_request_ke = torch.arange(
@@ -454,17 +477,30 @@ def _run_extend_case(
         device=device,
     )
     seqlens_expanded = per_request_ke.repeat(batch)
-    metadata = IndexerExtendMetadata(
+    contiguous_plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+            num_q_heads=cfg.num_heads,
+            max_q_rows=total_q,
+            max_k_rows=int(kv_fp8[0].shape[0]),
+            topk=topk,
+        )
+    )
+    contiguous_binding = contiguous_plan.bind(
+        scratch=_allocate_plan_scratch(contiguous_plan),
         k_start=k_start,
         k_end=k_start + seqlens_expanded,
+        gather_rows=int(kv_fp8[0].shape[0]),
+        topk=topk,
     )
 
     def run():
-        logits = extend_logits(
+        logits = contiguous_logits(
             q_fp8=q_fp8,
             weights=weights,
             kv_fp8=kv_fp8,
-            metadata=metadata,
+            binding=contiguous_binding,
         )
         return _select_ragged_topk_from_logits(
             logits=logits,
@@ -475,7 +511,7 @@ def _run_extend_case(
 
     clear_indexer_caches()
     actual = run()
-    expected_logits = extend_logits_reference(
+    expected_logits = contiguous_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=kv_fp8,
@@ -570,7 +606,7 @@ def main() -> None:
     cache_lens = _parse_csv_ints(args.cache_lens)
     decode_rows = _parse_csv_ints(args.decode_rows)
     extend_batches = _parse_csv_ints(args.extend_batches)
-    extend_q_lens = _parse_csv_ints(args.extend_q_lens)
+    contiguous_q_lens = _parse_csv_ints(args.contiguous_q_lens)
 
     case_seed = args.seed
     if args.mode in ("decode", "both"):
@@ -593,7 +629,7 @@ def main() -> None:
     if args.mode in ("extend", "both"):
         for cache_len in cache_lens:
             for batch in extend_batches:
-                for q_len in extend_q_lens:
+                for q_len in contiguous_q_lens:
                     if q_len > cache_len:
                         print(
                             f"skip extend batch={batch} q_len={q_len} cache_len={cache_len}: "

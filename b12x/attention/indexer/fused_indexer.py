@@ -5,12 +5,12 @@ slice of one query row's K, scores q·k via ``mxfp8`` MMA into shared memory
 (m = heads / MQA), folds each scored sub-tile into an in-SMEM running top-k via
 the ``tiled_topk`` radix (coarse-8-bit-histogram + byte-refine), and CTAs merge
 in turn. Logits never reach global memory — peak per-row working set is
-O(topk), not O(K). MLA (flat K/V) vs C4 (paged) is a constexpr K-loader
+O(topk), not O(K). contiguous K/V vs paged K/V is a constexpr K-loader
 specialization; the score assembly and top-k are identical (always m = heads).
 
 This module is the SCAFFOLD: launch config, dispatch gates, scratch trio, and
 the kernel class shell. The fused score→select kernel body lands per the phased
-plan (Phase 1 = C4 PAGED_C4; Phase 2 = FLAT_MLA loader; Phase 3 = topk 512 /
+plan (Phase 1 = paged; Phase 2 = CONTIGUOUS_MLA loader; Phase 3 = topk 512 /
 paged_output). The m=heads score helpers are reused from
 ``b12x/attention/indexer/kernel.py`` (``_compute_mxfp8_tile_partials`` et al.)
 and the radix select / virtual-index loaders from
@@ -88,10 +88,10 @@ _THREADS_PER_CTA = 1024
 # than materializing it.
 _MAX_CHUNK_ELEMENTS = 8192
 
-# Constexpr K/V-layout specialization (the ONLY MLA-vs-C4 divergence in the
+# Constexpr K/V-layout specialization (the ONLY contiguous-vs-paged divergence in the
 # fused kernel — everything downstream of the SMEM staging tile is shared).
-KV_LAYOUT_FLAT_MLA = 0
-KV_LAYOUT_PAGED_C4 = 1
+KV_LAYOUT_CONTIGUOUS_MLA = 0
+KV_LAYOUT_PAGED = 1
 
 # Routing is by ROW COUNT, not context width. Under CUDA-graph capture the gate
 # is fixed at capture time, and `width` there is the workspace page-table CAPACITY
@@ -123,7 +123,7 @@ def _load_flat_k_tile_scalar(
     s_k_page_stage: cute.Tensor,
     lane_linear: Int32,
 ):
-    """FLAT_MLA K-load: stage a 64-row tile of contiguous K starting at abs_base.
+    """CONTIGUOUS_MLA K-load: stage a 64-row tile of contiguous K starting at abs_base.
 
     Rows >= valid_rows are zero-filled (so the MMA contributes 0 for them — masked
     out anyway by the staging-write valid_slots guard).
@@ -189,17 +189,17 @@ def _load_permute_k_page_g2s(
     k_quant_bytes: cute.Tensor,  # [pages, 64, 128] uint8 (16B-aligned base)
     page_id: Int32,
     page_stride_bytes: Int32,  # dim-0 byte stride; 8192 for contiguous K, 8448 for
-                               # the packed C4 cache (64*128 quant + 64*4 scales / page)
+                               # the packed paged cache (64*128 quant + 64*4 scales / page)
     k_perm_base_addr: Int32,
     tx: Int32,
     n_threads: Int32,
 ):
-    """C4 fused global->shared load + permute: read 16-byte K granules straight
+    """paged fused global->shared load + permute: read 16-byte K granules straight
     from global into the ldmatrix-permuted SMEM layout. Replaces the scalar
     linear load + separate SMEM->SMEM repack pass (and its barrier) with one
     vectorized pass. Granule addresses are 16B-aligned (page*page_stride_bytes +
     row*128 + vec*16); page_stride_bytes MUST be the real dim-0 stride of
-    k_quant_bytes (the packed C4 cache interleaves per-page scales, so its page
+    k_quant_bytes (the packed paged cache interleaves per-page scales, so its page
     stride is 8448, not the contiguous 8192) — using a hardcoded stride reads the
     wrong page for the packed layout. It stays 16B-aligned (8448 = 16*528).
     """
@@ -291,7 +291,7 @@ _STATE_WORDS_PER_GROUP = 4  # arrival_counter, output_counter, relay_phase, pad
 _LAST_CTA_MERGE_MAX = 49152
 # Sentinel "never coop" threshold: larger than any live seq_len, so the per-group
 # auto-switch always takes the serial last-CTA arm (used when ctas_per_group*topk is
-# too small for coop's grid barriers to ever pay off -- see run_fused_indexer_c4).
+# too small for coop's grid barriers to ever pay off -- see run_fused_paged_indexer).
 _FORCE_LAST_CTA = 1 << 30
 
 
@@ -437,17 +437,17 @@ def plan_fused_indexer_scratch(
 class FusedIndexerConfig:
     """The compile-time specialization tuple for SparseNSAFusedIndexerKernel.
 
-    All MLA-vs-C4 / topk / output-format divergence is captured here so the
+    All contiguous-vs-paged / topk / output-format divergence is captured here so the
     finite variant set is fully enumerable from workspace caps (for prewarm).
     """
 
-    kv_layout: int  # KV_LAYOUT_FLAT_MLA | KV_LAYOUT_PAGED_C4
+    kv_layout: int  # KV_LAYOUT_CONTIGUOUS_MLA | KV_LAYOUT_PAGED
     topk: int  # 512 | 1024 | 2048
     paged_output: bool  # remap selected logical idx through a page table
     num_head_tiles: int  # head-dim tiling for the m=heads MMA
 
     def __post_init__(self) -> None:
-        if self.kv_layout not in (KV_LAYOUT_FLAT_MLA, KV_LAYOUT_PAGED_C4):
+        if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         if int(self.topk) not in _SUPPORTED_TOPK:
             raise ValueError(f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}")
@@ -535,7 +535,7 @@ def _build_fused_indexer_kernel(config: FusedIndexerConfig):
     # Phase 1 lands SparseNSAFusedIndexerKernel(config). Cached per constexpr
     # tuple so prewarm can compile every variant before CUDA-graph capture.
     raise NotImplementedError(
-        "SparseNSAFusedIndexerKernel body is implemented in Phase 1 (C4) / Phase 2 (MLA)"
+        "SparseNSAFusedIndexerKernel body is implemented in Phase 1 (paged) / Phase 2 (MLA)"
     )
 
 
@@ -869,7 +869,7 @@ def _fused_radix_select(
 
 
 class SparseNSAFusedIndexerKernel:
-    """C4 fused score+top-k, v1: single-CTA-per-row, scalar K-load, 1024 threads.
+    """paged fused score+top-k, v1: single-CTA-per-row, scalar K-load, 1024 threads.
 
     Score phase: warps 0-3 (tx < _PAGED_THREADS_PER_CTA) reuse the paged scorer's
     page-load + mxfp8 MMA (m=heads) into the SMEM logit staging; barriers are
@@ -883,7 +883,7 @@ class SparseNSAFusedIndexerKernel:
         *,
         num_heads_static: int,
         topk: int,
-        kv_layout: int = KV_LAYOUT_PAGED_C4,
+        kv_layout: int = KV_LAYOUT_PAGED,
         paged_output: bool = False,
         ctas_per_group: int = 1,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
@@ -894,12 +894,12 @@ class SparseNSAFusedIndexerKernel:
         self.kv_layout = int(kv_layout)
         self.ctas_per_group = max(1, int(ctas_per_group))
         self.merge_threshold = int(merge_threshold)
-        # dim-0 byte stride of k_quant_bytes for the PAGED_C4 wide load. Defaults to
-        # the contiguous 8192 (64*128); the packed C4 cache interleaves per-page
-        # scales so its real page stride is 8448 -- run_fused_indexer_c4 passes
+        # dim-0 byte stride of k_quant_bytes for the PAGED wide load. Defaults to
+        # the contiguous 8192 (64*128); the packed paged cache interleaves per-page
+        # scales so its real page stride is 8448 -- run_fused_paged_indexer passes
         # k_quant_bytes.stride(0) so the load reads the correct page.
         self.k_quant_page_stride = int(k_quant_page_stride)
-        if self.kv_layout not in (KV_LAYOUT_FLAT_MLA, KV_LAYOUT_PAGED_C4):
+        if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
         if self.topk not in _SUPPORTED_TOPK:
@@ -1074,10 +1074,10 @@ class SparseNSAFusedIndexerKernel:
         ni1 = shared_ptr_to_u32(storage.ni1.data_ptr())
         lr = shared_ptr_to_u32(storage.last_rem.data_ptr())
 
-        # PAGED_C4: valid k = [0, seqlen) via page table. FLAT_MLA: contiguous k =
+        # PAGED: valid k = [0, seqlen) via page table. CONTIGUOUS_MLA: contiguous k =
         # [k_start, k_end) with abs_start = k_start (no page table).
         abs_start = Int32(0)
-        if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED_C4):
+        if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
             seq_len = Int32(seqlens_per_query[q_idx])
         else:
             abs_start = Int32(k_start[q_idx])
@@ -1129,7 +1129,7 @@ class SparseNSAFusedIndexerKernel:
             n_new = Int32(0)
             do_page = Int32(0)
             page_id = Int32(0)
-            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED_C4):
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
                 page_id = Int32(-1)
                 if page_col < Int32(real_page_table.shape[1]):
                     page_id = Int32(real_page_table[q_idx, page_col])
@@ -1141,7 +1141,7 @@ class SparseNSAFusedIndexerKernel:
 
             if do_page != Int32(0):
                 n_new = valid_slots
-                if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED_C4):
+                if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
                     # Fused g2s load + permute (no linear staging, no repack pass).
                     _load_permute_k_page_g2s(
                         k_quant_bytes, page_id, Int32(self.k_quant_page_stride),
@@ -1153,7 +1153,7 @@ class SparseNSAFusedIndexerKernel:
                         scale_idx += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
                 else:
-                    # FLAT_MLA: masked wide scalar load into linear staging, then repack.
+                    # CONTIGUOUS_MLA: masked wide scalar load into linear staging, then repack.
                     _load_flat_k_tile_wide(
                         k_quant_bytes, abs_start + page_base, valid_slots,
                         s_k_page_stage, tx, Int32(_RADIX_THREADS),
@@ -1655,7 +1655,7 @@ def _to_kernel_tensor(tensor: torch.Tensor, dtype, *, assumed_align: int = 16):
     return cute_tensor
 
 
-def run_fused_indexer_c4(
+def run_fused_paged_indexer(
     *,
     q_bytes: torch.Tensor,  # uint8 view of fp8 q, [rows, heads, 128]
     weights: torch.Tensor,  # f32, [rows, heads]
@@ -1673,7 +1673,7 @@ def run_fused_indexer_c4(
     pack_indices: torch.Tensor | None = None,
     merge_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """C4 fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
+    """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
 
     pack_values/pack_indices/merge_state: optional caller-owned (workspace) scratch for
@@ -1744,15 +1744,15 @@ def run_fused_indexer_c4(
         state.zero_()
     else:
         pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
-    # Real dim-0 byte stride of the K-quant tensor: the packed C4 cache interleaves
+    # Real dim-0 byte stride of the K-quant tensor: the packed paged cache interleaves
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
     k_quant_page_stride = int(k_quant_bytes.stride(0))
     kernel = _build_fused_indexer_kernel(
-        KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), False, ctas_per_group,
+        KV_LAYOUT_PAGED, int(num_heads), int(topk), False, ctas_per_group,
         merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
     )
-    dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for C4
+    dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for paged
     args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8, assumed_align=4),
         _to_kernel_tensor(weights, cutlass.Float32, assumed_align=4),
@@ -1776,7 +1776,7 @@ def run_fused_indexer_c4(
     ]
     _launch_fused(
         kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED_C4, int(num_heads), int(topk), int(ctas_per_group),
+        (KV_LAYOUT_PAGED, int(num_heads), int(topk), int(ctas_per_group),
          int(merge_threshold), k_quant_page_stride),
     )
     return out_i, out_v
@@ -1809,7 +1809,7 @@ def run_fused_indexer_mla(
         else out_values
     )
     pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, 1, dev)
-    kernel = _build_fused_indexer_kernel(KV_LAYOUT_FLAT_MLA, int(num_heads), int(topk), False, 1)
+    kernel = _build_fused_indexer_kernel(KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), False, 1)
     # page table / seqlens unused for FLAT; pass minimal dummies.
     dummy_pt = torch.zeros((rows, 1), dtype=torch.int32, device=dev)
     dummy_sl = torch.zeros((rows,), dtype=torch.int32, device=dev)
@@ -1835,6 +1835,6 @@ def run_fused_indexer_mla(
         ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
     ]
     _launch_fused(
-        kernel, args, key_tensors, (KV_LAYOUT_FLAT_MLA, int(num_heads), int(topk), 1)
+        kernel, args, key_tensors, (KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), 1)
     )
     return out_i, out_v

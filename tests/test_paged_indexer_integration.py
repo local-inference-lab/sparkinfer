@@ -3,19 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.workspace import (
-    B12XAttentionArena,
-    B12XAttentionArenaCaps,
-    B12XAttentionWorkspaceContract,
-)
-from b12x.integration import (
-    B12XAttentionWorkspace,
+from b12x.attention.indexer import (
     clear_indexer_caches,
-    pack_compressed_index_k_cache_reference,
     index_topk_fp8,
-    compressed_index_logits_reference,
-    prepare_compressed_indexer_metadata,
+    pack_paged_index_k_cache_reference,
+    paged_index_logits_reference,
+    prepare_paged_indexer_metadata,
     resolve_replicated_num_q_heads,
+)
+from b12x.attention.indexer.scratch import (
+    B12XIndexerPagedScratchCaps,
+    plan_indexer_paged_scratch,
 )
 
 
@@ -55,7 +53,7 @@ def _rand_fp8_q(
     ).to(torch.float8_e4m3fn)
 
 
-def _expected_compressed_index_topk(
+def _expected_paged_index_topk(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -64,7 +62,7 @@ def _expected_compressed_index_topk(
     seqlens: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    logits = compressed_index_logits_reference(
+    logits = paged_index_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -80,6 +78,51 @@ def _expected_compressed_index_topk(
         torch.int32
     )
     return raw
+
+
+def _bind_paged_indexer(
+    *,
+    device: torch.device,
+    num_heads: int,
+    rows: int,
+    width_blocks: int,
+    topk: int,
+    real_page_table: torch.Tensor,
+    seqlens: torch.Tensor,
+    supertile_k: int = 512,
+    active_width: torch.Tensor | None = None,
+    schedule_metadata: torch.Tensor | None = None,
+    shared_page_table: bool = False,
+    route: str = "paged_tiled",
+):
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device=device,
+            num_q_heads=num_heads,
+            max_q_rows=rows,
+            max_page_table_width=width_blocks,
+            topk=topk,
+            page_size=64,
+            reserve_paged_logits=False,
+            paged_tile_logits_k_rows=supertile_k,
+            mode="prefill" if shared_page_table else "decode",
+            shared_page_table=shared_page_table,
+            route=route,
+        )
+    )
+    scratch = [
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    ]
+    return plan.bind(
+        scratch=scratch,
+        real_page_table=real_page_table,
+        cache_seqlens_int32=seqlens,
+        active_width=active_width,
+        schedule_metadata=schedule_metadata,
+        expected_num_q_heads=num_heads,
+        shared_page_table=shared_page_table,
+    )
 
 
 def test_resolve_replicated_num_q_heads_for_tensor_parallel() -> None:
@@ -109,28 +152,32 @@ def test_index_topk_fp8_hard_fails_on_cpu() -> None:
     )
     q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
     weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32, device=device)
-    index_k_cache = pack_compressed_index_k_cache_reference(
+    index_k_cache = pack_paged_index_k_cache_reference(
         torch.randn((12 * 64, 128), generator=gen, dtype=torch.float32, device=device) / 3
     )
 
-    metadata = prepare_compressed_indexer_metadata(
+    schedule = torch.empty((5, 2), dtype=torch.int32, device=device)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=512,
         real_page_table=real_page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=num_heads,
-        build_schedule=True,
-        schedule_num_sms=4,
+        seqlens=seqlens,
+        schedule_metadata=schedule,
     )
     with pytest.raises(NotImplementedError, match="requires CUDA"):
         index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             topk=512,
+            binding=binding,
         )
 
 
-def test_compressed_index_decode_rejects_sharded_selector_heads() -> None:
+def test_paged_index_decode_rejects_sharded_selector_heads() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(91_002)
@@ -141,15 +188,18 @@ def test_compressed_index_decode_rejects_sharded_selector_heads() -> None:
     )
     real_page_table = torch.tensor([[0]], dtype=torch.int32, device=device)
     seqlens = torch.tensor([1], dtype=torch.int32, device=device)
-    metadata = prepare_compressed_indexer_metadata(
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=replicated_heads,
+        rows=1,
+        width_blocks=1,
+        topk=512,
         real_page_table=real_page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=replicated_heads,
-        build_schedule=False,
+        seqlens=seqlens,
     )
     q_fp8 = _rand_fp8_q((1, 32, 128), gen=gen, device=device)
     weights = torch.randn((1, 32), generator=gen, dtype=torch.float32, device=device)
-    index_k_cache = pack_compressed_index_k_cache_reference(
+    index_k_cache = pack_paged_index_k_cache_reference(
         torch.randn((64, 128), generator=gen, dtype=torch.float32, device=device)
     )
 
@@ -158,79 +208,58 @@ def test_compressed_index_decode_rejects_sharded_selector_heads() -> None:
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             topk=512,
+            binding=binding,
         )
 
 
-def test_compressed_index_metadata_rejects_clamp_to_one_lengths() -> None:
+def test_paged_index_metadata_rejects_clamp_to_one_lengths() -> None:
     real_page_table = torch.full((1, 2), -1, dtype=torch.int32)
     clamped_seqlens = torch.tensor([1], dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="raw unclamped compressed lengths"):
-        prepare_compressed_indexer_metadata(
+    with pytest.raises(ValueError, match="raw unclamped paged-index lengths"):
+        prepare_paged_indexer_metadata(
             real_page_table=real_page_table,
             cache_seqlens_int32=clamped_seqlens,
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_decode_stage_keeps_contiguous_metadata_aliases() -> None:
-    device = torch.device("cuda")
+def test_paged_index_plan_binding_keeps_metadata_aliases() -> None:
+    device = torch.device("cpu")
     rows = 1
     num_heads = 64
     width_blocks = 16
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=512,
-        max_page_table_width=width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=True,
-        paged_indexer_logits_q_rows=rows,
-        paged_indexer_logits_k_rows=width_blocks * 64,
-        paged_indexer_tile_logits_k_rows=0,
-    )
     q_fp8 = torch.empty((rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device)
     weights = torch.empty((rows, num_heads), dtype=torch.float32, device=device)
+    del q_fp8, weights
     real_page_table = torch.empty((rows, width_blocks), dtype=torch.int32, device=device)
     seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
-    active_width = workspace.get_paged_indexer_active_width_cap()
+    active_width = torch.empty((1,), dtype=torch.int32, device=device)
     schedule = torch.empty((4, 2), dtype=torch.int32, device=device)
 
-    staged = workspace.stage_indexer_paged_decode(
-        q_fp8=q_fp8,
-        weights=weights,
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=512,
         real_page_table=real_page_table,
-        seqlens_per_query=seqlens,
+        seqlens=seqlens,
         active_width=active_width,
         schedule_metadata=schedule,
-        width_tokens=width_blocks * 64,
-        preinitialize_invalid_logits=False,
     )
 
-    assert staged["real_page_table"].data_ptr() == real_page_table.data_ptr()
-    assert staged["seqlens_per_query"].data_ptr() == seqlens.data_ptr()
-    assert staged["active_width"].data_ptr() == active_width.data_ptr()
-    assert staged["schedule_metadata"].data_ptr() == schedule.data_ptr()
+    assert binding.real_page_table.data_ptr() == real_page_table.data_ptr()
+    assert binding.cache_seqlens_int32.data_ptr() == seqlens.data_ptr()
+    assert binding.active_width.data_ptr() == active_width.data_ptr()
+    assert binding.schedule_metadata.data_ptr() == schedule.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_index_topk_fp8_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_COMPRESSED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -252,29 +281,9 @@ def test_index_topk_fp8_graph_matches_reference(
         device=device
     )
     api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
+    index_k_cache = pack_paged_index_k_cache_reference(
         torch.randn((80 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
         / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=512,
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
@@ -287,34 +296,34 @@ def test_index_topk_fp8_graph_matches_reference(
         )
         graph_real_page_table.copy_(live_table)
         graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
-        return prepare_compressed_indexer_metadata(
+        return prepare_paged_indexer_metadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_seqlens,
             expected_num_q_heads=num_heads,
             build_schedule=False,
         )
 
-    clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=512,
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=graph_real_page_table,
+        seqlens=graph_seqlens,
+        supertile_k=512,
     )
 
-    def fail_runtime_staging(**_kwargs):
-        raise AssertionError("C4 supertile path must not stage workspace metadata at runtime")
-
-    monkeypatch.setattr(workspace, "stage_indexer_paged_tiled_decode", fail_runtime_staging)
-
+    clear_indexer_caches()
     metadata = prepare([2, 40], [900, 960])
+    assert metadata.real_page_table.data_ptr() == binding.real_page_table.data_ptr()
     index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
         topk=topk,
         expected_num_q_heads=num_heads,
-        workspace=workspace,
+        binding=binding,
         out_indices=actual,
         supertile_k=512,
     )
@@ -326,16 +335,15 @@ def test_index_topk_fp8_graph_matches_reference(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             topk=topk,
             expected_num_q_heads=num_heads,
-            workspace=workspace,
+            binding=binding,
             out_indices=actual,
             supertile_k=512,
         )
     graph.replay()
     torch.cuda.synchronize(device)
-    expected_raw0 = _expected_compressed_index_topk(
+    expected_raw0 = _expected_paged_index_topk(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -351,7 +359,7 @@ def test_index_topk_fp8_graph_matches_reference(
     prepare([4, 8], [640, 768])
     graph.replay()
     torch.cuda.synchronize(device)
-    expected_raw1 = _expected_compressed_index_topk(
+    expected_raw1 = _expected_paged_index_topk(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -366,10 +374,10 @@ def test_index_topk_fp8_graph_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
+def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_COMPRESSED_INDEX_SUPERTILE_K", "4096")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "4096")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -398,53 +406,46 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         device=device
     )
     api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
+    index_k_cache = pack_paged_index_k_cache_reference(
         torch.randn((128 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
         / 3
     )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
+    padded_index_k_cache = torch.empty(
+        (int(index_k_cache.shape[0]), int(index_k_cache.shape[1]) + 16),
+        dtype=index_k_cache.dtype,
         device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=width_blocks,
-        max_total_q=1,
-        max_batch=1,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        indexer_max_k_rows=supertile_k,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=supertile_k,
     )
-    reference_workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=width_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=supertile_k,
+    padded_index_k_cache[:, : int(index_k_cache.shape[1])].copy_(index_k_cache)
+    index_k_cache = padded_index_k_cache.as_strided(
+        tuple(index_k_cache.shape),
+        (int(padded_index_k_cache.stride(0)), 1),
     )
+    assert not index_k_cache.is_contiguous()
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
     expected = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    shared_table_binding = graph_shared_page_table.expand(rows, -1)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=shared_table_binding,
+        seqlens=graph_seqlens,
+        supertile_k=supertile_k,
+        shared_page_table=True,
+    )
+    reference_binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=graph_real_page_table,
+        seqlens=graph_seqlens,
+        supertile_k=supertile_k,
+        shared_page_table=False,
+    )
 
     def prepare(page_start: int, seq_len: int, *, shared_page_table: bool):
         base_table = _make_real_page_table(
@@ -455,12 +456,12 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         )
         if shared_page_table:
             graph_shared_page_table.copy_(base_table)
-            real_page_table = graph_shared_page_table.expand(rows, -1)
+            real_page_table = shared_table_binding
         else:
             graph_real_page_table.copy_(base_table.expand(rows, -1))
             real_page_table = graph_real_page_table
         graph_seqlens.fill_(seq_len)
-        return prepare_compressed_indexer_metadata(
+        return prepare_paged_indexer_metadata(
             real_page_table=real_page_table,
             cache_seqlens_int32=graph_seqlens,
             expected_num_q_heads=num_heads,
@@ -469,36 +470,17 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         )
 
     clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=supertile_k,
-    )
-    reference_workspace.prewarm_paged_indexer_tiled_topk()
-    reference_workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=supertile_k,
-    )
-
-    def fail_paged_scorer_staging(**_kwargs):
-        raise AssertionError("shared C4 prefill must not use the row-wise paged scorer")
-
-    monkeypatch.setattr(
-        workspace,
-        "stage_indexer_paged_tiled_decode",
-        fail_paged_scorer_staging,
-    )
-
     metadata = prepare(3, 4096, shared_page_table=True)
     reference_metadata = prepare(3, 4096, shared_page_table=False)
+    assert metadata.real_page_table.data_ptr() == binding.real_page_table.data_ptr()
+    assert reference_metadata.real_page_table.data_ptr() == reference_binding.real_page_table.data_ptr()
     index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
-        metadata=reference_metadata,
         topk=topk,
         expected_num_q_heads=num_heads,
-        workspace=reference_workspace,
+        binding=reference_binding,
         out_indices=expected,
         supertile_k=supertile_k,
     )
@@ -506,10 +488,9 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
         topk=topk,
         expected_num_q_heads=num_heads,
-        workspace=workspace,
+        binding=binding,
         out_indices=actual,
         supertile_k=supertile_k,
     )
@@ -521,10 +502,9 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             topk=topk,
             expected_num_q_heads=num_heads,
-            workspace=workspace,
+            binding=binding,
             out_indices=actual,
             supertile_k=supertile_k,
         )
@@ -541,10 +521,9 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
-        metadata=reference_metadata,
         topk=topk,
         expected_num_q_heads=num_heads,
-        workspace=reference_workspace,
+        binding=reference_binding,
         out_indices=expected,
         supertile_k=supertile_k,
     )
@@ -556,10 +535,9 @@ def test_compressed_index_shared_supertile_prefill_graph_matches_reference(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
-def test_compressed_index_supertile_workspace_sizes_candidate_chunks() -> None:
-    device = torch.device("cuda")
-    page_size = 256
+def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
+    device = torch.device("cpu")
+    page_size = 64
     page_table_width = 1056
     supertile_k = 8192
     # The streaming fold replaced the old map+merge candidate slab (one half per
@@ -568,115 +546,66 @@ def test_compressed_index_supertile_workspace_sizes_candidate_chunks() -> None:
     chunk_count = (page_table_width * page_size + supertile_k - 1) // supertile_k
     assert chunk_count > 2  # this config is genuinely multi-chunk
 
-    arena = B12XAttentionArena.allocate(
-        B12XAttentionArenaCaps(
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
             device=device,
-            dtype=torch.bfloat16,
-            kv_dtype=torch.float8_e4m3fn,
-            num_q_heads=32,
-            indexer_num_q_heads=64,
-            head_dim=576,
-            max_v_head_dim=512,
-            topk=512,
+            num_q_heads=64,
+            max_q_rows=16,
             max_page_table_width=page_table_width,
-            extend_max_total_q=16,
-            extend_max_batch=4,
-            extend_max_kv_rows=0,
-            paged_max_q_rows=16,
-            paged_max_batch=4,
+            topk=512,
             page_size=page_size,
-            max_chunks_per_row=20,
-            reserve_paged_indexer_logits=False,
-            paged_indexer_tile_logits_k_rows=supertile_k,
+            reserve_paged_logits=False,
+            paged_tile_logits_k_rows=supertile_k,
+            route="paged_tiled",
         )
     )
-    workspace = arena.make_workspace(
-        B12XAttentionWorkspaceContract(
-            mode="decode",
-            max_total_q=16,
-            max_batch=4,
-            max_paged_q_rows=16,
-            max_kv_rows=0,
-            v_head_dim=512,
-            indexer_num_q_heads=64,
-            max_page_table_width=page_table_width,
-            topk=512,
-        ),
-        use_cuda_graph=True,
+    scratch = [
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    ]
+    real_page_table = torch.empty((16, page_table_width), dtype=torch.int32, device=device)
+    seqlens = torch.empty((16,), dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=scratch,
+        real_page_table=real_page_table,
+        cache_seqlens_int32=seqlens,
+        expected_num_q_heads=64,
     )
-
-    candidate_values, candidate_indices = workspace.get_indexer_extend_candidate_buffers()
+    candidate_values, candidate_indices = (
+        binding.scratch.get_indexer_contiguous_candidate_buffers()
+    )
     # Fold carry double-buffer: exactly two halves, decoupled from chunk_count.
     assert candidate_values.shape[0] == 2
     assert candidate_indices.shape[0] == 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
-def test_compressed_index_supertile_workspace_requires_prewarmed_launch_contract() -> None:
-    device = torch.device("cuda")
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=64,
-        indexer_num_q_heads=64,
-        head_dim=576,
-        v_head_dim=512,
-        topk=512,
-        max_page_table_width=16,
-        max_total_q=2,
-        max_batch=2,
-        max_paged_q_rows=2,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=512,
+def test_paged_index_supertile_plan_records_launch_contract() -> None:
+    device = torch.device("cpu")
+    plan = plan_indexer_paged_scratch(
+        B12XIndexerPagedScratchCaps(
+            device=device,
+            num_q_heads=64,
+            max_q_rows=2,
+            max_page_table_width=16,
+            topk=512,
+            page_size=64,
+            reserve_paged_logits=False,
+            paged_tile_logits_k_rows=512,
+            route="paged_tiled",
+        )
     )
 
-    with pytest.raises(RuntimeError, match="not prewarmed"):
-        workspace.require_paged_indexer_tiled_topk_plan(
-            topk=512,
-            block_q=32,
-            block_k=512,
-            num_k_tiles=1,
-        )
-
-    workspace.prewarm_paged_indexer_tiled_topk()
-    with pytest.raises(RuntimeError, match="not prewarmed"):
-        workspace.require_paged_indexer_tiled_scorer_plan(
-            block_q=32,
-            block_k=512,
-            width_tokens=512,
-            source_page_width=16,
-        )
-    index_k_cache = torch.empty((16, 64 * (128 + 4)), dtype=torch.uint8, device=device)
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=512,
-    )
-    with pytest.raises(RuntimeError, match="does not match"):
-        workspace.require_paged_indexer_tiled_scorer_plan(
-            block_q=32,
-            block_k=512,
-            width_tokens=1024,
-            source_page_width=16,
-        )
-    with pytest.raises(RuntimeError, match="does not match"):
-        workspace.require_paged_indexer_tiled_topk_plan(
-            topk=512,
-            block_q=32,
-            block_k=512,
-            num_k_tiles=2,
-        )
+    assert plan.layout.route == "paged_tiled"
+    assert plan.layout.supertile_tokens == 512
+    assert plan.layout.max_chunks == 2
+    assert plan.layout.tile_logits_elements == 32 * 512
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_COMPRESSED_INDEX_SUPERTILE_K", "1536")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "1536")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -699,29 +628,9 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
         device=device
     )
     api_weights = weights.unsqueeze(-1)
-    index_k_cache = pack_compressed_index_k_cache_reference(
+    index_k_cache = pack_paged_index_k_cache_reference(
         torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
         / 3
-    )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=num_heads,
-        indexer_num_q_heads=num_heads,
-        head_dim=576,
-        v_head_dim=512,
-        topk=topk,
-        max_page_table_width=supertile_blocks,
-        max_total_q=rows,
-        max_batch=rows,
-        max_paged_q_rows=rows,
-        max_kv_rows=0,
-        page_size=64,
-        use_cuda_graph=True,
-        reserve_paged_indexer_logits=False,
-        paged_indexer_tile_logits_k_rows=1536,
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
@@ -734,28 +643,33 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
         )
         graph_real_page_table.copy_(live_table)
         graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
-        return prepare_compressed_indexer_metadata(
+        return prepare_paged_indexer_metadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_seqlens,
             expected_num_q_heads=num_heads,
             build_schedule=False,
         )
 
-    clear_indexer_caches()
-    workspace.prewarm_paged_indexer_tiled_topk()
-    workspace.prewarm_paged_indexer_tiled_scorer(
-        index_k_cache=index_k_cache,
-        width_tokens=1536,
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=supertile_blocks,
+        topk=topk,
+        real_page_table=graph_real_page_table,
+        seqlens=graph_seqlens,
+        supertile_k=1536,
     )
+    clear_indexer_caches()
     metadata = prepare([2, 48], [960, 1024])
+    assert metadata.real_page_table.data_ptr() == binding.real_page_table.data_ptr()
     index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
         topk=topk,
         expected_num_q_heads=num_heads,
-        workspace=workspace,
+        binding=binding,
         out_indices=actual,
         supertile_k=1536,
     )
@@ -767,16 +681,15 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
             q_fp8=q_fp8,
             weights=api_weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             topk=topk,
             expected_num_q_heads=num_heads,
-            workspace=workspace,
+            binding=binding,
             out_indices=actual,
             supertile_k=1536,
         )
     graph.replay()
     torch.cuda.synchronize(device)
-    expected_raw0 = _expected_compressed_index_topk(
+    expected_raw0 = _expected_paged_index_topk(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -792,7 +705,7 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
     prepare([4, 12], [640, 704])
     graph.replay()
     torch.cuda.synchronize(device)
-    expected_raw1 = _expected_compressed_index_topk(
+    expected_raw1 = _expected_paged_index_topk(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,

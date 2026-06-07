@@ -1,4 +1,4 @@
-"""CuTeDSL extend logits kernel for the non-paged NSA contract."""
+"""CuTeDSL contiguous logits kernel for the non-paged NSA contract."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ _WARPS_K = _BLOCK_K // 16
 _WARPS_PER_CTA = _WARPS_Q * _WARPS_K
 _THREADS_PER_CTA = _WARPS_PER_CTA * _WARP_THREADS
 _MAX_Q_HEADS = 64
-_EXTEND_TMA_DESC_CACHE_SIZE = 32
+_CONTIGUOUS_TMA_DESC_CACHE_SIZE = 32
 
 _PREFILL_BLOCK_Q = 32  # Same Q tile size as decode
 _PREFILL_BLOCK_K = 256  # 4x K tile — fewer CTAs, more work per CTA
@@ -84,15 +84,15 @@ _PREFILL512_Q_HEADS_BATCH = 7  # Exp29: BF16 weights free 4KB smem, 10 batches v
 _PREFILL512_H32_Q_HEADS_BATCH = 7
 _PREFILL512_H32_WEIGHT_COLS = 32
 
-_NSA_EXTEND_PREFILL_THRESHOLD_ENV = "B12X_NSA_EXTEND_PREFILL_THRESHOLD"
-_NSA_EXTEND_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
+_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD"
+_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
 _PREFILL512_MIN_Q_ROWS = 1024
 _PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
-_EXTEND_TMA_DESC_WORDS = 16
+_CONTIGUOUS_TMA_DESC_WORDS = 16
 
 
-def _assume_extend_k_tma_source_aligned(t: cute.Tensor) -> cute.Tensor:
+def _assume_contiguous_k_tma_source_aligned(t: cute.Tensor) -> cute.Tensor:
     divby = 128 // t.element_type.width
     strides = []
     for dim, stride in enumerate(t.stride):
@@ -103,11 +103,11 @@ def _assume_extend_k_tma_source_aligned(t: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=tuple(strides)))
 
 
-def _make_extend_k_tma_source(k_quant_bytes: cute.Tensor) -> cute.Tensor:
-    return _assume_extend_k_tma_source_aligned(k_quant_bytes)
+def _make_contiguous_k_tma_source(k_quant_bytes: cute.Tensor) -> cute.Tensor:
+    return _assume_contiguous_k_tma_source_aligned(k_quant_bytes)
 
 
-def _make_extend_k_tma_smem_layout(block_k: int) -> cute.Layout:
+def _make_contiguous_k_tma_smem_layout(block_k: int) -> cute.Layout:
     return cute.make_composed_layout(
         make_swizzle(3, 4, 3),
         0,
@@ -118,22 +118,22 @@ def _make_extend_k_tma_smem_layout(block_k: int) -> cute.Layout:
     )
 
 
-def _make_extend_k_tma_smem_stage_layout(block_k: int) -> cute.Layout:
+def _make_contiguous_k_tma_smem_stage_layout(block_k: int) -> cute.Layout:
     return cute.tile_to_shape(
-        _make_extend_k_tma_smem_layout(block_k),
+        _make_contiguous_k_tma_smem_layout(block_k),
         (block_k, _INDEX_HEAD_DIM, 1),
         (0, 1, 2),
     )
 
 
 @lru_cache(maxsize=16)
-def _dummy_extend_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
+def _dummy_contiguous_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
     return torch.zeros((1,), dtype=torch.int64, device=torch.device("cuda", device_index))
 
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
-        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"{api_name} binding owns runtime tensors and kernel options; "
         f"do not also pass {', '.join(extras)}"
     )
 
@@ -145,15 +145,13 @@ def _require_bound_arg(value, *, api_name: str, name: str):
 
 
 @dataclass(frozen=True, kw_only=True)
-class IndexerExtendLogitsKernelBinding:
+class IndexerContiguousLogitsKernelBinding:
     q_fp8: torch.Tensor
     weights: torch.Tensor
     k_quant: torch.Tensor
     k_scale: torch.Tensor
     k_start: torch.Tensor
     k_end: torch.Tensor
-    contract_phantoms: dict[str, torch.Tensor] | None = None
-    workspace: object | None = None
     preinitialize_invalid_logits: bool = True
     tile_logits: torch.Tensor | None = None
     tile_k_offset: int = 0
@@ -172,10 +170,10 @@ class IndexerExtendLogitsKernelBinding:
     k_tma_prefill_desc_ptrs: torch.Tensor | None = None
 
     def run(self) -> torch.Tensor:
-        return run_extend_logits_kernel(binding=self)
+        return run_contiguous_logits_kernel(binding=self)
 
 
-def build_indexer_extend_logits_kernel_binding(
+def build_indexer_contiguous_logits_kernel_binding(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -183,8 +181,6 @@ def build_indexer_extend_logits_kernel_binding(
     k_scale: torch.Tensor,
     k_start: torch.Tensor,
     k_end: torch.Tensor,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace: object | None = None,
     preinitialize_invalid_logits: bool = True,
     tile_logits: torch.Tensor | None = None,
     tile_k_offset: int = 0,
@@ -201,16 +197,14 @@ def build_indexer_extend_logits_kernel_binding(
     out_view: torch.Tensor | None = None,
     k_tma_desc_ptrs: torch.Tensor | None = None,
     k_tma_prefill_desc_ptrs: torch.Tensor | None = None,
-) -> IndexerExtendLogitsKernelBinding:
-    return IndexerExtendLogitsKernelBinding(
+) -> IndexerContiguousLogitsKernelBinding:
+    return IndexerContiguousLogitsKernelBinding(
         q_fp8=q_fp8,
         weights=weights,
         k_quant=k_quant,
         k_scale=k_scale,
         k_start=k_start,
         k_end=k_end,
-        contract_phantoms=contract_phantoms,
-        workspace=workspace,
         preinitialize_invalid_logits=bool(preinitialize_invalid_logits),
         tile_logits=tile_logits,
         tile_k_offset=int(tile_k_offset),
@@ -323,7 +317,7 @@ def _view_last_dim_as_u32(tensor: torch.Tensor) -> torch.Tensor:
 
 
 @lru_cache(maxsize=1)
-def get_sparse_nsa_extend_shared_storage_cls():
+def get_sparse_nsa_contiguous_shared_storage_cls():
     class SharedStorage:
         pass
 
@@ -355,7 +349,7 @@ def get_sparse_nsa_extend_shared_storage_cls():
 
 
 @lru_cache(maxsize=1)
-def get_sparse_nsa_extend_prefill_shared_storage_cls():
+def get_sparse_nsa_contiguous_prefill_shared_storage_cls():
     class SharedStorage:
         pass
 
@@ -399,7 +393,7 @@ def get_sparse_nsa_extend_prefill_shared_storage_cls():
     return cute.struct(SharedStorage)
 
 
-def _encode_extend_k_tma_descriptor_into(
+def _encode_contiguous_k_tma_descriptor_into(
     k_quant_bytes: torch.Tensor,
     desc: torch.Tensor,
     desc_ptrs: torch.Tensor,
@@ -415,10 +409,10 @@ def _encode_extend_k_tma_descriptor_into(
         raise TypeError(
             f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}"
         )
-    if desc.shape != (_EXTEND_TMA_DESC_WORDS,) or desc.dtype != torch.uint64:
+    if desc.shape != (_CONTIGUOUS_TMA_DESC_WORDS,) or desc.dtype != torch.uint64:
         raise ValueError(
             "desc must be a uint64 tensor with shape "
-            f"({_EXTEND_TMA_DESC_WORDS},), got {tuple(desc.shape)} "
+            f"({_CONTIGUOUS_TMA_DESC_WORDS},), got {tuple(desc.shape)} "
             f"and {desc.dtype}"
         )
     if desc_ptrs.shape != (1,) or desc_ptrs.dtype != torch.int64:
@@ -465,7 +459,7 @@ def _encode_extend_k_tma_descriptor_into(
     return desc, desc_ptrs
 
 
-def _encode_extend_k_tma_descriptor(
+def _encode_contiguous_k_tma_descriptor(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_quant_bytes.ndim != 2 or k_quant_bytes.shape[1] != _INDEX_HEAD_DIM:
@@ -511,7 +505,7 @@ def _encode_extend_k_tma_descriptor(
     return desc, desc_ptrs
 
 
-def _get_cached_extend_k_tma_descriptor(
+def _get_cached_contiguous_k_tma_descriptor(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     key = (
@@ -521,22 +515,22 @@ def _get_cached_extend_k_tma_descriptor(
         str(k_quant_bytes.dtype),
         (k_quant_bytes.device.type, k_quant_bytes.device.index),
     )
-    cache = getattr(_get_cached_extend_k_tma_descriptor, "_cache", None)
+    cache = getattr(_get_cached_contiguous_k_tma_descriptor, "_cache", None)
     if cache is None:
         cache = OrderedDict()
-        setattr(_get_cached_extend_k_tma_descriptor, "_cache", cache)
+        setattr(_get_cached_contiguous_k_tma_descriptor, "_cache", cache)
     cached = cache.get(key)
     if cached is not None:
         cache.move_to_end(key)
         return cached
-    desc = _encode_extend_k_tma_descriptor(k_quant_bytes)
+    desc = _encode_contiguous_k_tma_descriptor(k_quant_bytes)
     cache[key] = desc
-    if len(cache) > _EXTEND_TMA_DESC_CACHE_SIZE:
+    if len(cache) > _CONTIGUOUS_TMA_DESC_CACHE_SIZE:
         cache.popitem(last=False)
     return desc
 
 
-def _encode_extend_k_tma_descriptor_prefill(
+def _encode_contiguous_k_tma_descriptor_prefill(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TMA descriptor for prefill kernel with _PREFILL_BLOCK_K=256 tile."""
@@ -582,7 +576,7 @@ def _encode_extend_k_tma_descriptor_prefill(
     return desc, desc_ptrs
 
 
-def _get_cached_extend_k_tma_descriptor_prefill(
+def _get_cached_contiguous_k_tma_descriptor_prefill(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     key = (
@@ -593,22 +587,22 @@ def _get_cached_extend_k_tma_descriptor_prefill(
         (k_quant_bytes.device.type, k_quant_bytes.device.index),
         "prefill",
     )
-    cache = getattr(_get_cached_extend_k_tma_descriptor_prefill, "_cache", None)
+    cache = getattr(_get_cached_contiguous_k_tma_descriptor_prefill, "_cache", None)
     if cache is None:
         cache = OrderedDict()
-        setattr(_get_cached_extend_k_tma_descriptor_prefill, "_cache", cache)
+        setattr(_get_cached_contiguous_k_tma_descriptor_prefill, "_cache", cache)
     cached = cache.get(key)
     if cached is not None:
         cache.move_to_end(key)
         return cached
-    desc = _encode_extend_k_tma_descriptor_prefill(k_quant_bytes)
+    desc = _encode_contiguous_k_tma_descriptor_prefill(k_quant_bytes)
     cache[key] = desc
-    if len(cache) > _EXTEND_TMA_DESC_CACHE_SIZE:
+    if len(cache) > _CONTIGUOUS_TMA_DESC_CACHE_SIZE:
         cache.popitem(last=False)
     return desc
 
 
-def _encode_extend_k_tma_descriptor_prefill512(
+def _encode_contiguous_k_tma_descriptor_prefill512(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TMA descriptor for the BK=512 prefill kernel's 256-row load subtiles."""
@@ -654,7 +648,7 @@ def _encode_extend_k_tma_descriptor_prefill512(
     return desc, desc_ptrs
 
 
-def _get_cached_extend_k_tma_descriptor_prefill512(
+def _get_cached_contiguous_k_tma_descriptor_prefill512(
     k_quant_bytes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     key = (
@@ -665,23 +659,23 @@ def _get_cached_extend_k_tma_descriptor_prefill512(
         (k_quant_bytes.device.type, k_quant_bytes.device.index),
         "prefill512",
     )
-    cache = getattr(_get_cached_extend_k_tma_descriptor_prefill512, "_cache", None)
+    cache = getattr(_get_cached_contiguous_k_tma_descriptor_prefill512, "_cache", None)
     if cache is None:
         cache = OrderedDict()
-        setattr(_get_cached_extend_k_tma_descriptor_prefill512, "_cache", cache)
+        setattr(_get_cached_contiguous_k_tma_descriptor_prefill512, "_cache", cache)
     cached = cache.get(key)
     if cached is not None:
         cache.move_to_end(key)
         return cached
-    desc = _encode_extend_k_tma_descriptor_prefill512(k_quant_bytes)
+    desc = _encode_contiguous_k_tma_descriptor_prefill512(k_quant_bytes)
     cache[key] = desc
-    if len(cache) > _EXTEND_TMA_DESC_CACHE_SIZE:
+    if len(cache) > _CONTIGUOUS_TMA_DESC_CACHE_SIZE:
         cache.popitem(last=False)
     return desc
 
 
 @cute.jit
-def _issue_extend_k_tma_copy(
+def _issue_contiguous_k_tma_copy(
     load_tma,
     producer_state,
     mbar_ptr,
@@ -695,7 +689,7 @@ def _issue_extend_k_tma_copy(
 
 
 @cute.jit
-def _issue_extend_k_tma_copy_pair(
+def _issue_contiguous_k_tma_copy_pair(
     load_tma0,
     load_tma1,
     producer_state,
@@ -885,7 +879,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         )
 
 
-class SparseNSAExtendLogitsKernel:
+class SparseNSAContiguousLogitsKernel:
     """Ragged logits kernel with Q and weights read from global memory.
 
     Phase 1+2+3: Q/weights from global, warp-ballot liveness, TMA SWIZZLE_128B (no k_linear/repack).
@@ -913,15 +907,15 @@ class SparseNSAExtendLogitsKernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
-        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        k_tma_source = _make_contiguous_k_tma_source(k_quant_bytes)
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             k_tma_source,
-            _make_extend_k_tma_smem_layout(_BLOCK_K),
+            _make_contiguous_k_tma_smem_layout(_BLOCK_K),
             (_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = get_sparse_nsa_extend_shared_storage_cls()
+        SharedStorage = get_sparse_nsa_contiguous_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
@@ -986,7 +980,7 @@ class SparseNSAExtendLogitsKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        SharedStorage = get_sparse_nsa_extend_shared_storage_cls()
+        SharedStorage = get_sparse_nsa_contiguous_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
@@ -995,7 +989,7 @@ class SparseNSAExtendLogitsKernel:
         )
         s_k_tma_stage = cute.make_tensor(
             s_k_perm_bytes.iterator,
-            _make_extend_k_tma_smem_stage_layout(_BLOCK_K),
+            _make_contiguous_k_tma_smem_stage_layout(_BLOCK_K),
         )
         load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_k,
@@ -1049,7 +1043,7 @@ class SparseNSAExtendLogitsKernel:
             if warp_idx == Int32(0):
                 cpasync.prefetch_descriptor(tma_atom_k)
             if warp_idx == Int32(0):
-                _issue_extend_k_tma_copy(
+                _issue_contiguous_k_tma_copy(
                     load_k_tma,
                     producer_state,
                     mbar_ptr_k,
@@ -1419,8 +1413,8 @@ def _prefill_qk_mma_from_smem_q(
         )
 
 
-class SparseNSAExtendLogitsPrefillKernel:
-    """Prefill-specialized extend logits kernel with _PREFILL_BLOCK_K=256.
+class SparseNSAContiguousLogitsPrefillKernel:
+    """Prefill-specialized contiguous logits kernel with _PREFILL_BLOCK_K=256.
 
     Uses 2 Q-warps x 4 K-warps = 256 threads. Each K-warp covers 64 K-rows
     (num_mma_kv=4), so the CTA processes 256 K rows per tile. This quarters the
@@ -1451,15 +1445,15 @@ class SparseNSAExtendLogitsPrefillKernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
-        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        k_tma_source = _make_contiguous_k_tma_source(k_quant_bytes)
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             k_tma_source,
-            _make_extend_k_tma_smem_layout(_PREFILL_BLOCK_K),
+            _make_contiguous_k_tma_smem_layout(_PREFILL_BLOCK_K),
             (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = get_sparse_nsa_extend_prefill_shared_storage_cls()
+        SharedStorage = get_sparse_nsa_contiguous_prefill_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
@@ -1525,7 +1519,7 @@ class SparseNSAExtendLogitsPrefillKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        SharedStorage = get_sparse_nsa_extend_prefill_shared_storage_cls()
+        SharedStorage = get_sparse_nsa_contiguous_prefill_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
@@ -1534,7 +1528,7 @@ class SparseNSAExtendLogitsPrefillKernel:
         )
         s_k_tma_stage = cute.make_tensor(
             s_k_perm_bytes.iterator,
-            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+            _make_contiguous_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
         )
         load_k_tma, _, _ = cute_copy.tma_get_copy_fn(
             tma_atom_k,
@@ -1598,7 +1592,7 @@ class SparseNSAExtendLogitsPrefillKernel:
             if warp_idx == Int32(0):
                 cpasync.prefetch_descriptor(tma_atom_k)
             if warp_idx == Int32(0):
-                _issue_extend_k_tma_copy(
+                _issue_contiguous_k_tma_copy(
                     load_k_tma,
                     producer_state,
                     mbar_ptr_k,
@@ -1860,7 +1854,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                             logits_out[q_row, k_row] = Float32(-Float32.inf)
 
 
-class SparseNSAExtendLogitsPrefill512Kernel:
+class SparseNSAContiguousLogitsPrefill512Kernel:
     """Experimental prefill scorer with _PREFILL512_BLOCK_K=512.
 
     This halves the K-CTA count versus the BK=256 prefill scorer. To keep
@@ -1896,11 +1890,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         write_invalid_logits: Int32,
         stream: cuda.CUstream,
     ):
-        k_tma_source = _make_extend_k_tma_source(k_quant_bytes)
+        k_tma_source = _make_contiguous_k_tma_source(k_quant_bytes)
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             k_tma_source,
-            _make_extend_k_tma_smem_layout(_PREFILL_BLOCK_K),
+            _make_contiguous_k_tma_smem_layout(_PREFILL_BLOCK_K),
             (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
@@ -1984,11 +1978,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         )
         s_k_tma_stage0 = cute.make_tensor(
             s_k_perm_bytes.iterator,
-            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+            _make_contiguous_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
         )
         s_k_tma_stage1 = cute.make_tensor(
             s_k_perm_bytes.iterator + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
-            _make_extend_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
+            _make_contiguous_k_tma_smem_stage_layout(_PREFILL_BLOCK_K),
         )
         g_k_tma_tile = cute.local_tile(
             k_tma_tensor,
@@ -2072,7 +2066,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 cpasync.prefetch_descriptor(tma_atom_k)
             if warp_idx == Int32(0):
                 k_subtile_idx = k_tile_idx * Int32(2)
-                _issue_extend_k_tma_copy_pair(
+                _issue_contiguous_k_tma_copy_pair(
                     load_k_tma0,
                     load_k_tma1,
                     producer_state,
@@ -2386,35 +2380,35 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_prefill_kernel(
+def _build_sparse_nsa_contiguous_prefill_kernel(
     *, tiled_output: bool = False
-) -> SparseNSAExtendLogitsPrefillKernel:
-    return SparseNSAExtendLogitsPrefillKernel(tiled_output=tiled_output)
+) -> SparseNSAContiguousLogitsPrefillKernel:
+    return SparseNSAContiguousLogitsPrefillKernel(tiled_output=tiled_output)
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_prefill512_kernel(
+def _build_sparse_nsa_contiguous_prefill512_kernel(
     *,
     tiled_output: bool = False,
     num_heads: int = 0,
-) -> SparseNSAExtendLogitsPrefill512Kernel:
+) -> SparseNSAContiguousLogitsPrefill512Kernel:
     if int(num_heads) == _PREFILL512_H32_WEIGHT_COLS:
-        return SparseNSAExtendLogitsPrefill512Kernel(
+        return SparseNSAContiguousLogitsPrefill512Kernel(
             tiled_output=tiled_output,
             q_heads_batch=_PREFILL512_H32_Q_HEADS_BATCH,
         )
-    return SparseNSAExtendLogitsPrefill512Kernel(tiled_output=tiled_output)
+    return SparseNSAContiguousLogitsPrefill512Kernel(tiled_output=tiled_output)
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_kernel(
+def _build_sparse_nsa_contiguous_kernel(
     *, tiled_output: bool = False
-) -> SparseNSAExtendLogitsKernel:
-    return SparseNSAExtendLogitsKernel(tiled_output=tiled_output)
+) -> SparseNSAContiguousLogitsKernel:
+    return SparseNSAContiguousLogitsKernel(tiled_output=tiled_output)
 
 
-def _use_sparse_nsa_extend_prefill(valid_q_rows: int) -> bool:
-    prefill_env = os.environ.get(_NSA_EXTEND_PREFILL_THRESHOLD_ENV, None)
+def _use_sparse_nsa_contiguous_prefill(valid_q_rows: int) -> bool:
+    prefill_env = os.environ.get(_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV, None)
     if prefill_env is not None:
         return int(prefill_env) > 0
     return valid_q_rows >= 256
@@ -2438,13 +2432,13 @@ def _prefill512_unsupported_reasons(
     return reasons
 
 
-def resolve_extend_prefill_block_k(
+def resolve_contiguous_prefill_block_k(
     *,
     valid_q_rows: int,
     k_rows: int,
     num_heads: int,
 ) -> int | None:
-    """Resolve the extend scorer path for the current shape.
+    """Resolve the contiguous scorer path for the current shape.
 
     Returns None for the decode scorer, 256 for the existing prefill tile, or
     512 for the larger experimental prefill tile.
@@ -2455,11 +2449,11 @@ def resolve_extend_prefill_block_k(
     num_heads = int(num_heads)
     if valid_q_rows <= 0 or k_rows <= 0:
         return None
-    if not _use_sparse_nsa_extend_prefill(valid_q_rows):
+    if not _use_sparse_nsa_contiguous_prefill(valid_q_rows):
         return None
 
     block_k_env = (
-        os.environ.get(_NSA_EXTEND_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
+        os.environ.get(_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
     )
     if block_k_env in ("", "auto"):
         return (
@@ -2481,16 +2475,16 @@ def resolve_extend_prefill_block_k(
         )
         if reasons:
             raise ValueError(
-                f"{_NSA_EXTEND_PREFILL_BLOCK_K_ENV}=512 is unsupported for this shape: "
+                f"{_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV}=512 is unsupported for this shape: "
                 + "; ".join(reasons)
             )
         return _PREFILL512_BLOCK_K
     raise ValueError(
-        f"{_NSA_EXTEND_PREFILL_BLOCK_K_ENV} must be auto, 256, or 512; got {block_k_env!r}"
+        f"{_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV} must be auto, 256, or 512; got {block_k_env!r}"
     )
 
 
-def supports_extend_logits_kernel(
+def supports_contiguous_logits_kernel(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -2537,7 +2531,7 @@ def supports_extend_logits_kernel(
     return True
 
 
-def run_extend_logits_kernel(
+def run_contiguous_logits_kernel(
     *,
     q_fp8: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
@@ -2545,14 +2539,12 @@ def run_extend_logits_kernel(
     k_scale: torch.Tensor | None = None,
     k_start: torch.Tensor | None = None,
     k_end: torch.Tensor | None = None,
-    contract_phantoms: dict[str, torch.Tensor] | None = None,
-    workspace=None,
     preinitialize_invalid_logits: bool | None = None,
     tile_logits: torch.Tensor | None = None,
     tile_k_offset: int | None = None,
     tile_num_k_tiles: int | None = None,
     prefill_block_k: int | None = None,
-    binding: IndexerExtendLogitsKernelBinding | None = None,
+    binding: IndexerContiguousLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     staged_binding = binding
     if binding is not None:
@@ -2565,8 +2557,6 @@ def run_extend_logits_kernel(
                 ("k_scale", k_scale),
                 ("k_start", k_start),
                 ("k_end", k_end),
-                ("contract_phantoms", contract_phantoms),
-                ("workspace", workspace),
                 ("preinitialize_invalid_logits", preinitialize_invalid_logits),
                 ("tile_logits", tile_logits),
                 ("tile_k_offset", tile_k_offset),
@@ -2576,35 +2566,33 @@ def run_extend_logits_kernel(
             if value is not None
         ]
         if extras:
-            _raise_binding_extras("run_extend_logits_kernel", extras)
+            _raise_binding_extras("run_contiguous_logits_kernel", extras)
         q_fp8 = binding.q_fp8
         weights = binding.weights
         k_quant = binding.k_quant
         k_scale = binding.k_scale
         k_start = binding.k_start
         k_end = binding.k_end
-        contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
         preinitialize_invalid_logits = binding.preinitialize_invalid_logits
         tile_logits = binding.tile_logits
         tile_k_offset = binding.tile_k_offset
         tile_num_k_tiles = binding.tile_num_k_tiles
         prefill_block_k = binding.prefill_block_k
 
-    q_fp8 = _require_bound_arg(q_fp8, api_name="run_extend_logits_kernel", name="q_fp8")
+    q_fp8 = _require_bound_arg(q_fp8, api_name="run_contiguous_logits_kernel", name="q_fp8")
     weights = _require_bound_arg(
-        weights, api_name="run_extend_logits_kernel", name="weights"
+        weights, api_name="run_contiguous_logits_kernel", name="weights"
     )
     k_quant = _require_bound_arg(
-        k_quant, api_name="run_extend_logits_kernel", name="k_quant"
+        k_quant, api_name="run_contiguous_logits_kernel", name="k_quant"
     )
     k_scale = _require_bound_arg(
-        k_scale, api_name="run_extend_logits_kernel", name="k_scale"
+        k_scale, api_name="run_contiguous_logits_kernel", name="k_scale"
     )
     k_start = _require_bound_arg(
-        k_start, api_name="run_extend_logits_kernel", name="k_start"
+        k_start, api_name="run_contiguous_logits_kernel", name="k_start"
     )
-    k_end = _require_bound_arg(k_end, api_name="run_extend_logits_kernel", name="k_end")
+    k_end = _require_bound_arg(k_end, api_name="run_contiguous_logits_kernel", name="k_end")
     preinitialize_invalid_logits = (
         True
         if preinitialize_invalid_logits is None
@@ -2612,7 +2600,7 @@ def run_extend_logits_kernel(
     )
     tile_k_offset = 0 if tile_k_offset is None else int(tile_k_offset)
 
-    if not supports_extend_logits_kernel(
+    if not supports_contiguous_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,
         k_quant=k_quant,
@@ -2621,7 +2609,7 @@ def run_extend_logits_kernel(
         k_end=k_end,
     ):
         raise ValueError(
-            "sparse NSA extend logits kernel only supports the exact CUDA FP8 contract"
+            "sparse NSA contiguous logits kernel only supports the exact CUDA FP8 contract"
         )
 
     q_rows_total = int(q_fp8.shape[0])
@@ -2637,7 +2625,7 @@ def run_extend_logits_kernel(
     # BK=512 is deliberately limited to target-ish long-prefill shapes; other
     # shapes keep the validated BK=256 prefill tile.
     if prefill_block_k is None:
-        _prefill_block_k = resolve_extend_prefill_block_k(
+        _prefill_block_k = resolve_contiguous_prefill_block_k(
             valid_q_rows=valid_q_rows,
             k_rows=k_rows,
             num_heads=int(q_fp8.shape[1]),
@@ -2727,7 +2715,7 @@ def run_extend_logits_kernel(
         missing = [name for name, value in required_staged.items() if value is None]
         if missing:
             raise ValueError(
-                "staged indexer extend binding is missing "
+                "staged indexer contiguous binding is missing "
                 + ", ".join(missing)
             )
         q_u32 = staged_binding.q_u32
@@ -2739,34 +2727,6 @@ def run_extend_logits_kernel(
         k_end_kernel = staged_binding.k_end_kernel
         out_kernel = staged_binding.out_kernel
         out_view = staged_binding.out_view
-    elif workspace is not None:
-        staged = workspace.stage_indexer_extend(
-            q_fp8=q_fp8,
-            weights=weights,
-            k_quant=k_quant,
-            k_scale=k_scale,
-            k_start=k_start,
-            k_end=k_end,
-            preinitialize_invalid_logits=preinitialize_invalid_logits,
-            requires_full_logits=not (_tiled_output and _use_prefill),
-        )
-        q_u32 = staged["q_u32"]
-        q_bytes_kernel = staged.get("q_bytes")
-        if q_bytes_kernel is None:
-            if not q_fp8.is_contiguous():
-                raise ValueError(
-                    "workspace-backed indexer extend requires contiguous q_fp8"
-                )
-            q_bytes_kernel = q_fp8.view(torch.uint8)
-        weights_kernel = staged["weights"]
-        k_quant_bytes = staged["k_quant_bytes"]
-        k_scale_kernel = staged["k_scales"]
-        k_start_kernel = staged["k_start"]
-        k_end_kernel = staged["k_end"]
-        out_kernel = staged["logits"]
-        out_view = staged["logits_view"]
-        if contract_phantoms is None:
-            contract_phantoms = workspace.get_indexer_contract_phantoms()
     else:
         if _tiled_output and _use_prefill:
             # In tiled mode, no need for the full scatter matrix
@@ -2805,17 +2765,27 @@ def run_extend_logits_kernel(
         return out_view
 
     device_index = q_fp8.device.index or 0
-    k_tma_desc_ptrs = _dummy_extend_k_tma_desc_ptrs(device_index)
+    k_tma_desc_ptrs = (
+        staged_binding.k_tma_prefill_desc_ptrs
+        if _use_prefill
+        and staged_binding is not None
+        and staged_binding.k_tma_prefill_desc_ptrs is not None
+        else (
+            staged_binding.k_tma_desc_ptrs
+            if staged_binding is not None and staged_binding.k_tma_desc_ptrs is not None
+            else _dummy_contiguous_k_tma_desc_ptrs(device_index)
+        )
+    )
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
-        kernel = _build_sparse_nsa_extend_prefill512_kernel(
+        kernel = _build_sparse_nsa_contiguous_prefill512_kernel(
             tiled_output=_tiled_output,
             num_heads=int(q_fp8.shape[1]),
         )
     elif _use_prefill:
-        kernel = _build_sparse_nsa_extend_prefill_kernel(tiled_output=_tiled_output)
+        kernel = _build_sparse_nsa_contiguous_prefill_kernel(tiled_output=_tiled_output)
     else:
-        kernel = _build_sparse_nsa_extend_kernel(tiled_output=_tiled_output)
+        kernel = _build_sparse_nsa_contiguous_kernel(tiled_output=_tiled_output)
 
     if tile_logits is not None and _tiled_output:
         tile_logits_kernel = tile_logits
@@ -2862,7 +2832,6 @@ def run_extend_logits_kernel(
             write_invalid_logits,
             current_cuda_stream(),
         )
-    _cp = contract_phantoms or {}
     if _use_prefill:
         _prefill_cache_variant = (
             "prefill512_h32"
@@ -2874,43 +2843,43 @@ def run_extend_logits_kernel(
         )
         cache_key = (
             _tensor_compile_key(
-                "extend_q_u32", _cp.get("extend_q_u32", q_u32), dynamic_dims=(0,)
+                "contiguous_q_u32", q_u32, dynamic_dims=(0,)
             ),
             _tensor_compile_key(
-                "extend_q_bytes",
-                _cp.get("extend_q_bytes", q_bytes_kernel),
+                "contiguous_q_bytes",
+                q_bytes_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_weights",
-                _cp.get("extend_weights", weights_kernel),
+                "contiguous_weights",
+                weights_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_quant",
-                _cp.get("extend_k_quant", k_quant_bytes),
+                "contiguous_k_quant",
+                k_quant_bytes,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
             _tensor_compile_key(
-                "extend_k_scale",
-                _cp.get("extend_k_scale", k_scale_kernel),
+                "contiguous_k_scale",
+                k_scale_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_start",
-                _cp.get("extend_k_start", k_start_kernel),
+                "contiguous_k_start",
+                k_start_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_end", _cp.get("extend_k_end", k_end_kernel), dynamic_dims=(0,)
+                "contiguous_k_end", k_end_kernel, dynamic_dims=(0,)
             ),
             _tensor_compile_key(
-                "extend_logits", _cp.get("extend_logits", out_kernel), dynamic_dims=(0,)
+                "contiguous_logits", out_kernel, dynamic_dims=(0,)
             ),
             _flat_tensor_compile_key(
-                "extend_tile_logits",
-                _cp.get("extend_tile_logits", tile_logits_kernel),
+                "contiguous_tile_logits",
+                tile_logits_kernel,
                 dynamic=True,
             ),
             (
@@ -2921,42 +2890,42 @@ def run_extend_logits_kernel(
     else:
         cache_key = (
             _tensor_compile_key(
-                "extend_q_u32", _cp.get("extend_q_u32", q_u32), dynamic_dims=(0,)
+                "contiguous_q_u32", q_u32, dynamic_dims=(0,)
             ),
             _tensor_compile_key(
-                "extend_weights",
-                _cp.get("extend_weights", weights_kernel),
+                "contiguous_weights",
+                weights_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_quant",
-                _cp.get("extend_k_quant", k_quant_bytes),
+                "contiguous_k_quant",
+                k_quant_bytes,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
             _tensor_compile_key(
-                "extend_k_scale",
-                _cp.get("extend_k_scale", k_scale_kernel),
+                "contiguous_k_scale",
+                k_scale_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_start",
-                _cp.get("extend_k_start", k_start_kernel),
+                "contiguous_k_start",
+                k_start_kernel,
                 dynamic_dims=(0,),
             ),
             _tensor_compile_key(
-                "extend_k_end", _cp.get("extend_k_end", k_end_kernel), dynamic_dims=(0,)
+                "contiguous_k_end", k_end_kernel, dynamic_dims=(0,)
             ),
             _tensor_compile_key(
-                "extend_logits", _cp.get("extend_logits", out_kernel), dynamic_dims=(0,)
+                "contiguous_logits", out_kernel, dynamic_dims=(0,)
             ),
             _flat_tensor_compile_key(
-                "extend_tile_logits", tile_logits_kernel, dynamic=True
+                "contiguous_tile_logits", tile_logits_kernel, dynamic=True
             ),
             ("decode", _tiled_output),
         )
     compile_spec = KernelCompileSpec.from_key(
-        "attention.indexer.extend_logits",
+        "attention.indexer.contiguous_logits",
         2,
         cache_key,
     )

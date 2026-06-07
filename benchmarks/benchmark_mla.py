@@ -22,7 +22,7 @@ from b12x.attention.mla.split import (
     select_sparse_mla_split_decode_config,
 )
 from b12x.attention.indexer.reference import (
-    extend_logits_reference,
+    contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
@@ -38,7 +38,7 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.attention.indexer.extend_kernel import (
+from b12x.attention.indexer.contiguous_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_Q,
@@ -48,15 +48,15 @@ from b12x.attention.indexer.persistent_topk import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
-from b12x.integration.indexer import (
-    IndexerExtendMetadata,
+from b12x.attention.indexer import (
+    IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
-    resolve_extend_prefill_block_k,
+    resolve_contiguous_prefill_block_k,
     paged_decode_logits,
-    extend_logits,
-    extend_tiled_topk,
+    contiguous_logits,
+    contiguous_tiled_topk,
     uses_paged_mqa_schedule,
 )
 
@@ -99,7 +99,7 @@ _RAGGED_TOPK_CHUNK = 4096
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
-_NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
+_NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
 _NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
@@ -1318,18 +1318,18 @@ def _run_prefill_or_verify_case(
         if use_graph_schedule_metadata
         else None
     )
-    live_extend_lengths = torch.arange(
+    live_contiguous_lengths = torch.arange(
         case.cache_len - case.q_len + 1,
         case.cache_len + 1,
         dtype=torch.int32,
         device=device,
     ).repeat(case.batch_size)
-    live_extend_k_start = torch.repeat_interleave(
+    live_contiguous_k_start = torch.repeat_interleave(
         torch.arange(case.batch_size, dtype=torch.int32, device=device) * case.cache_len,
         case.q_len,
     )
-    graph_extend_k_start = torch.empty_like(live_extend_k_start)
-    graph_extend_lengths = torch.empty_like(live_extend_lengths)
+    graph_contiguous_k_start = torch.empty_like(live_contiguous_k_start)
+    graph_contiguous_lengths = torch.empty_like(live_contiguous_lengths)
 
     def prepare_verify_graph() -> None:
         graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
@@ -1342,13 +1342,13 @@ def _run_prefill_or_verify_case(
                 cfg.page_size,
                 out=graph_schedule_metadata,
             )
-        graph_extend_k_start.copy_(live_extend_k_start)
-        graph_extend_lengths.copy_(live_extend_lengths)
+        graph_contiguous_k_start.copy_(live_contiguous_k_start)
+        graph_contiguous_lengths.copy_(live_contiguous_lengths)
 
     prepare_verify_graph()
-    extend_k_nope = k_nope[pool_locs.to(torch.long)]
-    extend_k_rope = k_rope[pool_locs.to(torch.long)]
-    extend_kv_cache = pack_mla_kv_cache_reference(extend_k_nope, extend_k_rope)
+    contiguous_k_nope = k_nope[pool_locs.to(torch.long)]
+    contiguous_k_rope = k_rope[pool_locs.to(torch.long)]
+    extend_kv_cache = pack_mla_kv_cache_reference(contiguous_k_nope, contiguous_k_rope)
     extend_kv_fp8 = _make_extend_kv_fp8(
         index_k_cache=index_k_cache,
         real_page_table=base_real_page_table,
@@ -1432,13 +1432,13 @@ def _run_prefill_or_verify_case(
         mla_metadata_mode = "target_verify"
         mla_workspace_mode = "verify"
     else:
-        extend_indexer_metadata = IndexerExtendMetadata(
-            k_start=graph_extend_k_start,
-            k_end=graph_extend_k_start + graph_extend_lengths,
+        extend_indexer_metadata = IndexerContiguousMetadata(
+            k_start=graph_contiguous_k_start,
+            k_end=graph_contiguous_k_start + graph_contiguous_lengths,
         )
         preinitialize_indexer_logits = not skip_indexer_logits_fill
 
-        _prefill_block_k = resolve_extend_prefill_block_k(
+        _prefill_block_k = resolve_contiguous_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
             num_heads=cfg.index_n_heads,
@@ -1460,7 +1460,7 @@ def _run_prefill_or_verify_case(
             )
 
         def run_indexer_logits():
-            result = extend_logits(
+            result = contiguous_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
@@ -1477,8 +1477,8 @@ def _run_prefill_or_verify_case(
             topk_val = min(case.topk, case.cache_len)
             _, topk_indices = run_tiled_supertile_topk(
                 tile_logits=tl,
-                k_start=graph_extend_k_start,
-                k_end=graph_extend_k_start + graph_extend_lengths,
+                k_start=graph_contiguous_k_start,
+                k_end=graph_contiguous_k_start + graph_contiguous_lengths,
                 topk=topk_val,
                 block_q=_block_q,
                 block_k=_prefill_block_k,
@@ -1491,14 +1491,14 @@ def _run_prefill_or_verify_case(
             else:
                 return _select_ragged_topk_from_logits(
                     logits=logits_for_topk,
-                    k_start=graph_extend_k_start,
-                    lengths=graph_extend_lengths,
+                    k_start=graph_contiguous_k_start,
+                    lengths=graph_contiguous_lengths,
                     topk=case.topk,
                 )
 
         def run_indexer():
             if _use_tiled_output:
-                return extend_tiled_topk(
+                return contiguous_tiled_topk(
                     q_fp8=q_fp8,
                     weights=weights,
                     kv_fp8=extend_kv_fp8,
@@ -1508,8 +1508,8 @@ def _run_prefill_or_verify_case(
             result = run_indexer_logits()
             return _select_ragged_topk_from_logits(
                 logits=result,
-                k_start=graph_extend_k_start,
-                lengths=graph_extend_lengths,
+                k_start=graph_contiguous_k_start,
+                lengths=graph_contiguous_lengths,
                 topk=case.topk,
             )
 
@@ -1521,8 +1521,8 @@ def _run_prefill_or_verify_case(
             torch.cuda.synchronize()
             sample_rows = sorted({0, logits_for_topk.shape[0] // 2, logits_for_topk.shape[0] - 1})
             for sample_row in sample_rows:
-                row_start = int(graph_extend_k_start[sample_row].item())
-                row_end = int((graph_extend_k_start[sample_row] + graph_extend_lengths[sample_row]).item())
+                row_start = int(graph_contiguous_k_start[sample_row].item())
+                row_end = int((graph_contiguous_k_start[sample_row] + graph_contiguous_lengths[sample_row]).item())
                 if row_start > 0 and not torch.isneginf(logits_for_topk[sample_row, :row_start]).all():
                     raise BenchmarkFailure(case, f"no-fill logits prefix was not -inf for row {sample_row}")
                 if row_end < logits_for_topk.shape[1] and not torch.isneginf(
@@ -1530,17 +1530,17 @@ def _run_prefill_or_verify_case(
                 ).all():
                     raise BenchmarkFailure(case, f"no-fill logits suffix was not -inf for row {sample_row}")
         if not use_runtime_ragged_topk:
-            expected_logits = extend_logits_reference(
+            expected_logits = contiguous_logits_reference(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
-                k_start=graph_extend_k_start,
-                k_end=graph_extend_k_start + graph_extend_lengths,
+                k_start=graph_contiguous_k_start,
+                k_end=graph_contiguous_k_start + graph_contiguous_lengths,
             )
             expected_topk = _select_ragged_topk_from_logits(
                 logits=expected_logits,
-                k_start=graph_extend_k_start,
-                lengths=graph_extend_lengths,
+                k_start=graph_contiguous_k_start,
+                lengths=graph_contiguous_lengths,
                 topk=case.topk,
             )
             torch.cuda.synchronize()
@@ -1556,8 +1556,8 @@ def _run_prefill_or_verify_case(
             del expected_topk
         mla_selected_indices = actual_topk
         mla_kv_cache = extend_kv_cache
-        mla_k_nope = extend_k_nope
-        mla_k_rope = extend_k_rope
+        mla_k_nope = contiguous_k_nope
+        mla_k_rope = contiguous_k_rope
         mla_metadata_mode = "extend"
         mla_workspace_mode = "extend"
 
@@ -1688,8 +1688,8 @@ def _run_prefill_or_verify_case(
         def run_indexer_topk():
             return _select_ragged_topk_from_logits(
                 logits=logits_for_topk,
-                k_start=graph_extend_k_start,
-                lengths=graph_extend_lengths,
+                k_start=graph_contiguous_k_start,
+                lengths=graph_contiguous_lengths,
                 topk=case.topk,
             )
 
@@ -1796,7 +1796,7 @@ def _run_prefill_or_verify_case(
     )
     indexer_prefill_block_k = None
     if case.mode == "prefill":
-        indexer_prefill_block_k = resolve_extend_prefill_block_k(
+        indexer_prefill_block_k = resolve_contiguous_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
             num_heads=cfg.index_n_heads,
@@ -2036,7 +2036,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("auto", "256", "512"),
         default=None,
         help=(
-            "override B12X_NSA_EXTEND_PREFILL_BLOCK_K for extend/prefill NSA logits; "
+            "override B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K for contiguous/prefill NSA logits; "
             "default preserves the existing environment"
         ),
     )

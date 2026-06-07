@@ -8,13 +8,13 @@ import pytest
 import torch
 
 from b12x.attention.indexer.reference import pack_index_k_cache_reference
-from b12x.integration.indexer import (
-    IndexerExtendMetadata,
+from b12x.attention.indexer import (
+    IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
     paged_decode_logits,
-    extend_logits,
+    contiguous_logits,
 )
 
 
@@ -622,11 +622,11 @@ def test_sglang_b12x_indexer_ragged_boundary_matches_b12x_reference() -> None:
         k_fp8_bytes.view(torch.float8_e4m3fn),
         k_scale_bytes.view(torch.float32).squeeze(-1),
     )
-    expected_logits = extend_logits(
+    expected_logits = contiguous_logits(
         q_fp8=q_fp8[: k_start.numel()],
         weights=weights[: k_start.numel()],
         kv_fp8=kv_fp8,
-        metadata=IndexerExtendMetadata(
+        metadata=IndexerContiguousMetadata(
             k_start=k_start,
             k_end=k_end,
         ),
