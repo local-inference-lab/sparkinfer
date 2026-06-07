@@ -958,7 +958,11 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 
 def _select_dynamic_tile_mn(
-    routed_rows: int, n: int, quant_mode: str = "nvfp4",
+    routed_rows: int,
+    n: int,
+    quant_mode: str = "nvfp4",
+    *,
+    activation: str = "silu",
 ) -> Tuple[int, int]:
     """Tile planner for the dynamic kernel.
 
@@ -977,6 +981,11 @@ def _select_dynamic_tile_mn(
     ovr = _dynamic_tile_mn_override()
     if ovr is not None:
         return ovr
+    activation = _get_activation_kernel_spec(
+        activation, quant_mode=quant_mode
+    ).activation
+    if activation == "relu2":
+        return (_LEVEL_TILE_M, _LEVEL_TILE_N)
     routed_rows = max(1, int(routed_rows))
     if routed_rows <= _DYNAMIC_SMALL_TILE_MAX_PAIRS:
         tile_m = 16
@@ -1911,7 +1920,7 @@ def _plan_core_workspace(
     # Tile planner: must match the kernel's choice (keyed identically on the
     # workspace capacity) so the grouped task/scale scratch is sized correctly.
     dynamic_tile_m, dynamic_tile_n = _select_dynamic_tile_mn(
-        routed_rows, n, quant_mode
+        routed_rows, n, quant_mode, activation=activation_spec.activation
     )
     if dynamic_physical_tiles is None or dynamic_task_capacity is None:
         dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(
@@ -2661,7 +2670,7 @@ def _make_workspace_plan(
         # indexes. Must NOT use the bare _dynamic_tile_m (would size for 128 while
         # the kernel runs the planner's tile -> scratch under-size).
         dynamic_tile_m, dynamic_tile_n = _select_dynamic_tile_mn(
-            routed_rows, n, quant_mode
+            routed_rows, n, quant_mode, activation=activation
         )
         dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry(
             state_E,
@@ -4674,7 +4683,9 @@ def _get_dynamic_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     dynamic_down_scale = _dynamic_down_scale_enabled()
     # Tile planner (same routed_rows as the scratch plan -> consistent choice).
-    mma_tiler_mn = _select_dynamic_tile_mn(m * num_topk, n, quant_mode)
+    mma_tiler_mn = _select_dynamic_tile_mn(
+        m * num_topk, n, quant_mode, activation=activation_spec.activation
+    )
     # Gated FC1 swap_ab: a non-128 (but 32-aligned) per-shard intermediate needs
     # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
     # inside one SF atom (env override for dev: B12X_DYNAMIC_SWAP_AB=0/1).
@@ -5052,7 +5063,10 @@ def _launch_dynamic_flat(
         _gptr(cutlass.Float32, token_weights, 4),
         m,
         max_rows,
-        physical_tiles_capacity * _select_dynamic_tile_mn(m * num_topk, n, quant_mode)[0],
+        physical_tiles_capacity
+        * _select_dynamic_tile_mn(
+            m * num_topk, n, quant_mode, activation=activation
+        )[0],
         task_capacity,
         physical_tiles_capacity,
         mac,

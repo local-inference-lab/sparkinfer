@@ -362,12 +362,18 @@ def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
     snapshots_root = cache_root / "snapshots"
     if not snapshots_root.is_dir():
         return None
+    snapshots = sorted(path for path in snapshots_root.iterdir() if path.is_dir())
     main_ref = cache_root / "refs" / "main"
     if main_ref.is_file():
         candidate = snapshots_root / main_ref.read_text().strip()
-        if candidate.is_dir():
+        if candidate.is_dir() and (candidate / "model.safetensors.index.json").is_file():
             return candidate
-    snapshots = sorted(path for path in snapshots_root.iterdir() if path.is_dir())
+    indexed_snapshots = [
+        path for path in snapshots
+        if (path / "model.safetensors.index.json").is_file()
+    ]
+    if indexed_snapshots:
+        return indexed_snapshots[-1]
     if snapshots:
         return snapshots[-1]
     return None

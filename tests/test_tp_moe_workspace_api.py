@@ -279,9 +279,10 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+    chunk_limit = 9
     x, topk_ids, topk_weights = make_routed_inputs(
         spec,
-        _dynamic_token_count(spec),
+        chunk_limit * 2,
         seed=321,
         device=device,
     )
@@ -314,7 +315,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     torch.cuda.synchronize(device)
 
     pool = allocate_tp_moe_workspace_pool()
-    monkeypatch.setattr(tp_moe, "_dynamic_token_chunk_limit", lambda *_args: 13)
+    monkeypatch.setattr(tp_moe, "_dynamic_token_chunk_limit", lambda *_args: chunk_limit)
     actual = b12x_moe_fp4(
         x,
         weights.w13_input_scale_quant_per_expert,
@@ -397,7 +398,7 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
         )
 
 
-def test_static_workspace_accepts_smaller_logical_requests() -> None:
+def test_micro_workspace_accepts_smaller_logical_requests() -> None:
     require_sm120()
     _require_model_weights()
 
@@ -406,7 +407,7 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x_large, topk_ids_large, topk_weights_large = make_routed_inputs(spec, 12, seed=900, device=device)
+    x_large, topk_ids_large, topk_weights_large = make_routed_inputs(spec, 6, seed=900, device=device)
     x_small, topk_ids_small, topk_weights_small = make_routed_inputs(spec, 1, seed=901, device=device)
 
     large_workspace = allocate_tp_moe_workspace(
@@ -466,7 +467,7 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
     assert metrics.cos > 0.9998
 
 
-def test_static_workspace_pool_reuses_largest_capacity() -> None:
+def test_micro_workspace_pool_reuses_largest_capacity() -> None:
     require_sm120()
     _require_model_weights()
 
@@ -475,7 +476,7 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x_large, topk_ids_large, topk_weights_large = make_routed_inputs(spec, 12, seed=910, device=device)
+    x_large, topk_ids_large, topk_weights_large = make_routed_inputs(spec, 6, seed=910, device=device)
     x_small, topk_ids_small, topk_weights_small = make_routed_inputs(spec, 2, seed=911, device=device)
     pool = allocate_tp_moe_workspace_pool()
 
@@ -630,12 +631,18 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     assert isinstance(workspace, tp_moe.TPDynamicWorkspace)
 
     n = spec.intermediate_size // spec.tp_size
+    tile_m, tile_n = tp_moe._select_dynamic_tile_mn(
+        x.shape[0] * spec.top_k,
+        n,
+    )
     max_phys_tiles, _, max_tasks = tp_moe._dynamic_task_geometry(
         spec.num_experts,
         n,
         x.shape[0] * spec.top_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
     )
-    rows_padded = max_phys_tiles * tp_moe._LEVEL_TILE_M
+    rows_padded = max_phys_tiles * tile_m
     cols_pad_k = tp_moe.align_up(spec.hidden_size // tp_moe._NVFP4_BLOCK_SIZE, 4)
 
     assert tuple(workspace.token_map.shape) == (rows_padded,)
@@ -915,10 +922,16 @@ def test_dynamic_workspace_pool_uses_capacity_geometry() -> None:
     assert len(pool.workspaces) == 1
     pooled_workspace = next(iter(pool.workspaces.values()))
     assert isinstance(pooled_workspace, tp_moe.TPDynamicWorkspace)
+    tile_m, tile_n = tp_moe._select_dynamic_tile_mn(
+        x.shape[0] * spec.top_k,
+        spec.intermediate_size // spec.tp_size,
+    )
     expected_tiles, _, expected_tasks = tp_moe._dynamic_task_geometry(
         spec.num_experts,
         spec.intermediate_size // spec.tp_size,
         x.shape[0] * spec.top_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
     )
     assert pooled_workspace.routed_rows_capacity == x.shape[0] * spec.top_k
     assert pooled_workspace.max_rows == tp_moe.align_up(x.shape[0] * spec.top_k, tp_moe._LEVEL_TILE_M)
@@ -926,7 +939,7 @@ def test_dynamic_workspace_pool_uses_capacity_geometry() -> None:
     assert pooled_workspace.task_capacity == expected_tasks
     assert tuple(pooled_workspace.packed_input.shape) == (
         1,
-        expected_tiles * tp_moe._LEVEL_TILE_M,
+        expected_tiles * tile_m,
         spec.hidden_size // 2,
     )
 
