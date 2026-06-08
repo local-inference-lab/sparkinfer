@@ -23,6 +23,9 @@ from b12x.attention.mla.compressed_reference import (
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
 )
+from b12x.attention.mla.compressed_config import (
+    compressed_mla_split_config_for_contract,
+)
 from b12x.integration.mla import (
     clear_mla_caches,
     compressed_mla_decode_forward,
@@ -213,6 +216,24 @@ def test_compressed_mla_page_byte_widths_match_padded_layout() -> None:
 def test_compressed_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
     signature = inspect.signature(compressed_mla_decode_forward)
     assert signature.parameters["expected_num_q_heads"].default is None
+
+
+def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
+    graph_rows_cfg = compressed_mla_split_config_for_contract(
+        rows=192,
+        width=384,
+        max_chunks=6,
+    )
+    larger_prefill_cfg = compressed_mla_split_config_for_contract(
+        rows=257,
+        width=384,
+        max_chunks=6,
+    )
+
+    assert graph_rows_cfg.chunk_size == 64
+    assert graph_rows_cfg.num_chunks == 6
+    assert larger_prefill_cfg.chunk_size == 1024
+    assert larger_prefill_cfg.num_chunks == 1
 
 
 def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:

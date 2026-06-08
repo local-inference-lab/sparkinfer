@@ -6,7 +6,10 @@ from b12x.attention.workspace import SparseMLASplitDecodeConfig
 
 
 _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE = 12
-_COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS = 64
+# vLLM captures MTP decode graphs with rows = requests * (1 + draft tokens).
+# Keep those graph-capacity rows on the decode split contract; switching to the
+# batched split contract at 66+ rows can poison smaller decode graph replays.
+_COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS = 256
 _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE = 64
 _COMPRESSED_MLA_BATCHED_SPLIT_CHUNK_SIZE = 1024
 _COMPRESSED_MLA_SPLIT_MAX_CHUNKS = 256
