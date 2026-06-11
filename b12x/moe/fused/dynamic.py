@@ -97,6 +97,7 @@ _TASK_SLICE_CHUNK = 1
 # alignment = copy size) and 20*g mod 32 spreads the eight g-rows a lane
 # quad touches across distinct bank groups.
 _W4A8_B_ROW_PAD = 80
+_W4A8_TMA_TILE_BYTES = 128 * 64  # one (128 n, 128 fp4-k) TMA box
 _W4A8_B_BUF_BYTES = 128 * _W4A8_B_ROW_PAD
 
 
@@ -1963,6 +1964,11 @@ class MoEDynamicKernelBackend:
             w4a8_resb = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
             w4a8_tcnt = self.num_mma_warps * self.num_threads_per_warp
 
+        # w4a8 TMA-B: per-mbarrier phase bits, owned by the producer warp.
+        # Persist across tasks (mbarriers are init'd once; epochs reset per
+        # task but phases must not).
+        w4a8_mbar_phase = Int32(0)
+
         consumer_live = Int32(1)
         while consumer_live > Int32(0):
             if is_cta_leader > Int32(0):
@@ -2497,10 +2503,19 @@ class MoEDynamicKernelBackend:
                                         b_hi_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
                                         sfb_arr_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
                                     for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                        if cutlass.const_expr(self.w4a8_b_tma):
+                                            # TMA layout (probe-pinned): chunk
+                                            # = kb ^ ((row>>1)&3) over 64B rows.
+                                            w4a8_bk = (
+                                                Int32(_kb)
+                                                ^ ((n_in_arr[_nt] >> Int32(1)) & Int32(3))
+                                            ) << Int32(4)
+                                        else:
+                                            w4a8_bk = Int32(_kb * 16)
                                         w_pk = ld_shared_u32(
                                             b_buf
                                             + n_in_arr[_nt] * Int32(self.w4a8_b_pad)
-                                            + Int32(_kb * 16)
+                                            + w4a8_bk
                                             + (lane_c << Int32(2))
                                         )
                                         sfb_arr[_nt] = (
@@ -2528,7 +2543,7 @@ class MoEDynamicKernelBackend:
                                             w_pk_u = ld_shared_u32(
                                                 b_buf + Int32(128 * 64)
                                                 + n_in_arr[_nt] * Int32(self.w4a8_b_pad)
-                                                + Int32(_kb * 16)
+                                                + w4a8_bk
                                                 + (lane_c << Int32(2))
                                             )
                                             sfb_arr_u[_nt] = (
@@ -3161,10 +3176,17 @@ class MoEDynamicKernelBackend:
                                 b_hi = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
                                 sfb_arr = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
                                 for _nt in cutlass.range_constexpr(fc2_n_tiles):
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        w4a8_bk2 = (
+                                            Int32(_kb)
+                                            ^ ((n_in_arr2[_nt] >> Int32(1)) & Int32(3))
+                                        ) << Int32(4)
+                                    else:
+                                        w4a8_bk2 = Int32(_kb * 16)
                                     w_dn = ld_shared_u32(
                                         b_buf
                                         + n_in_arr2[_nt] * Int32(self.w4a8_b_pad)
-                                        + Int32(_kb * 16)
+                                        + w4a8_bk2
                                         + (lane_c << Int32(2))
                                     )
                                     sfb_arr[_nt] = (
@@ -3505,29 +3527,89 @@ class MoEDynamicKernelBackend:
                                     _spin_wait_shared_ge_i32(
                                         w4a8_pipe_addr + Int32(16) + (par << Int32(2)), need
                                     )
-                                    if cutlass.const_expr(self.w4a8_depth == 4):
-                                        w4a8_b_dst = (
-                                            w4a8_sb0
-                                            + (w4a8_sb1 - w4a8_sb0) * (par >> Int32(1))
-                                            + (par & Int32(1)) * Int32(128 * 64)
-                                        )
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        # B granule through TMA: one box per
+                                        # 8KB half; granule bytes complete on
+                                        # this par's mbarrier. Region/stage
+                                        # selection mirrors the consumers'
+                                        # b_buf math exactly.
+                                        if lane_id == Int32(0):
+                                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                                w4a8_tma_mbar_ptr + par,
+                                                Int32(
+                                                    2 * _W4A8_TMA_TILE_BYTES
+                                                    if self.w4a8_fused
+                                                    else _W4A8_TMA_TILE_BYTES
+                                                ),
+                                            )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            if par == Int32(0):
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, 0)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_up_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, 1)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                            else:
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, 0)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_up_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, 1)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                        else:
+                                            # Non-fused small (relu2): region
+                                            # par>>1, stage par&1, single box.
+                                            if (par >> Int32(1)) == Int32(0):
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, par & Int32(1))],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                            else:
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, par & Int32(1))],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
                                     else:
-                                        w4a8_b_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
-                                    _w4a8_stage_b_tile(
-                                        b_w13_u32,
-                                        w4a8_b_dst,
-                                        b_base_p + Int64(_pkt) * Int64(16),
-                                        Int32(b_row_u32p), Int32(lane_id), 32,
-                                        self.w4a8_b_pad,
-                                    )
-                                    if cutlass.const_expr(self.w4a8_fused):
+                                        if cutlass.const_expr(self.w4a8_depth == 4):
+                                            w4a8_b_dst = (
+                                                w4a8_sb0
+                                                + (w4a8_sb1 - w4a8_sb0) * (par >> Int32(1))
+                                                + (par & Int32(1)) * Int32(128 * 64)
+                                            )
+                                        else:
+                                            w4a8_b_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
                                         _w4a8_stage_b_tile(
                                             b_w13_u32,
-                                            w4a8_b_dst + Int32(128 * 64),
-                                            b_base_pu + Int64(_pkt) * Int64(16),
+                                            w4a8_b_dst,
+                                            b_base_p + Int64(_pkt) * Int64(16),
                                             Int32(b_row_u32p), Int32(lane_id), 32,
                                             self.w4a8_b_pad,
                                         )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_b_tile(
+                                                b_w13_u32,
+                                                w4a8_b_dst + Int32(128 * 64),
+                                                b_base_pu + Int64(_pkt) * Int64(16),
+                                                Int32(b_row_u32p), Int32(lane_id), 32,
+                                                self.w4a8_b_pad,
+                                            )
                                     _w4a8_stage_a_tile(
                                         pa_u32,
                                         w4a8_sa0 + par * Int32(self.tile_shape_mnk[0] * 128),
@@ -3587,7 +3669,18 @@ class MoEDynamicKernelBackend:
                                     # Deferred publish: drain to one outstanding
                                     # group, release-publish the PREVIOUS window;
                                     # the current window's copies overlap the
-                                    # consumers' work on the previous one.
+                                    # consumers' work on the previous one. Under
+                                    # TMA-B the pending granule's mbarrier is
+                                    # waited too (whole warp; phase bit per par).
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        if w4a8_pend_epoch > Int32(0):
+                                            cute.arch.mbarrier_wait(
+                                                w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                                phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                            )
+                                            w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                                Int32(1) << w4a8_pend_par
+                                            )
                                     cute.arch.cp_async_wait_group(1)
                                     cute.arch.fence_proxy("async.shared", space="cta")
                                     if lane_id == Int32(0):
@@ -3644,30 +3737,83 @@ class MoEDynamicKernelBackend:
                                     w4a8_pipe_addr + Int32(16) + (par2 << Int32(2)), need2
                                 )
                                 row_off_p = Int64(_pt) * Int64(128)
-                                if cutlass.const_expr(self.w4a8_depth == 4):
-                                    w4a8_b2_dst = (
-                                        w4a8_sb0
-                                        + (w4a8_sb1 - w4a8_sb0) * (par2 >> Int32(1))
-                                        + (par2 & Int32(1)) * Int32(128 * 64)
-                                    )
+                                if cutlass.const_expr(self.w4a8_b_tma):
+                                    if lane_id == Int32(0):
+                                        cute.arch.mbarrier_arrive_and_expect_tx(
+                                            w4a8_tma_mbar_ptr + par2,
+                                            Int32(
+                                                2 * _W4A8_TMA_TILE_BYTES
+                                                if self.w4a8_fc2_pair
+                                                else _W4A8_TMA_TILE_BYTES
+                                            ),
+                                        )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        if par2 == Int32(0):
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, 0)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt + Int32(1), cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, 1)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, 0)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt + Int32(1), cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, 1)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                    else:
+                                        if (par2 >> Int32(1)) == Int32(0):
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, par2 & Int32(1))],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, par2 & Int32(1))],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
                                 else:
-                                    w4a8_b2_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
-                                _w4a8_stage_b_tile(
-                                    b_down_u32,
-                                    w4a8_b2_dst,
-                                    dn_base_p + row_off_p * Int64(dn_row_u32p),
-                                    Int32(dn_row_u32p), Int32(lane_id), 32,
-                                    self.w4a8_b_pad,
-                                )
-                                if cutlass.const_expr(self.w4a8_fc2_pair):
-                                    row_off_p2 = row_off_p + Int64(128)
+                                    if cutlass.const_expr(self.w4a8_depth == 4):
+                                        w4a8_b2_dst = (
+                                            w4a8_sb0
+                                            + (w4a8_sb1 - w4a8_sb0) * (par2 >> Int32(1))
+                                            + (par2 & Int32(1)) * Int32(128 * 64)
+                                        )
+                                    else:
+                                        w4a8_b2_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
                                     _w4a8_stage_b_tile(
                                         b_down_u32,
-                                        w4a8_b2_dst + Int32(128 * 64),
-                                        dn_base_p + row_off_p2 * Int64(dn_row_u32p),
+                                        w4a8_b2_dst,
+                                        dn_base_p + row_off_p * Int64(dn_row_u32p),
                                         Int32(dn_row_u32p), Int32(lane_id), 32,
                                         self.w4a8_b_pad,
                                     )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        row_off_p2 = row_off_p + Int64(128)
+                                        _w4a8_stage_b_tile(
+                                            b_down_u32,
+                                            w4a8_b2_dst + Int32(128 * 64),
+                                            dn_base_p + row_off_p2 * Int64(dn_row_u32p),
+                                            Int32(dn_row_u32p), Int32(lane_id), 32,
+                                            self.w4a8_b_pad,
+                                        )
                                 if cutlass.const_expr(self.w4a8_fc2_pair):
                                     w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(10))
                                 else:
@@ -3706,6 +3852,15 @@ class MoEDynamicKernelBackend:
                                             Int32(dnres_row_p), Int32(lane_id), 32,
                                         )
                                 cute.arch.cp_async_commit_group()
+                                if cutlass.const_expr(self.w4a8_b_tma):
+                                    if w4a8_pend_epoch > Int32(0):
+                                        cute.arch.mbarrier_wait(
+                                            w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                            phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                        )
+                                        w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                            Int32(1) << w4a8_pend_par
+                                        )
                                 cute.arch.cp_async_wait_group(1)
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 if lane_id == Int32(0):
@@ -3716,6 +3871,15 @@ class MoEDynamicKernelBackend:
                                         )
                                 w4a8_pend_par = par2
                                 w4a8_pend_epoch = epoch2
+                        if cutlass.const_expr(self.w4a8_b_tma):
+                            if w4a8_pend_epoch > Int32(0):
+                                cute.arch.mbarrier_wait(
+                                    w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                    phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                )
+                                w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                    Int32(1) << w4a8_pend_par
+                                )
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_proxy("async.shared", space="cta")
                         if lane_id == Int32(0):
