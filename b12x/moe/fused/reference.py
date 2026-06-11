@@ -1022,3 +1022,311 @@ def moe_reference_nvfp4(
             output[t] += trace.routed_out_accum
 
     return output.to(torch.bfloat16)
+
+
+# =============================================================================
+# W4A8 (MXFP8 activations x FP4 weights) reference oracle
+# =============================================================================
+
+
+def decompose_nvfp4_scales_to_mx_residual(
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompose per-K/16 E4M3 scales for the w4a8 hardware block-scale MMA.
+
+    Each adjacent K/16 scale pair (s0, s1) becomes a shared per-K/32 UE8M0
+    hardware exponent ``E = max(floor(log2(s0)), floor(log2(s1)))`` plus
+    per-K/16 residual multipliers ``r_j = s_j / 2^E`` stored as E4M3 (applied
+    in-register during nibble expansion).  Residuals for the max-exponent
+    block lie in [1, 2); the partner residual can underflow E4M3 when the
+    pair's exponents differ by more than ~2^9 (quantified by
+    ``nvfp4_mx_residual_quality_report``).
+
+    `scales` is `[..., rows, K/16]` in float8_e4m3fn or any float dtype.
+    Returns ``(ue8m0_bytes [..., rows, K/32] uint8,
+    residual [..., rows, K/16] float8_e4m3fn)``.
+    """
+    s = scales.to(torch.float32)
+    if s.shape[-1] % 2 != 0:
+        raise ValueError(f"K/16 scale count must be even, got {s.shape[-1]}")
+    pairs = s.reshape(*s.shape[:-1], s.shape[-1] // 2, 2)
+    if bool((pairs < 0).any().item()):
+        raise ValueError("NVFP4 block scales must be non-negative")
+    _ZERO_SENTINEL = -(2**30)
+    mant, exp = torch.frexp(pairs)
+    del mant
+    floor_log2 = torch.where(
+        pairs > 0, exp - 1, torch.full_like(exp, _ZERO_SENTINEL)
+    )
+    e_shared = floor_log2.amax(dim=-1)
+    both_zero = e_shared <= _ZERO_SENTINEL // 2
+    e_shared = torch.where(both_zero, torch.zeros_like(e_shared), e_shared)
+    ue8m0 = (e_shared + 127).clamp(0, 254).to(torch.uint8)
+    pow2 = torch.exp2(e_shared.to(torch.float32)).unsqueeze(-1)
+    residual = torch.where(pairs > 0, pairs / pow2, torch.zeros_like(pairs))
+    residual_e4m3 = residual.clamp(max=448.0).to(torch.float8_e4m3fn)
+    return ue8m0, residual_e4m3.reshape(s.shape)
+
+
+def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
+    """Quantify the loss of the NVFP4 -> (UE8M0, E4M3 residual) decomposition.
+
+    Reports, over all nonzero per-K/16 scales: the fraction of residuals
+    flushed to zero by E4M3 (whole block silenced), the fraction rounded in
+    the subnormal range, the max/mean relative residual rounding error, and
+    the largest K/32-pair exponent delta.  Run on real checkpoints before
+    claiming full-fidelity NVFP4 serving.
+    """
+    s = scales.to(torch.float32)
+    ue8m0, residual_e4m3 = decompose_nvfp4_scales_to_mx_residual(s)
+    del ue8m0
+    pairs = s.reshape(-1, 2)
+    nonzero = pairs > 0
+    mant, exp = torch.frexp(pairs)
+    del mant
+    floor_log2 = torch.where(nonzero, exp - 1, torch.zeros_like(exp))
+    delta = torch.where(
+        nonzero.all(dim=-1),
+        (floor_log2[:, 0] - floor_log2[:, 1]).abs(),
+        torch.zeros(pairs.shape[0], dtype=exp.dtype, device=s.device),
+    )
+    e_shared = torch.where(nonzero, floor_log2, torch.full_like(exp, -(2**30))).amax(dim=-1)
+    residual_exact = torch.where(
+        nonzero, pairs / torch.exp2(e_shared.to(torch.float32)).unsqueeze(-1), torch.zeros_like(pairs)
+    )
+    residual_stored = residual_e4m3.to(torch.float32).reshape(-1, 2)
+
+    nz = nonzero.reshape(-1)
+    exact = residual_exact.reshape(-1)[nz]
+    stored = residual_stored.reshape(-1)[nz]
+    flushed = (stored == 0) & (exact > 0)
+    subnormal = (exact > 0) & (exact < 2.0**-6)
+    rel_err = torch.where(exact > 0, (stored - exact).abs() / exact, torch.zeros_like(exact))
+    total = max(int(nz.sum().item()), 1)
+    return {
+        "nonzero_scales": float(total),
+        "flushed_fraction": float(flushed.sum().item()) / total,
+        "subnormal_fraction": float(subnormal.sum().item()) / total,
+        "max_rel_residual_error": float(rel_err.max().item()) if total else 0.0,
+        "mean_rel_residual_error": float(rel_err.mean().item()) if total else 0.0,
+        "max_pair_exponent_delta": float(delta.max().item()),
+    }
+
+
+def _quant_dequant_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
+    from b12x.cute.fp4 import quant_dequant_mxfp8_torch
+
+    return quant_dequant_mxfp8_torch(x)
+
+
+def _dequant_w4a8_weight_e8m0_k32(
+    w_packed: torch.Tensor,
+    scale_bytes: torch.Tensor,
+    rows: int,
+    cols: int,
+    fp4_lut: torch.Tensor,
+) -> torch.Tensor:
+    """Effective w4a8 weight values for an MXFP4 (e8m0/K32) source: exact."""
+    raw = _dequant_fp4(w_packed, rows, cols, fp4_lut)
+    scale = torch.exp2(scale_bytes.to(torch.float32) - 127.0)
+    n_blocks = cols // 32
+    return raw.view(rows, n_blocks, 32) * scale[:rows, :n_blocks].unsqueeze(-1)
+
+
+def _dequant_w4a8_weight_nvfp4_residual(
+    w_packed: torch.Tensor,
+    ue8m0_bytes: torch.Tensor,
+    residual_e4m3: torch.Tensor,
+    rows: int,
+    cols: int,
+    fp4_lut: torch.Tensor,
+) -> torch.Tensor:
+    """Effective w4a8 weight values for an NVFP4 source via the residual path.
+
+    Emulates the in-register expansion exactly: f16 nibble decode, f16
+    multiply by the stored E4M3 residual, RN round to the E4M3 payload, then
+    the shared per-K/32 hardware exponent.
+    """
+    raw = _dequant_fp4(w_packed, rows, cols, fp4_lut)
+    n16 = cols // 16
+    r = residual_e4m3.to(torch.float16)[:rows, :n16]
+    prod_f16 = raw.view(rows, n16, 16).to(torch.float16) * r.unsqueeze(-1)
+    payload = (
+        prod_f16.to(torch.float32)
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    n32 = cols // 32
+    scale = torch.exp2(ue8m0_bytes.to(torch.float32)[:rows, :n32] - 127.0)
+    return payload.view(rows, n32, 32) * scale.unsqueeze(-1)
+
+
+def _w4a8_effective_weight(
+    w_packed: torch.Tensor,
+    mx_scale_bytes: torch.Tensor,
+    residual_e4m3: torch.Tensor | None,
+    rows: int,
+    cols: int,
+    fp4_lut: torch.Tensor,
+) -> torch.Tensor:
+    if residual_e4m3 is None:
+        return _dequant_w4a8_weight_e8m0_k32(
+            w_packed, mx_scale_bytes, rows, cols, fp4_lut
+        ).view(rows, cols)
+    return _dequant_w4a8_weight_nvfp4_residual(
+        w_packed, mx_scale_bytes, residual_e4m3, rows, cols, fp4_lut
+    ).view(rows, cols)
+
+
+def moe_reference_w4a8_mx(
+    x: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_mx_scales: torch.Tensor,
+    w1_residual: torch.Tensor | None,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_mx_scales: torch.Tensor,
+    w2_residual: torch.Tensor | None,
+    w2_alphas: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    E: int,
+    K: int,
+    I_tp: int,
+    *,
+    activation: str = "silu",
+) -> torch.Tensor:
+    """W4A8 MoE oracle: MXFP8 (UE8M0/K32 + E4M3) activations x FP4 weights.
+
+    Activations are dynamically quantized per 32-element block with no global
+    scale (identical for every route of a token).  Weight semantics depend on
+    the source: ``w*_residual is None`` means an MXFP4 (e8m0/K32) checkpoint
+    consumed exactly; otherwise the NVFP4 residual-decomposition path is
+    emulated (see ``decompose_nvfp4_scales_to_mx_residual``).  ``w*_mx_scales``
+    are unswizzled ``[E, rows, K/32]`` UE8M0 bytes; ``w*_alphas`` carry the
+    per-expert weight global dequant scale (ones for MXFP4 sources).
+    """
+    _validate_reference_inputs(w1_fp4, I_tp, activation)
+    if K % 32 != 0 or I_tp % 32 != 0:
+        raise ValueError("K and I_tp must be divisible by 32 for w4a8")
+    is_gated = activation == "silu"
+    device = x.device
+    fp4_lut = _make_fp4_lut(device)
+    m = x.shape[0]
+
+    x_qd = _quant_dequant_mxfp8_rows(x.float())
+    output = torch.zeros(m, K, dtype=torch.float32, device=device)
+
+    for eid in range(E):
+        route_mask = topk_ids == eid
+        token_mask = route_mask.any(dim=1)
+        if not bool(token_mask.any().item()):
+            continue
+        alpha_fc1 = float(w1_alphas[eid].item())
+        alpha_fc2 = float(w2_alphas[eid].item())
+        fc1_rows = w1_fp4.shape[1]
+        w13_eff = _w4a8_effective_weight(
+            w1_fp4[eid], w1_mx_scales[eid], None if w1_residual is None else w1_residual[eid],
+            fc1_rows, K, fp4_lut,
+        )
+        w2_eff = _w4a8_effective_weight(
+            w2_fp4[eid], w2_mx_scales[eid], None if w2_residual is None else w2_residual[eid],
+            K, I_tp, fp4_lut,
+        )
+        xs = x_qd[token_mask]
+        if is_gated:
+            up_out = (xs @ w13_eff[:I_tp].T) * alpha_fc1
+            gate_out = (xs @ w13_eff[I_tp:].T) * alpha_fc1
+            intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+        else:
+            fc1_out = (xs @ w13_eff.T) * alpha_fc1
+            intermediate = torch.square(torch.relu(fc1_out))
+        int_qd = _quant_dequant_mxfp8_rows(intermediate)
+        down_out = (int_qd @ w2_eff.T) * alpha_fc2
+        route_weight = (topk_weights.float() * route_mask.float()).sum(dim=1)[token_mask]
+        output[token_mask] += route_weight.unsqueeze(1) * down_out
+
+    return output
+
+
+def trace_moe_reference_w4a8_route(
+    x: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_mx_scales: torch.Tensor,
+    w1_residual: torch.Tensor | None,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_mx_scales: torch.Tensor,
+    w2_residual: torch.Tensor | None,
+    w2_alphas: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    E: int,
+    K: int,
+    I_tp: int,
+    *,
+    token_idx: int,
+    route_idx: int,
+    activation: str = "silu",
+) -> MoERouteTrace:
+    """Single-route stage trace for the w4a8 oracle (kernel debugging aid)."""
+    del E
+    _validate_reference_inputs(w1_fp4, I_tp, activation)
+    is_gated = activation == "silu"
+    device = x.device
+    fp4_lut = _make_fp4_lut(device)
+
+    expert_idx = int(topk_ids[token_idx, route_idx].item())
+    router_weight = float(topk_weights[token_idx, route_idx].item())
+    alpha_fc1 = float(w1_alphas[expert_idx].item())
+    alpha_fc2 = float(w2_alphas[expert_idx].item())
+
+    x_qd = _quant_dequant_mxfp8_rows(x[token_idx].float().unsqueeze(0))[0]
+    fc1_rows = w1_fp4.shape[1]
+    w13_eff = _w4a8_effective_weight(
+        w1_fp4[expert_idx],
+        w1_mx_scales[expert_idx],
+        None if w1_residual is None else w1_residual[expert_idx],
+        fc1_rows, K, fp4_lut,
+    )
+    w2_eff = _w4a8_effective_weight(
+        w2_fp4[expert_idx],
+        w2_mx_scales[expert_idx],
+        None if w2_residual is None else w2_residual[expert_idx],
+        K, I_tp, fp4_lut,
+    )
+    fc1_out = None
+    gate_out = None
+    up_out = None
+    if is_gated:
+        up_out = (w13_eff[:I_tp] @ x_qd) * alpha_fc1
+        gate_out = (w13_eff[I_tp:] @ x_qd) * alpha_fc1
+        intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+    else:
+        fc1_out = (w13_eff @ x_qd) * alpha_fc1
+        intermediate = torch.square(torch.relu(fc1_out))
+    int_qd = _quant_dequant_mxfp8_rows(intermediate.unsqueeze(0))[0]
+    down_out = (w2_eff @ int_qd) * alpha_fc2
+    routed_out = router_weight * down_out
+
+    return MoERouteTrace(
+        token_idx=token_idx,
+        route_idx=route_idx,
+        expert_idx=expert_idx,
+        activation=activation,
+        router_weight=router_weight,
+        alpha_fc1=alpha_fc1,
+        alpha_fc2=alpha_fc2,
+        gs_fc1=1.0,
+        gs_fc2=1.0,
+        x_dequant=x_qd,
+        fc1_out=fc1_out,
+        gate_out=gate_out,
+        up_out=up_out,
+        intermediate=intermediate,
+        int_dequant=int_qd,
+        down_out=down_out,
+        routed_out=routed_out,
+        routed_out_accum=routed_out,
+    )

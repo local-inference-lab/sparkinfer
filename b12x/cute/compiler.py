@@ -1331,6 +1331,7 @@ def compile(
     func: Any,
     *args: Any,
     compile_spec: KernelCompileSpec | None = None,
+    dsl_compile_options: Any = None,
     **kwargs: Any,
 ) -> Any:
     import cutlass.cute as cute
@@ -1338,6 +1339,13 @@ def compile(
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
     compile_callable = cute.compile
+    if dsl_compile_options is not None:
+        # Subscript-style DSL compile options (e.g. OptLevel(2): ptxas -O3's
+        # scheduler register-starves some scalar-heavy kernels; see the w4a8
+        # dynamic MoE recipe).
+        compile_callable = cute.compile[dsl_compile_options]
+        kwargs = dict(kwargs)
+        kwargs["__dsl_compile_options_key"] = repr(dsl_compile_options)
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )
@@ -1380,7 +1388,10 @@ def compile(
         target=func,
         cache_key=compile_spec if compile_spec is not None else payload,
     )
-    compiled = compile_callable(func, *args, **kwargs)
+    call_kwargs = {
+        k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
+    }
+    compiled = compile_callable(func, *args, **call_kwargs)
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
