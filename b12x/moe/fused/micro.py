@@ -542,6 +542,15 @@ class MoEMicroKernelBackend:
             # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
             # the 512-thread launch register limit.
             num_fc1_chunks = max(num_fc1_chunks, n // (_BLOCK_SIZE * 2))
+        if self.a8_mx_mode:
+            # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
+            # (the default policy picks i_chunk=16 at m<=2).
+            a8_chunks = max(1, min(num_fc1_chunks, n // 32))
+            while a8_chunks > 1 and (
+                n % a8_chunks != 0 or (n // a8_chunks) % 32 != 0
+            ):
+                a8_chunks -= 1
+            num_fc1_chunks = a8_chunks
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
