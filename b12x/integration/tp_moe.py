@@ -992,13 +992,16 @@ def _select_dynamic_tile_mn(
     """
     quant_mode = _normalize_quant_mode(quant_mode)
     if _is_w4a8_quant_mode(quant_mode):
-        # Measured sweep (real GLM shard, graph replay): tile_m=16 wins at
-        # every band for w4a8 — m=512: 0.907ms vs 1.038 (tile 32) vs 2.281
-        # (tile 128); the small tiles multiply task parallelism and shrink
-        # the per-task sync:compute ratio.
+        # Measured sweeps (real GLM shard, graph replay, TMA-B staging):
+        # tile_m=16 wins up to ~5K routed rows (task parallelism, small
+        # sync:compute); tile_m=32 (4 TC warps/CTA) wins once the kernel
+        # goes compute-bound — m=1024: 1.121ms vs 1.421; m=4096: 3.14 vs
+        # 4.31. Crossover sits between 5120 and 10240 routed rows.
         ovr = _dynamic_tile_mn_override()
         if ovr is not None:
             return ovr
+        if max(1, int(routed_rows)) > 8192:
+            return (32, _LEVEL_TILE_N)
         return (16, _LEVEL_TILE_N)
     ovr = _dynamic_tile_mn_override()
     if ovr is not None:
