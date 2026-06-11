@@ -68,6 +68,7 @@ _DYNAMIC_SLICE_CHUNK = 1
 _DYNAMIC_SMALL_TILE_MAX_PAIRS = 640
 _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
+_MOE_FORCE_A8_ENV = "B12X_MOE_FORCE_A8"
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
@@ -815,6 +816,11 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 
 def default_moe_quant_mode() -> str:
+    # Force-overrides for callers that pass quant_mode=None. A8 wins over
+    # A16 when both are set (most-specific opt-in; A8 only exists for
+    # nvfp4-source checkpoints).
+    if _env_flag(_MOE_FORCE_A8_ENV, default=False):
+        return "w4a8_nvfp4"
     return "w4a16" if _env_flag(_MOE_FORCE_A16_ENV, default=False) else "nvfp4"
 
 
