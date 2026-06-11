@@ -226,6 +226,33 @@ def _tensor_meta_key(
     )
 
 
+def _traits_compile_key(traits: PagedForwardTraits) -> tuple[object, ...]:
+    return (
+        int(traits.cta_tile_q),
+        int(traits.cta_tile_kv),
+        int(traits.num_mma_q),
+        int(traits.num_mma_kv),
+        int(traits.num_mma_d_qk),
+        int(traits.num_mma_d_vo),
+        int(traits.num_warps_q),
+        int(traits.num_warps_kv),
+        int(traits.num_threads),
+        int(traits.head_dim_qk),
+        int(traits.head_dim_vo),
+        int(traits.upcast_stride_q),
+        int(traits.upcast_stride_k),
+        int(traits.upcast_stride_v),
+        int(traits.upcast_stride_o),
+        str(traits.q_dtype),
+        str(traits.kv_dtype),
+        str(traits.o_dtype),
+        int(traits.q_smem_bytes),
+        int(traits.shared_storage_bytes),
+        int(traits.num_ctas_per_sm),
+        int(traits.max_smem_per_threadblock),
+    )
+
+
 @lru_cache(maxsize=64)
 def _build_forward_kernel(
     traits: PagedForwardTraits,
@@ -358,19 +385,47 @@ def _resolve_paged_attention_binding(
     ]
     if extras:
         raise ValueError(
-            "paged attention binding owns runtime tensors and workspace; "
+            "paged attention binding owns runtime tensors and scratch; "
             f"do not also pass {', '.join(extras)}"
         )
+    binding_scratch = getattr(binding, "scratch", None)
+    if binding_scratch is None:
+        binding_scratch = binding.workspace
     return (
         binding.q,
         binding.k_cache,
         binding.v_cache,
-        binding.workspace,
+        binding_scratch,
         binding.output,
         binding.k_descale,
         binding.v_descale,
         binding.attention_sink_bias,
     )
+
+
+def _capture_decode_graph_replay_metadata_if_needed(
+    workspace: PagedAttentionWorkspace,
+) -> None:
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    if not (
+        getattr(workspace, "use_cuda_graph", False)
+        and getattr(workspace, "mode", None) == "decode"
+        and getattr(workspace, "_decode_graph_chunk_pages_lut", None) is not None
+        and getattr(workspace, "_plan", None) is not None
+    ):
+        return
+    if getattr(workspace, "_decode_graph_metadata_captured_in_graph", False):
+        return
+    update_metadata = getattr(
+        workspace,
+        "update_decode_graph_replay_metadata_from_runtime_cache_seqlens",
+        None,
+    )
+    if update_metadata is None:
+        return
+    update_metadata()
+    workspace._decode_graph_metadata_captured_in_graph = True
 
 
 def paged_attention_forward(
@@ -408,6 +463,7 @@ def paged_attention_forward(
         raise ValueError(
             "split-kv plan requires tmp_output and tmp_lse in the workspace"
         )
+    _capture_decode_graph_replay_metadata_if_needed(workspace)
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
         k_descale = k_descale[:, 0].contiguous()
     if v_descale is not None and v_descale.ndim == 2 and int(v_descale.shape[1]) == 1:
@@ -466,9 +522,6 @@ def paged_attention_forward(
             has_attention_sink_bias,
         )
     else:
-        disable_single_request_decode_graph = os.environ.get(
-            "B12X_PAGED_DISABLE_SINGLE_REQUEST_DECODE_GRAPH", "0"
-        ).lower() in {"1", "true", "yes", "on"}
         single_request_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
@@ -477,7 +530,6 @@ def paged_attention_forward(
             and workspace._decode_graph_chunk_pages_lut is not None
             and plan.num_qo_tiles == 1
             and plan.page_table_shape[0] == 1
-            and not disable_single_request_decode_graph
         )
         single_qtile_decode_graph = (
             plan.mode == "decode"
@@ -634,6 +686,18 @@ def paged_attention_forward(
     forward_lse_dynamic_dims = (0,) if plan.split_kv else (1,)
     forward_lse_dynamic_strides = () if plan.split_kv else (0,)
     forward_cache_key = [
+        _traits_compile_key(traits),
+        (
+            plan.mode,
+            bool(plan.split_kv),
+            bool(plan.enable_cuda_graph),
+            int(plan.gqa_group_size),
+            bool(use_native_fp8_qk),
+            bool(use_native_fp8_pv),
+            bool(decode_native_fp8_runtime_chunk_guard),
+            int(plan.window_left),
+            bool(has_attention_sink_bias),
+        ),
         _tensor_meta_key(q_cache_tensor, dynamic_dims=(0,)),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
@@ -658,6 +722,8 @@ def paged_attention_forward(
         _tensor_meta_key(v_descale, dynamic_dims=(0,)),
     ]
     cache_key_labels = [
+        "traits",
+        "kernel_policy",
         "q_contract" if use_capacity_contract else "q",
         "k_cache",
         "v_cache",
@@ -715,7 +781,7 @@ def paged_attention_forward(
     forward_args.append(stream)
     forward_spec = KernelCompileSpec.from_key(
         "attention.paged.forward",
-        1,
+        3,
         tuple(forward_cache_key),
         labels=tuple(cache_key_labels),
     )

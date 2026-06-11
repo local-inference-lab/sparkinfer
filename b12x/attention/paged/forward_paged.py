@@ -404,6 +404,8 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
     group_size,
     num_q_heads,
     row_bytes,
+    token_stride_bytes,
+    head_stride_bytes,
     sQBytes: cute.Tensor,
     lane,
     upcast_stride_q,
@@ -417,7 +419,10 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
             row_idx = Int32(lane_row + row_iter * 4)
             row_valid = row_idx < packed_tile_rows
             q_head_idx = Int32(q_head_base + row_idx)
-            row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+            row_byte_base = (
+                Int64(q_row_idx) * Int64(token_stride_bytes)
+                + Int64(q_head_idx) * Int64(head_stride_bytes)
+            )
             for mma_do in cutlass.range_constexpr(4):
                 vec_idx = Int32(lane_col + mma_do * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
@@ -435,7 +440,10 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
             q_group_lane = packed_q_idx - q_row_local * group_size
             q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
             q_row_idx = Int32(q_start + q_row_local)
-            row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+            row_byte_base = (
+                Int64(q_row_idx) * Int64(token_stride_bytes)
+                + Int64(q_head_idx) * Int64(head_stride_bytes)
+            )
             row_idx = Int32(lane_row + row_iter * 4)
             for mma_do in cutlass.range_constexpr(4):
                 vec_idx = Int32(lane_col + mma_do * 8)
@@ -458,6 +466,8 @@ def _async_copy_q_tile_permuted_128b_impl(
     group_size,
     num_q_heads,
     row_bytes,
+    token_stride_bytes,
+    head_stride_bytes,
     sQBytes: cute.Tensor,
     lane,
     warp_q_idx,
@@ -476,7 +486,10 @@ def _async_copy_q_tile_permuted_128b_impl(
             q_group_lane = packed_q_idx - q_row_local * group_size
             q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
             q_row_idx = Int32(q_start + q_row_local)
-            row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+            row_byte_base = (
+                Int64(q_row_idx) * Int64(token_stride_bytes)
+                + Int64(q_head_idx) * Int64(head_stride_bytes)
+            )
             row_idx = Int32(warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
             for mma_do in cutlass.range_constexpr(num_mma_d_qk // 4):
                 vec_idx = Int32(lane_col + mma_do * 8)
@@ -2714,6 +2727,9 @@ class PagedForwardKernel:
         kv_head_idx,
         num_kv_heads,
         row_bytes,
+        page_stride_bytes,
+        token_stride_bytes,
+        head_stride_bytes,
         sStageBytes: cute.Tensor,
         stage_byte_offset,
         lane,
@@ -2732,7 +2748,11 @@ class PagedForwardKernel:
             entry_idx = token_idx - page_iter * page_size
             page_id = mPageTable[request_idx, page_iter]
             row_valid = row_idx < valid_rows
-            row_byte_base = (((page_id * page_size + entry_idx) * num_kv_heads) + kv_head_idx) * row_bytes
+            row_byte_base = (
+                Int64(page_id) * Int64(page_stride_bytes)
+                + Int64(entry_idx) * Int64(token_stride_bytes)
+                + Int64(kv_head_idx) * Int64(head_stride_bytes)
+            )
             for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
                 vec_idx = Int32(lane_col + vec_iter * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
@@ -2850,6 +2870,8 @@ class PagedForwardKernel:
         group_size,
         num_q_heads,
         row_bytes,
+        token_stride_bytes,
+        head_stride_bytes,
         sQBytes: cute.Tensor,
         lane,
         warp_q_idx,
@@ -2872,6 +2894,8 @@ class PagedForwardKernel:
                 group_size,
                 num_q_heads,
                 row_bytes,
+                token_stride_bytes,
+                head_stride_bytes,
                 sQBytes,
                 lane,
                 self.traits.upcast_stride_q,
@@ -2888,7 +2912,10 @@ class PagedForwardKernel:
                 q_group_lane = packed_q_idx - q_row_local * group_size
                 q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
                 q_row_idx = Int32(q_start + q_row_local)
-                row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+                row_byte_base = (
+                    Int64(q_row_idx) * Int64(token_stride_bytes)
+                    + Int64(q_head_idx) * Int64(head_stride_bytes)
+                )
                 row_idx = Int32(warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
                 for mma_do in cutlass.range_constexpr(self.traits.num_mma_d_qk // 4):
                     vec_idx = Int32(lane_col + mma_do * 8)
@@ -3399,6 +3426,9 @@ class PagedForwardKernel:
         sVTC = None
         k_row_bytes = self.traits.head_dim_qk * (self.dtype_kv_storage.width // 8)
         v_row_bytes = self.traits.head_dim_vo * (self.dtype_kv_storage.width // 8)
+        q_storage_bytes = self.dtype_q.width // 8
+        q_token_stride_bytes = mQ.stride[0] * q_storage_bytes
+        q_head_stride_bytes = mQ.stride[1] * q_storage_bytes
         k_stage_bytes = stage_tile_rows * k_row_bytes
         v_stage_bytes = stage_tile_rows * v_row_bytes
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
@@ -3733,6 +3763,8 @@ class PagedForwardKernel:
                     group_size,
                     mQ.shape[1],
                     self.traits.head_dim_qk * (self.dtype_q.width // 8),
+                    q_token_stride_bytes,
+                    q_head_stride_bytes,
                     sQBytes,
                     lane,
                     warp_q_idx,
@@ -3754,6 +3786,8 @@ class PagedForwardKernel:
                 group_size,
                 mQ.shape[1],
                 self.traits.head_dim_qk * (self.dtype_q.width // 8),
+                q_token_stride_bytes,
+                q_head_stride_bytes,
                 sQBytes,
                 lane,
                 warp_q_idx,
@@ -5948,6 +5982,9 @@ class PagedFp8DecodeRawForwardKernel:
 
         sQBytes = cute.flatten(cute.recast_tensor(sQ, cutlass.Uint8))
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
+        q_storage_bytes = self.q_dtype.width // 8
+        q_token_stride_bytes = mQ.stride[0] * q_storage_bytes
+        q_head_stride_bytes = mQ.stride[1] * q_storage_bytes
         if warp_kv_idx == Int32(0):
             _async_copy_q_tile_permuted_128b_fp8_decode_impl(
                 mQBytes,
@@ -5958,6 +5995,8 @@ class PagedFp8DecodeRawForwardKernel:
                 group_size,
                 mQ.shape[1],
                 Int32(self.head_dim_qk * 2),
+                q_token_stride_bytes,
+                q_head_stride_bytes,
                 sQBytes,
                 lane,
                 Int32(self.head_dim_qk // 8),
@@ -6608,6 +6647,9 @@ class PagedBf16ExtendRawForwardKernel:
         mOFlat = cute.flatten(mO)
         mOFlatU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
+        q_storage_bytes = self.q_dtype.width // 8
+        q_token_stride_bytes = mQ.stride[0] * q_storage_bytes
+        q_head_stride_bytes = mQ.stride[1] * q_storage_bytes
         _async_copy_q_tile_permuted_128b_impl(
             mQBytes,
             q_start,
@@ -6617,6 +6659,8 @@ class PagedBf16ExtendRawForwardKernel:
             group_size,
             mQ.shape[1],
             Int32(self.head_dim_qk * 2),
+            q_token_stride_bytes,
+            q_head_stride_bytes,
             sQBytes,
             lane,
             warp_q_idx,
@@ -7301,6 +7345,9 @@ class PagedFp8ExtendRawForwardKernel:
             cpasync.prefetch_descriptor(tma_atom_V)
         mOFlat = cute.flatten(mO)
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
+        q_storage_bytes = self.q_dtype.width // 8
+        q_token_stride_bytes = mQ.stride[0] * q_storage_bytes
+        q_head_stride_bytes = mQ.stride[1] * q_storage_bytes
         _async_copy_q_tile_permuted_128b_impl(
             mQBytes,
             q_start,
@@ -7310,6 +7357,8 @@ class PagedFp8ExtendRawForwardKernel:
             group_size,
             mQ.shape[1],
             Int32(self.head_dim_qk * 2),
+            q_token_stride_bytes,
+            q_head_stride_bytes,
             sQBytes,
             lane,
             warp_q_idx,
