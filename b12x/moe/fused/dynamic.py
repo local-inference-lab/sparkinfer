@@ -239,6 +239,22 @@ def _st_shared_i32(addr, val, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_shared_release_i32(addr, val, *, loc=None, ip=None):
+    """CTA-scope release store: pairs with the consumers' acquire spin so
+    the producer's prior writes (including async-proxy writes it observed
+    via an mbarrier wait or cp.async drain) are visible before the flag."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+        "st.release.cta.shared.s32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _ld_shared_i32(addr, *, loc=None, ip=None):
     return Int32(llvm.inline_asm(
         T.i32(),
@@ -600,6 +616,10 @@ class MoEDynamicKernelBackend:
             self.w4a8_fc1_windows_per_slice = 1 if self.w4a8_fused else (
                 2 if self.is_gated else 1
             )
+            # B staged through TMA (probe-pinned SW64 layout: read chunk =
+            # kb ^ ((n_in>>1)&3)) instead of cp.async; the flag/epoch
+            # protocol is unchanged. Small tiles only (the dispatched path).
+            self.w4a8_b_tma = self.w4a8_small
             # Fused small tiles also stage FC2 B_down in PAIRS (one 16KB
             # granule = two output tiles), halving the FC2 sync cadence.
             self.w4a8_fc2_pair = self.w4a8_fused
@@ -1053,6 +1073,11 @@ class MoEDynamicKernelBackend:
             # buffer, [2..3] FC1 done count per buffer, [4..5] FC2 ready,
             # [6..7] FC2 done.
             w4a8_pipe: cute.struct.MemRange[cutlass.Int32, 8]
+            # One mbarrier per staging-buffer parity for w4a8 TMA-B staging
+            # (arrive count 1; phases tracked in producer registers).
+            w4a8_tma_mbar: cute.struct.MemRange[
+                cutlass.Int64, self.w4a8_depth if self.is_w4a8 else 1
+            ]
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_staged)],
                 self.buffer_align_bytes,
@@ -1113,6 +1138,12 @@ class MoEDynamicKernelBackend:
             cta_layout_vmnk=cta_layout_vmnk,
         )
 
+        if cutlass.const_expr(self.is_w4a8 and self.w4a8_b_tma):
+            w4a8_tma_mbar_ptr = storage.w4a8_tma_mbar.data_ptr()
+            if Int32(tidx) == Int32(0):
+                for _mb in cutlass.range_constexpr(self.w4a8_depth):
+                    cute.arch.mbarrier_init(w4a8_tma_mbar_ptr + _mb, Int32(1))
+            cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
@@ -1675,6 +1706,7 @@ class MoEDynamicKernelBackend:
         gB_down = cute.local_tile(mB_down, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
         gSFB_down = cute.local_tile(mSFB_down, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
         tBsB_down, tBgB_down = cpasync.tma_partition(tma_b_down, b_cta_crd, b_cta_layout, cute.group_modes(sB, 0, 2), cute.group_modes(gB_down, 0, 2))
+        tBsB_down_up, _ = cpasync.tma_partition(tma_b_down, b_cta_crd, b_cta_layout, cute.group_modes(sB_up, 0, 2), cute.group_modes(gB_down, 0, 2))
         tBsSFB_down, tBgSFB_down = cpasync.tma_partition(tma_sfb_down, b_cta_crd, b_cta_layout, cute.group_modes(sSFB, 0, 2), cute.group_modes(gSFB_down, 0, 2))
         tBsSFB_down = cute.filter_zeros(tBsSFB_down)
         tBgSFB_down = cute.filter_zeros(tBgSFB_down)
@@ -3552,27 +3584,20 @@ class MoEDynamicKernelBackend:
                                         self.tile_shape_mnk[0],
                                     )
                                     cute.arch.cp_async_commit_group()
-                                    if cutlass.const_expr(self.num_dma_warps > 1):
-                                        cute.arch.cp_async_wait_group(0)
-                                        cute.arch.fence_proxy("async.shared", space="cta")
-                                        if lane_id == Int32(0):
-                                            _st_shared_i32(
-                                                w4a8_pipe_addr + (par << Int32(2)), epoch
+                                    # Deferred publish: drain to one outstanding
+                                    # group, release-publish the PREVIOUS window;
+                                    # the current window's copies overlap the
+                                    # consumers' work on the previous one.
+                                    cute.arch.cp_async_wait_group(1)
+                                    cute.arch.fence_proxy("async.shared", space="cta")
+                                    if lane_id == Int32(0):
+                                        if w4a8_pend_epoch > Int32(0):
+                                            _st_shared_release_i32(
+                                                w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
+                                                w4a8_pend_epoch,
                                             )
-                                    else:
-                                        # Depth-2 drain: publish the PREVIOUS
-                                        # tile; the current tile's copies overlap
-                                        # the consumers' work on the previous one.
-                                        cute.arch.cp_async_wait_group(1)
-                                        cute.arch.fence_proxy("async.shared", space="cta")
-                                        if lane_id == Int32(0):
-                                            if w4a8_pend_epoch > Int32(0):
-                                                _st_shared_i32(
-                                                    w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
-                                                    w4a8_pend_epoch,
-                                                )
-                                        w4a8_pend_par = par
-                                        w4a8_pend_epoch = epoch
+                                    w4a8_pend_par = par
+                                    w4a8_pend_epoch = epoch
                             # (The original pass_gate wait below still pairs
                             # with the MMA warps' arrive; buffer reuse across
                             # passes is ordered by the done-count epochs.)
@@ -3681,29 +3706,21 @@ class MoEDynamicKernelBackend:
                                             Int32(dnres_row_p), Int32(lane_id), 32,
                                         )
                                 cute.arch.cp_async_commit_group()
-                                if cutlass.const_expr(self.num_dma_warps > 1):
-                                    cute.arch.cp_async_wait_group(0)
-                                    cute.arch.fence_proxy("async.shared", space="cta")
-                                    if lane_id == Int32(0):
-                                        _st_shared_i32(
-                                            w4a8_pipe_addr + (par2 << Int32(2)), epoch2
+                                cute.arch.cp_async_wait_group(1)
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                if lane_id == Int32(0):
+                                    if w4a8_pend_epoch > Int32(0):
+                                        _st_shared_release_i32(
+                                            w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
+                                            w4a8_pend_epoch,
                                         )
-                                else:
-                                    cute.arch.cp_async_wait_group(1)
-                                    cute.arch.fence_proxy("async.shared", space="cta")
-                                    if lane_id == Int32(0):
-                                        if w4a8_pend_epoch > Int32(0):
-                                            _st_shared_i32(
-                                                w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
-                                                w4a8_pend_epoch,
-                                            )
-                                    w4a8_pend_par = par2
-                                    w4a8_pend_epoch = epoch2
+                                w4a8_pend_par = par2
+                                w4a8_pend_epoch = epoch2
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_proxy("async.shared", space="cta")
                         if lane_id == Int32(0):
                             if w4a8_pend_epoch > Int32(0):
-                                _st_shared_i32(
+                                _st_shared_release_i32(
                                     w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
                                     w4a8_pend_epoch,
                                 )
