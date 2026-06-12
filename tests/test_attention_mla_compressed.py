@@ -449,8 +449,19 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         sm_scale=_SM_SCALE,
     )
 
-    assert workspace.kv_chunk_size_value == 1024
-    assert workspace.num_chunks_value == 3
+    # Contract rows (128) sit inside the MTP decode-split window (<=256 rows),
+    # so the fixed workspace must plan the decode split contract — derived from
+    # the contract dims, never the live shape (live would be 512/12 -> 43).
+    contract_cfg = compressed_mla_split_config_for_contract(
+        rows=contract_rows,
+        width=contract_width,
+        max_chunks=max_chunks_per_row,
+    )
+    assert contract_cfg.num_chunks != compressed_mla_split_chunks_for_contract(
+        rows=live_rows, width=live_width
+    )
+    assert workspace.kv_chunk_size_value == contract_cfg.chunk_size
+    assert workspace.num_chunks_value == contract_cfg.num_chunks
     assert calls["launch_num_chunks"] == max_chunks_per_row
     assert calls["direct_output"] is False
     assert calls["swa_cache_is_u8"] is True
