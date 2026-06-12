@@ -69,6 +69,20 @@ _DYNAMIC_SMALL_TILE_MAX_PAIRS = 640
 _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _MOE_FORCE_A8_ENV = "B12X_MOE_FORCE_A8"
+# W4A8 throughput tier (Marlin-port QMMA pipeline, b12x/moe/fused/w4a8/
+# pipeline.py): routed-rows floor above which dynamic-band w4a8_mx calls
+# dispatch to the tier. Measured on the DS4 bench (E=256 K=4096 I_tp=1024
+# topk=6, GPU0, 20 iters, commit e492252c): the tier first beats the dynamic
+# kernel by >5% at routed_rows=3840 (m=640: 1.302 vs 1.468 ms, -11%), widening
+# to -36% at 6144 (m=1024: 1.307 vs 2.038) and -46% at 12288 (m=2048: 1.537
+# vs 2.835); at 3456 the win is only 4.4% and at <=3072 the dynamic kernel
+# wins (m=512: 1.220 vs 1.307 -- 48-row expert-run group padding dominates at
+# few routes/expert). Floor rounded up to 4096.
+# Override with B12X_W4A8_TIER_MIN_ROUTED_ROWS (0 disables the tier);
+# B12X_MOE_FORCE_W4A8_TIER=1 forces the tier below the floor (testing).
+_W4A8_TIER_MIN_ROUTED_ROWS_ENV = "B12X_W4A8_TIER_MIN_ROUTED_ROWS"
+_W4A8_TIER_FORCE_ENV = "B12X_MOE_FORCE_W4A8_TIER"
+_W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT = 4096
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
@@ -1034,6 +1048,8 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _W4A16_PACKED_WEIGHT_CACHE.clear()
+    _W4A8_TIER_WEIGHT_CACHE.clear()
+    _W4A8_TIER_WORKSPACE_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
@@ -2317,6 +2333,102 @@ def _derive_w4a8_weight_grids(
     return ue8m0.contiguous(), residual.view(torch.uint8).contiguous()
 
 
+def _as_e8m0_k32_grid(
+    scales: torch.Tensor, rows: int, k_dim: int, *, name: str
+) -> torch.Tensor:
+    """Validate a checkpoint-native per-K/32 E8M0 grid for w4a8_mx."""
+    if scales.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise ValueError(
+            f"{name} must be E8M0 bytes (uint8/float8_e8m0fnu) for w4a8_mx, "
+            f"got {scales.dtype}"
+        )
+    grid = scales.view(torch.uint8)
+    expected = (int(grid.shape[0]), rows, k_dim // 32)
+    if grid.dim() != 3 or tuple(grid.shape) != expected:
+        raise ValueError(
+            f"{name} must be [E, rows, K//32] = {expected} for w4a8_mx, "
+            f"got {tuple(grid.shape)}"
+        )
+    return grid.contiguous()
+
+
+def _swap_w13_scale_halves_inplace(
+    blockscale: torch.Tensor, *, rows: int, cols_blocks: int
+) -> None:
+    """Swap the FC1 half blocks of a FlashInfer vec16-swizzled scale stack."""
+    u8 = blockscale.view(torch.uint8)
+    E = u8.shape[0]
+    rows_pad = align_up(rows, 128)
+    cols_pad = align_up(cols_blocks, 4)
+    grid = (
+        u8.reshape(E, rows_pad // 128, cols_pad // 4, 32, 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .reshape(E, rows_pad, cols_pad)
+    )
+    half = rows // 2
+    swapped = torch.cat([grid[:, half:rows], grid[:, :half], grid[:, rows:]], dim=1)
+    back = (
+        swapped.reshape(E, rows_pad // 128, 4, 32, cols_pad // 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .reshape(E, -1)
+    )
+    u8.reshape(E, -1).copy_(back)
+
+
+# Storages already flipped to the kernel-native [up; gate] order, keyed by
+# data_ptr. Values hold the tensors so the allocator cannot recycle a
+# registered address (a recycled data_ptr would skip the flip for new weights);
+# deliberately NOT cleared with the view caches — the storage stays normalized.
+_W13_NORMALIZED_STORAGES: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _ensure_w13_kernel_order_inplace(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    *,
+    n: int,
+    k: int,
+    quant_mode: str = "nvfp4",
+) -> None:
+    """One-time in-place flip of gate-first ("w31") FC1 storage to kernel order.
+
+    The gated micro/dynamic kernels consume fused FC1 weights as [up; gate]
+    ("w13"). vLLM fuses [gate; up], so flip the caller's weight and block-scale
+    storage once at first use — the load-time mirror of the W4A16 prepare-path
+    row rotation. Mutates caller storage in place.
+    """
+    reg_key = (w1_fp4.data_ptr(), w1_blockscale.data_ptr())
+    if reg_key in _W13_NORMALIZED_STORAGES:
+        return
+    if not w1_fp4.is_contiguous() or not w1_blockscale.is_contiguous():
+        raise ValueError("w31 FC1 normalization requires contiguous w1 storage")
+    w1_u8 = w1_fp4.view(torch.uint8)
+    if w1_u8.dim() != 3 or int(w1_u8.shape[1]) != 2 * n:
+        raise ValueError(
+            f"w31 FC1 weights must be [E, 2n, k//2]; got {tuple(w1_u8.shape)} for n={n}"
+        )
+    E = int(w1_u8.shape[0])
+    # Swap halves a few experts at a time to bound the temporary.
+    per_expert = int(w1_u8.shape[1]) * int(w1_u8.shape[2])
+    chunk = max(1, min(E, (32 << 20) // max(1, per_expert)))
+    for e0 in range(0, E, chunk):
+        sl = w1_u8[e0 : e0 + chunk]
+        tmp = sl[:, :n].clone()
+        sl[:, :n] = sl[:, n:]
+        sl[:, n:] = tmp
+    if quant_mode == "w4a8_mx":
+        # MXFP4 sources carry plain [E, 2n, K//32] grids — swap rows directly.
+        grid = _as_e8m0_k32_grid(w1_blockscale, 2 * n, k, name="w1_blockscale")
+        tmp = grid[:, :n].clone()
+        grid[:, :n] = grid[:, n:]
+        grid[:, n:] = tmp
+    else:
+        _swap_w13_scale_halves_inplace(
+            w1_blockscale, rows=2 * n, cols_blocks=k // 16
+        )
+    _W13_NORMALIZED_STORAGES[reg_key] = (w1_fp4, w1_blockscale)
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -2329,13 +2441,22 @@ def _get_weight_views(
     *,
     activation_spec: _ActivationKernelSpec,
     quant_mode: str = "nvfp4",
+    w13_layout: str = "w13",
 ) -> _WeightViews:
     """Create weight views from the expert-weight layout.
 
-    For gated SwiGLU kernels, ``w1_fp4`` is `[E, 2*n, k//2]`.
+    For gated SwiGLU kernels, ``w1_fp4`` is `[E, 2*n, k//2]`; ``w13_layout``
+    names the source half order ("w31"/gate-first sources are flipped to the
+    kernel-native [up; gate] order in place, once per storage).
     For relu2 kernels, ``w1_fp4`` is `[E, n, k//2]`.
     """
     global _LAST_WEIGHTS
+    quant_mode = _normalize_quant_mode(quant_mode)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    if w13_layout == "w31" and activation_spec.activation == "silu":
+        _ensure_w13_kernel_order_inplace(
+            w1_fp4, w1_blockscale, n=n, k=k, quant_mode=quant_mode
+        )
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -2344,7 +2465,7 @@ def _get_weight_views(
         w1_alphas.data_ptr(),
         w2_alphas.data_ptr(),
         activation_spec.activation,
-        _is_w4a8_quant_mode(quant_mode),
+        quant_mode if _is_w4a8_quant_mode(quant_mode) else "nvfp4",
     )
     last_wkey, last_wval = _LAST_WEIGHTS
     if last_wkey == key:
@@ -2361,8 +2482,17 @@ def _get_weight_views(
     # Compact contiguous scale storage for the FC1 weights.
     w1_n = activation_spec.w1_rows(n)
     bs_u8 = w1_blockscale.view(torch.uint8)
-    w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
-    down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
+    if quant_mode == "w4a8_mx":
+        # MXFP4 sources carry checkpoint-native per-K/32 E8M0 grids
+        # ([E, rows, K//32] bytes); there is no vec16 scale stack to view.
+        # The w4a8 kernels never read the vec16 SF descriptors, so the
+        # vec16 view slots are pointed at the grid bytes below purely to
+        # plumb valid addresses through the launch.
+        w13_sf = _as_e8m0_k32_grid(w1_blockscale, w1_n, k, name="w1_blockscale")
+        down_sf = _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale")
+    else:
+        w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
+        down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
     if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
         raise ValueError("w1_alphas and w2_alphas must be contiguous")
 
@@ -2392,17 +2522,20 @@ def _get_weight_views(
         sf_dtype, down_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
     if _is_w4a8_quant_mode(quant_mode):
-        if quant_mode != "w4a8_nvfp4":
-            raise NotImplementedError(
-                "only w4a8_nvfp4 (modelopt_nvfp4 sources) is dispatched through "
-                "b12x_moe_fp4; w4a8_mx needs an e8m0_k32 prepare path"
+        if quant_mode == "w4a8_nvfp4":
+            views.sfb_w13_mx, views.w13_residual = _derive_w4a8_weight_grids(
+                bs_u8, w1_n, k
             )
-        views.sfb_w13_mx, views.w13_residual = _derive_w4a8_weight_grids(
-            bs_u8, w1_n, k
-        )
-        views.sfb_down_mx, views.down_residual = _derive_w4a8_weight_grids(
-            w2_blockscale.view(torch.uint8), k, n
-        )
+            views.sfb_down_mx, views.down_residual = _derive_w4a8_weight_grids(
+                w2_blockscale.view(torch.uint8), k, n
+            )
+        else:
+            # w4a8_mx: the checkpoint E8M0 K/32 grids feed the kernel
+            # directly. Residuals stay None — the w4a8_mx kernel neither
+            # stages nor reads them (const_expr-gated) and the launch
+            # substitutes dummy pointers.
+            views.sfb_w13_mx = w13_sf
+            views.sfb_down_mx = down_sf
     _WEIGHT_CACHE[key] = views
     _LAST_WEIGHTS = (key, views)
     return views
@@ -2457,6 +2590,236 @@ def _get_w4a16_packed_weights(
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
     return prepared
+
+
+# --------------------------------------------------------------------------
+# W4A8 throughput tier (Marlin-port QMMA pipeline) dispatch
+# --------------------------------------------------------------------------
+
+# Repacked tier weights keyed by source data_ptrs + shapes (mirrors
+# _get_w4a16_packed_weights). Values hold the SOURCE tensors alongside the
+# prepared dict so the allocator cannot recycle a registered address into a
+# stale repack; a None prepared dict marks weights the tier cannot serve
+# (non-unit alphas) so the hot path skips the host-sync recheck.
+_W4A8_TIER_WEIGHT_CACHE: Dict[Tuple, Tuple[Tuple[torch.Tensor, ...], dict | None]] = {}
+# Capacity workspaces keyed per launch shape (v1: one per exact m).
+_W4A8_TIER_WORKSPACE_CACHE: Dict[Tuple, dict] = {}
+
+
+def _w4a8_tier_min_routed_rows() -> int:
+    raw = os.environ.get(_W4A8_TIER_MIN_ROUTED_ROWS_ENV)
+    if raw is None or not raw.strip():
+        return _W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT
+    return int(raw)
+
+
+def _get_w4a8_tier_prepared(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    *,
+    n: int,
+    k: int,
+) -> dict | None:
+    """Repack (once) kernel-order FC1/FC2 storage for the W4A8 tier GEMM.
+
+    Callers must have normalized w31 sources to kernel order ([up; gate])
+    BEFORE this point (the same _ensure_w13_kernel_order_inplace flip the
+    dynamic path runs) -- the repack reads the flipped storage. Returns None
+    when the tier cannot serve these weights (non-unit alphas: the tier GEMM
+    has no per-expert alpha operand in v1).
+    """
+    from b12x.moe.fused.w4a8.pipeline import prepare_w4a8_tier_weights
+
+    key = (
+        w1_fp4.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_alphas.data_ptr(),
+        tuple(w1_fp4.shape),
+        tuple(w2_fp4.shape),
+    )
+    cached = _W4A8_TIER_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
+    sources = (w1_fp4, w1_blockscale, w2_fp4, w2_blockscale, w1_alphas, w2_alphas)
+    # One-time host check (syncs): v1 consumes MXFP4 sources exactly, whose
+    # per-expert weight global dequant scales are ones by contract.
+    unit_alphas = bool(
+        torch.all(w1_alphas == 1.0).item() and torch.all(w2_alphas == 1.0).item()
+    )
+    if not unit_alphas:
+        logger.warning(
+            "w4a8 tier: non-unit w1/w2 alphas; falling back to the dynamic kernel"
+        )
+        _W4A8_TIER_WEIGHT_CACHE[key] = (sources, None)
+        return None
+    prepared = prepare_w4a8_tier_weights(
+        w1_fp4.view(torch.uint8),
+        _as_e8m0_k32_grid(w1_blockscale, 2 * n, k, name="w1_blockscale"),
+        w2_fp4.view(torch.uint8),
+        _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale"),
+    )
+    _W4A8_TIER_WEIGHT_CACHE[key] = (sources, prepared)
+    return prepared
+
+
+def _maybe_launch_w4a8_tier(
+    *,
+    a: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor | None,
+    m: int,
+    k: int,
+    n: int,
+    weight_E: int,
+    num_topk: int,
+    routed_rows: int,
+    activation: str,
+    quant_mode: str,
+    w13_layout: str,
+    apply_router_weight_on_input: bool,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Route a dynamic-band w4a8_mx call to the W4A8 throughput-tier pipeline.
+
+    Returns the output tensor when the tier handled the call, or None to fall
+    back to the dynamic kernel. Fallback / refusal conditions (v1):
+      - quant_mode != "w4a8_mx" (w4a8_nvfp4 needs residual scale grids and
+        per-expert alphas the tier GEMM does not implement);
+      - tier disabled: B12X_W4A8_TIER_MIN_ROUTED_ROWS=0;
+      - routed_rows below the floor (unless B12X_MOE_FORCE_W4A8_TIER=1) --
+        the tier's 48-row expert-run group padding loses to the dynamic
+        kernel at few routes/expert;
+      - activation != "silu" (the tier act kernel is fused silu(gate)*up +
+        MXFP8 quant only);
+      - apply_router_weight_on_input (v1 applies topk weights in the final
+        sum; unreachable today -- b12x_moe_fp4 raises NotImplementedError for
+        non-w4a16 modes earlier -- kept as a guard if that gate moves);
+      - geometry: k % 256 != 0 or n % 128 != 0 (GEMM tile_n=256 / tile_k=128
+        across FC1 [N=2n, K=k] and FC2 [N=k, K=n]; k % 256 also covers the
+        topk-sum column blocking) or topk_ids/topk_weights not [m, topk];
+      - non-unit w1/w2 alphas (checked once per weight storage, cached).
+    Routing contract (pipeline v1): every topk_ids entry must be a valid
+    expert in [0, weight_E) -- same as the serving routes the dynamic band
+    receives (no expert_map / dropped routes here).
+    """
+    if quant_mode != "w4a8_mx":
+        return None
+    min_routed = _w4a8_tier_min_routed_rows()
+    if min_routed == 0:
+        return None
+    if routed_rows < min_routed and not _env_flag(_W4A8_TIER_FORCE_ENV, default=False):
+        return None
+    if activation != "silu":
+        return None
+    if apply_router_weight_on_input:
+        return None
+    if k % 256 != 0 or n % 128 != 0:
+        return None
+    if topk_ids.dim() != 2 or topk_weights.dim() != 2:
+        return None
+
+    from b12x.moe.fused.w4a8.pipeline import (
+        build_w4a8_tier_workspace,
+        w4a8_tier_forward,
+    )
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    # w31 sources: same one-time in-place flip to kernel order ([up; gate])
+    # the dynamic path applies in _get_weight_views; the repack below reads
+    # the flipped storage. Idempotent per storage via the flip registry.
+    if w13_layout == "w31":
+        _ensure_w13_kernel_order_inplace(
+            w1_fp4, w1_blockscale, n=n, k=k, quant_mode=quant_mode
+        )
+    prepared = _get_w4a8_tier_prepared(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        n=n,
+        k=k,
+    )
+    if prepared is None:
+        return None
+
+    ws_key = (m, k, n, weight_E, num_topk, device)
+    ws = _W4A8_TIER_WORKSPACE_CACHE.get(ws_key)
+    if capturing and (ws is None or "fc2" not in ws["_compiled"]):
+        # Workspace build allocates and the first forward compiles (cute +
+        # triton JIT) -- neither is graph-capturable. Serving must warm the
+        # tier (one eager call per shape) before capture.
+        raise RuntimeError(
+            "CUDA graph capture requires a warmed w4a8 tier workspace; "
+            "run one eager b12x_moe_fp4 call for this shape before capture"
+        )
+    if ws is None:
+        ws = build_w4a8_tier_workspace(
+            m=m,
+            hidden_size=k,
+            intermediate_size=n,
+            num_experts=weight_E,
+            topk=num_topk,
+            device=device,
+        )
+        _W4A8_TIER_WORKSPACE_CACHE[ws_key] = ws
+
+    if output is None:
+        if capturing:
+            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+        output = torch.empty(m, k, dtype=a.dtype, device=device)
+    if output.shape != (m, k):
+        raise ValueError(
+            f"output must have shape {(m, k)}, got {tuple(output.shape)}"
+        )
+    if output.dtype != a.dtype:
+        raise ValueError(f"output must have dtype {a.dtype}, got {output.dtype}")
+    if output.device != device:
+        raise ValueError(f"output must be on device {device}, got {output.device}")
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous")
+
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        if capturing:
+            raise ValueError(
+                "CUDA graph capture requires contiguous int32 topk_ids on the "
+                "w4a8 tier path"
+            )
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+    if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+        if capturing:
+            raise ValueError(
+                "CUDA graph capture requires contiguous float32 topk_weights "
+                "on the w4a8 tier path"
+            )
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
+    return w4a8_tier_forward(
+        a,
+        prepared["w13_rp"],
+        prepared["w13_sfb"],
+        prepared["w2_rp"],
+        prepared["w2_sfb"],
+        topk_ids,
+        topk_weights,
+        ws,
+        out=output,
+    )
 
 
 def _prepare_modelopt_nvfp4_runtime_alphas(
@@ -6324,6 +6687,36 @@ def b12x_moe_fp4(
 
     impl = plan.implementation
     max_rows = plan.max_rows
+    if impl == "dynamic" and _is_w4a8_quant_mode(quant_mode):
+        # W4A8 throughput tier: prefill-band w4a8_mx routes to the Marlin-port
+        # QMMA pipeline (placed before chunking -- the tier workspace is
+        # capacity-sized per m and has no launch-ABI row limit). Returns None
+        # on any v1 fallback condition (documented on the helper).
+        tier_out = _maybe_launch_w4a8_tier(
+            a=a,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            m=m,
+            k=k,
+            n=n,
+            weight_E=weight_E,
+            num_topk=num_topk,
+            routed_rows=routed_rows,
+            activation=activation,
+            quant_mode=quant_mode,
+            w13_layout=w13_layout,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            device=device,
+        )
+        if tier_out is not None:
+            return tier_out
     if impl == "dynamic" and m > plan.max_tokens_per_launch:
         if not workspace_policy.can_chunk:
             raise ValueError(
@@ -6354,6 +6747,7 @@ def b12x_moe_fp4(
                 activation=activation,
                 quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
+                w13_layout=w13_layout,
                 swiglu_limit=swiglu_limit,
             )
         return chunk_output
@@ -6381,6 +6775,13 @@ def b12x_moe_fp4(
 
     if impl == "static":
         assert isinstance(s, TPCompactStaticWorkspace)
+        if quant_mode == "w4a8_mx":
+            # The micro a8_mx kernel consumes vec16 E4M3 scales; the
+            # e8m0_k32 micro wiring for MXFP4 sources is not threaded yet.
+            raise NotImplementedError(
+                "w4a8_mx tiny-decode (micro) serving is not wired yet; "
+                "w4a8_mx currently serves the dynamic band only"
+            )
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
@@ -6394,6 +6795,7 @@ def b12x_moe_fp4(
             n,
             k,
             activation_spec=activation_spec,
+            w13_layout=w13_layout,
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
@@ -6410,6 +6812,7 @@ def b12x_moe_fp4(
             k,
             activation_spec=activation_spec,
             quant_mode=quant_mode,
+            w13_layout=w13_layout,
         )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
