@@ -15,16 +15,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
+from b12x.attention.paged.api import paged_attention_forward
 from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.attention import (
-    PagedAttentionWorkspace,
-    clear_attention_caches,
-)
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
 from b12x.attention.paged.planner import (
     create_paged_plan,
     decode_chunk_pages_for_graph,
     resolve_decode_graph_ctas_per_sm,
 )
+from b12x.integration.attention import clear_attention_caches
+from b12x.integration.paged_attention_scratch import build_paged_attention_binding
 
 
 def require_sm120() -> None:
@@ -373,6 +373,28 @@ def _make_flashinfer_page_metadata(
 def _format_plan_desc(*, kv_chunk_size: int, split_kv: bool) -> str:
     desc = f"chunk={int(kv_chunk_size)}"
     return f"{desc},split" if split_kv else f"{desc},nosplit"
+
+
+def _run_backend_forward(
+    *,
+    workspace: PagedAttentionWorkspace,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    output: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+) -> None:
+    binding = build_paged_attention_binding(
+        scratch=workspace,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    paged_attention_forward(binding=binding)
 
 
 def _build_backend_graph_plan(
@@ -836,10 +858,11 @@ def _capture_backend_graph(
     )
 
     def run() -> None:
-        workspace.run(
-            q,
-            k_cache,
-            v_cache,
+        _run_backend_forward(
+            workspace=workspace,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
             output=output,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -1035,10 +1058,11 @@ def _capture_b12x_decode_graph_bucket(
     output = torch.empty_like(shared.q)
 
     def run() -> None:
-        workspace.run(
-            shared.q,
-            shared.k_cache,
-            shared.v_cache,
+        _run_backend_forward(
+            workspace=workspace,
+            q=shared.q,
+            k_cache=shared.k_cache,
+            v_cache=shared.v_cache,
             output=output,
             k_descale=shared.k_descale,
             v_descale=shared.v_descale,
