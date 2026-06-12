@@ -56,38 +56,24 @@ def _run(
     w13_layout: str = "w13",
     seed: int = 33,
 ) -> torch.Tensor:
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration.tp_moe import clear_tp_moe_caches
+    from tests.helpers import run_tp_moe_fp4
 
     clear_tp_moe_caches()
     weights = _weights()
     x, topk_ids, topk_weights = _routed_inputs(m, seed)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights["input_scale"],
-        w13_fp4,
-        weights["input_scale"],
-        weights["w2_fp4"],
-        topk_ids,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    )
-    out = b12x_moe_fp4(
-        x,
-        weights["input_scale"],
-        w13_fp4,
-        w13_mx,
-        weights["alphas"],
-        weights["input_scale"],
-        weights["w2_fp4"],
-        weights["w2_mx"],
-        weights["alphas"],
-        topk_weights,
-        topk_ids,
-        workspace=workspace,
+    out = run_tp_moe_fp4(
+        a=x,
+        a1_gscale=weights["input_scale"],
+        w1_fp4=w13_fp4,
+        w1_blockscale=w13_mx,
+        w1_alphas=weights["alphas"],
+        a2_gscale=weights["input_scale"],
+        w2_fp4=weights["w2_fp4"],
+        w2_blockscale=weights["w2_mx"],
+        w2_alphas=weights["alphas"],
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         input_scales_static=True,
         quant_mode="w4a8_mx",
         w13_layout=w13_layout,
@@ -248,11 +234,8 @@ def test_w4a8_mx_tier_graph_replay_tracks_routing_updates(monkeypatch) -> None:
     replay with routing/activations mutated IN PLACE must track the update
     (vs a fresh eager call on the same inputs, and vs the oracle)."""
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
+    from tests.helpers import make_tp_moe_fp4_binding
 
     monkeypatch.setenv("B12X_MOE_FORCE_W4A8_TIER", "1")
     monkeypatch.delenv("B12X_W4A8_TIER_MIN_ROUTED_ROWS", raising=False)
@@ -264,38 +247,34 @@ def test_w4a8_mx_tier_graph_replay_tracks_routing_updates(monkeypatch) -> None:
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
     graph_out = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights["input_scale"],
-        weights["w13_fp4"],
-        weights["input_scale"],
-        weights["w2_fp4"],
-        topk_ids,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    )
+    eager_out = torch.zeros_like(graph_out)
 
-    def _launch(out: torch.Tensor) -> None:
-        b12x_moe_fp4(
-            x,
-            weights["input_scale"],
-            weights["w13_fp4"],
-            weights["w13_mx"],
-            weights["alphas"],
-            weights["input_scale"],
-            weights["w2_fp4"],
-            weights["w2_mx"],
-            weights["alphas"],
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
+    def _make_binding(out: torch.Tensor):
+        return make_tp_moe_fp4_binding(
+            a=x,
+            a1_gscale=weights["input_scale"],
+            w1_fp4=weights["w13_fp4"],
+            w1_blockscale=weights["w13_mx"],
+            w1_alphas=weights["alphas"],
+            a2_gscale=weights["input_scale"],
+            w2_fp4=weights["w2_fp4"],
+            w2_blockscale=weights["w2_mx"],
+            w2_alphas=weights["alphas"],
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             output=out,
             input_scales_static=True,
             quant_mode="w4a8_mx",
         )
 
+    graph_binding = _make_binding(graph_out)
+    eager_binding = _make_binding(eager_out)
+
+    def _launch(binding) -> None:
+        b12x_moe_fp4(binding=binding)
+
     # Warm (compiles cute + triton, builds the tier workspace), then capture.
-    _launch(graph_out)
+    _launch(graph_binding)
     torch.cuda.synchronize()
     assert _tier_dispatched(), "expected the forced w4a8 tier dispatch"
 
@@ -304,7 +283,7 @@ def test_w4a8_mx_tier_graph_replay_tracks_routing_updates(monkeypatch) -> None:
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         with torch.cuda.graph(graph):
-            _launch(graph_out)
+            _launch(graph_binding)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
@@ -321,8 +300,8 @@ def test_w4a8_mx_tier_graph_replay_tracks_routing_updates(monkeypatch) -> None:
         torch.cuda.synchronize()
         replayed = graph_out.clone()
 
-        eager_out = torch.zeros_like(graph_out)
-        _launch(eager_out)
+        eager_out.zero_()
+        _launch(eager_binding)
         torch.cuda.synchronize()
 
         assert replayed.abs().sum().item() > 0, round_idx
@@ -359,12 +338,9 @@ def test_w4a8_mx_tier_glm_shard_geometry(monkeypatch) -> None:
     """GLM per-rank shard geometry: E=16, K=4096, n=256 (FC1 N=512, FC2
     N=4096 with K=256) through the forced tier, gated vs the oracle."""
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration.tp_moe import clear_tp_moe_caches
     from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from tests.helpers import run_tp_moe_fp4
 
     monkeypatch.setenv("B12X_MOE_FORCE_W4A8_TIER", "1")
     monkeypatch.delenv("B12X_W4A8_TIER_MIN_ROUTED_ROWS", raising=False)
@@ -375,29 +351,18 @@ def test_w4a8_mx_tier_glm_shard_geometry(monkeypatch) -> None:
     )
     m = 256
     x, topk_ids, topk_weights = _routed_inputs(m, 44)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights["input_scale"],
-        weights["w13_fp4"],
-        weights["input_scale"],
-        weights["w2_fp4"],
-        topk_ids,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    )
-    out = b12x_moe_fp4(
-        x,
-        weights["input_scale"],
-        weights["w13_fp4"],
-        weights["w13_mx"],
-        weights["alphas"],
-        weights["input_scale"],
-        weights["w2_fp4"],
-        weights["w2_mx"],
-        weights["alphas"],
-        topk_weights,
-        topk_ids,
-        workspace=workspace,
+    out = run_tp_moe_fp4(
+        a=x,
+        a1_gscale=weights["input_scale"],
+        w1_fp4=weights["w13_fp4"],
+        w1_blockscale=weights["w13_mx"],
+        w1_alphas=weights["alphas"],
+        a2_gscale=weights["input_scale"],
+        w2_fp4=weights["w2_fp4"],
+        w2_blockscale=weights["w2_mx"],
+        w2_alphas=weights["alphas"],
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         input_scales_static=True,
         quant_mode="w4a8_mx",
     )

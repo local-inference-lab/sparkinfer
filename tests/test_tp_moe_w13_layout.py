@@ -115,41 +115,27 @@ def _run(
     launches: int = 1,
     seed: int = 1234,
 ) -> torch.Tensor:
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration.tp_moe import clear_tp_moe_caches
+    from tests.helpers import run_tp_moe_fp4
 
     clear_tp_moe_caches()
     device = torch.device("cuda")
     weights = _sub_weights()
     x, topk_ids, topk_weights = make_routed_inputs(_make_spec(), m, seed=seed, device=device)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights["w1_input_scale"],
-        w13_weight,
-        weights["w2_input_scale"],
-        weights["w2_weight"],
-        topk_ids,
-        input_scales_static=True,
-        quant_mode=quant_mode,
-    )
     out = None
     for _ in range(launches):
-        out = b12x_moe_fp4(
-            x,
-            weights["w1_input_scale"],
-            w13_weight,
-            w13_blockscale,
-            weights["g1_alphas"],
-            weights["w2_input_scale"],
-            weights["w2_weight"],
-            weights["w2_blockscale"],
-            weights["g2_alphas"],
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
+        out = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=weights["w1_input_scale"],
+            w1_fp4=w13_weight,
+            w1_blockscale=w13_blockscale,
+            w1_alphas=weights["g1_alphas"],
+            a2_gscale=weights["w2_input_scale"],
+            w2_fp4=weights["w2_weight"],
+            w2_blockscale=weights["w2_blockscale"],
+            w2_alphas=weights["g2_alphas"],
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
             quant_mode=quant_mode,
             w13_layout=w13_layout,
