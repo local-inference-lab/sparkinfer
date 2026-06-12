@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+import os
 from typing import Literal
 
 import torch
@@ -110,8 +111,24 @@ class B12XPagedAttentionScratchCaps:
     num_cache_pages: int
     use_cuda_graph: bool = False
     copy_runtime_metadata: bool = True
+    msa_block_sparse: bool = False
+    msa_union_tile: bool | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "msa_block_sparse", bool(self.msa_block_sparse))
+        if self.msa_block_sparse and os.environ.get("B12X_PAGED_MSA") == "0":
+            raise RuntimeError("B12X_PAGED_MSA=0 disables MSA block-sparse paged attention")
+        if self.msa_union_tile is None:
+            msa_union_tile = (
+                self.msa_block_sparse
+                and self.mode == "extend"
+                and os.environ.get("B12X_PAGED_MSA_UNION_PREFILL", "1") != "0"
+            )
+        else:
+            msa_union_tile = bool(self.msa_union_tile)
+        if msa_union_tile and not (self.msa_block_sparse and self.mode == "extend"):
+            raise ValueError("msa_union_tile requires mode='extend' and msa_block_sparse=True")
+        object.__setattr__(self, "msa_union_tile", msa_union_tile)
         object.__setattr__(self, "device", _canonical_device(self.device))
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "num_kv_heads", max(int(self.num_kv_heads), 1))
@@ -157,6 +174,9 @@ class _B12XPagedAttentionScratchLayout:
     lse_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
+    msa_union_blocks_offset_bytes: int | None
+    msa_union_masks_offset_bytes: int | None
+    msa_union_counts_offset_bytes: int | None
 
 
 def _paged_attention_scratch_layout(
@@ -203,6 +223,22 @@ def _paged_attention_scratch_layout(
         (caps.max_partial_rows, caps.num_q_heads),
         torch.float32,
     )
+    msa_union_blocks_offset_bytes = None
+    msa_union_masks_offset_bytes = None
+    msa_union_counts_offset_bytes = None
+    if caps.msa_union_tile:
+        msa_union_blocks_offset_bytes = reserve(
+            (caps.max_work_items, caps.num_kv_heads, 128),
+            torch.int32,
+        )
+        msa_union_masks_offset_bytes = reserve(
+            (caps.max_work_items, caps.num_kv_heads, 128),
+            torch.int32,
+        )
+        msa_union_counts_offset_bytes = reserve(
+            (caps.max_work_items, caps.num_kv_heads),
+            torch.int32,
+        )
 
     return _B12XPagedAttentionScratchLayout(
         nbytes=max(int(offset), SCRATCH_ALIGN_BYTES),
@@ -221,6 +257,9 @@ def _paged_attention_scratch_layout(
         lse_offset_bytes=lse_offset_bytes,
         tmp_output_offset_bytes=tmp_output_offset_bytes,
         tmp_lse_offset_bytes=tmp_lse_offset_bytes,
+        msa_union_blocks_offset_bytes=msa_union_blocks_offset_bytes,
+        msa_union_masks_offset_bytes=msa_union_masks_offset_bytes,
+        msa_union_counts_offset_bytes=msa_union_counts_offset_bytes,
     )
 
 
@@ -296,6 +335,10 @@ class B12XPagedAttentionScratch:
     lse: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
+    msa_union_blocks: torch.Tensor | None = None
+    msa_union_masks: torch.Tensor | None = None
+    msa_union_counts: torch.Tensor | None = None
+    q2k_indices: torch.Tensor | None = None
     _plan_q: torch.Tensor | None = None
     _plan_output: torch.Tensor | None = None
     _plan_k_cache: torch.Tensor | None = None
@@ -310,6 +353,9 @@ class B12XPagedAttentionScratch:
     _prefill_graph_max_q_tiles_per_req: int | None = None
     _prefill_graph_max_chunks_per_q_tile: int | None = None
     _prefill_graph_max_q_rows_per_req: int | None = None
+    msa_block_sparse: bool = False
+    msa_union_tile: bool = False
+    _q2k_indices_data_ptr: int | None = None
     _live_plane_tma_desc_cache: dict[
         tuple[int, int, tuple[int, ...], tuple[int, ...], int, int],
         tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor],
@@ -358,6 +404,7 @@ class B12XPagedAttentionScratch:
         disable_split_kv: bool = False,
         window_left: int = -1,
         active_total_q: int | None = None,
+        q2k_indices: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
@@ -375,6 +422,7 @@ class B12XPagedAttentionScratch:
             disable_split_kv=disable_split_kv,
             window_left=window_left,
             active_total_q=active_total_q,
+            q2k_indices=q2k_indices,
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
@@ -496,6 +544,8 @@ class B12XPagedAttentionScratch:
                     if self.mode in ("extend", "verify") and not self.use_cuda_graph
                     else None
                 ),
+                msa_block_sparse=self.msa_block_sparse,
+                msa_union_tile=self.msa_union_tile,
             )
             self._ensure_capacity(plan)
             self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
@@ -804,6 +854,24 @@ class B12XPagedAttentionScratch:
                 page_size=self.page_size,
                 window_left=int(self._plan.window_left),
             )
+        elif getattr(self._plan, "msa_block_sparse", False):
+            from b12x.attention.paged.graph_replay import (
+                update_msa_decode_graph_chunk_metadata,
+            )
+
+            update_msa_decode_graph_chunk_metadata(
+                cache_seqlens=self.cache_seqlens,
+                request_indices=self.request_indices,
+                qo_tile_indices=self.qo_tile_indices,
+                kv_tile_indices=self.kv_tile_indices,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                block_valid_mask=self.block_valid_mask,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_window_start_tokens=self.kv_window_start_tokens,
+                kv_chunk_size=int(self._plan.kv_chunk_size),
+                page_size=self.page_size,
+            )
         elif self._use_regular_decode_graph_replay:
             from b12x.attention.paged.graph_replay import (
                 update_regular_decode_graph_chunk_metadata_from_lut,
@@ -881,6 +949,48 @@ class B12XPagedAttentionScratch:
         if int(v_cache.shape[3]) != self.head_dim_vo:
             raise ValueError("v_cache head_dim does not match the scratch contract")
 
+    def _validate_q2k_indices_reference(
+        self,
+        q2k_indices: torch.Tensor | None,
+    ) -> None:
+        if not self.msa_block_sparse:
+            if q2k_indices is not None:
+                raise ValueError(
+                    "q2k_indices can only be bound when scratch caps set msa_block_sparse=True"
+                )
+            self.q2k_indices = None
+            return
+        if os.environ.get("B12X_PAGED_MSA") == "0":
+            raise RuntimeError("B12X_PAGED_MSA=0 disables MSA block-sparse paged attention")
+        if q2k_indices is None:
+            raise ValueError("MSA block-sparse paged attention requires q2k_indices")
+        if q2k_indices.device != self.device:
+            raise ValueError("q2k_indices must stay on the scratch device")
+        if q2k_indices.dtype != torch.int32:
+            raise TypeError("q2k_indices must be a torch.int32 tensor")
+        if q2k_indices.ndim != 3:
+            raise ValueError("q2k_indices must have shape [kv_heads, total_q_capacity, 16]")
+        if not q2k_indices.is_contiguous():
+            raise ValueError("q2k_indices must be contiguous")
+        if int(q2k_indices.shape[0]) != self.num_kv_heads or int(q2k_indices.shape[2]) != 16:
+            raise ValueError(
+                "q2k_indices must have shape "
+                f"({self.num_kv_heads}, >=total_q_capacity, 16), got {tuple(q2k_indices.shape)}"
+            )
+        if int(q2k_indices.shape[1]) < self.total_q_capacity:
+            raise ValueError(
+                "q2k_indices total_q_capacity is smaller than scratch total_q_capacity"
+            )
+        data_ptr = int(q2k_indices.data_ptr())
+        if self._q2k_indices_data_ptr is None:
+            self._q2k_indices_data_ptr = data_ptr
+        elif self._q2k_indices_data_ptr != data_ptr:
+            raise ValueError(
+                "MSA q2k_indices data_ptr changed after prepare; graph-safe bindings "
+                "must rewrite the captured buffer in place"
+            )
+        self.q2k_indices = q2k_indices
+
 
 @dataclass(frozen=True, kw_only=True)
 class B12XPagedAttentionBinding:
@@ -889,6 +999,7 @@ class B12XPagedAttentionBinding:
     k_cache: torch.Tensor
     v_cache: torch.Tensor
     output: torch.Tensor
+    q2k_indices: torch.Tensor | None = None
     k_descale: torch.Tensor | None = None
     v_descale: torch.Tensor | None = None
     attention_sink_bias: torch.Tensor | None = None
@@ -967,6 +1078,7 @@ def build_paged_attention_binding(
     disable_split_kv: bool = False,
     window_left: int = -1,
     active_total_q: int | None = None,
+    q2k_indices: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
@@ -998,6 +1110,7 @@ def build_paged_attention_binding(
         )
     elif not scratch.prepared:
         raise RuntimeError("paged attention binding requires prepared scratch metadata")
+    scratch._validate_q2k_indices_reference(q2k_indices)
 
     return B12XPagedAttentionBinding(
         scratch=scratch,
@@ -1005,6 +1118,7 @@ def build_paged_attention_binding(
         k_cache=k_cache,
         v_cache=v_cache,
         output=output,
+        q2k_indices=q2k_indices,
         k_descale=k_descale,
         v_descale=v_descale,
         attention_sink_bias=attention_sink_bias,
@@ -1126,6 +1240,30 @@ def _materialize_paged_attention_scratch(
             shape=(caps.max_partial_rows, caps.num_q_heads),
             dtype=torch.float32,
         )
+    msa_union_blocks = None
+    msa_union_masks = None
+    msa_union_counts = None
+    if layout.msa_union_blocks_offset_bytes is not None:
+        msa_union_blocks, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_union_blocks_offset_bytes,
+            shape=(caps.max_work_items, caps.num_kv_heads, 128),
+            dtype=torch.int32,
+        )
+    if layout.msa_union_masks_offset_bytes is not None:
+        msa_union_masks, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_union_masks_offset_bytes,
+            shape=(caps.max_work_items, caps.num_kv_heads, 128),
+            dtype=torch.int32,
+        )
+    if layout.msa_union_counts_offset_bytes is not None:
+        msa_union_counts, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_union_counts_offset_bytes,
+            shape=(caps.max_work_items, caps.num_kv_heads),
+            dtype=torch.int32,
+        )
 
     return B12XPagedAttentionScratch(
         shared_scratch=scratch_storage,
@@ -1161,6 +1299,11 @@ def _materialize_paged_attention_scratch(
         lse=lse,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
+        msa_union_blocks=msa_union_blocks,
+        msa_union_masks=msa_union_masks,
+        msa_union_counts=msa_union_counts,
+        msa_block_sparse=caps.msa_block_sparse,
+        msa_union_tile=bool(caps.msa_union_tile),
         _plan_q=plan_q,
         _plan_output=plan_output,
         _plan_k_cache=plan_k_cache,
@@ -1189,6 +1332,7 @@ class B12XPagedAttentionScratchPlan:
     _decode_graph_chunk_pages_lut: torch.Tensor | None = None
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
+    _q2k_indices_data_ptr: int | None = None
 
     def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -1290,9 +1434,10 @@ class B12XPagedAttentionScratchPlan:
         self,
         *,
         batch: int,
-        total_q_capacity: int,
         max_page_table_width: int,
-        max_cache_page_count: int,
+        total_q_capacity: int | None = None,
+        max_cache_page_count: int | None = None,
+        fixed_split_size: int = -1,
         window_left: int = -1,
     ) -> "B12XPagedAttentionScratchPlan":
         if not self.caps.use_cuda_graph:
@@ -1304,6 +1449,14 @@ class B12XPagedAttentionScratchPlan:
             raise RuntimeError(
                 "prepare_decode_graph_replay_state is only valid for decode plans"
             )
+        if total_q_capacity is None:
+            total_q_capacity = int(self.caps.max_total_q)
+        else:
+            total_q_capacity = int(total_q_capacity)
+        if max_cache_page_count is None:
+            max_cache_page_count = int(max_page_table_width)
+        else:
+            max_cache_page_count = int(max_cache_page_count)
         if batch <= 0:
             raise ValueError("batch must be positive")
         if total_q_capacity <= 0:
@@ -1316,6 +1469,67 @@ class B12XPagedAttentionScratchPlan:
             raise ValueError(
                 "window_left must be -1 for full attention or a non-negative token count"
             )
+
+        if self.caps.msa_block_sparse:
+            if window_left != -1:
+                raise ValueError("MSA block-sparse decode graph replay does not support window_left/SWA")
+            if self.caps.page_size != 64:
+                raise ValueError("MSA block-sparse decode graph replay requires page_size=64")
+            if self.caps.head_dim_qk != 128 or self.caps.head_dim_vo != 128:
+                raise ValueError("MSA block-sparse decode graph replay requires head_dim_qk=head_dim_vo=128")
+            if self.caps.num_q_heads // self.caps.num_kv_heads != 16:
+                raise ValueError("MSA block-sparse decode graph replay requires gqa_group_size=16")
+            max_page_ids = torch.arange(
+                max_page_table_width, dtype=torch.int32, device=self.caps.device
+            )
+            max_page_table = (
+                (max_page_ids % self.caps.num_cache_pages)
+                .unsqueeze(0)
+                .expand(batch, -1)
+                .contiguous()
+            )
+            max_cache_seqlens = torch.full(
+                (batch,),
+                int(max_cache_page_count) * self.caps.page_size,
+                dtype=torch.int32,
+                device=self.caps.device,
+            )
+            max_cu_seqlens_q = self._build_capacity_cu_seqlens_q(
+                batch=batch,
+                total_q_capacity=total_q_capacity,
+                device=self.caps.device,
+            )
+            plan = create_paged_plan(
+                self._plan_q[:batch],
+                self._plan_k_cache,
+                self._plan_v_cache,
+                max_page_table,
+                max_cache_seqlens,
+                max_cu_seqlens_q,
+                mode="decode",
+                fixed_split_size=int(fixed_split_size),
+                force_split_kv=True,
+                window_left=-1,
+                enable_cuda_graph=True,
+                graph_chunk_policy=False,
+                max_batch_size_if_split=batch * 32,
+                msa_block_sparse=True,
+                plan_budget=None,
+            )
+            self._ensure_capacity(plan)
+            self._plan = plan
+            self._plan_metadata_cache = _make_plan_metadata_cache(
+                plan, device=self.caps.device
+            )
+            self._decode_graph_chunk_pages_lut = torch.empty(
+                (1,), dtype=torch.int32, device=self.caps.device
+            )
+            self._decode_graph_max_chunks_per_req = max(
+                int(plan.o_indptr[idx + 1] - plan.o_indptr[idx])
+                for idx in range(batch)
+            )
+            self._use_regular_decode_graph_replay = False
+            return self
 
         from b12x.attention.paged.graph_replay import (
             make_decode_chunk_pages_lut_tensor,
@@ -1410,7 +1624,7 @@ class B12XPagedAttentionScratchPlan:
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
         self._use_regular_decode_graph_replay = (
-            int(plan.gqa_group_size) <= 8
+            int(plan.gqa_group_size) <= int(plan.cta_tile_q)
             and self._plan_has_regular_decode_graph_grid(plan)
         )
         return self
@@ -1433,6 +1647,7 @@ class B12XPagedAttentionScratchPlan:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
+        q2k_indices: torch.Tensor | None = None,
     ) -> B12XPagedAttentionBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -1454,6 +1669,7 @@ class B12XPagedAttentionScratchPlan:
             decode_graph_max_chunks_per_req=self._decode_graph_max_chunks_per_req,
             use_regular_decode_graph_replay=self._use_regular_decode_graph_replay,
         )
+        scratch_views._q2k_indices_data_ptr = self._q2k_indices_data_ptr
         binding = build_paged_attention_binding(
             scratch=scratch_views,
             q=q,
@@ -1470,7 +1686,9 @@ class B12XPagedAttentionScratchPlan:
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
+            q2k_indices=q2k_indices,
         )
+        self._q2k_indices_data_ptr = scratch_views._q2k_indices_data_ptr
         return binding
 
 

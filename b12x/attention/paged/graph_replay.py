@@ -12,6 +12,9 @@ _DECODE_BLOCK_CHUNKS = 128
 _DECODE_BLOCK_PAGES = 128
 _PREFILL_BLOCK_WORK_ITEMS = 128
 _PREFILL_BLOCK_ROWS = 128
+_MSA_UNION_TOPK = 16
+_MSA_UNION_TOKENS_PER_TILE = 8
+_MSA_UNION_MAX_BLOCKS = _MSA_UNION_TOPK * _MSA_UNION_TOKENS_PER_TILE
 
 
 @triton.jit
@@ -265,6 +268,85 @@ def update_decode_graph_metadata_fused_triton(
 
 
 @triton.jit
+def build_msa_prefill_union_metadata_triton(
+    q2k_indices_ptr,
+    cache_seqlens_ptr,
+    cu_seqlens_q_ptr,
+    request_indices_ptr,
+    qo_tile_indices_ptr,
+    block_valid_mask_ptr,
+    union_blocks_ptr,
+    union_masks_ptr,
+    union_counts_ptr,
+    total_q_capacity,
+    block_valid_capacity,
+    NUM_KV_HEADS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOKENS_PER_TILE: tl.constexpr,
+    MAX_UNION_BLOCKS: tl.constexpr,
+):
+    work_idx = tl.program_id(axis=0)
+    kv_head_idx = tl.program_id(axis=1)
+    work_valid = work_idx < block_valid_capacity
+    block_valid = tl.load(block_valid_mask_ptr + work_idx, mask=work_valid, other=0).to(
+        tl.int32
+    )
+    active = work_valid & (block_valid != 0)
+    union_base = (work_idx * NUM_KV_HEADS + kv_head_idx) * MAX_UNION_BLOCKS
+    union_count_offset = work_idx * NUM_KV_HEADS + kv_head_idx
+    tl.store(union_counts_ptr + union_count_offset, 0, mask=work_valid)
+
+    request_idx = tl.load(request_indices_ptr + work_idx, mask=active, other=0).to(tl.int32)
+    qo_tile_idx = tl.load(qo_tile_indices_ptr + work_idx, mask=active, other=0).to(tl.int32)
+    q_start = tl.load(cu_seqlens_q_ptr + request_idx, mask=active, other=0).to(tl.int32)
+    q_end = tl.load(cu_seqlens_q_ptr + request_idx + 1, mask=active, other=0).to(tl.int32)
+    qo_len = q_end - q_start
+    cache_len = tl.load(cache_seqlens_ptr + request_idx, mask=active, other=0).to(tl.int32)
+    tile_first_token = qo_tile_idx * TOKENS_PER_TILE
+    tile_token_count = tl.minimum(tl.maximum(qo_len - tile_first_token, 0), TOKENS_PER_TILE)
+    union_count = tl.full((), 0, tl.int32)
+
+    for token_idx in tl.static_range(0, TOKENS_PER_TILE):
+        token_valid = active & (token_idx < tile_token_count)
+        q_row_idx = q_start + tile_first_token + token_idx
+        visible_len = cache_len - qo_len + tile_first_token + token_idx + 1
+        visible_len = tl.maximum(visible_len, 1)
+        bit = tl.full((), 1 << token_idx, tl.int32)
+        for list_idx in tl.static_range(0, TOPK):
+            q2k_offset = (kv_head_idx * total_q_capacity + q_row_idx) * TOPK + list_idx
+            block_id = tl.load(q2k_indices_ptr + q2k_offset, mask=token_valid, other=-1).to(tl.int32)
+            valid_block = token_valid & (block_id >= 0) & (block_id * BLOCK_TOKENS < visible_len)
+            found = tl.full((), False, tl.int1)
+            found_slot = tl.full((), 0, tl.int32)
+            for union_idx in tl.static_range(0, MAX_UNION_BLOCKS):
+                probe = union_idx < union_count
+                existing = tl.load(
+                    union_blocks_ptr + union_base + union_idx,
+                    mask=valid_block & probe,
+                    other=-1,
+                ).to(tl.int32)
+                match = valid_block & probe & (existing == block_id)
+                found_slot = tl.where(match & ~found, union_idx, found_slot)
+                found = found | match
+
+            do_update = valid_block & found
+            old_mask = tl.load(
+                union_masks_ptr + union_base + found_slot,
+                mask=do_update,
+                other=0,
+            ).to(tl.int32)
+            tl.store(union_masks_ptr + union_base + found_slot, old_mask | bit, mask=do_update)
+
+            do_store = valid_block & ~found & (union_count < MAX_UNION_BLOCKS)
+            tl.store(union_blocks_ptr + union_base + union_count, block_id, mask=do_store)
+            tl.store(union_masks_ptr + union_base + union_count, bit, mask=do_store)
+            union_count += tl.where(do_store, 1, 0)
+
+    tl.store(union_counts_ptr + union_count_offset, union_count, mask=work_valid)
+
+
+@triton.jit
 def update_decode_graph_compact_work_metadata_triton(
     request_indices_ptr,
     qo_tile_indices_ptr,
@@ -290,6 +372,54 @@ def update_decode_graph_compact_work_metadata_triton(
     tl.store(qo_tile_indices_ptr + work_offsets, 0, mask=work_mask)
     tl.store(kv_tile_indices_ptr + work_offsets, chunk_offsets.to(tl.int32), mask=work_mask)
     tl.store(block_valid_mask_ptr + work_offsets, 1, mask=valid_mask)
+
+
+@triton.jit
+def update_msa_decode_graph_metadata_fused_triton(
+    cache_seqlens_ptr,
+    merge_indptr_ptr,
+    o_indptr_ptr,
+    block_valid_mask_ptr,
+    kv_chunk_size_ptr,
+    kv_window_start_tokens_ptr,
+    kv_chunk_size,
+    block_valid_capacity,
+    PAGE_SIZE: tl.constexpr,
+    BATCH: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_WORK_ITEMS: tl.constexpr,
+):
+    batch_offsets = tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < BATCH
+    cache_len = tl.load(cache_seqlens_ptr + batch_offsets, mask=batch_mask, other=0).to(
+        tl.int32
+    )
+    visible_blocks = tl.maximum((cache_len + 127) // 128, 1)
+    selected_blocks = tl.minimum(visible_blocks, 16)
+    tail_tokens = tl.maximum(cache_len - (visible_blocks - 1) * 128, 1)
+    tail_pages = tl.minimum(tl.maximum((tail_tokens + PAGE_SIZE - 1) // PAGE_SIZE, 1), 2)
+    effective_pages = tl.maximum((selected_blocks - 1) * 2 + tail_pages, 1)
+    selected_tokens = effective_pages * PAGE_SIZE
+    num_chunks = tl.maximum((selected_tokens + kv_chunk_size - 1) // kv_chunk_size, 1)
+    prefix = tl.cumsum(tl.where(batch_mask, num_chunks, 0), 0)
+
+    tl.store(merge_indptr_ptr, 0)
+    tl.store(o_indptr_ptr, 0)
+    tl.store(merge_indptr_ptr + batch_offsets + 1, prefix, mask=batch_mask)
+    tl.store(o_indptr_ptr + batch_offsets + 1, prefix, mask=batch_mask)
+    tl.store(
+        kv_window_start_tokens_ptr + batch_offsets,
+        tl.zeros((BLOCK_BATCH,), tl.int32),
+        mask=batch_mask,
+    )
+    tl.store(kv_chunk_size_ptr, kv_chunk_size)
+
+    work_offsets = tl.arange(0, BLOCK_WORK_ITEMS)
+    tl.store(
+        block_valid_mask_ptr + work_offsets,
+        tl.zeros((BLOCK_WORK_ITEMS,), tl.int32),
+        mask=work_offsets < block_valid_capacity,
+    )
 
 
 @triton.jit
@@ -531,6 +661,77 @@ def summarize_decode_chunk_pages_lut(
             max_chunks_per_req = num_chunks
             worst_page_count = page_count
     return int(worst_page_count), int(max_chunks_per_req)
+
+
+def build_msa_prefill_union_metadata(
+    *,
+    q2k_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    request_indices: torch.Tensor,
+    qo_tile_indices: torch.Tensor,
+    block_valid_mask: torch.Tensor,
+    union_blocks: torch.Tensor,
+    union_masks: torch.Tensor,
+    union_counts: torch.Tensor,
+) -> None:
+    if q2k_indices.ndim != 3 or int(q2k_indices.shape[2]) != _MSA_UNION_TOPK:
+        raise ValueError("q2k_indices must have shape [kv_heads, total_q_capacity, 16]")
+    if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():
+        raise TypeError("q2k_indices must be contiguous torch.int32")
+    if union_blocks.dtype != torch.int32 or union_masks.dtype != torch.int32:
+        raise TypeError("MSA union block/mask buffers must be torch.int32")
+    if union_counts.dtype != torch.int32:
+        raise TypeError("MSA union count buffer must be torch.int32")
+    if union_blocks.ndim != 3 or union_masks.ndim != 3:
+        raise ValueError("MSA union block/mask buffers must be rank-3")
+    if union_counts.ndim != 2:
+        raise ValueError("MSA union count buffer must be rank-2")
+    if tuple(union_blocks.shape) != tuple(union_masks.shape):
+        raise ValueError("MSA union block and mask buffers must have matching shapes")
+    if int(union_blocks.shape[1]) != int(q2k_indices.shape[0]):
+        raise ValueError("MSA union buffers must use the same kv-head count as q2k_indices")
+    if int(union_blocks.shape[2]) < _MSA_UNION_MAX_BLOCKS:
+        raise ValueError("MSA union buffers need capacity for 128 blocks per tile")
+    if tuple(union_counts.shape) != tuple(union_blocks.shape[:2]):
+        raise ValueError("MSA union count buffer shape must match union_blocks[:2]")
+    work_capacity = int(block_valid_mask.shape[0])
+    if int(union_blocks.shape[0]) < work_capacity:
+        raise ValueError("MSA union buffers are smaller than block_valid_mask capacity")
+    if int(request_indices.shape[0]) < work_capacity or int(qo_tile_indices.shape[0]) < work_capacity:
+        raise ValueError("MSA worklist buffers are smaller than block_valid_mask capacity")
+    device = q2k_indices.device
+    tensors = (
+        cache_seqlens,
+        cu_seqlens_q,
+        request_indices,
+        qo_tile_indices,
+        block_valid_mask,
+        union_blocks,
+        union_masks,
+        union_counts,
+    )
+    if any(t.device != device for t in tensors):
+        raise ValueError("MSA union metadata tensors must all be on the q2k device")
+    build_msa_prefill_union_metadata_triton[(work_capacity, int(q2k_indices.shape[0]))](
+        q2k_indices,
+        cache_seqlens,
+        cu_seqlens_q,
+        request_indices,
+        qo_tile_indices,
+        block_valid_mask,
+        union_blocks,
+        union_masks,
+        union_counts,
+        int(q2k_indices.shape[1]),
+        work_capacity,
+        NUM_KV_HEADS=int(q2k_indices.shape[0]),
+        BLOCK_TOKENS=128,
+        TOPK=_MSA_UNION_TOPK,
+        TOKENS_PER_TILE=_MSA_UNION_TOKENS_PER_TILE,
+        MAX_UNION_BLOCKS=_MSA_UNION_MAX_BLOCKS,
+        num_warps=1,
+    )
 
 
 def stage_decode_cuda_graph_metadata(
@@ -854,6 +1055,149 @@ def update_decode_graph_replay_metadata(
         page_size=page_size,
         window_page_span=window_page_span,
         window_left=window_left,
+    )
+
+
+def update_msa_decode_graph_chunk_metadata(
+    *,
+    cache_seqlens: torch.Tensor,
+    request_indices: torch.Tensor,
+    qo_tile_indices: torch.Tensor,
+    kv_tile_indices: torch.Tensor,
+    merge_indptr: torch.Tensor,
+    o_indptr: torch.Tensor,
+    block_valid_mask: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    kv_window_start_tokens: torch.Tensor,
+    kv_chunk_size: int,
+    page_size: int,
+) -> None:
+    device = cache_seqlens.device
+    if request_indices.device != device:
+        raise ValueError("request_indices and cache_seqlens must be on the same device")
+    if qo_tile_indices.device != device or kv_tile_indices.device != device:
+        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+    if merge_indptr.device != device or o_indptr.device != device:
+        raise ValueError("indptr buffers and cache_seqlens must be on the same device")
+    if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
+        raise ValueError("MSA decode graph buffers and cache_seqlens must be on the same device")
+    if kv_window_start_tokens.device != device:
+        raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
+    if page_size != 64:
+        raise ValueError("MSA decode graph replay requires page_size=64")
+    kv_chunk_size = int(kv_chunk_size)
+    if kv_chunk_size <= 0 or kv_chunk_size % int(page_size) != 0:
+        raise ValueError("MSA decode graph kv_chunk_size must be a positive multiple of page_size")
+
+    bs = int(cache_seqlens.shape[0])
+    if bs <= 0:
+        raise ValueError("MSA decode graph replay requires bs > 0")
+    work_items_capacity = int(request_indices.shape[0])
+    block_valid_capacity = int(block_valid_mask.shape[0])
+    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
+        raise RuntimeError("MSA decode graph tile index buffers must match request_indices shape")
+    if work_items_capacity % bs != 0:
+        raise RuntimeError("MSA decode graph workspace request_indices shape is incompatible with the batch bucket")
+    max_chunks_per_req = work_items_capacity // bs
+    if max_chunks_per_req <= 0:
+        raise RuntimeError("MSA decode graph workspace must allocate at least one chunk per request")
+    max_required_chunks = triton.cdiv(16 * 128, kv_chunk_size)
+    if max_chunks_per_req < max_required_chunks:
+        raise RuntimeError(
+            "MSA decode graph workspace request_indices capacity is too small for the chunk size"
+        )
+    if int(merge_indptr.shape[0]) < bs + 1 or int(o_indptr.shape[0]) < bs + 1:
+        raise RuntimeError("MSA decode graph indptr buffers are smaller than the graph batch")
+    if int(kv_window_start_tokens.shape[0]) < bs:
+        raise RuntimeError("MSA decode graph kv_window_start_tokens is smaller than the graph batch")
+
+    update_msa_decode_graph_metadata_fused_triton[(1,)](
+        cache_seqlens,
+        merge_indptr,
+        o_indptr,
+        block_valid_mask,
+        kv_chunk_size_ptr,
+        kv_window_start_tokens,
+        kv_chunk_size,
+        block_valid_capacity,
+        PAGE_SIZE=page_size,
+        BATCH=bs,
+        BLOCK_BATCH=triton.next_power_of_2(bs),
+        BLOCK_WORK_ITEMS=triton.next_power_of_2(
+            max(work_items_capacity, block_valid_capacity)
+        ),
+    )
+    update_decode_graph_compact_work_metadata_triton[
+        (bs, triton.cdiv(max_chunks_per_req, _DECODE_BLOCK_CHUNKS))
+    ](
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        o_indptr,
+        block_valid_mask,
+        work_items_capacity,
+        block_valid_capacity,
+        BATCH=bs,
+        BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
+    )
+
+
+def update_msa_decode_graph_replay_metadata(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    request_indices: torch.Tensor,
+    qo_tile_indices: torch.Tensor,
+    kv_tile_indices: torch.Tensor,
+    merge_indptr: torch.Tensor,
+    o_indptr: torch.Tensor,
+    block_valid_mask: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    kv_window_start_tokens: torch.Tensor,
+    kv_chunk_size: int,
+    page_size: int,
+) -> None:
+    if req_to_token.device != page_table.device:
+        raise ValueError("req_to_token and page_table must be on the same device")
+    if req_pool_indices.device != page_table.device:
+        raise ValueError("req_pool_indices and page_table must be on the same device")
+    if cache_seqlens.device != page_table.device:
+        raise ValueError("cache_seqlens and page_table must be on the same device")
+    if page_size != 64:
+        raise ValueError("MSA decode graph replay requires page_size=64")
+
+    bs = int(cache_seqlens.shape[0])
+    if bs <= 0:
+        raise ValueError("MSA decode graph replay requires bs > 0")
+    if int(req_pool_indices.shape[0]) != bs:
+        raise ValueError("req_pool_indices shape must match cache_seqlens batch")
+
+    page_blocks = triton.cdiv(int(page_table.shape[1]), _DECODE_BLOCK_PAGES)
+    build_decode_graph_page_table_full_triton[(bs, page_blocks)](
+        req_to_token,
+        req_pool_indices,
+        page_table,
+        req_to_token.stride(0),
+        req_to_token.numel(),
+        page_table.stride(0),
+        PAGE_SIZE=page_size,
+        MAX_PAGES=int(page_table.shape[1]),
+        BLOCK_PAGES=_DECODE_BLOCK_PAGES,
+    )
+    update_msa_decode_graph_chunk_metadata(
+        cache_seqlens=cache_seqlens,
+        request_indices=request_indices,
+        qo_tile_indices=qo_tile_indices,
+        kv_tile_indices=kv_tile_indices,
+        merge_indptr=merge_indptr,
+        o_indptr=o_indptr,
+        block_valid_mask=block_valid_mask,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        kv_window_start_tokens=kv_window_start_tokens,
+        kv_chunk_size=kv_chunk_size,
+        page_size=page_size,
     )
 
 

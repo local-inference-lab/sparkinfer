@@ -51,6 +51,8 @@ _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
 )
 
 _DEFAULT_GRAPH_CTAS_PER_SM = 2
+_MSA_TOPK = 16
+_MSA_BLOCK_TOKENS = 128
 _BF16_MINIMAX_DECODE_MAX_CHUNKS = (
     (1, 512, 20),
     (1, 1, 16),
@@ -77,6 +79,23 @@ def _ceil_div(x: int, y: int) -> int:
 
 def _align_up(x: int, y: int) -> int:
     return _ceil_div(x, y) * y
+
+
+def _msa_decode_chunk_pages(policy_batch: int) -> int:
+    if int(policy_batch) <= 2:
+        return 2
+    if int(policy_batch) <= 8:
+        return 4
+    return 8
+
+
+def _msa_effective_pages(cache_len: int, page_size: int) -> int:
+    visible_blocks = max(_ceil_div(max(int(cache_len), 1), _MSA_BLOCK_TOKENS), 1)
+    selected_blocks = min(_MSA_TOPK, visible_blocks)
+    pages_per_block = _ceil_div(_MSA_BLOCK_TOKENS, int(page_size))
+    tail_tokens = max(int(cache_len) - (visible_blocks - 1) * _MSA_BLOCK_TOKENS, 1)
+    tail_pages = min(max(_ceil_div(tail_tokens, int(page_size)), 1), pages_per_block)
+    return max((selected_blocks - 1) * pages_per_block + tail_pages, 1)
 
 
 def _previous_power_of_two(x: int) -> int:
@@ -695,6 +714,10 @@ class PagedPlanKey:
     page_size: int
     num_kv_heads: int
     gqa_group_size: int
+    msa_block_sparse: bool
+    msa_union_tile: bool
+    msa_topk: int
+    msa_block_tokens: int
     device_index: int
 
 
@@ -735,6 +758,8 @@ def create_paged_plan(
     graph_ctas_per_sm: int | None = None,
     plan_budget: PagedPlanBudget | None = None,
     window_left: int = -1,
+    msa_block_sparse: bool = False,
+    msa_union_tile: bool | None = None,
 ) -> PagedPlan:
     if q.ndim != 3:
         raise ValueError(f"q must be rank-3 [total_q, q_heads, head_dim], got {tuple(q.shape)}")
@@ -764,6 +789,9 @@ def create_paged_plan(
         raise TypeError(f"unsupported kv dtype {k_cache.dtype}")
     if window_left < -1:
         raise ValueError("window_left must be -1 for full attention or a non-negative token count")
+    msa_block_sparse = bool(msa_block_sparse)
+    if msa_block_sparse and window_left >= 0:
+        raise ValueError("MSA block-sparse paged attention does not support window_left/SWA")
 
     total_q, num_q_heads, head_dim_qk = [int(dim) for dim in q.shape]
     num_pages, page_size, num_kv_heads, head_dim_k = [int(dim) for dim in k_cache.shape]
@@ -793,11 +821,32 @@ def create_paged_plan(
 
     inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode
+    if msa_union_tile is None:
+        msa_union_tile = (
+            msa_block_sparse
+            and mode == "extend"
+            and os.environ.get("B12X_PAGED_MSA_UNION_PREFILL", "1") != "0"
+        )
+    else:
+        msa_union_tile = bool(msa_union_tile)
+    if msa_union_tile and not (msa_block_sparse and mode == "extend"):
+        raise ValueError("MSA union-tile prefill requires an MSA extend plan")
+    if msa_block_sparse:
+        if mode not in ("decode", "extend"):
+            raise ValueError("MSA block-sparse paged attention currently supports decode and extend plans only")
+        if page_size != 64:
+            raise ValueError("MSA block-sparse paged attention requires page_size=64")
+        if head_dim_qk != 128 or head_dim_vo != 128:
+            raise ValueError("MSA block-sparse paged attention requires head_dim_qk=head_dim_vo=128")
+        if k_cache.dtype not in (torch.bfloat16, _FP8_KV_DTYPE):
+            raise TypeError(
+                "MSA block-sparse paged attention currently supports bf16 or fp8 KV decode only"
+            )
     if mode == "verify" and inferred_mode != "extend":
         raise ValueError(f"verify mode requires q_len > 1, got inferred mode {inferred_mode}")
     if force_split_kv is None:
-        force_split_kv = mode == "verify"
-    if mode == "decode" and force_split_kv:
+        force_split_kv = mode == "verify" or (msa_block_sparse and mode == "decode")
+    if mode == "decode" and force_split_kv and not msa_block_sparse:
         raise ValueError("decode plans do not support split-kv")
     if mode == "extend" and force_split_kv:
         raise ValueError("extend plans no longer support split-kv")
@@ -820,6 +869,8 @@ def create_paged_plan(
             )
 
     gqa_group_size = num_q_heads // num_kv_heads
+    if msa_block_sparse and gqa_group_size != 16:
+        raise ValueError("MSA block-sparse paged attention requires gqa_group_size=16")
     packed_qo_len_arr = [q_len * gqa_group_size for q_len in q_lengths]
     kv_len_arr = list(cache_pages_arr)
     policy_batch = _graph_policy_batch(
@@ -848,6 +899,18 @@ def create_paged_plan(
     else:
         kv_window_start_pages = [0 for _ in kv_len_arr]
         effective_kv_len_arr = kv_len_arr
+
+    if msa_block_sparse:
+        if msa_union_tile and mode == "extend":
+            effective_kv_len_arr = [
+                _MSA_TOPK * 8 * (_MSA_BLOCK_TOKENS // page_size)
+                for _ in cache_lengths
+            ]
+        else:
+            effective_kv_len_arr = [
+                _msa_effective_pages(cache_len, page_size)
+                for cache_len in cache_lengths
+            ]
 
     if enable_cuda_graph and window_left >= 0:
         max_graph_window_pages = max(1, _ceil_div(window_left + page_size, page_size))
@@ -885,6 +948,27 @@ def create_paged_plan(
         )
         total_num_qo_tiles = sum(_ceil_div(packed_qo_len, cta_tile_q) for packed_qo_len in packed_qo_len_arr)
 
+    if msa_block_sparse and mode == "extend":
+        cta_tile_q = gqa_group_size * (8 if msa_union_tile else 1)
+        if enable_cuda_graph:
+            total_num_qo_tiles = (
+                _ceil_div(total_q * gqa_group_size, cta_tile_q) + batch - 1
+            )
+        else:
+            total_num_qo_tiles = sum(
+                _ceil_div(packed_qo_len, cta_tile_q)
+                for packed_qo_len in packed_qo_len_arr
+            )
+
+    if (
+        msa_block_sparse
+        and cta_tile_q not in (gqa_group_size, gqa_group_size * 8)
+    ):
+        raise ValueError(
+            "MSA block-sparse paged attention requires one or eight tokens per query tile "
+            f"(gqa_group_size={gqa_group_size}, cta_tile_q={cta_tile_q})"
+        )
+
     kv_window_start_tokens = tuple(start_page * page_size for start_page in kv_window_start_pages)
     resolved_graph_ctas_per_sm = 0
     if enable_cuda_graph:
@@ -913,7 +997,13 @@ def create_paged_plan(
     if regularized_decode_graph:
         padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
 
-    if not _merge_backend_supports_split_kv(output_dtype=q.dtype, head_dim_vo=head_dim_vo):
+    if (
+        not msa_block_sparse
+        and not _merge_backend_supports_split_kv(
+            output_dtype=q.dtype,
+            head_dim_vo=head_dim_vo,
+        )
+    ):
         disable_split_kv = True
     if mode == "decode" and not force_split_kv:
         disable_split_kv = True
@@ -931,9 +1021,22 @@ def create_paged_plan(
             kv_chunk_size_pages = fixed_split_size
         else:
             kv_chunk_size_pages = required_kv_chunk_size_pages
+    elif msa_block_sparse and force_split_kv:
+        split_kv = False
+        kv_chunk_size_pages = (
+            int(fixed_split_size)
+            if fixed_split_size > 0
+            else _msa_decode_chunk_pages(policy_batch)
+        )
+        if kv_chunk_size_pages <= 0:
+            raise ValueError("MSA split chunk size must be positive")
     elif disable_split_kv and not force_split_kv:
         split_kv = False
-        kv_chunk_size_pages = max(max(effective_kv_len_arr), 1)
+        kv_chunk_size_pages = (
+            _ceil_div(_MSA_TOPK * _MSA_BLOCK_TOKENS, page_size)
+            if msa_block_sparse
+            else max(max(effective_kv_len_arr), 1)
+        )
     elif fixed_split_size > 0:
         split_kv = False
         kv_chunk_size_pages = fixed_split_size
@@ -1025,6 +1128,8 @@ def create_paged_plan(
         o_indptr.append(o_indptr[-1] + qo_len * num_chunks_kv)
 
     padded_batch_size = max(max_batch_size_if_split, total_num_qo_tiles) if enable_cuda_graph else new_batch_size
+    if msa_block_sparse and force_split_kv and not enable_cuda_graph:
+        padded_batch_size = max(padded_batch_size, 128)
     if regularized_decode_graph:
         padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
     if new_batch_size > padded_batch_size:
@@ -1099,6 +1204,10 @@ def create_paged_plan(
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         gqa_group_size=gqa_group_size,
+        msa_block_sparse=msa_block_sparse,
+        msa_union_tile=bool(msa_union_tile),
+        msa_topk=(_MSA_TOPK if msa_block_sparse else 0),
+        msa_block_tokens=(_MSA_BLOCK_TOKENS if msa_block_sparse else 0),
         device_index=q.device.index if q.device.index is not None else torch.cuda.current_device(),
     )
     return PagedPlan(

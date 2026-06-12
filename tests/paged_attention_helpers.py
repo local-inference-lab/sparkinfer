@@ -132,3 +132,88 @@ def quantize_paged_kv_cache_e4m3(
         k_descale.contiguous(),
         v_descale.contiguous(),
     )
+
+
+def make_msa_q2k_indices(
+    *,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    num_kv_heads: int,
+    total_q_capacity: int | None = None,
+    topk: int = 16,
+    block_tokens: int = 128,
+    seed: int = 0,
+    force_block0: bool = False,
+    poison_padding: bool = False,
+) -> torch.Tensor:
+    """Build sorted MiniMax-MSA q2k block lists for tests.
+
+    The returned tensor has shape `[num_kv_heads, total_q_capacity, topk]`.
+    Lists are batch-local block ids, sorted ascending, with the local block
+    forced present and tail entries padded with -1 by default.
+    """
+    if cache_seqlens.ndim != 1 or cu_seqlens_q.ndim != 1:
+        raise ValueError("cache_seqlens and cu_seqlens_q must be rank-1 tensors")
+    if int(block_tokens) <= 0 or int(topk) <= 0:
+        raise ValueError("block_tokens and topk must be positive")
+    if int(num_kv_heads) <= 0:
+        raise ValueError("num_kv_heads must be positive")
+    device = cache_seqlens.device
+    q_offsets = [int(v) for v in cu_seqlens_q.detach().cpu().tolist()]
+    cache_lengths = [int(v) for v in cache_seqlens.detach().cpu().tolist()]
+    total_q = q_offsets[-1] if q_offsets else 0
+    if total_q_capacity is None:
+        total_q_capacity = total_q
+    total_q_capacity = int(total_q_capacity)
+    if total_q_capacity < total_q:
+        raise ValueError("total_q_capacity must cover cu_seqlens_q[-1]")
+
+    q2k = torch.full(
+        (int(num_kv_heads), total_q_capacity, int(topk)),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+
+    poison_base = 1_000_000
+    for request_idx, (q_start, q_end) in enumerate(zip(q_offsets[:-1], q_offsets[1:])):
+        qo_len = q_end - q_start
+        cache_len = cache_lengths[request_idx]
+        for q_row in range(q_start, q_end):
+            token_local = q_row - q_start
+            visible = max(token_local + cache_len - qo_len + 1, 1)
+            num_visible_blocks = (visible + int(block_tokens) - 1) // int(block_tokens)
+            count = min(int(topk), num_visible_blocks)
+            local_block = max((visible - 1) // int(block_tokens), 0)
+            candidates = [block for block in range(num_visible_blocks) if block != local_block]
+            for kv_head in range(int(num_kv_heads)):
+                selected = {local_block}
+                if force_block0 and local_block != 0 and len(selected) < count:
+                    selected.add(0)
+                remaining = count - len(selected)
+                if remaining > 0 and candidates:
+                    perm = torch.randperm(len(candidates), generator=gen).tolist()
+                    for idx in perm:
+                        block = candidates[idx]
+                        if block in selected:
+                            continue
+                        selected.add(block)
+                        if len(selected) == count:
+                            break
+                values = sorted(selected)
+                q2k[kv_head, q_row, : len(values)] = torch.tensor(
+                    values, dtype=torch.int32, device=device
+                )
+                if poison_padding and len(values) < int(topk):
+                    pad_count = int(topk) - len(values)
+                    poison = torch.arange(
+                        poison_base,
+                        poison_base + pad_count,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    q2k[kv_head, q_row, len(values) :] = poison
+                    poison_base += pad_count
+    return q2k.contiguous()

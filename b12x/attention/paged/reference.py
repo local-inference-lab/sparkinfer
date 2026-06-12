@@ -198,3 +198,105 @@ def paged_attention_reference(
         out[q_start:q_end].copy_(out_cur)
         lse[q_start:q_end].copy_(lse_cur.transpose(0, 1))
     return out, lse
+
+
+def msa_attention_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    *,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    block_tokens: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference MiniMax-MSA sparse block-list paged attention.
+
+    `q2k_indices` is `[kv_heads, total_q_capacity, topk]`, containing
+    batch-local 128-token block ids.  Each selected block maps to two logical
+    64-token pages in `page_table`.
+    """
+    if q.ndim != 3:
+        raise ValueError(f"expected rank-3 q tensor, got rank {q.ndim}")
+    if q2k_indices.ndim != 3:
+        raise ValueError(
+            f"q2k_indices must be rank-3 [kv_heads, total_q_capacity, topk], got {tuple(q2k_indices.shape)}"
+        )
+    if k_cache.ndim != 4 or v_cache.ndim != 4:
+        raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
+    if int(k_cache.shape[1]) != 64 or int(v_cache.shape[1]) != 64:
+        raise ValueError("MSA reference expects page_size=64")
+    if int(block_tokens) != 128:
+        raise ValueError("MSA reference currently expects block_tokens=128")
+    if k_cache.shape[:3] != v_cache.shape[:3]:
+        raise ValueError("k_cache and v_cache structural shapes must match")
+    if int(q2k_indices.shape[0]) != int(k_cache.shape[2]):
+        raise ValueError("q2k_indices first dimension must match kv heads")
+
+    total_q, q_heads, head_dim_qk = q.shape
+    kv_heads = int(k_cache.shape[2])
+    head_dim_vo = int(v_cache.shape[-1])
+    if q_heads % kv_heads != 0:
+        raise ValueError("q_heads must be divisible by kv_heads")
+    if int(q2k_indices.shape[1]) < total_q:
+        raise ValueError("q2k_indices total_q_capacity is smaller than q")
+    if softmax_scale is None:
+        softmax_scale = head_dim_qk ** -0.5
+
+    out = torch.empty((total_q, q_heads, head_dim_vo), dtype=q.dtype, device=q.device)
+    lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)
+    q_offsets = [int(v) for v in cu_seqlens_q.detach().cpu().tolist()]
+    q_per_kv = q_heads // kv_heads
+
+    for request_idx, (q_start, q_end) in enumerate(zip(q_offsets[:-1], q_offsets[1:])):
+        qo_len = q_end - q_start
+        if qo_len <= 0:
+            continue
+        cache_len = int(cache_seqlens[request_idx].item())
+        k_full, v_full = materialize_paged_kv_cache(
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            request_idx=request_idx,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        for q_row in range(q_start, q_end):
+            token_local = q_row - q_start
+            causal_limit = token_local + cache_len - qo_len
+            visible_limit = max(min(causal_limit + 1, cache_len), 0)
+            for q_head in range(q_heads):
+                kv_head = q_head // q_per_kv
+                block_ids = q2k_indices[kv_head, q_row].detach().cpu().tolist()
+                key_chunks: list[torch.Tensor] = []
+                value_chunks: list[torch.Tensor] = []
+                for block_id_raw in block_ids:
+                    block_id = int(block_id_raw)
+                    if block_id < 0:
+                        continue
+                    block_start = block_id * block_tokens
+                    block_end = min(block_start + block_tokens, visible_limit)
+                    if block_end <= block_start:
+                        continue
+                    key_chunks.append(k_full[block_start:block_end, kv_head])
+                    value_chunks.append(v_full[block_start:block_end, kv_head])
+
+                if not key_chunks:
+                    out[q_row, q_head].zero_()
+                    lse[q_row, q_head] = float("-inf")
+                    continue
+
+                keys = torch.cat(key_chunks, dim=0).to(torch.float32)
+                values = torch.cat(value_chunks, dim=0).to(torch.float32)
+                scores = torch.matmul(keys, q[q_row, q_head].to(torch.float32)) * float(
+                    softmax_scale
+                )
+                probs = torch.softmax(scores, dim=0)
+                out[q_row, q_head].copy_(torch.matmul(probs, values).to(q.dtype))
+                lse[q_row, q_head] = torch.logsumexp(scores, dim=0).to(torch.float32)
+    return out, lse

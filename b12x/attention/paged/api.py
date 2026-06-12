@@ -17,6 +17,7 @@ from .forward_paged import (
     PagedForwardKernel,
 )
 from .forward_extend_generic import build_extend_forward_kernel
+from .graph_replay import build_msa_prefill_union_metadata
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 
@@ -79,6 +80,8 @@ def _resolve_native_fp8_attention_mma_flags(
     *,
     plan,
 ) -> tuple[bool, bool, bool]:
+    if getattr(plan, "msa_block_sparse", False):
+        return False, False, False
     use_native_fp8_qk = _uses_native_fp8_attention_mma(plan=plan)
     decode_runtime_chunk_guard = False
     if use_native_fp8_qk and plan.mode in ("decode", "verify"):
@@ -266,6 +269,7 @@ def _build_forward_kernel(
     decode_native_fp8_runtime_chunk_guard: bool,
     window_left: int,
     has_attention_sink_bias: bool,
+    msa_block_sparse: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -284,6 +288,7 @@ def _build_forward_kernel(
         decode_native_fp8_runtime_chunk_guard=decode_native_fp8_runtime_chunk_guard,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
+        msa_block_sparse=msa_block_sparse,
     )
 
 
@@ -294,6 +299,8 @@ def _build_extend_forward_kernel(
     use_native_fp8_pv: bool,
     window_left: int,
     has_attention_sink_bias: bool,
+    msa_block_sparse: bool,
+    msa_union_tile: bool,
 ) -> object:
     return build_extend_forward_kernel(
         traits,
@@ -301,6 +308,8 @@ def _build_extend_forward_kernel(
         use_native_fp8_pv,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
+        msa_block_sparse=msa_block_sparse,
+        msa_union_tile=msa_union_tile,
     )
 
 
@@ -338,6 +347,7 @@ def _resolve_paged_attention_binding(
     k_cache: torch.Tensor | None,
     v_cache: torch.Tensor | None,
     output: torch.Tensor | None,
+    q2k_indices: torch.Tensor | None,
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     attention_sink_bias: torch.Tensor | None,
@@ -347,6 +357,7 @@ def _resolve_paged_attention_binding(
     torch.Tensor,
     object,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -361,6 +372,7 @@ def _resolve_paged_attention_binding(
             ("k_cache", k_cache),
             ("v_cache", v_cache),
             ("output", output),
+            ("q2k_indices", q2k_indices),
             ("k_descale", k_descale),
             ("v_descale", v_descale),
             ("attention_sink_bias", attention_sink_bias),
@@ -381,6 +393,7 @@ def _resolve_paged_attention_binding(
         binding.v_cache,
         binding_scratch,
         binding.output,
+        getattr(binding, "q2k_indices", None),
         binding.k_descale,
         binding.v_descale,
         binding.attention_sink_bias,
@@ -418,18 +431,20 @@ def paged_attention_forward(
     v_cache: torch.Tensor | None = None,
     *,
     output: torch.Tensor | None = None,
+    q2k_indices: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     binding=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias = (
+    q, k_cache, v_cache, workspace, output, q2k_indices, k_descale, v_descale, attention_sink_bias = (
         _resolve_paged_attention_binding(
             binding=binding,
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
             output=output,
+            q2k_indices=q2k_indices,
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
@@ -470,6 +485,38 @@ def paged_attention_forward(
         raise ValueError("fp8 paged caches require k_descale and v_descale")
     if workspace.kv_window_start_tokens is None:
         raise RuntimeError("paged attention scratch is missing kv_window_start_tokens")
+    if getattr(plan, "msa_block_sparse", False):
+        if attention_sink_bias is not None:
+            raise ValueError(
+                "MSA block-sparse paged attention does not support attention_sink_bias"
+            )
+        if q2k_indices is None:
+            raise ValueError("MSA block-sparse paged attention requires q2k_indices")
+        if q2k_indices.ndim != 3:
+            raise ValueError(
+                "q2k_indices must have shape [kv_heads, total_q_capacity, 16]"
+            )
+        if q2k_indices.dtype != torch.int32:
+            raise TypeError("q2k_indices must be torch.int32")
+        if q2k_indices.device != q.device:
+            raise ValueError("q2k_indices must be on the same CUDA device as q")
+        if not q2k_indices.is_contiguous():
+            raise ValueError("q2k_indices must be contiguous")
+        expected_prefix = (plan.num_kv_heads, 16)
+        if (
+            int(q2k_indices.shape[0]) != expected_prefix[0]
+            or int(q2k_indices.shape[2]) != expected_prefix[1]
+        ):
+            raise ValueError(
+                "q2k_indices must have shape "
+                f"({plan.num_kv_heads}, >=total_q, 16), got {tuple(q2k_indices.shape)}"
+            )
+        if int(q2k_indices.shape[1]) < int(plan.total_q):
+            raise ValueError(
+                "q2k_indices total_q_capacity is smaller than active total_q"
+            )
+    elif q2k_indices is not None:
+        raise ValueError("q2k_indices can only be supplied for MSA block-sparse plans")
     has_attention_sink_bias = attention_sink_bias is not None
     if attention_sink_bias is None:
         attention_sink_bias = torch.empty(0, dtype=torch.float32, device=q.device)
@@ -502,13 +549,15 @@ def paged_attention_forward(
             use_native_fp8_pv,
             plan.window_left,
             has_attention_sink_bias,
+            bool(plan.msa_block_sparse),
+            bool(getattr(plan, "msa_union_tile", False)),
         )
     else:
         single_request_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
-            and plan.gqa_group_size <= 8
+            and plan.gqa_group_size <= plan.cta_tile_q
             and workspace._decode_graph_chunk_pages_lut is not None
             and plan.num_qo_tiles == 1
             and plan.page_table_shape[0] == 1
@@ -517,7 +566,8 @@ def paged_attention_forward(
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
-            and plan.gqa_group_size <= 8
+            and not bool(plan.msa_block_sparse)
+            and plan.gqa_group_size <= plan.cta_tile_q
             and workspace._decode_graph_chunk_pages_lut is not None
             and plan.page_table_shape[0] > 1
             and max(plan.qo_tile_indices, default=0) == 0
@@ -538,11 +588,37 @@ def paged_attention_forward(
             decode_native_fp8_runtime_chunk_guard,
             plan.window_left,
             has_attention_sink_bias,
+            bool(plan.msa_block_sparse),
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
     assert forward_output is not None
     assert forward_lse is not None
+    msa_union_blocks = None
+    msa_union_masks = None
+    msa_union_counts = None
+    if bool(getattr(plan, "msa_union_tile", False)):
+        msa_union_blocks = getattr(workspace, "msa_union_blocks", None)
+        msa_union_masks = getattr(workspace, "msa_union_masks", None)
+        msa_union_counts = getattr(workspace, "msa_union_counts", None)
+        if (
+            msa_union_blocks is None
+            or msa_union_masks is None
+            or msa_union_counts is None
+        ):
+            raise RuntimeError("MSA union-tile prefill requires union metadata scratch buffers")
+        assert q2k_indices is not None
+        build_msa_prefill_union_metadata(
+            q2k_indices=q2k_indices,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            request_indices=workspace.request_indices,
+            qo_tile_indices=workspace.qo_tile_indices,
+            block_valid_mask=workspace.block_valid_mask,
+            union_blocks=msa_union_blocks,
+            union_masks=msa_union_masks,
+            union_counts=msa_union_counts,
+        )
 
     q_arg = _to_kernel_tensor(q, _torch_to_cutlass_dtype(q.dtype))
     k_cache_arg = (
@@ -586,6 +662,18 @@ def paged_attention_forward(
     )
     block_valid_mask_arg = _to_kernel_tensor(
         workspace.block_valid_mask, cutlass.Int32, assumed_align=4
+    )
+    q2k_indices_arg = _to_kernel_tensor(
+        q2k_indices, cutlass.Int32, assumed_align=4
+    )
+    msa_union_blocks_arg = _to_kernel_tensor(
+        msa_union_blocks, cutlass.Int32, assumed_align=4
+    )
+    msa_union_masks_arg = _to_kernel_tensor(
+        msa_union_masks, cutlass.Int32, assumed_align=4
+    )
+    msa_union_counts_arg = _to_kernel_tensor(
+        msa_union_counts, cutlass.Int32, assumed_align=4
     )
     attention_sink_bias_arg = _to_kernel_tensor(
         attention_sink_bias, cutlass.Float32, assumed_align=4
@@ -690,6 +778,8 @@ def paged_attention_forward(
             bool(decode_native_fp8_runtime_chunk_guard),
             int(plan.window_left),
             bool(has_attention_sink_bias),
+            bool(plan.msa_block_sparse),
+            bool(getattr(plan, "msa_union_tile", False)),
         ),
         _tensor_meta_key(q_cache_tensor, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(k_cache),
@@ -764,12 +854,47 @@ def paged_attention_forward(
         kv_chunk_size_arg,
         kv_window_start_arg,
         block_valid_mask_arg,
-        attention_sink_bias_arg,
-        forward_output_arg,
-        forward_lse_arg,
-        k_descale_arg,
-        v_descale_arg,
     ]
+    forward_cache_key.append(
+        _tensor_meta_key(
+            q2k_indices,
+            dynamic_dims=(() if static_decode_graph_bucket else (1,)),
+        )
+    )
+    cache_key_labels.append("q2k_indices")
+    forward_args.append(q2k_indices_arg)
+    if plan.mode == "extend":
+        forward_cache_key.extend(
+            (
+                _tensor_meta_key(
+                    msa_union_blocks,
+                    dynamic_dims=grid_worklist_dynamic_first_dim,
+                ),
+                _tensor_meta_key(
+                    msa_union_masks,
+                    dynamic_dims=grid_worklist_dynamic_first_dim,
+                ),
+                _tensor_meta_key(
+                    msa_union_counts,
+                    dynamic_dims=grid_worklist_dynamic_first_dim,
+                ),
+            )
+        )
+        cache_key_labels.extend(
+            ("msa_union_blocks", "msa_union_masks", "msa_union_counts")
+        )
+        forward_args.extend(
+            (msa_union_blocks_arg, msa_union_masks_arg, msa_union_counts_arg)
+        )
+    forward_args.extend(
+        [
+            attention_sink_bias_arg,
+            forward_output_arg,
+            forward_lse_arg,
+            k_descale_arg,
+            v_descale_arg,
+        ]
+    )
     if plan.mode == "extend":
         k_tma_desc_arg = _to_kernel_tensor(
             k_tma_desc_ptrs, cutlass.Int64, assumed_align=8
@@ -808,7 +933,7 @@ def paged_attention_forward(
         merge_regular_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
-            and plan.gqa_group_size <= 8
+            and plan.gqa_group_size <= plan.cta_tile_q
             and workspace._decode_graph_chunk_pages_lut is not None
             and workspace._use_regular_decode_graph_replay
             and max(plan.qo_tile_indices, default=0) == 0

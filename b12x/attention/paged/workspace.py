@@ -1057,9 +1057,9 @@ class PagedAttentionWorkspace:
         self,
         *,
         batch: int,
-        total_q_capacity: int,
         max_page_table_width: int,
-        max_cache_page_count: int,
+        total_q_capacity: int | None = None,
+        max_cache_page_count: int | None = None,
         window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
@@ -1070,6 +1070,22 @@ class PagedAttentionWorkspace:
             raise RuntimeError(
                 "prepare_decode_graph_replay_state is only valid for decode workspaces"
             )
+        if total_q_capacity is None:
+            total_q_capacity = (
+                int(self._plan_q.shape[0]) if self._plan_q is not None else int(batch)
+            )
+        else:
+            total_q_capacity = int(total_q_capacity)
+        if max_cache_page_count is None:
+            max_cache_page_count = int(max_page_table_width)
+        else:
+            max_cache_page_count = int(max_cache_page_count)
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        if total_q_capacity <= 0:
+            raise ValueError("total_q_capacity must be positive")
+        if max_page_table_width <= 0:
+            raise ValueError("max_page_table_width must be positive")
         if max_cache_page_count <= 0:
             raise ValueError("max_cache_page_count must be positive")
         if window_left < -1:
@@ -1140,7 +1156,7 @@ class PagedAttentionWorkspace:
         )
         self._use_regular_decode_graph_replay = (
             self._plan is not None
-            and int(self._plan.gqa_group_size) <= 8
+            and int(self._plan.gqa_group_size) <= int(self._plan.cta_tile_q)
             and self._plan_has_regular_decode_graph_grid(self._plan)
         )
         self._validate_decode_graph_replay_capacity(batch=batch)
@@ -1450,6 +1466,14 @@ class PagedAttentionWorkspace:
             attention_sink_bias=attention_sink_bias,
         )
 
+    def _validate_q2k_indices_reference(
+        self, q2k_indices: torch.Tensor | None
+    ) -> None:
+        if q2k_indices is not None:
+            raise ValueError(
+                "q2k_indices are only supported by MSA block-sparse scratch bindings"
+            )
+
     @torch._dynamo.disable
     def run(
         self,
@@ -1462,8 +1486,9 @@ class PagedAttentionWorkspace:
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
         prepare_decode_graph_metadata: bool | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor]:
         from .api import paged_attention_forward
+        from b12x.integration.paged_attention_scratch import B12XPagedAttentionBinding
 
         if prepare_decode_graph_metadata is None:
             prepare_decode_graph_metadata = (
@@ -1494,14 +1519,16 @@ class PagedAttentionWorkspace:
                 self._decode_graph_metadata_captured_in_graph = True
 
         out, lse = paged_attention_forward(
-            q,
-            k_cache,
-            v_cache,
-            workspace=self,
-            output=output,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            attention_sink_bias=attention_sink_bias,
+            binding=B12XPagedAttentionBinding(
+                scratch=self,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                output=output,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                attention_sink_bias=attention_sink_bias,
+            )
         )
         return out, lse
 
