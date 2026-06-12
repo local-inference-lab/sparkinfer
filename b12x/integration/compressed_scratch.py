@@ -12,7 +12,6 @@ from b12x.attention.mla.compressed_config import (
 )
 from b12x.attention.mla.compressed_reference import COMPRESSED_MLA_HEAD_DIM
 from b12x.attention.workspace import (
-    B12XAttentionWorkspace,
     _split_output_buffer_from_tmp,
     _split_tmp_output_stride,
 )
@@ -390,14 +389,12 @@ def _validate_device(
     tensor: torch.Tensor,
     *,
     scratch: object | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
     name: str,
 ) -> None:
-    resource = scratch if scratch is not None else workspace
-    if resource is None:
-        raise TypeError("_validate_device requires scratch or workspace")
-    if tensor.device != resource.device:
-        raise ValueError(f"{name} device {tensor.device} does not match resource device {resource.device}")
+    if scratch is None:
+        raise TypeError("_validate_device requires scratch")
+    if tensor.device != scratch.device:
+        raise ValueError(f"{name} device {tensor.device} does not match scratch device {scratch.device}")
 
 
 def _normalize_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
@@ -458,8 +455,7 @@ def _validate_i32_vector(tensor: torch.Tensor, *, scratch: object, rows: int, na
 
 def build_compressed_mla_binding(
     *,
-    scratch: object | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
+    scratch: object,
     q: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_lengths: torch.Tensor,
@@ -467,13 +463,6 @@ def build_compressed_mla_binding(
     indexed_lengths: torch.Tensor | None = None,
     indexed_page_table: torch.Tensor | None = None,
 ) -> B12XCompressedMLABinding:
-    if scratch is None:
-        if workspace is None:
-            raise TypeError("build_compressed_mla_binding requires scratch or workspace")
-        scratch = workspace
-    elif workspace is not None and workspace is not scratch:
-        raise ValueError("scratch and workspace refer to different compressed MLA resources")
-
     q = _normalize_q(q, scratch=scratch)
     rows = int(q.shape[0])
     swa_indices = _normalize_i32_matrix(
@@ -538,7 +527,6 @@ def _validate_i32_contiguous(
     tensor: torch.Tensor,
     *,
     scratch: object | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
     name: str,
     ndim: int,
 ) -> None:
@@ -548,7 +536,7 @@ def _validate_i32_contiguous(
         raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
-    _validate_device(tensor, scratch=scratch, workspace=workspace, name=name)
+    _validate_device(tensor, scratch=scratch, name=name)
 
 
 

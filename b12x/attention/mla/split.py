@@ -56,7 +56,7 @@ def _is_cuda_graph_capture_active(device: torch.device) -> bool:
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
-        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"{api_name} binding owns runtime tensors, scratch, and kernel options; "
         f"do not also pass {', '.join(extras)}"
     )
 
@@ -79,7 +79,7 @@ class SparseMLASplitDecodeForwardBinding:
     tmp_output: torch.Tensor
     tmp_lse: torch.Tensor
     launch_num_chunks: int
-    workspace: object | None = None
+    scratch: object | None = None
     identity_page_table: bool = False
 
     def run(self) -> None:
@@ -108,7 +108,7 @@ class CompressedMLASplitDecodeForwardBinding:
     indexed_page_nbytes: int
     has_indexed: bool
     map_indexed_page_table: bool
-    workspace: object | None = None
+    scratch: object | None = None
     direct_output: bool = False
     single_tile_chunks: bool = False
     attn_sink: torch.Tensor | None = None
@@ -125,7 +125,7 @@ class SparseMLASplitDecodeMergeBinding:
     num_chunks_ptr: torch.Tensor
     output: torch.Tensor
     attn_sink: torch.Tensor | None = None
-    workspace: object | None = None
+    scratch: object | None = None
 
     def run(self) -> None:
         run_sparse_mla_split_decode_merge(binding=self)
@@ -145,7 +145,7 @@ class SparseMLASplitDecodeBinding:
     output: torch.Tensor
     launch_num_chunks: int
     attn_sink: torch.Tensor | None = None
-    workspace: object | None = None
+    scratch: object | None = None
     identity_page_table: bool = False
 
     def run(self) -> None:
@@ -164,7 +164,7 @@ def build_sparse_mla_split_decode_forward_binding(
     tmp_output: torch.Tensor,
     tmp_lse: torch.Tensor,
     launch_num_chunks: int,
-    workspace: object | None = None,
+    scratch: object | None = None,
     identity_page_table: bool = False,
 ) -> SparseMLASplitDecodeForwardBinding:
     return SparseMLASplitDecodeForwardBinding(
@@ -178,7 +178,7 @@ def build_sparse_mla_split_decode_forward_binding(
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         launch_num_chunks=int(launch_num_chunks),
-        workspace=workspace,
+        scratch=scratch,
         identity_page_table=bool(identity_page_table),
     )
 
@@ -205,7 +205,7 @@ def build_compressed_mla_split_decode_forward_binding(
     indexed_page_nbytes: int,
     has_indexed: bool,
     map_indexed_page_table: bool,
-    workspace: object | None = None,
+    scratch: object | None = None,
     direct_output: bool = False,
     single_tile_chunks: bool = False,
     attn_sink: torch.Tensor | None = None,
@@ -232,7 +232,7 @@ def build_compressed_mla_split_decode_forward_binding(
         indexed_page_nbytes=int(indexed_page_nbytes),
         has_indexed=bool(has_indexed),
         map_indexed_page_table=bool(map_indexed_page_table),
-        workspace=workspace,
+        scratch=scratch,
         direct_output=bool(direct_output),
         single_tile_chunks=bool(single_tile_chunks),
         attn_sink=attn_sink,
@@ -247,7 +247,7 @@ def build_sparse_mla_split_decode_merge_binding(
     num_chunks_ptr: torch.Tensor,
     output: torch.Tensor,
     attn_sink: torch.Tensor | None = None,
-    workspace: object | None = None,
+    scratch: object | None = None,
 ) -> SparseMLASplitDecodeMergeBinding:
     return SparseMLASplitDecodeMergeBinding(
         tmp_output=tmp_output,
@@ -255,7 +255,7 @@ def build_sparse_mla_split_decode_merge_binding(
         num_chunks_ptr=num_chunks_ptr,
         output=output,
         attn_sink=attn_sink,
-        workspace=workspace,
+        scratch=scratch,
     )
 
 
@@ -273,7 +273,7 @@ def build_sparse_mla_split_decode_binding(
     output: torch.Tensor,
     launch_num_chunks: int,
     attn_sink: torch.Tensor | None = None,
-    workspace: object | None = None,
+    scratch: object | None = None,
     identity_page_table: bool = False,
 ) -> SparseMLASplitDecodeBinding:
     return SparseMLASplitDecodeBinding(
@@ -289,7 +289,7 @@ def build_sparse_mla_split_decode_binding(
         output=output,
         launch_num_chunks=int(launch_num_chunks),
         attn_sink=attn_sink,
-        workspace=workspace,
+        scratch=scratch,
         identity_page_table=bool(identity_page_table),
     )
 
@@ -1450,7 +1450,7 @@ def run_sparse_mla_split_decode_forward(
         tmp_output = binding.tmp_output
         tmp_lse = binding.tmp_lse
         launch_num_chunks = binding.launch_num_chunks
-        workspace = binding.workspace
+        workspace = binding.scratch
         identity_page_table = binding.identity_page_table
 
     q_all = _require_bound_arg(
@@ -2218,7 +2218,7 @@ def run_compressed_mla_split_decode_forward(
         indexed_page_nbytes = binding.indexed_page_nbytes
         has_indexed = binding.has_indexed
         map_indexed_page_table = binding.map_indexed_page_table
-        workspace = binding.workspace
+        workspace = binding.scratch
         direct_output = binding.direct_output
         single_tile_chunks = binding.single_tile_chunks
         attn_sink = binding.attn_sink
@@ -2582,7 +2582,7 @@ def run_sparse_mla_split_decode_merge(
         num_chunks_ptr = binding.num_chunks_ptr
         output = binding.output
         attn_sink = binding.attn_sink
-        workspace = binding.workspace
+        workspace = binding.scratch
 
     tmp_output = _require_bound_arg(
         tmp_output,
@@ -2734,7 +2734,7 @@ def run_sparse_mla_split_decode(
         output = binding.output
         launch_num_chunks = binding.launch_num_chunks
         attn_sink = binding.attn_sink
-        workspace = binding.workspace
+        workspace = binding.scratch
         identity_page_table = binding.identity_page_table
 
     q_all = _require_bound_arg(

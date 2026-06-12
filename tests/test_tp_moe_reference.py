@@ -29,7 +29,6 @@ from benchmarks.benchmark_moe import (
     load_expert_weights,
 )
 from b12x.integration.tp_moe import (
-    allocate_tp_moe_workspace_pool,
     b12x_moe_fp4,
     clear_tp_moe_caches,
 )
@@ -252,6 +251,53 @@ def _moe_reference_nvfp4(
     return output
 
 
+def _make_b12x_moe_binding(
+    x: torch.Tensor,
+    weights,
+    scale_params,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+):
+    from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=int(x.shape[0]),
+            weight_E=int(weights.w13_weight.shape[0]),
+            k=int(x.shape[1]),
+            n=int(weights.w2_weight.shape[2]) * 2,
+            num_topk=int(topk_ids.shape[1]),
+            device=x.device,
+            dtype=x.dtype,
+            core_token_counts=(int(x.shape[0]),),
+            route_num_experts=0,
+            source_format=weights.source_format,
+            w13_layout=weights.w13_layout,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[idx].device)
+        for idx, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+    )
+    return plan.bind(
+        scratch=scratch,
+        a=x,
+        a1_gscale=scale_params.a1_gscale,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w1_alphas=scale_params.g1_alphas,
+        a2_gscale=scale_params.a2_gscale,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        w2_alphas=scale_params.g2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        input_scales_static=True,
+        source_format=weights.source_format,
+        w13_layout=weights.w13_layout,
+    )
+
+
 def _run_impl(
     impl: str,
     x: torch.Tensor,
@@ -270,26 +316,17 @@ def _run_impl(
         torch.cuda.synchronize()
         return output.detach().clone()
 
-    scale_params = get_scale_contract_params(weights, scale_contract)
-    workspace = allocate_tp_moe_workspace_pool()
-
     if clear_state:
         clear_tp_moe_caches()
-    out = b12x_moe_fp4(
+    scale_params = get_scale_contract_params(weights, scale_contract)
+    binding = _make_b12x_moe_binding(
         x,
-        scale_params.a1_gscale,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        scale_params.g1_alphas,
-        scale_params.a2_gscale,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        scale_params.g2_alphas,
+        weights,
+        scale_params,
         topk_weights,
         topk_ids,
-        workspace=workspace,
-        input_scales_static=True,
     )
+    out = b12x_moe_fp4(binding=binding)
     torch.cuda.synchronize()
     return out.detach().clone()
 
@@ -306,9 +343,6 @@ def _run_impl_sequence(
 ) -> list[torch.Tensor]:
     if impl != "flashinfer" and not clear_state_between_calls:
         clear_tp_moe_caches()
-    shared_workspace = None
-    if impl != "flashinfer" and weights_sequence:
-        shared_workspace = allocate_tp_moe_workspace_pool()
 
     outputs = []
     for weights in weights_sequence:
@@ -327,26 +361,16 @@ def _run_impl_sequence(
             continue
 
         scale_params = get_scale_contract_params(weights, scale_contract)
-        workspace = shared_workspace
-        if workspace is None:
-            workspace = allocate_tp_moe_workspace_pool()
         if clear_state_between_calls:
             clear_tp_moe_caches()
-        out = b12x_moe_fp4(
+        binding = _make_b12x_moe_binding(
             x,
-            scale_params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            scale_params.g1_alphas,
-            scale_params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            scale_params.g2_alphas,
+            weights,
+            scale_params,
             topk_weights,
             topk_ids,
-            workspace=workspace,
-            input_scales_static=True,
         )
+        out = b12x_moe_fp4(binding=binding)
         torch.cuda.synchronize()
         outputs.append(out.detach().clone())
     return outputs

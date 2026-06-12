@@ -6,8 +6,6 @@ import torch
 from b12x.cute.fp4 import swizzle_block_scale
 import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
-    allocate_tp_moe_workspace_pool,
-    b12x_moe_fp4,
     prepare_b12x_fp4_moe_weights,
 )
 from b12x.moe.fused.w4a16.host import (
@@ -20,6 +18,7 @@ from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
 )
+from .helpers import run_tp_moe_fp4
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
@@ -397,19 +396,18 @@ def test_fp4_e8m0_k32_is_rejected_by_w4a4_quant_mode() -> None:
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
 
     with pytest.raises(ValueError, match="quant_mode='w4a16'"):
-        b12x_moe_fp4(
-            a,
-            alpha,
-            torch.empty((1, 4, 2), dtype=torch.uint8),
-            scale,
-            alpha,
-            alpha,
-            torch.empty((1, 4, 2), dtype=torch.uint8),
-            scale,
-            alpha,
-            topk_weights,
-            topk_ids,
-            workspace=allocate_tp_moe_workspace_pool(),
+        run_tp_moe_fp4(
+            a=a,
+            a1_gscale=alpha,
+            w1_fp4=torch.empty((1, 4, 2), dtype=torch.uint8),
+            w1_blockscale=scale,
+            w1_alphas=alpha,
+            a2_gscale=alpha,
+            w2_fp4=torch.empty((1, 4, 2), dtype=torch.uint8),
+            w2_blockscale=scale,
+            w2_alphas=alpha,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             quant_mode="nvfp4",
             source_format="fp4_e8m0_k32",
             activation="relu2",

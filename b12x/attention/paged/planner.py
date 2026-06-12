@@ -561,7 +561,6 @@ def _prefill_binary_search_kv_chunk_size(
     plan_budget: PagedPlanBudget | None = None,
     min_kv_chunk_size: int = 1,
 ) -> tuple[bool, int]:
-    batch_size = len(packed_qo_len_arr)
     max_kv_len = max(max(kv_len_arr, default=1), 1)
     low = min_kv_chunk_size
     high = max_kv_len
@@ -797,7 +796,9 @@ def create_paged_plan(
     if mode == "verify" and inferred_mode != "extend":
         raise ValueError(f"verify mode requires q_len > 1, got inferred mode {inferred_mode}")
     if force_split_kv is None:
-        force_split_kv = mode in ("decode", "verify")
+        force_split_kv = mode == "verify"
+    if mode == "decode" and force_split_kv:
+        raise ValueError("decode plans do not support split-kv")
     if mode == "extend" and force_split_kv:
         raise ValueError("extend plans no longer support split-kv")
     if plan_budget is not None:
@@ -914,6 +915,8 @@ def create_paged_plan(
 
     if not _merge_backend_supports_split_kv(output_dtype=q.dtype, head_dim_vo=head_dim_vo):
         disable_split_kv = True
+    if mode == "decode" and not force_split_kv:
+        disable_split_kv = True
 
     min_kv_chunk_size = max(128 // page_size, 1)
     if mode == "extend":
@@ -930,7 +933,7 @@ def create_paged_plan(
             kv_chunk_size_pages = required_kv_chunk_size_pages
     elif disable_split_kv and not force_split_kv:
         split_kv = False
-        kv_chunk_size_pages = 1 << 30
+        kv_chunk_size_pages = max(max(effective_kv_len_arr), 1)
     elif fixed_split_size > 0:
         split_kv = False
         kv_chunk_size_pages = fixed_split_size

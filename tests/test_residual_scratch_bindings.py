@@ -7,7 +7,6 @@ import b12x.integration.residual as residual_impl
 from b12x.integration import (
     B12XMHCBinding,
     B12XMHCScratchCaps,
-    empty_mhc_workspace,
     plan_mhc_scratch,
 )
 from b12x.integration.residual import MHC_DEFAULT_BLOCK_K, MHC_DEFAULT_SPLIT_K
@@ -46,11 +45,6 @@ def test_mhc_scratch_plan_binds_caller_owned_scratch(monkeypatch) -> None:
     )
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-
-    def fail_make_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not build a workspace")
-
-    monkeypatch.setattr(type(plan), "make_pre_workspace", fail_make_workspace)
 
     binding = plan.bind(scratch=scratch)
 
@@ -97,33 +91,53 @@ def test_mhc_scratch_plan_binds_live_token_shape() -> None:
     assert binding.out is out
 
 
-def test_mhc_workspace_bind_returns_common_binding_type() -> None:
-    workspace = empty_mhc_workspace(
-        num_tokens=4,
-        hidden_size=16,
-        split_k=8,
-        device="cpu",
+def test_mhc_plan_binding_maps_caller_owned_outputs() -> None:
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            hidden_size=16,
+            split_k=8,
+        )
     )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    y = torch.empty((4, 16), dtype=torch.bfloat16)
+    post = torch.empty((4, 4), dtype=torch.float32)
+    comb = torch.empty((4, 4, 4), dtype=torch.float32)
+    out = torch.empty((4, 4, 16), dtype=torch.bfloat16)
 
-    binding = workspace.bind()
+    binding = plan.bind(scratch=scratch, y=y, post=post, comb=comb, out=out)
 
     assert isinstance(binding, B12XMHCBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.partials is workspace.partials
-    assert binding.y is workspace.y
-    assert binding.post_buffer is workspace.post
-    assert binding.comb_buffer is workspace.comb
-    assert binding.out is workspace.out
+    assert binding.partials.data_ptr() == scratch.data_ptr()
+    assert binding.y is y
+    assert binding.post_buffer is post
+    assert binding.comb_buffer is comb
+    assert binding.out is out
 
 
-def test_mhc_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
-    workspace = empty_mhc_workspace(
-        num_tokens=4,
-        hidden_size=16,
-        split_k=MHC_DEFAULT_SPLIT_K,
-        device="cpu",
+def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            hidden_size=16,
+            split_k=MHC_DEFAULT_SPLIT_K,
+        )
     )
-    binding = workspace.bind()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    y_storage = torch.empty((4, 16), dtype=torch.bfloat16)
+    post_storage = torch.empty((4, 4), dtype=torch.float32)
+    comb_storage = torch.empty((4, 4, 4), dtype=torch.float32)
+    binding = plan.bind(
+        scratch=scratch,
+        y=y_storage,
+        post=post_storage,
+        comb=comb_storage,
+    )
     residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
     fn = torch.empty((24, 64), dtype=torch.float32)
     hc_scale = torch.empty((3,), dtype=torch.float32)
@@ -148,19 +162,33 @@ def test_mhc_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
     assert y.shape == (0, 16)
     assert post.shape == (0, 4)
     assert comb.shape == (0, 4, 4)
-    assert y.untyped_storage().data_ptr() == workspace.y.untyped_storage().data_ptr()
-    assert post.untyped_storage().data_ptr() == workspace.post.untyped_storage().data_ptr()
-    assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
+    assert y.untyped_storage().data_ptr() == y_storage.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == post_storage.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == comb_storage.untyped_storage().data_ptr()
 
 
-def test_mhc_post_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
-    workspace = empty_mhc_workspace(
-        num_tokens=4,
-        hidden_size=16,
-        split_k=MHC_DEFAULT_SPLIT_K,
-        device="cpu",
+def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            hidden_size=16,
+            split_k=MHC_DEFAULT_SPLIT_K,
+        )
     )
-    binding = workspace.bind()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    residual_storage = torch.empty((4, 4, 16), dtype=torch.bfloat16)
+    y_storage = torch.empty((4, 16), dtype=torch.bfloat16)
+    post_storage = torch.empty((4, 4), dtype=torch.float32)
+    comb_storage = torch.empty((4, 4, 4), dtype=torch.float32)
+    binding = plan.bind(
+        scratch=scratch,
+        y=y_storage,
+        post=post_storage,
+        comb=comb_storage,
+        out=residual_storage,
+    )
     residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
     x = torch.empty((0, 16), dtype=torch.bfloat16)
     prev_post = torch.empty((0, 4, 1), dtype=torch.float32)
@@ -192,22 +220,27 @@ def test_mhc_post_pre_binding_supplies_workspace_outputs(monkeypatch) -> None:
     assert post.shape == (0, 4)
     assert comb.shape == (0, 4, 4)
     assert y.shape == (0, 16)
-    assert residual_cur.untyped_storage().data_ptr() == workspace.out.untyped_storage().data_ptr()
-    assert post.untyped_storage().data_ptr() == workspace.post.untyped_storage().data_ptr()
-    assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
-    assert y.untyped_storage().data_ptr() == workspace.y.untyped_storage().data_ptr()
+    assert residual_cur.untyped_storage().data_ptr() == residual_storage.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == post_storage.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == comb_storage.untyped_storage().data_ptr()
+    assert y.untyped_storage().data_ptr() == y_storage.untyped_storage().data_ptr()
 
 
 def test_mhc_pre_binding_owns_outputs() -> None:
-    workspace = empty_mhc_workspace(
-        num_tokens=4,
-        hidden_size=16,
-        split_k=8,
-        device="cpu",
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            hidden_size=16,
+            split_k=8,
+        )
     )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = plan.bind(scratch=scratch)
     y_out = torch.empty((0, 16), dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="binding owns workspace and output buffers"):
+    with pytest.raises(ValueError, match="binding owns scratch and output buffers"):
         residual_impl.b12x_mhc_pre(
             torch.empty((0, 4, 16), dtype=torch.bfloat16),
             torch.empty((24, 64), dtype=torch.float32),
@@ -216,6 +249,6 @@ def test_mhc_pre_binding_owns_outputs() -> None:
             rms_eps=1e-6,
             hc_eps=1e-6,
             sinkhorn_iters=2,
-            binding=workspace.bind(),
+            binding=binding,
             y_out=y_out,
         )

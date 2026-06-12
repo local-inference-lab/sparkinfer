@@ -907,12 +907,26 @@ class PagedAttentionWorkspace:
         if self._plan is None:
             raise RuntimeError("decode graph workspace has not been prepared")
 
-        self._validate_decode_graph_replay_capacity(
-            batch=int(self.cache_seqlens.shape[0])
-        )
+        batch = int(self.cache_seqlens.shape[0])
+        self._validate_decode_graph_replay_capacity(batch=batch)
         window_page_span = self._window_page_span_from_plan(self._plan)
 
-        if self._use_regular_decode_graph_replay:
+        if not self._plan.split_kv:
+            from .graph_replay import update_regular_decode_graph_chunk_metadata
+
+            update_regular_decode_graph_chunk_metadata(
+                cache_seqlens=self.cache_seqlens,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_chunk_size=int(self._plan.kv_chunk_size),
+                kv_window_start_tokens=self.kv_window_start_tokens,
+                max_chunks_per_req=1,
+                page_size=self.page_size,
+                window_page_span=window_page_span,
+                window_left=int(self._plan.window_left),
+            )
+        elif self._use_regular_decode_graph_replay:
             from .graph_replay import update_regular_decode_graph_chunk_metadata_from_lut
 
             update_regular_decode_graph_chunk_metadata_from_lut(
@@ -1321,12 +1335,44 @@ class PagedAttentionWorkspace:
         if self._plan is None:
             raise RuntimeError("decode graph workspace has not been prepared")
 
-        self._validate_decode_graph_replay_capacity(
-            batch=int(self.cache_seqlens.shape[0])
-        )
+        batch = int(self.cache_seqlens.shape[0])
+        self._validate_decode_graph_replay_capacity(batch=batch)
         window_page_span = self._window_page_span_from_plan(self._plan)
 
-        if self._use_regular_decode_graph_replay:
+        if not self._plan.split_kv:
+            from .graph_replay import (
+                _DECODE_BLOCK_PAGES,
+                build_decode_graph_page_table_full_triton,
+                update_regular_decode_graph_chunk_metadata,
+            )
+
+            page_blocks = (
+                int(self.page_table.shape[1]) + _DECODE_BLOCK_PAGES - 1
+            ) // _DECODE_BLOCK_PAGES
+            build_decode_graph_page_table_full_triton[(batch, page_blocks)](
+                req_to_token,
+                req_pool_indices,
+                self.page_table,
+                req_to_token.stride(0),
+                req_to_token.numel(),
+                self.page_table.stride(0),
+                PAGE_SIZE=self.page_size,
+                MAX_PAGES=int(self.page_table.shape[1]),
+                BLOCK_PAGES=_DECODE_BLOCK_PAGES,
+            )
+            update_regular_decode_graph_chunk_metadata(
+                cache_seqlens=self.cache_seqlens,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_chunk_size=int(self._plan.kv_chunk_size),
+                kv_window_start_tokens=self.kv_window_start_tokens,
+                max_chunks_per_req=1,
+                page_size=self.page_size,
+                window_page_span=window_page_span,
+                window_left=int(self._plan.window_left),
+            )
+        elif self._use_regular_decode_graph_replay:
             from .graph_replay import update_regular_decode_graph_replay_metadata
 
             update_regular_decode_graph_replay_metadata(

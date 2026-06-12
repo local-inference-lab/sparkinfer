@@ -10,7 +10,6 @@ from b12x.gemm import (
     BlockFP8LinearBinding,
     BlockFP8LinearScratchCaps,
     BlockFP8LinearWeight,
-    empty_block_fp8_linear_workspace,
     plan_block_fp8_linear_scratch,
 )
 from b12x.gemm.wo_projection import MXFP8Rows
@@ -87,24 +86,33 @@ def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch) -> None:
     assert binding.output is output
 
 
-def test_block_fp8_linear_workspace_bind_returns_common_binding_type(monkeypatch) -> None:
+def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
     monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
-    workspace = empty_block_fp8_linear_workspace(
-        3,
-        128,
-        256,
-        device="cpu",
-        output_dtype=torch.bfloat16,
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
     )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
     packed = _packed_weight()
 
-    binding = workspace.bind(source=source, packed_weight=packed)
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+    )
 
     assert isinstance(binding, BlockFP8LinearBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.x_q is workspace.x_q
-    assert binding.output is workspace.output
+    assert binding.x_q.values.data_ptr() == scratch.data_ptr()
+    assert binding.output is output
     assert binding.source is source
     assert binding.packed_weight is packed
 
@@ -112,16 +120,25 @@ def test_block_fp8_linear_workspace_bind_returns_common_binding_type(monkeypatch
 def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(block_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
     monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
-    workspace = empty_block_fp8_linear_workspace(
-        3,
-        128,
-        256,
-        device="cpu",
-        output_dtype=torch.bfloat16,
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
     )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
     packed = _packed_weight()
-    binding = workspace.bind(source=source, packed_weight=packed)
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+    )
     calls = {}
 
     def fake_quantize(source_tk, *, out=None):
@@ -142,23 +159,32 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     out = block_impl.block_fp8_linear_mxfp8(binding=binding)
 
     assert calls["source_tk"].data_ptr() == source.data_ptr()
-    assert calls["x_q_out"] is workspace.x_q
-    assert calls["dense_out"] is workspace.output
+    assert calls["x_q_out"] is binding.x_q
+    assert calls["dense_out"] is output
     assert out.shape == (3, 256)
 
 
 def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
-    workspace = empty_block_fp8_linear_workspace(
-        3,
-        128,
-        256,
-        device="cpu",
-        output_dtype=torch.bfloat16,
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
     )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
     packed = _packed_weight()
-    binding = workspace.bind(source=source, packed_weight=packed)
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+    )
 
     with pytest.raises(ValueError, match="binding owns source"):
         block_impl.block_fp8_linear_mxfp8(

@@ -118,13 +118,13 @@ class TPMoEWorkspace:
     volatile_launch_state: bool = False
 
     def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
-        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_fp4_binding(scratch=self, **kwargs)
 
     def bind_route(self, **kwargs) -> "TPMoERouteBinding":
-        return build_tp_moe_route_binding(workspace=self, **kwargs)
+        return build_tp_moe_route_binding(scratch=self, **kwargs)
 
     def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
-        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_sparse_fp4_binding(scratch=self, **kwargs)
 
 
 @dataclass(kw_only=True)
@@ -197,13 +197,13 @@ class TPW4A16Workspace:
     volatile_launch_state: bool = False
 
     def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
-        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_fp4_binding(scratch=self, **kwargs)
 
     def bind_route(self, **kwargs) -> "TPMoERouteBinding":
-        return build_tp_moe_route_binding(workspace=self, **kwargs)
+        return build_tp_moe_route_binding(scratch=self, **kwargs)
 
     def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
-        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_sparse_fp4_binding(scratch=self, **kwargs)
 
 
 @dataclass
@@ -258,13 +258,13 @@ class TPMoEWorkspacePool:
         self.frozen = bool(frozen)
 
     def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
-        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_fp4_binding(scratch=self, **kwargs)
 
     def bind_route(self, **kwargs) -> "TPMoERouteBinding":
-        return build_tp_moe_route_binding(workspace=self, **kwargs)
+        return build_tp_moe_route_binding(scratch=self, **kwargs)
 
     def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
-        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
+        return build_tp_moe_sparse_fp4_binding(scratch=self, **kwargs)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -467,61 +467,6 @@ class TPMoEScratchPlan:
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
-
-    def make_workspace_pool(
-        self,
-        *,
-        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-    ) -> TPMoEWorkspacePool:
-        t0 = time.perf_counter() if _B12X_TIMING else 0.0
-        scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
-        t_scratch = time.perf_counter() if _B12X_TIMING else 0.0
-        pool = allocate_tp_moe_workspace_pool(
-            shared_arena=scratch_storage,
-            route_workspace_nbytes=self.layout.route_workspace_nbytes,
-            core_workspace_nbytes=self.layout.core_workspace_nbytes,
-            frozen=self.caps.frozen,
-        )
-        t_pool = time.perf_counter() if _B12X_TIMING else 0.0
-        materialize_tp_moe_arena_workspaces(
-            pool,
-            max_tokens=self.caps.max_tokens,
-            weight_E=self.caps.weight_E,
-            k=self.caps.k,
-            n=self.caps.n,
-            num_topk=self.caps.num_topk,
-            device=self.caps.device,
-            dtype=self.caps.dtype,
-            core_token_counts=self.layout.core_token_counts,
-            quant_mode=self.caps.quant_mode,
-            activation=self.caps.activation,
-            apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
-            swiglu_limit=self.caps.swiglu_limit,
-            source_format=self.caps.source_format,
-            w13_layout=self.caps.w13_layout,
-            w4a16_weight_layout=self.caps.w4a16_weight_layout,
-            w4a16_scale_format=self.caps.w4a16_scale_format,
-        )
-        if _B12X_TIMING:
-            t_done = time.perf_counter()
-            total_ms = (t_done - t0) * 1000.0
-            if total_ms >= _B12X_TIMING_THRESHOLD_MS:
-                logger.warning(
-                    "b12x_tp_moe_make_workspace_pool timing tokens=%d k=%d n=%d "
-                    "E=%d topk=%d quant=%s scratch=%.3fms pool=%.3fms "
-                    "materialize=%.3fms total=%.3fms",
-                    int(self.caps.max_tokens),
-                    int(self.caps.k),
-                    int(self.caps.n),
-                    int(self.caps.weight_E),
-                    int(self.caps.num_topk),
-                    self.caps.quant_mode,
-                    (t_scratch - t0) * 1000.0,
-                    (t_pool - t_scratch) * 1000.0,
-                    (t_done - t_pool) * 1000.0,
-                    total_ms,
-                )
-        return pool
 
     def bind(
         self,
@@ -3999,7 +3944,7 @@ def allocate_tp_moe_workspace_pool(
 
 def build_tp_moe_fp4_binding(
     *,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
     w1_fp4: torch.Tensor,
@@ -4024,9 +3969,10 @@ def build_tp_moe_fp4_binding(
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
 ) -> TPMoEFP4Binding:
+    workspace = scratch
     if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
         raise TypeError(
-            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
+            "scratch must be a TP MoE scratch object"
         )
     if a.ndim != 2:
         raise ValueError(f"expected input activations with rank 2, got {tuple(a.shape)}")
@@ -4267,7 +4213,7 @@ def build_tp_moe_fp4_binding(
 
 def build_tp_moe_route_binding(
     *,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None,
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     hidden_states: torch.Tensor,
     top_k: int,
     gate_weight: torch.Tensor | None = None,
@@ -4275,12 +4221,12 @@ def build_tp_moe_route_binding(
     router_logits: torch.Tensor | None = None,
     renormalize: bool = True,
 ) -> TPMoERouteBinding:
-    if workspace is not None and not isinstance(
-        workspace,
+    if scratch is not None and not isinstance(
+        scratch,
         (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
     ):
         raise TypeError(
-            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool, or None"
+            "scratch must be a TP MoE scratch object or None"
         )
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -4296,7 +4242,7 @@ def build_tp_moe_route_binding(
     return TPMoERouteBinding(
         hidden_states=hidden_states,
         top_k=int(top_k),
-        scratch=workspace,
+        scratch=scratch,
         gate_weight=gate_weight,
         gate_bias=gate_bias,
         router_logits=router_logits,
@@ -4306,7 +4252,7 @@ def build_tp_moe_route_binding(
 
 def build_tp_moe_sparse_fp4_binding(
     *,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
     hidden_states: torch.Tensor,
     experts: B12XFP4ExpertWeights,
     routing: B12XTopKRouting | None = None,
@@ -4324,9 +4270,9 @@ def build_tp_moe_sparse_fp4_binding(
     activation: str = "silu",
     quant_mode: str | None = None,
 ) -> TPMoESparseFP4Binding:
-    if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
+    if not isinstance(scratch, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
         raise TypeError(
-            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
+            "scratch must be a TP MoE scratch object"
         )
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -4350,7 +4296,7 @@ def build_tp_moe_sparse_fp4_binding(
     return TPMoESparseFP4Binding(
         hidden_states=hidden_states,
         experts=experts,
-        scratch=workspace,
+        scratch=scratch,
         routing=routing,
         top_k=None if top_k is None else int(top_k),
         gate_weight=gate_weight,
@@ -5950,7 +5896,6 @@ def b12x_moe_fp4(
     topk_ids: torch.Tensor | None = None,  # [m, topk] int
     apply_router_weight_on_input: bool = False,
     *,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     output: torch.Tensor | None = None,
     input_scales_are_reciprocal: bool | None = None,
     input_scales_static: bool = False,
@@ -5971,6 +5916,7 @@ def b12x_moe_fp4(
     when the chosen backend cannot describe the required work buffers in a
     single launch.
     """
+    workspace = None
     if binding is not None:
         extras = [
             name
@@ -5986,7 +5932,6 @@ def b12x_moe_fp4(
                 ("w2_alphas", w2_alphas),
                 ("topk_weights", topk_weights),
                 ("topk_ids", topk_ids),
-                ("workspace", workspace),
                 ("output", output),
                 ("input_scales_are_reciprocal", input_scales_are_reciprocal),
                 ("fast_math", fast_math),
@@ -6153,6 +6098,8 @@ def b12x_moe_fp4(
                 f"unsupported TP MoE FP4 binding implementation "
                 f"{binding.implementation!r}"
             )
+    else:
+        raise TypeError("b12x_moe_fp4 requires binding")
     if (
         a is None
         or a1_gscale is None
@@ -6165,10 +6112,9 @@ def b12x_moe_fp4(
         or w2_alphas is None
         or topk_weights is None
         or topk_ids is None
-        or (binding is None and workspace is None)
     ):
         raise TypeError(
-            "b12x_moe_fp4 requires all FP4 tensors, routing tensors, and workspace or binding"
+            "b12x_moe_fp4 binding is missing FP4 or routing tensors"
         )
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
@@ -6403,7 +6349,6 @@ def b12x_moe_fp4(
                 topk_ids[start:end],
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 output=chunk_output[start:end],
-                workspace=workspace,
                 input_scales_static=effective_input_scales_static,
                 fast_math=fast_math,
                 activation=activation,
@@ -6902,18 +6847,16 @@ def b12x_route_experts_fast(
     gate_bias: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     renormalize: bool = True,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     binding: TPMoERouteBinding | None = None,
 ) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current
-    implementation preserves the simple reference math, but when a caller-owned
-    workspace is available it reuses route scratch buffers for the gate logits
-    and top-k outputs. Returned tensors may therefore alias mutable workspace
-    scratch and should be cloned by callers that want to retain them across
-    subsequent launches on the same workspace.
+    implementation preserves the simple reference math, but when caller-owned
+    scratch is available through the binding it reuses route buffers for the gate
+    logits and top-k outputs.
     """
+    scratch = None
     if binding is not None:
         extras = [
             name
@@ -6923,7 +6866,6 @@ def b12x_route_experts_fast(
                 ("gate_weight", gate_weight),
                 ("gate_bias", gate_bias),
                 ("router_logits", router_logits),
-                ("workspace", workspace),
             )
             if value is not None
         ]
@@ -6940,10 +6882,12 @@ def b12x_route_experts_fast(
         gate_bias = binding.gate_bias
         router_logits = binding.router_logits
         renormalize = binding.renormalize
-        workspace = binding.scratch
+        scratch = binding.scratch
+    else:
+        raise TypeError("b12x_route_experts_fast requires binding")
     if hidden_states is None or top_k is None:
         raise TypeError(
-            "b12x_route_experts_fast requires hidden_states/top_k inputs or binding"
+            "TP MoE route binding is missing hidden_states or top_k"
         )
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -7020,7 +6964,7 @@ def b12x_route_experts_fast(
         num_experts=num_experts,
         top_k=top_k,
         logits_dtype=logits_dtype,
-        workspace=workspace,
+        workspace=scratch,
     )
     if route_workspace is None:
         route_workspace = _alloc_route_workspace(
@@ -7067,7 +7011,6 @@ def b12x_sparse_moe_fp4(
     hidden_states: torch.Tensor | None = None,
     *,
     experts: B12XFP4ExpertWeights | None = None,
-    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     routing: B12XTopKRouting | None = None,
     top_k: int | None = None,
     gate_weight: torch.Tensor | None = None,
@@ -7090,13 +7033,13 @@ def b12x_sparse_moe_fp4(
     low-level contract while giving higher-level integrations a single call that
     can own `gate -> topk -> routed experts` at the sparse MoE block seam.
     """
+    workspace = None
     if binding is not None:
         extras = [
             name
             for name, value in (
                 ("hidden_states", hidden_states),
                 ("experts", experts),
-                ("workspace", workspace),
                 ("routing", routing),
                 ("top_k", top_k),
                 ("gate_weight", gate_weight),
@@ -7141,9 +7084,11 @@ def b12x_sparse_moe_fp4(
         fast_math = binding.fast_math
         activation = binding.activation
         quant_mode = binding.quant_mode
+    else:
+        raise TypeError("b12x_sparse_moe_fp4 requires binding")
     if hidden_states is None or experts is None or workspace is None:
         raise TypeError(
-            "b12x_sparse_moe_fp4 requires hidden_states, experts, workspace, or binding"
+            "TP MoE sparse FP4 binding is missing hidden_states, experts, or scratch"
         )
 
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
@@ -7168,31 +7113,34 @@ def b12x_sparse_moe_fp4(
     else:
         if top_k is None:
             raise ValueError("top_k is required when routing is not provided")
-        selected = b12x_route_experts_fast(
-            hidden_states,
+        route_binding = build_tp_moe_route_binding(
+            scratch=workspace,
+            hidden_states=hidden_states,
             top_k=top_k,
             gate_weight=gate_weight,
             gate_bias=gate_bias,
             router_logits=router_logits,
             renormalize=renormalize_topk,
-            workspace=workspace,
+        )
+        selected = b12x_route_experts_fast(
+            binding=route_binding,
         )
 
     _validate_sparse_routing(hidden_states, selected)
 
-    routed_output = b12x_moe_fp4(
-        hidden_states,
-        experts.a1_gscale,
-        experts.w1_fp4,
-        experts.w1_blockscale,
-        experts.w1_alphas,
-        experts.a2_gscale,
-        experts.w2_fp4,
-        experts.w2_blockscale,
-        experts.w2_alphas,
-        selected.topk_weights,
-        selected.topk_ids,
-        workspace=workspace,
+    moe_binding = build_tp_moe_fp4_binding(
+        scratch=workspace,
+        a=hidden_states,
+        a1_gscale=experts.a1_gscale,
+        w1_fp4=experts.w1_fp4,
+        w1_blockscale=experts.w1_blockscale,
+        w1_alphas=experts.w1_alphas,
+        a2_gscale=experts.a2_gscale,
+        w2_fp4=experts.w2_fp4,
+        w2_blockscale=experts.w2_blockscale,
+        w2_alphas=experts.w2_alphas,
+        topk_weights=selected.topk_weights,
+        topk_ids=selected.topk_ids,
         output=output,
         input_scales_static=input_scales_static,
         fast_math=fast_math,
@@ -7201,6 +7149,7 @@ def b12x_sparse_moe_fp4(
         source_format=experts.source_format,
         w13_layout=experts.w13_layout,
     )
+    routed_output = b12x_moe_fp4(binding=moe_binding)
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)
     if return_routing:

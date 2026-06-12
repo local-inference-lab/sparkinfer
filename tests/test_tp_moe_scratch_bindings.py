@@ -10,7 +10,8 @@ from b12x.integration import (
     TPMoERouteBinding,
     TPMoEScratchCaps,
     TPMoESparseFP4Binding,
-    TPMoEWorkspacePool,
+    build_tp_moe_route_binding,
+    build_tp_moe_sparse_fp4_binding,
     plan_tp_moe_scratch,
 )
 
@@ -27,7 +28,7 @@ def _caps() -> TPMoEScratchCaps:
     )
 
 
-def _runtime_tensors(m: int = 3):
+def _runtime_tensors(m: int = 3, topk: int = 2):
     a = torch.empty((m, 128), dtype=torch.bfloat16)
     a1_gscale = torch.ones((8,), dtype=torch.float32)
     w1_fp4 = torch.empty((8, 128, 64), dtype=torch.uint8)
@@ -37,8 +38,8 @@ def _runtime_tensors(m: int = 3):
     w2_fp4 = torch.empty((8, 128, 32), dtype=torch.uint8)
     w2_blockscale = torch.empty((8, 1, 1), dtype=torch.uint8)
     w2_alphas = torch.ones((8,), dtype=torch.float32)
-    topk_weights = torch.empty((m, 2), dtype=torch.float32)
-    topk_ids = torch.empty((m, 2), dtype=torch.int32)
+    topk_weights = torch.empty((m, topk), dtype=torch.float32)
+    topk_ids = torch.empty((m, topk), dtype=torch.int32)
     return {
         "a": a,
         "a1_gscale": a1_gscale,
@@ -177,24 +178,29 @@ def test_w4a16_topk6_bucket_materializes_with_planned_scratch(
     )
     scratch = _scratch_for_plan(plan)
 
-    pool = plan.make_workspace_pool(scratch=scratch)
+    binding = plan.bind(
+        scratch=scratch,
+        **_runtime_tensors(m=15, topk=6),
+        quant_mode="w4a16",
+    )
 
-    assert pool.workspaces
+    assert binding.implementation == "w4a16"
+    assert binding.fused_launch is not None
+    assert binding.topk_sum_launch is not None
 
 
-def test_tp_moe_scratch_plan_materializes_caller_owned_scratch_pool() -> None:
+def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
 
-    pool = plan.make_workspace_pool(scratch=scratch)
+    binding = plan.bind(scratch=scratch, **tensors)
 
-    assert isinstance(pool, TPMoEWorkspacePool)
-    assert pool.shared_arena is not None
-    assert pool.shared_arena.data_ptr() == scratch[0].data_ptr()
-    assert pool.route_workspace_nbytes == plan.layout.route_workspace_nbytes
-    assert pool.core_arena_nbytes == plan.layout.core_workspace_nbytes
-    assert pool.frozen is True
-    assert pool.workspaces
+    assert isinstance(binding, TPMoEFP4Binding)
+    assert binding.row_counts is not None
+    assert binding.row_counts.untyped_storage().data_ptr() == scratch[0].untyped_storage().data_ptr()
+    assert binding.a is tensors["a"]
+    assert binding.topk_ids is tensors["topk_ids"]
 
 
 def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
@@ -324,13 +330,12 @@ def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
     assert binding.packed_route_indices is not None
 
 
-def test_tp_moe_workspace_pool_bind_fp4_returns_common_binding_type() -> None:
+def test_tp_moe_plan_bind_fp4_returns_common_binding_type() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
-    pool = plan.make_workspace_pool(scratch=scratch)
     tensors = _runtime_tensors()
 
-    binding = pool.bind_fp4(**tensors)
+    binding = plan.bind(scratch=scratch, **tensors)
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
@@ -341,12 +346,11 @@ def test_tp_moe_workspace_pool_bind_fp4_returns_common_binding_type() -> None:
     assert binding.topk_ids is tensors["topk_ids"]
 
 
-def test_tp_moe_workspace_pool_bind_route_returns_common_binding_type() -> None:
-    pool = TPMoEWorkspacePool()
+def test_tp_moe_route_builder_returns_common_binding_type() -> None:
     hidden_states = torch.empty((3, 128), dtype=torch.bfloat16)
     gate_weight = torch.empty((8, 128), dtype=torch.bfloat16)
 
-    binding = pool.bind_route(
+    binding = build_tp_moe_route_binding(
         hidden_states=hidden_states,
         top_k=2,
         gate_weight=gate_weight,
@@ -354,17 +358,18 @@ def test_tp_moe_workspace_pool_bind_route_returns_common_binding_type() -> None:
 
     assert isinstance(binding, TPMoERouteBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is pool
+    assert binding.scratch is None
     assert binding.hidden_states is hidden_states
     assert binding.gate_weight is gate_weight
 
 
-def test_tp_moe_workspace_pool_bind_sparse_fp4_returns_common_binding_type() -> None:
-    pool = TPMoEWorkspacePool()
+def test_tp_moe_sparse_fp4_builder_returns_common_binding_type() -> None:
+    scratch = tp_moe_impl.TPMoEWorkspacePool()
     tensors = _runtime_tensors()
     experts = _experts(tensors)
 
-    binding = pool.bind_sparse_fp4(
+    binding = build_tp_moe_sparse_fp4_binding(
+        scratch=scratch,
         hidden_states=tensors["a"],
         experts=experts,
         routing=tp_moe_impl.B12XTopKRouting(
@@ -375,14 +380,15 @@ def test_tp_moe_workspace_pool_bind_sparse_fp4_returns_common_binding_type() -> 
 
     assert isinstance(binding, TPMoESparseFP4Binding)
     assert not hasattr(binding, "workspace")
-    assert binding.scratch is pool
+    assert binding.scratch is scratch
     assert binding.hidden_states is tensors["a"]
     assert binding.experts is experts
 
 
 def test_tp_moe_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> None:
-    pool = TPMoEWorkspacePool()
-    binding = pool.bind_fp4(**_runtime_tensors())
+    plan = plan_tp_moe_scratch(_caps())
+    scratch = _scratch_for_plan(plan)
+    binding = plan.bind(scratch=scratch, **_runtime_tensors())
     calls = {}
     sentinel = object()
 
@@ -397,10 +403,9 @@ def test_tp_moe_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> N
 
 
 def test_tp_moe_route_binding_run_uses_function_binding_argument(monkeypatch) -> None:
-    pool = TPMoEWorkspacePool()
     hidden_states = torch.empty((3, 128), dtype=torch.bfloat16)
     gate_weight = torch.empty((8, 128), dtype=torch.bfloat16)
-    binding = pool.bind_route(
+    binding = build_tp_moe_route_binding(
         hidden_states=hidden_states,
         top_k=2,
         gate_weight=gate_weight,
@@ -419,9 +424,10 @@ def test_tp_moe_route_binding_run_uses_function_binding_argument(monkeypatch) ->
 
 
 def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> None:
-    pool = TPMoEWorkspacePool()
+    scratch = tp_moe_impl.TPMoEWorkspacePool()
     tensors = _runtime_tensors()
-    binding = pool.bind_sparse_fp4(
+    binding = build_tp_moe_sparse_fp4_binding(
+        scratch=scratch,
         hidden_states=tensors["a"],
         experts=_experts(tensors),
         routing=tp_moe_impl.B12XTopKRouting(
@@ -443,19 +449,19 @@ def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(monkeypatc
 
 
 def test_tp_moe_fp4_binding_owns_runtime_tensors() -> None:
-    pool = TPMoEWorkspacePool()
+    plan = plan_tp_moe_scratch(_caps())
+    scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
-    binding = pool.bind_fp4(**tensors)
+    binding = plan.bind(scratch=scratch, **tensors)
 
     with pytest.raises(ValueError, match="binding owns runtime tensors"):
         tp_moe_impl.b12x_moe_fp4(tensors["a"], binding=binding)
 
 
 def test_tp_moe_route_binding_owns_runtime_tensors() -> None:
-    pool = TPMoEWorkspacePool()
     hidden_states = torch.empty((3, 128), dtype=torch.bfloat16)
     gate_weight = torch.empty((8, 128), dtype=torch.bfloat16)
-    binding = pool.bind_route(
+    binding = build_tp_moe_route_binding(
         hidden_states=hidden_states,
         top_k=2,
         gate_weight=gate_weight,
@@ -466,10 +472,11 @@ def test_tp_moe_route_binding_owns_runtime_tensors() -> None:
 
 
 def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
-    pool = TPMoEWorkspacePool()
+    scratch = tp_moe_impl.TPMoEWorkspacePool()
     tensors = _runtime_tensors()
     experts = _experts(tensors)
-    binding = pool.bind_sparse_fp4(
+    binding = build_tp_moe_sparse_fp4_binding(
+        scratch=scratch,
         hidden_states=tensors["a"],
         experts=experts,
         routing=tp_moe_impl.B12XTopKRouting(
@@ -482,21 +489,20 @@ def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
         tp_moe_impl.b12x_sparse_moe_fp4(
             tensors["a"],
             experts=experts,
-            workspace=pool,
             binding=binding,
         )
 
 
 def test_tp_moe_fp4_entrypoint_requires_tensors_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires all FP4 tensors"):
+    with pytest.raises(TypeError, match="requires binding"):
         tp_moe_impl.b12x_moe_fp4()
 
 
 def test_tp_moe_route_entrypoint_requires_inputs_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires hidden_states/top_k"):
+    with pytest.raises(TypeError, match="requires binding"):
         tp_moe_impl.b12x_route_experts_fast()
 
 
 def test_tp_moe_sparse_fp4_entrypoint_requires_inputs_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires hidden_states, experts, workspace"):
+    with pytest.raises(TypeError, match="requires binding"):
         tp_moe_impl.b12x_sparse_moe_fp4()

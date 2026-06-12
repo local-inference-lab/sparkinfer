@@ -55,10 +55,9 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
 
         from benchmarks.benchmark_moe import ModelSpec, load_expert_weights, make_routed_inputs
         from b12x.integration.tp_moe import (
-            allocate_tp_moe_workspace,
-            b12x_moe_fp4,
             clear_tp_moe_caches,
         )
+        from tests.helpers import run_tp_moe_fp4
 
         case = {case!r}
         clear_tp_moe_caches()
@@ -88,29 +87,19 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             w2_alphas = Parameter(w2_alphas, requires_grad=False)
 
         out = torch.empty_like(x)
-        workspace = allocate_tp_moe_workspace(
-            x,
-            a1_gscale,
-            weights.w13_weight,
-            a2_gscale,
-            weights.w2_weight,
-            topk_ids,
-            input_scales_static=True,
-        )
         print(f"case={{case}} start", flush=True)
-        b12x_moe_fp4(
-            x,
-            a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            w1_alphas,
-            a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            w2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
+        run_tp_moe_fp4(
+            a=x,
+            a1_gscale=a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             output=out,
             input_scales_static=True,
         )

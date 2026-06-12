@@ -1904,7 +1904,7 @@ def plan_attention_scratch(plan: AttentionPlan) -> AttentionScratchPlan:
         _layout=layout,
         _scratch_specs=(
             scratch_buffer_spec(
-                "contiguous_attention.arena",
+                "contiguous_attention.scratch",
                 nbytes=layout.nbytes,
                 device=plan.device,
             ),
@@ -1919,7 +1919,7 @@ def plan_varlen_attention_scratch(plan: VarlenAttentionPlan) -> VarlenAttentionS
         _layout=layout,
         _scratch_specs=(
             scratch_buffer_spec(
-                "varlen_contiguous_attention.arena",
+                "varlen_contiguous_attention.scratch",
                 nbytes=layout.nbytes,
                 device=plan.device,
             ),
@@ -2165,7 +2165,6 @@ def b12x_attention_forward(
     k: torch.Tensor | None = None,
     v: torch.Tensor | None = None,
     *,
-    workspace: AttentionWorkspace | AttentionWorkspacePool | None = None,
     plan: AttentionPlan | None = None,
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
@@ -2182,7 +2181,6 @@ def b12x_attention_forward(
                 ("q", q),
                 ("k", k),
                 ("v", v),
-                ("workspace", workspace),
                 ("plan", plan),
                 ("softmax_scale", softmax_scale),
                 ("attention_sink_bias", attention_sink_bias),
@@ -2204,10 +2202,10 @@ def b12x_attention_forward(
         plan = binding.plan
         softmax_scale = binding.softmax_scale
         attention_sink_bias = binding.attention_sink_bias
+    else:
+        raise TypeError("b12x_attention_forward requires binding")
     if q is None or k is None or v is None:
-        raise TypeError("b12x_attention_forward requires q, k, v, and workspace or binding")
-    if workspace is None and (output is None or lse is None):
-        raise TypeError("b12x_attention_forward requires workspace or binding")
+        raise TypeError("attention binding is missing q, k, or v")
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
     attention_sink_bias = _prepare_attention_sink_bias(
         attention_sink_bias,
@@ -2216,31 +2214,8 @@ def b12x_attention_forward(
     )
     has_attention_sink_bias = attention_sink_bias is not None
     if plan is None:
-        if workspace is None:
-            raise TypeError("workspace is required when plan is omitted")
-        if isinstance(workspace, AttentionWorkspacePool):
-            raise TypeError("workspace pools require an explicit AttentionPlan")
-        if has_attention_sink_bias != workspace.has_attention_sink_bias:
-            raise ValueError(
-                "attention_sink_bias mismatch: "
-                f"workspace expects {workspace.has_attention_sink_bias}, "
-                f"got {has_attention_sink_bias}"
-            )
-        resolved_plan = _get_attention_plan(
-            q_shape,
-            k_shape,
-            v_shape,
-            _cuda_device_index(workspace.device),
-            workspace.dtype,
-            workspace.causal,
-            workspace.window_size_left,
-            workspace.window_size_right,
-            workspace.has_attention_sink_bias,
-            workspace.tile_m,
-            workspace.tile_n,
-        )
-    else:
-        resolved_plan = plan
+        raise TypeError("attention binding is missing plan")
+    resolved_plan = plan
     if has_attention_sink_bias != resolved_plan.has_attention_sink_bias:
         raise ValueError(
             "attention_sink_bias mismatch: "
@@ -2266,11 +2241,7 @@ def b12x_attention_forward(
         plan=resolved_plan,
     )
     if output is None or lse is None:
-        if workspace is None:
-            raise TypeError("workspace is required when binding does not provide outputs")
-        resolved_workspace = _resolve_attention_workspace(workspace, plan=resolved_plan)
-        output = resolved_workspace.output
-        lse = resolved_workspace.lse
+        raise TypeError("attention binding is missing output or lse")
     else:
         _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, _, head_dim = _seq_dims(q_shape)
@@ -2314,7 +2285,6 @@ def b12x_varlen_attention_forward(
     cu_seqlens_q: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
     *,
-    workspace: VarlenAttentionWorkspace | None = None,
     plan: VarlenAttentionPlan | None = None,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
@@ -2336,7 +2306,6 @@ def b12x_varlen_attention_forward(
                 ("v", v),
                 ("cu_seqlens_q", cu_seqlens_q),
                 ("cu_seqlens_k", cu_seqlens_k),
-                ("workspace", workspace),
                 ("plan", plan),
                 ("max_seqlen_q", max_seqlen_q),
                 ("max_seqlen_k", max_seqlen_k),
@@ -2367,12 +2336,12 @@ def b12x_varlen_attention_forward(
         causal = binding.causal
         window_size = binding.window_size
         attention_sink_bias = binding.attention_sink_bias
+    else:
+        raise TypeError("b12x_varlen_attention_forward requires binding")
     if q is None or k is None or v is None or cu_seqlens_q is None:
         raise TypeError(
-            "b12x_varlen_attention_forward requires q, k, v, cu_seqlens_q, and workspace or binding"
+            "varlen attention binding is missing q, k, v, or cu_seqlens_q"
         )
-    if workspace is None and (output is None or lse is None):
-        raise TypeError("b12x_varlen_attention_forward requires workspace or binding")
     if cu_seqlens_k is None:
         cu_seqlens_k = cu_seqlens_q
     (
@@ -2391,49 +2360,8 @@ def b12x_varlen_attention_forward(
     )
     has_attention_sink_bias = attention_sink_bias is not None
     if plan is None:
-        if workspace is None:
-            raise TypeError("workspace is required when plan is omitted")
-        if has_attention_sink_bias != workspace.has_attention_sink_bias:
-            raise ValueError(
-                "attention_sink_bias mismatch: "
-                f"workspace expects {workspace.has_attention_sink_bias}, "
-                f"got {has_attention_sink_bias}"
-            )
-        max_seqlen_q = (
-            workspace.max_seqlen_q
-            if max_seqlen_q is None
-            else _resolve_max_seqlen(cu_seqlens_q, max_seqlen_q, name="max_seqlen_q")
-        )
-        max_seqlen_k = (
-            workspace.max_seqlen_k
-            if max_seqlen_k is None
-            else _resolve_max_seqlen(cu_seqlens_k, max_seqlen_k, name="max_seqlen_k")
-        )
-        resolved_causal = workspace.causal if causal is None else bool(causal)
-        if window_size is None:
-            window_size_left = workspace.window_size_left
-            window_size_right = workspace.window_size_right
-        else:
-            window_size_left, window_size_right = _normalize_window_size(window_size)
-        resolved_plan = _get_varlen_attention_plan(
-            q_shape,
-            k_shape,
-            v_shape,
-            cu_seqlens_q_shape,
-            cu_seqlens_k_shape,
-            _cuda_device_index(workspace.device),
-            workspace.dtype,
-            resolved_causal,
-            window_size_left,
-            window_size_right,
-            workspace.has_attention_sink_bias,
-            max_seqlen_q,
-            max_seqlen_k,
-            workspace.tile_m,
-            workspace.tile_n,
-        )
-    else:
-        resolved_plan = plan
+        raise TypeError("varlen attention binding is missing plan")
+    resolved_plan = plan
     if has_attention_sink_bias != resolved_plan.has_attention_sink_bias:
         raise ValueError(
             "attention_sink_bias mismatch: "
@@ -2471,11 +2399,7 @@ def b12x_varlen_attention_forward(
         plan=resolved_plan,
     )
     if output is None or lse is None:
-        if workspace is None:
-            raise TypeError("workspace is required when binding does not provide outputs")
-        _validate_varlen_workspace(workspace, plan=resolved_plan)
-        output = workspace.output
-        lse = workspace.lse
+        raise TypeError("varlen attention binding is missing output or lse")
     else:
         _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, head_dim = q_shape
@@ -2528,22 +2452,12 @@ __all__ = [
     'AttentionPlan',
     'AttentionPlanKey',
     'AttentionScratchPlan',
-    'AttentionWorkspace',
-    'AttentionWorkspacePool',
     'VarlenAttentionBinding',
     'VarlenAttentionPlan',
     'VarlenAttentionPlanKey',
     'VarlenAttentionScratchPlan',
-    'VarlenAttentionWorkspace',
-    'allocate_attention_workspace',
-    'allocate_attention_workspace_pool',
-    'allocate_attention_workspace_for_plan',
-    'allocate_varlen_attention_workspace',
-    'allocate_varlen_attention_workspace_for_plan',
     'b12x_attention_forward',
     'b12x_varlen_attention_forward',
-    'build_attention_binding',
-    'build_varlen_attention_binding',
     'clear_attention_caches',
     'create_attention_plan',
     'create_varlen_attention_plan',

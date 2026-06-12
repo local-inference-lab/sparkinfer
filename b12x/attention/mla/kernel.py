@@ -110,7 +110,7 @@ _MLA_SHARED_SCALE_STAGE_ELEMS = max(
 )
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
-        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"{api_name} binding owns runtime tensors, scratch, and kernel options; "
         f"do not also pass {', '.join(extras)}"
     )
 
@@ -129,7 +129,7 @@ class SparseMLAKernelBinding:
     active_token_counts: torch.Tensor
     sm_scale: float | torch.Tensor
     output: torch.Tensor
-    workspace: object | None = None
+    scratch: object | None = None
     identity_page_table: bool = False
 
     def run(self) -> None:
@@ -144,7 +144,7 @@ def build_sparse_mla_kernel_binding(
     active_token_counts: torch.Tensor,
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
-    workspace: object | None = None,
+    scratch: object | None = None,
     identity_page_table: bool = False,
 ) -> SparseMLAKernelBinding:
     return SparseMLAKernelBinding(
@@ -154,7 +154,7 @@ def build_sparse_mla_kernel_binding(
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
         output=output,
-        workspace=workspace,
+        scratch=scratch,
         identity_page_table=bool(identity_page_table),
     )
 
@@ -4677,7 +4677,7 @@ def run_sparse_mla_kernel(
         active_token_counts = binding.active_token_counts
         sm_scale = binding.sm_scale
         output = binding.output
-        workspace = binding.workspace
+        workspace = binding.scratch
         identity_page_table = binding.identity_page_table
 
     q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")

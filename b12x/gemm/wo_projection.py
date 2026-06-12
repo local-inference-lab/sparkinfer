@@ -55,58 +55,6 @@ class WOProjectionMXFP8Weights:
 
 
 @dataclass(frozen=True)
-class WOProjectionWorkspace:
-    """Fixed workspace for one WO projection graph contract."""
-
-    x_q: MXFP8Rows
-    tmp: torch.Tensor
-    tmp_q: MXFP8Rows
-    output: torch.Tensor
-
-    def bind(
-        self,
-        *,
-        source_tgd: torch.Tensor,
-        weights: "WOProjectionMXFP8Weights",
-        return_3d: bool = False,
-        expected_m: int | None = None,
-    ) -> "WOProjectionBinding":
-        return build_wo_projection_binding(
-            workspace=self,
-            source_tgd=source_tgd,
-            weights=weights,
-            return_3d=return_3d,
-            expected_m=expected_m,
-        )
-
-    def bind_inv_rope(
-        self,
-        *,
-        o: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        weights: "WOProjectionMXFP8Weights",
-        heads_per_group: int,
-        nope_dim: int = 448,
-        rope_dim: int = 64,
-        return_3d: bool = False,
-        expected_m: int | None = None,
-    ) -> "WOProjectionInvRopeBinding":
-        return build_wo_projection_inv_rope_binding(
-            workspace=self,
-            o=o,
-            positions=positions,
-            cos_sin_cache=cos_sin_cache,
-            weights=weights,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-            return_3d=return_3d,
-            expected_m=expected_m,
-        )
-
-
-@dataclass(frozen=True)
 class _WOProjectionScratchViews:
     x_q: MXFP8Rows
     tmp: torch.Tensor
@@ -201,7 +149,7 @@ class WOProjectionScratchPlan:
         weights: WOProjectionMXFP8Weights,
         return_3d: bool = False,
         expected_m: int | None = None,
-        ) -> WOProjectionBinding:
+    ) -> WOProjectionBinding:
         tokens = _validate_wo_projection_inputs(source_tgd, weights)
         self._check_live_capacity(tokens=tokens, weights=weights)
         views = self._views_from_scratch(scratch=scratch, tokens=tokens)
@@ -255,20 +203,6 @@ class WOProjectionScratchPlan:
             expected_m=expected_m,
         )
 
-    def make_workspace(
-        self,
-        *,
-        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-        tokens: int | None = None,
-    ) -> WOProjectionWorkspace:
-        views = self._views_from_scratch(scratch=scratch, tokens=tokens)
-        return WOProjectionWorkspace(
-            x_q=views.x_q,
-            tmp=views.tmp,
-            tmp_q=views.tmp_q,
-            output=views.output,
-        )
-
     def _views_from_scratch(
         self,
         *,
@@ -300,7 +234,7 @@ class WOProjectionScratchPlan:
         )
         if int(layout.nbytes) > int(self.layout.nbytes):
             raise RuntimeError(
-                "WO projection workspace layout exceeds reserved scratch "
+                "WO projection scratch layout exceeds reserved scratch "
                 f"capacity: requested={layout.nbytes}, reserved={self.layout.nbytes}"
             )
 
@@ -1805,73 +1739,6 @@ def _check_wo_projection_weights(weights: WOProjectionMXFP8Weights) -> None:
     )
 
 
-def empty_wo_projection_workspace(
-    tokens: int,
-    *,
-    groups: int,
-    group_width: int,
-    rank: int,
-    hidden: int,
-    device: torch.device | str,
-    output: torch.Tensor | None = None,
-) -> WOProjectionWorkspace:
-    """Allocate fixed scratch/output tensors for one WO projection graph shape."""
-
-    if tokens <= 0 or groups <= 0 or group_width <= 0 or rank <= 0 or hidden <= 0:
-        raise ValueError("tokens, groups, group_width, rank, and hidden must be positive")
-    _check_mxfp8_k(group_width)
-    _check_mxfp8_k(rank * groups)
-
-    x_q = empty_mxfp8_rows_for_dense_gemm(
-        tokens,
-        group_width,
-        num_groups=groups,
-        device=device,
-    )
-    tmp = empty_dense_gemm_mnl_view(
-        tokens,
-        rank,
-        groups,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    tmp_q = empty_mxfp8_rows_for_dense_gemm(
-        tokens,
-        rank * groups,
-        num_groups=1,
-        device=device,
-    )
-    if output is None:
-        output = torch.empty((tokens, hidden, 1), device=device, dtype=torch.bfloat16)
-    else:
-        _check_dense_gemm_mnl_view("output", output)
-        if output.shape != (tokens, hidden, 1):
-            raise ValueError(
-                f"output must have shape {(tokens, hidden, 1)}, got {tuple(output.shape)}"
-            )
-        if output.dtype != torch.bfloat16:
-            raise ValueError(f"output must be bfloat16, got {output.dtype}")
-    return WOProjectionWorkspace(x_q=x_q, tmp=tmp, tmp_q=tmp_q, output=output)
-
-
-def _check_wo_projection_workspace(
-    workspace: WOProjectionWorkspace,
-    *,
-    tokens: int,
-    weights: WOProjectionMXFP8Weights,
-) -> None:
-    if not isinstance(workspace, WOProjectionWorkspace):
-        raise TypeError("workspace must be a WOProjectionWorkspace instance")
-    _check_wo_projection_views(
-        x_q=workspace.x_q,
-        tmp=workspace.tmp,
-        tmp_q=workspace.tmp_q,
-        output=workspace.output,
-        tokens=tokens,
-        weights=weights,
-    )
-
-
 def _check_wo_projection_views(
     *,
     x_q: MXFP8Rows,
@@ -1968,19 +1835,20 @@ def _validate_wo_projection_inv_rope_inputs(
 
 def build_wo_projection_binding(
     *,
-    workspace: WOProjectionWorkspace,
+    x_q: MXFP8Rows,
+    tmp: torch.Tensor,
+    tmp_q: MXFP8Rows,
+    output: torch.Tensor,
     source_tgd: torch.Tensor,
     weights: WOProjectionMXFP8Weights,
     return_3d: bool = False,
     expected_m: int | None = None,
 ) -> WOProjectionBinding:
-    tokens = _validate_wo_projection_inputs(source_tgd, weights)
-    _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
     return _build_wo_projection_binding_from_views(
-        x_q=workspace.x_q,
-        tmp=workspace.tmp,
-        tmp_q=workspace.tmp_q,
-        output=workspace.output,
+        x_q=x_q,
+        tmp=tmp,
+        tmp_q=tmp_q,
+        output=output,
         source_tgd=source_tgd,
         weights=weights,
         return_3d=return_3d,
@@ -2022,7 +1890,10 @@ def _build_wo_projection_binding_from_views(
 
 def build_wo_projection_inv_rope_binding(
     *,
-    workspace: WOProjectionWorkspace,
+    x_q: MXFP8Rows,
+    tmp: torch.Tensor,
+    tmp_q: MXFP8Rows,
+    output: torch.Tensor,
     o: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -2042,12 +1913,19 @@ def build_wo_projection_inv_rope_binding(
     )
     _check_gpu_tensor("positions", positions)
     _check_gpu_tensor("cos_sin_cache", cos_sin_cache)
-    _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
+    _check_wo_projection_views(
+        x_q=x_q,
+        tmp=tmp,
+        tmp_q=tmp_q,
+        output=output,
+        tokens=tokens,
+        weights=weights,
+    )
     return _build_wo_projection_inv_rope_binding_from_views(
-        x_q=workspace.x_q,
-        tmp=workspace.tmp,
-        tmp_q=workspace.tmp_q,
-        output=workspace.output,
+        x_q=x_q,
+        tmp=tmp,
+        tmp_q=tmp_q,
+        output=output,
         o=o,
         positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -2234,7 +2112,6 @@ def wo_b_dense_gemm_mxfp8(
 def wo_projection_mxfp8(
     source_tgd: torch.Tensor | None = None,
     weights: WOProjectionMXFP8Weights | None = None,
-    workspace: WOProjectionWorkspace | None = None,
     *,
     return_3d: bool = False,
     binding: WOProjectionBinding | None = None,
@@ -2243,7 +2120,7 @@ def wo_projection_mxfp8(
     """Run the native MXFP8 WO-A/WO-B projection.
 
     `source_tgd` is `[tokens, groups, group_width]`. The default return value
-    is the SGLang-friendly `[tokens, hidden]` view over `workspace.output`.
+    is the SGLang-friendly `[tokens, hidden]` view over the binding output.
     """
 
     if binding is not None:
@@ -2252,13 +2129,12 @@ def wo_projection_mxfp8(
             for name, value in (
                 ("source_tgd", source_tgd),
                 ("weights", weights),
-                ("workspace", workspace),
             )
             if value is not None
         ]
         if extras:
             raise ValueError(
-                "WO projection binding owns source_tgd, weights, and workspace; "
+                "WO projection binding owns source_tgd, weights, and scratch tensors; "
                 f"do not also pass {', '.join(extras)}"
             )
         if return_3d:
@@ -2279,7 +2155,7 @@ def wo_projection_mxfp8(
         tmp_q = None
         output = None
     if source_tgd is None or weights is None:
-        raise TypeError("wo_projection_mxfp8 requires source_tgd, weights, and workspace or binding")
+        raise TypeError("wo_projection_mxfp8 requires source_tgd and weights or binding")
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     # WO auto-defaults the regime hint to the (capture-fixed) token count so the
     # wo_b up-projection (N=hidden>1536) picks the decode tile (32x128) at small
@@ -2288,14 +2164,8 @@ def wo_projection_mxfp8(
     # is fixed per compiled kernel. Pass expected_m explicitly to override.
     if expected_m is None:
         expected_m = int(tokens)
-    if workspace is not None:
-        _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
-        x_q = workspace.x_q
-        tmp = workspace.tmp
-        tmp_q = workspace.tmp_q
-        output = workspace.output
     if x_q is None or tmp is None or tmp_q is None or output is None:
-        raise TypeError("wo_projection_mxfp8 requires source_tgd, weights, and workspace or binding")
+        raise TypeError("wo_projection_mxfp8 requires binding for caller-owned scratch")
 
     alpha_one = _cached_alpha_one(source_tgd.device)
     quantize_wo_a_input_mxfp8(source_tgd, out=x_q)
@@ -2401,7 +2271,6 @@ def wo_projection_inv_rope_mxfp8(
     positions: torch.Tensor | None = None,
     cos_sin_cache: torch.Tensor | None = None,
     weights: WOProjectionMXFP8Weights | None = None,
-    workspace: WOProjectionWorkspace | None = None,
     *,
     heads_per_group: int | None = None,
     nope_dim: int = 448,
@@ -2420,7 +2289,6 @@ def wo_projection_inv_rope_mxfp8(
                 ("positions", positions),
                 ("cos_sin_cache", cos_sin_cache),
                 ("weights", weights),
-                ("workspace", workspace),
                 ("heads_per_group", heads_per_group),
             )
             if value is not None
@@ -2428,7 +2296,7 @@ def wo_projection_inv_rope_mxfp8(
         if extras:
             raise ValueError(
                 "WO projection inverse-RoPE binding owns runtime tensors, weights, "
-                f"workspace, and heads_per_group; do not also pass {', '.join(extras)}"
+                f"scratch tensors, and heads_per_group; do not also pass {', '.join(extras)}"
             )
         extra_options = []
         if nope_dim != 448:
@@ -2469,7 +2337,7 @@ def wo_projection_inv_rope_mxfp8(
     ):
         raise TypeError(
             "wo_projection_inv_rope_mxfp8 requires o, positions, cos_sin_cache, "
-            "weights, workspace, and heads_per_group or binding"
+            "weights, and heads_per_group or binding"
         )
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
@@ -2484,13 +2352,10 @@ def wo_projection_inv_rope_mxfp8(
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
         expected_m = int(tokens)
-    if workspace is not None:
-        _check_wo_projection_workspace(workspace, tokens=tokens, weights=weights)
-
     # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
     # gemm chain internally, so the token-shaped activation MXFP8 views never
     # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any
-    # bound/workspace scratch is intentionally unused here.
+    # bound scratch is intentionally unused here.
     output = torch.ops.b12x.wo_projection_inv_rope_mxfp8_fused(
         o,
         positions,
@@ -2524,13 +2389,11 @@ __all__ = [
     "WOProjectionMXFP8Weights",
     "WOProjectionScratchCaps",
     "WOProjectionScratchPlan",
-    "WOProjectionWorkspace",
     "build_wo_projection_binding",
     "build_wo_projection_inv_rope_binding",
     "dequantize_mxfp8_rows_torch",
     "empty_dense_gemm_mnl_view",
     "empty_mxfp8_rows_for_dense_gemm",
-    "empty_wo_projection_workspace",
     "pack_fp8_block_scaled_weight_mxfp8",
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",

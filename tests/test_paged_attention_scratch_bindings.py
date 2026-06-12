@@ -666,3 +666,263 @@ def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata
         rtol=2e-2,
     )
     assert _cosine_similarity(output, ref_out_2) >= 0.99999
+
+
+def _run_mimo_v25_fp8_decode_graph_case(
+    window_left: int,
+    seed: int,
+    *,
+    batch: int = 4,
+    cache_seqlens_list: list[int] | None = None,
+    page_table_width: int = 8,
+    num_pages: int = 128,
+    expect_page_table_width: int | None = None,
+) -> None:
+    if cache_seqlens_list is None:
+        cache_seqlens_list = [129, 193, 257, 385]
+    if len(cache_seqlens_list) != batch:
+        raise ValueError("cache_seqlens_list length must match batch")
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_mimo_packed_inputs(
+            q_seqlens=[1] * batch,
+            cache_seqlens=cache_seqlens_list,
+            page_size=64,
+            seed=seed,
+            page_table_width=page_table_width,
+            num_pages=num_pages,
+        )
+    )
+    k_cache = k_cache.to(torch.float8_e4m3fn)
+    v_cache = v_cache.to(torch.float8_e4m3fn)
+    k_descale = torch.ones((batch, 1), device=q.device, dtype=torch.float32)
+    v_descale = torch.ones((batch, 1), device=q.device, dtype=torch.float32)
+
+    plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=q.device,
+            mode="decode",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=16,
+            num_kv_heads=1,
+            head_dim_qk=192,
+            head_dim_vo=128,
+            page_size=64,
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=int(page_table.shape[1]),
+            max_work_items=512,
+            max_partial_rows=0,
+            num_cache_pages=int(k_cache.shape[0]),
+            use_cuda_graph=True,
+            copy_runtime_metadata=True,
+        )
+    )
+    plan.prepare_decode_graph_replay_state(
+        batch=batch,
+        total_q_capacity=batch,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+        window_left=window_left,
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    output = torch.empty(
+        (*q.shape[:-1], v_cache.shape[-1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+
+    def bind():
+        return plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            window_left=window_left,
+            active_total_q=batch,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    bind().run()
+    torch.cuda.synchronize()
+    eager = output.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        binding = bind()
+        binding.run()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref_out, _ = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        window_left=window_left,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    assert binding.scratch._plan.split_kv is False
+    if expect_page_table_width is not None:
+        assert binding.scratch.page_table is not None
+        assert int(binding.scratch.page_table.shape[1]) == expect_page_table_width
+    assert torch.allclose(output, eager, atol=0, rtol=0)
+    assert torch.allclose(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    paged_api.clear_paged_caches()
+
+    captured_specs = []
+
+    def capture_launch(
+        kernel: object,
+        *,
+        compile_spec: object,
+        compile_args: tuple[object, ...],
+        runtime_args: tuple[object, ...],
+    ) -> None:
+        del kernel, compile_args, runtime_args
+        captured_specs.append(compile_spec)
+
+    monkeypatch.setattr(paged_api, "b12x_launch", capture_launch)
+
+    def bind_no_split_decode(batch: int) -> None:
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+            _make_mimo_packed_inputs(
+                q_seqlens=[1] * batch,
+                cache_seqlens=[129] * batch,
+                page_size=64,
+                seed=3500 + batch,
+                page_table_width=8,
+                num_pages=128,
+            )
+        )
+        plan = plan_paged_attention_scratch(
+            B12XPagedAttentionScratchCaps(
+                device=q.device,
+                mode="decode",
+                dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=16,
+                num_kv_heads=1,
+                head_dim_qk=192,
+                head_dim_vo=128,
+                page_size=64,
+                max_total_q=batch,
+                max_batch=batch,
+                max_page_table_width=int(page_table.shape[1]),
+                max_work_items=512,
+                max_partial_rows=0,
+                num_cache_pages=int(k_cache.shape[0]),
+                use_cuda_graph=True,
+                copy_runtime_metadata=True,
+            )
+        )
+        plan.prepare_decode_graph_replay_state(
+            batch=batch,
+            total_q_capacity=batch,
+            max_page_table_width=int(page_table.shape[1]),
+            max_cache_page_count=int(page_table.shape[1]),
+            window_left=-1,
+        )
+        (spec,) = plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        output = torch.empty(
+            (*q.shape[:-1], v_cache.shape[-1]),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        binding = plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_total_q=batch,
+        )
+        assert binding.scratch._plan.split_kv is False
+        binding.run()
+
+    bind_no_split_decode(8)
+    bind_no_split_decode(4)
+
+    assert len(captured_specs) == 2
+    assert captured_specs[0] == captured_specs[1]
+
+
+@torch.inference_mode()
+def test_mimo_v25_fp8_decode_graph_full_then_swa_uses_static_plan_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    paged_api.clear_paged_caches()
+
+    def fail_regular_metadata_update(**kwargs: object) -> None:
+        raise AssertionError("non-split decode should not update chunk metadata")
+
+    monkeypatch.setattr(
+        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        fail_regular_metadata_update,
+    )
+    _run_mimo_v25_fp8_decode_graph_case(window_left=-1, seed=3100)
+    _run_mimo_v25_fp8_decode_graph_case(window_left=127, seed=3200)
+
+
+@torch.inference_mode()
+def test_mimo_v25_fp8_decode_graph_pads_large_power2_page_table_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    paged_api.clear_paged_caches()
+
+    def fail_regular_metadata_update(**kwargs: object) -> None:
+        raise AssertionError(
+            "full-window non-split decode should use cached graph metadata"
+        )
+
+    monkeypatch.setattr(
+        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        fail_regular_metadata_update,
+    )
+    _run_mimo_v25_fp8_decode_graph_case(
+        window_left=-1,
+        seed=3300,
+        batch=8,
+        cache_seqlens_list=[1] * 8,
+        page_table_width=16_384,
+        num_pages=2048,
+        expect_page_table_width=16_385,
+    )
+    _run_mimo_v25_fp8_decode_graph_case(
+        window_left=127,
+        seed=3400,
+        batch=8,
+        cache_seqlens_list=[129, 193, 257, 385, 449, 513, 577, 641],
+        page_table_width=16_384,
+        num_pages=2048,
+        expect_page_table_width=16_385,
+    )

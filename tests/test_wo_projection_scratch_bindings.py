@@ -9,7 +9,6 @@ from b12x.gemm import (
     WOProjectionInvRopeBinding,
     WOProjectionScratchCaps,
     empty_mxfp8_rows_for_dense_gemm,
-    empty_wo_projection_workspace,
     plan_wo_projection_scratch,
 )
 from b12x.gemm.wo_projection import WOProjectionMXFP8Weights
@@ -75,11 +74,6 @@ def test_wo_projection_scratch_plan_binds_live_shape(monkeypatch) -> None:
     source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
     weights = _weights()
 
-    def fail_make_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not build a workspace")
-
-    monkeypatch.setattr(type(plan), "make_workspace", fail_make_workspace)
-
     binding = plan.bind(scratch=scratch, source_tgd=source, weights=weights)
 
     assert isinstance(binding, WOProjectionBinding)
@@ -91,44 +85,34 @@ def test_wo_projection_scratch_plan_binds_live_shape(monkeypatch) -> None:
     assert binding.output.shape == (3, 256, 1)
 
 
-def test_wo_projection_workspace_bind_returns_common_binding_type(monkeypatch) -> None:
+def test_wo_projection_plan_binding_maps_scratch_views(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
-    workspace = empty_wo_projection_workspace(
-        3,
-        groups=2,
-        group_width=128,
-        rank=64,
-        hidden=256,
-        device="cpu",
-    )
+    plan = _plan()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
     weights = _weights()
 
-    binding = workspace.bind(source_tgd=source, weights=weights)
+    binding = plan.bind(scratch=scratch, source_tgd=source, weights=weights)
 
     assert isinstance(binding, WOProjectionBinding)
     assert not hasattr(binding, "workspace")
-    assert binding.x_q is workspace.x_q
-    assert binding.tmp is workspace.tmp
-    assert binding.tmp_q is workspace.tmp_q
-    assert binding.output is workspace.output
+    assert binding.x_q.values.data_ptr() == scratch.data_ptr()
+    assert binding.tmp.shape == (3, 64, 2)
+    assert binding.tmp_q.values.shape == (3, 128)
+    assert binding.output.shape == (3, 256, 1)
     assert binding.source_tgd is source
     assert binding.weights is weights
 
 
 def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
-    workspace = empty_wo_projection_workspace(
-        3,
-        groups=2,
-        group_width=128,
-        rank=64,
-        hidden=256,
-        device="cpu",
-    )
+    plan = _plan()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
     weights = _weights()
-    binding = workspace.bind(source_tgd=source, weights=weights)
+    binding = plan.bind(scratch=scratch, source_tgd=source, weights=weights)
     calls = {}
 
     def fake_quantize_a(source_tgd, *, out):
@@ -162,10 +146,10 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
     out = wo_impl.wo_projection_mxfp8(binding=binding)
 
     assert calls["source_tgd"] is source
-    assert calls["x_q_out"] is workspace.x_q
-    assert calls["tmp_out"] is workspace.tmp
-    assert calls["tmp_q_out"] is workspace.tmp_q
-    assert calls["output_out"] is workspace.output
+    assert calls["x_q_out"] is binding.x_q
+    assert calls["tmp_out"] is binding.tmp
+    assert calls["tmp_q_out"] is binding.tmp_q
+    assert calls["output_out"] is binding.output
     assert out.shape == (3, 256)
 
 
@@ -178,11 +162,6 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     positions = torch.empty((3,), dtype=torch.int64)
     cos_sin_cache = torch.empty((16, 32), dtype=torch.bfloat16)
     weights = _weights()
-
-    def fail_make_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not build a workspace")
-
-    monkeypatch.setattr(type(plan), "make_workspace", fail_make_workspace)
 
     binding = plan.bind_inv_rope(
         scratch=scratch,
@@ -231,22 +210,16 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
 
 def test_wo_projection_binding_owns_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
-    workspace = empty_wo_projection_workspace(
-        3,
-        groups=2,
-        group_width=128,
-        rank=64,
-        hidden=256,
-        device="cpu",
-    )
+    plan = _plan()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
     weights = _weights()
-    binding = workspace.bind(source_tgd=source, weights=weights)
+    binding = plan.bind(scratch=scratch, source_tgd=source, weights=weights)
 
     with pytest.raises(ValueError, match="binding owns source_tgd"):
         wo_impl.wo_projection_mxfp8(
             source,
             weights,
-            workspace,
             binding=binding,
         )

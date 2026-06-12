@@ -11,7 +11,10 @@ from b12x.attention.paged.planner import (
     infer_paged_mode,
     resolve_decode_graph_ctas_per_sm,
 )
-from b12x.integration.attention import PagedAttentionWorkspace
+from b12x.integration.attention import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 
 
 def _make_inputs(
@@ -64,7 +67,7 @@ def test_paged_infers_extend_mode() -> None:
     assert infer_paged_mode(cu_seqlens_q) == "extend"
 
 
-def test_paged_decode_plan_emits_exact_split_metadata() -> None:
+def test_paged_decode_plan_ignores_fixed_split_metadata() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[2048, 4096],
@@ -81,17 +84,35 @@ def test_paged_decode_plan_emits_exact_split_metadata() -> None:
 
     assert plan.mode == "decode"
     assert plan.cta_tile_q == 16
-    assert plan.split_kv is True
-    assert plan.kv_chunk_size == 8 * 64
-    assert plan.request_indices == (0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)
-    assert plan.qo_tile_indices == (0,) * 12
-    assert plan.kv_tile_indices == (0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7)
-    assert plan.merge_indptr == (0, 4, 12)
-    assert plan.o_indptr == (0, 4, 12)
-    assert plan.total_num_partial_rows == 12
+    assert plan.split_kv is False
+    assert plan.kv_chunk_size == 64 * 64
+    assert plan.request_indices == (0, 1)
+    assert plan.qo_tile_indices == (0, 0)
+    assert plan.kv_tile_indices == (0, 0)
+    assert plan.merge_indptr == (0, 1, 2)
+    assert plan.o_indptr == (0, 1, 2)
+    assert plan.total_num_partial_rows == 0
 
 
-def test_paged_workspace_shapes_follow_plan_metadata() -> None:
+def test_paged_decode_plan_rejects_forced_split_kv() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 1],
+        cache_seqlens=[2048, 4096],
+    )
+
+    with pytest.raises(ValueError, match="decode plans do not support split-kv"):
+        create_paged_plan(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            force_split_kv=True,
+        )
+
+
+def test_paged_scratch_shapes_follow_plan_metadata() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 6],
         cache_seqlens=[2048, 8192],
@@ -104,29 +125,52 @@ def test_paged_workspace_shapes_follow_plan_metadata() -> None:
         cache_seqlens,
         cu_seqlens_q,
     )
-    workspace = PagedAttentionWorkspace.for_tensors(
-        mode="extend",
+    scratch_plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=q.device,
+            mode="extend",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            head_dim_qk=q.shape[2],
+            head_dim_vo=v_cache.shape[3],
+            page_size=k_cache.shape[1],
+            max_total_q=plan.total_q,
+            max_batch=page_table.shape[0],
+            max_page_table_width=page_table.shape[1],
+            max_work_items=plan.new_batch_size,
+            max_partial_rows=plan.total_num_partial_rows,
+            num_cache_pages=k_cache.shape[0],
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=q.device)
+        for shape, dtype in scratch_plan.shapes_and_dtypes()
+    )
+    binding = scratch_plan.bind(
+        scratch=scratch,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
+        output=torch.empty((q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
     )
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
+    scratch_views = binding.scratch
 
-    assert workspace.lse.shape == (8, 7)
-    assert workspace.kv_chunk_size_ptr.item() == 128 * 64
-    assert workspace.total_num_rows_ptr.item() == 7
-    assert workspace.request_indices.shape[0] == plan.new_batch_size
-    assert workspace.merge_indptr.shape[0] == plan.total_q + 1
-    assert workspace.o_indptr.shape[0] == page_table.shape[0] + 1
-    assert workspace.tmp_output is None
-    assert workspace.tmp_lse is None
+    assert scratch_views.lse.shape == (8, 7)
+    assert scratch_views.kv_chunk_size_ptr.item() == 128 * 64
+    assert scratch_views.total_num_rows_ptr.item() == 7
+    assert scratch_views.request_indices.shape[0] == plan.new_batch_size
+    assert scratch_views.merge_indptr.shape[0] == plan.total_q + 1
+    assert scratch_views.o_indptr.shape[0] == page_table.shape[0] + 1
+    assert scratch_views.tmp_output is None
+    assert scratch_views.tmp_lse is None
 
 
-def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
+def test_paged_fp8_decode_plan_uses_single_kv_span() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1] * 8,
         cache_seqlens=[8192] * 8,
@@ -141,8 +185,10 @@ def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size > 0
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == 8192
+    assert plan.new_batch_size == page_table.shape[0]
+    assert plan.total_num_partial_rows == 0
+    assert plan.split_kv is False
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -372,7 +418,10 @@ def test_paged_graph_mode_uses_decode_graph_heuristic() -> None:
     expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
     assert plan.graph_ctas_per_sm == 2
     assert plan.max_batch_size_if_split == expected_budget
-    assert plan.kv_chunk_size == 5 * 64
+    assert plan.split_kv is False
+    assert plan.kv_chunk_size == 8192
+    assert plan.new_batch_size == batch
+    assert plan.total_num_partial_rows == 0
 
 
 def test_decode_graph_chunk_pages_for_graph_uses_heuristic() -> None:
@@ -519,7 +568,7 @@ def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:
         ([6] * 8, [32768] * 8, torch.bfloat16),
     ],
 )
-def test_paged_non_policy_chunk_selection_still_produces_valid_split_kv_plans(
+def test_paged_non_policy_chunk_selection_still_produces_valid_plans(
     q_seqlens: list[int],
     cache_seqlens: list[int],
     kv_dtype: torch.dtype,
@@ -540,9 +589,5 @@ def test_paged_non_policy_chunk_selection_still_produces_valid_split_kv_plans(
 
     assert plan.kv_chunk_size > 0
     assert plan.new_batch_size >= page_table.shape[0]
-    if q_seqlens[0] == 1:
-        assert plan.total_num_partial_rows >= plan.total_q
-        assert plan.split_kv is True
-    else:
-        assert plan.total_num_partial_rows == 0
-        assert plan.split_kv is False
+    assert plan.total_num_partial_rows == 0
+    assert plan.split_kv is False

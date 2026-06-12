@@ -84,7 +84,7 @@ _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
     raise ValueError(
-        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"{api_name} binding owns runtime tensors, scratch, and kernel options; "
         f"do not also pass {', '.join(extras)}"
     )
 
@@ -103,7 +103,7 @@ class SparseMLAOnePassKernelBinding:
     active_token_counts: torch.Tensor
     sm_scale: float | torch.Tensor
     output: torch.Tensor
-    workspace: object | None = None
+    scratch: object | None = None
 
     def run(self) -> None:
         run_sparse_mla_kernel(binding=self)
@@ -117,7 +117,7 @@ def build_sparse_mla_onepass_kernel_binding(
     active_token_counts: torch.Tensor,
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
-    workspace: object | None = None,
+    scratch: object | None = None,
 ) -> SparseMLAOnePassKernelBinding:
     return SparseMLAOnePassKernelBinding(
         q_all=q_all,
@@ -126,7 +126,7 @@ def build_sparse_mla_onepass_kernel_binding(
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
         output=output,
-        workspace=workspace,
+        scratch=scratch,
     )
 
 
@@ -2248,7 +2248,7 @@ def run_sparse_mla_kernel(
         active_token_counts = binding.active_token_counts
         sm_scale = binding.sm_scale
         output = binding.output
-        workspace = binding.workspace
+        workspace = binding.scratch
 
     q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")
     kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_kernel", name="kv_cache")

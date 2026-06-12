@@ -5,9 +5,10 @@ import torch
 import torch.nn.functional as F
 
 from b12x.integration import (
+    B12XMHCScratchCaps,
     b12x_mhc_post,
     b12x_mhc_post_pre,
-    empty_mhc_workspace,
+    plan_mhc_scratch,
 )
 
 from .helpers import require_sm120
@@ -76,6 +77,34 @@ def _make_inputs(
     return residual.contiguous(), x.contiguous(), fn.contiguous(), scale.contiguous(), bias.contiguous()
 
 
+def _make_mhc_binding(
+    *,
+    tokens: int,
+    hidden_size: int,
+    device: torch.device,
+    split_k: int = 64,
+):
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            split_k=split_k,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    return plan.bind(
+        scratch=scratch,
+        y=torch.empty((tokens, hidden_size), dtype=torch.bfloat16, device=device),
+        post=torch.empty((tokens, 4), dtype=torch.float32, device=device),
+        comb=torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
+        out=torch.empty((tokens, 4, hidden_size), dtype=torch.bfloat16, device=device),
+    )
+
+
 @pytest.mark.parametrize("tokens", [1, 3, 8])
 def test_b12x_mhc_post_match_reference(tokens: int) -> None:
     device = require_sm120()
@@ -121,8 +150,8 @@ def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
         seed=91_450 + tokens,
         device=device,
     )
-    workspace = empty_mhc_workspace(
-        num_tokens=tokens,
+    binding = _make_mhc_binding(
+        tokens=tokens,
         hidden_size=hidden_size,
         device=device,
     )
@@ -150,14 +179,14 @@ def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
         rms_eps=1e-6,
         hc_eps=1e-6,
         sinkhorn_iters=20,
-        workspace=workspace,
+        binding=binding,
     )
     torch.cuda.synchronize(device)
 
-    assert residual_cur.untyped_storage().data_ptr() == workspace.out.untyped_storage().data_ptr()
-    assert post.untyped_storage().data_ptr() == workspace.post.untyped_storage().data_ptr()
-    assert comb.untyped_storage().data_ptr() == workspace.comb.untyped_storage().data_ptr()
-    assert y.untyped_storage().data_ptr() == workspace.y.untyped_storage().data_ptr()
+    assert residual_cur.untyped_storage().data_ptr() == binding.out.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == binding.post_buffer.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == binding.comb_buffer.untyped_storage().data_ptr()
+    assert y.untyped_storage().data_ptr() == binding.y.untyped_storage().data_ptr()
 
     residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
     y_ref, post_ref, comb_ref = _mhc_pre_reference(
@@ -186,8 +215,8 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
         seed=91_470 + tokens,
         device=device,
     )
-    workspace = empty_mhc_workspace(
-        num_tokens=tokens,
+    binding = _make_mhc_binding(
+        tokens=tokens,
         hidden_size=hidden_size,
         device=device,
     )
@@ -220,7 +249,7 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
         rms_eps=1e-6,
         hc_eps=1e-6,
         sinkhorn_iters=20,
-        workspace=workspace,
+        binding=binding,
         norm_weight=norm_weight,
         norm_eps=1e-6,
     )
@@ -264,8 +293,8 @@ def test_b12x_mhc_pro_hidden_match_reference() -> None:
         seed=91_472,
         device=device,
     )
-    workspace = empty_mhc_workspace(
-        num_tokens=tokens,
+    binding = _make_mhc_binding(
+        tokens=tokens,
         hidden_size=hidden_size,
         split_k=split_k,
         device=device,
@@ -310,8 +339,7 @@ def test_b12x_mhc_pro_hidden_match_reference() -> None:
         rms_eps=1e-6,
         hc_eps=1e-6,
         sinkhorn_iters=20,
-        workspace=workspace,
-        split_k=split_k,
+        binding=binding,
         norm_weight=norm_weight,
         norm_eps=1e-6,
     )
@@ -382,15 +410,15 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     prev_post_arg = prev_post.contiguous()
     prev_comb_arg = prev_comb.contiguous()
     # CUDA graph capture requires caller-owned scratch (the partials buffer).
-    workspace = empty_mhc_workspace(
-        num_tokens=tokens,
+    binding = _make_mhc_binding(
+        tokens=tokens,
         hidden_size=hidden_size,
         device=device,
     )
-    residual_cur = workspace.out
-    y = workspace.y
-    post = workspace.post
-    comb = workspace.comb
+    residual_cur = binding.out
+    y = binding.y
+    post = binding.post_buffer
+    comb = binding.comb_buffer
 
     def run() -> None:
         b12x_mhc_post_pre(
@@ -404,7 +432,7 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
             rms_eps=1e-6,
             hc_eps=1e-6,
             sinkhorn_iters=20,
-            workspace=workspace,
+            binding=binding,
         )
 
     run()

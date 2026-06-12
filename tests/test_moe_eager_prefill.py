@@ -13,14 +13,11 @@ from benchmarks.benchmark_moe import (
     make_routed_inputs,
 )
 from b12x.integration.tp_moe import (
-    allocate_tp_moe_workspace,
-    allocate_tp_moe_workspace_pool,
-    b12x_moe_fp4,
     clear_tp_moe_caches,
 )
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
-from .helpers import require_sm120
+from .helpers import require_sm120, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -50,47 +47,35 @@ def test_moe_eager_prefill_matches_oracle_across_shapes() -> None:
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
     scale_params = get_scale_contract_params(weights, "shared")
-    workspace = allocate_tp_moe_workspace_pool()
 
     for m, seed in ((23, 2300), (80, 8000)):
         x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
-        exact_workspace = allocate_tp_moe_workspace(
-            x,
-            scale_params.a1_gscale,
-            weights.w13_weight,
-            scale_params.a2_gscale,
-            weights.w2_weight,
-            topk_ids,
-            input_scales_static=True,
-        )
-        expected = b12x_moe_fp4(
-            x,
-            scale_params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            scale_params.g1_alphas,
-            scale_params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            scale_params.g2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=exact_workspace,
+        expected = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=scale_params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=scale_params.g1_alphas,
+            a2_gscale=scale_params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=scale_params.g2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
         ).clone()
-        actual = b12x_moe_fp4(
-            x,
-            scale_params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            scale_params.g1_alphas,
-            scale_params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            scale_params.g2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
+        actual = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=scale_params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=scale_params.g1_alphas,
+            a2_gscale=scale_params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=scale_params.g2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
         ).clone()
         reference = moe_reference_nvfp4(

@@ -1906,7 +1906,7 @@ def run_unified_decode(
         num_chunks_ptr=workspace.num_chunks_ptr,
         output=output,
         attn_sink=attn_sink,
-        workspace=workspace,
+        scratch=workspace,
     )
     run_sparse_mla_split_decode_merge(binding=merge_binding)
     if not return_lse:

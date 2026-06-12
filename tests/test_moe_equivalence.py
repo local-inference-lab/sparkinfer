@@ -16,18 +16,16 @@ from benchmarks.benchmark_moe import (
     MODEL_PATH,
     TP_RANK,
     TP_SIZE,
-    allocate_layer_chain_workspace,
     ModelSpec,
     compare_graph_replay_outputs,
-    capture_moe_layer_chain,
     get_scale_contract_params,
     load_expert_weight_stack,
     load_expert_weights,
     make_input_activations,
     make_multilayer_routing_case,
     make_routed_inputs,
-    run_moe_layer_chain,
 )
+from tests.helpers import make_tp_moe_fp4_binding, run_tp_moe_fp4
 
 
 def _skip_if_unavailable() -> None:
@@ -60,16 +58,73 @@ def _load_multilayer_weights() -> tuple:
     )
 
 
+def _make_layer_chain_bindings(
+    weights_stack,
+    params_stack,
+    x: torch.Tensor,
+    topk_ids_per_layer: list[torch.Tensor],
+    topk_weights_per_layer: list[torch.Tensor],
+    output_buffers: list[torch.Tensor],
+    *,
+    activation: str,
+    fast_math: bool,
+):
+    if not (
+        len(weights_stack)
+        == len(params_stack)
+        == len(topk_ids_per_layer)
+        == len(topk_weights_per_layer)
+        == len(output_buffers)
+    ):
+        raise ValueError("layer-chain inputs must all have the same length")
+
+    bindings = []
+    current = x
+    for weights, params, topk_ids, topk_weights, output in zip(
+        weights_stack,
+        params_stack,
+        topk_ids_per_layer,
+        topk_weights_per_layer,
+        output_buffers,
+        strict=True,
+    ):
+        binding = make_tp_moe_fp4_binding(
+            a=current,
+            a1_gscale=params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=params.g1_alphas,
+            a2_gscale=params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=params.g2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            fast_math=fast_math,
+            output=output,
+            input_scales_static=True,
+            activation=activation,
+            quant_mode="nvfp4",
+            source_format=weights.source_format,
+            w13_layout=weights.w13_layout,
+        )
+        bindings.append(binding)
+        current = output
+    return bindings
+
+
+def _run_layer_chain_bindings(bindings) -> list[torch.Tensor]:
+    from b12x.integration import b12x_moe_fp4
+
+    return [b12x_moe_fp4(binding=binding) for binding in bindings]
+
+
 @pytest.mark.parametrize("m", [1, 2, 4, 8])
 def test_moe_nonzero(m):
     """Validate `b12x_moe_fp4` produces non-zero output with real weights."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration import clear_tp_moe_caches
 
     clear_tp_moe_caches()
 
@@ -78,28 +133,18 @@ def test_moe_nonzero(m):
     weights = load_expert_weights(MODEL_PATH, spec)
 
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=99, device=device)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        topk_ids,
-        input_scales_static=True,
-    )
-
-    out = b12x_moe_fp4(
-        x,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        weights.g1_alphas_per_expert,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        weights.g2_alphas_per_expert,
-        topk_weights, topk_ids,
-        workspace=workspace,
+    out = run_tp_moe_fp4(
+        a=x,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w1_alphas=weights.g1_alphas_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        w2_alphas=weights.g2_alphas_per_expert,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         input_scales_static=True,
     )
     torch.cuda.synchronize()
@@ -115,11 +160,7 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     """Validate graph replay stays correct when routing contents change."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
-        clear_tp_moe_caches,
-    )
+    from b12x.integration import b12x_moe_fp4, clear_tp_moe_caches
 
     clear_tp_moe_caches()
 
@@ -132,53 +173,29 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     topk_ids_buf = topk_ids0.clone()
     topk_weights_buf = topk_weights0.clone()
     graph_output = torch.empty_like(x_buf)
-    workspace = allocate_tp_moe_workspace(
-        x_buf,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        topk_ids_buf,
+    graph_binding = make_tp_moe_fp4_binding(
+        a=x_buf,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w1_alphas=weights.g1_alphas_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        w2_alphas=weights.g2_alphas_per_expert,
+        topk_weights=topk_weights_buf,
+        topk_ids=topk_ids_buf,
+        output=graph_output,
         input_scales_static=True,
     )
 
     # Compile once before capture; the replay check below is about routing safety.
-    b12x_moe_fp4(
-        x_buf,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        weights.g1_alphas_per_expert,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        weights.g2_alphas_per_expert,
-        topk_weights_buf,
-        topk_ids_buf,
-        output=graph_output,
-        workspace=workspace,
-        input_scales_static=True,
-    )
+    b12x_moe_fp4(binding=graph_binding)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        b12x_moe_fp4(
-            x_buf,
-            weights.w13_input_scale_quant_per_expert,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            weights.g1_alphas_per_expert,
-            weights.w2_input_scale_quant_per_expert,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            weights.g2_alphas_per_expert,
-            topk_weights_buf,
-            topk_ids_buf,
-            output=graph_output,
-            workspace=workspace,
-            input_scales_static=True,
-        )
+        b12x_moe_fp4(binding=graph_binding)
 
     for seed in (123, 456):
         x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
@@ -190,19 +207,18 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         torch.cuda.synchronize()
         replay_out = graph_output.clone()
 
-        eager_out = b12x_moe_fp4(
-            x,
-            weights.w13_input_scale_quant_per_expert,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            weights.g1_alphas_per_expert,
-            weights.w2_input_scale_quant_per_expert,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            weights.g2_alphas_per_expert,
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
+        eager_out = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=weights.w13_input_scale_quant_per_expert,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=weights.g1_alphas_per_expert,
+            a2_gscale=weights.w2_input_scale_quant_per_expert,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=weights.g2_alphas_per_expert,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
         )
         torch.cuda.synchronize()
@@ -243,36 +259,32 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
     graph_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
-    shared_workspace = allocate_layer_chain_workspace(
+    graph_bindings = _make_layer_chain_bindings(
         weights_stack,
         params_stack,
         x_buf,
         topk_ids_bufs,
+        topk_weights_bufs,
+        activation="silu",
+        fast_math=True,
+        output_buffers=graph_output_bufs,
+    )
+    eager_bindings = _make_layer_chain_bindings(
+        weights_stack,
+        params_stack,
+        x_buf,
+        topk_ids_bufs,
+        topk_weights_bufs,
+        activation="silu",
+        fast_math=True,
+        output_buffers=eager_output_bufs,
     )
 
-    run_moe_layer_chain(
-        weights_stack,
-        params_stack,
-        x_buf,
-        topk_ids_bufs,
-        topk_weights_bufs,
-        activation="silu",
-        fast_math=True,
-        output_buffers=graph_output_bufs,
-        workspace=shared_workspace,
-    )
+    _run_layer_chain_bindings(graph_bindings)
     torch.cuda.synchronize()
-    graph = capture_moe_layer_chain(
-        weights_stack,
-        params_stack,
-        x_buf,
-        topk_ids_bufs,
-        topk_weights_bufs,
-        activation="silu",
-        fast_math=True,
-        output_buffers=graph_output_bufs,
-        workspace=shared_workspace,
-    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_layer_chain_bindings(graph_bindings)
 
     scenario_specs = [
         ("disjoint", "disjoint", 1100),
@@ -307,17 +319,7 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         graph.replay()
         torch.cuda.synchronize()
 
-        run_moe_layer_chain(
-            weights_stack,
-            params_stack,
-            x_buf,
-            topk_ids_bufs,
-            topk_weights_bufs,
-            activation="silu",
-            fast_math=True,
-            output_buffers=eager_output_bufs,
-            workspace=shared_workspace,
-        )
+        _run_layer_chain_bindings(eager_bindings)
         torch.cuda.synchronize()
 
         for layer_idx, (replay_out, eager_out) in enumerate(

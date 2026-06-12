@@ -11,7 +11,6 @@ from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.attention.workspace import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
-    B12XAttentionWorkspace,
 )
 from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
@@ -27,9 +26,11 @@ from b12x.attention.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
 from b12x.integration.mla import (
+    B12XCompressedMLAScratchCaps,
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
+    plan_compressed_mla_scratch,
 )
 from b12x.cute.compiler import clear_compile_cache, compile_cache_info
 
@@ -131,35 +132,53 @@ def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
     assert torch.isfinite(live_args[4].float()).all()
 
 
-def _make_workspace(
+def _make_compressed_binding(
     *,
     device: torch.device | str,
     rows: int,
     topk: int,
     max_kv_rows: int,
+    q: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_indices: torch.Tensor | None = None,
+    indexed_lengths: torch.Tensor | None = None,
+    indexed_page_table: torch.Tensor | None = None,
     use_cuda_graph: bool = False,
     head_dim: int = _COMPRESSED_HEAD_DIM,
     v_head_dim: int = _COMPRESSED_HEAD_DIM,
     max_chunks_per_row: int = 64,
     max_page_table_width: int | None = None,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=_LOCAL_Q_HEADS,
-        head_dim=head_dim,
-        v_head_dim=v_head_dim,
-        topk=topk,
-        max_page_table_width=max_page_table_width,
-        max_total_q=rows,
-        max_batch=rows,
-        max_kv_rows=max_kv_rows,
-        use_cuda_graph=use_cuda_graph,
-        max_chunks_per_row=max_chunks_per_row,
-        reserve_compressed_mla_staging=True,
+):
+    plan = plan_compressed_mla_scratch(
+        B12XCompressedMLAScratchCaps(
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=_LOCAL_Q_HEADS,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            max_width=topk,
+            max_page_table_width=max_page_table_width,
+            max_q_rows=rows,
+            max_batch=rows,
+            max_kv_rows=max_kv_rows,
+            max_chunks_per_row=max_chunks_per_row,
+        )
     )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=indexed_page_table,
+    )
+    binding.scratch.use_cuda_graph = bool(use_cuda_graph)
+    return binding
 
 
 def _make_cache(
@@ -309,7 +328,6 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
     assert legacy_ragged > capped * 3
     assert capped < int(2.25 * (1 << 30))
 
-
 def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
     device = require_sm120()
     gen = torch.Generator(device=device)
@@ -370,16 +388,6 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         rows=live_rows,
         width=contract_width,
     )
-    workspace = _make_workspace(
-        device=device,
-        rows=contract_rows,
-        topk=contract_width,
-        max_kv_rows=1,
-        use_cuda_graph=True,
-        max_chunks_per_row=max_chunks_per_row,
-        max_page_table_width=page_table_width,
-    )
-
     q = _make_q(rows=live_rows, seed=121, device=device)
     swa_cache = torch.empty(
         (1, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
@@ -402,6 +410,21 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         -1,
         dtype=torch.int32,
         device=device,
+    )
+    binding = _make_compressed_binding(
+        device=device,
+        rows=contract_rows,
+        topk=contract_width,
+        max_kv_rows=1,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=indexed_page_table,
+        use_cuda_graph=True,
+        max_chunks_per_row=max_chunks_per_row,
+        max_page_table_width=page_table_width,
     )
 
     calls: dict[str, int | bool] = {}
@@ -436,21 +459,15 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     )
 
     actual = compressed_api_impl.compressed_mla_decode_forward(
-        q_all=q,
         swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
-        swa_indices=swa_indices,
-        swa_topk_lengths=swa_lengths,
+        binding=binding,
         indexed_k_cache=indexed_cache,
-        indexed_indices=indexed_indices,
-        indexed_topk_lengths=indexed_lengths,
-        indexed_page_table=indexed_page_table,
         indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        workspace=workspace,
         sm_scale=_SM_SCALE,
     )
 
-    assert workspace.kv_chunk_size_value == 1024
-    assert workspace.num_chunks_value == 3
+    assert binding.scratch.kv_chunk_size_value == 1024
+    assert binding.scratch.num_chunks_value == 3
     assert calls["launch_num_chunks"] == max_chunks_per_row
     assert calls["direct_output"] is False
     assert calls["swa_cache_is_u8"] is True
@@ -479,11 +496,16 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     attn_sink = torch.nn.Parameter(
         torch.linspace(-0.1, 0.1, _LOCAL_Q_HEADS, dtype=torch.float32, device=device)
     )
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=8,
         topk=swa_indices.shape[1] + indexed_indices.shape[1],
         max_kv_rows=8 * (swa_indices.shape[1] + indexed_indices.shape[1]),
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
         use_cuda_graph=True,
     )
 
@@ -492,16 +514,11 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_lengths,
             indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
             attn_sink=attn_sink,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         return captured_out
@@ -561,11 +578,16 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     indexed_indices = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
     swa_lengths = torch.zeros((1,), dtype=torch.int32, device=device)
     indexed_lengths = torch.tensor([width], dtype=torch.int32, device=device)
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=1,
         topk=width,
         max_kv_rows=width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
         use_cuda_graph=True,
     )
 
@@ -574,15 +596,10 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_lengths,
             indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
-            workspace=workspace,
             sm_scale=1.0,
         )
         return captured_out
@@ -619,11 +636,14 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
     attn_sink = torch.linspace(
         -0.08, 0.12, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
     )
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=q.shape[0],
         topk=swa_indices.shape[1],
         max_kv_rows=q.shape[0] * swa_indices.shape[1],
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
         use_cuda_graph=True,
     )
 
@@ -632,13 +652,10 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding,
             swa_page_size=swa_page_size,
             attn_sink=attn_sink,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         return captured_out
@@ -691,11 +708,14 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
     attn_sink = torch.linspace(
         -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
     )
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=rows,
         topk=width,
         max_kv_rows=rows * width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
         use_cuda_graph=True,
     )
 
@@ -704,12 +724,9 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding,
             attn_sink=attn_sink,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         return captured_out
@@ -755,11 +772,16 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
     indexed_indices = torch.full((1, 4), -1, dtype=torch.int32, device=device)
     swa_lengths = torch.tensor([6], dtype=torch.int32, device=device)
     indexed_lengths = torch.tensor([1], dtype=torch.int32, device=device)
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=q.shape[0],
         topk=swa_indices.shape[1] + indexed_indices.shape[1],
         max_kv_rows=q.shape[0] * (swa_indices.shape[1] + indexed_indices.shape[1]),
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
         use_cuda_graph=True,
     )
 
@@ -768,15 +790,10 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_lengths,
             indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         return captured_out
@@ -835,27 +852,25 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch
     swa_indices = torch.empty((1, 0), dtype=torch.int32, device=device)
     swa_lengths = torch.zeros((1,), dtype=torch.int32, device=device)
     indexed_lengths = torch.tensor([8], dtype=torch.int32, device=device)
-    workspace = _make_workspace(
+    binding_a = _make_compressed_binding(
         device=device,
         rows=1,
         topk=8,
         max_kv_rows=8,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0),
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=torch.arange(2, dtype=torch.int32, device=device).unsqueeze(0),
         use_cuda_graph=True,
     )
 
-    indexed_indices_a = torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0)
-    page_table_a = torch.arange(2, dtype=torch.int32, device=device).unsqueeze(0)
     compressed_mla_decode_forward(
-        q_all=q,
         swa_k_cache=swa_cache,
-        swa_indices=swa_indices,
-        swa_topk_lengths=swa_lengths,
+        binding=binding_a,
         indexed_k_cache=indexed_cache,
-        indexed_indices=indexed_indices_a,
-        indexed_topk_lengths=indexed_lengths,
         indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        indexed_page_table=page_table_a,
-        workspace=workspace,
         sm_scale=_SM_SCALE,
     )
     torch.cuda.synchronize(device)
@@ -866,19 +881,21 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch
         device=device,
     )
     page_table_b = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    binding_b = binding_a.scratch.bind(
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices_b,
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=page_table_b,
+    )
     freeze_kernel_resolution("compressed MLA page-table width must be dynamic")
     try:
         actual = compressed_mla_decode_forward(
-            q_all=q,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
+            binding=binding_b,
             indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices_b,
-            indexed_topk_lengths=indexed_lengths,
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-            indexed_page_table=page_table_b,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         torch.cuda.synchronize(device)
@@ -945,25 +962,25 @@ def test_compressed_mla_accepts_row_shared_page_table(monkeypatch) -> None:
     indexed_page_table = (
         torch.arange(2, dtype=torch.int32, device=device).unsqueeze(0).expand(rows, -1)
     )
-    workspace = _make_workspace(
+    binding = _make_compressed_binding(
         device=device,
         rows=rows,
         topk=indexed_indices.shape[1],
         max_kv_rows=rows * indexed_indices.shape[1],
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        indexed_page_table=indexed_page_table,
         use_cuda_graph=True,
     )
 
     actual = compressed_mla_decode_forward(
-        q_all=q,
         swa_k_cache=swa_cache,
-        swa_indices=swa_indices,
-        swa_topk_lengths=swa_lengths,
+        binding=binding,
         indexed_k_cache=indexed_cache,
-        indexed_indices=indexed_indices,
-        indexed_topk_lengths=indexed_lengths,
         indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        indexed_page_table=indexed_page_table,
-        workspace=workspace,
         sm_scale=_SM_SCALE,
     )
     torch.cuda.synchronize(device)
@@ -998,20 +1015,6 @@ def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkey
     # legacy split internals it was written for, post P10 default-flip.
     monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
-    workspace = B12XAttentionWorkspace.for_contract(
-        mode="decode",
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=_LOCAL_Q_HEADS,
-        head_dim=_COMPRESSED_HEAD_DIM,
-        v_head_dim=_COMPRESSED_HEAD_DIM,
-        topk=8,
-        max_total_q=3,
-        max_batch=3,
-        max_kv_rows=8,
-        use_cuda_graph=False,
-    )
     indexed_cache = _make_cache(
         tokens=64,
         page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
@@ -1030,17 +1033,24 @@ def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkey
     indexed_indices3 = torch.arange(8, dtype=torch.int32, device=device).repeat(3, 1)
     indexed_lengths3 = torch.full((3,), 8, dtype=torch.int32, device=device)
     page_table3 = torch.arange(2, dtype=torch.int32, device=device).repeat(3, 1)
-    compressed_mla_decode_forward(
-        q_all=q3,
-        swa_k_cache=swa_cache,
+    binding3 = _make_compressed_binding(
+        device=device,
+        rows=3,
+        topk=8,
+        max_kv_rows=8,
+        q=q3,
         swa_indices=swa_indices3,
-        swa_topk_lengths=swa_lengths3,
-        indexed_k_cache=indexed_cache,
+        swa_lengths=swa_lengths3,
         indexed_indices=indexed_indices3,
-        indexed_topk_lengths=indexed_lengths3,
-        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+        indexed_lengths=indexed_lengths3,
         indexed_page_table=page_table3,
-        workspace=workspace,
+        use_cuda_graph=False,
+    )
+    compressed_mla_decode_forward(
+        swa_k_cache=swa_cache,
+        binding=binding3,
+        indexed_k_cache=indexed_cache,
+        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
         sm_scale=_SM_SCALE,
     )
     torch.cuda.synchronize(device)
@@ -1055,20 +1065,22 @@ def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkey
     )
     indexed_lengths1 = torch.tensor([8], dtype=torch.int32, device=device)
     page_table1 = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    binding1 = binding3.scratch.bind(
+        q=q1,
+        swa_indices=swa_indices1,
+        swa_lengths=swa_lengths1,
+        indexed_indices=indexed_indices1,
+        indexed_lengths=indexed_lengths1,
+        indexed_page_table=page_table1,
+    )
 
     freeze_kernel_resolution("compressed MLA live rows must be runtime")
     try:
         actual = compressed_mla_decode_forward(
-            q_all=q1,
             swa_k_cache=swa_cache,
-            swa_indices=swa_indices1,
-            swa_topk_lengths=swa_lengths1,
+            binding=binding1,
             indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices1,
-            indexed_topk_lengths=indexed_lengths1,
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-            indexed_page_table=page_table1,
-            workspace=workspace,
             sm_scale=_SM_SCALE,
         )
         torch.cuda.synchronize(device)

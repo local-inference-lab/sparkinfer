@@ -84,7 +84,7 @@ def _resolve_launch_config(num_rows: int, stride: int, device: torch.device) -> 
     )
 
 
-def persistent_topk2048_workspace_nbytes(
+def persistent_topk2048_scratch_nbytes(
     num_rows: int,
     stride: int,
     *,
@@ -108,12 +108,12 @@ def _persistent_topk2048_capacity_nbytes(
     max_rows = max(int(max_rows), 1)
     max_stride = max(int(max_stride), 1)
     if device.type != "cuda":
-        return persistent_topk2048_workspace_nbytes(max_rows, max_stride, device=device)
+        return persistent_topk2048_scratch_nbytes(max_rows, max_stride, device=device)
     candidate_strides = {1, max_stride}
     if max_stride > _RADIX_THRESHOLD:
         candidate_strides.add(_RADIX_THRESHOLD + 1)
     return max(
-        persistent_topk2048_workspace_nbytes(max_rows, stride, device=device)
+        persistent_topk2048_scratch_nbytes(max_rows, stride, device=device)
         for stride in candidate_strides
     )
 
@@ -149,7 +149,7 @@ class B12XPersistentTopK2048Binding:
 @dataclass(frozen=True)
 class B12XPersistentTopK2048ScratchPlan:
     caps: B12XPersistentTopK2048ScratchCaps
-    workspace_nbytes: int
+    scratch_nbytes: int
     _scratch_specs: tuple[B12XScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
@@ -179,16 +179,16 @@ class B12XPersistentTopK2048ScratchPlan:
             raise ValueError(
                 f"logits stride {stride} exceeds persistent top-k capacity {self.caps.max_stride}"
             )
-        arena = scratch_tensor(
+        scratch_storage = scratch_tensor(
             scratch,
             self._scratch_specs,
             owner="persistent top-k 2048",
         )
-        workspace = arena[: self.workspace_nbytes].view(torch.int32)
+        state = scratch_storage[: self.scratch_nbytes].view(torch.int32)
         return build_persistent_topk2048_binding(
             logits=logits,
             lengths=lengths,
-            workspace=workspace,
+            scratch=state,
             page_table_1=page_table_1,
             output_indices=output_indices,
             max_seq_len=max_seq_len,
@@ -198,18 +198,18 @@ class B12XPersistentTopK2048ScratchPlan:
 def plan_persistent_topk2048_scratch(
     caps: B12XPersistentTopK2048ScratchCaps,
 ) -> B12XPersistentTopK2048ScratchPlan:
-    workspace_nbytes = _persistent_topk2048_capacity_nbytes(
+    scratch_nbytes = _persistent_topk2048_capacity_nbytes(
         caps.max_rows,
         caps.max_stride,
         device=caps.device,
     )
     return B12XPersistentTopK2048ScratchPlan(
         caps=caps,
-        workspace_nbytes=workspace_nbytes,
+        scratch_nbytes=scratch_nbytes,
         _scratch_specs=(
             scratch_buffer_spec(
                 "persistent_topk2048.state",
-                nbytes=workspace_nbytes,
+                nbytes=scratch_nbytes,
                 device=caps.device,
             ),
         ),
@@ -220,7 +220,7 @@ def build_persistent_topk2048_binding(
     *,
     logits: torch.Tensor,
     lengths: torch.Tensor,
-    workspace: torch.Tensor,
+    scratch: torch.Tensor,
     page_table_1: torch.Tensor | None = None,
     output_indices: torch.Tensor | None = None,
     max_seq_len: int | None = None,
@@ -237,14 +237,14 @@ def build_persistent_topk2048_binding(
         raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
     if lengths.device != logits.device:
         raise ValueError("lengths must be on the logits device")
-    if workspace.dtype != torch.int32 or workspace.device != logits.device:
-        raise ValueError("workspace must be an int32 tensor on the logits device")
-    if not workspace.is_contiguous():
-        raise ValueError("workspace must be contiguous")
+    if scratch.dtype != torch.int32 or scratch.device != logits.device:
+        raise ValueError("scratch must be an int32 tensor on the logits device")
+    if not scratch.is_contiguous():
+        raise ValueError("scratch must be contiguous")
     return B12XPersistentTopK2048Binding(
         logits=logits,
         lengths=lengths,
-        scratch=workspace,
+        scratch=scratch,
         page_table_1=page_table_1,
         output_indices=output_indices,
         max_seq_len=max_seq_len,
@@ -764,7 +764,7 @@ def run_persistent_topk2048(
     *,
     page_table_1: torch.Tensor | None = None,
     output_indices: torch.Tensor | None = None,
-    workspace: torch.Tensor | None = None,
+    scratch: torch.Tensor | None = None,
     max_seq_len: int | None = None,
     binding: B12XPersistentTopK2048Binding | None = None,
 ) -> torch.Tensor:
@@ -776,7 +776,7 @@ def run_persistent_topk2048(
                 ("lengths", lengths),
                 ("page_table_1", page_table_1),
                 ("output_indices", output_indices),
-                ("workspace", workspace),
+                ("scratch", scratch),
                 ("max_seq_len", max_seq_len),
             )
             if value is not None
@@ -790,7 +790,7 @@ def run_persistent_topk2048(
         lengths = binding.lengths
         page_table_1 = binding.page_table_1
         output_indices = binding.output_indices
-        workspace = binding.scratch
+        scratch = binding.scratch
         max_seq_len = binding.max_seq_len
     if logits is None or lengths is None:
         raise TypeError("run_persistent_topk2048 requires logits/lengths or binding")
@@ -836,19 +836,19 @@ def run_persistent_topk2048(
         raise ValueError("output_indices must be contiguous")
 
     state_words = launch.num_groups * _STATE_WORDS
-    if workspace is None:
+    if scratch is None:
         state = torch.empty((state_words,), dtype=torch.int32, device=logits.device)
     else:
-        if workspace.dtype != torch.int32 or workspace.device != logits.device:
-            raise ValueError("workspace must be an int32 tensor on the logits device")
-        if workspace.numel() < state_words:
+        if scratch.dtype != torch.int32 or scratch.device != logits.device:
+            raise ValueError("scratch must be an int32 tensor on the logits device")
+        if scratch.numel() < state_words:
             raise ValueError(
-                f"workspace too small: need {state_words * 4} bytes, "
-                f"got {workspace.numel() * workspace.element_size()} bytes"
+                f"scratch too small: need {state_words * 4} bytes, "
+                f"got {scratch.numel() * scratch.element_size()} bytes"
             )
-        state = workspace.reshape(-1)[:state_words]
+        state = scratch.reshape(-1)[:state_words]
         if not state.is_contiguous():
-            raise ValueError("workspace must be contiguous")
+            raise ValueError("scratch must be contiguous")
 
     paged_output = page_table_1 is not None
     if page_table_1 is None:

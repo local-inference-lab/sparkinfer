@@ -276,7 +276,7 @@ def test_sparse_mla_kernel_binding_run_uses_binding_argument(monkeypatch) -> Non
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
         output=output,
-        workspace=object(),
+        scratch=object(),
         identity_page_table=True,
     )
     calls = {}
@@ -314,7 +314,7 @@ def test_sparse_mla_onepass_kernel_binding_run_uses_binding_argument(monkeypatch
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
         output=output,
-        workspace=object(),
+        scratch=object(),
     )
     calls = {}
 
@@ -341,7 +341,7 @@ def test_sparse_mla_split_decode_binding_supplies_forward_and_merge(monkeypatch)
         output,
     ) = _sparse_tensors()
     attn_sink = torch.empty((2,), dtype=torch.float32)
-    workspace = object()
+    scratch = object()
     binding = mla_split.build_sparse_mla_split_decode_binding(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -355,7 +355,7 @@ def test_sparse_mla_split_decode_binding_supplies_forward_and_merge(monkeypatch)
         output=output,
         launch_num_chunks=3,
         attn_sink=attn_sink,
-        workspace=workspace,
+        scratch=scratch,
         identity_page_table=True,
     )
     calls = {}
@@ -381,14 +381,14 @@ def test_sparse_mla_split_decode_binding_supplies_forward_and_merge(monkeypatch)
     assert calls["forward"]["tmp_output"] is tmp_output
     assert calls["forward"]["tmp_lse"] is tmp_lse
     assert calls["forward"]["launch_num_chunks"] == 3
-    assert calls["forward"]["workspace"] is workspace
+    assert calls["forward"]["workspace"] is scratch
     assert calls["forward"]["identity_page_table"] is True
     assert calls["merge"]["tmp_output"] is tmp_output
     assert calls["merge"]["tmp_lse"] is tmp_lse
     assert calls["merge"]["num_chunks_ptr"] is num_chunks_ptr
     assert calls["merge"]["output"] is output
     assert calls["merge"]["attn_sink"] is attn_sink
-    assert calls["merge"]["workspace"] is workspace
+    assert calls["merge"]["workspace"] is scratch
 
 
 def test_sparse_mla_split_forward_binding_run_uses_binding_argument(monkeypatch) -> None:

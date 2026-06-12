@@ -31,7 +31,6 @@ from .split import (
     run_compressed_mla_split_decode_forward,
     run_sparse_mla_split_decode_merge,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
 
 
 _LN2 = math.log(2.0)
@@ -41,7 +40,6 @@ def compressed_mla_decode_forward(
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor | None = None,
     swa_topk_lengths: torch.Tensor | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
     binding=None,
     sm_scale: float,
     swa_page_size: int = COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -61,35 +59,34 @@ def compressed_mla_decode_forward(
     if lse_scale not in ("base2", "natural"):
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
 
-    scratch = workspace
-    if binding is not None:
-        binding_scratch = getattr(binding, "scratch", None)
-        if binding_scratch is None:
-            raise TypeError("compressed MLA binding is missing scratch")
-        if workspace is not None and workspace is not binding_scratch:
-            raise ValueError("workspace argument does not match compressed MLA binding scratch")
-        scratch = binding_scratch
-        if q_all is None:
-            q_all = getattr(binding, "q")
-        if swa_indices is None:
-            swa_indices = getattr(binding, "swa_indices")
-        if swa_topk_lengths is None:
-            swa_topk_lengths = getattr(binding, "swa_lengths")
-        if indexed_indices is None:
-            indexed_indices = getattr(binding, "indexed_indices", None)
-        if indexed_topk_lengths is None:
-            indexed_topk_lengths = getattr(binding, "indexed_lengths", None)
-        if indexed_page_table is None:
-            indexed_page_table = getattr(binding, "indexed_page_table", None)
-
-    if q_all is None:
-        raise TypeError("compressed_mla_decode_forward requires q_all or binding")
-    if swa_indices is None:
-        raise TypeError("compressed_mla_decode_forward requires swa_indices or binding")
-    if swa_topk_lengths is None:
-        raise TypeError("compressed_mla_decode_forward requires swa_topk_lengths or binding")
+    if binding is None:
+        raise TypeError("compressed_mla_decode_forward requires binding")
+    extras = [
+        name
+        for name, value in (
+            ("q_all", q_all),
+            ("swa_indices", swa_indices),
+            ("swa_topk_lengths", swa_topk_lengths),
+            ("indexed_indices", indexed_indices),
+            ("indexed_topk_lengths", indexed_topk_lengths),
+            ("indexed_page_table", indexed_page_table),
+        )
+        if value is not None
+    ]
+    if extras:
+        raise ValueError(
+            "compressed MLA binding owns q and index tensors; "
+            f"do not also pass {', '.join(extras)}"
+        )
+    scratch = getattr(binding, "scratch", None)
     if scratch is None:
-        raise TypeError("compressed_mla_decode_forward requires workspace or binding")
+        raise TypeError("compressed MLA binding is missing scratch")
+    q_all = getattr(binding, "q")
+    swa_indices = getattr(binding, "swa_indices")
+    swa_topk_lengths = getattr(binding, "swa_lengths")
+    indexed_indices = getattr(binding, "indexed_indices", None)
+    indexed_topk_lengths = getattr(binding, "indexed_lengths", None)
+    indexed_page_table = getattr(binding, "indexed_page_table", None)
 
     q3 = _normalize_compressed_q(q_all)
     rows, heads, _ = q3.shape
@@ -363,29 +360,7 @@ def compressed_mla_decode_forward(
                 f"buffer={tuple(scratch.output_buffer.shape)} required>="
                 f"({int(scratch.max_total_q)}, {heads}, {COMPRESSED_MLA_HEAD_DIM})"
             )
-        if binding is None:
-            (
-                q_kernel,
-                swa_indices_kernel,
-                swa_lengths_kernel,
-                indexed_indices_kernel,
-                indexed_lengths_kernel,
-                indexed_page_table_kernel,
-            ) = _stage_fixed_compressed_mla_inputs(
-                workspace=workspace,
-                q_all=q3,
-                swa_indices=swa_indices_2d,
-                swa_lengths=swa_topk_lengths,
-                indexed_indices=indexed_indices_for_kernel,
-                indexed_lengths=indexed_lengths_for_kernel,
-                indexed_page_table=indexed_page_table_for_kernel,
-            )
-            output_kernel = scratch.output_buffer[
-                : scratch.max_total_q,
-                :heads,
-                :COMPRESSED_MLA_HEAD_DIM,
-            ]
-        elif int(q_kernel.shape[0]) == int(scratch.max_total_q):
+        if int(q_kernel.shape[0]) == int(scratch.max_total_q):
             output_kernel = scratch.output_buffer[
                 : scratch.max_total_q,
                 :heads,
@@ -435,7 +410,7 @@ def compressed_mla_decode_forward(
         indexed_page_nbytes=compressed_mla_page_nbytes(indexed_page_size_for_kernel),
         has_indexed=has_indexed,
         map_indexed_page_table=map_indexed_page_table,
-        workspace=scratch,
+        scratch=scratch,
         direct_output=direct_single_chunk_output,
         single_tile_chunks=single_tile_chunks,
         attn_sink=attn_sink,
@@ -461,7 +436,7 @@ def compressed_mla_decode_forward(
             num_chunks_ptr=scratch.num_chunks_ptr,
             output=output_kernel,
             attn_sink=attn_sink if fused_sink_output else None,
-            workspace=scratch,
+            scratch=scratch,
         )
         run_sparse_mla_split_decode_merge(binding=merge_binding)
     if not needs_lse:
@@ -495,7 +470,7 @@ def _run_unified_sm120_compressed_prefill(
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_topk_lengths: torch.Tensor,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     sm_scale: float,
     swa_page_size: int,
     indexed_k_cache: torch.Tensor | None,
@@ -556,7 +531,7 @@ def _run_unified_sm120_compressed_prefill(
 
 def _stage_fixed_compressed_mla_inputs(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     q_all: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_lengths: torch.Tensor,
@@ -579,8 +554,8 @@ def _stage_fixed_compressed_mla_inputs(
         or indexed_page_table_stage is None
     ):
         raise RuntimeError(
-            "fixed compressed MLA workspace is missing capacity staging buffers; "
-            "set reserve_compressed_mla_staging=True when building the attention arena"
+            "fixed compressed MLA scratch is missing capacity staging buffers; "
+            "set reserve_compressed_mla_staging=True when planning scratch"
         )
 
     rows = int(q_all.shape[0])

@@ -6,7 +6,6 @@ from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.gemm.block_fp8_linear import (
     BlockFP8LinearScratchCaps,
     block_fp8_linear_mxfp8,
-    empty_block_fp8_linear_workspace,
     pack_block_fp8_linear_weight_mxfp8,
     plan_block_fp8_linear_scratch,
     quantize_block_fp8_linear_input_mxfp8,
@@ -85,16 +84,29 @@ def test_block_fp8_linear_replays_under_cuda_graph() -> None:
     ).contiguous()
     weight, scale = _make_block_fp8_weight(out_features, in_features)
     packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
-    workspace = empty_block_fp8_linear_workspace(
-        tokens,
-        in_features,
-        out_features,
-        device="cuda",
-        output_dtype=x.dtype,
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device=x.device,
+            max_tokens=tokens,
+            in_features=in_features,
+            out_features=out_features,
+            output_dtype=x.dtype,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=x.device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    output = torch.empty((tokens, out_features, 1), dtype=x.dtype, device=x.device)
+    binding = plan.bind(
+        scratch=scratch,
+        source=x,
+        packed_weight=packed,
+        output=output,
     )
 
     def run_once() -> torch.Tensor:
-        return block_fp8_linear_mxfp8(x, packed, workspace=workspace)
+        return block_fp8_linear_mxfp8(binding=binding)
 
     eager = run_once().clone()
     torch.cuda.synchronize()
@@ -108,7 +120,7 @@ def test_block_fp8_linear_replays_under_cuda_graph() -> None:
         graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(workspace.output[:, :, 0], eager, rtol=0, atol=0)
+    torch.testing.assert_close(output[:, :, 0], eager, rtol=0, atol=0)
 
 
 def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
@@ -160,7 +172,7 @@ def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
 
 
-def test_block_fp8_linear_default_workspace_path_captures() -> None:
+def test_block_fp8_linear_default_fused_path_captures() -> None:
     require_sm120()
     torch.manual_seed(20260525)
 

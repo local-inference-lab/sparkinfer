@@ -93,12 +93,12 @@ def _patch_launch(monkeypatch) -> None:
     monkeypatch.setattr(contig, "current_cuda_stream", lambda: 0)
 
 
-def test_attention_scratch_plan_exposes_one_opaque_arena_spec() -> None:
+def test_attention_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_attention_scratch(_attention_plan())
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "contiguous_attention.arena"
+    assert specs[0].name == "contiguous_attention.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
@@ -124,7 +124,7 @@ def test_attention_scratch_plan_binds_live_tensors(monkeypatch) -> None:
     assert binding.lse.shape == (2, 4, 3)
 
 
-def test_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch) -> None:
+def test_attention_scratch_plan_binding_maps_caller_owned_scratch(monkeypatch) -> None:
     _patch_attention_validation(monkeypatch)
     plan = plan_attention_scratch(_attention_plan())
     spec = plan.scratch_specs()[0]
@@ -133,34 +133,29 @@ def test_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch) -> No
     k = torch.empty(plan.plan.k_shape, dtype=torch.bfloat16)
     v = torch.empty(plan.plan.v_shape, dtype=torch.bfloat16)
     sink = torch.empty((4,), dtype=torch.float32)
-
-    def fail_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not build a workspace")
-
-    monkeypatch.setattr(contig, "_attention_workspace_from_scratch_plan", fail_workspace)
 
     binding = plan.bind(scratch=scratch, q=q, k=k, v=v, attention_sink_bias=sink)
 
     assert isinstance(binding, AttentionBinding)
     assert binding.output.shape == plan.plan.q_shape
+    assert binding.output.untyped_storage().data_ptr() == scratch.untyped_storage().data_ptr()
 
 
-def test_attention_workspace_bind_returns_common_binding_type(monkeypatch) -> None:
+def test_attention_scratch_plan_bind_returns_common_binding_type(monkeypatch) -> None:
     _patch_attention_validation(monkeypatch)
     plan = plan_attention_scratch(_attention_plan())
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    workspace = contig._attention_workspace_from_scratch_plan(plan, scratch=scratch)
     q = torch.empty(plan.plan.q_shape, dtype=torch.bfloat16)
     k = torch.empty(plan.plan.k_shape, dtype=torch.bfloat16)
     v = torch.empty(plan.plan.v_shape, dtype=torch.bfloat16)
     sink = torch.empty((4,), dtype=torch.float32)
 
-    binding = workspace.bind(q=q, k=k, v=v, plan=plan.plan, attention_sink_bias=sink)
+    binding = plan.bind(scratch=scratch, q=q, k=k, v=v, attention_sink_bias=sink)
 
     assert isinstance(binding, AttentionBinding)
-    assert binding.output is workspace.output
-    assert binding.lse is workspace.lse
+    assert binding.output.shape == plan.plan.q_shape
+    assert binding.lse.shape == (2, 4, 3)
     assert binding.plan is plan.plan
 
 
@@ -233,7 +228,7 @@ def test_varlen_attention_scratch_plan_binds_live_tensors(monkeypatch) -> None:
     assert binding.lse.shape == (4, 5)
 
 
-def test_varlen_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch) -> None:
+def test_varlen_attention_scratch_plan_binding_maps_caller_owned_scratch(monkeypatch) -> None:
     _patch_varlen_validation(monkeypatch)
     plan = plan_varlen_attention_scratch(_varlen_plan())
     spec = plan.scratch_specs()[0]
@@ -243,15 +238,6 @@ def test_varlen_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch
     v = torch.empty(plan.plan.v_shape, dtype=torch.bfloat16)
     cu_q = torch.tensor([0, 2, 5], dtype=torch.int32)
     sink = torch.empty((4,), dtype=torch.float32)
-
-    def fail_workspace(*args, **kwargs):
-        raise AssertionError("scratch binding must not build a workspace")
-
-    monkeypatch.setattr(
-        contig,
-        "_varlen_attention_workspace_from_scratch_plan",
-        fail_workspace,
-    )
 
     binding = plan.bind(
         scratch=scratch,
@@ -264,6 +250,7 @@ def test_varlen_attention_scratch_plan_bind_does_not_build_workspace(monkeypatch
 
     assert isinstance(binding, VarlenAttentionBinding)
     assert binding.output.shape == plan.plan.q_shape
+    assert binding.output.untyped_storage().data_ptr() == scratch.untyped_storage().data_ptr()
 
 
 def test_varlen_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:

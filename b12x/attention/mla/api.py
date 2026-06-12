@@ -28,9 +28,6 @@ from .split import (
     run_sparse_mla_split_decode,
     select_sparse_mla_split_decode_config,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
-
-
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
@@ -211,7 +208,7 @@ def _resolve_mla_prefill_strategy() -> Literal["auto", "single", "split"]:
 def _apply_mla_prefill_strategy(
     *,
     split_cfg,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     active_token_counts: torch.Tensor,
     device: torch.device,
     q_rows: int,
@@ -238,7 +235,7 @@ def _apply_mla_prefill_strategy(
 
 def _get_mla_output_view(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     q_all: torch.Tensor,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -297,7 +294,7 @@ def _validate_split_control_tensors(
 
 def _validate_split_workspace_views(
     *,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     q_rows: int,
     num_heads: int,
     v_head_dim: int,
@@ -358,36 +355,16 @@ def _resolve_sparse_mla_binding(
     selected_indices: torch.Tensor | None,
     cache_seqlens_int32: torch.Tensor | None,
     nsa_cache_seqlens_int32: torch.Tensor | None,
-    workspace: B12XAttentionWorkspace | None,
     selected_name: str,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    B12XAttentionWorkspace,
+    object,
 ]:
     if binding is None:
-        missing = [
-            name
-            for name, value in (
-                ("q_all", q_all),
-                (selected_name, selected_indices),
-                ("cache_seqlens_int32", cache_seqlens_int32),
-                ("nsa_cache_seqlens_int32", nsa_cache_seqlens_int32),
-                ("workspace", workspace),
-            )
-            if value is None
-        ]
-        if missing:
-            raise TypeError(f"missing required sparse MLA arguments: {', '.join(missing)}")
-        return (
-            q_all,
-            selected_indices,
-            cache_seqlens_int32,
-            nsa_cache_seqlens_int32,
-            workspace,
-        )
+        raise TypeError("sparse MLA forward requires binding")
 
     extras = [
         name
@@ -396,7 +373,6 @@ def _resolve_sparse_mla_binding(
             (selected_name, selected_indices),
             ("cache_seqlens_int32", cache_seqlens_int32),
             ("nsa_cache_seqlens_int32", nsa_cache_seqlens_int32),
-            ("workspace", workspace),
         )
         if value is not None
     ]
@@ -421,7 +397,6 @@ def sparse_mla_decode_forward(
     page_table_1: torch.Tensor | None = None,
     cache_seqlens_int32: torch.Tensor | None = None,
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
     binding=None,
     sm_scale: float,
     v_head_dim: int | None = None,
@@ -439,7 +414,6 @@ def sparse_mla_decode_forward(
             selected_indices=page_table_1,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            workspace=workspace,
             selected_name="page_table_1",
         )
     )
@@ -470,7 +444,6 @@ def sparse_mla_extend_forward(
     selected_token_offsets: torch.Tensor | None = None,
     cache_seqlens_int32: torch.Tensor | None = None,
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
-    workspace: B12XAttentionWorkspace | None = None,
     binding=None,
     sm_scale: float,
     v_head_dim: int | None = None,
@@ -485,7 +458,6 @@ def sparse_mla_extend_forward(
             selected_indices=selected_token_offsets,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            workspace=workspace,
             selected_name="selected_token_offsets",
         )
     )
@@ -513,7 +485,7 @@ def _run_sparse_mla(
     selected_indices: torch.Tensor,
     cache_seqlens_int32: torch.Tensor,
     active_token_counts: torch.Tensor,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     sm_scale: float,
     v_head_dim: int,
     return_lse: bool = False,
@@ -865,7 +837,7 @@ def _run_unified_sm120_prefill(
     kv_cache: torch.Tensor,
     selected_indices: torch.Tensor,
     active_token_counts: torch.Tensor,
-    workspace: B12XAttentionWorkspace,
+    workspace: object,
     sm_scale: float,
     v_head_dim: int,
     attn_sink: torch.Tensor | None,

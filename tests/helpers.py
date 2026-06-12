@@ -37,6 +37,101 @@ def require_sm120() -> torch.device:
     return torch.device("cuda")
 
 
+def make_tp_moe_fp4_binding(
+    *,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool | None = None,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    activation: str = "silu",
+    quant_mode: str | None = None,
+    unit_scale_contract: bool = False,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
+    prepared_w4a16: object | None = None,
+    swiglu_limit: float | None = None,
+):
+    from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+
+    weight_E = (
+        int(getattr(prepared_w4a16, "num_experts"))
+        if prepared_w4a16 is not None
+        else int(w1_fp4.shape[0])
+    )
+    n = (
+        int(getattr(prepared_w4a16, "intermediate_size"))
+        if prepared_w4a16 is not None
+        else int(w2_fp4.shape[2]) * 2
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=int(a.shape[0]),
+            weight_E=weight_E,
+            k=int(a.shape[1]),
+            n=n,
+            num_topk=int(topk_ids.shape[1]),
+            device=a.device,
+            dtype=a.dtype,
+            core_token_counts=(int(a.shape[0]),),
+            route_num_experts=0,
+            quant_mode=quant_mode,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+            source_format=source_format,
+            w13_layout=w13_layout,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[idx].device)
+        for idx, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+    )
+    return plan.bind(
+        scratch=scratch,
+        a=a,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode=quant_mode,
+        unit_scale_contract=unit_scale_contract,
+        source_format=source_format,
+        w13_layout=w13_layout,
+        prepared_w4a16=prepared_w4a16,
+        swiglu_limit=swiglu_limit,
+    )
+
+
+def run_tp_moe_fp4(**kwargs) -> torch.Tensor:
+    from b12x.integration import b12x_moe_fp4
+
+    return b12x_moe_fp4(binding=make_tp_moe_fp4_binding(**kwargs))
+
+
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 

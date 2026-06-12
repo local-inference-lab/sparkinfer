@@ -5,10 +5,10 @@ import torch
 
 from b12x.cute.fp4 import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
 from b12x.integration import tp_moe
-from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4, clear_tp_moe_caches
+from b12x.integration.tp_moe import clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
-from .helpers import require_sm120
+from .helpers import require_sm120, run_tp_moe_fp4
 
 
 BACKEND_CASES = [
@@ -131,19 +131,18 @@ def _run_activation_case(
         tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = static_cutover
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = micro_cutover
 
-        output = b12x_moe_fp4(
-            x,
-            a1_gscale,
-            w1_fp4,
-            w1_blockscale,
-            w1_alphas,
-            a2_gscale,
-            w2_fp4,
-            w2_blockscale,
-            w2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=allocate_tp_moe_workspace_pool(),
+        output = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
             activation=activation,
             fast_math=fast_math,
@@ -206,19 +205,18 @@ def _run_single_token_multi_expert_micro_case(
         tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = 128
         tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = 10_000
 
-        output = b12x_moe_fp4(
-            x,
-            a1_gscale,
-            w1_fp4,
-            w1_blockscale,
-            w1_alphas,
-            a2_gscale,
-            w2_fp4,
-            w2_blockscale,
-            w2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=allocate_tp_moe_workspace_pool(),
+        output = run_tp_moe_fp4(
+            a=x,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             input_scales_static=True,
             activation=activation,
             fast_math=False,

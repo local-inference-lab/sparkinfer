@@ -360,6 +360,29 @@ def update_regular_decode_graph_metadata_fused_triton(
 
 
 @triton.jit
+def update_decode_graph_window_start_tokens_triton(
+    cache_seqlens_ptr,
+    kv_window_start_tokens_ptr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    BATCH: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+):
+    batch_offsets = tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < BATCH
+    cache_len = tl.load(cache_seqlens_ptr + batch_offsets, mask=batch_mask, other=0).to(
+        tl.int32
+    )
+    window_start_token = tl.maximum(cache_len - 1 - WINDOW_LEFT, 0)
+    window_start_page = window_start_token // PAGE_SIZE
+    tl.store(
+        kv_window_start_tokens_ptr + batch_offsets,
+        window_start_page * PAGE_SIZE,
+        mask=batch_mask,
+    )
+
+
+@triton.jit
 def update_prefill_graph_work_metadata_triton(
     cache_seqlens_ptr,
     cu_seqlens_q_ptr,
@@ -957,6 +980,41 @@ def _launch_regular_decode_graph_metadata_fused(
         USE_LUT=use_lut,
         HAS_KV_CHUNK_SIZE_TENSOR=has_kv_chunk_size_tensor,
         FIXED_KV_CHUNK_SIZE=fixed_kv_chunk_size,
+    )
+
+
+def update_decode_graph_window_start_tokens(
+    *,
+    cache_seqlens: torch.Tensor,
+    kv_window_start_tokens: torch.Tensor,
+    page_size: int,
+    window_left: int,
+) -> None:
+    device = cache_seqlens.device
+    if kv_window_start_tokens.device != device:
+        raise ValueError(
+            "kv_window_start_tokens and cache_seqlens must be on the same device"
+        )
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    if window_left < 0:
+        raise ValueError("window_left must be non-negative")
+
+    bs = int(cache_seqlens.shape[0])
+    if bs <= 0:
+        raise ValueError("decode graph replay requires bs > 0")
+    if int(kv_window_start_tokens.shape[0]) < bs:
+        raise RuntimeError(
+            "decode graph kv_window_start_tokens is smaller than the graph batch"
+        )
+
+    update_decode_graph_window_start_tokens_triton[(1,)](
+        cache_seqlens,
+        kv_window_start_tokens,
+        PAGE_SIZE=page_size,
+        WINDOW_LEFT=int(window_left),
+        BATCH=bs,
+        BLOCK_BATCH=triton.next_power_of_2(bs),
     )
 
 

@@ -7,12 +7,6 @@ from b12x.attention.paged.planner import (
     create_paged_plan,
     infer_paged_mode,
 )
-from b12x.attention.paged.workspace import (
-    PagedAttentionArena,
-    PagedAttentionArenaCaps,
-    PagedAttentionWorkspace,
-    PagedAttentionWorkspaceContract,
-)
 from b12x.integration.paged_attention_scratch import (
     B12XPagedAttentionBinding,
     B12XPagedAttentionScratchCaps,
@@ -29,10 +23,6 @@ __all__ = [
     "B12XPagedAttentionBinding",
     "B12XPagedAttentionScratchCaps",
     "B12XPagedAttentionScratchPlan",
-    "PagedAttentionArena",
-    "PagedAttentionArenaCaps",
-    "PagedAttentionWorkspace",
-    "PagedAttentionWorkspaceContract",
     "clear_attention_caches",
     "create_paged_plan",
     "infer_paged_mode",

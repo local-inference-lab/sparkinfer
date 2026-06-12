@@ -23,7 +23,6 @@ from b12x.gemm.wo_projection import (
     _check_mxfp8_rows_storage,
     empty_dense_gemm_mnl_view,
     empty_mxfp8_rows_bases,
-    empty_mxfp8_rows_for_dense_gemm,
     mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
 )
@@ -49,29 +48,6 @@ class BlockFP8LinearWeight:
     in_features: int
     out_features: int
     block_size: tuple[int, int]
-
-
-@dataclass(frozen=True)
-class BlockFP8LinearWorkspace:
-    x_q: MXFP8Rows
-    output: torch.Tensor
-
-    def bind(
-        self,
-        *,
-        source: torch.Tensor,
-        packed_weight: "BlockFP8LinearWeight",
-        bias: torch.Tensor | None = None,
-        expected_m: int | None = None,
-    ) -> "BlockFP8LinearBinding":
-        return build_block_fp8_linear_binding(
-            source=source,
-            packed_weight=packed_weight,
-            x_q=self.x_q,
-            output=self.output,
-            bias=bias,
-            expected_m=expected_m,
-        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -426,24 +402,6 @@ def _check_block_fp8_linear_tensors(
         raise ValueError(f"output dtype {output.dtype} does not match input {output_dtype}")
 
 
-def _check_block_fp8_linear_workspace(
-    workspace: BlockFP8LinearWorkspace,
-    *,
-    tokens: int,
-    packed_weight: BlockFP8LinearWeight,
-    output_dtype: torch.dtype,
-) -> None:
-    if not isinstance(workspace, BlockFP8LinearWorkspace):
-        raise TypeError("workspace must be a BlockFP8LinearWorkspace")
-    _check_block_fp8_linear_tensors(
-        workspace.x_q,
-        workspace.output,
-        tokens=tokens,
-        packed_weight=packed_weight,
-        output_dtype=output_dtype,
-    )
-
-
 def build_block_fp8_linear_binding(
     *,
     source: torch.Tensor,
@@ -535,33 +493,6 @@ def pack_block_fp8_linear_weight_mxfp8(
         out_features=out_features,
         block_size=(128, 128),
     )
-
-
-def empty_block_fp8_linear_workspace(
-    tokens: int,
-    in_features: int,
-    out_features: int,
-    *,
-    device: torch.device | str,
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> BlockFP8LinearWorkspace:
-    if tokens <= 0 or in_features <= 0 or out_features <= 0:
-        raise ValueError("tokens, in_features, and out_features must be positive")
-    _check_mxfp8_k(in_features)
-    x_q = empty_mxfp8_rows_for_dense_gemm(
-        tokens,
-        in_features,
-        num_groups=1,
-        device=device,
-    )
-    output = empty_dense_gemm_mnl_view(
-        tokens,
-        out_features,
-        1,
-        device=device,
-        dtype=output_dtype,
-    )
-    return BlockFP8LinearWorkspace(x_q=x_q, output=output)
 
 
 def _run_block_fp8_quant_kernel(
@@ -719,7 +650,6 @@ def block_fp8_linear_mxfp8(
     source: torch.Tensor | None = None,
     packed_weight: BlockFP8LinearWeight | None = None,
     *,
-    workspace: BlockFP8LinearWorkspace | None = None,
     bias: torch.Tensor | None = None,
     binding: BlockFP8LinearBinding | None = None,
     expected_m: int | None = None,
@@ -737,7 +667,6 @@ def block_fp8_linear_mxfp8(
             for name, value in (
                 ("source", source),
                 ("packed_weight", packed_weight),
-                ("workspace", workspace),
                 ("bias", bias),
             )
             if value is not None
@@ -770,7 +699,7 @@ def block_fp8_linear_mxfp8(
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
 
-    if binding is None and workspace is None:
+    if binding is None:
         # No caller-owned buffers (e.g. the torch.compile path): one fully opaque
         # fused op runs quantize + dense GEMM internally, so the token-shaped
         # activation MXFP8 views stay inside the op and never reach the graph (see
@@ -788,34 +717,15 @@ def block_fp8_linear_mxfp8(
             output = output + bias
         return output.view(*source.shape[:-1], packed_weight.out_features)
 
-    if workspace is None:
-        if x_q_storage is None or output_storage is None:
-            workspace = empty_block_fp8_linear_workspace(
-                tokens,
-                packed_weight.in_features,
-                packed_weight.out_features,
-                device=source_2d.device,
-                output_dtype=source_2d.dtype,
-            )
-            x_q_storage = workspace.x_q
-            output_storage = workspace.output
-        else:
-            _check_block_fp8_linear_tensors(
-                x_q_storage,
-                output_storage,
-                tokens=tokens,
-                packed_weight=packed_weight,
-                output_dtype=source_2d.dtype,
-            )
-    else:
-        _check_block_fp8_linear_workspace(
-            workspace,
+    if x_q_storage is None or output_storage is None:
+        raise TypeError("block_fp8_linear_mxfp8 requires binding for caller-owned scratch")
+    _check_block_fp8_linear_tensors(
+        x_q_storage,
+        output_storage,
             tokens=tokens,
             packed_weight=packed_weight,
             output_dtype=source_2d.dtype,
-        )
-        x_q_storage = workspace.x_q
-        output_storage = workspace.output
+    )
 
     assert x_q_storage is not None
     assert output_storage is not None
@@ -884,21 +794,37 @@ def prewarm_block_fp8_linear_mxfp8(
 
     with torch.inference_mode():
         for tokens in counts:
-            workspace = empty_block_fp8_linear_workspace(
-                tokens,
-                packed_weight.in_features,
-                packed_weight.out_features,
-                device=device,
-                output_dtype=output_dtype,
-            )
             source = torch.zeros(
                 (tokens, packed_weight.in_features),
                 dtype=output_dtype,
                 device=device,
             )
-            block_fp8_linear_mxfp8(
-                source, packed_weight, workspace=workspace, expected_m=expected_m
+            plan = plan_block_fp8_linear_scratch(
+                BlockFP8LinearScratchCaps(
+                    device=device,
+                    max_tokens=tokens,
+                    in_features=packed_weight.in_features,
+                    out_features=packed_weight.out_features,
+                    output_dtype=output_dtype,
+                )
             )
+            spec = plan.scratch_specs()[0]
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            output = empty_dense_gemm_mnl_view(
+                tokens,
+                packed_weight.out_features,
+                1,
+                device=device,
+                dtype=output_dtype,
+            )
+            binding = plan.bind(
+                scratch=scratch,
+                source=source,
+                packed_weight=packed_weight,
+                output=output,
+                expected_m=expected_m,
+            )
+            block_fp8_linear_mxfp8(binding=binding)
         torch.cuda.synchronize(device)
 
 
@@ -907,10 +833,8 @@ __all__ = [
     "BlockFP8LinearScratchCaps",
     "BlockFP8LinearScratchPlan",
     "BlockFP8LinearWeight",
-    "BlockFP8LinearWorkspace",
     "build_block_fp8_linear_binding",
     "block_fp8_linear_mxfp8",
-    "empty_block_fp8_linear_workspace",
     "pack_block_fp8_linear_weight_mxfp8",
     "plan_block_fp8_linear_scratch",
     "prewarm_block_fp8_linear_mxfp8",

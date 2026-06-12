@@ -12,11 +12,16 @@ from benchmarks.benchmark_paged_attention import (
     _quantize_paged_kv_cache_global_e4m3,
 )
 from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.attention import PagedAttentionWorkspace
+from b12x.integration.attention import (
+    B12XPagedAttentionScratchCaps,
+    create_paged_plan,
+    paged_attention_forward,
+    plan_paged_attention_scratch,
+)
 
 from .helpers import require_sm120
+from .paged_attention_helpers import quantize_paged_kv_cache_e4m3
 from .test_attention_paged_planner import _make_inputs
-from .test_paged_attention_workspace_api import _quantize_paged_kv_cache_e4m3
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -25,19 +30,111 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
 
 
+class _PagedScratchHarness:
+    def __init__(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        mode: str,
+    ) -> None:
+        self.q = q
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        self.mode = mode
+        self.plan = None
+        self._scratch_plan = None
+        self._scratch = None
+        self._prepare_kwargs = {}
+        self._page_table = None
+        self._cache_seqlens = None
+        self._cu_seqlens_q = None
+
+    def prepare(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        self.plan = create_paged_plan(
+            self.q,
+            self.k_cache,
+            self.v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode=self.mode,
+            **kwargs,
+        )
+        self._scratch_plan = plan_paged_attention_scratch(
+            B12XPagedAttentionScratchCaps(
+                device=self.q.device,
+                mode=self.mode,
+                dtype=self.q.dtype,
+                kv_dtype=self.k_cache.dtype,
+                num_q_heads=self.q.shape[1],
+                num_kv_heads=self.k_cache.shape[2],
+                head_dim_qk=self.q.shape[2],
+                head_dim_vo=self.v_cache.shape[3],
+                page_size=self.k_cache.shape[1],
+                max_total_q=self.plan.total_q,
+                max_batch=page_table.shape[0],
+                max_page_table_width=page_table.shape[1],
+                max_work_items=max(self.plan.new_batch_size, 1),
+                max_partial_rows=self.plan.total_num_partial_rows,
+                num_cache_pages=self.k_cache.shape[0],
+            )
+        )
+        self._scratch = tuple(
+            torch.empty(shape, dtype=dtype, device=self.q.device)
+            for shape, dtype in self._scratch_plan.shapes_and_dtypes()
+        )
+        self._prepare_kwargs = dict(kwargs)
+        self._page_table = page_table
+        self._cache_seqlens = cache_seqlens
+        self._cu_seqlens_q = cu_seqlens_q
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        output: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+        attention_sink_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._scratch_plan is not None
+        assert self._scratch is not None
+        binding = self._scratch_plan.bind(
+            scratch=self._scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=self._page_table,
+            cache_seqlens=self._cache_seqlens,
+            cu_seqlens_q=self._cu_seqlens_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+            **self._prepare_kwargs,
+        )
+        self.plan = binding.scratch.plan
+        return paged_attention_forward(binding=binding)
+
+
 def _make_workspace(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     *,
     mode: str,
-) -> PagedAttentionWorkspace:
-    return PagedAttentionWorkspace.for_tensors(
-        mode=mode,
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-    )
+) -> _PagedScratchHarness:
+    return _PagedScratchHarness(q, k_cache, v_cache, mode=mode)
 
 
 def _run_decode_graph_check(
@@ -216,7 +313,7 @@ def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> No
         dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
     )
-    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+    k_fp8, v_fp8, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
         k_cache,
         v_cache,
         page_table,
@@ -467,7 +564,7 @@ def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
         dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
     )
-    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+    k_fp8, v_fp8, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
         k_cache,
         v_cache,
         page_table,

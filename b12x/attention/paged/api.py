@@ -19,7 +19,6 @@ from .forward_paged import (
 from .forward_extend_generic import build_extend_forward_kernel
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
-from .workspace import PagedAttentionWorkspace
 
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
@@ -181,14 +180,14 @@ def _descriptor_row_ptrs(desc: torch.Tensor) -> torch.Tensor:
 
 
 def _get_cached_plane_tma_descs(
-    workspace: PagedAttentionWorkspace,
+    scratch: object,
     *,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     plane_cols: int,
     tile_rows: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor] | None:
-    cached = getattr(workspace, "_live_plane_tma_desc_cache", None)
+    cached = getattr(scratch, "_live_plane_tma_desc_cache", None)
     if cached is None:
         return None
     key = (
@@ -338,7 +337,6 @@ def _resolve_paged_attention_binding(
     q: torch.Tensor | None,
     k_cache: torch.Tensor | None,
     v_cache: torch.Tensor | None,
-    workspace: PagedAttentionWorkspace | None,
     output: torch.Tensor | None,
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
@@ -347,27 +345,14 @@ def _resolve_paged_attention_binding(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    PagedAttentionWorkspace,
+    object,
     torch.Tensor,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
     if binding is None:
-        missing = [
-            name
-            for name, value in (
-                ("q", q),
-                ("k_cache", k_cache),
-                ("v_cache", v_cache),
-                ("workspace", workspace),
-                ("output", output),
-            )
-            if value is None
-        ]
-        if missing:
-            raise TypeError(f"missing required paged attention arguments: {', '.join(missing)}")
-        return q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias
+        raise TypeError("paged_attention_forward requires binding")
 
     extras = [
         name
@@ -375,7 +360,6 @@ def _resolve_paged_attention_binding(
             ("q", q),
             ("k_cache", k_cache),
             ("v_cache", v_cache),
-            ("workspace", workspace),
             ("output", output),
             ("k_descale", k_descale),
             ("v_descale", v_descale),
@@ -390,7 +374,7 @@ def _resolve_paged_attention_binding(
         )
     binding_scratch = getattr(binding, "scratch", None)
     if binding_scratch is None:
-        binding_scratch = binding.workspace
+        raise TypeError("paged attention binding must expose scratch")
     return (
         binding.q,
         binding.k_cache,
@@ -404,28 +388,28 @@ def _resolve_paged_attention_binding(
 
 
 def _capture_decode_graph_replay_metadata_if_needed(
-    workspace: PagedAttentionWorkspace,
+    scratch: object,
 ) -> None:
     if not torch.cuda.is_current_stream_capturing():
         return
     if not (
-        getattr(workspace, "use_cuda_graph", False)
-        and getattr(workspace, "mode", None) == "decode"
-        and getattr(workspace, "_decode_graph_chunk_pages_lut", None) is not None
-        and getattr(workspace, "_plan", None) is not None
+        getattr(scratch, "use_cuda_graph", False)
+        and getattr(scratch, "mode", None) == "decode"
+        and getattr(scratch, "_decode_graph_chunk_pages_lut", None) is not None
+        and getattr(scratch, "_plan", None) is not None
     ):
         return
-    if getattr(workspace, "_decode_graph_metadata_captured_in_graph", False):
+    if getattr(scratch, "_decode_graph_metadata_captured_in_graph", False):
         return
     update_metadata = getattr(
-        workspace,
+        scratch,
         "update_decode_graph_replay_metadata_from_runtime_cache_seqlens",
         None,
     )
     if update_metadata is None:
         return
     update_metadata()
-    workspace._decode_graph_metadata_captured_in_graph = True
+    scratch._decode_graph_metadata_captured_in_graph = True
 
 
 def paged_attention_forward(
@@ -433,7 +417,6 @@ def paged_attention_forward(
     k_cache: torch.Tensor | None = None,
     v_cache: torch.Tensor | None = None,
     *,
-    workspace: PagedAttentionWorkspace | None = None,
     output: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
@@ -446,7 +429,6 @@ def paged_attention_forward(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            workspace=workspace,
             output=output,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -458,10 +440,10 @@ def paged_attention_forward(
     cache_seqlens = workspace.cache_seqlens
     cu_seqlens_q = workspace.cu_seqlens_q
     if page_table is None or cache_seqlens is None or cu_seqlens_q is None:
-        raise RuntimeError("paged workspace metadata has not been prepared")
+        raise RuntimeError("paged attention scratch metadata has not been prepared")
     if plan.split_kv and (workspace.tmp_output is None or workspace.tmp_lse is None):
         raise ValueError(
-            "split-kv plan requires tmp_output and tmp_lse in the workspace"
+            "split-kv plan requires tmp_output and tmp_lse in the scratch binding"
         )
     _capture_decode_graph_replay_metadata_if_needed(workspace)
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
@@ -478,7 +460,7 @@ def paged_attention_forward(
         )
     if tuple(output.shape[1:]) != (plan.num_q_heads, plan.head_dim_vo):
         raise ValueError(
-            "output shape must match the prepared workspace contract: "
+            "output shape must match the prepared scratch contract: "
             f"expected (*, {plan.num_q_heads}, {plan.head_dim_vo}), got {tuple(output.shape)}"
         )
 
@@ -487,7 +469,7 @@ def paged_attention_forward(
     ) and (k_descale is None or v_descale is None):
         raise ValueError("fp8 paged caches require k_descale and v_descale")
     if workspace.kv_window_start_tokens is None:
-        raise RuntimeError("paged workspace is missing kv_window_start_tokens")
+        raise RuntimeError("paged attention scratch is missing kv_window_start_tokens")
     has_attention_sink_bias = attention_sink_bias is not None
     if attention_sink_bias is None:
         attention_sink_bias = torch.empty(0, dtype=torch.float32, device=q.device)
@@ -683,8 +665,19 @@ def paged_attention_forward(
         if use_capacity_contract and workspace._plan_output is not None
         else forward_output
     )
-    forward_lse_dynamic_dims = (0,) if plan.split_kv else (1,)
-    forward_lse_dynamic_strides = () if plan.split_kv else (0,)
+    static_decode_graph_bucket = (
+        plan.mode == "decode" and plan.enable_cuda_graph and not plan.split_kv
+    )
+    dynamic_first_dim = (0,)
+    grid_worklist_dynamic_first_dim = (
+        () if static_decode_graph_bucket else dynamic_first_dim
+    )
+    forward_lse_dynamic_dims = (
+        (0,) if plan.split_kv else (1,)
+    )
+    forward_lse_dynamic_strides = (
+        () if plan.split_kv else (0,)
+    )
     forward_cache_key = [
         _traits_compile_key(traits),
         (
@@ -698,28 +691,42 @@ def paged_attention_forward(
             int(plan.window_left),
             bool(has_attention_sink_bias),
         ),
-        _tensor_meta_key(q_cache_tensor, dynamic_dims=(0,)),
+        _tensor_meta_key(q_cache_tensor, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
-        _tensor_meta_key(page_table, dynamic_dims=(0,)),
-        _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
-        _tensor_meta_key(cu_seqlens_q, dynamic_dims=(0,)),
-        _tensor_meta_key(workspace.request_indices, dynamic_dims=(0,)),
-        _tensor_meta_key(workspace.qo_tile_indices, dynamic_dims=(0,)),
-        _tensor_meta_key(workspace.kv_tile_indices, dynamic_dims=(0,)),
-        _tensor_meta_key(workspace.o_indptr, dynamic_dims=(0,)),
+        _tensor_meta_key(page_table, dynamic_dims=dynamic_first_dim),
+        _tensor_meta_key(cache_seqlens, dynamic_dims=dynamic_first_dim),
+        _tensor_meta_key(cu_seqlens_q, dynamic_dims=dynamic_first_dim),
+        _tensor_meta_key(
+            workspace.request_indices,
+            dynamic_dims=grid_worklist_dynamic_first_dim,
+        ),
+        _tensor_meta_key(
+            workspace.qo_tile_indices,
+            dynamic_dims=grid_worklist_dynamic_first_dim,
+        ),
+        _tensor_meta_key(
+            workspace.kv_tile_indices,
+            dynamic_dims=grid_worklist_dynamic_first_dim,
+        ),
+        _tensor_meta_key(workspace.o_indptr, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(workspace.kv_chunk_size_ptr),
-        _tensor_meta_key(workspace.kv_window_start_tokens, dynamic_dims=(0,)),
-        _tensor_meta_key(workspace.block_valid_mask, dynamic_dims=(0,)),
+        _tensor_meta_key(
+            workspace.kv_window_start_tokens, dynamic_dims=dynamic_first_dim
+        ),
+        _tensor_meta_key(
+            workspace.block_valid_mask,
+            dynamic_dims=grid_worklist_dynamic_first_dim,
+        ),
         _tensor_meta_key(attention_sink_bias),
-        _tensor_meta_key(output_cache_tensor, dynamic_dims=(0,)),
+        _tensor_meta_key(output_cache_tensor, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(
             forward_lse,
             dynamic_dims=forward_lse_dynamic_dims,
             dynamic_strides=forward_lse_dynamic_strides,
         ),
-        _tensor_meta_key(k_descale, dynamic_dims=(0,)),
-        _tensor_meta_key(v_descale, dynamic_dims=(0,)),
+        _tensor_meta_key(k_descale, dynamic_dims=dynamic_first_dim),
+        _tensor_meta_key(v_descale, dynamic_dims=dynamic_first_dim),
     ]
     cache_key_labels = [
         "traits",

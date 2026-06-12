@@ -1,7 +1,7 @@
 """End-to-end w4a8_nvfp4 dispatch through b12x_moe_fp4 with real weights.
 
-Gates the Phase-5 serving integration: the same entry point, workspace
-allocator, and checkpoint weights as the nvfp4 path, with
+Gates the Phase-5 serving integration: the same entry point, scratch binding,
+and checkpoint weights as the nvfp4 path, with
 quant_mode="w4a8_nvfp4" deriving the UE8M0/residual grids on the fly.
 """
 
@@ -24,6 +24,7 @@ from benchmarks.benchmark_moe import (
     load_expert_weights,
     make_routed_inputs,
 )
+from tests.helpers import run_tp_moe_fp4
 
 
 def _skip_if_unavailable() -> None:
@@ -67,8 +68,6 @@ def test_unswizzle_batched_matches_reference() -> None:
 
 def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
     from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
-        b12x_moe_fp4,
         clear_tp_moe_caches,
     )
 
@@ -77,29 +76,18 @@ def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
     spec = _make_spec()
     weights = _weights()
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
-    workspace = allocate_tp_moe_workspace(
-        x,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        topk_ids,
-        input_scales_static=True,
-        quant_mode=quant_mode,
-    )
-    out = b12x_moe_fp4(
-        x,
-        weights.w13_input_scale_quant_per_expert,
-        weights.w13_weight,
-        weights.w13_blockscale_swizzled,
-        weights.g1_alphas_per_expert,
-        weights.w2_input_scale_quant_per_expert,
-        weights.w2_weight,
-        weights.w2_blockscale_swizzled,
-        weights.g2_alphas_per_expert,
-        topk_weights,
-        topk_ids,
-        workspace=workspace,
+    out = run_tp_moe_fp4(
+        a=x,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w1_alphas=weights.g1_alphas_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        w2_alphas=weights.g2_alphas_per_expert,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         input_scales_static=True,
         quant_mode=quant_mode,
     )

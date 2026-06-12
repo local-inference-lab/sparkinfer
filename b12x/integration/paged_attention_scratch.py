@@ -57,6 +57,20 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     return device
 
 
+def _page_table_width_for_scratch(caps: "B12XPagedAttentionScratchCaps") -> int:
+    width = int(caps.max_page_table_width)
+    if (
+        caps.mode == "decode"
+        and caps.use_cuda_graph
+        and caps.copy_runtime_metadata
+        and caps.kv_dtype == torch.float8_e4m3fn
+        and width >= 16_384
+        and width & (width - 1) == 0
+    ):
+        return width + 1
+    return width
+
+
 def _shape_only_cuda_tensor(
     shape: tuple[int, ...],
     *,
@@ -117,6 +131,11 @@ class B12XPagedAttentionScratchCaps:
         object.__setattr__(self, "use_cuda_graph", bool(self.use_cuda_graph))
         object.__setattr__(
             self, "copy_runtime_metadata", bool(self.copy_runtime_metadata)
+        )
+        object.__setattr__(
+            self,
+            "max_page_table_width",
+            _page_table_width_for_scratch(self),
         )
 
 
@@ -397,6 +416,12 @@ class B12XPagedAttentionScratch:
                     )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 self._copy_cached_plan_metadata(self._plan_metadata_cache)
+                if (
+                    self.mode == "decode"
+                    and self._decode_graph_chunk_pages_lut is not None
+                ):
+                    self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+                    self._decode_graph_metadata_captured_in_graph = True
                 return self
 
             if (
@@ -412,6 +437,11 @@ class B12XPagedAttentionScratch:
                         f"window_left={int(window_left)}"
                 )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+                if self._plan_metadata_cache is None:
+                    raise RuntimeError(
+                        "graph-mode paged scratch is missing cached plan metadata"
+                    )
+                self._copy_cached_plan_metadata(self._plan_metadata_cache)
                 if not self._decode_graph_metadata_captured_in_graph:
                     self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
                     if torch.cuda.is_current_stream_capturing():
@@ -761,7 +791,20 @@ class B12XPagedAttentionScratch:
             batch=int(self.cache_seqlens.shape[0])
         )
         window_page_span = self._window_page_span_from_plan(self._plan)
-        if self._use_regular_decode_graph_replay:
+        if not self._plan.split_kv:
+            if int(self._plan.window_left) < 0:
+                return self
+            from b12x.attention.paged.graph_replay import (
+                update_decode_graph_window_start_tokens,
+            )
+
+            update_decode_graph_window_start_tokens(
+                cache_seqlens=self.cache_seqlens,
+                kv_window_start_tokens=self.kv_window_start_tokens,
+                page_size=self.page_size,
+                window_left=int(self._plan.window_left),
+            )
+        elif self._use_regular_decode_graph_replay:
             from b12x.attention.paged.graph_replay import (
                 update_regular_decode_graph_chunk_metadata_from_lut,
             )
@@ -1349,7 +1392,8 @@ class B12XPagedAttentionScratchPlan:
             max_cu_seqlens_q,
             mode="decode",
             fixed_split_size=-1,
-            disable_split_kv=False,
+            disable_split_kv=True,
+            force_split_kv=False,
             window_left=int(window_left),
             enable_cuda_graph=True,
             graph_chunk_policy=True,

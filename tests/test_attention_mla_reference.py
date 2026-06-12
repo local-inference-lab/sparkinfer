@@ -17,11 +17,12 @@ from b12x.attention.mla.reference import (
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.integration.mla import (
+    B12XSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
+    plan_sparse_mla_scratch,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
@@ -211,28 +212,99 @@ def _compare(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
     return diff.abs().max().item(), torch.sqrt(diff.square().mean()).item(), cos
 
 
-def _make_workspace(
+def _make_sparse_mla_binding(
     *,
     mode: str,
     device: torch.device,
+    q_all: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
     max_total_q: int,
     max_batch: int,
     topk: int,
     cfg: GLMMLAConfig,
+    kv_dtype: torch.dtype = torch.uint8,
     use_cuda_graph: bool = False,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
-        mode=mode,
+):
+    plan = plan_sparse_mla_scratch(
+        B12XSparseMLAScratchCaps(
+            mode=mode,
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=kv_dtype,
+            num_q_heads=int(q_all.shape[1]),
+            head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+            v_head_dim=cfg.kv_lora_rank,
+            max_width=topk,
+            max_q_rows=max_total_q,
+            max_batch=max_batch,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = plan.bind(
+        scratch=scratch,
+        q=q_all,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+    )
+    binding.scratch.use_cuda_graph = bool(use_cuda_graph)
+    return binding
+
+
+def _make_decode_binding(
+    *,
+    device: torch.device,
+    q_all: torch.Tensor,
+    metadata: MLASparseDecodeMetadata,
+    max_total_q: int,
+    max_batch: int,
+    topk: int,
+    cfg: GLMMLAConfig,
+    kv_dtype: torch.dtype = torch.uint8,
+    use_cuda_graph: bool = False,
+):
+    return _make_sparse_mla_binding(
+        mode="decode",
         device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=cfg.num_heads,
-        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
+        q_all=q_all,
+        selected_indices=metadata.page_table_1,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         max_total_q=max_total_q,
         max_batch=max_batch,
+        topk=topk,
+        cfg=cfg,
+        kv_dtype=kv_dtype,
         use_cuda_graph=use_cuda_graph,
+    )
+
+
+def _make_extend_binding(
+    *,
+    device: torch.device,
+    q_all: torch.Tensor,
+    metadata: MLASparseExtendMetadata,
+    max_total_q: int,
+    max_batch: int,
+    topk: int,
+    cfg: GLMMLAConfig,
+    kv_dtype: torch.dtype = torch.uint8,
+):
+    return _make_sparse_mla_binding(
+        mode="extend",
+        device=device,
+        q_all=q_all,
+        selected_indices=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
+        max_total_q=max_total_q,
+        max_batch=max_batch,
+        topk=topk,
+        cfg=cfg,
+        kv_dtype=kv_dtype,
     )
 
 
@@ -451,9 +523,10 @@ def test_glm51_layer0_decode_api_handles_sparse_indices_and_padding() -> None:
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=width,
@@ -461,12 +534,8 @@ def test_glm51_layer0_decode_api_handles_sparse_indices_and_padding() -> None:
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -524,9 +593,10 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
         max_seq_len_k=cache_len,
         mode="extend",
     )
-    workspace = _make_workspace(
-        mode="extend",
+    binding = _make_extend_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=q_len,
         max_batch=q_len,
         topk=width,
@@ -534,12 +604,8 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
     )
 
     actual = sparse_mla_extend_forward(
-        q_all=q_all,
         kv_cache=packed,
-        selected_token_offsets=metadata.selected_token_offsets,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -580,9 +646,10 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: in
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=width,
@@ -590,12 +657,8 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: in
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -642,9 +705,10 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=width,
@@ -652,12 +716,8 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -698,9 +758,10 @@ def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> Non
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=width,
@@ -708,12 +769,8 @@ def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> Non
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -757,9 +814,10 @@ def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes(
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=width,
@@ -773,12 +831,8 @@ def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes(
     def run() -> None:
         nonlocal captured_out
         captured_out = sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=packed,
-            page_table_1=metadata.page_table_1,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            workspace=workspace,
+            binding=binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
@@ -847,26 +901,19 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=local_heads,
-        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
+        q_all=q_local,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
+        topk=topk,
+        cfg=cfg,
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_local,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -922,26 +969,20 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = B12XAttentionWorkspace.for_fixed_capacity(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=local_heads,
-        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
+        q_all=q_local,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
+        topk=topk,
+        cfg=cfg,
+        kv_dtype=torch.float8_e4m3fn,
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_local,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -981,9 +1022,10 @@ def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
         nsa_cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_decode_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=1,
         max_batch=1,
         topk=cache_len,
@@ -991,12 +1033,8 @@ def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
     )
 
     actual = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=metadata.page_table_1,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -1042,9 +1080,10 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
         max_seq_len_k=cache_len,
         mode="extend",
     )
-    workspace = _make_workspace(
-        mode="extend",
+    binding = _make_extend_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=q_len,
         max_batch=q_len,
         topk=cache_len,
@@ -1052,12 +1091,8 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
     )
 
     actual = sparse_mla_extend_forward(
-        q_all=q_all,
         kv_cache=packed,
-        selected_token_offsets=metadata.selected_token_offsets,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -1115,9 +1150,10 @@ def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
         max_seq_len_k=cache_len,
         mode="extend",
     )
-    workspace = _make_workspace(
-        mode="extend",
+    binding = _make_extend_binding(
         device=device,
+        q_all=q_all,
+        metadata=metadata,
         max_total_q=q_len,
         max_batch=1,
         topk=width,
@@ -1125,12 +1161,8 @@ def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
     )
 
     actual = sparse_mla_extend_forward(
-        q_all=q_all,
         kv_cache=packed,
-        selected_token_offsets=metadata.selected_token_offsets,
-        cache_seqlens_int32=metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-        workspace=workspace,
+        binding=binding,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )

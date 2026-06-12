@@ -17,6 +17,72 @@ def _require_contiguous_backend() -> torch.device:
     return device
 
 
+def _run_attention_with_plan(
+    plan,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    attention_sink_bias: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from b12x.attention.contiguous import (
+        b12x_attention_forward,
+        plan_attention_scratch,
+    )
+
+    scratch_plan = plan_attention_scratch(plan)
+    spec = scratch_plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return b12x_attention_forward(binding=binding)
+
+
+def _run_varlen_attention_with_plan(
+    plan,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: Optional[bool] = None,
+    window_size: Optional[Tuple[int, int]] = None,
+    softmax_scale: Optional[float] = None,
+    attention_sink_bias: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from b12x.attention.contiguous import (
+        b12x_varlen_attention_forward,
+        plan_varlen_attention_scratch,
+    )
+
+    scratch_plan = plan_varlen_attention_scratch(plan)
+    spec = scratch_plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        window_size=window_size,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return b12x_varlen_attention_forward(binding=binding)
+
+
 def _vision_reference_attention_segment(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -278,8 +344,6 @@ def test_contiguous_attention_matches_sglang_torch_ref(
 ) -> None:
     device = _require_contiguous_backend()
     from b12x.attention.contiguous import (
-        allocate_attention_workspace_for_plan,
-        b12x_attention_forward,
         clear_attention_caches,
         create_attention_plan,
     )
@@ -294,14 +358,11 @@ def test_contiguous_attention_matches_sglang_torch_ref(
     )
 
     plan = create_attention_plan(q, k, v, causal=causal, window_size=window_size)
-    workspace = allocate_attention_workspace_for_plan(plan)
-    out, _lse = b12x_attention_forward(
+    out, _lse = _run_attention_with_plan(
+        plan,
         q,
         k,
         v,
-        workspace=workspace,
-        plan=plan,
-        window_size=window_size,
     )
     torch.cuda.synchronize()
 
@@ -320,8 +381,6 @@ def test_contiguous_attention_matches_sglang_torch_ref(
 def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
     from b12x.attention.contiguous import (
-        allocate_attention_workspace_for_plan,
-        b12x_attention_forward,
         clear_attention_caches,
         create_attention_plan,
     )
@@ -351,14 +410,11 @@ def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sink
         window_size=window_size,
         attention_sink_bias=sinks,
     )
-    workspace = allocate_attention_workspace_for_plan(plan)
-    out, _lse = b12x_attention_forward(
+    out, _lse = _run_attention_with_plan(
+        plan,
         q,
         k,
         v,
-        workspace=workspace,
-        plan=plan,
-        window_size=window_size,
         attention_sink_bias=sinks,
     )
     torch.cuda.synchronize()
@@ -379,8 +435,6 @@ def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sink
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
     from b12x.attention.contiguous import (
-        allocate_varlen_attention_workspace_for_plan,
-        b12x_varlen_attention_forward,
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -417,14 +471,12 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
         window_size=window_size,
         attention_sink_bias=sinks,
     )
-    workspace = allocate_varlen_attention_workspace_for_plan(plan)
-    out, _lse = b12x_varlen_attention_forward(
+    out, _lse = _run_varlen_attention_with_plan(
+        plan,
         q,
         k,
         v,
         cu_seqlens,
-        workspace=workspace,
-        plan=plan,
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
         causal=False,
@@ -450,8 +502,6 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
     from b12x.attention.contiguous import (
-        allocate_varlen_attention_workspace_for_plan,
-        b12x_varlen_attention_forward,
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -488,14 +538,12 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_a
         window_size=window_size,
         attention_sink_bias=sinks,
     )
-    workspace = allocate_varlen_attention_workspace_for_plan(plan)
-    out, _lse = b12x_varlen_attention_forward(
+    out, _lse = _run_varlen_attention_with_plan(
+        plan,
         q,
         k,
         v,
         cu_seqlens,
-        workspace=workspace,
-        plan=plan,
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
         causal=False,
@@ -521,8 +569,6 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_a
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and_sinks() -> None:
     device = _require_contiguous_backend()
     from b12x.attention.contiguous import (
-        allocate_varlen_attention_workspace_for_plan,
-        b12x_varlen_attention_forward,
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -559,14 +605,12 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and
         window_size=window_size,
         attention_sink_bias=sinks,
     )
-    workspace = allocate_varlen_attention_workspace_for_plan(plan)
-    out, _lse = b12x_varlen_attention_forward(
+    out, _lse = _run_varlen_attention_with_plan(
+        plan,
         q,
         k,
         v,
         cu_seqlens,
-        workspace=workspace,
-        plan=plan,
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
         causal=False,

@@ -30,7 +30,7 @@ def test_persistent_topk2048_scratch_plan_exposes_one_opaque_state_spec() -> Non
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
-    assert specs[0].nbytes == plan.workspace_nbytes
+    assert specs[0].nbytes == plan.scratch_nbytes
 
 
 def test_persistent_topk2048_scratch_plan_binds_caller_owned_arena() -> None:
