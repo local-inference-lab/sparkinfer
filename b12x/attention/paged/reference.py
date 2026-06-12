@@ -217,8 +217,9 @@ def msa_attention_reference(
     """Reference MiniMax-MSA sparse block-list paged attention.
 
     `q2k_indices` is `[kv_heads, total_q_capacity, topk]`, containing
-    batch-local 128-token block ids.  Each selected block maps to two logical
-    64-token pages in `page_table`.
+    batch-local 128-token block ids.  Each selected block maps to
+    `block_tokens // page_size` page-table entries (two logical 64-token pages
+    at page_size=64, one page at page_size=128).
     """
     if q.ndim != 3:
         raise ValueError(f"expected rank-3 q tensor, got rank {q.ndim}")
@@ -228,10 +229,12 @@ def msa_attention_reference(
         )
     if k_cache.ndim != 4 or v_cache.ndim != 4:
         raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
-    if int(k_cache.shape[1]) != 64 or int(v_cache.shape[1]) != 64:
-        raise ValueError("MSA reference expects page_size=64")
+    if int(k_cache.shape[1]) not in (64, 128) or int(v_cache.shape[1]) != int(k_cache.shape[1]):
+        raise ValueError("MSA reference expects matching page_size 64 or 128")
     if int(block_tokens) != 128:
         raise ValueError("MSA reference currently expects block_tokens=128")
+    if int(block_tokens) % int(k_cache.shape[1]) != 0:
+        raise ValueError("MSA reference expects page_size dividing block_tokens")
     if k_cache.shape[:3] != v_cache.shape[:3]:
         raise ValueError("k_cache and v_cache structural shapes must match")
     if int(q2k_indices.shape[0]) != int(k_cache.shape[2]):

@@ -92,6 +92,29 @@ def _make_paged_kv_tma_source_tensor(t: cute.Tensor, stage_tile_rows: int):
     )
 
 
+def _make_paged_kv_tile_source_tensor(
+    t: cute.Tensor, stage_tile_rows: int, page_tiles_per_entry: int
+):
+    """Flatten a [num_pages, page_size, kv_heads, head_dim] cache into 64-row tiles.
+
+    `page_tiles_per_entry` is the host-validated number of `stage_tile_rows`-row
+    tiles spanned by one page-table entry stride (derived from the CACHE STRIDE,
+    so strided slices such as vLLM's combined [N, 2, 128, H, D] cache produce
+    phantom tiles for the unrelated plane which are never addressed).
+    """
+    t_pages = cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
+    t_pages = _assume_paged_kv_tma_source_aligned(t_pages)
+    tile_stride = stage_tile_rows * t_pages.stride[0]
+    total_page_tiles = page_tiles_per_entry * t_pages.shape[3]
+    return cute.make_tensor(
+        t_pages.iterator,
+        cute.make_layout(
+            (stage_tile_rows, t_pages.shape[1], t_pages.shape[2], total_page_tiles),
+            stride=(t_pages.stride[0], t_pages.stride[1], t_pages.stride[2], tile_stride),
+        ),
+    )
+
+
 def _make_payload_ptr(payload_u8: cute.Tensor, dtype, offset_bytes: int = 0):
     ptr = payload_u8.iterator if offset_bytes == 0 else payload_u8.iterator + offset_bytes
     return cute.recast_ptr(ptr.align(16), dtype=dtype)
@@ -2468,6 +2491,8 @@ class PagedForwardKernel:
         window_left: int = -1,
         has_attention_sink_bias: bool = False,
         msa_block_sparse: bool = False,
+        page_size: int = 64,
+        page_tiles_per_entry: int = 1,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -2485,6 +2510,21 @@ class PagedForwardKernel:
         self.msa_block_sparse = bool(msa_block_sparse)
         self.MSA_BLOCK_TOKENS = 128
         self.MSA_TOPK = 16
+        self.page_size = int(page_size)
+        self.page_tiles_per_entry = int(page_tiles_per_entry)
+        if self.page_size not in (64, 128):
+            raise ValueError(f"paged decode kernel supports page_size 64 or 128, got {self.page_size}")
+        if self.page_size == 128 and not self.msa_block_sparse:
+            raise ValueError("page_size=128 paged decode requires msa_block_sparse=True")
+        if self.page_size == 64 and self.page_tiles_per_entry != 1:
+            raise ValueError("page_size=64 paged decode requires page_tiles_per_entry=1")
+        if self.page_tiles_per_entry < self.page_size // 64:
+            raise ValueError(
+                "page_tiles_per_entry must cover at least the logical page rows: "
+                f"got {self.page_tiles_per_entry} for page_size={self.page_size}"
+            )
+        # Number of page-table entries that span one 128-token MSA block.
+        self.entries_per_block = self.MSA_BLOCK_TOKENS // self.page_size
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2732,6 +2772,11 @@ class PagedForwardKernel:
         block_count = (cache_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(self.MSA_BLOCK_TOKENS)
         block_count = cutlass.select_(block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK))
         block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
+        if const_expr(self.page_size == 128):
+            # Whole-page walk: the host planner and the in-graph Triton updater
+            # count full 128-token pages at page_size=128, so the kernel must not
+            # tail-compact (tail clamp is min=2, max=2 in 64-token tiles).
+            return block_count * Int32(self.MSA_BLOCK_TOKENS)
         last_j = block_count - Int32(1)
         local_block_id = mQ2KIndices[kv_head_idx, q_row_idx, last_j]
         tail_tokens = cache_len - local_block_id * Int32(self.MSA_BLOCK_TOKENS)
@@ -2751,15 +2796,30 @@ class PagedForwardKernel:
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
+            if const_expr(self.entries_per_block == 1):
+                block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
+                return cutlass.select_(
+                    block_id >= Int32(0),
+                    block_id,
+                    Int32(0),
+                )
             block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
             subpage = block_offset // page_size
             block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
             return cutlass.select_(
                 block_id >= Int32(0),
-                block_id * Int32(2) + subpage,
+                block_id * Int32(self.entries_per_block) + subpage,
                 Int32(0),
             )
         return tile_token_base // page_size
+
+    @cute.jit
+    def _tile_sub64_idx(self, tile_token_base):
+        """64-row tile index within one page-table entry (always 0 at page_size=64)."""
+        if const_expr(self.page_size == 64):
+            return Int32(0)
+        page_j = tile_token_base // Int32(self.page_size)
+        return (tile_token_base - page_j * Int32(self.page_size)) // Int32(64)
 
     @cute.jit
     def _tile_key_base(
@@ -2801,7 +2861,7 @@ class PagedForwardKernel:
         upcast_stride,
         fill_zero: cutlass.Constexpr,
     ):
-        page_size = Int32(mPageTable.shape[1] * 0 + 64)
+        page_size = Int32(self.page_size)
         lane_row = lane // 8
         lane_col = lane % 8
         for tile_iter in cutlass.range_constexpr(self.traits.num_mma_kv * 4 // self.traits.num_warps_q):
@@ -2835,6 +2895,12 @@ class PagedForwardKernel:
                     )
 
     @cute.jit
+    def _tile_src_idx_from_page_id(self, page_id, sub_tile):
+        if const_expr(self.page_size == 64):
+            return page_id
+        return page_id * Int32(self.page_tiles_per_entry) + sub_tile
+
+    @cute.jit
     def _issue_paged_kv_tma_copy_planes(
         self,
         load_tma0,
@@ -2846,10 +2912,11 @@ class PagedForwardKernel:
         mPageTable: cute.Tensor,
         request_idx,
         page_idx,
+        sub_tile,
     ):
         page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
         pipeline_tma.producer_acquire(producer_state)
-        src_idx = page_id
+        src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
         load_tma2(src_idx=src_idx, producer_state=producer_state)
@@ -2866,10 +2933,11 @@ class PagedForwardKernel:
         mPageTable: cute.Tensor,
         request_idx,
         page_idx,
+        sub_tile,
     ):
         page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
         pipeline_tma.producer_acquire(producer_state)
-        src_idx = page_id
+        src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
         load_tma2(src_idx=src_idx, producer_state=producer_state)
@@ -2884,10 +2952,11 @@ class PagedForwardKernel:
         mPageTable: cute.Tensor,
         request_idx,
         page_idx,
+        sub_tile,
     ):
         page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
         pipeline_tma.producer_acquire(producer_state)
-        src_idx = page_id
+        src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
 
@@ -2900,10 +2969,11 @@ class PagedForwardKernel:
         mPageTable: cute.Tensor,
         request_idx,
         page_idx,
+        sub_tile,
     ):
         page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
         pipeline_tma.producer_acquire(producer_state)
-        src_idx = page_id
+        src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
 
     @cute.jit
@@ -3061,7 +3131,7 @@ class PagedForwardKernel:
                 or self.stage_tile_rows != 64
             )
         ):
-            raise ValueError("MSA block-sparse decode requires page_size=64, gqa_group_size=16, and head_dim=128")
+            raise ValueError("MSA block-sparse decode requires page_size in (64, 128), gqa_group_size=16, and head_dim=128")
         if const_expr(mQ.element_type != self.dtype_q):
             raise TypeError("mQ dtype must match dtype_q")
         if const_expr(mKCache.element_type != self.dtype_kv_storage or mVCache.element_type != self.dtype_kv_storage):
@@ -3087,10 +3157,21 @@ class PagedForwardKernel:
         mVCache = _assume_tensor_aligned(mVCache)
         mO = _assume_tensor_aligned(mO)
 
-        mKCacheT = cute.make_tensor(mKCache.iterator, cute.select(mKCache.layout, mode=[1, 3, 2, 0]))
-        mVCacheT = cute.make_tensor(mVCache.iterator, cute.select(mVCache.layout, mode=[1, 3, 2, 0]))
-        mKCacheT = _assume_paged_kv_tma_source_aligned(mKCacheT)
-        mVCacheT = _assume_paged_kv_tma_source_aligned(mVCacheT)
+        if const_expr(self.page_size == 64):
+            mKCacheT = cute.make_tensor(mKCache.iterator, cute.select(mKCache.layout, mode=[1, 3, 2, 0]))
+            mVCacheT = cute.make_tensor(mVCache.iterator, cute.select(mVCache.layout, mode=[1, 3, 2, 0]))
+            mKCacheT = _assume_paged_kv_tma_source_aligned(mKCacheT)
+            mVCacheT = _assume_paged_kv_tma_source_aligned(mVCacheT)
+        else:
+            # page_size=128: flatten each page-table entry into
+            # `page_tiles_per_entry` physical 64-row TMA tiles (stride-derived,
+            # so strided vLLM K/V slices keep their phantom-plane gap).
+            mKCacheT = _make_paged_kv_tile_source_tensor(
+                mKCache, self.stage_tile_rows, self.page_tiles_per_entry
+            )
+            mVCacheT = _make_paged_kv_tile_source_tensor(
+                mVCache, self.stage_tile_rows, self.page_tiles_per_entry
+            )
         tma_tensor_K = mKCacheT
         tma_tensor_V = mVCacheT
         tma_atom_K = None
@@ -3810,6 +3891,7 @@ class PagedForwardKernel:
                         role_prefetch_base,
                         page_size,
                     )
+                    role_sub_tile = self._tile_sub64_idx(role_prefetch_base)
                     self._issue_paged_kv_tma_copy_2planes(
                         load_K_tma0,
                         load_K_tma1,
@@ -3818,6 +3900,7 @@ class PagedForwardKernel:
                         mPageTable,
                         request_idx,
                         role_page_idx,
+                        role_sub_tile,
                     )
                     role_k_producer_state.advance()
                     self._issue_paged_kv_tma_copy_2planes(
@@ -3828,6 +3911,7 @@ class PagedForwardKernel:
                         mPageTable,
                         request_idx,
                         role_page_idx,
+                        role_sub_tile,
                     )
                     role_v_producer_state.advance()
                     role_prefetch_base += stage_tile_rows
@@ -4039,6 +4123,7 @@ class PagedForwardKernel:
                         prefetch_base,
                         page_size,
                     )
+                    prefetch_sub_tile = self._tile_sub64_idx(prefetch_base)
                     if const_expr(self.k_tma_plane_count > 3):
                         self._issue_paged_kv_tma_copy_planes(
                             load_K_tma0,
@@ -4050,6 +4135,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     elif const_expr(self.k_tma_plane_count > 2):
                         self._issue_paged_kv_tma_copy_3planes(
@@ -4061,6 +4147,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     elif const_expr(self.k_tma_plane_count > 1):
                         self._issue_paged_kv_tma_copy_2planes(
@@ -4071,6 +4158,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -4080,6 +4168,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     if const_expr(self.v_tma_plane_count > 3):
                         self._issue_paged_kv_tma_copy_planes(
@@ -4092,6 +4181,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     elif const_expr(self.v_tma_plane_count > 2):
                         self._issue_paged_kv_tma_copy_3planes(
@@ -4103,6 +4193,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     elif const_expr(self.v_tma_plane_count > 1):
                         self._issue_paged_kv_tma_copy_2planes(
@@ -4113,6 +4204,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -4122,6 +4214,7 @@ class PagedForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_page_idx,
+                            prefetch_sub_tile,
                         )
                 k_producer_state.advance()
                 v_producer_state.advance()
@@ -4515,6 +4608,7 @@ class PagedForwardKernel:
                                     next_tile_base,
                                     page_size,
                                 )
+                                next_sub_tile = self._tile_sub64_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
                                     self._issue_paged_kv_tma_copy_planes(
                                         load_K_tma0,
@@ -4526,6 +4620,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_3planes(
@@ -4537,6 +4632,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 1):
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -4547,6 +4643,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_1plane(
@@ -4556,6 +4653,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                             k_producer_state.advance()
                     k_consumer_state.advance()
@@ -4660,6 +4758,7 @@ class PagedForwardKernel:
                                     next_tile_base,
                                     page_size,
                                 )
+                                next_sub_tile = self._tile_sub64_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
                                     self._issue_paged_kv_tma_copy_planes(
                                         load_K_tma0,
@@ -4671,6 +4770,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_3planes(
@@ -4682,6 +4782,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 1):
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -4692,6 +4793,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_1plane(
@@ -4701,6 +4803,7 @@ class PagedForwardKernel:
                                         mPageTable,
                                         request_idx,
                                         next_page_idx,
+                                        next_sub_tile,
                                     )
                             k_producer_state.advance()
                     k_consumer_state.advance()
@@ -4951,6 +5054,7 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            next_sub_tile = self._tile_sub64_idx(next_tile_base)
                             if const_expr(self.v_tma_plane_count > 3):
                                 self._issue_paged_kv_tma_copy_planes(
                                     load_V_tma0,
@@ -4962,6 +5066,7 @@ class PagedForwardKernel:
                                     mPageTable,
                                     request_idx,
                                     next_page_idx,
+                                    next_sub_tile,
                                 )
                             elif const_expr(self.v_tma_plane_count > 2):
                                 self._issue_paged_kv_tma_copy_3planes(
@@ -4973,6 +5078,7 @@ class PagedForwardKernel:
                                     mPageTable,
                                     request_idx,
                                     next_page_idx,
+                                    next_sub_tile,
                                 )
                             elif const_expr(self.v_tma_plane_count > 1):
                                 self._issue_paged_kv_tma_copy_2planes(
@@ -4983,6 +5089,7 @@ class PagedForwardKernel:
                                     mPageTable,
                                     request_idx,
                                     next_page_idx,
+                                    next_sub_tile,
                                 )
                             else:
                                 self._issue_paged_kv_tma_copy_1plane(
@@ -4992,6 +5099,7 @@ class PagedForwardKernel:
                                     mPageTable,
                                     request_idx,
                                     next_page_idx,
+                                    next_sub_tile,
                                 )
                         v_producer_state.advance()
                         prefetch_base += stage_tile_rows

@@ -1473,8 +1473,10 @@ class B12XPagedAttentionScratchPlan:
         if self.caps.msa_block_sparse:
             if window_left != -1:
                 raise ValueError("MSA block-sparse decode graph replay does not support window_left/SWA")
-            if self.caps.page_size != 64:
-                raise ValueError("MSA block-sparse decode graph replay requires page_size=64")
+            if self.caps.page_size not in (64, 128):
+                raise ValueError(
+                    "MSA block-sparse decode graph replay requires page_size=64 or page_size=128"
+                )
             if self.caps.head_dim_qk != 128 or self.caps.head_dim_vo != 128:
                 raise ValueError("MSA block-sparse decode graph replay requires head_dim_qk=head_dim_vo=128")
             if self.caps.num_q_heads // self.caps.num_kv_heads != 16:

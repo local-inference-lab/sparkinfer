@@ -147,7 +147,34 @@ def _encode_plane_tma_descriptors(
     U64 = cuda.cuuint64_t
     U32 = cuda.cuuint32_t
     row_bytes = kv_heads * head_dim * elem_bytes
-    total_rows = num_pages * page_size
+    # The plane descriptors flatten the cache to rank-2 [head_dim, total_rows]
+    # with row pitch row_bytes; rows within a page must therefore be contiguous
+    # at exactly kv_heads * head_dim elements, and total_rows must be derived
+    # from the PAGE STRIDE (not the shape) so strided caches (e.g. vLLM's
+    # combined [N, 2, page, H, D] K/V slices) keep flat row coordinates
+    # `tile_idx * tile_rows` in-bounds.
+    if int(cache.stride(3)) != 1:
+        raise ValueError("plane TMA cache requires contiguous head_dim (stride(3) == 1)")
+    if int(cache.stride(2)) != head_dim:
+        raise ValueError("plane TMA cache requires contiguous kv-head rows (stride(2) == head_dim)")
+    row_stride_elems = int(cache.stride(1))
+    if row_stride_elems != kv_heads * head_dim:
+        raise ValueError(
+            "plane TMA cache requires rows-within-page contiguous: "
+            f"stride(1)={row_stride_elems} != kv_heads*head_dim={kv_heads * head_dim}"
+        )
+    page_stride_elems = int(cache.stride(0))
+    if page_stride_elems % row_stride_elems != 0:
+        raise ValueError(
+            "plane TMA cache page stride must be a whole number of rows: "
+            f"stride(0)={page_stride_elems}, stride(1)={row_stride_elems}"
+        )
+    page_stride_rows = page_stride_elems // row_stride_elems
+    if page_stride_rows % tile_rows != 0:
+        raise ValueError(
+            f"plane TMA cache page stride rows ({page_stride_rows}) must be a multiple of tile_rows={tile_rows}"
+        )
+    total_rows = num_pages * page_stride_rows
     base_ptr = int(cache.view(torch.uint8).data_ptr())
     head_stride_bytes = head_dim * elem_bytes
 
@@ -173,6 +200,45 @@ def _encode_plane_tma_descriptors(
             dtype=torch.uint64,
         )
     return host_desc.to(device=cache.device, non_blocking=False)
+
+
+def _paged_kv_tiles_per_table_entry(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    tile_rows: int,
+    name: str,
+) -> int:
+    """Physical `tile_rows`-row tiles spanned by one page-table entry stride.
+
+    Derived from the CACHE STRIDE, not assumed contiguous: vLLM's combined
+    [num_blocks, 2, 128, H, D] cache exposes K/V as strided slices whose page
+    stride covers both planes; the off-plane rows appear as phantom tiles that
+    are never addressed.
+    """
+    if cache.ndim != 4:
+        raise ValueError(f"{name} must be rank-4 [num_pages, page_size, kv_heads, head_dim]")
+    if int(cache.stride(3)) != 1:
+        raise ValueError(f"{name} requires contiguous head_dim (stride(3) == 1)")
+    row_stride_elems = int(cache.stride(1))
+    if row_stride_elems <= 0:
+        raise ValueError(f"{name} requires a positive token stride")
+    page_stride_elems = int(cache.stride(0))
+    if page_stride_elems % row_stride_elems != 0:
+        raise ValueError(
+            f"{name} page stride must be a whole number of token rows: "
+            f"stride(0)={page_stride_elems}, stride(1)={row_stride_elems}"
+        )
+    page_stride_rows = page_stride_elems // row_stride_elems
+    if page_stride_rows % tile_rows != 0:
+        raise ValueError(
+            f"{name} page stride rows ({page_stride_rows}) must be a multiple of {tile_rows}"
+        )
+    if page_stride_rows < int(page_size):
+        raise ValueError(
+            f"{name} page stride rows ({page_stride_rows}) are smaller than page_size={page_size}"
+        )
+    return page_stride_rows // tile_rows
 
 
 def _descriptor_row_ptrs(desc: torch.Tensor) -> torch.Tensor:
@@ -270,6 +336,8 @@ def _build_forward_kernel(
     window_left: int,
     has_attention_sink_bias: bool,
     msa_block_sparse: bool,
+    page_size: int,
+    page_tiles_per_entry: int,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -289,6 +357,8 @@ def _build_forward_kernel(
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
         msa_block_sparse=msa_block_sparse,
+        page_size=page_size,
+        page_tiles_per_entry=page_tiles_per_entry,
     )
 
 
@@ -301,6 +371,7 @@ def _build_extend_forward_kernel(
     has_attention_sink_bias: bool,
     msa_block_sparse: bool,
     msa_union_tile: bool,
+    page_size: int,
 ) -> object:
     return build_extend_forward_kernel(
         traits,
@@ -310,6 +381,7 @@ def _build_extend_forward_kernel(
         has_attention_sink_bias=has_attention_sink_bias,
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
+        page_size=page_size,
     )
 
 
@@ -540,6 +612,33 @@ def paged_attention_forward(
     use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard = (
         _resolve_native_fp8_attention_mma_flags(plan=plan)
     )
+    page_size = int(plan.page_size)
+    page_tiles_per_entry = 1
+    if page_size == 128:
+        if not bool(getattr(plan, "msa_block_sparse", False)):
+            raise ValueError("page_size=128 paged attention requires msa_block_sparse=True")
+        if k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or v_cache.dtype != k_cache.dtype:
+            raise ValueError(
+                "page_size=128 MSA paged attention requires matching bf16 or fp8 e4m3 K/V caches"
+            )
+        k_tiles_per_entry = _paged_kv_tiles_per_table_entry(
+            k_cache,
+            page_size=page_size,
+            tile_rows=64,
+            name="k_cache",
+        )
+        v_tiles_per_entry = _paged_kv_tiles_per_table_entry(
+            v_cache,
+            page_size=page_size,
+            tile_rows=64,
+            name="v_cache",
+        )
+        if k_tiles_per_entry != v_tiles_per_entry:
+            raise ValueError(
+                "page_size=128 MSA paged attention requires K and V caches with equal "
+                f"page-stride tile counts, got {k_tiles_per_entry} vs {v_tiles_per_entry}"
+            )
+        page_tiles_per_entry = k_tiles_per_entry
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
@@ -551,6 +650,7 @@ def paged_attention_forward(
             has_attention_sink_bias,
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
+            page_size,
         )
     else:
         single_request_decode_graph = (
@@ -589,6 +689,8 @@ def paged_attention_forward(
             plan.window_left,
             has_attention_sink_bias,
             bool(plan.msa_block_sparse),
+            page_size,
+            page_tiles_per_entry,
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
@@ -780,6 +882,8 @@ def paged_attention_forward(
             bool(has_attention_sink_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
+            int(page_size),
+            int(page_tiles_per_entry),
         ),
         _tensor_meta_key(q_cache_tensor, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(k_cache),

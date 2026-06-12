@@ -17,6 +17,7 @@ def make_paged_inputs(
     seed: int = 0,
     page_table_width: int | None = None,
     num_pages: int | None = None,
+    vllm_combined_kv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if len(q_seqlens) != len(cache_seqlens):
         raise ValueError("q_seqlens and cache_seqlens must have the same length")
@@ -46,28 +47,48 @@ def make_paged_inputs(
             f"num_pages={num_pages} is smaller than required total {total_pages_needed}"
         )
 
-    k_cache = (
-        torch.randn(
-            num_pages,
-            page_size,
-            kv_heads,
-            head_dim_qk,
-            device=device,
-            dtype=dtype,
+    if vllm_combined_kv:
+        # vLLM MiniMax-M3 layout: one combined cache [num_blocks, 2, page, H, D]
+        # with K = cache[:, 0] and V = cache[:, 1] as STRIDED slices.
+        if head_dim_qk != head_dim_vo:
+            raise ValueError("vllm_combined_kv requires head_dim_qk == head_dim_vo")
+        combined_kv_cache = (
+            torch.randn(
+                num_pages,
+                2,
+                page_size,
+                kv_heads,
+                head_dim_qk,
+                device=device,
+                dtype=dtype,
+            )
+            / 4
         )
-        / 4
-    )
-    v_cache = (
-        torch.randn(
-            num_pages,
-            page_size,
-            kv_heads,
-            head_dim_vo,
-            device=device,
-            dtype=dtype,
+        k_cache = combined_kv_cache[:, 0]
+        v_cache = combined_kv_cache[:, 1]
+    else:
+        k_cache = (
+            torch.randn(
+                num_pages,
+                page_size,
+                kv_heads,
+                head_dim_qk,
+                device=device,
+                dtype=dtype,
+            )
+            / 4
         )
-        / 4
-    )
+        v_cache = (
+            torch.randn(
+                num_pages,
+                page_size,
+                kv_heads,
+                head_dim_vo,
+                device=device,
+                dtype=dtype,
+            )
+            / 4
+        )
     page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
     page_order = torch.randperm(num_pages, device=device)
     cursor = 0

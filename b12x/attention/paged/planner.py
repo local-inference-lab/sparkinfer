@@ -81,12 +81,16 @@ def _align_up(x: int, y: int) -> int:
     return _ceil_div(x, y) * y
 
 
-def _msa_decode_chunk_pages(policy_batch: int) -> int:
+def _msa_decode_chunk_tokens(policy_batch: int) -> int:
     if int(policy_batch) <= 2:
-        return 2
+        return 128
     if int(policy_batch) <= 8:
-        return 4
-    return 8
+        return 256
+    return 512
+
+
+def _msa_decode_chunk_pages(policy_batch: int, page_size: int) -> int:
+    return _ceil_div(_msa_decode_chunk_tokens(policy_batch), int(page_size))
 
 
 def _msa_effective_pages(cache_len: int, page_size: int) -> int:
@@ -802,8 +806,13 @@ def create_paged_plan(
         raise ValueError("k_cache and v_cache structural shapes must match except head_dim")
     if head_dim_k != head_dim_qk:
         raise ValueError("primary paged backend expects head_dim_qk to match k_cache head_dim")
-    if page_size != 64:
-        raise ValueError(f"primary paged backend expects page_size=64, got {page_size}")
+    if page_size == 128:
+        if not msa_block_sparse:
+            raise ValueError(
+                "primary paged backend supports page_size=128 only for MSA block-sparse plans"
+            )
+    elif page_size != 64:
+        raise ValueError(f"primary paged backend expects page_size=64 (or 128 for MSA), got {page_size}")
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     if tuple(cache_seqlens.shape) != (batch,):
@@ -834,13 +843,26 @@ def create_paged_plan(
     if msa_block_sparse:
         if mode not in ("decode", "extend"):
             raise ValueError("MSA block-sparse paged attention currently supports decode and extend plans only")
-        if page_size != 64:
-            raise ValueError("MSA block-sparse paged attention requires page_size=64")
+        if page_size not in (64, 128):
+            raise ValueError("MSA block-sparse paged attention requires page_size=64 or page_size=128")
         if head_dim_qk != 128 or head_dim_vo != 128:
             raise ValueError("MSA block-sparse paged attention requires head_dim_qk=head_dim_vo=128")
         if k_cache.dtype not in (torch.bfloat16, _FP8_KV_DTYPE):
             raise TypeError(
-                "MSA block-sparse paged attention currently supports bf16 or fp8 KV decode only"
+                "MSA block-sparse paged attention supports bf16 or fp8 KV only"
+            )
+        if (
+            mode == "extend"
+            and not msa_union_tile
+            and k_cache.dtype == _FP8_KV_DTYPE
+        ):
+            # The per-token (cta_tile_q=16) extend dequant path produces wrong
+            # results with fp8 KV (pre-existing, never exercised before MSA;
+            # see .msaport plan follow-ups). Union-tile is the production
+            # prefill path and is fp8-correct.
+            raise TypeError(
+                "MSA fp8 extend requires union-tile prefill "
+                "(per-token fp8 extend is not supported)"
             )
     if mode == "verify" and inferred_mode != "extend":
         raise ValueError(f"verify mode requires q_len > 1, got inferred mode {inferred_mode}")
@@ -1026,7 +1048,7 @@ def create_paged_plan(
         kv_chunk_size_pages = (
             int(fixed_split_size)
             if fixed_split_size > 0
-            else _msa_decode_chunk_pages(policy_batch)
+            else _msa_decode_chunk_pages(policy_batch, page_size)
         )
         if kv_chunk_size_pages <= 0:
             raise ValueError("MSA split chunk size must be positive")

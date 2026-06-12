@@ -2202,6 +2202,7 @@ class PagedForwardKernel:
         has_attention_sink_bias: bool = False,
         msa_block_sparse: bool = False,
         msa_union_tile: bool = False,
+        page_size: int = 64,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -2216,6 +2217,13 @@ class PagedForwardKernel:
         self.MSA_BLOCK_TOKENS = 128
         self.MSA_TOPK = 16
         self.MSA_UNION_TOKENS_PER_TILE = 8
+        self.page_size = int(page_size)
+        if self.page_size not in (64, 128):
+            raise ValueError(f"paged extend kernel supports page_size 64 or 128, got {self.page_size}")
+        if self.page_size == 128 and not self.msa_block_sparse:
+            raise ValueError("page_size=128 paged extend requires msa_block_sparse=True")
+        # Number of page-table entries that span one 128-token MSA block.
+        self.entries_per_block = self.MSA_BLOCK_TOKENS // self.page_size
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2528,6 +2536,10 @@ class PagedForwardKernel:
         block_count = (visible_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(self.MSA_BLOCK_TOKENS)
         block_count = cutlass.select_(block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK))
         block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
+        if const_expr(self.page_size == 128):
+            # Whole-page walk at page_size=128: the planner counts full
+            # 128-token pages, so the kernel must not tail-compact.
+            return block_count * Int32(self.MSA_BLOCK_TOKENS)
         last_j = block_count - Int32(1)
         local_block_id = mQ2KIndices[kv_head_idx, q_row_idx, last_j]
         tail_tokens = visible_len - local_block_id * Int32(self.MSA_BLOCK_TOKENS)
@@ -2550,6 +2562,9 @@ class PagedForwardKernel:
     ):
         block_count = mMSAUnionCounts[work_idx, kv_head_idx]
         block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
+        if const_expr(self.page_size == 128):
+            # Whole-page walk at page_size=128 (no tail compaction).
+            return block_count * Int32(self.MSA_BLOCK_TOKENS)
         last_block_id = mMSAUnionBlocks[work_idx, kv_head_idx, block_count - Int32(1)]
         max_visible_len = cache_len - qo_len + tile_first_token + tile_token_count
         max_visible_len = cutlass.select_(max_visible_len > Int32(0), max_visible_len, Int32(1))
@@ -2572,6 +2587,17 @@ class PagedForwardKernel:
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
+            if const_expr(self.entries_per_block == 1):
+                block_id = (
+                    mMSAUnionBlocks[work_idx, kv_head_idx, block_j]
+                    if const_expr(self.msa_union_tile)
+                    else mQ2KIndices[kv_head_idx, q_row_idx, block_j]
+                )
+                return cutlass.select_(
+                    block_id >= Int32(0),
+                    block_id,
+                    Int32(0),
+                )
             block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
             subpage = block_offset // page_size
             block_id = (
@@ -2581,7 +2607,7 @@ class PagedForwardKernel:
             )
             return cutlass.select_(
                 block_id >= Int32(0),
-                block_id * Int32(2) + subpage,
+                block_id * Int32(self.entries_per_block) + subpage,
                 Int32(0),
             )
         return tile_token_base // page_size
@@ -2650,7 +2676,7 @@ class PagedForwardKernel:
         upcast_stride,
         fill_zero: cutlass.Constexpr,
     ):
-        page_size = Int32(mPageTable.shape[1] * 0 + 64)
+        page_size = Int32(self.page_size)
         lane_row = lane // 8
         lane_col = lane % 8
         for tile_iter in cutlass.range_constexpr(self.traits.num_mma_kv * 4 // self.traits.num_warps_q):
@@ -2911,7 +2937,7 @@ class PagedForwardKernel:
             )
         ):
             raise ValueError(
-                "MSA block-sparse extend requires cta_tile_q=16 or union cta_tile_q=128, page_size=64, cta_tile_kv dividing 64, and head_dim=128"
+                "MSA block-sparse extend requires cta_tile_q=16 or union cta_tile_q=128, page_size in (64, 128), cta_tile_kv dividing 64, and head_dim=128"
             )
         if const_expr(mQ.element_type != self.dtype_q):
             raise TypeError("mQ dtype must match dtype_q")
@@ -6199,6 +6225,7 @@ def build_extend_forward_kernel(
     has_attention_sink_bias: bool = False,
     msa_block_sparse: bool = False,
     msa_union_tile: bool = False,
+    page_size: int = 64,
 ):
     enable_paged_kv_tma = os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
     return PagedExtendForwardKernel(
@@ -6214,4 +6241,5 @@ def build_extend_forward_kernel(
         has_attention_sink_bias=has_attention_sink_bias,
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
+        page_size=page_size,
     )

@@ -385,6 +385,7 @@ def update_msa_decode_graph_metadata_fused_triton(
     kv_chunk_size,
     block_valid_capacity,
     PAGE_SIZE: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
     BATCH: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
     BLOCK_WORK_ITEMS: tl.constexpr,
@@ -397,8 +398,10 @@ def update_msa_decode_graph_metadata_fused_triton(
     visible_blocks = tl.maximum((cache_len + 127) // 128, 1)
     selected_blocks = tl.minimum(visible_blocks, 16)
     tail_tokens = tl.maximum(cache_len - (visible_blocks - 1) * 128, 1)
-    tail_pages = tl.minimum(tl.maximum((tail_tokens + PAGE_SIZE - 1) // PAGE_SIZE, 1), 2)
-    effective_pages = tl.maximum((selected_blocks - 1) * 2 + tail_pages, 1)
+    tail_pages = tl.minimum(
+        tl.maximum((tail_tokens + PAGE_SIZE - 1) // PAGE_SIZE, 1), PAGES_PER_BLOCK
+    )
+    effective_pages = tl.maximum((selected_blocks - 1) * PAGES_PER_BLOCK + tail_pages, 1)
     selected_tokens = effective_pages * PAGE_SIZE
     num_chunks = tl.maximum((selected_tokens + kv_chunk_size - 1) // kv_chunk_size, 1)
     prefix = tl.cumsum(tl.where(batch_mask, num_chunks, 0), 0)
@@ -1083,11 +1086,13 @@ def update_msa_decode_graph_chunk_metadata(
         raise ValueError("MSA decode graph buffers and cache_seqlens must be on the same device")
     if kv_window_start_tokens.device != device:
         raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
-    if page_size != 64:
-        raise ValueError("MSA decode graph replay requires page_size=64")
+    if page_size not in (64, 128):
+        raise ValueError("MSA decode graph replay requires page_size=64 or page_size=128")
     kv_chunk_size = int(kv_chunk_size)
-    if kv_chunk_size <= 0 or kv_chunk_size % int(page_size) != 0:
-        raise ValueError("MSA decode graph kv_chunk_size must be a positive multiple of page_size")
+    # Chunk boundaries are 64-token-tile aligned in the compacted virtual key
+    # space regardless of the physical page size.
+    if kv_chunk_size <= 0 or kv_chunk_size % 64 != 0:
+        raise ValueError("MSA decode graph kv_chunk_size must be a positive multiple of 64 tokens")
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
@@ -1121,6 +1126,7 @@ def update_msa_decode_graph_chunk_metadata(
         kv_chunk_size,
         block_valid_capacity,
         PAGE_SIZE=page_size,
+        PAGES_PER_BLOCK=128 // int(page_size),
         BATCH=bs,
         BLOCK_BATCH=triton.next_power_of_2(bs),
         BLOCK_WORK_ITEMS=triton.next_power_of_2(
@@ -1165,8 +1171,8 @@ def update_msa_decode_graph_replay_metadata(
         raise ValueError("req_pool_indices and page_table must be on the same device")
     if cache_seqlens.device != page_table.device:
         raise ValueError("cache_seqlens and page_table must be on the same device")
-    if page_size != 64:
-        raise ValueError("MSA decode graph replay requires page_size=64")
+    if page_size not in (64, 128):
+        raise ValueError("MSA decode graph replay requires page_size=64 or page_size=128")
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
