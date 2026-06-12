@@ -12,6 +12,7 @@ from b12x.attention.indexer.api import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
 )
+from b12x.attention.indexer.msa_reference import MSA_BLOCK_TOKENS
 from b12x.integration.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
@@ -90,6 +91,8 @@ class B12XIndexerScratchCaps:
     paged_logits_k_rows: int = 0
     route: str = INDEXER_PAGED_ROUTE_AUTO
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
+    score_mode: str = "nsa"
+    num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -117,8 +120,13 @@ class B12XIndexerScratchCaps:
                 f"{sorted(_INDEXER_PAGED_ROUTES)}, got {route!r}"
             )
         object.__setattr__(self, "route", route)
+        score_mode = str(self.score_mode).lower()
+        if score_mode not in ("nsa", "msa"):
+            raise ValueError(f"indexer scratch score_mode must be nsa or msa, got {score_mode!r}")
+        object.__setattr__(self, "score_mode", score_mode)
 
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
+        object.__setattr__(self, "num_idx_heads", max(int(self.num_idx_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "topk", max(int(self.topk), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
@@ -180,6 +188,8 @@ class B12XIndexerPagedScratchCaps:
     mode: str = "decode"
     shared_page_table: bool = False
     route: str = INDEXER_PAGED_ROUTE_AUTO
+    score_mode: str = "nsa"
+    num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -187,6 +197,7 @@ class B12XIndexerPagedScratchCaps:
             device = torch.device("cuda", torch.cuda.current_device())
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
+        object.__setattr__(self, "num_idx_heads", max(int(self.num_idx_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(
             self,
@@ -217,6 +228,10 @@ class B12XIndexerPagedScratchCaps:
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "shared_page_table", bool(self.shared_page_table))
         object.__setattr__(self, "route", route)
+        score_mode = str(self.score_mode).lower()
+        if score_mode not in ("nsa", "msa"):
+            raise ValueError(f"indexer paged scratch score_mode must be nsa or msa, got {score_mode!r}")
+        object.__setattr__(self, "score_mode", score_mode)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -229,6 +244,8 @@ class B12XIndexerContiguousScratchCaps:
     k_dtype: torch.dtype = torch.float8_e4m3fn
     supertile_k: int = 32768
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
+    score_mode: str = "nsa"
+    num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -236,6 +253,7 @@ class B12XIndexerContiguousScratchCaps:
             device = torch.device("cuda", torch.cuda.current_device())
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
+        object.__setattr__(self, "num_idx_heads", max(int(self.num_idx_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         max_k_rows = max(int(self.max_k_rows), 1)
         max_k_rows = (
@@ -257,6 +275,10 @@ class B12XIndexerContiguousScratchCaps:
         ) * prefill_block_k
         object.__setattr__(self, "supertile_k", supertile_k)
         object.__setattr__(self, "prefill_block_k", prefill_block_k)
+        score_mode = str(self.score_mode).lower()
+        if score_mode not in ("nsa", "msa"):
+            raise ValueError(f"indexer contiguous scratch score_mode must be nsa or msa, got {score_mode!r}")
+        object.__setattr__(self, "score_mode", score_mode)
 
 @dataclass(frozen=True, kw_only=True)
 class _B12XIndexerPagedScratchLayout:
@@ -283,6 +305,16 @@ class _B12XIndexerPagedScratchLayout:
     fused_pack_values_offset_bytes: int
     fused_pack_indices_offset_bytes: int
     fused_merge_state_offset_bytes: int
+    msa_page_scores_offset_bytes: int
+    msa_block_scores_offset_bytes: int
+    msa_q2k_indices_offset_bytes: int
+    msa_topk_score_scratch_offset_bytes: int
+    msa_topk_values_offset_bytes: int
+    msa_topk_indices_offset_bytes: int
+    msa_sort_values_offset_bytes: int
+    msa_sort_indices_offset_bytes: int
+    msa_expanded_page_table_offset_bytes: int
+    msa_expanded_seqlens_offset_bytes: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -306,6 +338,13 @@ class _B12XIndexerContiguousScratchLayout:
     k_tma_desc_ptrs_offset_bytes: int
     k_tma_prefill_desc_offset_bytes: int
     k_tma_prefill_desc_ptrs_offset_bytes: int
+    msa_block_scores_offset_bytes: int
+    msa_q2k_indices_offset_bytes: int
+    msa_topk_score_scratch_offset_bytes: int
+    msa_topk_values_offset_bytes: int
+    msa_topk_indices_offset_bytes: int
+    msa_sort_values_offset_bytes: int
+    msa_sort_indices_offset_bytes: int
 
 @dataclass(kw_only=True)
 class B12XIndexerPagedScratch:
@@ -343,6 +382,16 @@ class B12XIndexerPagedScratch:
     fused_indexer_pack_values: torch.Tensor | None = None
     fused_indexer_pack_indices: torch.Tensor | None = None
     fused_indexer_merge_state: torch.Tensor | None = None
+    msa_page_scores: torch.Tensor | None = None
+    msa_block_scores: torch.Tensor | None = None
+    msa_q2k_indices: torch.Tensor | None = None
+    msa_topk_score_scratch: torch.Tensor | None = None
+    msa_topk_values: torch.Tensor | None = None
+    msa_topk_indices: torch.Tensor | None = None
+    msa_sort_values: torch.Tensor | None = None
+    msa_sort_indices: torch.Tensor | None = None
+    msa_expanded_page_table: torch.Tensor | None = None
+    msa_expanded_seqlens: torch.Tensor | None = None
 
     def bind(
         self,
@@ -364,6 +413,24 @@ class B12XIndexerPagedScratch:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+        )
+
+    def bind_msa(
+        self,
+        *,
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
+        topk: int | None = None,
+    ) -> "B12XIndexerMSAPagedBinding":
+        return build_indexer_msa_paged_binding(
+            scratch=self,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            schedule_metadata=schedule_metadata,
+            topk=topk,
         )
 
     def get_indexer_contiguous_tile_logits(self) -> torch.Tensor:
@@ -519,6 +586,13 @@ class B12XIndexerContiguousScratch:
     metadata_k_end: torch.Tensor
     k_tma_desc_ptrs: torch.Tensor
     k_tma_prefill_desc_ptrs: torch.Tensor
+    msa_block_scores: torch.Tensor | None = None
+    msa_q2k_indices: torch.Tensor | None = None
+    msa_topk_score_scratch: torch.Tensor | None = None
+    msa_topk_values: torch.Tensor | None = None
+    msa_topk_indices: torch.Tensor | None = None
+    msa_sort_values: torch.Tensor | None = None
+    msa_sort_indices: torch.Tensor | None = None
 
     def prepare_k_padding(self, *, k_rows: int) -> None:
         k_rows = int(k_rows)
@@ -536,6 +610,20 @@ class B12XIndexerContiguousScratch:
         if padded_rows > k_rows:
             self.k_quant[k_rows:padded_rows].zero_()
             self.k_scale_bytes[k_rows:padded_rows].zero_()
+
+    def bind_msa(
+        self,
+        *,
+        k_start: torch.Tensor,
+        k_end: torch.Tensor,
+        topk: int | None = None,
+    ) -> "B12XIndexerMSAContiguousBinding":
+        return build_indexer_msa_contiguous_binding(
+            scratch=self,
+            k_start=k_start,
+            k_end=k_end,
+            topk=topk,
+        )
 
 @dataclass(frozen=True, kw_only=True)
 class B12XIndexerPagedBinding:
@@ -567,6 +655,45 @@ class B12XIndexerContiguousBinding:
     prefill_block_k: int | None = None
     supertile_k: int | None = None
     strict: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XIndexerMSAPagedBinding:
+    scratch: object
+    metadata: IndexerPagedDecodeMetadata
+    real_page_table: torch.Tensor
+    cache_seqlens_int32: torch.Tensor
+    active_width: torch.Tensor
+    schedule_metadata: torch.Tensor | None = None
+    page_scores: torch.Tensor | None = None
+    block_scores: torch.Tensor | None = None
+    q2k_indices: torch.Tensor | None = None
+    topk_score_scratch: torch.Tensor | None = None
+    topk_values: torch.Tensor | None = None
+    topk_indices: torch.Tensor | None = None
+    sort_values: torch.Tensor | None = None
+    sort_indices: torch.Tensor | None = None
+    expanded_page_table: torch.Tensor | None = None
+    expanded_seqlens: torch.Tensor | None = None
+    topk: int | None = None
+    num_idx_heads: int | None = None
+    strict: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XIndexerMSAContiguousBinding:
+    scratch: object
+    metadata: IndexerContiguousMetadata
+    block_scores: torch.Tensor | None = None
+    q2k_indices: torch.Tensor | None = None
+    topk_score_scratch: torch.Tensor | None = None
+    topk_values: torch.Tensor | None = None
+    topk_indices: torch.Tensor | None = None
+    sort_values: torch.Tensor | None = None
+    sort_indices: torch.Tensor | None = None
+    topk: int | None = None
+    num_idx_heads: int | None = None
+    strict: bool = True
 
 def _resolve_indexer_paged_supertile_tokens(raw_tokens: int) -> int:
     if int(raw_tokens) <= 0:
@@ -773,6 +900,67 @@ def _indexer_paged_scratch_layout(
     cursor += fused_state_words * dtype_nbytes(torch.int32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
+    msa_enabled = str(caps.score_mode) == "msa"
+    num_idx_heads = max(int(caps.num_idx_heads), 1)
+    max_pages_even = int(caps.max_page_table_width)
+    if max_pages_even % 2 != 0:
+        max_pages_even += 1
+    max_blocks = max(
+        1,
+        (int(caps.max_page_table_width) * page_size + MSA_BLOCK_TOKENS - 1)
+        // MSA_BLOCK_TOKENS,
+    )
+    msa_page_score_elements = (
+        num_idx_heads * max_q_rows * max_pages_even if msa_enabled else 0
+    )
+    msa_block_score_elements = (
+        num_idx_heads * max_q_rows * max_blocks if msa_enabled else 0
+    )
+    msa_q2k_elements = num_idx_heads * max_q_rows * int(caps.topk) if msa_enabled else 0
+    msa_expanded_rows = num_idx_heads * max_q_rows if msa_enabled else 0
+
+    msa_page_scores_offset_bytes = cursor
+    cursor += msa_page_score_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_block_scores_offset_bytes = cursor
+    cursor += msa_block_score_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_q2k_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_score_scratch_offset_bytes = cursor
+    cursor += msa_block_score_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_values_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int64)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_sort_values_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_sort_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int64)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_expanded_page_table_offset_bytes = cursor
+    cursor += (
+        msa_expanded_rows * int(caps.max_page_table_width) * dtype_nbytes(torch.int32)
+    )
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_expanded_seqlens_offset_bytes = cursor
+    cursor += msa_expanded_rows * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
     return _B12XIndexerPagedScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
         supertile_tokens=supertile_tokens,
@@ -797,6 +985,16 @@ def _indexer_paged_scratch_layout(
         fused_pack_values_offset_bytes=fused_pack_values_offset_bytes,
         fused_pack_indices_offset_bytes=fused_pack_indices_offset_bytes,
         fused_merge_state_offset_bytes=fused_merge_state_offset_bytes,
+        msa_page_scores_offset_bytes=msa_page_scores_offset_bytes,
+        msa_block_scores_offset_bytes=msa_block_scores_offset_bytes,
+        msa_q2k_indices_offset_bytes=msa_q2k_indices_offset_bytes,
+        msa_topk_score_scratch_offset_bytes=msa_topk_score_scratch_offset_bytes,
+        msa_topk_values_offset_bytes=msa_topk_values_offset_bytes,
+        msa_topk_indices_offset_bytes=msa_topk_indices_offset_bytes,
+        msa_sort_values_offset_bytes=msa_sort_values_offset_bytes,
+        msa_sort_indices_offset_bytes=msa_sort_indices_offset_bytes,
+        msa_expanded_page_table_offset_bytes=msa_expanded_page_table_offset_bytes,
+        msa_expanded_seqlens_offset_bytes=msa_expanded_seqlens_offset_bytes,
     )
 
 
@@ -891,6 +1089,42 @@ def _indexer_contiguous_scratch_layout(
     cursor += dtype_nbytes(torch.int64)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
+    msa_enabled = str(caps.score_mode) == "msa"
+    num_idx_heads = max(int(caps.num_idx_heads), 1)
+    max_blocks = max(1, (max_k_rows + MSA_BLOCK_TOKENS - 1) // MSA_BLOCK_TOKENS)
+    msa_block_score_elements = (
+        num_idx_heads * max_q_rows * max_blocks if msa_enabled else 0
+    )
+    msa_q2k_elements = num_idx_heads * max_q_rows * topk if msa_enabled else 0
+
+    msa_block_scores_offset_bytes = cursor
+    cursor += msa_block_score_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_q2k_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_score_scratch_offset_bytes = cursor
+    cursor += msa_block_score_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_values_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.float32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_topk_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int64)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_sort_values_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    msa_sort_indices_offset_bytes = cursor
+    cursor += msa_q2k_elements * dtype_nbytes(torch.int64)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
     return _B12XIndexerContiguousScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
         max_k_rows=max_k_rows,
@@ -911,6 +1145,13 @@ def _indexer_contiguous_scratch_layout(
         k_tma_desc_ptrs_offset_bytes=k_tma_desc_ptrs_offset_bytes,
         k_tma_prefill_desc_offset_bytes=k_tma_prefill_desc_offset_bytes,
         k_tma_prefill_desc_ptrs_offset_bytes=k_tma_prefill_desc_ptrs_offset_bytes,
+        msa_block_scores_offset_bytes=msa_block_scores_offset_bytes,
+        msa_q2k_indices_offset_bytes=msa_q2k_indices_offset_bytes,
+        msa_topk_score_scratch_offset_bytes=msa_topk_score_scratch_offset_bytes,
+        msa_topk_values_offset_bytes=msa_topk_values_offset_bytes,
+        msa_topk_indices_offset_bytes=msa_topk_indices_offset_bytes,
+        msa_sort_values_offset_bytes=msa_sort_values_offset_bytes,
+        msa_sort_indices_offset_bytes=msa_sort_indices_offset_bytes,
     )
 
 
@@ -1024,6 +1265,88 @@ def _materialize_indexer_paged_scratch(
         fused_pack_indices = None
         fused_merge_state = None
 
+    if str(caps.score_mode) == "msa":
+        num_idx_heads = max(int(caps.num_idx_heads), 1)
+        max_pages_even = int(caps.max_page_table_width)
+        if max_pages_even % 2 != 0:
+            max_pages_even += 1
+        max_blocks = max(
+            1,
+            (int(caps.max_page_table_width) * int(caps.page_size) + MSA_BLOCK_TOKENS - 1)
+            // MSA_BLOCK_TOKENS,
+        )
+        msa_page_scores, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_page_scores_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, max_pages_even),
+            dtype=torch.float32,
+        )
+        msa_block_scores, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_block_scores_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, max_blocks),
+            dtype=torch.float32,
+        )
+        msa_q2k_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_q2k_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int32,
+        )
+        msa_topk_score_scratch, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_score_scratch_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, max_blocks),
+            dtype=torch.float32,
+        )
+        msa_topk_values, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_values_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.float32,
+        )
+        msa_topk_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int64,
+        )
+        msa_sort_values, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_sort_values_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int32,
+        )
+        msa_sort_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_sort_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int64,
+        )
+        msa_expanded_page_table, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_expanded_page_table_offset_bytes,
+            shape=(num_idx_heads * max_q_rows, int(caps.max_page_table_width)),
+            dtype=torch.int32,
+        )
+        msa_expanded_seqlens, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_expanded_seqlens_offset_bytes,
+            shape=(num_idx_heads * max_q_rows,),
+            dtype=torch.int32,
+        )
+    else:
+        msa_page_scores = None
+        msa_block_scores = None
+        msa_q2k_indices = None
+        msa_topk_score_scratch = None
+        msa_topk_values = None
+        msa_topk_indices = None
+        msa_sort_values = None
+        msa_sort_indices = None
+        msa_expanded_page_table = None
+        msa_expanded_seqlens = None
+
     scratch = B12XIndexerPagedScratch(
         shared_scratch=scratch_storage,
         device=caps.device,
@@ -1055,6 +1378,16 @@ def _materialize_indexer_paged_scratch(
         fused_indexer_pack_values=fused_pack_values,
         fused_indexer_pack_indices=fused_pack_indices,
         fused_indexer_merge_state=fused_merge_state,
+        msa_page_scores=msa_page_scores,
+        msa_block_scores=msa_block_scores,
+        msa_q2k_indices=msa_q2k_indices,
+        msa_topk_score_scratch=msa_topk_score_scratch,
+        msa_topk_values=msa_topk_values,
+        msa_topk_indices=msa_topk_indices,
+        msa_sort_values=msa_sort_values,
+        msa_sort_indices=msa_sort_indices,
+        msa_expanded_page_table=msa_expanded_page_table,
+        msa_expanded_seqlens=msa_expanded_seqlens,
     )
     return scratch
 
@@ -1180,6 +1513,60 @@ def _materialize_indexer_contiguous_scratch(
         k_tma_desc_ptrs.fill_(int(k_tma_desc.data_ptr()))
         k_tma_prefill_desc_ptrs.fill_(int(k_tma_prefill_desc.data_ptr()))
 
+    if str(caps.score_mode) == "msa":
+        num_idx_heads = max(int(caps.num_idx_heads), 1)
+        max_blocks = max(1, (max_k_rows + MSA_BLOCK_TOKENS - 1) // MSA_BLOCK_TOKENS)
+        msa_block_scores, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_block_scores_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, max_blocks),
+            dtype=torch.float32,
+        )
+        msa_q2k_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_q2k_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int32,
+        )
+        msa_topk_score_scratch, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_score_scratch_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, max_blocks),
+            dtype=torch.float32,
+        )
+        msa_topk_values, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_values_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.float32,
+        )
+        msa_topk_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_topk_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int64,
+        )
+        msa_sort_values, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_sort_values_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int32,
+        )
+        msa_sort_indices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.msa_sort_indices_offset_bytes,
+            shape=(num_idx_heads, max_q_rows, topk),
+            dtype=torch.int64,
+        )
+    else:
+        msa_block_scores = None
+        msa_q2k_indices = None
+        msa_topk_score_scratch = None
+        msa_topk_values = None
+        msa_topk_indices = None
+        msa_sort_values = None
+        msa_sort_indices = None
+
     return B12XIndexerContiguousScratch(
         shared_scratch=scratch_storage,
         device=caps.device,
@@ -1203,6 +1590,13 @@ def _materialize_indexer_contiguous_scratch(
         metadata_k_end=metadata_k_end,
         k_tma_desc_ptrs=k_tma_desc_ptrs,
         k_tma_prefill_desc_ptrs=k_tma_prefill_desc_ptrs,
+        msa_block_scores=msa_block_scores,
+        msa_q2k_indices=msa_q2k_indices,
+        msa_topk_score_scratch=msa_topk_score_scratch,
+        msa_topk_values=msa_topk_values,
+        msa_topk_indices=msa_topk_indices,
+        msa_sort_values=msa_sort_values,
+        msa_sort_indices=msa_sort_indices,
     )
 
 def _validate_device(
@@ -1450,6 +1844,131 @@ def build_indexer_contiguous_binding(
         strict=bool(strict),
     )
 
+
+def _require_msa_scratch_tensor(scratch: object, name: str) -> torch.Tensor:
+    tensor = getattr(scratch, name, None)
+    if tensor is None:
+        raise RuntimeError(
+            "MSA indexer binding requires scratch planned with score_mode='msa'; "
+            f"missing {name}"
+        )
+    return tensor
+
+
+def build_indexer_msa_paged_binding(
+    *,
+    scratch: object,
+    real_page_table: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    active_width: torch.Tensor | None = None,
+    schedule_metadata: torch.Tensor | None = None,
+    topk: int | None = None,
+) -> B12XIndexerMSAPagedBinding:
+    if scratch is None:
+        raise TypeError("build_indexer_msa_paged_binding requires scratch")
+    _validate_i32_contiguous(
+        real_page_table,
+        scratch=scratch,
+        name="real_page_table",
+        ndim=2,
+    )
+    _validate_i32_contiguous(
+        cache_seqlens_int32,
+        scratch=scratch,
+        name="cache_seqlens_int32",
+        ndim=1,
+    )
+    if int(real_page_table.shape[0]) != int(cache_seqlens_int32.shape[0]):
+        raise ValueError("real_page_table rows must match cache_seqlens_int32")
+    if active_width is None:
+        active_width = scratch.get_paged_indexer_active_width_cap()
+    _validate_i32_contiguous(active_width, scratch=scratch, name="active_width", ndim=1)
+    if active_width.shape != (1,):
+        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+    if schedule_metadata is not None:
+        _validate_i32_contiguous(
+            schedule_metadata,
+            scratch=scratch,
+            name="schedule_metadata",
+            ndim=2,
+        )
+        if int(schedule_metadata.shape[1]) != 2:
+            raise ValueError("schedule_metadata must have trailing dimension 2")
+    if int(real_page_table.shape[0]) > int(getattr(scratch, "max_total_q", real_page_table.shape[0])):
+        raise ValueError("real_page_table rows exceed MSA paged scratch capacity")
+    if int(real_page_table.shape[1]) > int(getattr(scratch, "max_page_table_width", real_page_table.shape[1])):
+        raise ValueError("real_page_table width exceeds MSA paged scratch capacity")
+
+    block_scores = _require_msa_scratch_tensor(scratch, "msa_block_scores")
+    q2k_indices = _require_msa_scratch_tensor(scratch, "msa_q2k_indices")
+    page_scores = _require_msa_scratch_tensor(scratch, "msa_page_scores")
+    topk = int(getattr(scratch, "topk", q2k_indices.shape[2]) if topk is None else topk)
+    if topk <= 0 or topk > int(q2k_indices.shape[2]):
+        raise ValueError(f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}")
+    num_idx_heads = int(block_scores.shape[0])
+    return B12XIndexerMSAPagedBinding(
+        scratch=scratch,
+        metadata=IndexerPagedDecodeMetadata(
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            paged_mqa_schedule_metadata=schedule_metadata,
+        ),
+        real_page_table=real_page_table,
+        cache_seqlens_int32=cache_seqlens_int32,
+        active_width=active_width,
+        schedule_metadata=schedule_metadata,
+        page_scores=page_scores,
+        block_scores=block_scores,
+        q2k_indices=q2k_indices,
+        topk_score_scratch=_require_msa_scratch_tensor(scratch, "msa_topk_score_scratch"),
+        topk_values=_require_msa_scratch_tensor(scratch, "msa_topk_values"),
+        topk_indices=_require_msa_scratch_tensor(scratch, "msa_topk_indices"),
+        sort_values=_require_msa_scratch_tensor(scratch, "msa_sort_values"),
+        sort_indices=_require_msa_scratch_tensor(scratch, "msa_sort_indices"),
+        expanded_page_table=_require_msa_scratch_tensor(scratch, "msa_expanded_page_table"),
+        expanded_seqlens=_require_msa_scratch_tensor(scratch, "msa_expanded_seqlens"),
+        topk=topk,
+        num_idx_heads=num_idx_heads,
+        strict=True,
+    )
+
+
+def build_indexer_msa_contiguous_binding(
+    *,
+    scratch: object,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    topk: int | None = None,
+) -> B12XIndexerMSAContiguousBinding:
+    if scratch is None:
+        raise TypeError("build_indexer_msa_contiguous_binding requires scratch")
+    _validate_i32_contiguous(k_start, scratch=scratch, name="k_start", ndim=1)
+    _validate_i32_contiguous(k_end, scratch=scratch, name="k_end", ndim=1)
+    if k_start.shape != k_end.shape:
+        raise ValueError("k_start and k_end must have matching shapes")
+    if int(k_start.shape[0]) > int(getattr(scratch, "max_q_rows", k_start.shape[0])):
+        raise ValueError("k_start rows exceed MSA contiguous scratch capacity")
+    block_scores = _require_msa_scratch_tensor(scratch, "msa_block_scores")
+    q2k_indices = _require_msa_scratch_tensor(scratch, "msa_q2k_indices")
+    topk = int(getattr(scratch, "topk", q2k_indices.shape[2]) if topk is None else topk)
+    if topk <= 0 or topk > int(q2k_indices.shape[2]):
+        raise ValueError(f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}")
+    return B12XIndexerMSAContiguousBinding(
+        scratch=scratch,
+        metadata=IndexerContiguousMetadata(k_start=k_start, k_end=k_end),
+        block_scores=block_scores,
+        q2k_indices=q2k_indices,
+        topk_score_scratch=_require_msa_scratch_tensor(scratch, "msa_topk_score_scratch"),
+        topk_values=_require_msa_scratch_tensor(scratch, "msa_topk_values"),
+        topk_indices=_require_msa_scratch_tensor(scratch, "msa_topk_indices"),
+        sort_values=_require_msa_scratch_tensor(scratch, "msa_sort_values"),
+        sort_indices=_require_msa_scratch_tensor(scratch, "msa_sort_indices"),
+        topk=topk,
+        num_idx_heads=int(block_scores.shape[0]),
+        strict=True,
+    )
+
+
 @dataclass(frozen=True)
 class B12XIndexerPagedScratchPlan:
     caps: B12XIndexerPagedScratchCaps
@@ -1493,6 +2012,35 @@ class B12XIndexerPagedScratchPlan:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+        )
+
+    def bind_msa(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
+        topk: int | None = None,
+    ) -> B12XIndexerMSAPagedBinding:
+        scratch_storage = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="paged MSA indexer",
+        )
+        scratch_views = _materialize_indexer_paged_scratch(
+            self.caps,
+            scratch_storage,
+            self.layout,
+        )
+        return build_indexer_msa_paged_binding(
+            scratch=scratch_views,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            schedule_metadata=schedule_metadata,
+            topk=topk,
         )
 
 
@@ -1542,6 +2090,35 @@ class B12XIndexerContiguousScratchPlan:
             include_lengths=True,
             include_merge_positions=False,
             strict=True,
+        )
+
+    def bind_msa(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        k_start: torch.Tensor | None = None,
+        k_end: torch.Tensor | None = None,
+        topk: int | None = None,
+    ) -> B12XIndexerMSAContiguousBinding:
+        scratch_storage = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="indexer contiguous MSA",
+        )
+        scratch_views = _materialize_indexer_contiguous_scratch(
+            self.caps,
+            scratch_storage,
+            self.layout,
+        )
+        if k_start is None:
+            k_start = scratch_views.metadata_k_start
+        if k_end is None:
+            k_end = scratch_views.metadata_k_end
+        return build_indexer_msa_contiguous_binding(
+            scratch=scratch_views,
+            k_start=k_start,
+            k_end=k_end,
+            topk=self.caps.topk if topk is None else topk,
         )
 
 def plan_indexer_paged_scratch(
@@ -1600,6 +2177,9 @@ class B12XIndexerScratchPlan:
     def bind(self, **kwargs):
         return self.inner.bind(**kwargs)
 
+    def bind_msa(self, **kwargs):
+        return self.inner.bind_msa(**kwargs)
+
 
 def plan_indexer_scratch(
     caps: B12XIndexerScratchCaps,
@@ -1624,6 +2204,8 @@ def plan_indexer_scratch(
                 mode=caps.mode,
                 shared_page_table=caps.shared_page_table,
                 route=caps.route,
+                score_mode=caps.score_mode,
+                num_idx_heads=caps.num_idx_heads,
             )
         )
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS:
@@ -1640,6 +2222,8 @@ def plan_indexer_scratch(
                     caps.supertile_k if caps.supertile_k > 0 else caps.max_k_rows
                 ),
                 prefill_block_k=caps.prefill_block_k,
+                score_mode=caps.score_mode,
+                num_idx_heads=caps.num_idx_heads,
             )
         )
     else:
@@ -1656,6 +2240,8 @@ __all__ = [
     "B12XIndexerPagedScratchCaps",
     "B12XIndexerPagedScratchPlan",
     "B12XIndexerContiguousBinding",
+    "B12XIndexerMSAPagedBinding",
+    "B12XIndexerMSAContiguousBinding",
     "B12XIndexerContiguousScratch",
     "B12XIndexerContiguousScratchCaps",
     "B12XIndexerContiguousScratchPlan",
@@ -1663,6 +2249,8 @@ __all__ = [
     "INDEXER_SOURCE_LAYOUT_PAGED",
     "build_indexer_paged_binding",
     "build_indexer_contiguous_binding",
+    "build_indexer_msa_paged_binding",
+    "build_indexer_msa_contiguous_binding",
     "plan_indexer_scratch",
     "plan_indexer_paged_scratch",
     "plan_indexer_contiguous_scratch",

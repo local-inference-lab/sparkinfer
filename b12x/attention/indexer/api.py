@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -9,6 +10,8 @@ from functools import lru_cache
 import torch
 
 from .kernel import (
+    IndexerScoreMode,
+    IndexerOutputMode,
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _should_use_schedule_multi_row_kernel,
     clear_indexer_kernel_cache,
@@ -23,8 +26,17 @@ from .contiguous_kernel import (
     _PREFILL_BLOCK_Q,
     build_indexer_contiguous_logits_kernel_binding,
     resolve_contiguous_prefill_block_k,
+    run_contiguous_block_scores_kernel,
     run_contiguous_logits_kernel,
     supports_contiguous_logits_kernel,
+)
+from .msa_reference import (
+    MSA_BLOCK_TOKENS,
+    MSA_SM_SCALE,
+    MSA_TOPK_BLOCKS,
+    msa_contiguous_block_scores_reference,
+    msa_paged_decode_block_scores_reference,
+    quantize_msa_q_fp8_reference,
 )
 from .reference import contiguous_logits_reference
 from .schedule_metadata import (
@@ -40,6 +52,7 @@ from .persistent_topk import clear_persistent_topk2048_kernel_cache
 
 
 _INDEX_HEAD_DIM = 128
+_INT32_MAX = torch.iinfo(torch.int32).max
 _VALIDATE_PAGE_IDS = bool(int(os.getenv("B12X_NSA_VALIDATE_PAGE_IDS", "0")))
 
 
@@ -205,6 +218,239 @@ def _make_active_width_tensor(
     return torch.minimum(active_width, width_cap)
 
 
+def quantize_msa_q_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize MSA index-Q rows into the production FP8+scale contract."""
+
+    return quantize_msa_q_fp8_reference(q)
+
+
+def msa_decode_query_positions(cache_seqlens_int32: torch.Tensor) -> torch.Tensor:
+    """Return decode query token positions from cache lengths."""
+
+    if cache_seqlens_int32.ndim != 1:
+        raise ValueError(
+            f"cache_seqlens_int32 must be rank-1, got {tuple(cache_seqlens_int32.shape)}"
+        )
+    if cache_seqlens_int32.dtype != torch.int32:
+        raise ValueError(
+            f"cache_seqlens_int32 must have dtype torch.int32, got {cache_seqlens_int32.dtype}"
+        )
+    return cache_seqlens_int32 - 1
+
+
+def msa_prefill_query_positions(
+    cu_seqlens_q: torch.Tensor,
+    total_q: int,
+) -> torch.Tensor:
+    """Return packed prefill query token positions."""
+
+    if cu_seqlens_q.ndim != 1:
+        raise ValueError(f"cu_seqlens_q must be rank-1, got {tuple(cu_seqlens_q.shape)}")
+    if cu_seqlens_q.dtype != torch.int32:
+        raise ValueError(f"cu_seqlens_q must have dtype torch.int32, got {cu_seqlens_q.dtype}")
+    total_q = int(total_q)
+    if total_q < 0:
+        raise ValueError(f"total_q must be non-negative, got {total_q}")
+    return torch.arange(total_q, dtype=torch.int32, device=cu_seqlens_q.device)
+
+
+def _validate_msa_block_scores_selection(
+    *,
+    block_scores: torch.Tensor,
+    query_positions: torch.Tensor,
+    block_base: torch.Tensor | None,
+    topk: int,
+    out_indices: torch.Tensor | None,
+) -> tuple[int, int, int]:
+    if block_scores.ndim != 3:
+        raise ValueError(f"block_scores must be rank-3, got {tuple(block_scores.shape)}")
+    if block_scores.dtype != torch.float32:
+        raise ValueError(f"block_scores must have dtype torch.float32, got {block_scores.dtype}")
+    num_heads, q_rows, num_blocks = map(int, block_scores.shape)
+    if query_positions.ndim != 1 or query_positions.shape[0] != q_rows:
+        raise ValueError(
+            f"query_positions must have shape ({q_rows},), got {tuple(query_positions.shape)}"
+        )
+    if query_positions.dtype != torch.int32:
+        raise ValueError(f"query_positions must have dtype torch.int32, got {query_positions.dtype}")
+    if query_positions.device != block_scores.device:
+        raise ValueError("query_positions device must match block_scores")
+    if block_base is not None:
+        if block_base.ndim != 1 or block_base.shape[0] != q_rows:
+            raise ValueError(f"block_base must have shape ({q_rows},), got {tuple(block_base.shape)}")
+        if block_base.dtype != torch.int32:
+            raise ValueError(f"block_base must have dtype torch.int32, got {block_base.dtype}")
+        if block_base.device != block_scores.device:
+            raise ValueError("block_base device must match block_scores")
+    if out_indices is not None:
+        if out_indices.dtype != torch.int32:
+            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+        if out_indices.device != block_scores.device:
+            raise ValueError("out_indices device must match block_scores")
+        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+            raise ValueError(
+                f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
+                f"got {tuple(out_indices.shape)}"
+            )
+    return num_heads, q_rows, num_blocks
+
+
+def msa_topk_blocks(
+    *,
+    block_scores: torch.Tensor,
+    query_positions: torch.Tensor,
+    block_base: torch.Tensor | None = None,
+    topk: int = MSA_TOPK_BLOCKS,
+    out_indices: torch.Tensor | None = None,
+    score_scratch: torch.Tensor | None = None,
+    top_values: torch.Tensor | None = None,
+    top_indices: torch.Tensor | None = None,
+    sort_values: torch.Tensor | None = None,
+    sort_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select MSA block ids from raw block scores.
+
+    Output ids are ascending and batch-local when ``block_base`` is provided.
+    Invalid trailing entries are ``-1``.
+    """
+
+    topk = int(topk)
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
+    num_heads, q_rows, num_blocks = _validate_msa_block_scores_selection(
+        block_scores=block_scores,
+        query_positions=query_positions,
+        block_base=block_base,
+        topk=topk,
+        out_indices=out_indices,
+    )
+    if out_indices is None:
+        result = torch.full(
+            (num_heads, q_rows, topk),
+            -1,
+            dtype=torch.int32,
+            device=block_scores.device,
+        )
+    else:
+        result = out_indices[:num_heads, :q_rows, :topk]
+        result.fill_(-1)
+    if topk == 0 or num_blocks == 0:
+        return result
+
+    if score_scratch is not None:
+        if score_scratch.dtype != torch.float32 or score_scratch.device != block_scores.device:
+            raise ValueError("score_scratch must be float32 on the block_scores device")
+        if (
+            score_scratch.ndim != 3
+            or score_scratch.shape[0] < num_heads
+            or score_scratch.shape[1] < q_rows
+            or score_scratch.shape[2] < num_blocks
+        ):
+            raise ValueError(
+                f"score_scratch must have shape at least ({num_heads}, {q_rows}, {num_blocks}), "
+                f"got {tuple(score_scratch.shape)}"
+            )
+        scores = score_scratch[:num_heads, :q_rows, :num_blocks]
+        scores.copy_(block_scores)
+    else:
+        scores = block_scores.clone()
+    local_blocks = torch.div(query_positions, MSA_BLOCK_TOKENS, rounding_mode="floor")
+    valid_local = (local_blocks >= 0) & (local_blocks < num_blocks)
+    scatter_idx = (
+        local_blocks.clamp(min=0, max=num_blocks - 1)
+        .to(torch.long)
+        .view(1, q_rows, 1)
+        .expand(num_heads, q_rows, 1)
+    )
+    current_local = torch.gather(scores, 2, scatter_idx)
+    force_values = torch.where(
+        valid_local.view(1, q_rows, 1),
+        torch.full_like(current_local, float("inf")),
+        current_local,
+    )
+    scores.scatter_(2, scatter_idx, force_values)
+
+    gather_k = min(topk, num_blocks)
+    topk_out = None
+    if top_values is not None or top_indices is not None:
+        if top_values is None or top_indices is None:
+            raise ValueError("top_values and top_indices must be provided together")
+        if top_values.dtype != torch.float32 or top_values.device != block_scores.device:
+            raise ValueError("top_values must be float32 on the block_scores device")
+        if top_indices.dtype != torch.int64 or top_indices.device != block_scores.device:
+            raise ValueError("top_indices must be int64 on the block_scores device")
+        if (
+            top_values.ndim != 3
+            or top_indices.ndim != 3
+            or top_values.shape[0] < num_heads
+            or top_values.shape[1] < q_rows
+            or top_values.shape[2] < gather_k
+            or top_indices.shape[0] < num_heads
+            or top_indices.shape[1] < q_rows
+            or top_indices.shape[2] < gather_k
+        ):
+            raise ValueError("top-k scratch tensors are too small")
+        topk_out = (
+            top_values[:num_heads, :q_rows, :gather_k],
+            top_indices[:num_heads, :q_rows, :gather_k],
+        )
+    top_values, top_indices = torch.topk(
+        scores,
+        k=gather_k,
+        dim=2,
+        largest=True,
+        sorted=False,
+        out=topk_out,
+    )
+    if out_indices is not None:
+        local_indices = result[:, :, :gather_k]
+        local_indices.copy_(top_indices)
+        if block_base is not None:
+            local_indices.sub_(block_base.view(1, q_rows, 1))
+    elif sort_values is not None:
+        if sort_values.dtype != torch.int32 or sort_values.device != block_scores.device:
+            raise ValueError("sort_values must be int32 on the block_scores device")
+        if (
+            sort_values.ndim != 3
+            or sort_values.shape[0] < num_heads
+            or sort_values.shape[1] < q_rows
+            or sort_values.shape[2] < gather_k
+        ):
+            raise ValueError("sort_values scratch tensor is too small")
+        local_indices = sort_values[:num_heads, :q_rows, :gather_k]
+        local_indices.copy_(top_indices)
+        if block_base is not None:
+            local_indices.sub_(block_base.view(1, q_rows, 1))
+    else:
+        local_indices = top_indices.to(torch.int32)
+        if block_base is not None:
+            local_indices = local_indices - block_base.view(1, q_rows, 1)
+    valid = (top_values > float("-inf")) & (local_indices >= 0)
+    local_indices.masked_fill_(~valid, _INT32_MAX)
+    sort_out = None
+    if sort_values is not None and sort_indices is not None:
+        if sort_indices.dtype != torch.int64 or sort_indices.device != block_scores.device:
+            raise ValueError("sort_indices must be int64 on the block_scores device")
+        if (
+            sort_indices.ndim != 3
+            or sort_indices.shape[0] < num_heads
+            or sort_indices.shape[1] < q_rows
+            or sort_indices.shape[2] < gather_k
+        ):
+            raise ValueError("sort_indices scratch tensor is too small")
+        sort_out = (
+            sort_values[:num_heads, :q_rows, :gather_k],
+            sort_indices[:num_heads, :q_rows, :gather_k],
+        )
+    if sort_out is None:
+        sorted_indices = torch.sort(local_indices, dim=2).values
+    else:
+        sorted_indices = torch.sort(local_indices, dim=2, out=sort_out).values
+    sorted_indices.masked_fill_(sorted_indices == _INT32_MAX, -1)
+    result[:, :, :gather_k].copy_(sorted_indices)
+    return result
+
+
 def _validate_paged_decode_inputs(
     *,
     q_fp8: torch.Tensor,
@@ -286,6 +532,7 @@ def paged_decode_logits(
     page_size: int = 64,
     preinitialize_invalid_logits: bool = True,
     active_width_override: torch.Tensor | None = None,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
     binding=None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -306,6 +553,9 @@ def paged_decode_logits(
         active_width_override = binding.active_width
     if metadata is None:
         raise TypeError("paged_decode_logits requires metadata or binding")
+    score_mode = int(score_mode)
+    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+        raise ValueError(f"unsupported indexer score_mode {score_mode}")
 
     weights_f = _validate_paged_decode_inputs(
         q_fp8=q_fp8,
@@ -413,6 +663,7 @@ def paged_decode_logits(
         active_width=active_width,
         page_size=page_size,
         preinitialize_invalid_logits=preinitialize_invalid_logits,
+        score_mode=score_mode,
     )
     if valid_q_rows == full_q_rows:
         return logits_valid
@@ -427,6 +678,302 @@ def paged_decode_logits(
     return logits
 
 
+def _validate_msa_q_inputs(
+    *,
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+) -> tuple[int, int]:
+    if q_fp8.ndim != 3:
+        raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
+    if q_fp8.shape[2] != _INDEX_HEAD_DIM:
+        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+    if q_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}")
+    if q_scale.ndim != 2 or q_scale.shape != q_fp8.shape[:2]:
+        raise ValueError(
+            f"q_scale must have shape {tuple(q_fp8.shape[:2])}, got {tuple(q_scale.shape)}"
+        )
+    if q_scale.dtype != torch.float32:
+        raise ValueError(f"q_scale must have dtype torch.float32, got {q_scale.dtype}")
+    if q_scale.device != q_fp8.device:
+        raise ValueError("q_scale device must match q_fp8")
+    return int(q_fp8.shape[0]), int(q_fp8.shape[1])
+
+
+def _validate_msa_block_scores_out(
+    *,
+    out: torch.Tensor | None,
+    num_heads: int,
+    q_rows: int,
+    num_blocks: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if out is None:
+        return None
+    if out.dtype != torch.float32:
+        raise ValueError(f"out must have dtype torch.float32, got {out.dtype}")
+    if out.device != device:
+        raise ValueError("out device must match q_fp8")
+    if out.ndim != 3 or out.shape[0] < num_heads or out.shape[1] < q_rows or out.shape[2] < num_blocks:
+        raise ValueError(
+            f"out must have shape at least ({num_heads}, {q_rows}, {num_blocks}), "
+            f"got {tuple(out.shape)}"
+        )
+    return out[:num_heads, :q_rows, :num_blocks]
+
+
+def msa_paged_decode_block_scores(
+    *,
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: IndexerPagedDecodeMetadata | None = None,
+    page_size: int = 64,
+    out: torch.Tensor | None = None,
+    binding=None,
+) -> torch.Tensor:
+    """Score MSA decode candidates and max-pool over 128-token KV blocks."""
+
+    active_width_override = None
+    page_scores_scratch = None
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("out", out),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "MSA paged binding owns metadata and block-score buffers; do not also pass "
+                f"{', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        active_width_override = getattr(binding, "active_width", None)
+        page_scores_scratch = getattr(binding, "page_scores", None)
+        out = getattr(binding, "block_scores", None)
+    if metadata is None:
+        raise TypeError("msa_paged_decode_block_scores requires metadata or binding")
+    q_rows, num_heads = _validate_msa_q_inputs(q_fp8=q_fp8, q_scale=q_scale)
+    if metadata.real_page_table.ndim != 2:
+        raise ValueError(
+            f"real_page_table must be rank-2, got {tuple(metadata.real_page_table.shape)}"
+        )
+    if metadata.cache_seqlens_int32.ndim != 1:
+        raise ValueError(
+            "cache_seqlens_int32 must be rank-1, got "
+            f"{tuple(metadata.cache_seqlens_int32.shape)}"
+        )
+    valid_q_rows = int(metadata.real_page_table.shape[0])
+    if metadata.cache_seqlens_int32.shape[0] != valid_q_rows:
+        raise ValueError("real_page_table rows must match cache_seqlens_int32")
+    if valid_q_rows > q_rows:
+        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+    width_tokens = int(metadata.real_page_table.shape[1]) * int(page_size)
+    num_blocks = math.ceil(width_tokens / MSA_BLOCK_TOKENS)
+    out_view = _validate_msa_block_scores_out(
+        out=out,
+        num_heads=num_heads,
+        q_rows=q_rows,
+        num_blocks=num_blocks,
+        device=q_fp8.device,
+    )
+    if out_view is None:
+        block_scores = torch.full(
+            (num_heads, q_rows, num_blocks),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    else:
+        block_scores = out_view
+        block_scores.fill_(float("-inf"))
+    if valid_q_rows == 0 or width_tokens == 0:
+        return block_scores
+
+    if q_fp8.device.type != "cuda":
+        ref = msa_paged_decode_block_scores_reference(
+            q_fp8=q_fp8,
+            q_scale=q_scale,
+            index_k_cache=index_k_cache,
+            real_page_table=metadata.real_page_table,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            page_size=page_size,
+        )
+        block_scores.copy_(ref[:, :q_rows, :num_blocks])
+        return block_scores
+
+    max_pages = int(metadata.real_page_table.shape[1])
+    use_page_max = (
+        os.getenv("B12X_MSA_DECODE_PAGEMAX", "1") != "0"
+        and uses_paged_mqa_schedule(q_rows=valid_q_rows, max_pages=max_pages)
+    )
+    if use_page_max:
+        weights = q_scale[:valid_q_rows].contiguous() * MSA_SM_SCALE
+        seqlens_valid = metadata.cache_seqlens_int32.contiguous()
+        if active_width_override is None:
+            active_width = _make_active_width_tensor(
+                seqlens_per_query=seqlens_valid,
+                width=width_tokens,
+            )
+        else:
+            active_width = active_width_override
+        schedule_metadata = metadata.paged_mqa_schedule_metadata
+        if schedule_metadata is None:
+            if _is_cuda_graph_capture_active(q_fp8.device):
+                raise ValueError(
+                    "paged_mqa_schedule_metadata must be precomputed before CUDA graph capture "
+                    "for MSA scheduled page-max decode"
+                )
+            schedule_metadata = build_paged_mqa_schedule_metadata(seqlens_valid, page_size)
+        page_scores = run_paged_logits_kernel(
+            q_fp8=q_fp8[:valid_q_rows],
+            weights=weights,
+            index_k_cache=index_k_cache,
+            real_page_table=metadata.real_page_table,
+            seqlens_per_query=seqlens_valid,
+            schedule_metadata=schedule_metadata,
+            active_width=active_width,
+            page_size=page_size,
+            preinitialize_invalid_logits=True,
+            score_mode=IndexerScoreMode.MSA_BILINEAR,
+            output_mode=IndexerOutputMode.PAGE_HEAD_MAX,
+            page_scores=page_scores_scratch,
+        )
+        paired = page_scores.view(num_heads, valid_q_rows, -1, 2).amax(dim=3)
+        block_scores[:, :valid_q_rows, :].copy_(paired[:, :, :num_blocks])
+        return block_scores
+
+    q_expanded = q_fp8[:valid_q_rows].contiguous().reshape(
+        valid_q_rows * num_heads,
+        1,
+        _INDEX_HEAD_DIM,
+    )
+    weights = (
+        q_scale[:valid_q_rows].contiguous().reshape(valid_q_rows * num_heads, 1)
+        * MSA_SM_SCALE
+    )
+    metadata_expanded = IndexerPagedDecodeMetadata(
+        real_page_table=metadata.real_page_table.repeat_interleave(num_heads, dim=0),
+        cache_seqlens_int32=metadata.cache_seqlens_int32.repeat_interleave(num_heads),
+        paged_mqa_schedule_metadata=None,
+    )
+    token_logits = paged_decode_logits(
+        q_fp8=q_expanded,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=metadata_expanded,
+        page_size=page_size,
+        preinitialize_invalid_logits=True,
+        score_mode=IndexerScoreMode.MSA_BILINEAR,
+    )
+    padded_width = num_blocks * MSA_BLOCK_TOKENS
+    if padded_width != width_tokens:
+        pooled_input = torch.full(
+            (valid_q_rows * num_heads, padded_width),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        pooled_input[:, :width_tokens].copy_(token_logits)
+    else:
+        pooled_input = token_logits
+    pooled = (
+        pooled_input.view(valid_q_rows, num_heads, num_blocks, MSA_BLOCK_TOKENS)
+        .amax(dim=3)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    block_scores[:, :valid_q_rows, :].copy_(pooled)
+    return block_scores
+
+
+def msa_q2k_indices_decode(
+    *,
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: IndexerPagedDecodeMetadata | None = None,
+    topk: int = MSA_TOPK_BLOCKS,
+    out_indices: torch.Tensor | None = None,
+    binding=None,
+) -> torch.Tensor:
+    """Run MSA decode score, block max-pool, local forcing, and top-k selection."""
+
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("out_indices", out_indices),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "MSA paged binding owns metadata and q2k output; do not also pass "
+                f"{', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        if getattr(binding, "topk", None) is not None:
+            topk = int(binding.topk)
+        out_indices = getattr(binding, "q2k_indices", None)
+    if metadata is None:
+        raise TypeError("msa_q2k_indices_decode requires metadata or binding")
+    q_rows, num_heads = _validate_msa_q_inputs(q_fp8=q_fp8, q_scale=q_scale)
+    topk = int(topk)
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
+    if out_indices is not None:
+        if out_indices.dtype != torch.int32:
+            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+        if out_indices.device != q_fp8.device:
+            raise ValueError("out_indices device must match q_fp8")
+        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+            raise ValueError(
+                f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
+                f"got {tuple(out_indices.shape)}"
+            )
+    valid_q_rows = int(metadata.real_page_table.shape[0])
+    if valid_q_rows > q_rows:
+        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+    block_scores = msa_paged_decode_block_scores(
+        q_fp8=q_fp8,
+        q_scale=q_scale,
+        index_k_cache=index_k_cache,
+        metadata=None if binding is not None else metadata,
+        binding=binding,
+    )
+    if out_indices is None:
+        result = torch.full(
+            (num_heads, q_rows, topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+    else:
+        result = out_indices[:num_heads, :q_rows, :topk]
+        result.fill_(-1)
+    if valid_q_rows == 0:
+        return result
+    selected = msa_topk_blocks(
+        block_scores=block_scores[:, :valid_q_rows, :],
+        query_positions=msa_decode_query_positions(metadata.cache_seqlens_int32),
+        topk=topk,
+        out_indices=result[:, :valid_q_rows, :],
+        score_scratch=getattr(binding, "topk_score_scratch", None) if binding is not None else None,
+        top_values=getattr(binding, "topk_values", None) if binding is not None else None,
+        top_indices=getattr(binding, "topk_indices", None) if binding is not None else None,
+        sort_values=getattr(binding, "sort_values", None) if binding is not None else None,
+        sort_indices=getattr(binding, "sort_indices", None) if binding is not None else None,
+    )
+    if selected.data_ptr() != result[:, :valid_q_rows, :].data_ptr():
+        result[:, :valid_q_rows, :].copy_(selected)
+    return result
+
+
 def contiguous_logits(
     *,
     q_fp8: torch.Tensor,
@@ -435,6 +982,7 @@ def contiguous_logits(
     metadata: IndexerContiguousMetadata | None = None,
     preinitialize_invalid_logits: bool = True,
     tile_logits: torch.Tensor | None = None,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
     binding=None,
 ) -> torch.Tensor:
     strict_binding = False
@@ -457,6 +1005,9 @@ def contiguous_logits(
         tile_logits = binding.tile_logits
     if metadata is None:
         raise TypeError("contiguous_logits requires metadata or binding")
+    score_mode = int(score_mode)
+    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+        raise ValueError(f"unsupported indexer score_mode {score_mode}")
     k_start = metadata.k_start
     k_end = metadata.k_end
     if q_fp8.ndim != 3:
@@ -499,8 +1050,14 @@ def contiguous_logits(
             k_end=k_end,
             preinitialize_invalid_logits=preinitialize_invalid_logits,
             tile_logits=tile_logits,
+            score_mode=score_mode,
         )
         return result
+
+    if score_mode != IndexerScoreMode.NSA_RELU_SUM:
+        raise NotImplementedError(
+            "contiguous_logits score_mode=MSA_BILINEAR requires the CUDA FP8 scorer contract"
+        )
 
     return contiguous_logits_reference(
         q_fp8=q_fp8,
@@ -509,6 +1066,223 @@ def contiguous_logits(
         k_start=k_start,
         k_end=k_end,
     )
+
+
+def msa_contiguous_block_scores(
+    *,
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    metadata: IndexerContiguousMetadata | None = None,
+    out: torch.Tensor | None = None,
+    binding=None,
+) -> torch.Tensor:
+    """Score MSA prefill candidates and max-pool over global 128-token K blocks."""
+
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("out", out),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "MSA contiguous binding owns metadata and block-score buffers; do not also pass "
+                f"{', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        out = getattr(binding, "block_scores", None)
+    if metadata is None:
+        raise TypeError("msa_contiguous_block_scores requires metadata or binding")
+    q_rows, num_heads = _validate_msa_q_inputs(q_fp8=q_fp8, q_scale=q_scale)
+    k_start = metadata.k_start
+    k_end = metadata.k_end
+    if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
+        raise ValueError("MSA contiguous metadata requires matching rank-1 k_start/k_end")
+    if k_start.shape[0] > q_rows:
+        raise ValueError(f"metadata describes {k_start.shape[0]} q rows, but q_fp8 has {q_rows}")
+    if k_start.dtype != torch.int32 or k_end.dtype != torch.int32:
+        raise ValueError("k_start and k_end must have dtype torch.int32")
+    if not _is_cuda_graph_capture_active(q_fp8.device):
+        misaligned = torch.remainder(k_start, MSA_BLOCK_TOKENS) != 0
+        if bool(torch.any(misaligned).item()):
+            raise ValueError("MSA contiguous k_start values must be 128-token aligned")
+    k_quant, k_scale = kv_fp8
+    k_rows = int(k_quant.shape[0])
+    num_blocks = math.ceil(k_rows / MSA_BLOCK_TOKENS)
+    out_view = _validate_msa_block_scores_out(
+        out=out,
+        num_heads=num_heads,
+        q_rows=q_rows,
+        num_blocks=num_blocks,
+        device=q_fp8.device,
+    )
+    if out_view is None:
+        block_scores = torch.full(
+            (num_heads, q_rows, num_blocks),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    else:
+        block_scores = out_view
+        block_scores.fill_(float("-inf"))
+    valid_q_rows = int(k_start.shape[0])
+    if valid_q_rows == 0 or k_rows == 0:
+        return block_scores
+
+    if q_fp8.device.type != "cuda":
+        ref = msa_contiguous_block_scores_reference(
+            q_fp8=q_fp8,
+            q_scale=q_scale,
+            kv_fp8=kv_fp8,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        block_scores.copy_(ref[:, :q_rows, :num_blocks])
+        return block_scores
+
+    weights = q_scale.contiguous() * MSA_SM_SCALE
+    kernel_kwargs = {}
+    if binding is not None and bool(getattr(binding, "strict", False)):
+        scratch = binding.scratch
+        if not hasattr(scratch, "prepare_k_padding"):
+            raise RuntimeError("strict MSA contiguous binding requires plan-owned scratch")
+        if not q_fp8.is_contiguous():
+            raise ValueError("strict MSA contiguous binding requires contiguous q_fp8")
+        if not k_quant.is_contiguous() or not k_scale.is_contiguous():
+            raise ValueError("strict MSA contiguous binding requires contiguous K tensors")
+        scratch.prepare_k_padding(k_rows=k_rows)
+        if k_quant.data_ptr() != scratch.k_quant.data_ptr():
+            raise ValueError("strict MSA contiguous K values must be a scratch prefix")
+        if k_scale.data_ptr() != scratch.k_scale.data_ptr():
+            raise ValueError("strict MSA contiguous K scales must be a scratch prefix")
+        q_bytes = q_fp8.view(torch.uint8)
+        kernel_kwargs.update(
+            q_bytes=q_bytes,
+            q_u32=q_bytes.view(torch.uint32).view(
+                int(q_fp8.shape[0]),
+                int(q_fp8.shape[1]),
+                _INDEX_HEAD_DIM // 4,
+            ),
+            weights_kernel=weights.contiguous(),
+            k_quant_bytes=scratch.k_quant.view(torch.uint8),
+            k_scale_kernel=scratch.k_scale,
+            k_start_kernel=k_start,
+            k_end_kernel=k_end,
+            out_kernel=scratch.dummy_logits,
+            tile_logits_kernel=scratch.tile_logits,
+            k_tma_prefill_desc_ptrs=scratch.k_tma_prefill_desc_ptrs,
+        )
+    return run_contiguous_block_scores_kernel(
+        q_fp8=q_fp8,
+        weights=weights,
+        k_quant=k_quant,
+        k_scale=k_scale,
+        k_start=k_start,
+        k_end=k_end,
+        block_scores=block_scores,
+        num_blocks_out=num_blocks,
+        **kernel_kwargs,
+    )
+
+
+def msa_q2k_indices_prefill(
+    *,
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    metadata: IndexerContiguousMetadata | None = None,
+    query_positions: torch.Tensor | None = None,
+    block_base: torch.Tensor | None = None,
+    topk: int = MSA_TOPK_BLOCKS,
+    out_indices: torch.Tensor | None = None,
+    binding=None,
+) -> torch.Tensor:
+    """Run MSA prefill score, block max-pool, local forcing, and top-k selection."""
+
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("metadata", metadata),
+                ("out_indices", out_indices),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "MSA contiguous binding owns metadata and q2k output; do not also pass "
+                f"{', '.join(extras)}"
+            )
+        metadata = binding.metadata
+        if getattr(binding, "topk", None) is not None:
+            topk = int(binding.topk)
+        out_indices = getattr(binding, "q2k_indices", None)
+    if metadata is None:
+        raise TypeError("msa_q2k_indices_prefill requires metadata or binding")
+    q_rows, num_heads = _validate_msa_q_inputs(q_fp8=q_fp8, q_scale=q_scale)
+    valid_q_rows = int(metadata.k_start.shape[0])
+    if valid_q_rows > q_rows:
+        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+    topk = int(topk)
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
+    if out_indices is not None:
+        if out_indices.dtype != torch.int32:
+            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+        if out_indices.device != q_fp8.device:
+            raise ValueError("out_indices device must match q_fp8")
+        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+            raise ValueError(
+                f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
+                f"got {tuple(out_indices.shape)}"
+            )
+    block_scores = msa_contiguous_block_scores(
+        q_fp8=q_fp8,
+        q_scale=q_scale,
+        kv_fp8=kv_fp8,
+        metadata=None if binding is not None else metadata,
+        binding=binding,
+    )
+    if out_indices is None:
+        result = torch.full(
+            (num_heads, q_rows, topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+    else:
+        result = out_indices[:num_heads, :q_rows, :topk]
+        result.fill_(-1)
+    if valid_q_rows == 0:
+        return result
+    if query_positions is None:
+        query_positions = metadata.k_end - 1
+    else:
+        query_positions = query_positions[:valid_q_rows]
+    if block_base is None:
+        block_base = torch.div(metadata.k_start, MSA_BLOCK_TOKENS, rounding_mode="floor")
+    else:
+        block_base = block_base[:valid_q_rows]
+    selected = msa_topk_blocks(
+        block_scores=block_scores[:, :valid_q_rows, :],
+        query_positions=query_positions,
+        block_base=block_base,
+        topk=topk,
+        out_indices=result[:, :valid_q_rows, :],
+        score_scratch=getattr(binding, "topk_score_scratch", None) if binding is not None else None,
+        top_values=getattr(binding, "topk_values", None) if binding is not None else None,
+        top_indices=getattr(binding, "topk_indices", None) if binding is not None else None,
+        sort_values=getattr(binding, "sort_values", None) if binding is not None else None,
+        sort_indices=getattr(binding, "sort_indices", None) if binding is not None else None,
+    )
+    if selected.data_ptr() != result[:, :valid_q_rows, :].data_ptr():
+        result[:, :valid_q_rows, :].copy_(selected)
+    return result
 
 
 def _reference_topk_indices_from_logits(

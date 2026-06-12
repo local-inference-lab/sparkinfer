@@ -39,6 +39,7 @@ from b12x.cute.fp4 import (
     st_global_v4_f32,
 )
 from b12x.cute.utils import current_cuda_stream
+from .kernel import IndexerScoreMode
 
 
 _INDEX_HEAD_DIM = 128
@@ -157,6 +158,7 @@ class IndexerContiguousLogitsKernelBinding:
     tile_k_offset: int = 0
     tile_num_k_tiles: int | None = None
     prefill_block_k: int | None = None
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM
     q_u32: torch.Tensor | None = None
     q_bytes: torch.Tensor | None = None
     weights_kernel: torch.Tensor | None = None
@@ -186,6 +188,7 @@ def build_indexer_contiguous_logits_kernel_binding(
     tile_k_offset: int = 0,
     tile_num_k_tiles: int | None = None,
     prefill_block_k: int | None = None,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
     q_u32: torch.Tensor | None = None,
     q_bytes: torch.Tensor | None = None,
     weights_kernel: torch.Tensor | None = None,
@@ -210,6 +213,7 @@ def build_indexer_contiguous_logits_kernel_binding(
         tile_k_offset=int(tile_k_offset),
         tile_num_k_tiles=None if tile_num_k_tiles is None else int(tile_num_k_tiles),
         prefill_block_k=None if prefill_block_k is None else int(prefill_block_k),
+        score_mode=int(score_mode),
         q_u32=q_u32,
         q_bytes=q_bytes,
         weights_kernel=weights_kernel,
@@ -388,9 +392,20 @@ def get_sparse_nsa_contiguous_prefill_shared_storage_cls():
             cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
             16,
         ],
+        "block_partial": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _PREFILL_WARPS_K * _PREFILL_BLOCK_Q],
+            16,
+        ],
     }
 
     return cute.struct(SharedStorage)
+
+
+@cute.jit
+def _reduce_quad_max(value: Float32) -> Float32:
+    value = attention_ops.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1))
+    value = attention_ops.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=2))
+    return value
 
 
 def _encode_contiguous_k_tma_descriptor_into(
@@ -885,8 +900,14 @@ class SparseNSAContiguousLogitsKernel:
     Phase 1+2+3: Q/weights from global, warp-ballot liveness, TMA SWIZZLE_128B (no k_linear/repack).
     """
 
-    def __init__(self, *, tiled_output: bool = False):
+    def __init__(
+        self,
+        *,
+        tiled_output: bool = False,
+        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    ):
         self._tiled_output = tiled_output
+        self._score_mode = int(score_mode)
 
     @cute.jit
     def __call__(
@@ -1091,15 +1112,21 @@ class SparseNSAContiguousLogitsKernel:
                     row_slot = (reg_id % 4) // 2
                     q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
                     if q_local < Int32(_BLOCK_Q):
-                        acc_frag[0, 0, reg_id] = Float32(
-                            acc_frag[0, 0, reg_id]
-                            + attention_ops.fmax(score_frag[0, 0, reg_id], Float32(0.0))
-                            * (
-                                Float32(weights[q_tile_base + q_local, head_idx])
-                                if q_tile_base + q_local < valid_q_rows
-                                else Float32(0.0)
-                            )
+                        w_val = (
+                            Float32(weights[q_tile_base + q_local, head_idx])
+                            if q_tile_base + q_local < valid_q_rows
+                            else Float32(0.0)
                         )
+                        if cutlass.const_expr(self._score_mode == IndexerScoreMode.MSA_BILINEAR):
+                            acc_frag[0, 0, reg_id] = Float32(
+                                acc_frag[0, 0, reg_id] + score_frag[0, 0, reg_id] * w_val
+                            )
+                        else:
+                            acc_frag[0, 0, reg_id] = Float32(
+                                acc_frag[0, 0, reg_id]
+                                + attention_ops.fmax(score_frag[0, 0, reg_id], Float32(0.0))
+                                * w_val
+                            )
                 head_idx += Int32(1)
 
             lane_group = lane // Int32(4)
@@ -1423,8 +1450,16 @@ class SparseNSAContiguousLogitsPrefillKernel:
     global reads.
     """
 
-    def __init__(self, *, tiled_output: bool = False):
+    def __init__(
+        self,
+        *,
+        tiled_output: bool = False,
+        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        block_score_output: bool = False,
+    ):
         self._tiled_output = tiled_output
+        self._score_mode = int(score_mode)
+        self._block_score_output = bool(block_score_output)
 
     @cute.jit
     def __call__(
@@ -1438,8 +1473,10 @@ class SparseNSAContiguousLogitsPrefillKernel:
         k_end: cute.Tensor,
         logits_out: cute.Tensor,
         tile_logits: cute.Tensor,
+        block_scores: cute.Tensor,
         valid_q_rows: Int32,
         valid_k_rows: Int32,
+        num_blocks_out: Int32,
         k_tile_offset: Int32,
         output_num_k_tiles: Int32,
         write_invalid_logits: Int32,
@@ -1465,8 +1502,10 @@ class SparseNSAContiguousLogitsPrefillKernel:
             k_end,
             logits_out,
             tile_logits,
+            block_scores,
             valid_q_rows,
             valid_k_rows,
+            num_blocks_out,
             k_tile_offset,
             output_num_k_tiles,
             write_invalid_logits,
@@ -1495,8 +1534,10 @@ class SparseNSAContiguousLogitsPrefillKernel:
         k_end: cute.Tensor,
         logits_out: cute.Tensor,
         tile_logits: cute.Tensor,
+        block_scores: cute.Tensor,
         valid_q_rows: Int32,
         valid_k_rows: Int32,
+        num_blocks_out: Int32,
         k_tile_offset: Int32,
         output_num_k_tiles: Int32,
         write_invalid_logits: Int32,
@@ -1515,6 +1556,7 @@ class SparseNSAContiguousLogitsPrefillKernel:
         valid_q_rows = Int32(valid_q_rows)
         k_total_rows = Int32(valid_k_rows)
         TILED_OUTPUT = cutlass.const_expr(self._tiled_output)
+        BLOCK_SCORE_OUTPUT = cutlass.const_expr(self._block_score_output)
         num_heads = Int32(q_u32.shape[1])
 
         smem = cutlass.utils.SmemAllocator()
@@ -1547,6 +1589,12 @@ class SparseNSAContiguousLogitsPrefillKernel:
             cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,))
         )
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
+        s_block_partial = storage.block_partial.get_tensor(
+            cute.make_layout(
+                (_PREFILL_WARPS_K, _PREFILL_BLOCK_Q),
+                stride=(_PREFILL_BLOCK_Q, 1),
+            )
+        )
 
         if tx == 0:
             cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
@@ -1736,23 +1784,95 @@ class SparseNSAContiguousLogitsPrefillKernel:
                         w_rs1 = ld_shared_f32(
                             w_smem_base + w_off_rs1 + head_idx * Int32(4)
                         )
-                        for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
-                            for reg_id in cutlass.range_constexpr(8):
-                                row_slot = (reg_id % 4) // 2
-                                q_local = (
-                                    warp_q_idx * Int32(16)
-                                    + lane_group
-                                    + Int32(8 * row_slot)
-                                )
-                                w_val = w_rs0 if row_slot == Int32(0) else w_rs1
-                                acc_frag[Int32(0), mma_kv, reg_id] = Float32(
-                                    acc_frag[Int32(0), mma_kv, reg_id]
-                                    + attention_ops.fmax(
-                                        score_frag[Int32(0), mma_kv, reg_id],
-                                        Float32(0.0),
+                        if BLOCK_SCORE_OUTPUT:
+                            lane_pair_base = Int32(2) * (lane % Int32(4))
+                            local_max_rs0 = Float32(-Float32.inf)
+                            local_max_rs1 = Float32(-Float32.inf)
+                            for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                                for reg_id in cutlass.range_constexpr(8):
+                                    row_slot = (reg_id % 4) // 2
+                                    q_local = (
+                                        warp_q_idx * Int32(16)
+                                        + lane_group
+                                        + Int32(8 * row_slot)
                                     )
-                                    * w_val
+                                    k_local = (
+                                        warp_k_idx * Int32(_PREFILL_NUM_MMA_KV * 16)
+                                        + mma_kv * Int32(16)
+                                        + lane_pair_base
+                                        + Int32(8 * (reg_id // 4))
+                                        + Int32(reg_id % 2)
+                                    )
+                                    q_row = q_tile_base + q_local
+                                    k_row = k_tile_base + k_local
+                                    row_start = Int32(s_k_start[q_local])
+                                    row_end = Int32(s_k_end[q_local])
+                                    if (
+                                        q_row < valid_q_rows
+                                        and k_row < k_total_rows
+                                        and k_row >= row_start
+                                        and k_row < row_end
+                                    ):
+                                        w_val = w_rs0 if row_slot == Int32(0) else w_rs1
+                                        score = Float32(
+                                            score_frag[Int32(0), mma_kv, reg_id]
+                                            * w_val
+                                            * s_scales[k_local]
+                                        )
+                                        if row_slot == Int32(0):
+                                            local_max_rs0 = attention_ops.fmax(
+                                                local_max_rs0,
+                                                score,
+                                            )
+                                        else:
+                                            local_max_rs1 = attention_ops.fmax(
+                                                local_max_rs1,
+                                                score,
+                                            )
+                            local_max_rs0 = _reduce_quad_max(local_max_rs0)
+                            local_max_rs1 = _reduce_quad_max(local_max_rs1)
+                            if lane % Int32(4) == Int32(0):
+                                s_block_partial[warp_k_idx, q_local_rs0] = local_max_rs0
+                                s_block_partial[warp_k_idx, q_local_rs1] = local_max_rs1
+                            cute.arch.sync_threads()
+                            if tx < Int32(64):
+                                q_local_out = tx % Int32(_PREFILL_BLOCK_Q)
+                                block_local = tx // Int32(_PREFILL_BLOCK_Q)
+                                block_idx = k_tile_idx * Int32(2) + block_local
+                                q_row_out = q_tile_base + q_local_out
+                                v = attention_ops.fmax(
+                                    s_block_partial[block_local * Int32(2), q_local_out],
+                                    s_block_partial[block_local * Int32(2) + Int32(1), q_local_out],
                                 )
+                                if q_row_out < valid_q_rows and block_idx < num_blocks_out:
+                                    block_scores[head_idx, q_row_out, block_idx] = v
+                            cute.arch.sync_threads()
+                        else:
+                            for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                                for reg_id in cutlass.range_constexpr(8):
+                                    row_slot = (reg_id % 4) // 2
+                                    q_local = (
+                                        warp_q_idx * Int32(16)
+                                        + lane_group
+                                        + Int32(8 * row_slot)
+                                    )
+                                    w_val = w_rs0 if row_slot == Int32(0) else w_rs1
+                                    if cutlass.const_expr(
+                                        self._score_mode == IndexerScoreMode.MSA_BILINEAR
+                                    ):
+                                        acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                                            acc_frag[Int32(0), mma_kv, reg_id]
+                                            + score_frag[Int32(0), mma_kv, reg_id] * w_val
+                                        )
+                                    else:
+                                        acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                                            acc_frag[Int32(0), mma_kv, reg_id]
+                                            + attention_ops.fmax(
+                                                score_frag[Int32(0), mma_kv, reg_id],
+                                                Float32(0.0),
+                                            )
+                                            * w_val
+                                        )
                 # The next batch reuses the same Q shared-memory slots.
                 cute.arch.sync_threads()
                 batch_base_head += Int32(_PREFILL_Q_HEADS_BATCH)
@@ -1760,7 +1880,9 @@ class SparseNSAContiguousLogitsPrefillKernel:
             # Write back — each K-warp covers NUM_MMA_KV * 16 K-rows
             lane_group = lane // Int32(4)
             lane_pair_base = Int32(2) * (lane % Int32(4))
-            if TILED_OUTPUT:
+            if BLOCK_SCORE_OUTPUT:
+                pass
+            elif TILED_OUTPUT:
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
@@ -1825,7 +1947,9 @@ class SparseNSAContiguousLogitsPrefillKernel:
                             elif write_invalid_logits != Int32(0):
                                 logits_out[q_row, k_row] = Float32(-Float32.inf)
         else:
-            if TILED_OUTPUT:
+            if BLOCK_SCORE_OUTPUT:
+                pass  # dead tile; host -inf prefill covers block scores
+            elif TILED_OUTPUT:
                 pass  # dead tile; topk filters with k_start/lengths
             elif write_invalid_logits != Int32(0):
                 lane_group = lane // Int32(4)
@@ -1867,9 +1991,11 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
         *,
         tiled_output: bool = False,
         q_heads_batch: int = _PREFILL512_Q_HEADS_BATCH,
+        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
     ):
         self._tiled_output = tiled_output
         self._q_heads_batch = int(q_heads_batch)
+        self._score_mode = int(score_mode)
 
     @cute.jit
     def __call__(
@@ -2184,14 +2310,22 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
                                 w_val = w_rs0 if row_slot == Int32(0) else w_rs1
-                                acc_frag[Int32(0), mma_kv, reg_id] = Float32(
-                                    acc_frag[Int32(0), mma_kv, reg_id]
-                                    + attention_ops.fmax(
-                                        score_frag[Int32(0), mma_kv, reg_id],
-                                        Float32(0.0),
+                                if cutlass.const_expr(
+                                    self._score_mode == IndexerScoreMode.MSA_BILINEAR
+                                ):
+                                    acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                                        acc_frag[Int32(0), mma_kv, reg_id]
+                                        + score_frag[Int32(0), mma_kv, reg_id] * w_val
                                     )
-                                    * w_val
-                                )
+                                else:
+                                    acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                                        acc_frag[Int32(0), mma_kv, reg_id]
+                                        + attention_ops.fmax(
+                                            score_frag[Int32(0), mma_kv, reg_id],
+                                            Float32(0.0),
+                                        )
+                                        * w_val
+                                    )
                 cute.arch.sync_threads()
                 batch_base_head += Int32(Q_HEADS_BATCH)
 
@@ -2381,9 +2515,16 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
 
 @lru_cache(maxsize=16)
 def _build_sparse_nsa_contiguous_prefill_kernel(
-    *, tiled_output: bool = False
+    *,
+    tiled_output: bool = False,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    block_score_output: bool = False,
 ) -> SparseNSAContiguousLogitsPrefillKernel:
-    return SparseNSAContiguousLogitsPrefillKernel(tiled_output=tiled_output)
+    return SparseNSAContiguousLogitsPrefillKernel(
+        tiled_output=tiled_output,
+        score_mode=score_mode,
+        block_score_output=block_score_output,
+    )
 
 
 @lru_cache(maxsize=16)
@@ -2391,20 +2532,30 @@ def _build_sparse_nsa_contiguous_prefill512_kernel(
     *,
     tiled_output: bool = False,
     num_heads: int = 0,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
 ) -> SparseNSAContiguousLogitsPrefill512Kernel:
     if int(num_heads) == _PREFILL512_H32_WEIGHT_COLS:
         return SparseNSAContiguousLogitsPrefill512Kernel(
             tiled_output=tiled_output,
             q_heads_batch=_PREFILL512_H32_Q_HEADS_BATCH,
+            score_mode=score_mode,
         )
-    return SparseNSAContiguousLogitsPrefill512Kernel(tiled_output=tiled_output)
+    return SparseNSAContiguousLogitsPrefill512Kernel(
+        tiled_output=tiled_output,
+        score_mode=score_mode,
+    )
 
 
 @lru_cache(maxsize=16)
 def _build_sparse_nsa_contiguous_kernel(
-    *, tiled_output: bool = False
+    *,
+    tiled_output: bool = False,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
 ) -> SparseNSAContiguousLogitsKernel:
-    return SparseNSAContiguousLogitsKernel(tiled_output=tiled_output)
+    return SparseNSAContiguousLogitsKernel(
+        tiled_output=tiled_output,
+        score_mode=score_mode,
+    )
 
 
 def _use_sparse_nsa_contiguous_prefill(valid_q_rows: int) -> bool:
@@ -2544,6 +2695,7 @@ def run_contiguous_logits_kernel(
     tile_k_offset: int | None = None,
     tile_num_k_tiles: int | None = None,
     prefill_block_k: int | None = None,
+    score_mode: int | None = None,
     binding: IndexerContiguousLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     staged_binding = binding
@@ -2562,6 +2714,7 @@ def run_contiguous_logits_kernel(
                 ("tile_k_offset", tile_k_offset),
                 ("tile_num_k_tiles", tile_num_k_tiles),
                 ("prefill_block_k", prefill_block_k),
+                ("score_mode", score_mode),
             )
             if value is not None
         ]
@@ -2578,6 +2731,7 @@ def run_contiguous_logits_kernel(
         tile_k_offset = binding.tile_k_offset
         tile_num_k_tiles = binding.tile_num_k_tiles
         prefill_block_k = binding.prefill_block_k
+        score_mode = binding.score_mode
 
     q_fp8 = _require_bound_arg(q_fp8, api_name="run_contiguous_logits_kernel", name="q_fp8")
     weights = _require_bound_arg(
@@ -2599,6 +2753,11 @@ def run_contiguous_logits_kernel(
         else bool(preinitialize_invalid_logits)
     )
     tile_k_offset = 0 if tile_k_offset is None else int(tile_k_offset)
+    score_mode = (
+        IndexerScoreMode.NSA_RELU_SUM if score_mode is None else int(score_mode)
+    )
+    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+        raise ValueError(f"unsupported indexer score_mode {score_mode}")
 
     if not supports_contiguous_logits_kernel(
         q_fp8=q_fp8,
@@ -2781,11 +2940,19 @@ def run_contiguous_logits_kernel(
         kernel = _build_sparse_nsa_contiguous_prefill512_kernel(
             tiled_output=_tiled_output,
             num_heads=int(q_fp8.shape[1]),
+            score_mode=score_mode,
         )
     elif _use_prefill:
-        kernel = _build_sparse_nsa_contiguous_prefill_kernel(tiled_output=_tiled_output)
+        kernel = _build_sparse_nsa_contiguous_prefill_kernel(
+            tiled_output=_tiled_output,
+            score_mode=score_mode,
+            block_score_output=False,
+        )
     else:
-        kernel = _build_sparse_nsa_contiguous_kernel(tiled_output=_tiled_output)
+        kernel = _build_sparse_nsa_contiguous_kernel(
+            tiled_output=_tiled_output,
+            score_mode=score_mode,
+        )
 
     if tile_logits is not None and _tiled_output:
         tile_logits_kernel = tile_logits
@@ -2793,8 +2960,32 @@ def run_contiguous_logits_kernel(
         tile_logits_kernel = torch.empty(
             (1, 1), dtype=torch.float32, device=q_fp8.device
         )
+    block_scores_kernel = torch.empty(
+        (1, 1, 1), dtype=torch.float32, device=q_fp8.device
+    )
 
-    if _use_prefill:
+    if _use_prefill and _prefill_block_k == _PREFILL_BLOCK_K:
+        write_invalid_logits = 0 if preinitialize_invalid_logits else 1
+        args = (
+            _to_kernel_tensor(q_u32, cutlass.Uint32),
+            _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
+            _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
+            _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
+            _to_kernel_tensor(k_scale_kernel, cutlass.Float32, assumed_align=4),
+            _to_kernel_tensor(k_start_kernel, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(k_end_kernel, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(out_kernel, cutlass.Float32, assumed_align=4),
+            _to_kernel_tensor(tile_logits_kernel, cutlass.Float32, assumed_align=4),
+            _to_kernel_tensor(block_scores_kernel, cutlass.Float32, assumed_align=4),
+            valid_q_rows,
+            k_rows,
+            Int32(0),
+            Int32(tile_k_offset),
+            Int32(output_num_k_tiles),
+            write_invalid_logits,
+            current_cuda_stream(),
+        )
+    elif _use_prefill:
         write_invalid_logits = 0 if preinitialize_invalid_logits else 1
         args = (
             _to_kernel_tensor(q_u32, cutlass.Uint32),
@@ -2883,8 +3074,19 @@ def run_contiguous_logits_kernel(
                 dynamic=True,
             ),
             (
+                _flat_tensor_compile_key(
+                    "contiguous_block_scores",
+                    block_scores_kernel,
+                    dynamic=True,
+                )
+                if _prefill_block_k == _PREFILL_BLOCK_K
+                else ("contiguous_block_scores", "unused")
+            ),
+            (
                 _prefill_cache_variant,
                 _tiled_output,
+                score_mode,
+                False,
             ),
         )
     else:
@@ -2922,7 +3124,7 @@ def run_contiguous_logits_kernel(
             _flat_tensor_compile_key(
                 "contiguous_tile_logits", tile_logits_kernel, dynamic=True
             ),
-            ("decode", _tiled_output),
+            ("decode", _tiled_output, score_mode),
         )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.contiguous_logits",
@@ -2938,3 +3140,158 @@ def run_contiguous_logits_kernel(
     if _tiled_output and _use_prefill:
         return tile_logits
     return out_view
+
+
+def run_contiguous_block_scores_kernel(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    k_quant: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    block_scores: torch.Tensor | None = None,
+    num_blocks_out: int | None = None,
+    q_u32: torch.Tensor | None = None,
+    q_bytes: torch.Tensor | None = None,
+    weights_kernel: torch.Tensor | None = None,
+    k_quant_bytes: torch.Tensor | None = None,
+    k_scale_kernel: torch.Tensor | None = None,
+    k_start_kernel: torch.Tensor | None = None,
+    k_end_kernel: torch.Tensor | None = None,
+    out_kernel: torch.Tensor | None = None,
+    tile_logits_kernel: torch.Tensor | None = None,
+    k_tma_prefill_desc_ptrs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if not supports_contiguous_logits_kernel(
+        q_fp8=q_fp8,
+        weights=weights,
+        k_quant=k_quant,
+        k_scale=k_scale,
+        k_start=k_start,
+        k_end=k_end,
+    ):
+        raise ValueError(
+            "MSA contiguous block-score kernel only supports the production CUDA FP8 contract"
+        )
+    if int(q_fp8.shape[1]) > 8:
+        raise ValueError("MSA contiguous block-score kernel supports at most 8 index heads")
+    if weights.dtype != torch.float32:
+        raise ValueError(f"weights must have dtype torch.float32, got {weights.dtype}")
+    q_rows_total = int(q_fp8.shape[0])
+    valid_q_rows = int(k_start.shape[0])
+    k_rows = int(k_quant.shape[0])
+    num_heads = int(q_fp8.shape[1])
+    inferred_blocks = (k_rows + _PREFILL_BLOCK_K // 2 - 1) // (_PREFILL_BLOCK_K // 2)
+    if num_blocks_out is None:
+        num_blocks_out = inferred_blocks
+    num_blocks_out = int(num_blocks_out)
+    if num_blocks_out < inferred_blocks:
+        raise ValueError(
+            f"num_blocks_out {num_blocks_out} is smaller than required {inferred_blocks}"
+        )
+    if block_scores is None:
+        block_scores = torch.full(
+            (num_heads, q_rows_total, num_blocks_out),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    else:
+        if block_scores.dtype != torch.float32:
+            raise ValueError(f"block_scores must have dtype torch.float32, got {block_scores.dtype}")
+        if block_scores.device != q_fp8.device:
+            raise ValueError("block_scores device must match q_fp8")
+        if (
+            block_scores.ndim != 3
+            or int(block_scores.shape[0]) < num_heads
+            or int(block_scores.shape[1]) < q_rows_total
+            or int(block_scores.shape[2]) < num_blocks_out
+        ):
+            raise ValueError(
+                "block_scores must have shape at least "
+                f"({num_heads}, {q_rows_total}, {num_blocks_out}), got "
+                f"{tuple(block_scores.shape)}"
+            )
+        block_scores = block_scores[:num_heads, :q_rows_total, :num_blocks_out]
+        block_scores.fill_(float("-inf"))
+    if valid_q_rows == 0 or k_rows == 0:
+        return block_scores
+
+    if q_bytes is None:
+        q_bytes = q_fp8.contiguous().view(torch.uint8)
+    if q_u32 is None:
+        q_u32 = _view_last_dim_as_u32(q_bytes)
+    if weights_kernel is None:
+        weights_kernel = weights.contiguous()
+    if k_quant_bytes is None or k_scale_kernel is None:
+        k_quant_padded, k_scale_padded = _pad_kv_rows(
+            k_quant=k_quant,
+            k_scale=k_scale,
+            pad_block_k=_PREFILL_BLOCK_K,
+        )
+        k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
+        k_scale_kernel = k_scale_padded.contiguous()
+    if k_start_kernel is None:
+        k_start_kernel = k_start.contiguous()
+    if k_end_kernel is None:
+        k_end_kernel = k_end.contiguous()
+    if out_kernel is None:
+        out_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+    if tile_logits_kernel is None:
+        tile_logits_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+    if k_tma_prefill_desc_ptrs is None:
+        device_index = q_fp8.device.index or 0
+        k_tma_prefill_desc_ptrs = _dummy_contiguous_k_tma_desc_ptrs(device_index)
+
+    output_num_k_tiles = max(1, (k_rows + _PREFILL_BLOCK_K - 1) // _PREFILL_BLOCK_K)
+    kernel = _build_sparse_nsa_contiguous_prefill_kernel(
+        tiled_output=False,
+        score_mode=IndexerScoreMode.MSA_BILINEAR,
+        block_score_output=True,
+    )
+    args = (
+        _to_kernel_tensor(q_u32, cutlass.Uint32),
+        _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
+        _to_kernel_tensor(k_tma_prefill_desc_ptrs, cutlass.Int64, assumed_align=8),
+        _to_kernel_tensor(k_scale_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(k_start_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(k_end_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(out_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(tile_logits_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(block_scores, cutlass.Float32, assumed_align=4),
+        valid_q_rows,
+        k_rows,
+        Int32(num_blocks_out),
+        Int32(0),
+        Int32(output_num_k_tiles),
+        Int32(0),
+        current_cuda_stream(),
+    )
+    cache_key = (
+        _tensor_compile_key("contiguous_q_u32", q_u32, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_q_bytes", q_bytes, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_weights", weights_kernel, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_k_quant", k_quant_bytes, dynamic_dims=(0,)),
+        _tensor_compile_key("k_tma_prefill_desc_ptrs", k_tma_prefill_desc_ptrs),
+        _tensor_compile_key("contiguous_k_scale", k_scale_kernel, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_k_start", k_start_kernel, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_k_end", k_end_kernel, dynamic_dims=(0,)),
+        _tensor_compile_key("contiguous_dummy_logits", out_kernel, dynamic_dims=(0,)),
+        _flat_tensor_compile_key("contiguous_tile_logits", tile_logits_kernel, dynamic=True),
+        _tensor_compile_key("contiguous_block_scores", block_scores, dynamic_dims=(1,)),
+        ("prefill_msa_blockmax", False, IndexerScoreMode.MSA_BILINEAR, True),
+    )
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.contiguous_block_scores",
+        1,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
+    return block_scores
