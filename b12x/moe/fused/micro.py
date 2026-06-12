@@ -32,7 +32,9 @@ from b12x.cute.fp4 import (
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
+    mx_scale_from_amax32,
     nvfp4_scale_from_amax,
+    quant_dequant_e4m3_2,
     pack_f32x2_to_f16x2,
     prefetch_global_l2,
     quant_dequant_2,
@@ -302,6 +304,7 @@ class MoEMicroKernelBackend:
         dynamic_down_scale: bool = False,
         compile_time_phase: int = 0,
         w4a16_mode: bool = False,
+        a8_mx_mode: bool = False,
         scale_format: str = "e4m3_k16",
         swiglu_limit: float | None = None,
         w13_layout: str = "w13",
@@ -312,8 +315,12 @@ class MoEMicroKernelBackend:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
         if scale_format not in {"e4m3_k16", "e8m0_k32"}:
             raise ValueError(f"unsupported micro scale_format {scale_format!r}")
-        if scale_format == "e8m0_k32" and not w4a16_mode:
-            raise ValueError("e8m0_k32 scales are only supported in W4A16 micro mode")
+        if w4a16_mode and a8_mx_mode:
+            raise ValueError("w4a16_mode and a8_mx_mode are mutually exclusive")
+        if scale_format == "e8m0_k32" and not (w4a16_mode or a8_mx_mode):
+            raise ValueError(
+                "e8m0_k32 scales require the W4A16 or a8_mx micro mode"
+            )
         if swiglu_limit is not None and activation != "silu":
             raise ValueError("swiglu_limit requires the gated (silu) activation")
         if w13_layout not in {"w13", "w31"}:
@@ -335,6 +342,10 @@ class MoEMicroKernelBackend:
         self.dynamic_down_scale = dynamic_down_scale
         self.compile_time_phase = int(compile_time_phase)
         self.w4a16_mode = w4a16_mode
+        # a8_mx: quantize-dequantize activations through E4M3 with per-32
+        # UE8M0 block scales (no global scale) so decode numerics track the
+        # w4a8 prefill recipe. Same f16 dot-product math and weights.
+        self.a8_mx_mode = a8_mx_mode
         self._cfg = None
         self.m_const = 0
         self.m1_fc2_onepass = False
@@ -351,6 +362,7 @@ class MoEMicroKernelBackend:
             self.dynamic_down_scale,
             self.compile_time_phase,
             self.w4a16_mode,
+            self.a8_mx_mode,
             self.scale_format,
             self.w13_layout,
             self.has_swiglu_limit,
@@ -530,6 +542,15 @@ class MoEMicroKernelBackend:
             # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
             # the 512-thread launch register limit.
             num_fc1_chunks = max(num_fc1_chunks, n // (_BLOCK_SIZE * 2))
+        if self.a8_mx_mode:
+            # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
+            # (the default policy picks i_chunk=16 at m<=2).
+            a8_chunks = max(1, min(num_fc1_chunks, n // 32))
+            while a8_chunks > 1 and (
+                n % a8_chunks != 0 or (n // a8_chunks) % 32 != 0
+            ):
+                a8_chunks -= 1
+            num_fc1_chunks = a8_chunks
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
@@ -552,6 +573,10 @@ class MoEMicroKernelBackend:
             grid_x = max(1, min(int(max_active_ctas), fc1_tasks, fc2_tasks))
         m1_fc2_onepass = bool(m == 1 and grid_x >= fc2_tasks)
 
+        if self.a8_mx_mode and cfg.i_chunk % 32 != 0:
+            # The per-32 block scale reads the partner 16-block; the FC2
+            # intermediate chunk must hold whole 32-blocks.
+            raise ValueError("a8_mx micro mode requires i_chunk % 32 == 0")
         self._cfg = cfg
         self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
@@ -1212,7 +1237,22 @@ class MoEMicroKernelBackend:
                             v0 = Float32(a_input[x_base + Int32(i * 2)])
                             v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                             smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
-                    else:
+                    if cutlass.const_expr(self.a8_mx_mode):
+                        # Per-32 UE8M0 + E4M3 quantize-dequant (w4a8 prefill numerics).
+                        blk_peak = Float32(0.0)
+                        pair_delta = (Int32(1) - Int32(2) * (in_blk & Int32(1))) * Int32(_BLOCK_SIZE)
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                            v = Float32(a_input[x_base + Int32(i)])
+                            w = Float32(a_input[x_base + pair_delta + Int32(i)])
+                            blk_peak = fmax_f32(blk_peak, fmax_f32(v, -v))
+                            blk_peak = fmax_f32(blk_peak, fmax_f32(w, -w))
+                        scale32, inv32 = mx_scale_from_amax32(blk_peak)
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                            v0 = Float32(a_input[x_base + Int32(i * 2)])
+                            v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                            f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
+                            smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                    if cutlass.const_expr((not self.w4a16_mode) and (not self.a8_mx_mode)):
                         blk_peak = Float32(0.0)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE):
                             v = Float32(a_input[x_base + Int32(i)])
@@ -1261,6 +1301,10 @@ class MoEMicroKernelBackend:
                 alpha_fc1 = w1_alphas[eid]
                 gs_fc1 = input_gs[eid]
                 gs_fc2 = down_input_scale[eid]
+                if cutlass.const_expr(self.a8_mx_mode):
+                    # a8_mx activations are self-ranging: fold the calibrated
+                    # input global scale out of the combined nvfp4 alpha.
+                    alpha_fc1 = alpha_fc1 * gs_fc1
 
             # ---- Input quantization ----
             if cutlass.const_expr(cfg.k_segments != 2):
@@ -1278,7 +1322,22 @@ class MoEMicroKernelBackend:
                                 v0 = Float32(a_input[x_base + Int32(i * 2)])
                                 v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                                 smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
-                        else:
+                        if cutlass.const_expr(self.a8_mx_mode):
+                            # Per-32 UE8M0 + E4M3 quantize-dequant (w4a8 prefill numerics).
+                            blk_peak = Float32(0.0)
+                            pair_delta = (Int32(1) - Int32(2) * (in_blk & Int32(1))) * Int32(_BLOCK_SIZE)
+                            for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                                v = Float32(a_input[x_base + Int32(i)])
+                                w = Float32(a_input[x_base + pair_delta + Int32(i)])
+                                blk_peak = fmax_f32(blk_peak, fmax_f32(v, -v))
+                                blk_peak = fmax_f32(blk_peak, fmax_f32(w, -w))
+                            scale32, inv32 = mx_scale_from_amax32(blk_peak)
+                            for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                                v0 = Float32(a_input[x_base + Int32(i * 2)])
+                                v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                                f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
+                                smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                        if cutlass.const_expr((not self.w4a16_mode) and (not self.a8_mx_mode)):
                             blk_peak = Float32(0.0)
                             for i in cutlass.range_constexpr(_BLOCK_SIZE):
                                 v = Float32(a_input[x_base + Int32(i)])
@@ -1998,7 +2057,22 @@ class MoEMicroKernelBackend:
                                 v0 = Float32(a_input[x_base + Int32(i * 2)])
                                 v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                                 smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
-                        else:
+                        if cutlass.const_expr(self.a8_mx_mode):
+                            # Per-32 UE8M0 + E4M3 quantize-dequant (w4a8 prefill numerics).
+                            blk_peak = Float32(0.0)
+                            pair_delta = (Int32(1) - Int32(2) * (in_blk & Int32(1))) * Int32(_BLOCK_SIZE)
+                            for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                                v = Float32(a_input[x_base + Int32(i)])
+                                w = Float32(a_input[x_base + pair_delta + Int32(i)])
+                                blk_peak = fmax_f32(blk_peak, fmax_f32(v, -v))
+                                blk_peak = fmax_f32(blk_peak, fmax_f32(w, -w))
+                            scale32, inv32 = mx_scale_from_amax32(blk_peak)
+                            for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                                v0 = Float32(a_input[x_base + Int32(i * 2)])
+                                v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                                f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
+                                smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                        if cutlass.const_expr((not self.w4a16_mode) and (not self.a8_mx_mode)):
                             blk_peak = Float32(0.0)
                             for i in cutlass.range_constexpr(_BLOCK_SIZE):
                                 v = Float32(a_input[x_base + Int32(i)])
@@ -2058,6 +2132,40 @@ class MoEMicroKernelBackend:
                     fc2_rescale = gs_fc2 / gs_fc2_eff
             if tidx < Int32(cfg.inter_blocks):
                 mid_blk = tidx
+                if cutlass.const_expr(self.a8_mx_mode):
+                    # Per-32 UE8M0 + E4M3 quantize-dequant of the FC2 input
+                    # (self-ranging: no global scale, no dynamic rescale).
+                    blk_peak = Float32(0.0)
+                    pair_delta = (Int32(1) - Int32(2) * (mid_blk & Int32(1))) * Int32(_BLOCK_SIZE)
+                    for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                        v = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i)]
+                        w = smem_int[mid_blk * Int32(_BLOCK_SIZE) + pair_delta + Int32(i)]
+                        blk_peak = fmax_f32(blk_peak, fmax_f32(v, -v))
+                        blk_peak = fmax_f32(blk_peak, fmax_f32(w, -w))
+                    scale32, inv32 = mx_scale_from_amax32(blk_peak)
+                    for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                        v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
+                        v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
+                        f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
+                        # The combined nvfp4 FC2 alpha is 1/(gs_fc2 * gs_w2);
+                        # a8_mx quantizes without the global scale, so fold it
+                        # into the dequantized values here (post-roundtrip:
+                        # exact alpha-equivalent, single site for all FC2
+                        # variants).
+                        f0 = f0 * gs_fc2
+                        f1 = f1 * gs_fc2
+                        half_base = chunk_idx * Int32(cfg.i_chunk // 2) + mid_blk * Int32(_BLOCK_SIZE // 2)
+                        n_blk = half_base // Int32(128)
+                        h_local = half_base - n_blk * Int32(128)
+                        h_i = h_local + Int32(i)
+                        packed_idx = (
+                            t * Int32(cfg.inter_u32) +
+                            k_idx * Int32(cfg.fc2_n_chunks * 128) +
+                            n_blk * Int32(128) +
+                            (h_i % Int32(4)) * Int32(32) +
+                            (h_i // Int32(4))
+                        )
+                        intermediate[packed_idx] = pack_f32x2_to_f16x2(f0, f1)
                 if cutlass.const_expr(self.w4a16_mode):
                     for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
                         v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
@@ -2074,7 +2182,7 @@ class MoEMicroKernelBackend:
                             (h_i // Int32(4))
                         )
                         intermediate[packed_idx] = pack_f32x2_to_f16x2(v0, v1)
-                else:
+                if cutlass.const_expr((not self.w4a16_mode) and (not self.a8_mx_mode)):
                     blk_peak = Float32(0.0)
                     for i in cutlass.range_constexpr(_BLOCK_SIZE):
                         v = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i)]

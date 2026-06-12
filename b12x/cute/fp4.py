@@ -87,6 +87,16 @@ def as_grouped_scale_view(scale_storage: torch.Tensor, rows: int, cols: int) -> 
     return sf.permute(3, 4, 1, 5, 2, 0)
 
 
+def as_grouped_scale_view_mx(scale_storage: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Grouped UE8M0 scale view for vec32 (MXFP8 w4a8) block scales."""
+    batch = scale_storage.shape[0]
+    rows_padded = align_up(rows, 128)
+    cols_padded = align_up(cols // 32, 4)
+    sf = scale_storage.view(torch.float8_e8m0fnu)
+    sf = sf.view(batch, rows_padded // 128, cols_padded // 4, 32, 4, 4)
+    return sf.permute(3, 4, 1, 5, 2, 0)
+
+
 def _fp4_quantize_values(x: torch.Tensor) -> torch.Tensor:
     sign = torch.sign(x)
     x = torch.abs(x.clone())
@@ -177,6 +187,121 @@ def relu2_quantize_grouped_nvfp4_torch(
     activated = torch.square(F.relu(input_tensor.float()))
     activated = activated.to(input_tensor.dtype).to(torch.float32)
     return quantize_grouped_nvfp4_torch(activated, row_counts, global_scale)
+
+
+MX_SF_VEC_SIZE = 32  # Elements per UE8M0 scale block (MXFP8 w4a8 activations)
+_INV_FLOAT8_E4M3_MAX = 1.0 / FLOAT8_E4M3_MAX
+
+
+def pow2_ceil_ue8m0_torch(scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bit-exact Torch replica of the ``pow2_ceil_ue8m0`` device intrinsic.
+
+    Rounds positive fp32 scales UP to a power of two by bumping the exponent
+    whenever the mantissa is nonzero.  Returns ``(rounded_fp32, ue8m0_u8)``;
+    a zero scale maps to (0.0, byte 0).
+    """
+    bits = scale.to(torch.float32).contiguous().view(torch.int32)
+    mant = bits & 0x007FFFFF
+    bumped = torch.where(mant != 0, (bits + 0x00800000) & 0x7F800000, bits)
+    rounded = bumped.view(torch.float32)
+    byte = ((bumped >> 23) & 0xFF).to(torch.uint8)
+    return rounded, byte
+
+
+def _ue8m0_output_scale_torch(byte: torch.Tensor) -> torch.Tensor:
+    """Torch replica of ``ue8m0_to_output_scale``: 2^(127-byte), 0 for byte 0."""
+    inv_bits = (254 - byte.to(torch.int32)).clamp(min=0) << 23
+    inv = inv_bits.view(torch.float32)
+    return torch.where(byte == 0, torch.zeros_like(inv), inv)
+
+
+def quant_dequant_mxfp8_torch(x: torch.Tensor) -> torch.Tensor:
+    """Per-32-block MXFP8 quantize-dequantize roundtrip (oracle helper).
+
+    Matches the in-kernel ``quantize_block_fp8_mx`` numerics bit-for-bit:
+    UE8M0 ceil block scale, E4M3 RN-saturating payload.
+    """
+    orig_shape = x.shape
+    cols = orig_shape[-1]
+    if cols % MX_SF_VEC_SIZE != 0:
+        raise ValueError(f"last dim must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
+    blocked = x.to(torch.float32).reshape(-1, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
+    block_max = blocked.abs().amax(dim=-1, keepdim=True)
+    rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
+    inv = _ue8m0_output_scale_torch(byte)
+    payload = (
+        (blocked * inv)
+        .clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    return (payload * rounded).reshape(orig_shape)
+
+
+def quantize_grouped_mxfp8_torch(
+    input_tensor: torch.Tensor,
+    row_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-Torch grouped MXFP8 quantization (no global scale).
+
+    Mirrors ``quantize_grouped_nvfp4_torch`` for the w4a8 activation path:
+    returns ``(payload, scale_view)`` where ``payload`` is E4M3 bytes in
+    ``[R, C, G]`` order and ``scale_view`` is the swizzled UE8M0 grouped
+    view (vec32 columns).
+    """
+    num_groups, rows, cols = input_tensor.shape
+    if cols % MX_SF_VEC_SIZE != 0:
+        raise ValueError(f"cols must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
+
+    payload = torch.zeros((num_groups, rows, cols), dtype=torch.uint8, device=input_tensor.device)
+    scales = torch.zeros(
+        (num_groups, rows, cols // MX_SF_VEC_SIZE), dtype=torch.uint8, device=input_tensor.device
+    )
+    for group_idx in range(num_groups):
+        valid_rows = int(row_counts[group_idx].item())
+        if valid_rows == 0:
+            continue
+        x = input_tensor[group_idx, :valid_rows].float()
+        blocked = x.view(valid_rows, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
+        block_max = blocked.abs().amax(dim=-1, keepdim=True)
+        rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
+        inv = _ue8m0_output_scale_torch(byte)
+        q = (
+            (blocked * inv)
+            .clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .view(valid_rows, cols)
+        )
+        payload[group_idx, :valid_rows] = q
+        scales[group_idx, :valid_rows] = byte.squeeze(-1)
+
+    payload_view = payload.permute(1, 2, 0).contiguous()
+    swizzled = swizzle_block_scale(scales)
+    scale_view = as_grouped_scale_view_mx(swizzled, rows, cols)
+    return payload_view, scale_view
+
+
+def silu_mul_quantize_grouped_mxfp8_torch(
+    input_tensor: torch.Tensor,
+    row_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiLU(left)*right then grouped MXFP8 quantization (w4a8 FC2 input)."""
+    cols = input_tensor.shape[-1] // 2
+    left = input_tensor[..., :cols].float()
+    right = input_tensor[..., cols:].float()
+    activated = (F.silu(left) * right).to(input_tensor.dtype).to(torch.float32)
+    return quantize_grouped_mxfp8_torch(activated, row_counts)
+
+
+def relu2_quantize_grouped_mxfp8_torch(
+    input_tensor: torch.Tensor,
+    row_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ReLU^2 then grouped MXFP8 quantization (w4a8 FC2 input, non-gated)."""
+    activated = torch.square(F.relu(input_tensor.float()))
+    activated = activated.to(input_tensor.dtype).to(torch.float32)
+    return quantize_grouped_mxfp8_torch(activated, row_counts)
 
 
 # =============================================================================
@@ -861,6 +986,44 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cp_async_u32_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+    """4-byte `cp.async.ca.shared.global` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global [$0], [$1], 4;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async_u64_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+    """8-byte `cp.async.ca.shared.global` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global [$0], [$1], 8;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -2923,6 +3086,44 @@ def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def cvt_f32x4_to_e4m3x4(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Convert 4 float32 values to 4 packed E4M3 bytes (v0 in the low byte)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(v0).ir_value(loc=loc, ip=ip),
+                Float32(v1).ir_value(loc=loc, ip=ip),
+                Float32(v2).ir_value(loc=loc, ip=ip),
+                Float32(v3).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 lo, hi;
+                cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;
+                cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;
+                mov.b32 $0, {lo, hi};
+            }
+            """,
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def nvfp4_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc=None, ip=None) -> Float32:
     """Compute block_amax * reciprocal_global_scale / 6 with CUDA tensor-scalar semantics."""
     return Float32(
@@ -3351,6 +3552,108 @@ def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def e2m1x8_to_e4m3x8(
+    packed_u32: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Expand 8 packed E2M1 nibbles into 8 E4M3 bytes, losslessly.
+
+    Every E2M1 value is exactly representable in E4M3, so this is a pure
+    relabeling done with two prmt magnitude-LUT lookups plus a sign pass.
+    Nibble i of the input becomes byte i of the (lo, hi) output pair.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed_u32).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 clo, chi, cslo, cshi, mlo, mhi, slo, shi;
+            .reg .b32 tbl_a, tbl_b, tbl_s, zero;
+            // E4M3 encodings of {0, .5, 1, 1.5, 2, 3, 4, 6}.
+            mov.b32 tbl_a, 0x3C383000;
+            mov.b32 tbl_b, 0x4C484440;
+            mov.b32 tbl_s, 0x00008000;
+            mov.b32 zero, 0;
+            // Magnitude codes (low 3 bits of each nibble) as prmt selectors.
+            and.b32 clo, $2, 0x00007777;
+            shr.u32 chi, $2, 16;
+            and.b32 chi, chi, 0x00007777;
+            prmt.b32 mlo, tbl_a, tbl_b, clo;
+            prmt.b32 mhi, tbl_a, tbl_b, chi;
+            // Sign bit (nibble bit 3) -> byte bit 7 via a 2-entry LUT.
+            shr.u32 cslo, $2, 3;
+            and.b32 cslo, cslo, 0x00001111;
+            shr.u32 cshi, $2, 19;
+            and.b32 cshi, cshi, 0x00001111;
+            prmt.b32 slo, tbl_s, zero, cslo;
+            prmt.b32 shi, tbl_s, zero, cshi;
+            or.b32 $0, mlo, slo;
+            or.b32 $1, mhi, shi;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def e2m1x8_mul_residual_to_e4m3x8(
+    packed_u32: Uint32, residual_h2: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Expand 8 E2M1 nibbles to E4M3 bytes with a residual multiplier.
+
+    Decodes to f16 pairs, multiplies by ``residual_h2`` (the same residual
+    broadcast to both f16 lanes), and rounds to E4M3.  Used by the w4a8
+    NVFP4 path where the per-K/16 e4m3 scale is decomposed into a shared
+    UE8M0 hardware exponent and this in-register residual.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(packed_u32).ir_value(loc=loc, ip=ip),
+            Uint32(residual_h2).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b8 b0, b1, b2, b3;
+            .reg .b32 h0, h1, h2, h3;
+            .reg .b16 e0, e1, e2, e3;
+            mov.b32 {b0, b1, b2, b3}, $2;
+            cvt.rn.f16x2.e2m1x2 h0, b0;
+            cvt.rn.f16x2.e2m1x2 h1, b1;
+            cvt.rn.f16x2.e2m1x2 h2, b2;
+            cvt.rn.f16x2.e2m1x2 h3, b3;
+            mul.f16x2 h0, h0, $3;
+            mul.f16x2 h1, h1, $3;
+            mul.f16x2 h2, h2, $3;
+            mul.f16x2 h3, h3, $3;
+            cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;
+            cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;
+            cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;
+            cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;
+            mov.b32 $0, {e0, e1};
+            mov.b32 $1, {e2, e3};
+        }
+        """,
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
 
 
 @dsl_user_op
@@ -4529,6 +4832,122 @@ def relu2_quantize_block_fp4(
     activated = relu2_16(x)
     block_max = max_abs_16(activated)
     return quantize_block_fp4(activated, block_max, global_scale_val)
+
+
+# =============================================================================
+# MXFP8 (w4a8) Block Quantization: 32-wide UE8M0 + E4M3
+# =============================================================================
+
+
+@cute.jit
+def max_abs_32(values: cute.Tensor) -> Float32:
+    """Compute the maximum absolute value of 32 float32 values."""
+    result = fabs_f32(values[0])
+    for i in cutlass.range_constexpr(1, 32):
+        result = fmax_f32(result, fabs_f32(values[i]))
+    return result
+
+
+@cute.jit
+def quantize_block_fp8_mx(
+    values: cute.Tensor, max_abs: Float32,
+) -> Tuple[cute.Tensor, Uint32]:
+    """Quantize 32 float32 values to E4M3 payload bytes + UE8M0 scale byte.
+
+    The scale is ``pow2_ceil(max_abs / 448)`` so the scaled payload never
+    exceeds the E4M3 range; the payload carries its own exponent, so the
+    power-of-two block scale handles range only.  No global scale is
+    involved (the MX scheme is self-ranging).  Returns
+    ``(payload_u32x8, ue8m0_byte)`` with value ``4*i + j`` in byte ``j`` of
+    ``payload[i]``.  An all-zero block yields scale byte 0 (decoded as a
+    zero output scale) and a zero payload.
+    """
+    scale_f = max_abs * Float32(1.0 / FLOAT8_E4M3_MAX)
+    _, scale_byte = pow2_ceil_ue8m0(scale_f)
+    inv_scale = ue8m0_to_output_scale(scale_byte)
+    payload = cute.make_rmem_tensor((8,), Uint32)
+    for i in cutlass.range_constexpr(8):
+        payload[i] = cvt_f32x4_to_e4m3x4(
+            values[i * 4 + 0] * inv_scale,
+            values[i * 4 + 1] * inv_scale,
+            values[i * 4 + 2] * inv_scale,
+            values[i * 4 + 3] * inv_scale,
+        )
+    return payload, scale_byte
+
+
+@cute.jit
+def silu_mul_32(
+    gate: cute.Tensor, up: cute.Tensor,
+) -> cute.Tensor:
+    """Fused SiLU(gate) * up for 32 float32 element pairs."""
+    out = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        g = gate[i]
+        sigmoid_g = cute.arch.rcp_approx(
+            Float32(1.0) + cute.math.exp(-g, fastmath=False)
+        )
+        out[i] = g * sigmoid_g * up[i]
+    return out
+
+
+@cute.jit
+def silu_mul_quantize_block_fp8_mx(
+    gate: cute.Tensor, up: cute.Tensor,
+) -> Tuple[cute.Tensor, Uint32]:
+    """Fused SiLU(gate)*up + MXFP8 quantize for 32 element pairs."""
+    activated = silu_mul_32(gate, up)
+    block_max = max_abs_32(activated)
+    return quantize_block_fp8_mx(activated, block_max)
+
+
+@cute.jit
+def relu2_32(x: cute.Tensor) -> cute.Tensor:
+    """Compute ReLU^2 for 32 float32 values."""
+    out = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        v = fmax_f32(x[i], Float32(0.0))
+        out[i] = v * v
+    return out
+
+
+@cute.jit
+def relu2_quantize_block_fp8_mx(
+    x: cute.Tensor,
+) -> Tuple[cute.Tensor, Uint32]:
+    """Fuse ReLU^2 and MXFP8 quantization for 32 float32 values."""
+    activated = relu2_32(x)
+    block_max = max_abs_32(activated)
+    return quantize_block_fp8_mx(activated, block_max)
+
+
+@cute.jit
+def mx_scale_from_amax32(amax: Float32) -> Tuple[Float32, Float32]:
+    """Per-32 MXFP8 block scale from a precomputed amax.
+
+    Returns ``(scale, inv_scale)`` with ``scale = pow2_ceil(amax/448)`` —
+    identical numerics to ``quantize_block_fp8_mx`` (zero amax yields
+    (0, 0), silencing the block).
+    """
+    rounded, byte = pow2_ceil_ue8m0(amax * Float32(1.0 / FLOAT8_E4M3_MAX))
+    inv_scale = ue8m0_to_output_scale(byte)
+    return rounded, inv_scale
+
+
+@cute.jit
+def quant_dequant_e4m3_2(
+    v0: Float32, v1: Float32, inv_scale: Float32, scale: Float32,
+) -> Tuple[Float32, Float32]:
+    """Quantize-dequantize a pair through E4M3 with a power-of-two block scale.
+
+    Bit-matches the w4a8 prefill activation quantizer
+    (``quantize_block_fp8_mx``): RN-saturating E4M3 of ``v*inv_scale``,
+    decoded back and rescaled.  Used by the micro decode kernel's a8_mx mode
+    so decode numerics track the prefill recipe.
+    """
+    q0 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v0 * inv_scale)) * scale
+    q1 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v1 * inv_scale)) * scale
+    return q0, q1
 
 
 # =============================================================================

@@ -20,6 +20,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
         share_expert_scales: bool = False,
         single_token: bool = False,
         dynamic_down_scale: bool = False,
+        a8_mx_mode: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -31,6 +32,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
             share_expert_scales=share_expert_scales,
             single_token=single_token,
             dynamic_down_scale=dynamic_down_scale,
+            a8_mx_mode=a8_mx_mode,
         )
 
     @classmethod
@@ -55,6 +57,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         swap_ab: bool = False,
+        quant_recipe: str = "nvfp4",
     ):
         super().__init__(
             sf_vec_size,
@@ -64,6 +67,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
             swap_ab=swap_ab,
+            quant_recipe=quant_recipe,
         )
 
 

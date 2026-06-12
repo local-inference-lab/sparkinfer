@@ -53,18 +53,30 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
+    broadcast_f32_to_half2,
+    cp_async4_shared_global,
+    cp_async_u32_shared_global,
+    cp_async_u64_shared_global,
+    e2m1x8_mul_residual_to_e4m3x8,
+    e2m1x8_to_e4m3x8,
     fabs_f32,
     fmax_f32,
+    fp8_e4m3_to_f32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
+    ld_shared_u32,
+    atomic_add_shared_i32,
+    mxfp8_mma_m16n8k32_f32_e4m3,
     quantize_block_fp4,
     quantize_block_fp4_fast,
+    quantize_block_fp8_mx,
     get_ptr_as_int64,
     st_global_f32,
     st_global_i32,
     shared_ptr_to_u32,
     st_shared_f32,
     st_shared_u8,
+    st_shared_u32,
     st_global_u64,
     st_global_v4_u32,
     warp_reduce,
@@ -80,6 +92,102 @@ from b12x.cute.fp4 import scatter_add_v4_bf16x2
 
 _SF_VEC_SIZE = 16
 _TASK_SLICE_CHUNK = 1
+# w4a8 smem staging geometry: one 128-row x 64-byte packed-FP4 B tile per
+# k-tile. Rows pad to 80 bytes: 16-aligned (cp.async.cg requires dst
+# alignment = copy size) and 20*g mod 32 spreads the eight g-rows a lane
+# quad touches across distinct bank groups.
+_W4A8_B_ROW_PAD = 80
+_W4A8_TMA_TILE_BYTES = 128 * 64  # one (128 n, 128 fp4-k) TMA box
+_W4A8_B_BUF_BYTES = 128 * _W4A8_B_ROW_PAD
+
+
+@cute.jit
+def _w4a8_stage_b_tile(
+    b_u32: cute.Tensor,
+    smem_base: Int32,
+    base_idx: Int64,
+    row_u32_stride: Int32,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+    row_pad: cutlass.Constexpr = _W4A8_B_ROW_PAD,
+):
+    """cp.async one 128x64B packed-FP4 tile into smem rows.
+
+    Unpadded (64B) rows XOR-swizzle the 16B chunk by the row's low bits —
+    without it every consumer B load is a 4-8 way bank conflict."""
+    for i in cutlass.range_constexpr((128 * 4 + tcnt - 1) // tcnt):
+        idx = tidx + Int32(i * tcnt)
+        if idx < Int32(128 * 4):
+            r = idx >> Int32(2)
+            ch = idx & Int32(3)
+            gaddr = get_ptr_as_int64(
+                b_u32,
+                base_idx + Int64(r) * Int64(row_u32_stride) + Int64(ch * 4),
+            )
+            cp_async4_shared_global(
+                smem_base + r * Int32(row_pad) + ch * Int32(16), gaddr
+            )
+
+
+@cute.jit
+def _w4a8_stage_a_tile(
+    pa_u32: cute.Tensor,
+    smem_base: Int32,
+    base_idx: Int64,
+    row_u32_stride: Int32,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+):
+    """cp.async one rows x 128B E4M3 A tile into smem rows.
+
+    Chunks XOR-swizzle by the row's low bits: at a 128B row stride every
+    lane of an A-fragment load hits one bank otherwise."""
+    for i in cutlass.range_constexpr((rows * 8 + tcnt - 1) // tcnt):
+        idx = tidx + Int32(i * tcnt)
+        if idx < Int32(rows * 8):
+            r = idx >> Int32(3)
+            ch = idx & Int32(7)
+            gaddr = get_ptr_as_int64(
+                pa_u32,
+                base_idx + Int64(r) * Int64(row_u32_stride) + Int64(ch * 4),
+            )
+            cp_async4_shared_global(smem_base + (r << Int32(7)) + (ch << Int32(4)), gaddr)
+
+
+@cute.jit
+def _w4a8_stage_bytes4(
+    t_u8: cute.Tensor,
+    smem_base: Int32,
+    base_idx: Int64,
+    row_stride: Int32,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+    rows: cutlass.Constexpr = 128,
+):
+    """cp.async 4 contiguous bytes per row (scale grids)."""
+    for i in cutlass.range_constexpr((rows + tcnt - 1) // tcnt):
+        r = tidx + Int32(i * tcnt)
+        if r < Int32(rows):
+            gaddr = get_ptr_as_int64(t_u8, base_idx + Int64(r) * Int64(row_stride))
+            cp_async_u32_shared_global(smem_base + (r << Int32(2)), gaddr)
+
+
+@cute.jit
+def _w4a8_stage_bytes8(
+    t_u8: cute.Tensor,
+    smem_base: Int32,
+    base_idx: Int64,
+    row_stride: Int32,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+):
+    """cp.async 8 contiguous bytes per row for 128 rows (residual grids)."""
+    for i in cutlass.range_constexpr((128 + tcnt - 1) // tcnt):
+        r = tidx + Int32(i * tcnt)
+        if r < Int32(128):
+            gaddr = get_ptr_as_int64(t_u8, base_idx + Int64(r) * Int64(row_stride))
+            cp_async_u64_shared_global(smem_base + (r << Int32(3)), gaddr)
 _PRODUCER_PAIRS_PER_WARP = 2
 _FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
 
@@ -124,6 +232,22 @@ def _st_shared_i32(addr, val, *, loc=None, ip=None):
         None,
         [Int32(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
         "st.shared.s32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _st_shared_release_i32(addr, val, *, loc=None, ip=None):
+    """CTA-scope release store: pairs with the consumers' acquire spin so
+    the producer's prior writes (including async-proxy writes it observed
+    via an mbarrier wait or cp.async drain) are visible before the flag."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+        "st.release.cta.shared.s32 [$0], $1;",
         "r,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -207,6 +331,32 @@ def _spin_wait_global_eq_i32(addr, expected, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _spin_wait_shared_ge_i32(addr, value, *, loc=None, ip=None):
+    """Spin until the shared i32 at ``addr`` is >= ``value`` (acquire)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Int32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .pred %p0;\n"
+        ".reg .s32 %val;\n"
+        "spin_ge_loop:\n"
+        "  ld.acquire.cta.shared.s32 %val, [$0];\n"
+        "  setp.lt.s32 %p0, %val, $1;\n"
+        "  @%p0 bra spin_ge_loop;\n"
+        "}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _threadfence(*, loc=None, ip=None):
     llvm.inline_asm(
         None, [],
@@ -248,15 +398,38 @@ class MoEDynamicKernelBackend:
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         swap_ab: bool = False,
+        quant_recipe: str = "nvfp4",
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
+        if quant_recipe not in {"nvfp4", "w4a8_mx", "w4a8_nvfp4"}:
+            raise ValueError(f"unsupported quant_recipe {quant_recipe!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
+        # w4a8 recipes: E4M3 activations (dynamic per-32 UE8M0 block scales)
+        # against the same packed-FP4 weight bytes, computed on the FP8
+        # m16n8k32 block-scale MMA. "w4a8_nvfp4" additionally applies the
+        # per-K/16 residual multipliers from the NVFP4 scale decomposition
+        # during nibble expansion. The control plane, epilogue, and scatter
+        # are shared with the nvfp4 recipe; operands are read directly from
+        # global/shared memory (no A/SF TMA staging) in this bring-up shape.
+        self.quant_recipe = quant_recipe
+        self.is_w4a8 = quant_recipe != "nvfp4"
+        self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
+        if self.is_w4a8 and swap_ab:
+            raise ValueError("w4a8 recipes do not support swap_ab yet")
+        if self.is_w4a8 and share_input_across_experts:
+            raise ValueError(
+                "w4a8 recipes do not support share_input_across_experts yet"
+            )
+        if self.is_w4a8 and dynamic_down_scale:
+            raise ValueError(
+                "w4a8 recipes are self-ranging; dynamic_down_scale does not apply"
+            )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
@@ -304,7 +477,14 @@ class MoEDynamicKernelBackend:
             self.num_mma_warps = 8
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
-        self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
+        # w4a8 small tiles: two producer warps (the staging-issue bandwidth of
+        # one warp limits the DRAM-bound bands; epochs split by parity).
+        # NOTE: a 2-warp producer split (epochs by parity) was tried and
+        # mis-corrupts (~cos 0.98 at m=64); kept dormant pending a root cause.
+        self.num_dma_warps = 1
+        self.threads_per_cta = (
+            self.num_mma_warps + self.num_dma_warps
+        ) * self.num_threads_per_warp
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
         self.buffer_align_bytes = 1024
 
@@ -415,6 +595,35 @@ class MoEDynamicKernelBackend:
         # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
         while self.ab_stage > 1 and 32 % self.ab_stage != 0:
             self.ab_stage -= 1
+        if self.is_w4a8:
+            # w4a8 repurposes the staging regions as fixed double buffers; a
+            # larger ab_stage only inflates smem. Capping at 2 cuts the CTA
+            # footprint to ~88KB so two blocks co-reside per SM (the barrier-
+            # heavy mainloop needs the extra occupancy to hide latency).
+            self.ab_stage = min(self.ab_stage, 2)
+            # Staging layout/depth (see the kernel hoist block): python ints
+            # must live on self so in-loop const_expr sees them as static.
+            # Small tiles: gated FC1 runs FUSED (one k sweep, both gate+up
+            # accumulators — 64 hot regs fit at tile_m<=32) with 16KB
+            # gate+up B granules at depth 2; non-gated small tiles use
+            # depth-4 single-pass staging. Tile 128 keeps two passes/depth 2.
+            self.w4a8_small = self.tile_shape_mnk[0] <= 32
+            self.w4a8_fused = self.w4a8_small and self.is_gated
+            self.w4a8_depth = (
+                2 if self.w4a8_fused else (4 if self.w4a8_small else 2)
+            )
+            self.w4a8_b_pad = 64 if self.w4a8_small else _W4A8_B_ROW_PAD
+            self.w4a8_depth_log2 = self.w4a8_depth.bit_length() - 1
+            self.w4a8_fc1_windows_per_slice = 1 if self.w4a8_fused else (
+                2 if self.is_gated else 1
+            )
+            # B staged through TMA (probe-pinned SW64 layout: read chunk =
+            # kb ^ ((n_in>>1)&3)) instead of cp.async; the flag/epoch
+            # protocol is unchanged. Small tiles only (the dispatched path).
+            self.w4a8_b_tma = self.w4a8_small
+            # Fused small tiles also stage FC2 B_down in PAIRS (one 16KB
+            # granule = two output tiles), halving the FC2 sync cadence.
+            self.w4a8_fc2_pair = self.w4a8_fused
         self.epi_stage = 1
         (
             self.a_smem_layout_staged,
@@ -612,6 +821,14 @@ class MoEDynamicKernelBackend:
         token_weights: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
+        *,
+        # w4a8 recipe operands (placeholders under the nvfp4 recipe): plain
+        # (unswizzled) UE8M0 K/32 weight scale grids and, for w4a8_nvfp4, the
+        # per-K/16 E4M3 residual grids from the NVFP4 scale decomposition.
+        sfb_w13_mx: cute.Tensor | None = None,    # [w1_n, K//32, E] uint8
+        sfb_down_mx: cute.Tensor | None = None,   # [K, I_tp//32, E] uint8
+        w13_residual: cute.Tensor | None = None,  # [w1_n, K//16, E] uint8
+        down_residual: cute.Tensor | None = None, # [K, I_tp//16, E] uint8
     ):
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
@@ -683,6 +900,29 @@ class MoEDynamicKernelBackend:
             if self.is_gated:
                 gate_tile_cnt = gate_tile_cnt // Int32(2)
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
+        if cutlass.const_expr(self.is_w4a8):
+            assert sfb_w13_mx is not None and sfb_down_mx is not None, (
+                "w4a8 recipes require sfb_w13_mx and sfb_down_mx"
+            )
+            assert not self.w4a8_residual or (
+                w13_residual is not None and down_residual is not None
+            ), "w4a8_nvfp4 requires w13_residual and down_residual"
+            assert self.ab_stage * self.sa_tile_shape_mk[0] * self.sa_tile_shape_mk[1] // 2 >= (
+                self.tile_shape_mnk[0] * self.tile_shape_mnk[2]
+            ), "w4a8 needs ab_stage >= 2 to repurpose the sA staging region"
+        if cutlass.const_expr(sfb_w13_mx is None):
+            sfb_w13_mx = row_counts  # unused placeholder under nvfp4
+        if cutlass.const_expr(sfb_down_mx is None):
+            sfb_down_mx = row_counts
+        if cutlass.const_expr(w13_residual is None):
+            w13_residual = sfb_w13_mx
+        if cutlass.const_expr(down_residual is None):
+            down_residual = sfb_down_mx
+        # Raw u32 views over the packed-FP4 weight bytes for the w4a8 direct
+        # global-load path (the TMA-derived gB tensors are coordinate tensors
+        # and not byte-addressable).
+        b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
+        b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
             a_input, topk_ids, topk_weights,
@@ -708,6 +948,8 @@ class MoEDynamicKernelBackend:
             launch_params, expert_write_rows, expert_tile_base,
             input_global_scale, alpha, down_alpha, global_scale,
             scatter_output, token_map, token_weights,
+            sfb_w13_mx, sfb_down_mx, w13_residual, down_residual,
+            b_w13_u32, b_down_u32,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -760,6 +1002,12 @@ class MoEDynamicKernelBackend:
         scatter_output: cute.Tensor,
         token_map: cute.Tensor,
         token_weights: cute.Tensor,
+        sfb_w13_mx: cute.Tensor,
+        sfb_down_mx: cute.Tensor,
+        w13_residual: cute.Tensor,
+        down_residual: cute.Tensor,
+        b_w13_u32: cute.Tensor,
+        b_down_u32: cute.Tensor,
     ):
         """Kernel entry point."""
         from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -822,6 +1070,15 @@ class MoEDynamicKernelBackend:
             phase2_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             scatter_tok_cache: cute.struct.MemRange[cutlass.Int32, self.tile_shape_mnk[0]]
             scatter_weight_cache: cute.struct.MemRange[cutlass.Float32, self.tile_shape_mnk[0]]
+            # w4a8 producer-consumer staging flags: [0..1] FC1 ready epoch per
+            # buffer, [2..3] FC1 done count per buffer, [4..5] FC2 ready,
+            # [6..7] FC2 done.
+            w4a8_pipe: cute.struct.MemRange[cutlass.Int32, 8]
+            # One mbarrier per staging-buffer parity for w4a8 TMA-B staging
+            # (arrive count 1; phases tracked in producer registers).
+            w4a8_tma_mbar: cute.struct.MemRange[
+                cutlass.Int64, self.w4a8_depth if self.is_w4a8 else 1
+            ]
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_staged)],
                 self.buffer_align_bytes,
@@ -882,6 +1139,12 @@ class MoEDynamicKernelBackend:
             cta_layout_vmnk=cta_layout_vmnk,
         )
 
+        if cutlass.const_expr(self.is_w4a8 and self.w4a8_b_tma):
+            w4a8_tma_mbar_ptr = storage.w4a8_tma_mbar.data_ptr()
+            if Int32(tidx) == Int32(0):
+                for _mb in cutlass.range_constexpr(self.w4a8_depth):
+                    cute.arch.mbarrier_init(w4a8_tma_mbar_ptr + _mb, Int32(1))
+            cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
@@ -907,7 +1170,13 @@ class MoEDynamicKernelBackend:
         row_counts = launch_params.row_counts
         num_experts = Int32(row_counts.shape[0])
         sf_blocks_per_row = cols // Int32(16)
-        output_bytes_per_row = cols // Int32(2)
+        if cutlass.const_expr(self.is_w4a8):
+            # E4M3 payload: one byte per element; UE8M0 scales per 32 elements.
+            output_bytes_per_row = cols
+            mx_blocks_per_row = cols // Int32(32)
+        else:
+            output_bytes_per_row = cols // Int32(2)
+            mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
         cols_u32 = cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
         total_pairs = Int32(topk_ids.shape[0])
@@ -1202,48 +1471,83 @@ class MoEDynamicKernelBackend:
                             token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
 
                             gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-                            sf_idx = lane_id
-                            while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(16)
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                                block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
-                                    value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
-                                    values[elem_idx] = value
-                                    block_max = fmax_f32(block_max, fabs_f32(value))
-                                packed64 = Uint64(0)
-                                scale_byte = Uint8(0)
-                                if self.is_gated and self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                                else:
-                                    packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
-
-                                output_offset = (
-                                    (phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])) * output_bytes_per_row
-                                    + sf_idx * Int32(8)
-                                )
-                                st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
-
-                                k_tile_idx = sf_idx // Int32(4)
-                                inner_k_idx = sf_idx % Int32(4)
-                                # scale_storage uses 128-row SF atoms: index by the
-                                # 128-atom + row-within-atom, not the MMA tile.
-                                # Identity at tile_m==128.
+                            if cutlass.const_expr(self.is_w4a8):
+                                # w4a8: per-32 dynamic UE8M0 + E4M3 payload, no
+                                # global scale. Payload stored plain row-major;
+                                # scales stored plain [row, cols//32].
                                 phys_row = (
                                     phys_tile * Int32(self.tile_shape_mnk[0])
                                     + row % Int32(self.tile_shape_mnk[0])
                                 )
-                                sf_atom = phys_row >> Int32(7)
-                                sf_row = phys_row & Int32(127)
-                                scale_offset = (
-                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                    + k_tile_idx * Int32(32 * 4 * 4)
-                                    + (sf_row % Int32(32)) * Int32(4 * 4)
-                                    + (sf_row // Int32(32)) * Int32(4)
-                                    + inner_k_idx
-                                )
-                                scale_storage[scale_offset] = scale_byte
-                                sf_idx += Int32(32)
+                                blk_idx = lane_id
+                                while blk_idx < mx_blocks_per_row:
+                                    block_start = blk_idx * Int32(32)
+                                    values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(32):
+                                        value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
+                                    payload, mx_scale_byte = quantize_block_fp8_mx(values, block_max)
+                                    output_offset = phys_row * output_bytes_per_row + block_start
+                                    for pair_idx in cutlass.range_constexpr(4):
+                                        packed64 = (
+                                            Uint64(payload[pair_idx * 2 + 1]) << Uint64(32)
+                                        ) | Uint64(payload[pair_idx * 2])
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage,
+                                                output_offset + Int32(pair_idx * 8),
+                                            ),
+                                            packed64,
+                                        )
+                                    scale_storage[phys_row * mx_blocks_per_row + blk_idx] = Uint8(
+                                        mx_scale_byte & Uint32(0xFF)
+                                    )
+                                    blk_idx += Int32(32)
+                            else:
+                                sf_idx = lane_id
+                                while sf_idx < sf_blocks_per_row:
+                                    block_start = sf_idx * Int32(16)
+                                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(16):
+                                        value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
+                                    packed64 = Uint64(0)
+                                    scale_byte = Uint8(0)
+                                    if self.is_gated and self.fast_math:
+                                        packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
+                                    else:
+                                        packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+
+                                    output_offset = (
+                                        (phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])) * output_bytes_per_row
+                                        + sf_idx * Int32(8)
+                                    )
+                                    st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
+
+                                    k_tile_idx = sf_idx // Int32(4)
+                                    inner_k_idx = sf_idx % Int32(4)
+                                    # scale_storage uses 128-row SF atoms: index by the
+                                    # 128-atom + row-within-atom, not the MMA tile.
+                                    # Identity at tile_m==128.
+                                    phys_row = (
+                                        phys_tile * Int32(self.tile_shape_mnk[0])
+                                        + row % Int32(self.tile_shape_mnk[0])
+                                    )
+                                    sf_atom = phys_row >> Int32(7)
+                                    sf_row = phys_row & Int32(127)
+                                    scale_offset = (
+                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                                        + k_tile_idx * Int32(32 * 4 * 4)
+                                        + (sf_row % Int32(32)) * Int32(4 * 4)
+                                        + (sf_row // Int32(32)) * Int32(4)
+                                        + inner_k_idx
+                                    )
+                                    scale_storage[scale_offset] = scale_byte
+                                    sf_idx += Int32(32)
 
                             if full_tile_publish_enabled > Int32(0):
                                 cute.arch.sync_warp()
@@ -1403,6 +1707,7 @@ class MoEDynamicKernelBackend:
         gB_down = cute.local_tile(mB_down, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
         gSFB_down = cute.local_tile(mSFB_down, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None))
         tBsB_down, tBgB_down = cpasync.tma_partition(tma_b_down, b_cta_crd, b_cta_layout, cute.group_modes(sB, 0, 2), cute.group_modes(gB_down, 0, 2))
+        tBsB_down_up, _ = cpasync.tma_partition(tma_b_down, b_cta_crd, b_cta_layout, cute.group_modes(sB_up, 0, 2), cute.group_modes(gB_down, 0, 2))
         tBsSFB_down, tBgSFB_down = cpasync.tma_partition(tma_sfb_down, b_cta_crd, b_cta_layout, cute.group_modes(sSFB, 0, 2), cute.group_modes(gSFB_down, 0, 2))
         tBsSFB_down = cute.filter_zeros(tBsSFB_down)
         tBgSFB_down = cute.filter_zeros(tBgSFB_down)
@@ -1618,6 +1923,52 @@ class MoEDynamicKernelBackend:
         # Consumer steady state: pop one ready task per CTA, then let
         # the MMA warps and DMA warp cooperate on that task.
         # ===================================================================
+        if cutlass.const_expr(self.is_w4a8):
+            # w4a8 operand views and smem addresses, hoisted out of the
+            # consumer loop (loop state must be purely dynamic expressions).
+            lane_c = Int32(tidx) & Int32(3)
+            lane_g = (Int32(tidx) & Int32(31)) >> Int32(2)
+            tCgC_id = thr_mma.partition_C(
+                cute.make_identity_tensor(
+                    (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
+                )
+            )
+            n_k32_per_tile = self.tile_shape_mnk[2] // 32
+            a_u32_per_row = cols // Int32(4)
+            a_mx_per_row = cols // Int32(32)
+            pa_u32 = cute.recast_tensor(packed_a_storage, cutlass.Uint32)
+            sa_flat_addr = shared_ptr_to_u32(storage.sA.data_ptr())
+            # Double-buffered staging regions (repurposed; TMA is off under
+            # w4a8): B tiles in sB/sB_up, SFB byte rows in sSFB, residual
+            # byte rows in sSFB_up, A-scale byte rows in sSFA.
+            w4a8_sb0 = shared_ptr_to_u32(storage.sB.data_ptr())
+            # FC1 A tiles double-buffer through the sC region (32KB, provably
+            # free during the FC1 mainloop: the epilogue writes it afterwards).
+            # Staging depth: 4 buffers for small tiles (the DRAM-bound bands
+            # need memory-level parallelism, and capacity allows it); 2 for
+            # tile 128. Depth-4 layout: B unpadded 64B rows, two bufs per sB
+            # region; A bufs in sA past the FC2-intermediate bytes; FC1
+            # residual bufs in sC (dead until the epilogue rendezvous); FC2
+            # residual bufs alias the (FC1-only) A-buf region.
+            if cutlass.const_expr(self.w4a8_small):
+                w4a8_sa0 = shared_ptr_to_u32(storage.sA.data_ptr()) + Int32(4096)
+                w4a8_res0 = shared_ptr_to_u32(storage.sC.data_ptr())
+                w4a8_res2 = w4a8_sa0
+            else:
+                w4a8_sa0 = shared_ptr_to_u32(storage.sC.data_ptr())
+                w4a8_res0 = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
+                w4a8_res2 = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
+            w4a8_pipe_addr = shared_ptr_to_u32(storage.w4a8_pipe.data_ptr())
+            w4a8_sb1 = shared_ptr_to_u32(storage.sB_up.data_ptr())
+            w4a8_sfbb = shared_ptr_to_u32(storage.sSFB.data_ptr())
+            w4a8_resb = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
+            w4a8_tcnt = self.num_mma_warps * self.num_threads_per_warp
+
+        # w4a8 TMA-B: per-mbarrier phase bits, owned by the producer warp.
+        # Persist across tasks (mbarriers are init'd once; epochs reset per
+        # task but phases must not).
+        w4a8_mbar_phase = Int32(0)
+
         consumer_live = Int32(1)
         while consumer_live > Int32(0):
             if is_cta_leader > Int32(0):
@@ -1683,6 +2034,9 @@ class MoEDynamicKernelBackend:
                     _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
                     st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
                     cache_row += Int32(self.threads_per_cta)
+                if cutlass.const_expr(self.is_w4a8):
+                    if Int32(tidx) < Int32(8):
+                        _st_shared_i32(w4a8_pipe_addr + Int32(tidx) * Int32(4), Int32(0))
                 cute.arch.sync_threads()
             if has_task == Int32(0):
                 if is_done > Int32(0):
@@ -1695,6 +2049,12 @@ class MoEDynamicKernelBackend:
                 task_valid_rows_val = _ld_shared_i32(ctrl_base_addr + Int32(24))
 
                 alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                if cutlass.const_expr(self.is_w4a8):
+                    # w4a8 activations are self-ranging: the calibrated input
+                    # global scale is NOT applied at quantize time, so fold it
+                    # out of the combined nvfp4 alpha to leave the pure weight
+                    # dequant alpha (alpha_nvfp4 = 1/(gs_act * gs_w)).
+                    alpha_value = alpha_value * input_global_scale[task_expert_idx].to(cutlass.Float32)
                 valid_rows = task_valid_rows_val
 
                 # In-loop SFA partition for sub-128 tiles. FC1 reads the
@@ -1748,6 +2108,8 @@ class MoEDynamicKernelBackend:
                 epi_buffer = Int32(0)
 
                 down_alpha_value = down_alpha[task_expert_idx].to(cutlass.Float32)
+                if cutlass.const_expr(self.is_w4a8):
+                    down_alpha_value = down_alpha_value * global_scale[task_expert_idx].to(cutlass.Float32)
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
@@ -1961,7 +2323,412 @@ class MoEDynamicKernelBackend:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
 
-                    if cutlass.const_expr(not self.swap_ab):
+                    if cutlass.const_expr(self.is_w4a8):
+                        # ===== w4a8 FC1: direct-global operands, raw FP8 MMA =====
+                        # Re-assert the MMA warps' register budget at the top of
+                        # the w4a8 hot region: without a dominating setmaxnreg,
+                        # ptxas register-targets for occupancy (observed: 40-reg
+                        # compile, accumulators spilled around every QMMA).
+                        cute.arch.setmaxregister_increase(self.mma_register_requirement)
+                        # Probe-pinned addressing (tests/test_w4a8_fragment_probe):
+                        # lane t (c=t%4, g=t/4) expands the packed-FP4 word for
+                        # orig k [K0+8c, +8) into the (b0,b1) regs of the k32
+                        # mxf8f6f4 atom; A regs are contiguous u32 loads; SFA row
+                        # r is read from lanes 4*(r%8)+(r//8) byte 0, SFB col n
+                        # from lane 4n byte 0.
+                        m_tile_row_base = task_m_tile_idx * Int32(self.tile_shape_mnk[0])
+                        cur_slice = task_slice_begin_idx + slice_idx
+                        up_n_tile = cur_slice
+                        gate_n_tile = cur_slice
+                        if cutlass.const_expr(self.is_gated):
+                            gate_n_tile = cur_slice + gate_tile_cnt
+
+                        # Accumulate into a FLAT rmem tensor (simple strides,
+                        # constant indices): the nested partition_C layout of
+                        # gate_acc/up_acc defeats register promotion under
+                        # scalar element access (observed: 40-reg compile with
+                        # GBs of local spill traffic). Results copy into the
+                        # layout-native accumulators once per pass for the
+                        # shared epilogue.
+                        # Two passes (gate, then up) keep one 128-register
+                        # accumulator hot at a time -- interleaving both blows the
+                        # 232-register budget and thrashes spills. Per k32 block
+                        # the B words for all n-atoms are loaded and expanded
+                        # once into register arrays (the m-atom loop reuses
+                        # them), batching the global loads back-to-back for
+                        # memory-level parallelism.
+                        # fc1_k_tile_cnt counts 128-wide FP4-position tiles over
+                        # the byte-backed packed_a view (2K positions); the E4M3
+                        # contraction advances 128 BYTES per iteration, so halve.
+                        for _pass in cutlass.range_constexpr(
+                            self.w4a8_fc1_windows_per_slice
+                        ):
+                            if cutlass.const_expr(_pass == 0):
+                                pass_n_tile = gate_n_tile
+                            else:
+                                pass_n_tile = up_n_tile
+                            # Accumulator as a flat tuple of SSA values:
+                            # loop-carried across the dynamic k loop, so the
+                            # MMAs read/write registers, never local memory.
+                            w4a8_facc = tuple(
+                                cutlass.Float32(0.0)
+                                for _ in range(4 * fc1_m_tiles * fc1_n_tiles)
+                            )
+                            if cutlass.const_expr(self.w4a8_fused):
+                                # Fused single sweep: the up accumulator rides
+                                # the same k loop (64 hot regs at tile_m<=32).
+                                w4a8_facc_u = tuple(
+                                    cutlass.Float32(0.0)
+                                    for _ in range(4 * fc1_m_tiles * fc1_n_tiles)
+                                )
+                            # ---- cp.async double-buffered operand staging ----
+                            # Per 128-deep k-tile: the B tile (8.5KB padded), the
+                            # SFB byte rows, the residual byte rows, and the
+                            # A-scale byte rows are staged by the MMA warps while
+                            # the previous tile computes. A payload stays as
+                            # direct global loads (16 words per k32 block,
+                            # covered by the MMA stream).
+                            KT_fc1 = fc1_k_tile_cnt // 2
+                            n_base_pass = pass_n_tile * Int32(self.tile_shape_mnk[1])
+                            b_row_u32 = b_w13_u32.shape[1]
+                            b_pass_base = (
+                                Int64(task_expert_idx) * Int64(b_w13_u32.shape[0] * b_row_u32)
+                                + Int64(n_base_pass) * Int64(b_row_u32)
+                            )
+                            sfb_row_b = sfb_w13_mx.shape[1]
+                            sfb_pass_base = (
+                                Int64(task_expert_idx) * Int64(sfb_w13_mx.shape[0] * sfb_row_b)
+                                + Int64(n_base_pass) * Int64(sfb_row_b)
+                            )
+                            if cutlass.const_expr(self.w4a8_residual):
+                                res_row_b = w13_residual.shape[1]
+                                res_pass_base = (
+                                    Int64(task_expert_idx) * Int64(w13_residual.shape[0] * res_row_b)
+                                    + Int64(n_base_pass) * Int64(res_row_b)
+                                )
+                            asc_pass_base = Int64(m_tile_row_base) * Int64(a_mx_per_row)
+
+                            for _w4a8_kt in range(KT_fc1):
+                                fc1_epoch = (
+                                    slice_idx
+                                    * Int32(
+                                        self.w4a8_fc1_windows_per_slice * KT_fc1
+                                        + (
+                                            output_tile_cnt // 2
+                                            if self.w4a8_fc2_pair
+                                            else output_tile_cnt
+                                        )
+                                    )
+                                    + Int32(_pass * KT_fc1) + _w4a8_kt + Int32(1)
+                                )
+                                par = (fc1_epoch - Int32(1)) & Int32(self.w4a8_depth - 1)
+                                _spin_wait_shared_ge_i32(
+                                    w4a8_pipe_addr + (par << Int32(2)), fc1_epoch
+                                )
+                                cute.arch.fence_proxy("async.shared", space="cta")
+
+                                if cutlass.const_expr(self.w4a8_depth == 4):
+                                    b_buf = (
+                                        w4a8_sb0
+                                        + (w4a8_sb1 - w4a8_sb0) * (par >> Int32(1))
+                                        + (par & Int32(1)) * Int32(128 * 64)
+                                    )
+                                else:
+                                    b_buf = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
+                                sa_buf = w4a8_sa0 + par * Int32(self.tile_shape_mnk[0] * 128)
+                                if cutlass.const_expr(self.w4a8_fused):
+                                    sfb_buf = w4a8_sfbb + (par << Int32(10))
+                                    res_buf = w4a8_res0 + (par << Int32(11))
+                                else:
+                                    sfb_buf = w4a8_sfbb + (par << Int32(9))
+                                    res_buf = w4a8_res0 + (par << Int32(10))
+                                # A-scale staging bufs: the sSFA region is
+                                # tiny at small tiles (tile_m*8 per stage) and
+                                # its base bytes carry the FC2 intermediate
+                                # scales. At depth 4 the sSFB_up region is
+                                # entirely free (residual bufs moved to
+                                # sC/sA), so A-scale bufs live there.
+                                if cutlass.const_expr(self.w4a8_small):
+                                    asc_buf = w4a8_resb + par * Int32(
+                                        self.tile_shape_mnk[0] * 4
+                                    )
+                                else:
+                                    asc_buf = sfa_base_addr + (par << Int32(9))
+
+                                n_in_arr = cute.make_rmem_tensor((fc1_n_tiles,), Int32)
+                                sfb_words = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                res_w0 = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                res_w1 = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                if cutlass.const_expr(self.w4a8_fused):
+                                    sfb_words_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    res_w0_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    res_w1_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                    _cnv = tCgC_id[(None, 0, _nt)]
+                                    _cn = _cnv[0]
+                                    n_in = _cn[1] - Int32(2) * lane_c + lane_g
+                                    n_in_arr[_nt] = n_in
+                                    sfb_words[_nt] = ld_shared_u32(sfb_buf + (n_in << Int32(2)))
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        sfb_words_u[_nt] = ld_shared_u32(
+                                            sfb_buf + Int32(512) + (n_in << Int32(2))
+                                        )
+                                    if cutlass.const_expr(self.w4a8_residual):
+                                        res_w0[_nt] = ld_shared_u32(res_buf + (n_in << Int32(3)))
+                                        res_w1[_nt] = ld_shared_u32(res_buf + (n_in << Int32(3)) + Int32(4))
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            res_w0_u[_nt] = ld_shared_u32(
+                                                res_buf + Int32(1024) + (n_in << Int32(3))
+                                            )
+                                            res_w1_u[_nt] = ld_shared_u32(
+                                                res_buf + Int32(1024) + (n_in << Int32(3)) + Int32(4)
+                                            )
+                                asc_words = cute.make_rmem_tensor((fc1_m_tiles,), Uint32)
+                                row_lo_arr = cute.make_rmem_tensor((fc1_m_tiles,), Int32)
+                                for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                    _c0v = tCgC_id[(None, _mt, 0)]
+                                    _c0 = _c0v[0]
+                                    row_lo_arr[_mt] = _c0[0]
+                                    sel = _c0[0] + ((lane_c & Int32(1)) << Int32(3))
+                                    asc_words[_mt] = ld_shared_u32(asc_buf + (sel << Int32(2)))
+
+                                for _kb in cutlass.range_constexpr(n_k32_per_tile):
+                                    kbg = _w4a8_kt * Int32(n_k32_per_tile) + Int32(_kb)
+                                    a_word_base = kbg * Int32(8) + Int32(2) * lane_c
+                                    b_lo = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    b_hi = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    sfb_arr = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        b_lo_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                        b_hi_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                        sfb_arr_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
+                                    for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                        if cutlass.const_expr(self.w4a8_b_tma):
+                                            # TMA layout (probe-pinned): chunk
+                                            # = kb ^ ((row>>1)&3) over 64B rows.
+                                            w4a8_bk = (
+                                                Int32(_kb)
+                                                ^ ((n_in_arr[_nt] >> Int32(1)) & Int32(3))
+                                            ) << Int32(4)
+                                        else:
+                                            w4a8_bk = Int32(_kb * 16)
+                                        w_pk = ld_shared_u32(
+                                            b_buf
+                                            + n_in_arr[_nt] * Int32(self.w4a8_b_pad)
+                                            + w4a8_bk
+                                            + (lane_c << Int32(2))
+                                        )
+                                        sfb_arr[_nt] = (
+                                            sfb_words[_nt] >> Uint32(_kb * 8)
+                                        ) & Uint32(0xFF)
+                                        if cutlass.const_expr(self.w4a8_residual):
+                                            if cutlass.const_expr(_kb < 2):
+                                                res_word = res_w0[_nt]
+                                            else:
+                                                res_word = res_w1[_nt]
+                                            res_b = (
+                                                res_word
+                                                >> (
+                                                    Uint32((_kb * 2) % 4 * 8)
+                                                    + (Uint32(lane_c) >> Uint32(1)) * Uint32(8)
+                                                )
+                                            ) & Uint32(0xFF)
+                                            res_h2 = broadcast_f32_to_half2(fp8_e4m3_to_f32(res_b))
+                                            blo, bhi = e2m1x8_mul_residual_to_e4m3x8(w_pk, res_h2)
+                                        else:
+                                            blo, bhi = e2m1x8_to_e4m3x8(w_pk)
+                                        b_lo[_nt] = blo
+                                        b_hi[_nt] = bhi
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            w_pk_u = ld_shared_u32(
+                                                b_buf + Int32(128 * 64)
+                                                + n_in_arr[_nt] * Int32(self.w4a8_b_pad)
+                                                + w4a8_bk
+                                                + (lane_c << Int32(2))
+                                            )
+                                            sfb_arr_u[_nt] = (
+                                                sfb_words_u[_nt] >> Uint32(_kb * 8)
+                                            ) & Uint32(0xFF)
+                                            if cutlass.const_expr(self.w4a8_residual):
+                                                if cutlass.const_expr(_kb < 2):
+                                                    res_word_u = res_w0_u[_nt]
+                                                else:
+                                                    res_word_u = res_w1_u[_nt]
+                                                res_b_u = (
+                                                    res_word_u
+                                                    >> (
+                                                        Uint32((_kb * 2) % 4 * 8)
+                                                        + (Uint32(lane_c) >> Uint32(1)) * Uint32(8)
+                                                    )
+                                                ) & Uint32(0xFF)
+                                                res_h2_u = broadcast_f32_to_half2(
+                                                    fp8_e4m3_to_f32(res_b_u)
+                                                )
+                                                blo_u, bhi_u = e2m1x8_mul_residual_to_e4m3x8(
+                                                    w_pk_u, res_h2_u
+                                                )
+                                            else:
+                                                blo_u, bhi_u = e2m1x8_to_e4m3x8(w_pk_u)
+                                            b_lo_u[_nt] = blo_u
+                                            b_hi_u[_nt] = bhi_u
+                                    for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                        row_lo = row_lo_arr[_mt]
+                                        row_hi = row_lo + Int32(8)
+                                        a_addr_lo = (
+                                            sa_buf + (row_lo << Int32(7))
+                                            + Int32(_kb * 32) + (lane_c << Int32(3))
+                                        )
+                                        a_addr_hi = (
+                                            sa_buf + (row_hi << Int32(7))
+                                            + Int32(_kb * 32) + (lane_c << Int32(3))
+                                        )
+                                        a0 = ld_shared_u32(a_addr_lo)
+                                        a1 = ld_shared_u32(a_addr_hi)
+                                        a2 = ld_shared_u32(a_addr_lo + Int32(4))
+                                        a3 = ld_shared_u32(a_addr_hi + Int32(4))
+                                        sfa_w = (
+                                            asc_words[_mt] >> Uint32(_kb * 8)
+                                        ) & Uint32(0xFF)
+                                        for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                            _fi = ((_mt * fc1_n_tiles) + _nt) * 4
+                                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                                w4a8_facc[_fi],
+                                                w4a8_facc[_fi + 1],
+                                                w4a8_facc[_fi + 2],
+                                                w4a8_facc[_fi + 3],
+                                                a0, a1, a2, a3,
+                                                b_lo[_nt], b_hi[_nt],
+                                                sfa_w, sfb_arr[_nt],
+                                            )
+                                            w4a8_facc = (
+                                                w4a8_facc[:_fi]
+                                                + (d0, d1, d2, d3)
+                                                + w4a8_facc[_fi + 4:]
+                                            )
+                                            if cutlass.const_expr(self.w4a8_fused):
+                                                u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                                    w4a8_facc_u[_fi],
+                                                    w4a8_facc_u[_fi + 1],
+                                                    w4a8_facc_u[_fi + 2],
+                                                    w4a8_facc_u[_fi + 3],
+                                                    a0, a1, a2, a3,
+                                                    b_lo_u[_nt], b_hi_u[_nt],
+                                                    sfa_w, sfb_arr_u[_nt],
+                                                )
+                                                w4a8_facc_u = (
+                                                    w4a8_facc_u[:_fi]
+                                                    + (u0, u1, u2, u3)
+                                                    + w4a8_facc_u[_fi + 4:]
+                                                )
+                                cute.arch.sync_warp()
+                                if lane_c == Int32(0) and lane_g == Int32(0):
+                                    atomic_add_shared_i32(
+                                        w4a8_pipe_addr + Int32(16) + (par << Int32(2)),
+                                        Int32(1),
+                                    )
+                            # Hand the pass result to the epilogue's
+                            # layout-native accumulator (cold copy).
+                            for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                for _nt in cutlass.range_constexpr(fc1_n_tiles):
+                                    _fi = ((_mt * fc1_n_tiles) + _nt) * 4
+                                    if cutlass.const_expr(_pass == 0):
+                                        o_sl = gate_acc[(None, _mt, _nt)]
+                                    else:
+                                        o_sl = up_acc[(None, _mt, _nt)]
+                                    o_sl[0] = w4a8_facc[_fi]
+                                    o_sl[1] = w4a8_facc[_fi + 1]
+                                    o_sl[2] = w4a8_facc[_fi + 2]
+                                    o_sl[3] = w4a8_facc[_fi + 3]
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        u_sl = up_acc[(None, _mt, _nt)]
+                                        u_sl[0] = w4a8_facc_u[_fi]
+                                        u_sl[1] = w4a8_facc_u[_fi + 1]
+                                        u_sl[2] = w4a8_facc_u[_fi + 2]
+                                        u_sl[3] = w4a8_facc_u[_fi + 3]
+                        self.pass_gate_barrier.arrive_unaligned()
+
+                        # All MMA warps must be past their FC1 staging-buffer
+                        # reads before sC is rewritten below: without the old
+                        # per-k-tile CTA barriers, a fast warp's epilogue store
+                        # could clobber a lagging warp's staged A tile in sC.
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                        # Activation into sC (same math as the nvfp4 path), then
+                        # w4a8 quantize: E4M3 payload + UE8M0 scales into the
+                        # repurposed sA/sSFA smem regions at plain layouts.
+                        for epi_m in cutlass.range_constexpr(epi_rest_m):
+                            epi_m_valid = valid_rows - Int32(epi_m) * Int32(self.epi_tile[0])
+                            epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
+                            if epi_m_valid > Int32(0):
+                                for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
+                                    for mma_m_in_epi in cutlass.range_constexpr(MmaMPerEpiM):
+                                        mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
+                                        mma_n = mma_n_in_epi
+                                        tRS_rD_slice = tRS_rD[(None, mma_m_in_epi, mma_n_in_epi)]
+                                        gate_slice = tRS_rGate[(None, mma_m, mma_n)]
+                                        if cutlass.const_expr(self.is_gated):
+                                            up_slice = tRS_rUp[(None, mma_m, mma_n)]
+                                            for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
+                                                g = alpha_value * gate_slice[elem_idx]
+                                                u = alpha_value * up_slice[elem_idx]
+                                                sigmoid_g = cute.arch.rcp_approx(
+                                                    cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math),
+                                                )
+                                                tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                        else:
+                                            for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
+                                                g = alpha_value * gate_slice[elem_idx]
+                                                relu_g = fmax_f32(g, cutlass.Float32(0.0))
+                                                tRS_rD_slice[elem_idx] = relu_g * relu_g
+
+                                acc_vec = tRS_rD.load()
+                                acc_vec = acc_vec.to(cutlass.BFloat16)
+                                tRS_rD_out.store(acc_vec)
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    tRS_rD_out,
+                                    tRS_sD[(None, None, None, epi_buffer)],
+                                )
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                            self.epilog_sync_barrier.arrive_and_wait()
+
+                            rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
+                            epi_rows = epi_m_valid
+                            if epi_rows > Int32(self.epi_tile[0]):
+                                epi_rows = Int32(self.epi_tile[0])
+                            if epi_rows < Int32(0):
+                                epi_rows = Int32(0)
+                            mx_blocks_tile = Int32(self.tile_shape_mnk[2] // 32)
+                            quant_idx = Int32(tidx)
+                            while quant_idx < epi_rows * mx_blocks_tile:
+                                local_row = quant_idx // mx_blocks_tile
+                                row = rows_offset + local_row
+                                mx_block = quant_idx - local_row * mx_blocks_tile
+                                block_start = mx_block * Int32(32)
+                                values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                                block_max = cutlass.Float32(0.0)
+                                for elem_idx in cutlass.range_constexpr(32):
+                                    value = cutlass.Float32(
+                                        sC[local_row, block_start + elem_idx, epi_buffer]
+                                    )
+                                    values[elem_idx] = value
+                                    block_max = fmax_f32(block_max, fabs_f32(value))
+                                payload, mx_scale_byte = quantize_block_fp8_mx(values, block_max)
+                                pay_addr = sa_flat_addr + row * Int32(self.tile_shape_mnk[2]) + block_start
+                                for word_idx in cutlass.range_constexpr(8):
+                                    st_shared_u32(
+                                        pay_addr + Int32(word_idx * 4), payload[word_idx]
+                                    )
+                                st_shared_u8(
+                                    sfa_base_addr + row * mx_blocks_tile + mx_block,
+                                    Uint8(mx_scale_byte & Uint32(0xFF)),
+                                )
+                                quant_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
+
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                    if cutlass.const_expr((not self.swap_ab) and (not self.is_w4a8)):
                         # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
                         fz_crSFA = cute.filter_zeros(crSFA)
                         fz_crSFB = cute.filter_zeros(crSFB)
@@ -2258,7 +3025,7 @@ class MoEDynamicKernelBackend:
                     # half of the shared 128-row atom, so phase B reads offset 0
                     # (vs FC1's per-task offset). Re-slice both. Identity at
                     # tile_m==128.
-                    if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                    if cutlass.const_expr((not self.is_w4a8) and self.sfa_tiles_per_block > 1):
                         _sA_p2 = cute.local_tile(
                             sA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
                             (Int32(0), 0, None),
@@ -2278,24 +3045,25 @@ class MoEDynamicKernelBackend:
                         csSFA = thr_ld_SFA.partition_S(_sSFA_p2)
                         crSFA = thr_ld_SFA.retile(tCrSFA)
 
-                    csA_phase2 = csA[None, None, None, 0]
-                    csSFA_phase2 = csSFA[None, None, None, 0]
-
                     expert_idx = task_expert_idx
 
-                    # Consume all output tiles continuously from phase2_pipeline.
+                    if cutlass.const_expr(not self.is_w4a8):
+                        csA_phase2 = csA[None, None, None, 0]
+                        csSFA_phase2 = csSFA[None, None, None, 0]
 
-                    # Hoist A-side register loads: sA is constant across all
-                    # FC2 output tiles (quantized intermediate). Load crA and
-                    # crSFA for all k-blocks once, reuse for all 32 tiles.
-                    fz_crSFA_p2 = cute.filter_zeros(crSFA)
-                    cute.copy(smem_copy_A, csA_phase2[None, None, 0], crA[None, None, 0])
-                    fz_csSFA_p2 = cute.filter_zeros(csSFA_phase2)
-                    cute.copy(smem_copy_SFA, fz_csSFA_p2[None, None, 0], fz_crSFA_p2[None, None, 0])
-                    for _kb_pre in cutlass.range_constexpr(num_k_blocks - 1):
-                        k_pre = _kb_pre + 1
-                        cute.copy(smem_copy_A, csA_phase2[None, None, k_pre], crA[None, None, k_pre])
-                        cute.copy(smem_copy_SFA, fz_csSFA_p2[None, None, k_pre], fz_crSFA_p2[None, None, k_pre])
+                        # Consume all output tiles continuously from phase2_pipeline.
+
+                        # Hoist A-side register loads: sA is constant across all
+                        # FC2 output tiles (quantized intermediate). Load crA and
+                        # crSFA for all k-blocks once, reuse for all 32 tiles.
+                        fz_crSFA_p2 = cute.filter_zeros(crSFA)
+                        cute.copy(smem_copy_A, csA_phase2[None, None, 0], crA[None, None, 0])
+                        fz_csSFA_p2 = cute.filter_zeros(csSFA_phase2)
+                        cute.copy(smem_copy_SFA, fz_csSFA_p2[None, None, 0], fz_crSFA_p2[None, None, 0])
+                        for _kb_pre in cutlass.range_constexpr(num_k_blocks - 1):
+                            k_pre = _kb_pre + 1
+                            cute.copy(smem_copy_A, csA_phase2[None, None, k_pre], crA[None, None, k_pre])
+                            cute.copy(smem_copy_SFA, fz_csSFA_p2[None, None, k_pre], fz_crSFA_p2[None, None, k_pre])
 
                     # Seed FC1-epilogue scratch that the FC2 loop re-binds. With
                     # the non-swap FC1 wrapped in `const_expr(not swap_ab)`, these
@@ -2309,34 +3077,211 @@ class MoEDynamicKernelBackend:
                     local_row = Int32(0)
                     phase2_cons_state.reset_count()
                     for output_tile_idx in range(0, output_tile_cnt, 1, unroll=4):
-                        phase2_peek = phase2_pipeline.consumer_try_wait(phase2_cons_state)
-                        phase2_pipeline.consumer_wait(phase2_cons_state, phase2_peek)
-                        csB_phase2 = csB[None, None, None, phase2_cons_state.index]
-                        csSFB_phase2 = csSFB[None, None, None, phase2_cons_state.index]
+                        if cutlass.const_expr(not self.is_w4a8):
+                            phase2_peek = phase2_pipeline.consumer_try_wait(phase2_cons_state)
+                            phase2_pipeline.consumer_wait(phase2_cons_state, phase2_peek)
+                            csB_phase2 = csB[None, None, None, phase2_cons_state.index]
+                            csSFB_phase2 = csSFB[None, None, None, phase2_cons_state.index]
 
-                        # Only load B-side (B_down changes per output tile; A is hoisted)
-                        cute.copy(smem_copy_B, csB_phase2[None, None, 0], crB[None, None, 0])
-                        f2 = cute.filter_zeros(csSFB_phase2)
-                        f4 = cute.filter_zeros(crSFB)
-                        cute.copy(smem_copy_SFB, f2[None, None, 0], f4[None, None, 0])
+                            # Only load B-side (B_down changes per output tile; A is hoisted)
+                            cute.copy(smem_copy_B, csB_phase2[None, None, 0], crB[None, None, 0])
+                            f2 = cute.filter_zeros(csSFB_phase2)
+                            f4 = cute.filter_zeros(crSFB)
+                            cute.copy(smem_copy_SFB, f2[None, None, 0], f4[None, None, 0])
 
-                        down_acc.fill(0.0)
-                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                            k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                            if k_block_idx == num_k_blocks - 1:
-                                phase2_pipeline.consumer_release(phase2_cons_state)
-                                phase2_cons_state.advance()
-                            if k_next > 0:
-                                # Only B-side for next k-block (A already in registers)
-                                cute.copy(smem_copy_B, csB_phase2[None, None, k_next], crB[None, None, k_next])
-                                f2 = cute.filter_zeros(csSFB_phase2)
-                                f4 = cute.filter_zeros(crSFB)
-                                cute.copy(smem_copy_SFB, f2[None, None, k_next], f4[None, None, k_next])
+                        if cutlass.const_expr(not self.is_w4a8):
+                            down_acc.fill(0.0)
+                        if cutlass.const_expr(self.is_w4a8):
+                            # w4a8 FC2: A from the epilogue's plain smem region,
+                            # B_down/scales/residuals cp.async double-buffered
+                            # across output tiles, raw FP8 MMA.
+                            w4a8_facc2 = tuple(
+                                cutlass.Float32(0.0)
+                                for _ in range(4 * fc2_m_tiles * fc2_n_tiles)
+                            )
+                            w4a8_fc2_windows = (
+                                output_tile_cnt // 2
+                                if self.w4a8_fc2_pair
+                                else output_tile_cnt
+                            )
+                            fc2_epoch = (
+                                slice_idx
+                                * Int32(
+                                    self.w4a8_fc1_windows_per_slice
+                                    * (fc1_k_tile_cnt // 2)
+                                    + w4a8_fc2_windows
+                                )
+                                + Int32(
+                                    self.w4a8_fc1_windows_per_slice
+                                    * (fc1_k_tile_cnt // 2)
+                                )
+                                + (
+                                    (output_tile_idx >> Int32(1))
+                                    if cutlass.const_expr(self.w4a8_fc2_pair)
+                                    else output_tile_idx
+                                )
+                                + Int32(1)
+                            )
+                            par = (fc2_epoch - Int32(1)) & Int32(self.w4a8_depth - 1)
+                            _spin_wait_shared_ge_i32(
+                                w4a8_pipe_addr + (par << Int32(2)), fc2_epoch
+                            )
+                            cute.arch.fence_proxy("async.shared", space="cta")
+
+                            if cutlass.const_expr(self.w4a8_depth == 4):
+                                b_buf = (
+                                    w4a8_sb0
+                                    + (w4a8_sb1 - w4a8_sb0) * (par >> Int32(1))
+                                    + (par & Int32(1)) * Int32(128 * 64)
+                                )
+                            else:
+                                b_buf = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
+                            if cutlass.const_expr(self.w4a8_fc2_pair):
+                                w4a8_t_in_pair = output_tile_idx & Int32(1)
+                                b_buf = b_buf + w4a8_t_in_pair * Int32(128 * 64)
+                                sfb_buf = (
+                                    w4a8_sfbb + (par << Int32(10))
+                                    + (w4a8_t_in_pair << Int32(9))
+                                )
+                                res_buf = (
+                                    w4a8_res2 + (par << Int32(11))
+                                    + (w4a8_t_in_pair << Int32(10))
+                                )
+                            else:
+                                sfb_buf = w4a8_sfbb + (par << Int32(9))
+                                res_buf = w4a8_res2 + (par << Int32(10))
+                            mx_blocks_tile_p2 = Int32(self.tile_shape_mnk[2] // 32)
+
+                            n_in_arr2 = cute.make_rmem_tensor((fc2_n_tiles,), Int32)
+                            sfb_words2 = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                            res2_w0 = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                            res2_w1 = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                            for _nt in cutlass.range_constexpr(fc2_n_tiles):
+                                _cnv = tCgC_id[(None, 0, _nt)]
+                                _cn = _cnv[0]
+                                n_in = _cn[1] - Int32(2) * lane_c + lane_g
+                                n_in_arr2[_nt] = n_in
+                                sfb_words2[_nt] = ld_shared_u32(sfb_buf + (n_in << Int32(2)))
+                                if cutlass.const_expr(self.w4a8_residual):
+                                    res2_w0[_nt] = ld_shared_u32(res_buf + (n_in << Int32(3)))
+                                    res2_w1[_nt] = ld_shared_u32(res_buf + (n_in << Int32(3)) + Int32(4))
+                            rowlo_arr2 = cute.make_rmem_tensor((fc2_m_tiles,), Int32)
+                            for _mt in cutlass.range_constexpr(fc2_m_tiles):
+                                _c0v = tCgC_id[(None, _mt, 0)]
+                                _c0 = _c0v[0]
+                                rowlo_arr2[_mt] = _c0[0]
+
+                            for _kb in cutlass.range_constexpr(n_k32_per_tile):
+                                b_lo = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                                b_hi = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                                sfb_arr = cute.make_rmem_tensor((fc2_n_tiles,), Uint32)
+                                for _nt in cutlass.range_constexpr(fc2_n_tiles):
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        w4a8_bk2 = (
+                                            Int32(_kb)
+                                            ^ ((n_in_arr2[_nt] >> Int32(1)) & Int32(3))
+                                        ) << Int32(4)
+                                    else:
+                                        w4a8_bk2 = Int32(_kb * 16)
+                                    w_dn = ld_shared_u32(
+                                        b_buf
+                                        + n_in_arr2[_nt] * Int32(self.w4a8_b_pad)
+                                        + w4a8_bk2
+                                        + (lane_c << Int32(2))
+                                    )
+                                    sfb_arr[_nt] = (
+                                        sfb_words2[_nt] >> Uint32(_kb * 8)
+                                    ) & Uint32(0xFF)
+                                    if cutlass.const_expr(self.w4a8_residual):
+                                        if cutlass.const_expr(_kb < 2):
+                                            res_word = res2_w0[_nt]
+                                        else:
+                                            res_word = res2_w1[_nt]
+                                        res_b = (
+                                            res_word
+                                            >> (
+                                                Uint32((_kb * 2) % 4 * 8)
+                                                + (Uint32(lane_c) >> Uint32(1)) * Uint32(8)
+                                            )
+                                        ) & Uint32(0xFF)
+                                        res_h2 = broadcast_f32_to_half2(fp8_e4m3_to_f32(res_b))
+                                        blo, bhi = e2m1x8_mul_residual_to_e4m3x8(w_dn, res_h2)
+                                    else:
+                                        blo, bhi = e2m1x8_to_e4m3x8(w_dn)
+                                    b_lo[_nt] = blo
+                                    b_hi[_nt] = bhi
+                                for _mt in cutlass.range_constexpr(fc2_m_tiles):
+                                    row_lo = rowlo_arr2[_mt]
+                                    row_hi = row_lo + Int32(8)
+                                    a_addr_lo = (
+                                        sa_flat_addr
+                                        + row_lo * Int32(self.tile_shape_mnk[2])
+                                        + Int32(_kb * 32)
+                                        + Int32(8) * lane_c
+                                    )
+                                    a_addr_hi = (
+                                        sa_flat_addr
+                                        + row_hi * Int32(self.tile_shape_mnk[2])
+                                        + Int32(_kb * 32)
+                                        + Int32(8) * lane_c
+                                    )
+                                    a0 = ld_shared_u32(a_addr_lo)
+                                    a1 = ld_shared_u32(a_addr_hi)
+                                    a2 = ld_shared_u32(a_addr_lo + Int32(4))
+                                    a3 = ld_shared_u32(a_addr_hi + Int32(4))
+                                    sfa_w = Uint32(0)
+                                    if lane_c < Int32(2):
+                                        sf_row = row_lo
+                                        if lane_c == Int32(1):
+                                            sf_row = row_hi
+                                        sf_idx = sf_row * mx_blocks_tile_p2 + Int32(_kb)
+                                        sf_word = ld_shared_u32(
+                                            sfa_base_addr + ((sf_idx >> Int32(2)) << Int32(2))
+                                        )
+                                        sfa_w = (
+                                            sf_word >> ((Uint32(sf_idx) & Uint32(3)) * Uint32(8))
+                                        ) & Uint32(0xFF)
+                                    for _nt in cutlass.range_constexpr(fc2_n_tiles):
+                                        _fi = ((_mt * fc2_n_tiles) + _nt) * 4
+                                        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                            w4a8_facc2[_fi],
+                                            w4a8_facc2[_fi + 1],
+                                            w4a8_facc2[_fi + 2],
+                                            w4a8_facc2[_fi + 3],
+                                            a0, a1, a2, a3,
+                                            b_lo[_nt], b_hi[_nt],
+                                            sfa_w, sfb_arr[_nt],
+                                        )
+                                        w4a8_facc2 = (
+                                            w4a8_facc2[:_fi]
+                                            + (d0, d1, d2, d3)
+                                            + w4a8_facc2[_fi + 4:]
+                                        )
                             for _mt in cutlass.range_constexpr(fc2_m_tiles):
                                 for _nt in cutlass.range_constexpr(fc2_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(mma_atom, down_acc[None, _mt, _nt], tCrA[None, _mt, k_block_idx], tCrB[None, _nt, k_block_idx], down_acc[None, _mt, _nt])
+                                    _fi = ((_mt * fc2_n_tiles) + _nt) * 4
+                                    dn_sl = down_acc[(None, _mt, _nt)]
+                                    dn_sl[0] = w4a8_facc2[_fi]
+                                    dn_sl[1] = w4a8_facc2[_fi + 1]
+                                    dn_sl[2] = w4a8_facc2[_fi + 2]
+                                    dn_sl[3] = w4a8_facc2[_fi + 3]
+                        if cutlass.const_expr(not self.is_w4a8):
+                            for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                                k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
+                                if k_block_idx == num_k_blocks - 1:
+                                    phase2_pipeline.consumer_release(phase2_cons_state)
+                                    phase2_cons_state.advance()
+                                if k_next > 0:
+                                    # Only B-side for next k-block (A already in registers)
+                                    cute.copy(smem_copy_B, csB_phase2[None, None, k_next], crB[None, None, k_next])
+                                    f2 = cute.filter_zeros(csSFB_phase2)
+                                    f4 = cute.filter_zeros(crSFB)
+                                    cute.copy(smem_copy_SFB, f2[None, None, k_next], f4[None, None, k_next])
+                                for _mt in cutlass.range_constexpr(fc2_m_tiles):
+                                    for _nt in cutlass.range_constexpr(fc2_n_tiles):
+                                        mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
+                                        mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
+                                        cute.gemm(mma_atom, down_acc[None, _mt, _nt], tCrA[None, _mt, k_block_idx], tCrB[None, _nt, k_block_idx], down_acc[None, _mt, _nt])
 
                         # Scatter using precomputed metadata (no redundant gmem loads)
                         tile_n_base_cur = output_tile_idx * Int32(self.tile_shape_mnk[1])
@@ -2428,13 +3373,32 @@ class MoEDynamicKernelBackend:
                             # finish scatter before next output tile's pipeline ops
                             # (pipeline consumer is collective across all MMA warps).
                             self.epilog_sync_barrier.arrive_and_wait()
+                            if cutlass.const_expr(self.is_w4a8):
+                                # All MMA warps are past their staging-buffer and
+                                # sC reads (the barrier above orders them);
+                                # release the buffer use in one bump — once per
+                                # PAIR under fused FC2 pairing.
+                                if cutlass.const_expr(self.w4a8_fc2_pair):
+                                    if (output_tile_idx & Int32(1)) == Int32(1):
+                                        if Int32(tidx) == Int32(0):
+                                            atomic_add_shared_i32(
+                                                w4a8_pipe_addr + Int32(16)
+                                                + (par << Int32(2)),
+                                                Int32(self.num_mma_warps),
+                                            )
+                                else:
+                                    if Int32(tidx) == Int32(0):
+                                        atomic_add_shared_i32(
+                                            w4a8_pipe_addr + Int32(16) + (par << Int32(2)),
+                                            Int32(self.num_mma_warps),
+                                        )
 
                     # Signal that FC2/scatter no longer needs sA, so the DMA
                     # warp may start the next slice/task's FC1 loads.
                     self.pass_final_barrier.arrive_unaligned()
                     slice_idx += Int32(1)
 
-            elif warp_idx == self.tma_load_warp_id:
+            elif warp_idx < self.num_mma_warps + self.num_dma_warps:
                 task_expert_idx = _ld_shared_i32(ctrl_base_addr + Int32(8))
                 task_m_tile_idx = _ld_shared_i32(ctrl_base_addr + Int32(12))
                 task_slice_begin_idx = _ld_shared_i32(ctrl_base_addr + Int32(16))
@@ -2472,8 +3436,461 @@ class MoEDynamicKernelBackend:
                         tBgSFB_w13_gate_hi_nk = tBgSFB_w13[(None, gate_hi_idx, None, task_expert_idx)]
 
                     # ---- FC1 gate pass ----
+                    if cutlass.const_expr(self.is_w4a8):
+                        # w4a8 producer: the DMA warp cp.asyncs each k-tile's
+                        # operands into the staging buffers and publishes them
+                        # via per-buffer ready epochs; the MMA warps consume by
+                        # spinning on the epoch (no CTA barriers in the k loop)
+                        # and acknowledge via per-buffer done counts. Epochs are
+                        # monotonic per task, so buffer reuse across passes,
+                        # FC2, and slices is ordered by the flags alone.
+                        w4a8_KT = fc1_k_tile_cnt // 2
+                        w4a8_passes = self.w4a8_fc1_windows_per_slice
+                        m_row_base_p = task_m_tile_idx * Int32(self.tile_shape_mnk[0])
+                        w4a8_pend_par = Int32(0)
+                        w4a8_pend_epoch = Int32(0)
+                        # With two producer warps, epochs split by parity:
+                        # warp 0 stages odd epochs (pars 0,2), warp 1 even
+                        # (pars 1,3) — disjoint buffers, independent FIFOs.
+                        w4a8_warp_off = warp_idx - Int32(self.tma_load_warp_id)
+                        asc_base_p = Int64(m_row_base_p) * Int64(a_mx_per_row)
+                        cur_slice_p = task_slice_begin_idx + slice_idx
+                        for _pp in cutlass.range_constexpr(w4a8_passes):
+                            if cutlass.const_expr(_pp == 0):
+                                p_n_tile = cur_slice_p
+                                if cutlass.const_expr(self.is_gated):
+                                    p_n_tile = cur_slice_p + gate_tile_cnt
+                            else:
+                                p_n_tile = cur_slice_p
+                            if cutlass.const_expr(self.w4a8_fused):
+                                # Fused: this window also stages the up half.
+                                pu_n_tile = cur_slice_p
+                                nu_base_p = pu_n_tile * Int32(self.tile_shape_mnk[1])
+                            n_base_p = p_n_tile * Int32(self.tile_shape_mnk[1])
+                            b_row_u32p = b_w13_u32.shape[1]
+                            b_base_p = (
+                                Int64(task_expert_idx) * Int64(b_w13_u32.shape[0] * b_row_u32p)
+                                + Int64(n_base_p) * Int64(b_row_u32p)
+                            )
+                            sfb_row_p = sfb_w13_mx.shape[1]
+                            sfb_base_p = (
+                                Int64(task_expert_idx) * Int64(sfb_w13_mx.shape[0] * sfb_row_p)
+                                + Int64(n_base_p) * Int64(sfb_row_p)
+                            )
+                            if cutlass.const_expr(self.w4a8_fused):
+                                b_base_pu = (
+                                    Int64(task_expert_idx)
+                                    * Int64(b_w13_u32.shape[0] * b_row_u32p)
+                                    + Int64(nu_base_p) * Int64(b_row_u32p)
+                                )
+                                sfb_base_pu = (
+                                    Int64(task_expert_idx)
+                                    * Int64(sfb_w13_mx.shape[0] * sfb_row_p)
+                                    + Int64(nu_base_p) * Int64(sfb_row_p)
+                                )
+                            if cutlass.const_expr(self.w4a8_residual):
+                                res_row_p = w13_residual.shape[1]
+                                res_base_p = (
+                                    Int64(task_expert_idx) * Int64(w13_residual.shape[0] * res_row_p)
+                                    + Int64(n_base_p) * Int64(res_row_p)
+                                )
+                                if cutlass.const_expr(self.w4a8_fused):
+                                    res_base_pu = (
+                                        Int64(task_expert_idx)
+                                        * Int64(w13_residual.shape[0] * res_row_p)
+                                        + Int64(nu_base_p) * Int64(res_row_p)
+                                    )
+                            w4a8_uses = w4a8_passes * w4a8_KT + (
+                                output_tile_cnt // 2
+                                if self.w4a8_fc2_pair
+                                else output_tile_cnt
+                            )
+                            for _pkt in range(w4a8_KT):
+                                # Unified buffer-use epochs: gate tiles, up
+                                # tiles, then FC2 tiles share one sequence, so
+                                # every cross-phase buffer reuse is ordered by
+                                # the same ready/done flags.
+                                epoch = (
+                                    slice_idx * Int32(w4a8_uses)
+                                    + Int32(_pp * w4a8_KT) + _pkt + Int32(1)
+                                )
+                                par = (epoch - Int32(1)) & Int32(self.w4a8_depth - 1)
+                                w4a8_owned = Int32(1)
+                                if cutlass.const_expr(self.num_dma_warps > 1):
+                                    w4a8_owned = Int32(
+                                        ((epoch - Int32(1)) & Int32(1)) == w4a8_warp_off
+                                    )
+                                if w4a8_owned > Int32(0):
+                                    need = (
+                                        (epoch - Int32(1)) >> Int32(self.w4a8_depth_log2)
+                                    ) * Int32(self.num_mma_warps)
+                                    _spin_wait_shared_ge_i32(
+                                        w4a8_pipe_addr + Int32(16) + (par << Int32(2)), need
+                                    )
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        # B granule through TMA: one box per
+                                        # 8KB half; granule bytes complete on
+                                        # this par's mbarrier. Region/stage
+                                        # selection mirrors the consumers'
+                                        # b_buf math exactly.
+                                        if lane_id == Int32(0):
+                                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                                w4a8_tma_mbar_ptr + par,
+                                                Int32(
+                                                    2 * _W4A8_TMA_TILE_BYTES
+                                                    if self.w4a8_fused
+                                                    else _W4A8_TMA_TILE_BYTES
+                                                ),
+                                            )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            if par == Int32(0):
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, 0)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_up_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, 1)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                            else:
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, 0)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_up_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, 1)],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                        else:
+                                            # Non-fused small (relu2): region
+                                            # par>>1, stage par&1, single box.
+                                            if (par >> Int32(1)) == Int32(0):
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13[(None, par & Int32(1))],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                            else:
+                                                cute.copy(
+                                                    tma_b_w13,
+                                                    tBgB_w13_gate_nk[(None, _pkt)],
+                                                    tBsB_w13_up[(None, par & Int32(1))],
+                                                    tma_bar_ptr=w4a8_tma_mbar_ptr + par,
+                                                )
+                                    else:
+                                        if cutlass.const_expr(self.w4a8_depth == 4):
+                                            w4a8_b_dst = (
+                                                w4a8_sb0
+                                                + (w4a8_sb1 - w4a8_sb0) * (par >> Int32(1))
+                                                + (par & Int32(1)) * Int32(128 * 64)
+                                            )
+                                        else:
+                                            w4a8_b_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
+                                        _w4a8_stage_b_tile(
+                                            b_w13_u32,
+                                            w4a8_b_dst,
+                                            b_base_p + Int64(_pkt) * Int64(16),
+                                            Int32(b_row_u32p), Int32(lane_id), 32,
+                                            self.w4a8_b_pad,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_b_tile(
+                                                b_w13_u32,
+                                                w4a8_b_dst + Int32(128 * 64),
+                                                b_base_pu + Int64(_pkt) * Int64(16),
+                                                Int32(b_row_u32p), Int32(lane_id), 32,
+                                                self.w4a8_b_pad,
+                                            )
+                                    _w4a8_stage_a_tile(
+                                        pa_u32,
+                                        w4a8_sa0 + par * Int32(self.tile_shape_mnk[0] * 128),
+                                        Int64(m_row_base_p) * Int64(a_u32_per_row)
+                                        + Int64(_pkt) * Int64(32),
+                                        a_u32_per_row, Int32(lane_id), 32,
+                                        self.tile_shape_mnk[0],
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        w4a8_sfb_dst = w4a8_sfbb + (par << Int32(10))
+                                    else:
+                                        w4a8_sfb_dst = w4a8_sfbb + (par << Int32(9))
+                                    _w4a8_stage_bytes4(
+                                        sfb_w13_mx,
+                                        w4a8_sfb_dst,
+                                        sfb_base_p + Int64(_pkt) * Int64(4),
+                                        Int32(sfb_row_p), Int32(lane_id), 32,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        _w4a8_stage_bytes4(
+                                            sfb_w13_mx,
+                                            w4a8_sfb_dst + Int32(512),
+                                            sfb_base_pu + Int64(_pkt) * Int64(4),
+                                            Int32(sfb_row_p), Int32(lane_id), 32,
+                                        )
+                                    if cutlass.const_expr(self.w4a8_residual):
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            w4a8_res_dst = w4a8_res0 + (par << Int32(11))
+                                        else:
+                                            w4a8_res_dst = w4a8_res0 + (par << Int32(10))
+                                        _w4a8_stage_bytes8(
+                                            w13_residual,
+                                            w4a8_res_dst,
+                                            res_base_p + Int64(_pkt) * Int64(8),
+                                            Int32(res_row_p), Int32(lane_id), 32,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_bytes8(
+                                                w13_residual,
+                                                w4a8_res_dst + Int32(1024),
+                                                res_base_pu + Int64(_pkt) * Int64(8),
+                                                Int32(res_row_p), Int32(lane_id), 32,
+                                            )
+                                    _w4a8_stage_bytes4(
+                                        scale_storage,
+                                        (
+                                            w4a8_resb
+                                            + par * Int32(self.tile_shape_mnk[0] * 4)
+                                        )
+                                        if cutlass.const_expr(self.w4a8_small)
+                                        else (sfa_base_addr + (par << Int32(9))),
+                                        asc_base_p + Int64(_pkt) * Int64(4),
+                                        a_mx_per_row, Int32(lane_id), 32,
+                                        self.tile_shape_mnk[0],
+                                    )
+                                    cute.arch.cp_async_commit_group()
+                                    # Deferred publish: drain to one outstanding
+                                    # group, release-publish the PREVIOUS window;
+                                    # the current window's copies overlap the
+                                    # consumers' work on the previous one. Under
+                                    # TMA-B the pending granule's mbarrier is
+                                    # waited too (whole warp; phase bit per par).
+                                    if cutlass.const_expr(self.w4a8_b_tma):
+                                        if w4a8_pend_epoch > Int32(0):
+                                            cute.arch.mbarrier_wait(
+                                                w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                                phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                            )
+                                            w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                                Int32(1) << w4a8_pend_par
+                                            )
+                                    cute.arch.cp_async_wait_group(1)
+                                    cute.arch.fence_proxy("async.shared", space="cta")
+                                    if lane_id == Int32(0):
+                                        if w4a8_pend_epoch > Int32(0):
+                                            _st_shared_release_i32(
+                                                w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
+                                                w4a8_pend_epoch,
+                                            )
+                                    w4a8_pend_par = par
+                                    w4a8_pend_epoch = epoch
+                            # (The original pass_gate wait below still pairs
+                            # with the MMA warps' arrive; buffer reuse across
+                            # passes is ordered by the done-count epochs.)
+                        # ---- FC2 B_down staging (per output tile) ----
+                        dn_row_u32p = b_down_u32.shape[1]
+                        dn_base_p = (
+                            Int64(task_expert_idx) * Int64(b_down_u32.shape[0] * dn_row_u32p)
+                            + Int64(cur_slice_p) * Int64(16)
+                        )
+                        dnsf_row_p = sfb_down_mx.shape[1]
+                        dnsf_base_p = (
+                            Int64(task_expert_idx) * Int64(sfb_down_mx.shape[0] * dnsf_row_p)
+                            + Int64(cur_slice_p) * Int64(4)
+                        )
+                        if cutlass.const_expr(self.w4a8_residual):
+                            dnres_row_p = down_residual.shape[1]
+                            dnres_base_p = (
+                                Int64(task_expert_idx) * Int64(down_residual.shape[0] * dnres_row_p)
+                                + Int64(cur_slice_p) * Int64(8)
+                            )
+                        w4a8_fc2_step = 2 if self.w4a8_fc2_pair else 1
+                        for _pt in range(0, output_tile_cnt, w4a8_fc2_step):
+                            epoch2 = (
+                                slice_idx * Int32(w4a8_uses)
+                                + Int32(w4a8_passes * w4a8_KT)
+                                + (
+                                    (_pt >> Int32(1))
+                                    if cutlass.const_expr(self.w4a8_fc2_pair)
+                                    else _pt
+                                )
+                                + Int32(1)
+                            )
+                            par2 = (epoch2 - Int32(1)) & Int32(self.w4a8_depth - 1)
+                            w4a8_owned2 = Int32(1)
+                            if cutlass.const_expr(self.num_dma_warps > 1):
+                                w4a8_owned2 = Int32(
+                                    ((epoch2 - Int32(1)) & Int32(1)) == w4a8_warp_off
+                                )
+                            if w4a8_owned2 > Int32(0):
+                                need2 = (
+                                    (epoch2 - Int32(1)) >> Int32(self.w4a8_depth_log2)
+                                ) * Int32(self.num_mma_warps)
+                                _spin_wait_shared_ge_i32(
+                                    w4a8_pipe_addr + Int32(16) + (par2 << Int32(2)), need2
+                                )
+                                row_off_p = Int64(_pt) * Int64(128)
+                                if cutlass.const_expr(self.w4a8_b_tma):
+                                    if lane_id == Int32(0):
+                                        cute.arch.mbarrier_arrive_and_expect_tx(
+                                            w4a8_tma_mbar_ptr + par2,
+                                            Int32(
+                                                2 * _W4A8_TMA_TILE_BYTES
+                                                if self.w4a8_fc2_pair
+                                                else _W4A8_TMA_TILE_BYTES
+                                            ),
+                                        )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        if par2 == Int32(0):
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, 0)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt + Int32(1), cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, 1)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, 0)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt + Int32(1), cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, 1)],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                    else:
+                                        if (par2 >> Int32(1)) == Int32(0):
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down[(None, par2 & Int32(1))],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_b_down,
+                                                tBgB_down[(None, _pt, cur_slice_p, task_expert_idx)],
+                                                tBsB_down_up[(None, par2 & Int32(1))],
+                                                tma_bar_ptr=w4a8_tma_mbar_ptr + par2,
+                                            )
+                                else:
+                                    if cutlass.const_expr(self.w4a8_depth == 4):
+                                        w4a8_b2_dst = (
+                                            w4a8_sb0
+                                            + (w4a8_sb1 - w4a8_sb0) * (par2 >> Int32(1))
+                                            + (par2 & Int32(1)) * Int32(128 * 64)
+                                        )
+                                    else:
+                                        w4a8_b2_dst = w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
+                                    _w4a8_stage_b_tile(
+                                        b_down_u32,
+                                        w4a8_b2_dst,
+                                        dn_base_p + row_off_p * Int64(dn_row_u32p),
+                                        Int32(dn_row_u32p), Int32(lane_id), 32,
+                                        self.w4a8_b_pad,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        row_off_p2 = row_off_p + Int64(128)
+                                        _w4a8_stage_b_tile(
+                                            b_down_u32,
+                                            w4a8_b2_dst + Int32(128 * 64),
+                                            dn_base_p + row_off_p2 * Int64(dn_row_u32p),
+                                            Int32(dn_row_u32p), Int32(lane_id), 32,
+                                            self.w4a8_b_pad,
+                                        )
+                                if cutlass.const_expr(self.w4a8_fc2_pair):
+                                    w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(10))
+                                else:
+                                    w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(9))
+                                _w4a8_stage_bytes4(
+                                    sfb_down_mx,
+                                    w4a8_sfb2_dst,
+                                    dnsf_base_p + row_off_p * Int64(dnsf_row_p),
+                                    Int32(dnsf_row_p), Int32(lane_id), 32,
+                                )
+                                if cutlass.const_expr(self.w4a8_fc2_pair):
+                                    _w4a8_stage_bytes4(
+                                        sfb_down_mx,
+                                        w4a8_sfb2_dst + Int32(512),
+                                        dnsf_base_p
+                                        + (row_off_p + Int64(128)) * Int64(dnsf_row_p),
+                                        Int32(dnsf_row_p), Int32(lane_id), 32,
+                                    )
+                                if cutlass.const_expr(self.w4a8_residual):
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        w4a8_res2_dst = w4a8_res2 + (par2 << Int32(11))
+                                    else:
+                                        w4a8_res2_dst = w4a8_res2 + (par2 << Int32(10))
+                                    _w4a8_stage_bytes8(
+                                        down_residual,
+                                        w4a8_res2_dst,
+                                        dnres_base_p + row_off_p * Int64(dnres_row_p),
+                                        Int32(dnres_row_p), Int32(lane_id), 32,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        _w4a8_stage_bytes8(
+                                            down_residual,
+                                            w4a8_res2_dst + Int32(1024),
+                                            dnres_base_p
+                                            + (row_off_p + Int64(128)) * Int64(dnres_row_p),
+                                            Int32(dnres_row_p), Int32(lane_id), 32,
+                                        )
+                                cute.arch.cp_async_commit_group()
+                                if cutlass.const_expr(self.w4a8_b_tma):
+                                    if w4a8_pend_epoch > Int32(0):
+                                        cute.arch.mbarrier_wait(
+                                            w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                            phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                        )
+                                        w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                            Int32(1) << w4a8_pend_par
+                                        )
+                                cute.arch.cp_async_wait_group(1)
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                if lane_id == Int32(0):
+                                    if w4a8_pend_epoch > Int32(0):
+                                        _st_shared_release_i32(
+                                            w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
+                                            w4a8_pend_epoch,
+                                        )
+                                w4a8_pend_par = par2
+                                w4a8_pend_epoch = epoch2
+                        if cutlass.const_expr(self.w4a8_b_tma):
+                            if w4a8_pend_epoch > Int32(0):
+                                cute.arch.mbarrier_wait(
+                                    w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                    phase=(w4a8_mbar_phase >> w4a8_pend_par) & Int32(1),
+                                )
+                                w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                    Int32(1) << w4a8_pend_par
+                                )
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        if lane_id == Int32(0):
+                            if w4a8_pend_epoch > Int32(0):
+                                _st_shared_release_i32(
+                                    w4a8_pipe_addr + (w4a8_pend_par << Int32(2)),
+                                    w4a8_pend_epoch,
+                                )
+                        w4a8_pend_epoch = Int32(0)
                     prod_state.reset_count()
-                    for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):
+                    for k_tile in range(0, fc1_k_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4):
                         ml_pipeline.producer_acquire(prod_state)
                         cute.copy(tma_a, tAgA_mk[(None, k_tile)], tAsA[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
                         cute.copy(tma_sfa, tAgSFA_mk[(None, k_tile)], tAsSFA[(None, prod_state.index)], tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state))
@@ -2495,13 +3912,20 @@ class MoEDynamicKernelBackend:
                         prod_state.advance()
 
                     # Wait for the MMA warps to finish the FC1 gate/only pass
-                    # before reusing sA/sB/sSFA/sSFB for up/FC2 staging.
-                    self.pass_gate_barrier.wait_unaligned()
+                    # before reusing sA/sB/sSFA/sSFB for up/FC2 staging. Under
+                    # w4a8 the staging-flag epochs order every buffer reuse, so
+                    # the producer only contributes its arrival and keeps
+                    # streaming the up/FC2 tiles (the wait would idle it for
+                    # the MMA warps' whole gate pass).
+                    if cutlass.const_expr(self.is_w4a8):
+                        self.pass_gate_barrier.arrive_unaligned()
+                    else:
+                        self.pass_gate_barrier.wait_unaligned()
 
                     if self.is_gated:
                         # ---- FC1 up pass ----
                         up_prod_state.reset_count()
-                        for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):
+                        for k_tile in range(0, fc1_k_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4):
                             up_pipeline.producer_acquire(up_prod_state)
                             cute.copy(tma_a, tAgA_mk[(None, k_tile)], tAsA[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
                             cute.copy(tma_b_w13, tBgB_w13_up_nk[(None, k_tile)], tBsB_w13_up[(None, up_prod_state.index)], tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state))
@@ -2518,7 +3942,7 @@ class MoEDynamicKernelBackend:
                     # Load ALL FC2 tiles continuously once stage1 no longer needs
                     # the gate staging buffers.
                     phase2_prod_state.reset_count()
-                    for output_tile_idx in range(0, output_tile_cnt, 1, unroll=4):
+                    for output_tile_idx in range(0, output_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4):
                         phase2_pipeline.producer_acquire(phase2_prod_state)
                         cute.copy(tma_b_down, tBgB_down[(None, output_tile_idx, intermediate_slice, task_expert_idx)], tBsB_down[(None, phase2_prod_state.index)], tma_bar_ptr=phase2_pipeline.producer_get_barrier(phase2_prod_state))
                         cute.copy(tma_sfb_down, tBgSFB_down[(None, output_tile_idx, intermediate_slice, task_expert_idx)], tBsSFB_down[(None, phase2_prod_state.index)], tma_bar_ptr=phase2_pipeline.producer_get_barrier(phase2_prod_state))
@@ -2532,11 +3956,12 @@ class MoEDynamicKernelBackend:
 
 
 
-        if warp_idx == self.tma_load_warp_id:
-            ml_pipeline.producer_tail(prod_state)
-            if self.is_gated:
-                up_pipeline.producer_tail(up_prod_state)
-            phase2_pipeline.producer_tail(phase2_prod_state)
+        if cutlass.const_expr(not self.is_w4a8):
+            if warp_idx == self.tma_load_warp_id:
+                ml_pipeline.producer_tail(prod_state)
+                if self.is_gated:
+                    up_pipeline.producer_tail(up_prod_state)
+                phase2_pipeline.producer_tail(phase2_prod_state)
         return
 
 
