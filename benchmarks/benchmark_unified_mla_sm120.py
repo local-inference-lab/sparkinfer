@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Graph-captured latency + KV-bandwidth comparison: UNIFIED SM120 sparse-MLA
-backend (b12x/attention/mla/unified_sm120) vs the EXISTING legacy backends.
+"""Graph-captured latency + KV-bandwidth comparison for SM120 sparse-MLA.
 
 GOAL (rs-1 SM120 port, benchmark phase): show the unified CuTeDSL backend is
 PERFORMANT, not merely correct -- the payoff of PTX parity. Three contracts:
@@ -24,7 +23,7 @@ features, so a silent fallback would make unified==legacy (fake parity).  We do
 NOT trust the env flag.  We install TWO spies:
 
   (1) launch counter: wrap b12x.cute.compiler.launch and count every launch
-      whose compile_spec.kernel_id contains "unified_sm120" (i.e. the REAL
+      whose compile_spec.kernel_id contains "sm120" (i.e. the REAL
       UnifiedDecodeKernel / UnifiedPrefillKernel cubin compile+launch).  CUDA
       graphs capture these launches during warmup+capture; replay re-issues the
       captured kernel WITHOUT re-entering Python, so a non-zero launch-counter
@@ -84,7 +83,7 @@ _GLM_KV_BYTES_PER_TOKEN = 656
 _DSV4_HEAD_DIM = COMPRESSED_MLA_HEAD_DIM              # 512
 _DSV4_PREFILL_PAGE = 64    # the page_block_size the unified prefill kernel uses
 
-_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
+_UNIFIED_ENV = "B12X_MLA_SM120_ROUTE_REMOVED"
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +98,7 @@ class UnifiedSpy:
     detectable (the counters stay flat)."""
 
     def __init__(self) -> None:
-        self.kernel_launches = 0          # unified_sm120 cubin launches (compiler.launch)
+        self.kernel_launches = 0          # SM120 cubin launches (compiler.launch)
         self.decode_dispatch = 0          # run_unified_decode entrypoint hits
         self.prefill_dispatch = 0         # run_unified_prefill entrypoint hits
         self._saved: list[tuple] = []
@@ -111,15 +110,14 @@ class UnifiedSpy:
 
     def install(self) -> None:
         import b12x.cute.compiler as compiler_mod
-        import b12x.attention.mla.unified_sm120 as unified_pkg
-        import b12x.attention.mla.unified_sm120.launch as launch_mod
-        import b12x.attention.mla.unified_sm120.prefill as prefill_mod
+        import b12x.attention.mla.kernel as launch_mod
+        import b12x.attention.mla.prefill as prefill_mod
 
         real_launch = compiler_mod.launch
 
         def spy_launch(func, *, compile_spec, compile_args, runtime_args, compile_kwargs=None):
             kid = str(getattr(compile_spec, "kernel_id", ""))
-            if "unified_sm120" in kid:
+            if "sm120" in kid:
                 self.kernel_launches += 1
             return real_launch(
                 func,
@@ -140,10 +138,8 @@ class UnifiedSpy:
             self._saved.append((prefill_mod, "b12x_launch", prefill_mod.b12x_launch))
             prefill_mod.b12x_launch = spy_launch
 
-        # Dispatch-entrypoint wrappers. compressed_api does `from . import
-        # unified_sm120; unified_sm120.run_unified_decode(...)` (package attr).
-        # api.py does `from .unified_sm120.launch import run_unified_decode`
-        # (launch-module attr) inside the call.  Patch BOTH bindings.
+        # Dispatch-entrypoint wrappers. The APIs import the promoted root
+        # ``kernel.py`` entrypoints inside the call. Patch that binding.
         real_decode = launch_mod.run_unified_decode
 
         def spy_decode(*args, **kwargs):
@@ -152,8 +148,6 @@ class UnifiedSpy:
 
         self._saved.append((launch_mod, "run_unified_decode", launch_mod.run_unified_decode))
         launch_mod.run_unified_decode = spy_decode
-        self._saved.append((unified_pkg, "run_unified_decode", unified_pkg.run_unified_decode))
-        unified_pkg.run_unified_decode = spy_decode
 
         real_prefill = prefill_mod.run_unified_prefill
 
@@ -191,7 +185,7 @@ def unified_enabled(enabled: bool):
 # warmup+capture, then time replays.
 # --------------------------------------------------------------------------- #
 def _time_graph(run, *, spy: UnifiedSpy, warmup: int, replays: int, l2_flush):
-    import b12x.attention.mla.unified_sm120.launch as _launch_mod
+    import b12x.attention.mla.kernel as _launch_mod
 
     spy.reset()
     _launch_mod.LAST_DECODE_PLAN.clear()
@@ -413,7 +407,7 @@ def _repack_prefill_to_compressed(packed_dsv4, page_size, num_blocks, dsv4_ref):
 
 def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, replays, l2_flush, seed):
     prefill_ref, dsv4_ref = _import_prefill_ref()
-    from b12x.attention.mla.unified_sm120.prefill import run_unified_prefill as _direct_prefill
+    from b12x.attention.mla.prefill import run_unified_prefill as _direct_prefill
 
     page_size = _DSV4_PREFILL_PAGE
     num_blocks = max(2, (topk + page_size - 1) // page_size + 1)
@@ -438,7 +432,7 @@ def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, repl
     #      prefill_dispatch is counted -- _direct_prefill above is only imported to
     #      assert the symbol exists.
     del _direct_prefill
-    import b12x.attention.mla.unified_sm120.prefill as prefill_mod
+    import b12x.attention.mla.prefill as prefill_mod
 
     def run_unified():
         return prefill_mod.run_unified_prefill(

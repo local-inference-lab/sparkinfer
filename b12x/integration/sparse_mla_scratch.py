@@ -37,7 +37,7 @@ from b12x.integration.scratch import (
 )
 
 # Candidate window for the unified SM120 split-K decode (matches
-# unified_sm120 _CAND_WINDOW / the vLLM _DECODE_SPLIT_TILE). The merge reduction
+# SM120 sparse MLA _CAND_WINDOW / the vLLM _DECODE_SPLIT_TILE). The merge reduction
 # count (num_chunks) is the per-row split count; kv_chunk_size is informational
 # for the unified merge but is seeded for parity with the legacy contract.
 _SPARSE_MLA_DECODE_KV_CHUNK = 64

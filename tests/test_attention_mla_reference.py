@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from b12x.attention.mla.kernel import run_sparse_mla_kernel
 from b12x.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
@@ -738,7 +737,7 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
 
 
 @pytest.mark.parametrize("width", [129, 2048])
-def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> None:
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(width: int) -> None:
     device = require_sm120()
     _require_glm_weights()
 
@@ -774,15 +773,13 @@ def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> Non
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
-    expected = torch.empty_like(actual)
-    sm_scale_tensor = torch.tensor([cfg.sm_scale], dtype=torch.float32, device=device)
-    run_sparse_mla_kernel(
+    expected = dense_mla_reference(
         q_all=q_all,
-        kv_cache=packed,
+        k_nope=k_nope,
+        k_rope=k_rope,
         page_table_1=page_table_1,
-        active_token_counts=cache_seqlens,
-        sm_scale=sm_scale_tensor,
-        output=expected,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
     )
     torch.cuda.synchronize(device)
 

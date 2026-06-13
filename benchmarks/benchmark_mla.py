@@ -16,7 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.mla.split import (
+from b12x.attention.mla.legacy.split import (
     run_sparse_mla_split_decode_forward,
     run_sparse_mla_split_decode_merge,
     select_sparse_mla_split_decode_config,

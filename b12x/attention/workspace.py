@@ -2488,7 +2488,7 @@ class B12XAttentionWorkspace:
             self._contract_kv_scales = None
             return
 
-        from b12x.attention.mla.kernel import _extract_packed_kv_runtime_views
+        from b12x.attention.mla.packed import _extract_packed_kv_runtime_views
 
         kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(self.ragged_kv_cache)
         self._contract_kv_rows = _shape_only_cuda_tensor(

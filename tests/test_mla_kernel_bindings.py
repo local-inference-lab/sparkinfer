@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-import b12x.attention.mla.kernel as mla_kernel
-import b12x.attention.mla.kernel_onepass as mla_onepass_kernel
-import b12x.attention.mla.split as mla_split
+import b12x.attention.mla.legacy.kernel as mla_kernel
+import b12x.attention.mla.legacy.kernel_onepass as mla_onepass_kernel
+import b12x.attention.mla.legacy.split as mla_split
 
 
 def _sparse_tensors():
@@ -67,12 +67,12 @@ def _compressed_tensors():
 
 def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
     # Import modules for registration side effects.
-    __import__("b12x.attention.mla.unified_sm120.launch")
-    __import__("b12x.attention.mla.unified_sm120.prefill")
+    __import__("b12x.attention.mla.kernel")
+    __import__("b12x.attention.mla.prefill")
     # prefill_mg registers the single-cache MG op + the new dual-cache MG op
-    # (unified_sm120_prefill_mg_dual). prefill.py imports it lazily, so import it
+    # (sparse_mla_sm120_prefill_mg_dual). prefill.py imports it lazily, so import it
     # explicitly here for the binding/fake-dispatch coverage.
-    __import__("b12x.attention.mla.unified_sm120.prefill_mg")
+    __import__("b12x.attention.mla.prefill_mg")
 
     with FakeTensorMode():
         q_all = torch.empty((2, 2, 512), dtype=torch.bfloat16)
@@ -127,7 +127,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
 
         mid_output = torch.empty((2, 2, 2, 512), dtype=torch.bfloat16)
         mid_lse = torch.empty((2, 2, 2), dtype=torch.float32)
-        torch.ops.b12x.unified_sm120_decode_grid(
+        torch.ops.b12x.sparse_mla_sm120_decode_grid(
             q_all,
             cache,
             indices,
@@ -161,7 +161,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         # The single-cache decode-reuse prefill op was REMOVED (no fallback kernel
         # in prefill.py); the only prefill op is the MG dual-cache op below.
         # DUAL-CACHE MG prefill op (the new op DSV4 has_extra routes through).
-        torch.ops.b12x.unified_sm120_prefill_mg_dual(
+        torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
             q_all,        # q
             cache,        # kv_flat (MAIN)
             indices,      # topk_indices
@@ -190,13 +190,13 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         )
 
 
-def test_unified_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None:
+def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None:
     # DSV4 dual-cache heads=80 is a paired 64-head MG prefix plus one 16-head
     # single-group tail. This is Python dispatch coverage only; the focused CUDA
     # numerics live in the SM120 test suite.
-    __import__("b12x.attention.mla.unified_sm120.prefill")
-    import b12x.attention.mla.unified_sm120.prefill_mg as prefill_mg
-    from b12x.attention.mla.unified_sm120.prefill import run_unified_prefill
+    __import__("b12x.attention.mla.prefill")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill import run_unified_prefill
 
     calls = []
 
@@ -239,13 +239,13 @@ def test_unified_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch)
     assert calls[1]["lse_out"] is lse
 
 
-def test_unified_sm120_prefill_dual_non_eligible_raises() -> None:
+def test_sm120_prefill_dual_non_eligible_raises() -> None:
     # DSV4 dual-cache prefill is MG-only (topk==128, heads divisible by 16);
     # everything else RAISEs (the decode-reuse has_extra fallback was removed).
     # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
     # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).
-    __import__("b12x.attention.mla.unified_sm120.prefill")
-    from b12x.attention.mla.unified_sm120.prefill import run_unified_prefill
+    __import__("b12x.attention.mla.prefill")
+    from b12x.attention.mla.prefill import run_unified_prefill
 
     topk = 64  # != 128 -> non-eligible dual
     q = torch.empty((2, 32, 512), dtype=torch.bfloat16)

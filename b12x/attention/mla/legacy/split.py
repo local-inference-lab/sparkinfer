@@ -24,7 +24,7 @@ from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import shared_ptr_to_u32
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
-from .compressed_reference import compressed_mla_page_nbytes
+from ..compressed_reference import compressed_mla_page_nbytes
 from .kernel import (
     _COMPRESSED_MLA_HEAD_DIM,
     _MLA_GROUP_SIZE,

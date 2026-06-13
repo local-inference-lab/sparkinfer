@@ -1,4 +1,4 @@
-# unified_sm120 — Port Postmortem & Handoff
+# SM120 sparse MLA — Port Postmortem & Handoff
 
 Porting FlashInfer's hand-written SM120 sparse-MLA CUDA kernels to 100% CuTeDSL as a
 unified, `cute.constexpr`-specialized backend in b12x. Built on branch `rs-1` over 14
@@ -8,7 +8,7 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
 
 ## 1. TL;DR / current state
 
-- **`b12x/attention/mla/unified_sm120/`** is a new, 100%-CuTeDSL backend that reimplements
+- **`b12x/attention/mla/`** is a new, 100%-CuTeDSL backend that reimplements
   FlashInfer's SM120 sparse-MLA **decode + prefill** for **two model types in ONE traced
   kernel family**, specialized at trace time via `cute.constexpr`:
   - **DSV4** (compressed, UE8M0 footer scales, `V_HAS_ROPE`) — hot-op **PTX byte-matches
@@ -18,15 +18,15 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
 - **Feature parity with upstream:** attn_sink, return_lse, `VALID_HPB<16` (TP shards),
   multi-token mixed per-token-length decode, dual-cache (extra tokens, incl. zero-width main),
   split-K + base-2 merge.
-- **It is the SM120 default.** The existing front-door functions (`sparse_mla_decode_forward`,
-  `sparse_mla_extend_forward`, `compressed_mla_decode_forward`) route here automatically on
-  SM120+ CUDA. Escape hatch: `backend="legacy"` kwarg or `B12X_MLA_SM120_UNIFIED=0`.
-  Genuinely-upstream-unsupported contracts (mapped `indexed_page_table`, partial dual-cache
-  trio) **RAISE** — no silent legacy fallback.
+- **It is the only wired sparse-MLA CUDA backend.** The existing front-door functions
+  (`sparse_mla_decode_forward`, `sparse_mla_extend_forward`, `compressed_mla_decode_forward`)
+  route here automatically on SM120+ CUDA. Unsupported backends, including `backend="legacy"`,
+  **RAISE**. Genuinely-upstream-unsupported contracts (mapped `indexed_page_table`, partial
+  dual-cache trio) **RAISE** — no silent legacy fallback.
 - **Faster than legacy** at batch=1 decode: DSV4 **3.2–4.1×**, GLM **1.2–1.6×** (after
   replicating FlashInfer's wave-balanced split-K launch tuning).
-- **Legacy kernels are untouched** (byte-identical) and remain the escape-hatch / non-SM120
-  path. The whole effort was additive (+7,929 / −4).
+- **Legacy kernels are archived under `b12x/attention/mla/legacy/`** for source history and
+  direct legacy tests only; public sparse-MLA dispatch no longer routes to them.
 - **Tests:** full MLA surface 157 passed, 0 real failures (6 benign env/diagnostic skips).
 
 ### Files
@@ -36,9 +36,9 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
 | `smem.py` | per-model SharedStorage layout (const_expr offsets), ~91 KB DSV4 / ~99 KB GLM |
 | `io.py` | IO-warp producer: `cp_async_bulk_g2s_mbar` gather + mbarrier; `io_threads` param (32 decode / 128 prefill); per-chunk main/extra section dispatch |
 | `decode_math.py` | the shared math stages S0–S7 (Q-quant, QK block-scaled / GLM post-MMA-scale, RoPE, online softmax, P/W-quant, XV, epilogue) — used by BOTH decode and prefill |
-| `decode` kernel (in `launch.py`) | 288-thread warp-specialized decode (8 math + 1 IO) + split-K planner + merge wiring |
+| decode kernel (in `kernel.py`) | 288-thread warp-specialized decode (8 math + 1 IO) + split-K planner + merge wiring |
 | `prefill.py` | 384-thread/4-IO single-pass prefill reusing the decode stages |
-| `launch.py` | `run_unified_decode` / `run_unified_prefill` launchers, KernelCompileSpec keying, wave-balanced split-K heuristic, the multiple device entries (see §7) |
+| `kernel.py` | `run_unified_decode` / `run_unified_prefill` launchers, KernelCompileSpec keying, wave-balanced split-K heuristic, the multiple device entries (see §7) |
 
 Deeper artifacts (gitignored working notes): `.sm120port/` (phase-1 design, parity plan,
 benchmark findings, verified traits, reference python oracles). Extracted **FlashInfer
@@ -175,10 +175,11 @@ default-flipped, no fallbacks, faster-than-legacy decode, 157 tests green.
   CUTE_DSL_KEEP=ptx python <probe>`; diff the hot-op histogram against the reference in
   `~/projects/archive/sm120port/ref_ptx/` (env var is `CUTE_DSL_KEEP=ptx`, not the deprecated
   `CUTE_DSL_KEEP_PTX`). DSV4 byte-identity is checked by stash-diffing a recompiled pre-change tree.
-- **Dispatch.** The single gate is `api.py::_use_unified_sm120(backend, device)`; `compressed_api`
-  imports it. Default = unified on SM120+ CUDA; `backend="legacy"` / `B12X_MLA_SM120_UNIFIED=0`
-  forces legacy; `backend="sm120_unified"` forces unified even with env=0. Non-CUDA/pre-SM120 →
-  legacy. Unsupported-upstream contracts RAISE (never silent legacy).
+- **Dispatch.** The single gate is `api.py::_use_sm120_sparse_mla(backend, device)`; `compressed_api`
+  imports it. SM120+ CUDA routes to the active kernel path; `backend="sm120"` is the only
+  accepted explicit backend. Unsupported backends raise, and non-CUDA/pre-SM120 sparse MLA uses
+  the PyTorch reference fallback where graph capture and identity page-table constraints allow it.
+  Unsupported-upstream contracts RAISE (never silent legacy).
 - **Numerics.** DSV4 ≈ 0.9998 vs reference; GLM ≥ 0.9995. FP8 tolerance is `atol≈2e-2` /
   `cos>0.999` for the unified suites; the GLM dense-oracle tests use the legacy bar `cos≥0.9995`.
 

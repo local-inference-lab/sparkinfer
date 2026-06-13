@@ -11,8 +11,8 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.attention.mla import kernel as mla_kernel
-from b12x.attention.mla import split as mla_split
+from b12x.attention.mla.legacy import kernel as mla_kernel
+from b12x.attention.mla.legacy import split as mla_split
 
 
 class _FakeMLAWorkspace:
@@ -242,36 +242,30 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
     assert captured["d_v"] == 256
 
 
-def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
+def test_sparse_mla_decode_with_lse_uses_reference_lse_base2(monkeypatch) -> None:
     workspace = _make_workspace(mode="decode")
 
-    def fake_select_split(**kwargs):
-        del kwargs
-        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
-
-        return SparseMLASplitDecodeConfig(chunk_size=2, num_chunks=2)
-
-    def fake_run_split_decode(**kwargs):
-        output = kwargs["output"]
-        output.zero_()
-        tmp_lse = kwargs["tmp_lse"]
-        tmp_lse.fill_(float("-inf"))
-        tmp_lse[:2, :8, 0] = torch.tensor(
-            [[0.0] * 8, [float("-inf")] * 8],
-            dtype=tmp_lse.dtype,
-        )
-        tmp_lse[:2, :8, 1] = torch.tensor(
-            [[1.0] * 8, [2.0] * 8],
-            dtype=tmp_lse.dtype,
-        )
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+        return_lse=False,
+    ):
+        del kv_cache, page_table_1, active_token_counts, sm_scale
+        assert return_lse is True
+        output = q_all[:, :, :v_head_dim].clone()
+        lse = torch.empty((q_all.shape[0], q_all.shape[1]), dtype=torch.float32)
+        lse[0].fill_(math.log2(3.0))
+        lse[1].fill_(2.0)
+        return output, lse
 
     monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        fake_select_split,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_split_decode",
-        fake_run_split_decode,
+        "b12x.attention.mla.api.sparse_mla_reference",
+        fake_sparse_mla_reference,
     )
 
     q_all = torch.ones((2, 8, 256), dtype=torch.bfloat16)
@@ -294,46 +288,38 @@ def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
     )
 
     assert output.shape == (2, 8, 256)
-    assert output.data_ptr() == workspace.output_buffer[:2, :8, :256].data_ptr()
     assert lse_base2.shape == (2, 8)
-    assert lse_base2.data_ptr() == workspace.final_lse[:2, :8].data_ptr()
     expected_row0 = math.log2(3.0)
     assert torch.allclose(lse_base2[0], torch.full((8,), expected_row0))
     assert torch.allclose(lse_base2[1], torch.full((8,), 2.0))
 
 
-def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
+def test_sparse_mla_decode_with_lse_natural_scales_reference_lse(
     monkeypatch,
 ) -> None:
     workspace = _make_workspace(mode="decode")
 
-    def fake_select_split(**kwargs):
-        del kwargs
-        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
-
-        return SparseMLASplitDecodeConfig(chunk_size=2, num_chunks=2)
-
-    def fake_run_split_decode(**kwargs):
-        output = kwargs["output"]
-        output.zero_()
-        tmp_lse = kwargs["tmp_lse"]
-        tmp_lse.fill_(float("-inf"))
-        tmp_lse[:2, :8, 0] = torch.tensor(
-            [[0.0] * 8, [float("-inf")] * 8],
-            dtype=tmp_lse.dtype,
-        )
-        tmp_lse[:2, :8, 1] = torch.tensor(
-            [[1.0] * 8, [2.0] * 8],
-            dtype=tmp_lse.dtype,
-        )
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+        return_lse=False,
+    ):
+        del kv_cache, page_table_1, active_token_counts, sm_scale
+        assert return_lse is True
+        output = q_all[:, :, :v_head_dim].clone()
+        lse = torch.empty((q_all.shape[0], q_all.shape[1]), dtype=torch.float32)
+        lse[0].fill_(math.log2(3.0))
+        lse[1].fill_(2.0)
+        return output, lse
 
     monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        fake_select_split,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_split_decode",
-        fake_run_split_decode,
+        "b12x.attention.mla.api.sparse_mla_reference",
+        fake_sparse_mla_reference,
     )
 
     q_all = torch.ones((2, 8, 256), dtype=torch.bfloat16)
@@ -357,9 +343,7 @@ def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
     )
 
     assert output.shape == (2, 8, 256)
-    assert output.data_ptr() == workspace.output_buffer[:2, :8, :256].data_ptr()
     assert lse_natural.shape == (2, 8)
-    assert lse_natural.data_ptr() == workspace.final_lse[:2, :8].data_ptr()
     expected_row0 = math.log(3.0)
     assert torch.allclose(lse_natural[0], torch.full((8,), expected_row0))
     assert torch.allclose(lse_natural[1], torch.full((8,), 2.0 * math.log(2.0)))
@@ -562,36 +546,27 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
     )
 
 
-def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
+def test_sparse_mla_verify_uses_reference_when_sm120_unavailable(monkeypatch) -> None:
     workspace = _make_workspace(mode="verify", topk=2048)
     captured: dict[str, object] = {}
 
-    def fake_select_split(**kwargs):
-        del kwargs
-        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
-
-        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=64)
-
-    def fake_run_split_decode(**kwargs):
-        captured["run_split"] = True
-        output = kwargs["output"]
-        output.zero_()
-
-    def fail_run_sparse_mla_kernel(**kwargs):
-        del kwargs
-        raise AssertionError("verify path should not use generic sparse MLA kernel")
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+    ):
+        del kv_cache, sm_scale
+        captured["page_table_1"] = page_table_1
+        captured["active_token_counts"] = active_token_counts
+        return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        fake_select_split,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_split_decode",
-        fake_run_split_decode,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_kernel",
-        fail_run_sparse_mla_kernel,
+        "b12x.attention.mla.api.sparse_mla_reference",
+        fake_sparse_mla_reference,
     )
 
     q_all = torch.ones((5, 8, 256), dtype=torch.bfloat16)
@@ -619,41 +594,30 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
     )
 
     assert output.shape == (5, 8, 256)
-    assert captured["run_split"] is True
+    assert captured["page_table_1"] is page_table_1
+    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
 
-def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
+def test_sparse_mla_extend_uses_reference_when_sm120_unavailable(monkeypatch) -> None:
     workspace = _make_workspace(mode="extend", topk=2048)
     captured: dict[str, object] = {}
 
-    def fake_select_split(**kwargs):
-        del kwargs
-        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
-
-        return SparseMLASplitDecodeConfig(chunk_size=64, num_chunks=32)
-
-    def fake_run_split_decode(**kwargs):
-        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
-        output = kwargs["output"]
-        output.zero_()
-
-    def fail_run_sparse_mla_kernel(**kwargs):
-        del kwargs
-        raise AssertionError(
-            "extend split path should not use generic sparse MLA kernel"
-        )
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+    ):
+        del kv_cache, page_table_1, sm_scale
+        captured["active_token_counts"] = active_token_counts.clone()
+        return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        fake_select_split,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_split_decode",
-        fake_run_split_decode,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_kernel",
-        fail_run_sparse_mla_kernel,
+        "b12x.attention.mla.api.sparse_mla_reference",
+        fake_sparse_mla_reference,
     )
 
     q_all = torch.ones((5, 8, 256), dtype=torch.bfloat16)
@@ -684,95 +648,49 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
     assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
 
-def test_sparse_mla_large_bs1_extend_prefers_single_pass(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-    q_rows = 2048
-    workspace = _make_workspace(
-        mode="extend",
-        topk=2048,
-        max_total_q=q_rows,
-        max_batch=1,
-    )
-
-    def fake_select_split(**kwargs):
-        del kwargs
-        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
-
-        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=64)
-
-    def fail_run_split_decode(**kwargs):
-        del kwargs
-        raise AssertionError("large bs=1 extend should prefer the single-pass kernel")
-
-    def fake_run_sparse_mla_kernel(**kwargs):
-        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
-        kwargs["output"].zero_()
-
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        fake_select_split,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.supports_sparse_mla_kernel",
-        lambda **kwargs: True,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_split_decode",
-        fail_run_split_decode,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_kernel",
-        fake_run_sparse_mla_kernel,
-    )
-
-    q_all = torch.ones((q_rows, 8, 256), dtype=torch.bfloat16)
-    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
-    page_table_1 = torch.zeros((q_rows, 2048), dtype=torch.int32)
-    cache_seqlens = torch.full((1,), 2048, dtype=torch.int32)
-    nsa_cache_seqlens = torch.full((q_rows,), 2048, dtype=torch.int32)
-    nsa_cu = torch.tensor([0, q_rows], dtype=torch.int32)
-    metadata = MLASparseExtendMetadata(
-        selected_token_offsets=page_table_1,
+def test_sparse_mla_decode_rejects_legacy_backend() -> None:
+    workspace = _make_workspace(mode="decode")
+    q_all = torch.ones((2, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((16, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.zeros((2, 4), dtype=torch.int32)
+    cache_seqlens = torch.full((2,), 8, dtype=torch.int32)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
         cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=nsa_cache_seqlens,
-        nsa_cu_seqlens_q=nsa_cu,
-        nsa_cu_seqlens_k=nsa_cu,
-        max_seq_len_q=q_rows,
-        max_seq_len_k=2048,
-        mode="extend",
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=8,
     )
 
-    output = sparse_mla_extend_forward(
-        kv_cache=kv_cache,
-        binding=_extend_binding(workspace, q_all, metadata),
-        sm_scale=1.0,
-        v_head_dim=256,
-    )
+    with pytest.raises(ValueError, match="legacy sparse MLA kernels have been retired"):
+        sparse_mla_decode_forward(
+            kv_cache=kv_cache,
+            binding=_decode_binding(workspace, q_all, metadata),
+            sm_scale=1.0,
+            v_head_dim=256,
+            backend="legacy",
+        )
 
-    assert output.shape == (q_rows, 8, 256)
-    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
-
-def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> None:
+def test_sparse_mla_extend_passes_active_token_counts_to_reference(monkeypatch) -> None:
     workspace = _make_workspace(mode="extend", topk=6)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
-        lambda **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "b12x.attention.mla.api.supports_sparse_mla_kernel",
-        lambda **kwargs: True,
-    )
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+    ):
+        del kv_cache, page_table_1, sm_scale
+        captured["active_token_counts"] = active_token_counts.clone()
+        return q_all[:, :, :v_head_dim].clone()
 
-    def fake_run_sparse_mla_kernel(**kwargs):
-        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
-        kwargs["output"].zero_()
-
     monkeypatch.setattr(
-        "b12x.attention.mla.api.run_sparse_mla_kernel",
-        fake_run_sparse_mla_kernel,
+        "b12x.attention.mla.api.sparse_mla_reference",
+        fake_sparse_mla_reference,
     )
 
     q_all = torch.ones((3, 8, 256), dtype=torch.bfloat16)

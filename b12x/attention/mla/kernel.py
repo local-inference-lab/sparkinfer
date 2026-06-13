@@ -1,4789 +1,1933 @@
-"""MXFP8/BF16 sparse MLA kernels for the exact GLM-5.1 NSA packed-cache contract."""
+"""Launch / dispatch entrypoints for the active SM120 sparse-MLA backend.
+
+The ``run_unified_decode`` entrypoint builds views, plans split-K chunk ranges,
+launches the warp-specialized decode grid, and runs the shared base-2 split merge
+to produce final output. DSV4 compressed MLA and GLM_NSA use the same promoted
+SM120 runtime; the legacy kernels live under ``b12x.attention.mla.legacy`` and
+are no longer wired into public sparse-MLA dispatch.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
+import math
 import os
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 import torch
-from cutlass import Float32, Int32, Int64, Uint32
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
-from b12x.cute.fp4 import (
-    bf16_mma_m16n16k16_f32,
-    bfloat2_habs2,
-    bfloat2_hmax2,
-    bfloat2_hmax_to_f32,
-    bfloat2_mul,
-    broadcast_f32_to_bfloat2,
-    byte_perm,
-    cvt_f32_to_ue8m0,
-    cvt_bf16x2_to_e4m3x2,
-    fp8x4_e4m3_to_bfloat2x2,
-    frag_layout_swizzle_16b_to_8b,
-    frag_layout_swizzle_16b_to_8b_trans,
-    get_ptr_as_int64,
-    ld_global_nc_u32,
-    ldmatrix_m8n8x4_b16,
-    ldmatrix_m8n8x4_left_half_b16,
-    ldmatrix_m8n8x4_right_half_b16,
-    ldmatrix_m8n8x4_trans_b16,
-    ldmatrix_m8n8x4_trans_left_half_b16,
-    ldmatrix_m8n8x4_trans_right_half_b16,
-    mxfp8_mma_m16n8k32_f32_e4m3,
-    pack_f32x2_to_bfloat2,
-    shared_ptr_to_u32,
-    st_shared_v4_u32,
-    ue8m0_to_output_scale,
+from b12x.attention._cute.ops import LOG2_E
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    key_field,
+    tensor_key,
 )
-from b12x.cute.utils import current_cuda_stream
-
-from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
-from .traits import SparseMLATraits, select_sparse_mla_traits
-
-
-_MLA_HEAD_DIM = _MLA_NOPE_DIM + _MLA_ROPE_DIM
-_MLA_SCALE_GROUPS = _MLA_NOPE_DIM // _MLA_GROUP_SIZE
-_MLA_OUTPUT_DIM = _MLA_NOPE_DIM
-_MLA_WARP_THREADS = 32
-_MLA_OUTPUT_FRAGMENTS_PER_LANE = _MLA_OUTPUT_DIM // _MLA_WARP_THREADS
-_MLA_HEADS_PER_TILE = 16
-_MLA_TOKEN_TILE = 64
-_MLA_NOPE_GROUP_ELEMS = 128
-_MLA_NOPE_GROUP_Q_U32 = _MLA_NOPE_GROUP_ELEMS // 2
-_MLA_NOPE_GROUP_KV_U32 = _MLA_NOPE_GROUP_ELEMS // 4
-_MLA_NOPE_GROUP_Q_VECS = (_MLA_NOPE_GROUP_ELEMS * 2) // 16
-_MLA_NOPE_GROUP_KV_VECS = _MLA_NOPE_GROUP_ELEMS // 16
-_MLA_NOPE_GROUP_KV_BF16_VECS = (_MLA_NOPE_GROUP_ELEMS * 2) // 16
-_MLA_NOPE_QK_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
-_MLA_ROPE_Q_U32 = _MLA_ROPE_DIM // 2
-_MLA_ROPE_VECS = (_MLA_ROPE_DIM * 2) // 16
-_MLA_Q_NOPE_STAGE_BYTES = _MLA_HEADS_PER_TILE * _MLA_NOPE_GROUP_ELEMS * 2
-_MLA_Q_ROPE_STAGE_BYTES = _MLA_HEADS_PER_TILE * _MLA_ROPE_DIM * 2
-_MLA_KV_NOPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS
-_MLA_KV_NOPE_QK_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS * 2
-_MLA_KV_ROPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_ROPE_DIM * 2
-_MLA_Q_STAGE_BYTES = _MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES + _MLA_Q_ROPE_STAGE_BYTES
-# Per-group Q stage: one nope group (4KB) or rope (2KB) at a time.
-# Reduces smem ~23KB -> ~9KB, enabling ~11 CTAs/SM (vs 4).
-_MLA_Q_GROUP_STAGE_BYTES = _MLA_Q_NOPE_STAGE_BYTES
-# Per-group streaming: KV stage holds one nope group OR rope at a time.
-# Reduces smem ~38.6KB -> ~22.6KB, enabling 4 CTAs/SM (vs 2).
-_MLA_KV_STAGE_BYTES = _MLA_KV_NOPE_STAGE_BYTES
-_MLA_SCALE_STAGE_ELEMS = _MLA_TOKEN_TILE * _MLA_SCALE_GROUPS
-_MLA_SCALE_BYTES = _MLA_SCALE_GROUPS * 4
-_MLA_NOPE_U32_OFFSET = 0
-_MLA_SCALE_U32_OFFSET = _MLA_NOPE_DIM // 4
-_MLA_ROPE_U32_OFFSET = _MLA_SCALE_U32_OFFSET + _MLA_SCALE_GROUPS
-_MLA_NUM_MMA_KV = _MLA_TOKEN_TILE // 16
-_MLA_QK_NUM_MMA_D = 4
-_MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
-
-_COMPRESSED_MLA_NOPE_DIM = 448
-_COMPRESSED_MLA_ROPE_DIM = 64
-_COMPRESSED_MLA_HEAD_DIM = _COMPRESSED_MLA_NOPE_DIM + _COMPRESSED_MLA_ROPE_DIM
-_COMPRESSED_MLA_GROUP_SIZE = 64
-_COMPRESSED_MLA_SCALE_GROUPS = _COMPRESSED_MLA_NOPE_DIM // _COMPRESSED_MLA_GROUP_SIZE
-_COMPRESSED_MLA_PAYLOAD_BYTES = 576
-_COMPRESSED_MLA_SCALE_BYTES = 8
-_COMPRESSED_MLA_GROUP_Q_U32 = _COMPRESSED_MLA_GROUP_SIZE // 2
-_COMPRESSED_MLA_GROUP_Q_VECS = (_COMPRESSED_MLA_GROUP_SIZE * 2) // 16
-_COMPRESSED_MLA_GROUP_KV_VECS = _COMPRESSED_MLA_GROUP_SIZE // 16
-_COMPRESSED_MLA_GROUP_KV_STAGE_VECS = _MLA_NOPE_GROUP_KV_VECS
-_COMPRESSED_MLA_GROUP_KV_BF16_VECS = (_COMPRESSED_MLA_GROUP_SIZE * 2) // 16
-_COMPRESSED_MLA_QK_NUM_MMA_D = _COMPRESSED_MLA_GROUP_SIZE // 16
-_COMPRESSED_MLA_SCALE_STAGE_STRIDE = _MLA_TOKEN_TILE + _MLA_TOKEN_TILE // 8
-_COMPRESSED_MLA_SCALE_STAGE_ELEMS = (
-    _COMPRESSED_MLA_SCALE_STAGE_STRIDE * _COMPRESSED_MLA_SCALE_GROUPS
+from b12x.cute.compiler import (
+    launch as b12x_launch,
 )
-_MLA_SHARED_SCALE_STAGE_ELEMS = max(
-    _MLA_SCALE_STAGE_ELEMS,
-    _COMPRESSED_MLA_SCALE_STAGE_ELEMS,
+from b12x.cute.fp4 import shared_ptr_to_u32
+
+from .decode_math import (
+    s0_quantize_q_to_smem,
+    s1_qk_nope_block_scaled,
+    s2_qk_rope_bf16,
+    s3_mask_and_scale,
+    s4_online_softmax,
+    s5_fill_sm_p_full,
+    s6_xv_nope,
+    s6b_xv_rope,
+    s7_epilogue,
 )
-def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
-    raise ValueError(
-        f"{api_name} binding owns runtime tensors, scratch, and kernel options; "
-        f"do not also pass {', '.join(extras)}"
-    )
+from .io import io_issue_gather
+from .smem import get_unified_shared_storage_cls, make_smem_layout
+from .traits import (
+    ModelType,
+    infer_model_type,
+    make_unified_traits,
+)
+
+# natural-log of 2 (base2 <-> natural LSE conversion).
+_LN2 = math.log(2.0)
+
+# BI=64 candidates per chunk (one full/empty KV buffer window). The split-K
+# planner cuts the topk into chunk-aligned ranges so split partials are disjoint
+# and the merge is exact (split boundary == chunk boundary).
+_CAND_WINDOW = 64
+
+# DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
+_DSV4_HEAD_DIM = 512
+# GLM_NSA uncompressed contract head dim (q_nope 512 + q_rope 64).
+_GLM_HEAD_DIM = 576
+# GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
+_GLM_KV_GMEM_STRIDE = 656
 
 
-def _require_bound_arg(value, *, api_name: str, name: str):
-    if value is None:
-        raise TypeError(f"{api_name} requires {name} or binding")
-    return value
+# Optional decode num_splits override (P9b AutoTuner sweep hook). ``<= 0`` (or an
+# unparseable value, or unset) means "use the FlashInfer-ported wave-balanced
+# heuristic"; ``>= 1`` pins num_splits to that value (still clamped to
+# [1, num_chunks] and to the workspace split capacity). Read PER CALL (not cached
+# at import) so a sweep / AutoTuner can flip it between launches.
+_MLA_SM120_NUM_SPLITS_ENV = "B12X_MLA_SM120_NUM_SPLITS"
+
+# FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
+# (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
+# gap looks small but require more than this many integer waves are rejected.
+_CEIL_WAVES_MAX = 3
+
+# Observability: the most recent decode split plan (read by benchmarks / the
+# P9c AutoTuner sweep to report num_splits_used). Pure side-channel -- does NOT
+# affect numerics or the launch. Keys are informational.
+LAST_DECODE_PLAN: dict = {}
 
 
-@dataclass(frozen=True, kw_only=True)
-class SparseMLAKernelBinding:
-    q_all: torch.Tensor
-    kv_cache: torch.Tensor
-    page_table_1: torch.Tensor
-    active_token_counts: torch.Tensor
-    sm_scale: float | torch.Tensor
-    output: torch.Tensor
-    scratch: object | None = None
-    identity_page_table: bool = False
+def _env_num_splits_override() -> int:
+    """Read ``B12X_MLA_SM120_NUM_SPLITS`` per call. ``<= 0`` / unset / bad -> 0
+    (heuristic). Mirrors FlashInfer's ``chunks_per_block_override <= 0 -> C++
+    heuristic`` convention, but for OUR num_splits (== FlashInfer's active block
+    count num_splits_eff)."""
+    raw = os.environ.get(_MLA_SM120_NUM_SPLITS_ENV)
+    if raw is None:
+        return 0
+    try:
+        v = int(raw.strip())
+    except (TypeError, ValueError):
+        return 0
+    return v if v > 0 else 0
 
-    def run(self) -> None:
-        run_sparse_mla_kernel(binding=self)
+
+def _wave_balanced_num_splits(
+    *, num_chunks: int, per_token_head: int, sm_count: int
+) -> int:
+    """Replicate FlashInfer's decode-dsv4 occupancy decision in OUR chunk-range
+    parameterization, returning OUR ``num_splits`` (== FlashInfer's active block
+    count ``num_splits_eff``).
+
+    FlashInfer splits MAXIMALLY: its ``num_splits`` == ``num_chunks`` (one block
+    per KV chunk; sparse_mla_sm120.py:259-260,286), then a C++ heuristic
+    (csrc/sparse_mla_sm120_decode_dsv4.cu:69-102) picks ``chunks_per_block`` to
+    wave-balance the launch and computes ``num_splits_eff = ceil(num_splits /
+    cpb)`` ACTIVE blocks. Our UnifiedDecodeKernel processes a contiguous
+    chunk-RANGE per CTA, so OUR ``num_splits`` directly IS that active count: we
+    port the cpb tail-gap search VERBATIM over ``num_chunks`` chunks, then return
+    ``ceil(num_chunks / cpb*)``.
+
+    Tail-gap formula (VERBATIM from the .cu):
+        per_token_head = num_tokens * H_BLOCKS
+        for cpb in 1..num_chunks:                  # FlashInfer: 1..num_splits
+            eff    = ceil(num_chunks / cpb)
+            active = per_token_head * eff
+            ceil_w = ceil(active / sm_count)
+            if ceil_w > CEIL_WAVES_MAX(=3): continue
+            waves  = active / sm_count
+            gap    = ceil_w - waves
+            pick cpb minimizing gap (tie -> larger cpb, fewer launched blocks)
+        num_splits = ceil(num_chunks / cpb*)       # == FlashInfer num_splits_eff
+    """
+    num_chunks = max(int(num_chunks), 1)
+    per_token_head = max(int(per_token_head), 1)
+    sm_count = max(int(sm_count), 1)
+
+    chunks_per_block = 1
+    best_gap = 2.0
+    for cpb in range(1, num_chunks + 1):
+        eff = (num_chunks + cpb - 1) // cpb
+        active = per_token_head * eff
+        ceil_w = (active + sm_count - 1) // sm_count
+        if ceil_w > _CEIL_WAVES_MAX:
+            continue
+        waves = active / sm_count
+        gap = ceil_w - waves
+        if gap < best_gap - 1e-6 or (gap < best_gap + 1e-6 and cpb > chunks_per_block):
+            best_gap = gap
+            chunks_per_block = cpb
+    # OUR num_splits == FlashInfer's num_splits_eff = ceil(num_splits / cpb*),
+    # where FlashInfer's num_splits == num_chunks (maximal split).
+    return (num_chunks + chunks_per_block - 1) // chunks_per_block
 
 
-def build_sparse_mla_kernel_binding(
+# ---------------------------------------------------------------------------
+# Split-K planning. Reuse the compressed planner's chunk-count idiom but pin the
+# per-split chunk granularity to the kernel's BI=64 window so split boundaries
+# land on chunk boundaries (a candidate is processed by exactly one split ->
+# multi-split is numerically identical to single-split).
+# ---------------------------------------------------------------------------
+def plan_unified_decode_splits(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: float | torch.Tensor,
-    output: torch.Tensor,
-    scratch: object | None = None,
-    identity_page_table: bool = False,
-) -> SparseMLAKernelBinding:
-    return SparseMLAKernelBinding(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=page_table_1,
-        active_token_counts=active_token_counts,
-        sm_scale=sm_scale,
-        output=output,
-        scratch=scratch,
-        identity_page_table=bool(identity_page_table),
-    )
-
-
-def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
-    if dtype == torch.bfloat16:
-        return cutlass.BFloat16
-    if dtype == torch.float16:
-        return cutlass.Float16
-    if dtype == torch.float32:
-        return cutlass.Float32
-    if dtype == torch.int32:
-        return cutlass.Int32
-    if dtype == torch.uint8:
-        return cutlass.Uint8
-    if dtype == torch.uint32:
-        return cutlass.Uint32
-    raise TypeError(f"unsupported dtype {dtype}")
-
-
-def _to_kernel_tensor(
-    tensor: torch.Tensor,
-    dtype: type[cutlass.Numeric],
-    *,
-    assumed_align: int = 16,
-) -> cutlass.cute.Tensor:
-    cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
-    cute_tensor.element_type = dtype
-    leading_dim = next((idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None)
-    if leading_dim is not None and tensor.ndim >= 2:
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    return cute_tensor
-
-
-def _tensor_meta_key(
-    tensor: torch.Tensor,
-    *,
-    dynamic_dims: tuple[int, ...] = (),
-) -> tuple[tuple[object, ...], tuple[int, ...], str, tuple[str, int | None]]:
-    dynamic_dim_set = set(dynamic_dims)
-    return (
-        tuple(
-            DimKey.dynamic() if idx in dynamic_dim_set else int(dim)
-            for idx, dim in enumerate(tensor.shape)
-        ),
-        tuple(tensor.stride()),
-        str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
-    )
-
-
-def _workspace_contract_kv_tensors(
-    workspace: object | None,
-    kv_cache: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if workspace is None:
-        return None, None
-    contract_selector = getattr(workspace, "contract_kv_tensors_for", None)
-    if callable(contract_selector):
-        return contract_selector(kv_cache)
-    return (
-        getattr(workspace, "_contract_kv_rows", None),
-        getattr(workspace, "_contract_kv_scales", None),
-    )
-
-
-@cute.jit
-def _warp_allreduce_sum(value: Float32) -> Float32:
-    for shift in cutlass.range_constexpr(5):
-        value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=1 << shift))
-    return value
-
-
-@cute.jit
-def _warp_allreduce_max(value: Float32) -> Float32:
-    for shift in cutlass.range_constexpr(5):
-        value = attention_ops.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift))
-    return value
-
-
-@dsl_user_op
-def _cp_async_load_128b_pred(
-    smem_addr: Int32,
-    gmem_addr: Int64,
-    predicate: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(predicate).ir_value(loc=loc, ip=ip),
-            Int32(smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        " .reg .pred p;\n"
-        " setp.ne.b32 p, $0, 0;\n"
-        " @p cp.async.ca.shared.global.L2::64B [$1], [$2], 16;\n"
-        "}",
-        "r,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "ex2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def _log2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "lg2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@cute.jit
-def _permuted_offset_128b(row_idx, vec_idx, stride_128b):
-    return row_idx * stride_128b + (vec_idx ^ (row_idx % 8))
-
-
-@cute.jit
-def _smem_addr_from_b128_offset(base_addr: Int32, offset_128b):
-    return base_addr + Int32(offset_128b * 16)
-
-
-@dsl_user_op
-def _ld_global_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
-            "ld.global.u8 $0, [$1];",
-            "=r,l",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _ue8m0_to_input_scale(scale_u8: Uint32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Uint32(scale_u8).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .pred is_zero;
-                .reg .b32 bits, subnormal;
-                setp.eq.u32 is_zero, $1, 0;
-                shl.b32 bits, $1, 23;
-                mov.u32 subnormal, 0x00400000;
-                selp.b32 bits, subnormal, bits, is_zero;
-                mov.b32 $0, bits;
-            }
-            """,
-            "=f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _ue8m0x4_to_input_scales(
-    scale_u32: Uint32, *, loc=None, ip=None
-) -> tuple[Float32, Float32, Float32, Float32]:
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
-        [Uint32(scale_u32).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .pred p0, p1, p2, p3;
-            .reg .b32 b0, b1, b2, b3;
-            .reg .b32 s0, s1, s2, s3;
-            and.b32 b0, $4, 0x000000ff;
-            shr.u32 b1, $4, 8;
-            and.b32 b1, b1, 0x000000ff;
-            shr.u32 b2, $4, 16;
-            and.b32 b2, b2, 0x000000ff;
-            shr.u32 b3, $4, 24;
-            setp.eq.u32 p0, b0, 0;
-            setp.eq.u32 p1, b1, 0;
-            setp.eq.u32 p2, b2, 0;
-            setp.eq.u32 p3, b3, 0;
-            shl.b32 s0, b0, 23;
-            shl.b32 s1, b1, 23;
-            shl.b32 s2, b2, 23;
-            shl.b32 s3, b3, 23;
-            selp.b32 s0, 0x00400000, s0, p0;
-            selp.b32 s1, 0x00400000, s1, p1;
-            selp.b32 s2, 0x00400000, s2, p2;
-            selp.b32 s3, 0x00400000, s3, p3;
-            mov.b32 $0, s0;
-            mov.b32 $1, s1;
-            mov.b32 $2, s2;
-            mov.b32 $3, s3;
-        }
-        """,
-        "=f,=f,=f,=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return (
-        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
-        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
-        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
-        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
-    )
-
-
-@cute.jit
-def _advance_offset_by_row_128b(offset_128b, step_size, row_stride_128b):
-    return offset_128b + step_size * row_stride_128b
-
-
-@cute.jit
-def _advance_offset_by_column_128b_2(offset_128b, step_idx):
-    xor_term = Int32(0x2) + (Int32(0x4) if step_idx % 2 == 1 else Int32(0))
-    extra = Int32(8) if step_idx % 4 == 3 else Int32(0)
-    return (offset_128b ^ xor_term) + extra
-
-
-@cute.jit
-def _stage_token_indices(
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    q_idx: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    lane: Int32,
-    identity_page_table: cutlass.Constexpr[bool],
-):
-    token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
-        token_pos = token_base + token_local
-        if cutlass.const_expr(identity_page_table):
-            sTokenIdx[token_local] = (
-                q_idx * Int32(page_table_1.shape[1]) + token_pos
-                if token_pos < token_end
-                else Int32(-1)
-            )
-        else:
-            sTokenIdx[token_local] = (
-                Int32(page_table_1[q_idx, token_pos]) if token_pos < token_end else Int32(-1)
-            )
-        token_local += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_compressed_token_indices(
-    swa_indices: cute.Tensor,
-    swa_lengths: cute.Tensor,
-    indexed_indices: cute.Tensor,
-    indexed_lengths: cute.Tensor,
-    indexed_page_table: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    q_idx: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    map_indexed_page_table: cutlass.Constexpr[bool],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_table_width: Int32,
-):
-    if cutlass.const_expr(not has_swa):
-        indexed_len = Int32(0)
-        if cutlass.const_expr(has_indexed):
-            indexed_len = Int32(indexed_lengths[q_idx])
-            if indexed_len < Int32(0):
-                indexed_len = Int32(0)
-            if indexed_len > Int32(indexed_indices.shape[1]):
-                indexed_len = Int32(indexed_indices.shape[1])
-
-        token_local = lane
-        while token_local < Int32(_MLA_TOKEN_TILE):
-            token_pos = token_base + token_local
-            encoded = Int32(-1)
-            if token_pos < token_end:
-                if cutlass.const_expr(has_indexed):
-                    if token_pos < indexed_len:
-                        raw_indexed = Int32(indexed_indices[q_idx, token_pos])
-                        if cutlass.const_expr(map_indexed_page_table):
-                            page_col = raw_indexed // Int32(indexed_page_size)
-                            page_off = raw_indexed - page_col * Int32(indexed_page_size)
-                            valid_page_col = raw_indexed >= Int32(0)
-                            if valid_page_col:
-                                valid_page_col = page_col >= Int32(0)
-                            if valid_page_col:
-                                valid_page_col = page_col < Int32(indexed_page_table_width)
-                            page_id = Int32(-1)
-                            if valid_page_col:
-                                page_id = Int32(indexed_page_table[q_idx, page_col])
-                            if page_id >= Int32(0):
-                                token_idx = page_id * Int32(indexed_page_size) + page_off
-                                encoded = Int32(0) - token_idx - Int32(2)
-                        else:
-                            if raw_indexed >= Int32(0):
-                                encoded = Int32(0) - raw_indexed - Int32(2)
-            sTokenIdx[token_local] = encoded
-            token_local += Int32(_MLA_WARP_THREADS)
-    else:
-        swa_len = Int32(swa_lengths[q_idx])
-        if swa_len < Int32(0):
-            swa_len = Int32(0)
-        if swa_len > Int32(swa_indices.shape[1]):
-            swa_len = Int32(swa_indices.shape[1])
-
-        indexed_len = Int32(0)
-        if cutlass.const_expr(has_indexed):
-            indexed_len = Int32(indexed_lengths[q_idx])
-            if indexed_len < Int32(0):
-                indexed_len = Int32(0)
-            if indexed_len > Int32(indexed_indices.shape[1]):
-                indexed_len = Int32(indexed_indices.shape[1])
-
-        token_local = lane
-        while token_local < Int32(_MLA_TOKEN_TILE):
-            token_pos = token_base + token_local
-            encoded = Int32(-1)
-            if token_pos < token_end:
-                if token_pos < swa_len:
-                    raw_swa = Int32(swa_indices[q_idx, token_pos])
-                    if raw_swa >= Int32(0):
-                        encoded = raw_swa
-                else:
-                    extra_slot = token_pos - swa_len
-                    if cutlass.const_expr(has_indexed):
-                        if extra_slot < indexed_len:
-                            raw_indexed = Int32(indexed_indices[q_idx, extra_slot])
-                            if cutlass.const_expr(map_indexed_page_table):
-                                page_col = raw_indexed // Int32(indexed_page_size)
-                                page_off = raw_indexed - page_col * Int32(indexed_page_size)
-                                valid_page_col = raw_indexed >= Int32(0)
-                                if valid_page_col:
-                                    valid_page_col = page_col >= Int32(0)
-                                if valid_page_col:
-                                    valid_page_col = page_col < Int32(indexed_page_table_width)
-                                page_id = Int32(-1)
-                                if valid_page_col:
-                                    page_id = Int32(indexed_page_table[q_idx, page_col])
-                                if page_id >= Int32(0):
-                                    token_idx = page_id * Int32(indexed_page_size) + page_off
-                                    encoded = Int32(0) - token_idx - Int32(2)
-                            else:
-                                if raw_indexed >= Int32(0):
-                                    encoded = Int32(0) - raw_indexed - Int32(2)
-            sTokenIdx[token_local] = encoded
-            token_local += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_token_scales(
-    kv_scales: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    group_idx: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
-        token_idx = Int32(sTokenIdx[token_local])
-        sScale[token_local] = (
-            Float32(kv_scales[token_idx, group_idx])
-            if token_idx >= Int32(0) and token_idx < num_kv
-            else Float32(0.0)
-        )
-        token_local += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _compressed_token_base(
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    encoded_token: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-) -> tuple[Int64, Int64, Int64, Int64]:
-    if cutlass.const_expr(not has_swa):
-        src_u8 = get_ptr_as_int64(indexed_u8, Int64(0))
-        page_size = Int64(indexed_page_size)
-        page_nbytes = Int64(indexed_page_nbytes)
-        token_idx = Int64(0)
-        valid = Int64(0)
-        if encoded_token <= Int32(-2):
-            token_idx = Int64(Int32(0) - encoded_token - Int32(2))
-            valid = Int64(1)
-    elif cutlass.const_expr(not has_indexed):
-        src_u8 = get_ptr_as_int64(swa_u8, Int64(0))
-        page_size = Int64(swa_page_size)
-        page_nbytes = Int64(swa_page_nbytes)
-        token_idx = Int64(0)
-        valid = Int64(0)
-        if encoded_token >= Int32(0):
-            token_idx = Int64(encoded_token)
-            valid = Int64(1)
-    else:
-        src_u8 = get_ptr_as_int64(swa_u8, Int64(0))
-        page_size = Int64(swa_page_size)
-        page_nbytes = Int64(swa_page_nbytes)
-        token_idx = Int64(0)
-        valid = Int64(0)
-        if encoded_token >= Int32(0):
-            token_idx = Int64(encoded_token)
-            valid = Int64(1)
-        elif encoded_token <= Int32(-2):
-            token_idx = Int64(Int32(0) - encoded_token - Int32(2))
-            src_u8 = get_ptr_as_int64(indexed_u8, Int64(0))
-            page_size = Int64(indexed_page_size)
-            page_nbytes = Int64(indexed_page_nbytes)
-            valid = Int64(1)
-    page = token_idx // page_size
-    token_offset = token_idx - page * page_size
-    payload_base = page * page_nbytes + token_offset * Int64(_COMPRESSED_MLA_PAYLOAD_BYTES)
-    scale_base = (
-        page * page_nbytes
-        + page_size * Int64(_COMPRESSED_MLA_PAYLOAD_BYTES)
-        + token_offset * Int64(_COMPRESSED_MLA_SCALE_BYTES)
-    )
-    return src_u8, payload_base, scale_base, valid
-
-
-@cute.jit
-def _compressed_scale_smem_idx(token_local: Int32, group_idx: Int32):
-    return (
-        group_idx * Int32(_COMPRESSED_MLA_SCALE_STAGE_STRIDE)
-        + token_local
-        + token_local // Int32(8)
-    )
-
-
-@cute.jit
-def _stage_compressed_token_scales(
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    group_idx: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
-        encoded = Int32(sTokenIdx[token_local])
-        src_u8, _, scale_base, valid = _compressed_token_base(
-            swa_u8,
-            indexed_u8,
-            encoded,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
-        scale = Float32(0.0)
-        if valid != Int64(0):
-            scale = _ue8m0_to_input_scale(_ld_global_u8(src_u8 + scale_base + Int64(group_idx)))
-        sScale[_compressed_scale_smem_idx(token_local, group_idx)] = scale
-        token_local += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_all_compressed_token_scales(
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    token_local = lane
-    while token_local < Int32(_MLA_TOKEN_TILE):
-        encoded = Int32(-1)
-        if token_local < tile_tokens:
-            encoded = Int32(sTokenIdx[token_local])
-        src_u8, _, scale_base, valid = _compressed_token_base(
-            swa_u8,
-            indexed_u8,
-            encoded,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
-        scale0 = Float32(0.0)
-        scale1 = Float32(0.0)
-        scale2 = Float32(0.0)
-        scale3 = Float32(0.0)
-        scale4 = Float32(0.0)
-        scale5 = Float32(0.0)
-        scale6 = Float32(0.0)
-        if valid != Int64(0):
-            word0 = ld_global_nc_u32(src_u8 + scale_base)
-            scale0, scale1, scale2, scale3 = _ue8m0x4_to_input_scales(word0)
-            word1 = ld_global_nc_u32(src_u8 + scale_base + Int64(4))
-            scale4, scale5, scale6, _ = _ue8m0x4_to_input_scales(word1)
-        sScale[_compressed_scale_smem_idx(token_local, Int32(0))] = scale0
-        sScale[_compressed_scale_smem_idx(token_local, Int32(1))] = scale1
-        sScale[_compressed_scale_smem_idx(token_local, Int32(2))] = scale2
-        sScale[_compressed_scale_smem_idx(token_local, Int32(3))] = scale3
-        sScale[_compressed_scale_smem_idx(token_local, Int32(4))] = scale4
-        sScale[_compressed_scale_smem_idx(token_local, Int32(5))] = scale5
-        sScale[_compressed_scale_smem_idx(token_local, Int32(6))] = scale6
-        token_local += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_all_token_scales(
-    kv_scales: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    num_kv: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_SCALE_STAGE_ELEMS)
-    while linear < total:
-        group_idx = linear // Int32(_MLA_TOKEN_TILE)
-        token_local = linear - group_idx * Int32(_MLA_TOKEN_TILE)
-        token_idx = Int32(sTokenIdx[token_local])
-        sScale[linear] = (
-            Float32(kv_scales[token_idx, group_idx])
-            if token_idx >= Int32(0) and token_idx < num_kv
-            else Float32(0.0)
-        )
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _clamp_active_token_count(
-    active_token_counts: cute.Tensor,
-    q_idx: Int32,
-    max_width: Int32,
-) -> Int32:
-    token_end = Int32(active_token_counts[q_idx])
-    if token_end < Int32(0):
-        token_end = Int32(0)
-    if token_end > max_width:
-        token_end = max_width
-    return token_end
-
-
-def _extract_packed_kv_runtime_views(
-    kv_cache: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_rows_u32 = _view_last_dim_as_u32(kv_rows_bytes)
-    kv_scales = kv_rows_bytes[:, _MLA_NOPE_DIM : _MLA_NOPE_DIM + _MLA_SCALE_BYTES].view(
-        torch.float32
-    )
-    return kv_rows_u32, kv_scales
-
-
-@cute.jit
-def _stage_q_u32_block(
-    q_u32: cute.Tensor,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    base_u32: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    q_base_addr: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_HEADS_PER_TILE) * vecs_per_row
-    num_heads = Int32(q_u32.shape[1])
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        head_idx = head_tile_start + row
-        dst_addr = _smem_addr_from_b128_offset(
-            q_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if head_idx < num_heads:
-            src_u32 = base_u32 + vec_idx * Int32(4)
-            v0 = Uint32(q_u32[q_idx, head_idx, src_u32 + Int32(0)])
-            v1 = Uint32(q_u32[q_idx, head_idx, src_u32 + Int32(1)])
-            v2 = Uint32(q_u32[q_idx, head_idx, src_u32 + Int32(2)])
-            v3 = Uint32(q_u32[q_idx, head_idx, src_u32 + Int32(3)])
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_q_u32_block_async(
-    q_u32: cute.Tensor,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    base_u32: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    q_base_addr: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_HEADS_PER_TILE) * vecs_per_row
-    num_heads = Int32(q_u32.shape[1])
-    row_stride_u32 = Int32(q_u32.shape[2])
-    q_row_stride_u32 = Int32(q_u32.shape[1]) * row_stride_u32
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        head_idx = head_tile_start + row
-        dst_addr = _smem_addr_from_b128_offset(
-            q_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        valid = Int32(0)
-        safe_head_idx = Int32(0)
-        if head_idx < num_heads:
-            valid = Int32(1)
-            safe_head_idx = head_idx
-        src_u32 = base_u32 + vec_idx * Int32(4)
-        _cp_async_load_128b_pred(
-            dst_addr,
-            get_ptr_as_int64(
-                q_u32,
-                q_idx * q_row_stride_u32 + safe_head_idx * row_stride_u32 + src_u32,
-            ),
-            valid,
-        )
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_kv_u32_block(
-    kv_u32: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    base_u32: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    kv_base_addr: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        token_idx = Int32(sTokenIdx[row])
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if token_idx >= Int32(0) and token_idx < num_kv:
-            src_u32 = base_u32 + vec_idx * Int32(4)
-            v0 = Uint32(kv_u32[token_idx, src_u32 + Int32(0)])
-            v1 = Uint32(kv_u32[token_idx, src_u32 + Int32(1)])
-            v2 = Uint32(kv_u32[token_idx, src_u32 + Int32(2)])
-            v3 = Uint32(kv_u32[token_idx, src_u32 + Int32(3)])
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_compressed_kv_u32_block_active_only(
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    base_byte: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    kv_base_addr: Int32,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    active_total = tile_tokens * vecs_per_row
-    if active_total > total:
-        active_total = total
-
-    linear = lane
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if linear < active_total:
-            encoded = Int32(sTokenIdx[row])
-            src_u8, payload_base, _, valid = _compressed_token_base(
-                swa_u8,
-                indexed_u8,
-                encoded,
-                has_swa,
-                has_indexed,
-                swa_page_size,
-                swa_page_nbytes,
-                indexed_page_size,
-                indexed_page_nbytes,
-            )
-            if valid != Int64(0):
-                src_byte = payload_base + Int64(base_byte) + Int64(vec_idx) * Int64(16)
-                v0 = ld_global_nc_u32(src_u8 + src_byte + Int64(0))
-                v1 = ld_global_nc_u32(src_u8 + src_byte + Int64(4))
-                v2 = ld_global_nc_u32(src_u8 + src_byte + Int64(8))
-                v3 = ld_global_nc_u32(src_u8 + src_byte + Int64(12))
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_compressed_kv_u32_block(
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    base_byte: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    kv_base_addr: Int32,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    active_total = tile_tokens * vecs_per_row
-    if active_total > total:
-        active_total = total
-
-    linear = lane
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if linear < active_total:
-            encoded = Int32(sTokenIdx[row])
-            src_u8, payload_base, _, valid = _compressed_token_base(
-                swa_u8,
-                indexed_u8,
-                encoded,
-                has_swa,
-                has_indexed,
-                swa_page_size,
-                swa_page_nbytes,
-                indexed_page_size,
-                indexed_page_nbytes,
-            )
-            if valid != Int64(0):
-                src_byte = payload_base + Int64(base_byte) + Int64(vec_idx) * Int64(16)
-                v0 = ld_global_nc_u32(src_u8 + src_byte + Int64(0))
-                v1 = ld_global_nc_u32(src_u8 + src_byte + Int64(4))
-                v2 = ld_global_nc_u32(src_u8 + src_byte + Int64(8))
-                v3 = ld_global_nc_u32(src_u8 + src_byte + Int64(12))
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-    linear = active_total + lane
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_kv_u32_block_async(
-    kv_u32: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    base_u32: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    kv_base_addr: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    row_stride_u32 = Int32(kv_u32.shape[1])
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        token_idx = Int32(sTokenIdx[row])
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        valid = Int32(0)
-        safe_token_idx = Int32(0)
-        if token_idx >= Int32(0):
-            if token_idx < num_kv:
-                valid = Int32(1)
-                safe_token_idx = token_idx
-        src_u32 = base_u32 + vec_idx * Int32(4)
-        _cp_async_load_128b_pred(
-            dst_addr,
-            get_ptr_as_int64(kv_u32, safe_token_idx * row_stride_u32 + src_u32),
-            valid,
-        )
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _stage_kv_bf16_block(
-    kv_u32: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    base_u32: Int32,
-    vecs_per_row: Int32,
-    row_stride_128b: Int32,
-    kv_base_addr: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
-    while linear < total:
-        row = linear // vecs_per_row
-        vec_idx = linear - row * vecs_per_row
-        token_idx = Int32(sTokenIdx[row])
-        dst_addr = _smem_addr_from_b128_offset(
-            kv_base_addr,
-            _permuted_offset_128b(row, vec_idx, row_stride_128b),
-        )
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if token_idx >= Int32(0) and token_idx < num_kv:
-            scale_bf2 = broadcast_f32_to_bfloat2(Float32(sScale[row]))
-            src_u32 = base_u32 + vec_idx * Int32(2)
-            raw0 = Uint32(kv_u32[token_idx, src_u32 + Int32(0)])
-            raw1 = Uint32(kv_u32[token_idx, src_u32 + Int32(1)])
-            v0, v1 = fp8x4_e4m3_to_bfloat2x2(raw0)
-            v2, v3 = fp8x4_e4m3_to_bfloat2x2(raw1)
-            v0 = bfloat2_mul(v0, scale_bf2)
-            v1 = bfloat2_mul(v1, scale_bf2)
-            v2 = bfloat2_mul(v2, scale_bf2)
-            v3 = bfloat2_mul(v3, scale_bf2)
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_MLA_WARP_THREADS)
-
-
-@cute.jit
-def _literal_qk_mma_into_sfrag_mxfp8_raw(
-    s_frag: cute.Tensor,
-    q_base_addr: Int32,
-    k_base_addr: Int32,
-    lane: Int32,
-    row_base: Int32,
-    num_mma_q: Int32,
-    num_mma_kv: Int32,
-    num_mma_d_qk: Int32,
-    upcast_stride_q: Int32,
-    upcast_stride_k: Int32,
-):
-    unit_scale = Uint32(0x7F7F7F7F)
-    mask16 = Uint32(0xFFFF)
-    shift16 = Uint32(16)
-    q_offset = _permuted_offset_128b(
-        lane % Int32(16),
-        lane // Int32(16),
-        upcast_stride_q,
-    )
-    k_offset = _permuted_offset_128b(
-        row_base + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
-        (lane % Int32(16)) // Int32(8),
-        upcast_stride_k,
-    )
-    for mma_pair in cutlass.range_constexpr(num_mma_d_qk // 2):
-        a_regs_k0 = cute.make_rmem_tensor(
-            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
-            Uint32,
-        )
-        q_regs = cute.make_rmem_tensor(
-            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
-            Uint32,
-        )
-
-        q_offset_cur = q_offset
-        for mma_q in cutlass.range_constexpr(num_mma_q):
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
-            a_regs_k0[mma_q, 0] = a0
-            a_regs_k0[mma_q, 1] = a1
-            a_regs_k0[mma_q, 2] = a2
-            a_regs_k0[mma_q, 3] = a3
-            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
-
-        mma_d0 = mma_pair * 2
-        q_offset_mid = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0) - Int32(
-            num_mma_q * 16 * upcast_stride_q
-        )
-        q_offset_cur = q_offset_mid
-        for mma_q in cutlass.range_constexpr(num_mma_q):
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
-            q_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) << shift16
-            )
-            q_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) << shift16
-            )
-            q_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(a0) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(a2) & mask16) << shift16
-            )
-            q_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(a1) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(a3) & mask16) << shift16
-            )
-            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
-        q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0 + 1) - Int32(
-            num_mma_q * 16 * upcast_stride_q
-        )
-
-        k_offset_cur = k_offset
-        for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
-            b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
-            b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
-            b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
-            b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
-            b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
-            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, 16, upcast_stride_k)
-
-            for mma_q in cutlass.range_constexpr(num_mma_q):
-                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 0],
-                    s_frag[mma_q, mma_kv, 1],
-                    s_frag[mma_q, mma_kv, 2],
-                    s_frag[mma_q, mma_kv, 3],
-                    q_regs[mma_q, 0],
-                    q_regs[mma_q, 1],
-                    q_regs[mma_q, 2],
-                    q_regs[mma_q, 3],
-                    b0_k0,
-                    b0_k1,
-                    unit_scale,
-                    unit_scale,
-                )
-                d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 4],
-                    s_frag[mma_q, mma_kv, 5],
-                    s_frag[mma_q, mma_kv, 6],
-                    s_frag[mma_q, mma_kv, 7],
-                    q_regs[mma_q, 0],
-                    q_regs[mma_q, 1],
-                    q_regs[mma_q, 2],
-                    q_regs[mma_q, 3],
-                    b1_k0,
-                    b1_k1,
-                    unit_scale,
-                    unit_scale,
-                )
-                s_frag[mma_q, mma_kv, 0] = d0
-                s_frag[mma_q, mma_kv, 1] = d1
-                s_frag[mma_q, mma_kv, 2] = d2
-                s_frag[mma_q, mma_kv, 3] = d3
-                s_frag[mma_q, mma_kv, 4] = d4
-                s_frag[mma_q, mma_kv, 5] = d5
-                s_frag[mma_q, mma_kv, 6] = d6
-                s_frag[mma_q, mma_kv, 7] = d7
-
-        k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
-            num_mma_kv * 16 * upcast_stride_k
-        )
-
-
-@cute.jit
-def _literal_qk_mma_into_sfrag_bf16(
-    s_frag: cute.Tensor,
-    q_base_addr: Int32,
-    k_base_addr: Int32,
-    lane: Int32,
-    row_base: Int32,
-    num_mma_q: Int32,
-    num_mma_kv: Int32,
-    num_mma_d_qk: Int32,
-    upcast_stride_q: Int32,
-    upcast_stride_k: Int32,
-):
-    for mma_d in cutlass.range_constexpr(num_mma_d_qk):
-        a_regs = cute.make_rmem_tensor(
-            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
-            Uint32,
-        )
-        for mma_q in cutlass.range_constexpr(num_mma_q):
-            q_row = lane % Int32(16)
-            q_col = mma_d * 2 + lane // Int32(16)
-            q_offset = _permuted_offset_128b(q_row, q_col, upcast_stride_q)
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset))
-            a_regs[mma_q, 0] = a0
-            a_regs[mma_q, 1] = a1
-            a_regs[mma_q, 2] = a2
-            a_regs[mma_q, 3] = a3
-
-        for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            k_row = row_base + mma_kv * 16 + Int32(8) * (lane // Int32(16)) + lane % Int32(8)
-            k_col = mma_d * 2 + (lane % Int32(16)) // Int32(8)
-            k_offset = _permuted_offset_128b(k_row, k_col, upcast_stride_k)
-            b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(k_base_addr, k_offset))
-
-            for mma_q in cutlass.range_constexpr(num_mma_q):
-                d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
-                    s_frag[mma_q, mma_kv, 0],
-                    s_frag[mma_q, mma_kv, 1],
-                    s_frag[mma_q, mma_kv, 2],
-                    s_frag[mma_q, mma_kv, 3],
-                    s_frag[mma_q, mma_kv, 4],
-                    s_frag[mma_q, mma_kv, 5],
-                    s_frag[mma_q, mma_kv, 6],
-                    s_frag[mma_q, mma_kv, 7],
-                    a_regs[mma_q, 0],
-                    a_regs[mma_q, 1],
-                    a_regs[mma_q, 2],
-                    a_regs[mma_q, 3],
-                    b0,
-                    b1,
-                    b2,
-                    b3,
-                )
-                s_frag[mma_q, mma_kv, 0] = d0
-                s_frag[mma_q, mma_kv, 1] = d1
-                s_frag[mma_q, mma_kv, 2] = d2
-                s_frag[mma_q, mma_kv, 3] = d3
-                s_frag[mma_q, mma_kv, 4] = d4
-                s_frag[mma_q, mma_kv, 5] = d5
-                s_frag[mma_q, mma_kv, 6] = d6
-                s_frag[mma_q, mma_kv, 7] = d7
-
-
-@cute.jit
-def _zero_score_frag(score_frag: cute.Tensor):
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            score_frag[0, mma_kv, reg_id] = Float32(0.0)
-
-
-@cute.jit
-def _zero_output_frag(o_frag: cute.Tensor):
-    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-        for reg_id in cutlass.range_constexpr(8):
-            o_frag[0, mma_d, reg_id] = Float32(0.0)
-
-
-@cute.jit
-def _zero_output_frag_b1(o_frag: cute.Tensor):
-    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-        o_frag[0, mma_d, 0] = Float32(0.0)
-        o_frag[0, mma_d, 1] = Float32(0.0)
-        o_frag[0, mma_d, 4] = Float32(0.0)
-        o_frag[0, mma_d, 5] = Float32(0.0)
-
-
-@cute.jit
-def _accumulate_scaled_score_frag(
-    dst_frag: cute.Tensor,
-    src_frag: cute.Tensor,
-    sScale: cute.Tensor,
-    scale_base: Int32,
-    lane: Int32,
-):
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            token_local = (
-                mma_kv * 16
-                + lane_pair_base
-                + Int32(8) * (reg_id // 4)
-                + Int32(reg_id % 2)
-            )
-            dst_frag[0, mma_kv, reg_id] = Float32(
-                dst_frag[0, mma_kv, reg_id]
-                + src_frag[0, mma_kv, reg_id] * Float32(sScale[scale_base + token_local])
-            )
-
-
-@cute.jit
-def _accumulate_compressed_scaled_score_frag(
-    dst_frag: cute.Tensor,
-    src_frag: cute.Tensor,
-    sScale: cute.Tensor,
-    group_idx: Int32,
-    lane: Int32,
-):
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    scale_base = group_idx * Int32(_COMPRESSED_MLA_SCALE_STAGE_STRIDE)
-    scale01_k0 = Float32(sScale[scale_base + lane_pair_base + Int32(0)])
-    scale02_k0 = Float32(sScale[scale_base + lane_pair_base + Int32(1)])
-    scale89_k0 = Float32(sScale[scale_base + lane_pair_base + Int32(9)])
-    scale90_k0 = Float32(sScale[scale_base + lane_pair_base + Int32(10)])
-    scale01_k1 = Float32(sScale[scale_base + lane_pair_base + Int32(18)])
-    scale02_k1 = Float32(sScale[scale_base + lane_pair_base + Int32(19)])
-    scale89_k1 = Float32(sScale[scale_base + lane_pair_base + Int32(27)])
-    scale90_k1 = Float32(sScale[scale_base + lane_pair_base + Int32(28)])
-    scale01_k2 = Float32(sScale[scale_base + lane_pair_base + Int32(36)])
-    scale02_k2 = Float32(sScale[scale_base + lane_pair_base + Int32(37)])
-    scale89_k2 = Float32(sScale[scale_base + lane_pair_base + Int32(45)])
-    scale90_k2 = Float32(sScale[scale_base + lane_pair_base + Int32(46)])
-    scale01_k3 = Float32(sScale[scale_base + lane_pair_base + Int32(54)])
-    scale02_k3 = Float32(sScale[scale_base + lane_pair_base + Int32(55)])
-    scale89_k3 = Float32(sScale[scale_base + lane_pair_base + Int32(63)])
-    scale90_k3 = Float32(sScale[scale_base + lane_pair_base + Int32(64)])
-
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        scale01 = scale01_k0
-        scale02 = scale02_k0
-        scale89 = scale89_k0
-        scale90 = scale90_k0
-        if mma_kv == 1:
-            scale01 = scale01_k1
-            scale02 = scale02_k1
-            scale89 = scale89_k1
-            scale90 = scale90_k1
-        elif mma_kv == 2:
-            scale01 = scale01_k2
-            scale02 = scale02_k2
-            scale89 = scale89_k2
-            scale90 = scale90_k2
-        elif mma_kv == 3:
-            scale01 = scale01_k3
-            scale02 = scale02_k3
-            scale89 = scale89_k3
-            scale90 = scale90_k3
-
-        dst_frag[0, mma_kv, 0] = Float32(
-            dst_frag[0, mma_kv, 0] + src_frag[0, mma_kv, 0] * scale01
-        )
-        dst_frag[0, mma_kv, 1] = Float32(
-            dst_frag[0, mma_kv, 1] + src_frag[0, mma_kv, 1] * scale02
-        )
-        dst_frag[0, mma_kv, 2] = Float32(
-            dst_frag[0, mma_kv, 2] + src_frag[0, mma_kv, 2] * scale01
-        )
-        dst_frag[0, mma_kv, 3] = Float32(
-            dst_frag[0, mma_kv, 3] + src_frag[0, mma_kv, 3] * scale02
-        )
-        dst_frag[0, mma_kv, 4] = Float32(
-            dst_frag[0, mma_kv, 4] + src_frag[0, mma_kv, 4] * scale89
-        )
-        dst_frag[0, mma_kv, 5] = Float32(
-            dst_frag[0, mma_kv, 5] + src_frag[0, mma_kv, 5] * scale90
-        )
-        dst_frag[0, mma_kv, 6] = Float32(
-            dst_frag[0, mma_kv, 6] + src_frag[0, mma_kv, 6] * scale89
-        )
-        dst_frag[0, mma_kv, 7] = Float32(
-            dst_frag[0, mma_kv, 7] + src_frag[0, mma_kv, 7] * scale90
-        )
-
-
-@cute.jit
-def _compute_score_tile_scaled(
-    score_frag: cute.Tensor,
-    q_u32: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    identity_page_table: cutlass.Constexpr[bool],
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    num_heads = Int32(q_u32.shape[1])
-    num_kv = Int32(kv_rows_u32.shape[0])
-    tile_tokens = token_end - token_base
-
-    _stage_token_indices(
-        page_table_1,
-        sTokenIdx,
-        q_idx,
-        token_base,
-        token_end,
-        lane,
-        identity_page_table,
-    )
-    cute.arch.sync_threads()
-
-    _zero_score_frag(score_frag)
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-
-    for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        _stage_q_u32_block(
-            q_u32,
-            q_idx,
-            head_tile_start,
-            Int32(group_idx * _MLA_NOPE_GROUP_Q_U32),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            q_base_addr,
-            lane,
-        )
-        _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(group_idx), num_kv, lane)
-        _stage_kv_u32_block(
-            kv_rows_u32,
-            sTokenIdx,
-            Int32(_MLA_NOPE_U32_OFFSET + group_idx * _MLA_NOPE_GROUP_KV_U32),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            kv_base_addr,
-            num_kv,
-            lane,
-        )
-        cute.arch.sync_threads()
-
-        frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
-        _zero_score_frag(frag_tmp)
-        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
-            _stage_kv_bf16_block(
-                kv_rows_u32,
-                sTokenIdx,
-                sScale,
-                Int32(_MLA_NOPE_U32_OFFSET + group_idx * _MLA_NOPE_GROUP_KV_U32),
-                Int32(_MLA_NOPE_GROUP_KV_BF16_VECS),
-                Int32(_MLA_NOPE_GROUP_KV_BF16_VECS),
-                kv_base_addr,
-                num_kv,
-                lane,
-            )
-            cute.arch.sync_threads()
-            _literal_qk_mma_into_sfrag_bf16(
-                frag_tmp,
-                q_base_addr,
-                kv_base_addr,
-                lane,
-                Int32(0),
-                Int32(1),
-                Int32(_MLA_NUM_MMA_KV),
-                Int32(_MLA_NOPE_QK_NUM_MMA_D),
-                Int32(_MLA_NOPE_GROUP_Q_VECS),
-                Int32(_MLA_NOPE_GROUP_KV_BF16_VECS),
-            )
-            for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-                for reg_id in cutlass.range_constexpr(8):
-                    score_frag[0, mma_kv, reg_id] = Float32(
-                        score_frag[0, mma_kv, reg_id] + frag_tmp[0, mma_kv, reg_id]
-                    )
-        else:
-            _literal_qk_mma_into_sfrag_mxfp8_raw(
-                frag_tmp,
-                q_base_addr,
-                kv_base_addr,
-                lane,
-                Int32(0),
-                Int32(1),
-                Int32(_MLA_NUM_MMA_KV),
-                Int32(_MLA_NOPE_QK_NUM_MMA_D),
-                Int32(_MLA_NOPE_GROUP_Q_VECS),
-                Int32(_MLA_NOPE_GROUP_KV_VECS),
-            )
-            _accumulate_scaled_score_frag(score_frag, frag_tmp, sScale, Int32(0), lane)
-        cute.arch.sync_threads()
-
-    _stage_q_u32_block(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        q_base_addr,
-        lane,
-    )
-    _stage_kv_u32_block(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_ROPE_U32_OFFSET),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        kv_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.sync_threads()
-
-    frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
-    _zero_score_frag(frag_rope)
-    _literal_qk_mma_into_sfrag_bf16(
-        frag_rope,
-        q_base_addr,
-        kv_base_addr,
-        lane,
-        Int32(0),
-        Int32(1),
-        Int32(_MLA_NUM_MMA_KV),
-        Int32(_MLA_QK_NUM_MMA_D),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            score_frag[0, mma_kv, reg_id] = Float32(score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id])
-
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            row_slot = (reg_id % 4) // 2
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            token_local = (
-                mma_kv * 16
-                + lane_pair_base
-                + Int32(8) * (reg_id // 4)
-                + Int32(reg_id % 2)
-            )
-            token_idx = Int32(sTokenIdx[token_local])
-            valid = token_local < tile_tokens
-            if valid:
-                valid = valid and token_idx >= Int32(0)
-            if valid:
-                valid = valid and token_idx < num_kv
-            if valid:
-                valid = valid and head_idx < num_heads
-            score_frag[0, mma_kv, reg_id] = (
-                Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
-                if valid
-                else Float32(-Float32.inf)
-            )
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _update_softmax_stats_b2(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    o_rescale_frag: cute.Tensor,
-):
-    for row_slot in cutlass.range_constexpr(2):
-        m_prev = Float32(m_frag[0, row_slot])
-        m_new = Float32(m_prev)
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_ops.fmax(
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 0],
-                    score_frag[0, mma_kv, row_slot * 2 + 1],
-                ),
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 4],
-                    score_frag[0, mma_kv, row_slot * 2 + 5],
-                ),
-            )
-            m_new = attention_ops.fmax(m_new, m_local)
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-        scale_term = (
-            Float32(1.0)
-            if m_prev == -Float32.inf
-            else _exp2_approx_ftz_f32(m_prev - m_new)
-        )
-        o_rescale_frag[0, row_slot] = scale_term
-        # d_frag is stored as the 4-lane reduced total on every lane in the row group.
-        # Divide by 4 before the next reduction so we do not re-count the prior state.
-        d_acc = Float32(d_frag[0, row_slot] * scale_term * Float32(0.25))
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            p0 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 0] - m_new)
-            )
-            p1 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 1] - m_new)
-            )
-            p2 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 4] - m_new)
-            )
-            p3 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 5] - m_new)
-            )
-            d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-        m_frag[0, row_slot] = Float32(m_new)
-        d_frag[0, row_slot] = Float32(d_acc)
-
-
-@cute.jit
-def _update_softmax_stats_b1(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    o_rescale_frag: cute.Tensor,
-):
-    m_prev = Float32(m_frag[0, 0])
-    m_new = Float32(m_prev)
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_ops.fmax(
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 0],
-                score_frag[0, mma_kv, 1],
-            ),
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 4],
-                score_frag[0, mma_kv, 5],
-            ),
-        )
-        m_new = attention_ops.fmax(m_new, m_local)
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-    scale_term = (
-        Float32(1.0)
-        if m_prev == -Float32.inf
-        else _exp2_approx_ftz_f32(m_prev - m_new)
-    )
-    o_rescale_frag[0, 0] = scale_term
-    d_acc = Float32(d_frag[0, 0] * scale_term * Float32(0.25))
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        p0 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_new)
-        )
-        p1 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_new)
-        )
-        p2 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_new)
-        )
-        p3 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_new)
-        )
-        d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-    m_frag[0, 0] = Float32(m_new)
-    d_frag[0, 0] = Float32(d_acc)
-
-
-@cute.jit
-def _fill_normalized_p_frag_from_scores(
-    p_frag: cute.Tensor,
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-):
-    del d_frag
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for row_slot in cutlass.range_constexpr(2):
-            m_scaled = Float32(m_frag[0, row_slot])
-            p0 = (
-                Float32(0.0)
-                if m_scaled == -Float32.inf
-                else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 0] - m_scaled))
-            )
-            p1 = (
-                Float32(0.0)
-                if m_scaled == -Float32.inf
-                else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 1] - m_scaled))
-            )
-            p2 = (
-                Float32(0.0)
-                if m_scaled == -Float32.inf
-                else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 4] - m_scaled))
-            )
-            p3 = (
-                Float32(0.0)
-                if m_scaled == -Float32.inf
-                else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 5] - m_scaled))
-            )
-            p_frag[0, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
-            p_frag[0, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
-
-
-@cute.jit
-def _fill_normalized_p_frag_from_scores_b1(
-    p_frag: cute.Tensor,
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-):
-    del d_frag
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_scaled = Float32(m_frag[0, 0])
-        p0 = (
-            Float32(0.0)
-            if m_scaled == -Float32.inf
-            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_scaled))
-        )
-        p1 = (
-            Float32(0.0)
-            if m_scaled == -Float32.inf
-            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_scaled))
-        )
-        p2 = (
-            Float32(0.0)
-            if m_scaled == -Float32.inf
-            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_scaled))
-        )
-        p3 = (
-            Float32(0.0)
-            if m_scaled == -Float32.inf
-            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_scaled))
-        )
-        p_frag[0, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
-        p_frag[0, mma_kv, 1] = Uint32(0)
-        p_frag[0, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
-        p_frag[0, mma_kv, 3] = Uint32(0)
-
-
-
-@cute.jit
-def _update_softmax_rescale_and_p_b1(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-):
-    """Fused softmax-stats + O-rescale + P-norm for single-head-slot (b1) path."""
-    m_prev = Float32(m_frag[0, 0])
-    m_new = Float32(m_prev)
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_ops.fmax(
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 0],
-                score_frag[0, mma_kv, 1],
-            ),
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 4],
-                score_frag[0, mma_kv, 5],
-            ),
-        )
-        m_new = attention_ops.fmax(m_new, m_local)
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-    scale_term = (
-        Float32(1.0)
-        if m_prev == -Float32.inf
-        else _exp2_approx_ftz_f32(m_prev - m_new)
-    )
-
-    # O-rescale: apply scale_term to all slot-0 elements of o_frag0-3
-    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-        o_frag0[0, mma_d, 0] = Float32(o_frag0[0, mma_d, 0] * scale_term)
-        o_frag0[0, mma_d, 1] = Float32(o_frag0[0, mma_d, 1] * scale_term)
-        o_frag0[0, mma_d, 4] = Float32(o_frag0[0, mma_d, 4] * scale_term)
-        o_frag0[0, mma_d, 5] = Float32(o_frag0[0, mma_d, 5] * scale_term)
-        o_frag1[0, mma_d, 0] = Float32(o_frag1[0, mma_d, 0] * scale_term)
-        o_frag1[0, mma_d, 1] = Float32(o_frag1[0, mma_d, 1] * scale_term)
-        o_frag1[0, mma_d, 4] = Float32(o_frag1[0, mma_d, 4] * scale_term)
-        o_frag1[0, mma_d, 5] = Float32(o_frag1[0, mma_d, 5] * scale_term)
-        o_frag2[0, mma_d, 0] = Float32(o_frag2[0, mma_d, 0] * scale_term)
-        o_frag2[0, mma_d, 1] = Float32(o_frag2[0, mma_d, 1] * scale_term)
-        o_frag2[0, mma_d, 4] = Float32(o_frag2[0, mma_d, 4] * scale_term)
-        o_frag2[0, mma_d, 5] = Float32(o_frag2[0, mma_d, 5] * scale_term)
-        o_frag3[0, mma_d, 0] = Float32(o_frag3[0, mma_d, 0] * scale_term)
-        o_frag3[0, mma_d, 1] = Float32(o_frag3[0, mma_d, 1] * scale_term)
-        o_frag3[0, mma_d, 4] = Float32(o_frag3[0, mma_d, 4] * scale_term)
-        o_frag3[0, mma_d, 5] = Float32(o_frag3[0, mma_d, 5] * scale_term)
-
-    # Combined d accumulation + p_frag fill: compute exp2(score - m_new) once
-    d_acc = Float32(d_frag[0, 0] * scale_term * Float32(0.25))
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        p0 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_new)
-        )
-        p1 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_new)
-        )
-        p2 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_new)
-        )
-        p3 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_new)
-        )
-        d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-        p_frag[0, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
-        p_frag[0, mma_kv, 1] = Uint32(0)
-        p_frag[0, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
-        p_frag[0, mma_kv, 3] = Uint32(0)
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-    m_frag[0, 0] = Float32(m_new)
-    d_frag[0, 0] = Float32(d_acc)
-
-
-@cute.jit
-def _update_softmax_rescale_and_p_b2(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-):
-    """Fused softmax-stats + O-rescale + P-norm for dual-head-slot (b2) path."""
-    for row_slot in cutlass.range_constexpr(2):
-        m_prev = Float32(m_frag[0, row_slot])
-        m_new = Float32(m_prev)
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_ops.fmax(
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 0],
-                    score_frag[0, mma_kv, row_slot * 2 + 1],
-                ),
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 4],
-                    score_frag[0, mma_kv, row_slot * 2 + 5],
-                ),
-            )
-            m_new = attention_ops.fmax(m_new, m_local)
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-        scale_term = (
-            Float32(1.0)
-            if m_prev == -Float32.inf
-            else _exp2_approx_ftz_f32(m_prev - m_new)
-        )
-
-        # O-rescale for this row_slot
-        if cutlass.const_expr(row_slot == 0):
-            rs = scale_term
-            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                o_frag0[0, mma_d, 0] = Float32(o_frag0[0, mma_d, 0] * rs)
-                o_frag0[0, mma_d, 1] = Float32(o_frag0[0, mma_d, 1] * rs)
-                o_frag0[0, mma_d, 4] = Float32(o_frag0[0, mma_d, 4] * rs)
-                o_frag0[0, mma_d, 5] = Float32(o_frag0[0, mma_d, 5] * rs)
-                o_frag1[0, mma_d, 0] = Float32(o_frag1[0, mma_d, 0] * rs)
-                o_frag1[0, mma_d, 1] = Float32(o_frag1[0, mma_d, 1] * rs)
-                o_frag1[0, mma_d, 4] = Float32(o_frag1[0, mma_d, 4] * rs)
-                o_frag1[0, mma_d, 5] = Float32(o_frag1[0, mma_d, 5] * rs)
-                o_frag2[0, mma_d, 0] = Float32(o_frag2[0, mma_d, 0] * rs)
-                o_frag2[0, mma_d, 1] = Float32(o_frag2[0, mma_d, 1] * rs)
-                o_frag2[0, mma_d, 4] = Float32(o_frag2[0, mma_d, 4] * rs)
-                o_frag2[0, mma_d, 5] = Float32(o_frag2[0, mma_d, 5] * rs)
-                o_frag3[0, mma_d, 0] = Float32(o_frag3[0, mma_d, 0] * rs)
-                o_frag3[0, mma_d, 1] = Float32(o_frag3[0, mma_d, 1] * rs)
-                o_frag3[0, mma_d, 4] = Float32(o_frag3[0, mma_d, 4] * rs)
-                o_frag3[0, mma_d, 5] = Float32(o_frag3[0, mma_d, 5] * rs)
-        else:
-            rs1 = scale_term
-            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                o_frag0[0, mma_d, 2] = Float32(o_frag0[0, mma_d, 2] * rs1)
-                o_frag0[0, mma_d, 3] = Float32(o_frag0[0, mma_d, 3] * rs1)
-                o_frag0[0, mma_d, 6] = Float32(o_frag0[0, mma_d, 6] * rs1)
-                o_frag0[0, mma_d, 7] = Float32(o_frag0[0, mma_d, 7] * rs1)
-                o_frag1[0, mma_d, 2] = Float32(o_frag1[0, mma_d, 2] * rs1)
-                o_frag1[0, mma_d, 3] = Float32(o_frag1[0, mma_d, 3] * rs1)
-                o_frag1[0, mma_d, 6] = Float32(o_frag1[0, mma_d, 6] * rs1)
-                o_frag1[0, mma_d, 7] = Float32(o_frag1[0, mma_d, 7] * rs1)
-                o_frag2[0, mma_d, 2] = Float32(o_frag2[0, mma_d, 2] * rs1)
-                o_frag2[0, mma_d, 3] = Float32(o_frag2[0, mma_d, 3] * rs1)
-                o_frag2[0, mma_d, 6] = Float32(o_frag2[0, mma_d, 6] * rs1)
-                o_frag2[0, mma_d, 7] = Float32(o_frag2[0, mma_d, 7] * rs1)
-                o_frag3[0, mma_d, 2] = Float32(o_frag3[0, mma_d, 2] * rs1)
-                o_frag3[0, mma_d, 3] = Float32(o_frag3[0, mma_d, 3] * rs1)
-                o_frag3[0, mma_d, 6] = Float32(o_frag3[0, mma_d, 6] * rs1)
-                o_frag3[0, mma_d, 7] = Float32(o_frag3[0, mma_d, 7] * rs1)
-
-        # Combined d accumulation + p_frag fill
-        d_acc = Float32(d_frag[0, row_slot] * scale_term * Float32(0.25))
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            p0 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 0] - m_new)
-            )
-            p1 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 1] - m_new)
-            )
-            p2 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 4] - m_new)
-            )
-            p3 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 5] - m_new)
-            )
-            d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-            p_frag[0, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
-            p_frag[0, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-        m_frag[0, row_slot] = Float32(m_new)
-        d_frag[0, row_slot] = Float32(d_acc)
-
-
-@cute.jit
-def _update_softmax_and_p_b1(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-):
-    m_prev = Float32(m_frag[0, 0])
-    m_new = Float32(m_prev)
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        m_local = attention_ops.fmax(
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 0],
-                score_frag[0, mma_kv, 1],
-            ),
-            attention_ops.fmax(
-                score_frag[0, mma_kv, 4],
-                score_frag[0, mma_kv, 5],
-            ),
-        )
-        m_new = attention_ops.fmax(m_new, m_local)
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-    m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-    scale_term = (
-        Float32(1.0)
-        if m_prev == -Float32.inf
-        else _exp2_approx_ftz_f32(m_prev - m_new)
-    )
-
-    d_acc = Float32(d_frag[0, 0] * scale_term * Float32(0.25))
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        p0 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_new)
-        )
-        p1 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_new)
-        )
-        p2 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_new)
-        )
-        p3 = (
-            Float32(0.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_new)
-        )
-        d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-        p_frag[0, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
-        p_frag[0, mma_kv, 1] = Uint32(0)
-        p_frag[0, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
-        p_frag[0, mma_kv, 3] = Uint32(0)
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-    m_frag[0, 0] = Float32(m_new)
-    d_frag[0, 0] = Float32(d_acc)
-
-
-@cute.jit
-def _update_softmax_and_p_b2(
-    score_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-):
-    for row_slot in cutlass.range_constexpr(2):
-        m_prev = Float32(m_frag[0, row_slot])
-        m_new = Float32(m_prev)
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            m_local = attention_ops.fmax(
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 0],
-                    score_frag[0, mma_kv, row_slot * 2 + 1],
-                ),
-                attention_ops.fmax(
-                    score_frag[0, mma_kv, row_slot * 2 + 4],
-                    score_frag[0, mma_kv, row_slot * 2 + 5],
-                ),
-            )
-            m_new = attention_ops.fmax(m_new, m_local)
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-        m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
-
-        scale_term = (
-            Float32(1.0)
-            if m_prev == -Float32.inf
-            else _exp2_approx_ftz_f32(m_prev - m_new)
-        )
-
-        d_acc = Float32(d_frag[0, row_slot] * scale_term * Float32(0.25))
-        for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-            p0 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 0] - m_new)
-            )
-            p1 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 1] - m_new)
-            )
-            p2 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 4] - m_new)
-            )
-            p3 = (
-                Float32(0.0)
-                if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(score_frag[0, mma_kv, row_slot * 2 + 5] - m_new)
-            )
-            d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
-            p_frag[0, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
-            p_frag[0, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
-        d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
-        m_frag[0, row_slot] = Float32(m_new)
-        d_frag[0, row_slot] = Float32(d_acc)
-
-
-@cute.jit
-def _literal_pv_mma_into_ofrag_mxfp8_scaled(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    v_base_addr: Int32,
-    sScale: cute.Tensor,
-    scale_base: Int32,
-    pv_scale: Float32,
-    lane: Int32,
-):
-    mask16 = Uint32(0xFFFF)
-    shift16 = Uint32(16)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    del pv_scale
-
-    scale01_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
-    )
-    scale89_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(8)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
-    )
-    scale01_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(16)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(17)]),
-    )
-    scale89_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(24)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(25)]),
-    )
-    scale01_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(32)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(33)]),
-    )
-    scale89_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(40)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(41)]),
-    )
-    scale01_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(48)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(49)]),
-    )
-    scale89_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(56)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(57)]),
-    )
-
-    a00 = bfloat2_mul(p_frag[0, 0, 0], scale01_k0)
-    a10 = bfloat2_mul(p_frag[0, 0, 1], scale01_k0)
-    a80 = bfloat2_mul(p_frag[0, 0, 2], scale89_k0)
-    a90 = bfloat2_mul(p_frag[0, 0, 3], scale89_k0)
-    a16 = bfloat2_mul(p_frag[0, 1, 0], scale01_k1)
-    a17 = bfloat2_mul(p_frag[0, 1, 1], scale01_k1)
-    a24 = bfloat2_mul(p_frag[0, 1, 2], scale89_k1)
-    a25 = bfloat2_mul(p_frag[0, 1, 3], scale89_k1)
-
-    sfa0 = cvt_f32_to_ue8m0(
-        bfloat2_hmax_to_f32(
-            bfloat2_hmax2(
-                bfloat2_hmax2(
-                    bfloat2_hmax2(
-                        bfloat2_habs2(a00),
-                        bfloat2_habs2(a10),
-                    ),
-                    bfloat2_hmax2(
-                        bfloat2_habs2(a80),
-                        bfloat2_habs2(a90),
-                    ),
-                ),
-                bfloat2_hmax2(
-                    bfloat2_hmax2(
-                        bfloat2_habs2(a16),
-                        bfloat2_habs2(a17),
-                    ),
-                    bfloat2_hmax2(
-                        bfloat2_habs2(a24),
-                        bfloat2_habs2(a25),
-                    ),
-                ),
-            )
-        )
-    )
-    inv_sfa0 = broadcast_f32_to_bfloat2(ue8m0_to_output_scale(sfa0))
-    sfa = Uint32(sfa0)
-    unit_scale = Uint32(0x7F)
-
-    a_regs = cute.make_rmem_tensor(
-        cute.make_layout((1, 4), stride=(4, 1)),
-        Uint32,
-    )
-    a_regs[0, 0] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a00, inv_sfa0)) & mask16) | (
-        (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a80, inv_sfa0)) & mask16) << shift16
-    )
-    a_regs[0, 1] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a10, inv_sfa0)) & mask16) | (
-        (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a90, inv_sfa0)) & mask16) << shift16
-    )
-    a_regs[0, 2] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a16, inv_sfa0)) & mask16) | (
-        (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a24, inv_sfa0)) & mask16) << shift16
-    )
-    a_regs[0, 3] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a17, inv_sfa0)) & mask16) | (
-        (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a25, inv_sfa0)) & mask16) << shift16
-    )
-
-    v_offset = _permuted_offset_128b(
-        lane % Int32(16),
-        lane // Int32(16),
-        Int32(_MLA_NOPE_GROUP_KV_VECS),
-    )
-    v_offset_k0 = v_offset
-    v_offset_k1 = _advance_offset_by_row_128b(v_offset, 16, Int32(_MLA_NOPE_GROUP_KV_VECS))
-    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-        b0_k0 = Uint32(0)
-        b1_k0 = Uint32(0)
-        b0_k1 = Uint32(0)
-        b1_k1 = Uint32(0)
-        if mma_d % 2 == 0:
-            b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_left_half_b16(
-                _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
-            )
-            b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_left_half_b16(
-                _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
-            )
-        else:
-            b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_right_half_b16(
-                _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
-            )
-            b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_right_half_b16(
-                _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
-            )
-        b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
-        b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
-        b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
-        b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
-        b01_k0 = byte_perm(b0_k0, b1_k0, Int32(0x5410))
-        b23_k0 = byte_perm(b0_k0, b1_k0, Int32(0x7632))
-        b01_k1 = byte_perm(b0_k1, b1_k1, Int32(0x5410))
-        b23_k1 = byte_perm(b0_k1, b1_k1, Int32(0x7632))
-
-        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-            o_frag[0, mma_d, 0],
-            o_frag[0, mma_d, 1],
-            o_frag[0, mma_d, 2],
-            o_frag[0, mma_d, 3],
-            a_regs[0, 0],
-            a_regs[0, 1],
-            a_regs[0, 2],
-            a_regs[0, 3],
-            b01_k0,
-            b01_k1,
-            sfa,
-            unit_scale,
-        )
-        d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
-            o_frag[0, mma_d, 4],
-            o_frag[0, mma_d, 5],
-            o_frag[0, mma_d, 6],
-            o_frag[0, mma_d, 7],
-            a_regs[0, 0],
-            a_regs[0, 1],
-            a_regs[0, 2],
-            a_regs[0, 3],
-            b23_k0,
-            b23_k1,
-            sfa,
-            unit_scale,
-        )
-        o_frag[0, mma_d, 0] = d0
-        o_frag[0, mma_d, 1] = d1
-        o_frag[0, mma_d, 2] = d2
-        o_frag[0, mma_d, 3] = d3
-        o_frag[0, mma_d, 4] = d4
-        o_frag[0, mma_d, 5] = d5
-        o_frag[0, mma_d, 6] = d6
-        o_frag[0, mma_d, 7] = d7
-        if mma_d % 2 == 1:
-            v_offset_k0 = _advance_offset_by_column_128b_2(v_offset_k0, mma_d // 2)
-            v_offset_k1 = _advance_offset_by_column_128b_2(v_offset_k1, mma_d // 2)
-
-
-@cute.jit
-def _literal_pv_mma_into_ofrag_fp8_raw_scaled(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    v_base_addr: Int32,
-    sScale: cute.Tensor,
-    scale_base: Int32,
-    lane: Int32,
-):
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-
-    scale01_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
-    )
-    scale89_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(8)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
-    )
-    scale01_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(16)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(17)]),
-    )
-    scale89_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(24)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(25)]),
-    )
-    scale01_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(32)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(33)]),
-    )
-    scale89_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(40)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(41)]),
-    )
-    scale01_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(48)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(49)]),
-    )
-    scale89_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(56)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(57)]),
-    )
-
-    v_offset = _permuted_offset_128b(
-        lane % Int32(16),
-        lane // Int32(16),
-        Int32(_MLA_NOPE_GROUP_KV_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        a_regs = cute.make_rmem_tensor(
-            cute.make_layout((1, 4), stride=(4, 1)),
-            Uint32,
-        )
-        scale01 = scale01_k0
-        scale89 = scale89_k0
-        if mma_kv == 1:
-            scale01 = scale01_k1
-            scale89 = scale89_k1
-        elif mma_kv == 2:
-            scale01 = scale01_k2
-            scale89 = scale89_k2
-        elif mma_kv == 3:
-            scale01 = scale01_k3
-            scale89 = scale89_k3
-        a_regs[0, 0] = bfloat2_mul(p_frag[0, mma_kv, 0], scale01)
-        a_regs[0, 1] = bfloat2_mul(p_frag[0, mma_kv, 1], scale01)
-        a_regs[0, 2] = bfloat2_mul(p_frag[0, mma_kv, 2], scale89)
-        a_regs[0, 3] = bfloat2_mul(p_frag[0, mma_kv, 3], scale89)
-
-        v_offset_cur = v_offset
-        for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-            b_f8_0 = Uint32(0)
-            b_f8_1 = Uint32(0)
-            if mma_d % 2 == 0:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(
-                    _smem_addr_from_b128_offset(v_base_addr, v_offset_cur)
-                )
-            else:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(
-                    _smem_addr_from_b128_offset(v_base_addr, v_offset_cur)
-                )
-            b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
-            b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
-            b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
-            b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_1)
-            tmp = b1
-            b1 = b2
-            b2 = tmp
-            if mma_d % 2 == 1:
-                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
-            d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
-                o_frag[0, mma_d, 0],
-                o_frag[0, mma_d, 1],
-                o_frag[0, mma_d, 2],
-                o_frag[0, mma_d, 3],
-                o_frag[0, mma_d, 4],
-                o_frag[0, mma_d, 5],
-                o_frag[0, mma_d, 6],
-                o_frag[0, mma_d, 7],
-                a_regs[0, 0],
-                a_regs[0, 1],
-                a_regs[0, 2],
-                a_regs[0, 3],
-                b0,
-                b1,
-                b2,
-                b3,
-            )
-            o_frag[0, mma_d, 0] = d0
-            o_frag[0, mma_d, 1] = d1
-            o_frag[0, mma_d, 2] = d2
-            o_frag[0, mma_d, 3] = d3
-            o_frag[0, mma_d, 4] = d4
-            o_frag[0, mma_d, 5] = d5
-            o_frag[0, mma_d, 6] = d6
-            o_frag[0, mma_d, 7] = d7
-        v_offset = _advance_offset_by_row_128b(v_offset_cur, 16, Int32(_MLA_NOPE_GROUP_KV_VECS)) - Int32(_MLA_VO_NUM_MMA_D)
-    v_offset -= Int32(16 * _MLA_NUM_MMA_KV * _MLA_NOPE_GROUP_KV_VECS)
-
-
-@cute.jit
-def _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    v_base_addr: Int32,
-    sScale: cute.Tensor,
-    scale_base: Int32,
-    lane: Int32,
-    mma_d_offset: cutlass.Constexpr[int],
-):
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-
-    scale01_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
-    )
-    scale89_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(10)]),
-    )
-    scale01_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(18)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(19)]),
-    )
-    scale89_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(27)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(28)]),
-    )
-    scale01_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(36)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(37)]),
-    )
-    scale89_k2 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(45)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(46)]),
-    )
-    scale01_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(54)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(55)]),
-    )
-    scale89_k3 = pack_f32x2_to_bfloat2(
-        Float32(sScale[scale_base + lane_pair_base + Int32(63)]),
-        Float32(sScale[scale_base + lane_pair_base + Int32(64)]),
-    )
-
-    v_offset = _permuted_offset_128b(
-        lane % Int32(16),
-        lane // Int32(16),
-        Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        a_regs = cute.make_rmem_tensor(
-            cute.make_layout((1, 4), stride=(4, 1)),
-            Uint32,
-        )
-        scale01 = scale01_k0
-        scale89 = scale89_k0
-        if mma_kv == 1:
-            scale01 = scale01_k1
-            scale89 = scale89_k1
-        elif mma_kv == 2:
-            scale01 = scale01_k2
-            scale89 = scale89_k2
-        elif mma_kv == 3:
-            scale01 = scale01_k3
-            scale89 = scale89_k3
-        a_regs[0, 0] = bfloat2_mul(p_frag[0, mma_kv, 0], scale01)
-        a_regs[0, 1] = bfloat2_mul(p_frag[0, mma_kv, 1], scale01)
-        a_regs[0, 2] = bfloat2_mul(p_frag[0, mma_kv, 2], scale89)
-        a_regs[0, 3] = bfloat2_mul(p_frag[0, mma_kv, 3], scale89)
-
-        v_offset_cur = v_offset
-        for local_mma_d in cutlass.range_constexpr(_COMPRESSED_MLA_GROUP_SIZE // 16):
-            b_f8_0 = Uint32(0)
-            b_f8_1 = Uint32(0)
-            if local_mma_d % 2 == 0:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(
-                    _smem_addr_from_b128_offset(v_base_addr, v_offset_cur)
-                )
-            else:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(
-                    _smem_addr_from_b128_offset(v_base_addr, v_offset_cur)
-                )
-            b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
-            b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
-            b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
-            b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_1)
-            tmp = b1
-            b1 = b2
-            b2 = tmp
-            if local_mma_d % 2 == 1:
-                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, local_mma_d // 2)
-            mma_d = mma_d_offset + local_mma_d
-            d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
-                o_frag[0, mma_d, 0],
-                o_frag[0, mma_d, 1],
-                o_frag[0, mma_d, 2],
-                o_frag[0, mma_d, 3],
-                o_frag[0, mma_d, 4],
-                o_frag[0, mma_d, 5],
-                o_frag[0, mma_d, 6],
-                o_frag[0, mma_d, 7],
-                a_regs[0, 0],
-                a_regs[0, 1],
-                a_regs[0, 2],
-                a_regs[0, 3],
-                b0,
-                b1,
-                b2,
-                b3,
-            )
-            o_frag[0, mma_d, 0] = d0
-            o_frag[0, mma_d, 1] = d1
-            o_frag[0, mma_d, 2] = d2
-            o_frag[0, mma_d, 3] = d3
-            o_frag[0, mma_d, 4] = d4
-            o_frag[0, mma_d, 5] = d5
-            o_frag[0, mma_d, 6] = d6
-            o_frag[0, mma_d, 7] = d7
-        v_offset = _advance_offset_by_row_128b(
-            v_offset_cur,
-            16,
-            Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-        ) - Int32(_COMPRESSED_MLA_GROUP_SIZE // 16)
-        # The 64-wide compressed group is staged in an 8-vector swizzled row.
-        # Rows whose swizzle sets bit 2 need to advance back to logical vec0.
-        if lane % Int32(8) >= Int32(4):
-            v_offset += Int32(8)
-
-
-@cute.jit
-def _literal_pv_mma_into_ofrag_bf16_64(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    v_base_addr: Int32,
-    lane: Int32,
-    mma_d_offset: cutlass.Constexpr[int],
-):
-    v_offset = _permuted_offset_128b(
-        lane % Int32(16),
-        lane // Int32(16),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        a_regs = cute.make_rmem_tensor(
-            cute.make_layout((1, 4), stride=(4, 1)),
-            Uint32,
-        )
-        a_regs[0, 0] = p_frag[0, mma_kv, 0]
-        a_regs[0, 1] = p_frag[0, mma_kv, 1]
-        a_regs[0, 2] = p_frag[0, mma_kv, 2]
-        a_regs[0, 3] = p_frag[0, mma_kv, 3]
-
-        v_offset_cur = v_offset
-        for local_mma_d in cutlass.range_constexpr(_COMPRESSED_MLA_ROPE_DIM // 16):
-            mma_d = mma_d_offset + local_mma_d
-            v_row = mma_kv * Int32(16) + lane % Int32(16)
-            v_col = Int32(local_mma_d) * Int32(2) + lane // Int32(16)
-            v_offset_cur = _permuted_offset_128b(
-                v_row,
-                v_col,
-                Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-            )
-            b0, b1, b2, b3 = ldmatrix_m8n8x4_trans_b16(
-                _smem_addr_from_b128_offset(v_base_addr, v_offset_cur)
-            )
-            d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
-                o_frag[0, mma_d, 0],
-                o_frag[0, mma_d, 1],
-                o_frag[0, mma_d, 2],
-                o_frag[0, mma_d, 3],
-                o_frag[0, mma_d, 4],
-                o_frag[0, mma_d, 5],
-                o_frag[0, mma_d, 6],
-                o_frag[0, mma_d, 7],
-                a_regs[0, 0],
-                a_regs[0, 1],
-                a_regs[0, 2],
-                a_regs[0, 3],
-                b0,
-                b1,
-                b2,
-                b3,
-            )
-            o_frag[0, mma_d, 0] = d0
-            o_frag[0, mma_d, 1] = d1
-            o_frag[0, mma_d, 2] = d2
-            o_frag[0, mma_d, 3] = d3
-            o_frag[0, mma_d, 4] = d4
-            o_frag[0, mma_d, 5] = d5
-            o_frag[0, mma_d, 6] = d6
-            o_frag[0, mma_d, 7] = d7
-
-
-@cute.jit
-def _store_output_group(
-    out_tensor: cute.Tensor,
-    o_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    out_row_idx: Int32,
-    head_tile_start: Int32,
-    group_idx: Int32,
-    lane: Int32,
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    for row_slot in cutlass.range_constexpr(2):
-        head_local = lane_group + Int32(8) * row_slot
-        head_idx = head_tile_start + head_local
-        if head_idx < Int32(out_tensor.shape[1]):
-            reg_base = row_slot * 2
-            inv_d = (
-                Float32(0.0)
-                if d_frag[0, row_slot] == Float32(0.0)
-                else Float32(1.0) / Float32(d_frag[0, row_slot])
-            )
-            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
-                    o_frag[0, mma_d, reg_base + 0] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
-                    o_frag[0, mma_d, reg_base + 1] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
-                    o_frag[0, mma_d, reg_base + 4] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
-                    o_frag[0, mma_d, reg_base + 5] * inv_d
-                ).to(out_tensor.element_type)
-
-
-@cute.jit
-def _store_output_group_with_sink(
-    out_tensor: cute.Tensor,
-    o_frag: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    attn_sink: cute.Tensor,
-    out_row_idx: Int32,
-    head_tile_start: Int32,
-    group_idx: Int32,
-    lane: Int32,
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    for row_slot in cutlass.range_constexpr(2):
-        head_local = lane_group + Int32(8) * row_slot
-        head_idx = head_tile_start + head_local
-        if head_idx < Int32(out_tensor.shape[1]):
-            reg_base = row_slot * 2
-            row_m = Float32(m_frag[0, row_slot])
-            sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
-            new_m = attention_ops.fmax(row_m, sink_m)
-            prev_scale = (
-                Float32(0.0)
-                if row_m == -Float32.inf
-                else _exp2_approx_ftz_f32(row_m - new_m)
-            )
-            sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
-            denom = Float32(d_frag[0, row_slot] * prev_scale + sink_scale)
-            out_scale = (
-                Float32(0.0)
-                if denom == Float32(0.0)
-                else Float32(prev_scale) / denom
-            )
-            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
-                    o_frag[0, mma_d, reg_base + 0] * out_scale
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
-                    o_frag[0, mma_d, reg_base + 1] * out_scale
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
-                    o_frag[0, mma_d, reg_base + 4] * out_scale
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
-                    o_frag[0, mma_d, reg_base + 5] * out_scale
-                ).to(out_tensor.element_type)
-
-
-@cute.jit
-def _store_output_group_chunked(
-    out_tensor: cute.Tensor,
-    o_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    head_tile_start: Int32,
-    group_idx: Int32,
-    lane: Int32,
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    for row_slot in cutlass.range_constexpr(2):
-        head_local = lane_group + Int32(8) * row_slot
-        head_idx = head_tile_start + head_local
-        if head_idx < Int32(out_tensor.shape[1]):
-            reg_base = row_slot * 2
-            inv_d = (
-                Float32(0.0)
-                if d_frag[0, row_slot] == Float32(0.0)
-                else Float32(1.0) / Float32(d_frag[0, row_slot])
-            )
-            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(0)] = Float32(
-                    o_frag[0, mma_d, reg_base + 0] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(1)] = Float32(
-                    o_frag[0, mma_d, reg_base + 1] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(8)] = Float32(
-                    o_frag[0, mma_d, reg_base + 4] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(9)] = Float32(
-                    o_frag[0, mma_d, reg_base + 5] * inv_d
-                ).to(out_tensor.element_type)
-
-
-@cute.jit
-def _store_partial_lse(
-    tmp_lse: cute.Tensor,
-    partial_idx: Int32,
-    head_tile_start: Int32,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    lane: Int32,
-):
-    if lane % Int32(4) == Int32(0):
-        lane_group = lane // Int32(4)
-        for row_slot in cutlass.range_constexpr(2):
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            if head_idx < Int32(tmp_lse.shape[1]):
-                row_lse = Float32(-Float32.inf)
-                if m_frag[0, row_slot] != -Float32.inf:
-                    row_lse = Float32(m_frag[0, row_slot] + _log2_approx_ftz_f32(d_frag[0, row_slot]))
-                tmp_lse[partial_idx, head_idx] = row_lse
-
-
-@cute.jit
-def _store_partial_lse_chunked(
-    tmp_lse: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    head_tile_start: Int32,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    lane: Int32,
-):
-    if lane % Int32(4) == Int32(0):
-        lane_group = lane // Int32(4)
-        for row_slot in cutlass.range_constexpr(2):
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            if head_idx < Int32(tmp_lse.shape[1]):
-                row_lse = Float32(-Float32.inf)
-                if m_frag[0, row_slot] != -Float32.inf:
-                    row_lse = Float32(
-                        m_frag[0, row_slot] + _log2_approx_ftz_f32(d_frag[0, row_slot])
-                    )
-                tmp_lse[out_row_idx, head_idx, out_chunk_idx] = row_lse
-
-
-@cute.jit
-def _accumulate_scaled_output_frag(
-    dst_frag: cute.Tensor,
-    src_frag: cute.Tensor,
-    scale: Float32,
-):
-    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-        for reg_id in cutlass.range_constexpr(8):
-            dst_frag[0, mma_d, reg_id] = Float32(dst_frag[0, mma_d, reg_id] + src_frag[0, mma_d, reg_id] * scale)
-
-
-@cute.jit
-def _run_staged_pv_group_into_target(
-    target_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    sScale: cute.Tensor,
-    group_base_addr: Int32,
-    scale_base: Int32,
-    tile_pv_scale: Float32,
-    lane: Int32,
-):
-    if cutlass.const_expr(
-        os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
-        or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
-    ):
-        _literal_pv_mma_into_ofrag_fp8_raw_scaled(
-            target_frag,
-            p_frag,
-            group_base_addr,
-            sScale,
-            scale_base,
-            lane,
-        )
-    else:
-        _literal_pv_mma_into_ofrag_mxfp8_scaled(
-            target_frag,
-            p_frag,
-            group_base_addr,
-            sScale,
-            scale_base,
-            tile_pv_scale,
-            lane,
-        )
-
-
-@cute.jit
-def _accumulate_pv_groups_from_p_frag(
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    p_frag: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    kv_base_addr: Int32,
-    lane: Int32,
-):
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_token_scales(
-            kv_scales,
-            sTokenIdx,
-            sScale,
-            group_idx,
-            Int32(kv_rows_u32.shape[0]),
-            lane,
-        )
-        tile_output_scale = _warp_allreduce_max(Float32(sScale[lane]))
-        tile_pv_scale = (
-            Float32(0.0)
-            if tile_output_scale == Float32(0.0)
-            else cute.arch.rcp_approx(tile_output_scale)
-        )
-        _stage_kv_u32_block(
-            kv_rows_u32,
-            sTokenIdx,
-            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            kv_base_addr,
-            Int32(kv_rows_u32.shape[0]),
-            lane,
-        )
-        cute.arch.sync_threads()
-        tile_o_frag = cute.make_rmem_tensor(
-            cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1)),
-            Float32,
-        )
-        _zero_output_frag(tile_o_frag)
-        if cutlass.const_expr(
-            os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
-            or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
-        ):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled(
-                tile_o_frag,
-                p_frag,
-                kv_base_addr,
-                sScale,
-                Int32(0),
-                lane,
-            )
-            accum_scale = Float32(1.0)
-        else:
-            _literal_pv_mma_into_ofrag_mxfp8_scaled(
-                tile_o_frag,
-                p_frag,
-                kv_base_addr,
-                sScale,
-                Int32(0),
-                tile_pv_scale,
-                lane,
-            )
-            accum_scale = Float32(1.0)
-        if cutlass.const_expr(block_offset == 0):
-            _accumulate_scaled_output_frag(o_frag0, tile_o_frag, accum_scale)
-        elif cutlass.const_expr(block_offset == 1):
-            _accumulate_scaled_output_frag(o_frag1, tile_o_frag, accum_scale)
-        elif cutlass.const_expr(block_offset == 2):
-            _accumulate_scaled_output_frag(o_frag2, tile_o_frag, accum_scale)
-        else:
-            _accumulate_scaled_output_frag(o_frag3, tile_o_frag, accum_scale)
-        cute.arch.sync_threads()
-
-
-@cute.jit
-def _compute_score_tile_scaled_from_staged_nope(
-    score_frag: cute.Tensor,
-    q_u32: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    identity_page_table: cutlass.Constexpr[bool],
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    num_heads = Int32(q_u32.shape[1])
-    num_kv = Int32(kv_rows_u32.shape[0])
-    tile_tokens = token_end - token_base
-
-    _stage_token_indices(
-        page_table_1,
-        sTokenIdx,
-        q_idx,
-        token_base,
-        token_end,
-        lane,
-        identity_page_table,
-    )
-    cute.arch.sync_threads()
-    _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
-
-    _zero_score_frag(score_frag)
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-
-    # Pipelined per-group Q+KV co-streaming: overlap async staging with compute
-    # Prologue: stage nope group 0
-    _stage_q_u32_block_async(
-        q_u32, q_idx, head_tile_start,
-        Int32(0), Int32(_MLA_NOPE_GROUP_Q_VECS), Int32(_MLA_NOPE_GROUP_Q_VECS),
-        q_base_addr, lane,
-    )
-    _stage_kv_u32_block_async(
-        kv_rows_u32, sTokenIdx,
-        Int32(_MLA_NOPE_U32_OFFSET),
-        Int32(_MLA_NOPE_GROUP_KV_VECS), Int32(_MLA_NOPE_GROUP_KV_VECS),
-        kv_base_addr, num_kv, lane,
-    )
-    cute.arch.cp_async_commit_group()
-
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-
-        # Compute current nope group
-        frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
-        _zero_score_frag(frag_tmp)
-        _literal_qk_mma_into_sfrag_mxfp8_raw(
-            frag_tmp,
-            q_base_addr,
-            kv_base_addr,
-            lane,
-            Int32(0),
-            Int32(1),
-            Int32(_MLA_NUM_MMA_KV),
-            Int32(_MLA_NOPE_QK_NUM_MMA_D),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-        )
-        _accumulate_scaled_score_frag(
-            score_frag,
-            frag_tmp,
-            sScale,
-            group_idx * Int32(_MLA_TOKEN_TILE),
-            lane,
-        )
-        cute.arch.sync_threads()
-
-        # Issue async staging for next nope group (overlapped with next iteration)
-        if cutlass.const_expr(block_offset < _MLA_SCALE_GROUPS - 1):
-            _stage_q_u32_block_async(
-                q_u32, q_idx, head_tile_start,
-                (group_idx + Int32(1)) * Int32(_MLA_NOPE_GROUP_Q_U32),
-                Int32(_MLA_NOPE_GROUP_Q_VECS), Int32(_MLA_NOPE_GROUP_Q_VECS),
-                q_base_addr, lane,
-            )
-            _stage_kv_u32_block_async(
-                kv_rows_u32, sTokenIdx,
-                Int32(_MLA_NOPE_U32_OFFSET) + (group_idx + Int32(1)) * Int32(_MLA_NOPE_GROUP_KV_U32),
-                Int32(_MLA_NOPE_GROUP_KV_VECS), Int32(_MLA_NOPE_GROUP_KV_VECS),
-                kv_base_addr, num_kv, lane,
-            )
-            cute.arch.cp_async_commit_group()
-
-    # Rope QK: co-stream Q rope + KV rope
-    _stage_q_u32_block_async(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        q_base_addr,
-        lane,
-    )
-    _stage_kv_u32_block_async(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_ROPE_U32_OFFSET),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        kv_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-    cute.arch.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
-    _zero_score_frag(frag_rope)
-    _literal_qk_mma_into_sfrag_bf16(
-        frag_rope,
-        q_base_addr,
-        kv_base_addr,
-        lane,
-        Int32(0),
-        Int32(1),
-        Int32(_MLA_NUM_MMA_KV),
-        Int32(_MLA_QK_NUM_MMA_D),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            score_frag[0, mma_kv, reg_id] = Float32(score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id])
-
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            row_slot = (reg_id % 4) // 2
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            token_local = (
-                mma_kv * 16
-                + lane_pair_base
-                + Int32(8) * (reg_id // 4)
-                + Int32(reg_id % 2)
-            )
-            token_idx = Int32(sTokenIdx[token_local])
-            valid = token_local < tile_tokens
-            if valid:
-                valid = valid and token_idx >= Int32(0)
-            if valid:
-                valid = valid and token_idx < num_kv
-            if valid:
-                valid = valid and head_idx < num_heads
-            score_frag[0, mma_kv, reg_id] = (
-                Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
-                if valid
-                else Float32(-Float32.inf)
-            )
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _compute_compressed_score_tile_scaled(
-    score_frag: cute.Tensor,
-    q_u32: cute.Tensor,
-    swa_u8: cute.Tensor,
-    swa_indices: cute.Tensor,
-    swa_lengths: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    indexed_indices: cute.Tensor,
-    indexed_lengths: cute.Tensor,
-    indexed_page_table: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    map_indexed_page_table: cutlass.Constexpr[bool],
-    indexed_page_table_width: Int32,
-):
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    num_heads = Int32(q_u32.shape[1])
-    tile_tokens = token_end - token_base
-
-    _stage_compressed_token_indices(
-        swa_indices,
-        swa_lengths,
-        indexed_indices,
-        indexed_lengths,
-        indexed_page_table,
-        sTokenIdx,
-        q_idx,
-        token_base,
-        token_end,
-        lane,
-        has_swa,
-        has_indexed,
-        map_indexed_page_table,
-        indexed_page_size,
-        indexed_page_table_width,
-    )
-    cute.arch.sync_threads()
-
-    _zero_score_frag(score_frag)
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    _stage_all_compressed_token_scales(
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        tile_tokens,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-
-    for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_q_u32_block(
-            q_u32,
-            q_idx,
-            head_tile_start,
-            group_idx * Int32(_COMPRESSED_MLA_GROUP_Q_U32),
-            Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-            Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-            q_base_addr,
-            lane,
-        )
-        _stage_compressed_kv_u32_block_active_only(
-            swa_u8,
-            indexed_u8,
-            sTokenIdx,
-            group_idx * Int32(_COMPRESSED_MLA_GROUP_SIZE),
-            Int32(_COMPRESSED_MLA_GROUP_KV_VECS),
-            Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-            kv_base_addr,
-            tile_tokens,
-            lane,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
-        cute.arch.sync_threads()
-
-        frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
-        _zero_score_frag(frag_tmp)
-        _literal_qk_mma_into_sfrag_mxfp8_raw(
-            frag_tmp,
-            q_base_addr,
-            kv_base_addr,
-            lane,
-            Int32(0),
-            Int32(1),
-            Int32(_MLA_NUM_MMA_KV),
-            Int32(_COMPRESSED_MLA_QK_NUM_MMA_D),
-            Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-            Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-        )
-        _accumulate_compressed_scaled_score_frag(
-            score_frag,
-            frag_tmp,
-            sScale,
-            group_idx,
-            lane,
-        )
-        cute.arch.sync_threads()
-
-    _stage_q_u32_block(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_COMPRESSED_MLA_NOPE_DIM // 2),
-        Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-        q_base_addr,
-        lane,
-    )
-    _stage_compressed_kv_u32_block_active_only(
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        Int32(_COMPRESSED_MLA_NOPE_DIM),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        kv_base_addr,
-        tile_tokens,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-    cute.arch.sync_threads()
-
-    frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
-    _zero_score_frag(frag_rope)
-    _literal_qk_mma_into_sfrag_bf16(
-        frag_rope,
-        q_base_addr,
-        kv_base_addr,
-        lane,
-        Int32(0),
-        Int32(1),
-        Int32(_MLA_NUM_MMA_KV),
-        Int32(_COMPRESSED_MLA_QK_NUM_MMA_D),
-        Int32(_COMPRESSED_MLA_GROUP_Q_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            score_frag[0, mma_kv, reg_id] = Float32(
-                score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id]
-            )
-
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            row_slot = (reg_id % 4) // 2
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            token_local = (
-                mma_kv * 16
-                + lane_pair_base
-                + Int32(8) * (reg_id // 4)
-                + Int32(reg_id % 2)
-            )
-            encoded = Int32(sTokenIdx[token_local])
-            valid = token_local < tile_tokens
-            if valid:
-                valid = valid and encoded != Int32(-1)
-            if valid:
-                valid = valid and head_idx < num_heads
-            score_frag[0, mma_kv, reg_id] = (
-                Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
-                if valid
-                else Float32(-Float32.inf)
-            )
-    cute.arch.sync_threads()
-
-
-
-
-@cute.jit
-def _pipeline_stage_q_async(
-    q_u32: cute.Tensor,
-    q_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    lane: Int32,
-):
-    """Stage Q into smem (async). Call AFTER QK compute frees q_stage."""
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_q_u32_block_async(
-            q_u32,
-            q_idx,
-            head_tile_start,
-            group_idx * Int32(_MLA_NOPE_GROUP_Q_U32),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
-            lane,
-        )
-    _stage_q_u32_block_async(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-
-
-
-
-
-
-@cute.jit
-def _accumulate_pv_groups_from_p_frag_staged(
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    p_frag: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    kv_base_addr: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    # Pipelined KV streaming: overlap stage of next group with compute of current
-    # Prologue: stage nope group 0
-    _stage_kv_u32_block_async(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_NOPE_U32_OFFSET),
-        Int32(_MLA_NOPE_GROUP_KV_VECS),
-        Int32(_MLA_NOPE_GROUP_KV_VECS),
-        kv_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-
-        scale_base = group_idx * Int32(_MLA_TOKEN_TILE)
-        tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
-        tile_pv_scale = (
-            Float32(0.0)
-            if tile_output_scale == Float32(0.0)
-            else cute.arch.rcp_approx(tile_output_scale)
-        )
-        # Compute PV from current buffer
-        if cutlass.const_expr(block_offset == 0):
-            _run_staged_pv_group_into_target(
-                o_frag0, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
-            )
-        elif cutlass.const_expr(block_offset == 1):
-            _run_staged_pv_group_into_target(
-                o_frag1, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
-            )
-        elif cutlass.const_expr(block_offset == 2):
-            _run_staged_pv_group_into_target(
-                o_frag2, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
-            )
-        else:
-            _run_staged_pv_group_into_target(
-                o_frag3, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
-            )
-        cute.arch.sync_threads()
-
-        # Issue async staging for next nope group
-        if cutlass.const_expr(block_offset < _MLA_SCALE_GROUPS - 1):
-            _stage_kv_u32_block_async(
-                kv_rows_u32,
-                sTokenIdx,
-                Int32(_MLA_NOPE_U32_OFFSET) + (group_idx + Int32(1)) * Int32(_MLA_NOPE_GROUP_KV_U32),
-                Int32(_MLA_NOPE_GROUP_KV_VECS),
-                Int32(_MLA_NOPE_GROUP_KV_VECS),
-                kv_base_addr,
-                num_kv,
-                lane,
-            )
-            cute.arch.cp_async_commit_group()
-
-
-@cute.jit
-def _accumulate_compressed_pv_groups_from_p_frag_staged(
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    p_frag: cute.Tensor,
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    kv_base_addr: Int32,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    for block_offset in cutlass.range_constexpr(_COMPRESSED_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_compressed_kv_u32_block(
-            swa_u8,
-            indexed_u8,
-            sTokenIdx,
-            group_idx * Int32(_COMPRESSED_MLA_GROUP_SIZE),
-            Int32(_COMPRESSED_MLA_GROUP_KV_VECS),
-            Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-            kv_base_addr,
-            tile_tokens,
-            lane,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
-        cute.arch.sync_threads()
-
-        scale_base = group_idx * Int32(_COMPRESSED_MLA_SCALE_STAGE_STRIDE)
-        if cutlass.const_expr(block_offset == 0):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag0, p_frag, kv_base_addr, sScale, scale_base, lane, 0)
-        elif cutlass.const_expr(block_offset == 1):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag0, p_frag, kv_base_addr, sScale, scale_base, lane, 4)
-        elif cutlass.const_expr(block_offset == 2):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag1, p_frag, kv_base_addr, sScale, scale_base, lane, 0)
-        elif cutlass.const_expr(block_offset == 3):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag1, p_frag, kv_base_addr, sScale, scale_base, lane, 4)
-        elif cutlass.const_expr(block_offset == 4):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag2, p_frag, kv_base_addr, sScale, scale_base, lane, 0)
-        elif cutlass.const_expr(block_offset == 5):
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag2, p_frag, kv_base_addr, sScale, scale_base, lane, 4)
-        else:
-            _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(o_frag3, p_frag, kv_base_addr, sScale, scale_base, lane, 0)
-        cute.arch.sync_threads()
-
-    _stage_compressed_kv_u32_block(
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        Int32(_COMPRESSED_MLA_NOPE_DIM),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        kv_base_addr,
-        tile_tokens,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-    cute.arch.sync_threads()
-    _literal_pv_mma_into_ofrag_bf16_64(o_frag3, p_frag, kv_base_addr, lane, 4)
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _accumulate_compressed_pv_fp8_group_into_frag(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    kv_base_addr: Int32,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-    scale_group: cutlass.Constexpr[int],
-    mma_d_offset: cutlass.Constexpr[int],
-):
-    _stage_compressed_kv_u32_block(
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        Int32(scale_group * _COMPRESSED_MLA_GROUP_SIZE),
-        Int32(_COMPRESSED_MLA_GROUP_KV_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_KV_STAGE_VECS),
-        kv_base_addr,
-        tile_tokens,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-    cute.arch.sync_threads()
-    _literal_pv_mma_into_ofrag_fp8_raw_scaled_64(
-        o_frag,
-        p_frag,
-        kv_base_addr,
-        sScale,
-        Int32(scale_group * _COMPRESSED_MLA_SCALE_STAGE_STRIDE),
-        lane,
-        mma_d_offset,
-    )
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _accumulate_compressed_pv_rope_group_into_frag(
-    o_frag: cute.Tensor,
-    p_frag: cute.Tensor,
-    swa_u8: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    kv_base_addr: Int32,
-    tile_tokens: Int32,
-    lane: Int32,
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-):
-    _stage_compressed_kv_u32_block(
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        Int32(_COMPRESSED_MLA_NOPE_DIM),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        Int32(_COMPRESSED_MLA_GROUP_KV_BF16_VECS),
-        kv_base_addr,
-        tile_tokens,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-    cute.arch.sync_threads()
-    _literal_pv_mma_into_ofrag_bf16_64(o_frag, p_frag, kv_base_addr, lane, 4)
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _store_output_groups(
-    out_tensor: cute.Tensor,
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    d_frag: cute.Tensor,
-    out_row_idx: Int32,
-    head_tile_start: Int32,
-    lane: Int32,
-):
-    _store_output_group(
-        out_tensor,
-        o_frag0,
-        d_frag,
-        out_row_idx,
-        head_tile_start,
-        Int32(0),
-        lane,
-    )
-    _store_output_group(
-        out_tensor,
-        o_frag1,
-        d_frag,
-        out_row_idx,
-        head_tile_start,
-        Int32(1),
-        lane,
-    )
-    _store_output_group(
-        out_tensor,
-        o_frag2,
-        d_frag,
-        out_row_idx,
-        head_tile_start,
-        Int32(2),
-        lane,
-    )
-    _store_output_group(
-        out_tensor,
-        o_frag3,
-        d_frag,
-        out_row_idx,
-        head_tile_start,
-        Int32(3),
-        lane,
-    )
-
-
-@cute.jit
-def _store_output_groups_with_sink(
-    out_tensor: cute.Tensor,
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    m_frag: cute.Tensor,
-    d_frag: cute.Tensor,
-    attn_sink: cute.Tensor,
-    out_row_idx: Int32,
-    head_tile_start: Int32,
-    lane: Int32,
-):
-    _store_output_group_with_sink(
-        out_tensor,
-        o_frag0,
-        m_frag,
-        d_frag,
-        attn_sink,
-        out_row_idx,
-        head_tile_start,
-        Int32(0),
-        lane,
-    )
-    _store_output_group_with_sink(
-        out_tensor,
-        o_frag1,
-        m_frag,
-        d_frag,
-        attn_sink,
-        out_row_idx,
-        head_tile_start,
-        Int32(1),
-        lane,
-    )
-    _store_output_group_with_sink(
-        out_tensor,
-        o_frag2,
-        m_frag,
-        d_frag,
-        attn_sink,
-        out_row_idx,
-        head_tile_start,
-        Int32(2),
-        lane,
-    )
-    _store_output_group_with_sink(
-        out_tensor,
-        o_frag3,
-        m_frag,
-        d_frag,
-        attn_sink,
-        out_row_idx,
-        head_tile_start,
-        Int32(3),
-        lane,
-    )
-
-
-@cute.jit
-def _store_output_groups_chunked(
-    out_tensor: cute.Tensor,
-    o_frag0: cute.Tensor,
-    o_frag1: cute.Tensor,
-    o_frag2: cute.Tensor,
-    o_frag3: cute.Tensor,
-    d_frag: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    head_tile_start: Int32,
-    lane: Int32,
-):
-    _store_output_group_chunked(
-        out_tensor,
-        o_frag0,
-        d_frag,
-        out_row_idx,
-        out_chunk_idx,
-        head_tile_start,
-        Int32(0),
-        lane,
-    )
-    _store_output_group_chunked(
-        out_tensor,
-        o_frag1,
-        d_frag,
-        out_row_idx,
-        out_chunk_idx,
-        head_tile_start,
-        Int32(1),
-        lane,
-    )
-    _store_output_group_chunked(
-        out_tensor,
-        o_frag2,
-        d_frag,
-        out_row_idx,
-        out_chunk_idx,
-        head_tile_start,
-        Int32(2),
-        lane,
-    )
-    _store_output_group_chunked(
-        out_tensor,
-        o_frag3,
-        d_frag,
-        out_row_idx,
-        out_chunk_idx,
-        head_tile_start,
-        Int32(3),
-        lane,
-    )
-
-
-@cute.jit
-def _run_single_tile_compressed_mla_tile(
-    q_u32: cute.Tensor,
-    swa_u8: cute.Tensor,
-    swa_indices: cute.Tensor,
-    swa_lengths: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    indexed_indices: cute.Tensor,
-    indexed_lengths: cute.Tensor,
-    indexed_page_table: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_start: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    out_tensor: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    lse_tensor: cute.Tensor | None,
-    attn_sink: cute.Tensor,
-    apply_attn_sink: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    map_indexed_page_table: cutlass.Constexpr[bool],
-    indexed_page_table_width: Int32,
-):
-    md_layout = cute.make_layout((1, 2), stride=(2, 1))
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    p_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 4), stride=(8, 4, 1))
-    o_layout = cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1))
-
-    m_frag = cute.make_rmem_tensor(md_layout, Float32)
-    d_frag = cute.make_rmem_tensor(md_layout, Float32)
-    for row_slot in cutlass.range_constexpr(2):
-        m_frag[0, row_slot] = Float32(-Float32.inf)
-        d_frag[0, row_slot] = Float32(0.0)
-
-    score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-    _compute_compressed_score_tile_scaled(
-        score_frag,
-        q_u32,
-        swa_u8,
-        swa_indices,
-        swa_lengths,
-        indexed_u8,
-        indexed_indices,
-        indexed_lengths,
-        indexed_page_table,
-        sTokenIdx,
-        sScale,
-        q_base_addr,
-        kv_base_addr,
-        q_idx,
-        head_tile_start,
-        token_start,
-        token_end,
-        sm_scale_log2,
-        lane,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        has_swa,
-        has_indexed,
-        map_indexed_page_table,
-        indexed_page_table_width,
-    )
-
-    p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-    num_heads = Int32(q_u32.shape[1])
-    has_second_head_slot = head_tile_start + Int32(8) < num_heads
-    if has_second_head_slot:
-        _update_softmax_and_p_b2(score_frag, m_frag, d_frag, p_frag)
-    else:
-        _update_softmax_and_p_b1(score_frag, m_frag, d_frag, p_frag)
-
-    o_frag = cute.make_rmem_tensor(o_layout, Float32)
-    if has_second_head_slot:
-        _zero_output_frag(o_frag)
-    else:
-        _zero_output_frag_b1(o_frag)
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        0,
-        0,
-    )
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
+    topk: int,
+    max_chunks: int,
+    forced_num_splits: int | None = None,
+    num_tokens: int = 1,
+    h_blocks: int = 1,
+    sm_count: int | None = None,
+    extra_topk: int = 0,
+) -> tuple[int, int, int]:
+    """Return ``(num_chunks, num_splits, chunks_per_split)``.
+
+    ``num_chunks = ceil(topk / BI) + ceil(extra_topk / BI)`` is the number of
+    BI=64 candidate windows spanning BOTH the main and the EXTRA cache sections
+    (DSV4 dual-cache; ``extra_topk=0`` reduces to the single-cache main count).
+    ``num_splits`` is chosen by replicating FlashInfer's decode launch tuning:
+    FlashInfer splits MAXIMALLY (one block per KV chunk) then wave-balances via a
+    chunks_per_block heuristic to an ACTIVE block count
+    ``num_splits_eff = ceil(num_chunks / cpb*)``. Our CTA owns a chunk-RANGE, so
+    OUR ``num_splits`` directly IS that active count -- we port the same
+    CEIL_WAVES_MAX=3 tail-gap search (see ``_wave_balanced_num_splits``).
+
+    Override precedence (highest first):
+      1. ``forced_num_splits`` (explicit caller arg -- multi-split numeric checks).
+      2. ``B12X_MLA_SM120_NUM_SPLITS`` env (>=1 pins; <=0/unset -> heuristic).
+      3. The FlashInfer-ported wave-balanced heuristic (needs ``sm_count``;
+         falls back to 1 if ``sm_count`` is unavailable).
+
+    ``num_splits`` is clamped to ``[1, num_chunks]`` and to ``max_chunks`` (the
+    workspace mid_out/mid_lse split capacity).
+    """
+    # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache): topk==0 means
+    # NO main chunks -- the main section is elided and the decode attends ONLY the
+    # extra chunks. Keep ceil(0/BI)==0 here (do NOT floor topk to 1, which would
+    # fabricate a phantom main chunk that the num_main_chunks==0 dispatch would
+    # then mis-route as an over-allocated extra chunk). The single-cache /
+    # no-extra empty decode is still protected by the num_chunks>=1 floor below.
+    topk = max(int(topk), 0)
+    extra_topk = max(int(extra_topk), 0)
+    # num_chunks spans main + extra sections (FlashInfer num_splits = ceil(topk/BI)
+    # + ceil(extra_topk/BI)); the wave-balance heuristic then picks the active
+    # block count over the COMBINED chunk count. Floored to >=1 so a fully-empty
+    # decode (topk==0 and extra_topk==0) still launches one (masked) chunk.
+    num_chunks = max(
         1,
-        4,
+        (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+        + ((extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW),
     )
-    if cutlass.const_expr(lse_tensor is None):
-        if cutlass.const_expr(apply_attn_sink):
-            _store_output_group_with_sink(
-                out_tensor,
-                o_frag,
-                m_frag,
-                d_frag,
-                attn_sink,
-                out_row_idx,
-                head_tile_start,
-                Int32(0),
-                lane,
+
+    if forced_num_splits is not None:
+        num_splits = max(1, int(forced_num_splits))
+    else:
+        env_override = _env_num_splits_override()
+        if env_override > 0:
+            num_splits = env_override
+        elif sm_count and sm_count > 0:
+            num_splits = _wave_balanced_num_splits(
+                num_chunks=num_chunks,
+                per_token_head=max(1, int(num_tokens)) * max(1, int(h_blocks)),
+                sm_count=int(sm_count),
             )
         else:
-            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(0), lane)
-    else:
-        _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(0), lane)
+            num_splits = 1
 
-    if has_second_head_slot:
-        _zero_output_frag(o_frag)
-    else:
-        _zero_output_frag_b1(o_frag)
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        2,
-        0,
-    )
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        3,
-        4,
-    )
-    if cutlass.const_expr(lse_tensor is None):
-        if cutlass.const_expr(apply_attn_sink):
-            _store_output_group_with_sink(
-                out_tensor,
-                o_frag,
-                m_frag,
-                d_frag,
-                attn_sink,
-                out_row_idx,
-                head_tile_start,
-                Int32(1),
-                lane,
-            )
-        else:
-            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(1), lane)
-    else:
-        _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(1), lane)
-
-    if has_second_head_slot:
-        _zero_output_frag(o_frag)
-    else:
-        _zero_output_frag_b1(o_frag)
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        4,
-        0,
-    )
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        5,
-        4,
-    )
-    if cutlass.const_expr(lse_tensor is None):
-        if cutlass.const_expr(apply_attn_sink):
-            _store_output_group_with_sink(
-                out_tensor,
-                o_frag,
-                m_frag,
-                d_frag,
-                attn_sink,
-                out_row_idx,
-                head_tile_start,
-                Int32(2),
-                lane,
-            )
-        else:
-            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(2), lane)
-    else:
-        _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(2), lane)
-
-    if has_second_head_slot:
-        _zero_output_frag(o_frag)
-    else:
-        _zero_output_frag_b1(o_frag)
-    _accumulate_compressed_pv_fp8_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        sScale,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-        6,
-        0,
-    )
-    _accumulate_compressed_pv_rope_group_into_frag(
-        o_frag,
-        p_frag,
-        swa_u8,
-        indexed_u8,
-        sTokenIdx,
-        kv_base_addr,
-        token_end - token_start,
-        lane,
-        has_swa,
-        has_indexed,
-        swa_page_size,
-        swa_page_nbytes,
-        indexed_page_size,
-        indexed_page_nbytes,
-    )
-    if cutlass.const_expr(lse_tensor is None):
-        if cutlass.const_expr(apply_attn_sink):
-            _store_output_group_with_sink(
-                out_tensor,
-                o_frag,
-                m_frag,
-                d_frag,
-                attn_sink,
-                out_row_idx,
-                head_tile_start,
-                Int32(3),
-                lane,
-            )
-        else:
-            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(3), lane)
-    else:
-        _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(3), lane)
-        _store_partial_lse_chunked(
-            lse_tensor,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            m_frag,
-            d_frag,
-            lane,
-        )
+    num_splits = min(num_splits, num_chunks, max(1, int(max_chunks)))
+    chunks_per_split = (num_chunks + num_splits - 1) // num_splits
+    return num_chunks, num_splits, chunks_per_split
 
 
-@cute.jit
-def _run_one_pass_sparse_mla_tile(
-    q_u32: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_start: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    out_tensor: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    lse_tensor: cute.Tensor | None,
-    identity_page_table: cutlass.Constexpr[bool],
-):
-    md_layout = cute.make_layout((1, 2), stride=(2, 1))
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    p_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 4), stride=(8, 4, 1))
-    o_layout = cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1))
+class UnifiedDecodeKernel:
+    """288-thread warp-specialized DSV4 decode with split-K partial writeback.
 
-    m_frag = cute.make_rmem_tensor(md_layout, Float32)
-    d_frag = cute.make_rmem_tensor(md_layout, Float32)
-    o_rescale_frag = cute.make_rmem_tensor(md_layout, Float32)
-    for row_slot in cutlass.range_constexpr(2):
-        m_frag[0, row_slot] = Float32(-Float32.inf)
-        d_frag[0, row_slot] = Float32(0.0)
-        o_rescale_frag[0, row_slot] = Float32(1.0)
+    Grid = (num_tokens, H_BLOCKS, num_splits). Each CTA owns one query token, one
+    HPB=16-head block, and one chunk-range slice (split). 8 math warps consume
+    the double-buffered KV gathered by the 9th IO warp (cp.async.bulk + mbarrier,
+    io.py); the math runs S0-S6b over the split's chunks then S7 writes this
+    split's NORMALIZED partial O + base-2 LSE into mid_out / mid_lse in the exact
+    split.py merge convention. The hot-op MMA PTX (14 block-scaled + 14 plain
+    e4m3 + 8 bf16) is identical to the single-CTA P6 kernel: the split slicing
+    only changes the chunk-loop BOUNDS and the epilogue DESTINATION.
+    """
 
-    o_frag0 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag1 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag2 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag3 = cute.make_rmem_tensor(o_layout, Float32)
-    num_heads = Int32(q_u32.shape[1])
-    has_second_head_slot = head_tile_start + Int32(8) < num_heads
-    if has_second_head_slot:
-        _zero_output_frag(o_frag0)
-        _zero_output_frag(o_frag1)
-        _zero_output_frag(o_frag2)
-        _zero_output_frag(o_frag3)
-    else:
-        _zero_output_frag_b1(o_frag0)
-        _zero_output_frag_b1(o_frag1)
-        _zero_output_frag_b1(o_frag2)
-        _zero_output_frag_b1(o_frag3)
-    if token_end - token_start <= Int32(_MLA_TOKEN_TILE):
-        # Single-tile path: already single-pass, unchanged
-        score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
-            _compute_score_tile_scaled(
-                score_frag,
-                q_u32,
-                kv_rows_u32,
-                kv_scales,
-                page_table_1,
-                sTokenIdx,
-                sScale,
-                q_base_addr,
-                kv_base_addr,
-                q_idx,
-                head_tile_start,
-                token_start,
-                token_end,
-                sm_scale_log2,
-                lane,
-                identity_page_table,
-            )
-        else:
-            _compute_score_tile_scaled_from_staged_nope(
-                score_frag,
-                q_u32,
-                kv_rows_u32,
-                kv_scales,
-                page_table_1,
-                sTokenIdx,
-                sScale,
-                q_base_addr,
-                kv_base_addr,
-                q_idx,
-                head_tile_start,
-                token_start,
-                token_end,
-                sm_scale_log2,
-                lane,
-                identity_page_table,
-            )
-        if has_second_head_slot:
-            _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
-        else:
-            _update_softmax_stats_b1(score_frag, m_frag, d_frag, o_rescale_frag)
-        p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-        if has_second_head_slot:
-            _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
-        else:
-            _fill_normalized_p_frag_from_scores_b1(p_frag, score_frag, m_frag, d_frag)
-        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
-            _accumulate_pv_groups_from_p_frag(
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-                p_frag,
-                kv_rows_u32,
-                kv_scales,
-                sTokenIdx,
-                sScale,
-                kv_base_addr,
-                lane,
-            )
-        else:
-            _accumulate_pv_groups_from_p_frag_staged(
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-                p_frag,
-                kv_rows_u32,
-                sTokenIdx,
-                sScale,
-                kv_base_addr,
-                Int32(kv_rows_u32.shape[0]),
-                lane,
-            )
-    else:
-        # Multi-tile: sequential per-group QK+PV (~10KB smem, ~9 CTAs/SM)
-        num_kv = Int32(kv_rows_u32.shape[0])
-
-        token_base = token_start
-
-        while token_base < token_end:
-            tile_end = cutlass.select_(
-                token_base + Int32(_MLA_TOKEN_TILE) < token_end,
-                token_base + Int32(_MLA_TOKEN_TILE),
-                token_end,
-            )
-
-            # QK: sequential per-group (no KV double-buffering)
-            score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-            if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
-                _compute_score_tile_scaled(
-                    score_frag,
-                    q_u32,
-                    kv_rows_u32,
-                    kv_scales,
-                    page_table_1,
-                    sTokenIdx,
-                    sScale,
-                    q_base_addr,
-                    kv_base_addr,
-                    q_idx,
-                    head_tile_start,
-                    token_base,
-                    tile_end,
-                    sm_scale_log2,
-                    lane,
-                    identity_page_table,
-                )
-            else:
-                _compute_score_tile_scaled_from_staged_nope(
-                    score_frag,
-                    q_u32,
-                    kv_rows_u32,
-                    kv_scales,
-                    page_table_1,
-                    sTokenIdx,
-                    sScale,
-                    q_base_addr,
-                    kv_base_addr,
-                    q_idx,
-                    head_tile_start,
-                    token_base,
-                    tile_end,
-                    sm_scale_log2,
-                    lane,
-                    identity_page_table,
-                )
-
-            # Fused softmax-stats + O-rescale + P-norm
-            p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-            if has_second_head_slot:
-                _update_softmax_rescale_and_p_b2(
-                    score_frag, m_frag, d_frag, p_frag,
-                    o_frag0, o_frag1, o_frag2, o_frag3,
-                )
-            else:
-                _update_softmax_rescale_and_p_b1(
-                    score_frag, m_frag, d_frag, p_frag,
-                    o_frag0, o_frag1, o_frag2, o_frag3,
-                )
-
-
-            # PV: sequential per-group (no KV double-buffering)
-            if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
-                _accumulate_pv_groups_from_p_frag(
-                    o_frag0,
-                    o_frag1,
-                    o_frag2,
-                    o_frag3,
-                    p_frag,
-                    kv_rows_u32,
-                    kv_scales,
-                    sTokenIdx,
-                    sScale,
-                    kv_base_addr,
-                    lane,
-                )
-            else:
-                _accumulate_pv_groups_from_p_frag_staged(
-                    o_frag0,
-                    o_frag1,
-                    o_frag2,
-                    o_frag3,
-                    p_frag,
-                    kv_rows_u32,
-                    sTokenIdx,
-                    sScale,
-                    kv_base_addr,
-                    num_kv,
-                    lane,
-                )
-
-            token_base = tile_end
-
-    if cutlass.const_expr(lse_tensor is None):
-        _store_output_groups(
-            out_tensor,
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            d_frag,
-            out_row_idx,
-            head_tile_start,
-            lane,
-            )
-    else:
-        _store_output_groups_chunked(
-            out_tensor,
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            d_frag,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            lane,
-        )
-        _store_partial_lse_chunked(
-            lse_tensor,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            m_frag,
-            d_frag,
-            lane,
-        )
-
-
-@cute.jit
-def _run_one_pass_compressed_mla_tile(
-    q_u32: cute.Tensor,
-    swa_u8: cute.Tensor,
-    swa_indices: cute.Tensor,
-    swa_lengths: cute.Tensor,
-    indexed_u8: cute.Tensor,
-    indexed_indices: cute.Tensor,
-    indexed_lengths: cute.Tensor,
-    indexed_page_table: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_start: Int32,
-    token_end: Int32,
-    sm_scale_log2: Float32,
-    lane: Int32,
-    out_tensor: cute.Tensor,
-    out_row_idx: Int32,
-    out_chunk_idx: Int32,
-    lse_tensor: cute.Tensor | None,
-    attn_sink: cute.Tensor,
-    apply_attn_sink: cutlass.Constexpr[bool],
-    swa_page_size: cutlass.Constexpr[int],
-    swa_page_nbytes: cutlass.Constexpr[int],
-    indexed_page_size: cutlass.Constexpr[int],
-    indexed_page_nbytes: cutlass.Constexpr[int],
-    has_swa: cutlass.Constexpr[bool],
-    has_indexed: cutlass.Constexpr[bool],
-    map_indexed_page_table: cutlass.Constexpr[bool],
-    indexed_page_table_width: Int32,
-):
-    md_layout = cute.make_layout((1, 2), stride=(2, 1))
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    p_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 4), stride=(8, 4, 1))
-    o_layout = cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1))
-
-    m_frag = cute.make_rmem_tensor(md_layout, Float32)
-    d_frag = cute.make_rmem_tensor(md_layout, Float32)
-    o_rescale_frag = cute.make_rmem_tensor(md_layout, Float32)
-    for row_slot in cutlass.range_constexpr(2):
-        m_frag[0, row_slot] = Float32(-Float32.inf)
-        d_frag[0, row_slot] = Float32(0.0)
-        o_rescale_frag[0, row_slot] = Float32(1.0)
-
-    o_frag0 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag1 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag2 = cute.make_rmem_tensor(o_layout, Float32)
-    o_frag3 = cute.make_rmem_tensor(o_layout, Float32)
-    num_heads = Int32(q_u32.shape[1])
-    has_second_head_slot = head_tile_start + Int32(8) < num_heads
-    if has_second_head_slot:
-        _zero_output_frag(o_frag0)
-        _zero_output_frag(o_frag1)
-        _zero_output_frag(o_frag2)
-        _zero_output_frag(o_frag3)
-    else:
-        _zero_output_frag_b1(o_frag0)
-        _zero_output_frag_b1(o_frag1)
-        _zero_output_frag_b1(o_frag2)
-        _zero_output_frag_b1(o_frag3)
-
-    token_base = token_start
-    while token_base < token_end:
-        tile_end = cutlass.select_(
-            token_base + Int32(_MLA_TOKEN_TILE) < token_end,
-            token_base + Int32(_MLA_TOKEN_TILE),
-            token_end,
-        )
-
-        score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-        _compute_compressed_score_tile_scaled(
-            score_frag,
-            q_u32,
-            swa_u8,
-            swa_indices,
-            swa_lengths,
-            indexed_u8,
-            indexed_indices,
-            indexed_lengths,
-            indexed_page_table,
-            sTokenIdx,
-            sScale,
-            q_base_addr,
-            kv_base_addr,
-            q_idx,
-            head_tile_start,
-            token_base,
-            tile_end,
-            sm_scale_log2,
-            lane,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-            has_swa,
-            has_indexed,
-            map_indexed_page_table,
-            indexed_page_table_width,
-        )
-
-        p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-        if has_second_head_slot:
-            _update_softmax_rescale_and_p_b2(
-                score_frag,
-                m_frag,
-                d_frag,
-                p_frag,
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-            )
-        else:
-            _update_softmax_rescale_and_p_b1(
-                score_frag,
-                m_frag,
-                d_frag,
-                p_frag,
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-            )
-
-        _accumulate_compressed_pv_groups_from_p_frag_staged(
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            p_frag,
-            swa_u8,
-            indexed_u8,
-            sTokenIdx,
-            sScale,
-            kv_base_addr,
-            tile_end - token_base,
-            lane,
-            has_swa,
-            has_indexed,
-            swa_page_size,
-            swa_page_nbytes,
-            indexed_page_size,
-            indexed_page_nbytes,
-        )
-        token_base = tile_end
-
-    if cutlass.const_expr(lse_tensor is None):
-        if cutlass.const_expr(apply_attn_sink):
-            _store_output_groups_with_sink(
-                out_tensor,
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-                m_frag,
-                d_frag,
-                attn_sink,
-                out_row_idx,
-                head_tile_start,
-                lane,
-            )
-        else:
-            _store_output_groups(
-                out_tensor,
-                o_frag0,
-                o_frag1,
-                o_frag2,
-                o_frag3,
-                d_frag,
-                out_row_idx,
-                head_tile_start,
-                lane,
-            )
-    else:
-        _store_output_groups_chunked(
-            out_tensor,
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            d_frag,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            lane,
-        )
-        _store_partial_lse_chunked(
-            lse_tensor,
-            out_row_idx,
-            out_chunk_idx,
-            head_tile_start,
-            m_frag,
-            d_frag,
-            lane,
-        )
-
-
-def get_sparse_mla_shared_storage_cls():
-    class SharedStorage:
-        pass
-
-    SharedStorage.__annotations__ = {
-        "q_group_stage": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_GROUP_STAGE_BYTES)],
-            128,
-        ],
-        "kv_stage_a": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
-            128,
-        ],
-        "token_idx": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Int32, _MLA_TOKEN_TILE],
-            16,
-        ],
-        "token_scale_a": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _MLA_SHARED_SCALE_STAGE_ELEMS],
-            16,
-        ],
-    }
-    return cute.struct(SharedStorage)
-
-
-class SparseMLAKernel:
-    """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
-
-    def __init__(self, head_tiles: int, identity_page_table: bool = False):
-        self.head_tiles = int(head_tiles)
-        self.identity_page_table = bool(identity_page_table)
+    def __init__(self, traits, layout, page_block_size, chunks_per_split,
+                 h_blocks, num_splits, num_heads, q_head_dim, topk, extra_topk,
+                 q_stride, swa_indices_stride0, extra_indices_stride0,
+                 mid_out_stride, mid_lse_stride,
+                 has_extra=False,
+                 pbs_extra=1, valid_hpb=None, head_block_offset=0,
+                 per_token_len=False):
+        self.traits = traits
+        self.layout = layout
+        self.page_block_size = int(page_block_size)
+        self.chunks_per_split = int(chunks_per_split)
+        self.h_blocks = int(h_blocks)
+        self.num_splits = int(num_splits)
+        self.num_heads = int(num_heads)
+        self.q_head_dim = int(q_head_dim)
+        self.topk = int(topk)
+        self.extra_topk = int(extra_topk)
+        self.q_stride_row = int(q_stride[0])
+        self.q_stride_head = int(q_stride[1])
+        self.q_stride_dim = int(q_stride[2])
+        self.swa_indices_stride_row = int(swa_indices_stride0)
+        self.extra_indices_stride_row = int(extra_indices_stride0)
+        self.mid_out_stride_row = int(mid_out_stride[0])
+        self.mid_out_stride_head = int(mid_out_stride[1])
+        self.mid_out_stride_split = int(mid_out_stride[2])
+        self.mid_out_stride_dim = int(mid_out_stride[3])
+        self.mid_lse_stride_row = int(mid_lse_stride[0])
+        self.mid_lse_stride_head = int(mid_lse_stride[1])
+        self.mid_lse_stride_split = int(mid_lse_stride[2])
+        # DSV4 dual-cache (P7c). When False the extra-section code is const_expr-
+        # elided -> no-extra DSV4 / GLM PTX byte-identical.
+        self.has_extra = bool(has_extra)
+        self.pbs_extra = int(pbs_extra)
+        # P10b multi-token per-token topk_length. When False the section_len /
+        # extra_section_len are uniform Int32 scalars (the byte-identical base /
+        # uniform-length path; the per-token length tensors never enter the device
+        # entry). When True a per-token int32 length tensor is read in-kernel at
+        # t=blockIdx.x and clamped to [0, topk] -> the per-CTA section bound. The
+        # launcher routes here ONLY for a genuinely-mixed-length multi-token batch
+        # (a uniform batch collapses to the scalar path -> PTX byte-identical).
+        self.per_token_len = bool(per_token_len)
+        # VALID_HPB (small-TP / non-multiple-of-16 head shards). Upstream
+        # VALID_HPB=min(NUM_HEADS,HPB) (decode_dsv4_kernel.cuh:152): the kernel
+        # computes a FULL HPB=16 tile with zero-Q padding then gates output/LSE
+        # writes to valid_hpb rows. ``valid_hpb`` is a const_expr (s0/s4/s7 gate on
+        # it). When valid_hpb == t.hpb (the FULL-block default) the s0/s4/s7 calls
+        # pass the IDENTICAL constexpr value as the pre-P10 kernel, so the
+        # full-block trace + PTX stay byte-identical. A REMAINDER block (heads not
+        # a multiple of 16) is launched as a SEPARATE 1-block grid with
+        # valid_hpb=remainder and head_block_offset shifting head_base to the
+        # tail head range.
+        self.valid_hpb = int(valid_hpb) if valid_hpb is not None else int(traits.hpb)
+        # head_block_offset shifts head_base = (head_block + offset) * hpb so a
+        # remainder-only 1-block grid writes the correct (tail) head range. When 0
+        # (the full-block / base path) the const_expr branch is elided -> the
+        # head_base computation is byte-identical to the pre-P10 kernel.
+        self.head_block_offset = int(head_block_offset)
+        self.math_threads = int(traits.math_threads)
+        self.block_threads = int(traits.block_threads)
 
     @cute.jit
     def __call__(
         self,
-        q_u32: cute.Tensor,
-        kv_rows_u32: cute.Tensor,
-        kv_scales: cute.Tensor,
-        page_table_1: cute.Tensor,
-        active_token_counts: cute.Tensor,
-        sm_scale: cute.Tensor,
-        output: cute.Tensor,
+        q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,    # (rows, topk) int32 (MAIN indices)
+        mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
+        mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        section_len: Int32,          # MAIN per-row valid topk length
+        stride_kv_block: Int64,      # MAIN per-block byte stride
+        num_tokens: Int32,
         stream: cuda.CUstream,
     ):
+        # SINGLE-CACHE entry: EXACTLY the v1 traced signature (8 data args +
+        # stream). The dispatcher selects this (func=kernel -> __call__) when
+        # has_extra=False so the no-extra DSV4 / GLM trace, mangled name, and the
+        # launched @cute.kernel (self.kernel, 8 params) stay byte-identical to the
+        # pre-P7c kernel: the extra-section args never enter the device entry.
         self.kernel(
-            q_u32,
-            kv_rows_u32,
-            kv_scales,
-            page_table_1,
-            active_token_counts,
-            sm_scale,
-            output,
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
         ).launch(
-            grid=(output.shape[0], self.head_tiles, 1),
-            block=[_MLA_WARP_THREADS, 1, 1],
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_extra(
+        self,
+        q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,    # (rows, topk) int32 (MAIN indices)
+        mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
+        mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        section_len: Int32,          # MAIN per-row valid topk length
+        stride_kv_block: Int64,      # MAIN per-block byte stride
+        extra_kv_cache_u8: cute.Tensor,  # flat u8 EXTRA cache (DSV4 dual-cache)
+        extra_indices: cute.Tensor,      # (rows, extra_topk) int32
+        extra_section_len: Int32,        # EXTRA per-row valid length
+        num_main_chunks: Int32,          # ceil(main_len/BI); chunks >= this read the EXTRA cache
+        stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        # DUAL-CACHE entry (DSV4 P7c): the dispatcher selects this (func=
+        # kernel.call_extra) only when has_extra=True, so its DISTINCT mangled name
+        # never collides with the byte-identical single-cache __call__. It launches
+        # the 13-param @cute.kernel (self.kernel_extra), which shares the body via
+        # _kernel_body(has_extra=True).
+        self.kernel_extra(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_section_len,
+            num_main_chunks, stride_extra_kv_block,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_pertok(
+        self,
+        q_all: cute.Tensor,          # (rows, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,    # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,    # (rows, topk) int32 (MAIN indices)
+        mid_out: cute.Tensor,        # (rows, heads, splits, D_V) bf16 partials
+        mid_lse: cute.Tensor,        # (rows, heads, splits) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        topk_length: cute.Tensor,    # (rows,) int32 per-token MAIN valid length
+        stride_kv_block: Int64,      # MAIN per-block byte stride
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        # SINGLE-CACHE PER-TOKEN entry (P10b multi-token mixed-length): a DISTINCT
+        # mangled name (the topk_length tensor replaces the section_len scalar) so
+        # it never collides with the byte-identical uniform-length __call__. Each
+        # CTA reads section_len = clamp(topk_length[blockIdx.x], 0, topk) -> the
+        # per-token section bound; over-allocated chunks for short tokens are fully
+        # masked (idx<0 + section bound) so their partials are -inf and the merge
+        # ignores them.
+        self.kernel_pertok(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, topk_length, stride_kv_block,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_extra_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        topk_length: cute.Tensor,        # (rows,) int32 per-token MAIN valid length
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,  # (rows,) int32 per-token EXTRA valid length
+        num_main_chunks: Int32,          # ceil(MAX main_len/BI); chunks >= this read EXTRA
+        stride_extra_kv_block: Int64,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        # DUAL-CACHE PER-TOKEN entry (P10b): both the MAIN and EXTRA section lengths
+        # are read per-token (topk_length / extra_topk_length at t=blockIdx.x). The
+        # main/extra chunk split (num_main_chunks) stays UNIFORM (workspace geometry
+        # over the MAX topk); per-token clamping zeroes the over-allocated chunks.
+        self.kernel_extra_pertok(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, topk_length, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_topk_length,
+            num_main_chunks, stride_extra_kv_block,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
     def kernel(
         self,
-        q_u32: cute.Tensor,
-        kv_rows_u32: cute.Tensor,
-        kv_scales: cute.Tensor,
-        page_table_1: cute.Tensor,
-        active_token_counts: cute.Tensor,
-        sm_scale: cute.Tensor,
-        output: cute.Tensor,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        section_len: Int32,
+        stride_kv_block: Int64,
     ):
+        t = self.traits
+        L = self.layout
+        tid = Int32(cute.arch.thread_idx()[0])
         lane = cute.arch.lane_idx()
-        q_idx, head_tile_idx, _ = cute.arch.block_idx()
-        q_idx = Int32(q_idx)
-        head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
-        token_end = _clamp_active_token_count(active_token_counts, q_idx, Int32(page_table_1.shape[1]))
+        warp_id = tid >> Int32(5)
 
-        smem = cutlass.utils.SmemAllocator()
-        SharedStorage = get_sparse_mla_shared_storage_cls()
-        storage = smem.allocate(SharedStorage)
-        sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale_a.get_tensor(
-            cute.make_layout((_MLA_SHARED_SCALE_STAGE_ELEMS,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+        token_idx, head_block, split_idx = cute.arch.block_idx()
+        token_idx = Int32(token_idx)
+        head_block = Int32(head_block)
+        split_idx = Int32(split_idx)
+        # REMAINDER-block grids shift head_base to the tail head range; the offset
+        # const_expr is elided (==0) for the full-block / base path -> byte-identical.
+        if cutlass.const_expr(self.head_block_offset != 0):
+            head_block = head_block + Int32(self.head_block_offset)
+        head_base = head_block * Int32(t.hpb)
 
-        _run_one_pass_sparse_mla_tile(
-            q_u32,
-            kv_rows_u32,
-            kv_scales,
-            page_table_1,
-            sTokenIdx,
-            sScale,
-            q_base_addr,
-            kv_base_addr,
-            q_idx,
-            head_tile_start,
-            Int32(0),
-            token_end,
-            Float32(sm_scale[Int32(0)] * attention_ops.LOG2_E),
-            lane,
-            output,
-            q_idx,
-            Int32(0),
-            None,
-            self.identity_page_table,
+        smem = cutlass_utils.SmemAllocator()
+        SharedStorage = get_unified_shared_storage_cls(t)
+        st = smem.allocate(SharedStorage)
+
+        q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
+        q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
+        kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
+        kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
+        reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+        reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
+        reduce_sum_addr = reduce_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+        w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
+        sm_p_full_addr = shared_ptr_to_u32(st.sm_p_full.data_ptr())
+
+        q_sc_view = st.q_sc.get_tensor(cute.make_layout(int(L.q_sc_bytes // 4)))
+        amax_view = st.reduce.get_tensor(cute.make_layout(int(L.reduce_bytes // 4)))
+        token_idx_view = st.token_idx.get_tensor(
+            cute.make_layout(int(L.token_idx_buf_bytes * L.token_idx_bufs // 4))
+        )
+        w_head_sc_view = st.w_head_sc.get_tensor(
+            cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
 
-@lru_cache(maxsize=16)
-def _build_sparse_mla_kernel_for_shape(
-    traits: SparseMLATraits,
-    head_tiles: int,
-    identity_page_table: bool,
-) -> SparseMLAKernel:
-    del traits
-    return SparseMLAKernel(head_tiles, identity_page_table)
+        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        is_io = warp_id >= Int32(self.math_threads // 32)
 
+        kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
+        kv_rope_buf = Int32(L.kv_rope_buf_bytes)
+        kv_sc_buf = Int32(L.kv_sc_buf_bytes)
+        tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
 
-def clear_sparse_mla_kernel_cache() -> None:
-    _build_sparse_mla_kernel_for_shape.cache_clear()
+        # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
+        mbar_base = st.mbar.data_ptr()
+        n_buf = int(L.kv_bufs)
 
+        if tid == Int32(0):
+            for s in cutlass.range_constexpr(n_buf):
+                cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
+                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
+        cute.arch.barrier()  # full-CTA (288) structural fence.
 
-def _view_last_dim_as_u32(tensor: torch.Tensor) -> torch.Tensor:
-    if not tensor.is_contiguous():
-        tensor = tensor.contiguous()
-    byte_width = tensor.shape[-1] * tensor.element_size()
-    if byte_width % 4 != 0:
-        raise ValueError(f"last dimension byte-width must be divisible by 4, got {byte_width}")
-    byte_view = tensor.view(torch.uint8).reshape(*tensor.shape[:-1], byte_width)
-    return byte_view.view(torch.uint32).reshape(*tensor.shape[:-1], byte_width // 4)
+        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
 
-
-def supports_sparse_mla_kernel(
-    *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    v_head_dim: int,
-) -> bool:
-    return (
-        select_sparse_mla_traits(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=page_table_1,
-            output_dtype=q_all.dtype,
-            v_head_dim=v_head_dim,
+        # swa_indices for THIS token row: a 1-D (topk,) slice.
+        topk_row = cute.make_tensor(
+            swa_indices.iterator
+            + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
+            cute.make_layout(self.topk),
         )
-        is not None
-    )
+        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        q_token = cute.make_tensor(
+            q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
+            cute.make_layout(
+                (self.num_heads, self.q_head_dim),
+                stride=(self.q_stride_head, self.q_stride_dim),
+            ),
+        )
+        warp_first_cand = warp_id * Int32(8)
 
+        # ════════════════════════════════════════════════════════════════════
+        # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
+        # ════════════════════════════════════════════════════════════════════
+        if is_io:
+            io_lane = lane
+            prod_phase = Int32(1)
+            prod_idx = Int32(0)
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                buf = Int32(lc) & Int32(1)
+                g_start = ci * Int32(_CAND_WINDOW)
+                g_end = g_start + Int32(_CAND_WINDOW)
+                if g_end > section_len:
+                    g_end = section_len
 
-def run_sparse_mla_kernel(
-    *,
-    q_all: torch.Tensor | None = None,
-    kv_cache: torch.Tensor | None = None,
-    page_table_1: torch.Tensor | None = None,
-    active_token_counts: torch.Tensor | None = None,
-    sm_scale: float | torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
-    workspace: object | None = None,
-    identity_page_table: bool | None = None,
-    binding: SparseMLAKernelBinding | None = None,
-) -> None:
-    if binding is not None:
-        extras = [
-            name
-            for name, value in (
-                ("q_all", q_all),
-                ("kv_cache", kv_cache),
-                ("page_table_1", page_table_1),
-                ("active_token_counts", active_token_counts),
-                ("sm_scale", sm_scale),
-                ("output", output),
-                ("workspace", workspace),
-                ("identity_page_table", identity_page_table),
+                cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
+
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+                io_issue_gather(
+                    kv_cache_u8, topk_row,
+                    kv_fp8_addr + buf * kv_fp8_buf,
+                    kv_rope_addr + buf * kv_rope_buf,
+                    kv_sc_addr + buf * kv_sc_buf,
+                    tok_buf_view,
+                    mbar_base + buf,  # full[buf]
+                    g_start, g_end,
+                    Int32(self.page_block_size), stride_kv_block, io_lane,
+                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                    scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
+                    scale_format=t.scale_format,
+                )
+                prod_idx += Int32(1)
+                if prod_idx == Int32(n_buf):
+                    prod_idx = Int32(0)
+                    prod_phase ^= Int32(1)
+
+        else:
+            # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
+            n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
+            s0_quantize_q_to_smem(
+                q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
+                head_base, Int32(self.valid_hpb), tid,
+                d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
+                quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
+                q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
             )
-            if value is not None
-        ]
-        if extras:
-            _raise_binding_extras("run_sparse_mla_kernel", extras)
-        q_all = binding.q_all
-        kv_cache = binding.kv_cache
-        page_table_1 = binding.page_table_1
-        active_token_counts = binding.active_token_counts
-        sm_scale = binding.sm_scale
-        output = binding.output
-        workspace = binding.scratch
-        identity_page_table = binding.identity_page_table
 
-    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")
-    kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_kernel", name="kv_cache")
-    page_table_1 = _require_bound_arg(
-        page_table_1,
-        api_name="run_sparse_mla_kernel",
-        name="page_table_1",
-    )
-    active_token_counts = _require_bound_arg(
-        active_token_counts,
-        api_name="run_sparse_mla_kernel",
-        name="active_token_counts",
-    )
-    sm_scale = _require_bound_arg(sm_scale, api_name="run_sparse_mla_kernel", name="sm_scale")
-    output = _require_bound_arg(output, api_name="run_sparse_mla_kernel", name="output")
-    identity_page_table = False if identity_page_table is None else bool(identity_page_table)
+            accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
+            accr_frag = cute.make_rmem_tensor(4, Float32)
+            gmax_frag = cute.make_rmem_tensor(2, Float32)
+            gsum_frag = cute.make_rmem_tensor(2, Float32)
+            for k in cutlass.range_constexpr(n_acc_tiles * 4):
+                accn_frag[k] = Float32(0.0)
+            for k in cutlass.range_constexpr(4):
+                accr_frag[k] = Float32(0.0)
+            gmax_frag[0] = Float32(-1e30); gmax_frag[1] = Float32(-1e30)
+            gsum_frag[0] = Float32(0.0); gsum_frag[1] = Float32(0.0)
 
-    traits = select_sparse_mla_traits(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=page_table_1,
-        output_dtype=output.dtype,
-        v_head_dim=output.shape[-1],
-    )
-    if traits is None:
-        raise ValueError("sparse MLA kernel only supports the exact CUDA GLM-5.1 contract")
-    if active_token_counts.dtype != torch.int32:
-        raise ValueError(
-            f"active_token_counts must have dtype torch.int32, got {active_token_counts.dtype}"
+            cons_phase = Int32(0)
+            cons_idx = Int32(0)
+
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                split_cand_start = ci * Int32(_CAND_WINDOW)
+                buf = Int32(lc) & Int32(1)
+
+                kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
+                kv_rope_b = kv_rope_addr + buf * kv_rope_buf
+                kv_sc_b = kv_sc_addr + buf * kv_sc_buf
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+
+                acc_nope = [
+                    [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                     accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                    for at in range(n_acc_tiles)
+                ]
+                acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+                global_max = [gmax_frag[0], gmax_frag[1]]
+                global_sum = [gsum_frag[0], gsum_frag[1]]
+
+                cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
+                # discarded the per-group e4m3 mantissa headroom and cost ~0.003
+                # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
+                # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
+                # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
+
+                qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                qk = s1_qk_nope_block_scaled(
+                    qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                    warp_first_cand, lane,
+                    num_scales=t.num_scales, quant_tile=t.quant_tile,
+                    q_nope_stride=t.q_nope_stride, kv_smem_stride=t.kv_smem_stride,
+                    scale_bytes_per_token=8, scale_format=t.scale_format,
+                )
+                qk = s2_qk_rope_bf16(
+                    qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
+                )
+
+                split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                if split_cand_end > section_len:
+                    split_cand_end = section_len
+                qk = s3_mask_and_scale(
+                    qk, tok_buf_view, warp_first_cand,
+                    split_cand_start, split_cand_end, section_len,
+                    sm_scale_log2, lane,
+                )
+
+                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                p, wr0, wr1 = s4_online_softmax(
+                    qk, p, acc_nope, acc_rope, global_max, global_sum,
+                    reduce_max_addr, reduce_sum_addr, False,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                    n_acc_tiles=n_acc_tiles,
+                )
+                w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
+
+                s5_fill_sm_p_full(
+                    w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
+                    bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                acc_nope = s6_xv_nope(
+                    w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view, w_fp8_addr,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb, bi=t.bi,
+                    kv_smem_stride=t.kv_smem_stride, w_fp8_stride=t.bi + 16, n_warps=8,
+                    scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
+                    scale_format=t.scale_format,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+
+                # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
+                if cutlass.const_expr(t.v_has_rope):
+                    acc_rope = s6b_xv_rope(
+                        acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
+                        bi=t.bi, d_rope=t.d_rope, n_warps=8,
+                    )
+
+                for at in cutlass.range_constexpr(n_acc_tiles):
+                    accn_frag[at * 4 + 0] = acc_nope[at][0]
+                    accn_frag[at * 4 + 1] = acc_nope[at][1]
+                    accn_frag[at * 4 + 2] = acc_nope[at][2]
+                    accn_frag[at * 4 + 3] = acc_nope[at][3]
+                accr_frag[0] = acc_rope[0]; accr_frag[1] = acc_rope[1]
+                accr_frag[2] = acc_rope[2]; accr_frag[3] = acc_rope[3]
+                gmax_frag[0] = global_max[0]; gmax_frag[1] = global_max[1]
+                gsum_frag[0] = global_sum[0]; gsum_frag[1] = global_sum[1]
+
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                if tid == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                cons_idx += Int32(1)
+                if cons_idx == Int32(n_buf):
+                    cons_idx = Int32(0)
+                    cons_phase ^= Int32(1)
+
+            # ── S7: write this split's NORMALIZED partial + base-2 LSE into
+            #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
+            fin_acc_nope = [
+                [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                 accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                for at in range(n_acc_tiles)
+            ]
+            fin_acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+            fin_gmax = [gmax_frag[0], gmax_frag[1]]
+            fin_gsum = [gsum_frag[0], gsum_frag[1]]
+
+            # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
+            # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
+            out_o = cute.make_tensor(
+                mid_out.iterator
+                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
+                cute.make_layout(
+                    (t.hpb, t.d_v),
+                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
+                ),
+            )
+            # mid_lse[token, head_base + h, split]: (HPB,) view.
+            out_lse = cute.make_tensor(
+                mid_lse.iterator
+                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
+            )
+            s7_epilogue(
+                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
+                warp_id, lane,
+                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
+                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
+                nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
+            )
+
+    @cute.kernel
+    def kernel_extra(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        section_len: Int32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_section_len: Int32,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+    ):
+        # DUAL-CACHE @cute.kernel: 13 device params; threads the real extra-section
+        # args into the shared body (has_extra=True).
+        self._kernel_body(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, section_len, stride_kv_block,
+            extra_kv_cache_u8, extra_indices, extra_section_len,
+            num_main_chunks, stride_extra_kv_block,
+            swa_indices, extra_indices,  # length tensors unused (per_token_len=False)
+            has_extra=True, per_token_len=False,
         )
-    if active_token_counts.device != q_all.device:
-        raise ValueError("active_token_counts must be on the same device as q_all")
-    if active_token_counts.ndim != 1 or active_token_counts.shape[0] != q_all.shape[0]:
-        raise ValueError(
-            "active_token_counts must be rank-1 with one entry per query row, "
-            f"got {tuple(active_token_counts.shape)} for q rows {q_all.shape[0]}"
+
+    @cute.kernel
+    def kernel_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+    ):
+        # SINGLE-CACHE PER-TOKEN @cute.kernel (P10b): the per-token MAIN length
+        # tensor replaces the scalar section_len; the body reads
+        # section_len = clamp(topk_length[blockIdx.x], 0, topk) per CTA. The scalar
+        # section_len/extra_section_len/num_main_chunks args are dummies (elided by
+        # per_token_len/has_extra const_expr); the extra tensor slots alias
+        # swa_indices (never read when has_extra=False).
+        self._kernel_body(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, Int32(0), stride_kv_block,
+            kv_cache_u8, swa_indices, Int32(0),
+            Int32(0), stride_kv_block,
+            topk_length, swa_indices,
+            has_extra=False, per_token_len=True,
         )
 
-    kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
-    q_u32 = _view_last_dim_as_u32(q_all)
-    if isinstance(sm_scale, torch.Tensor):
-        sm_scale_tensor = sm_scale
+    @cute.kernel
+    def kernel_extra_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+    ):
+        # DUAL-CACHE PER-TOKEN @cute.kernel (P10b): both MAIN and EXTRA section
+        # lengths are read per-token (topk_length / extra_topk_length at
+        # t=blockIdx.x). num_main_chunks (the uniform main/extra chunk split) stays
+        # a scalar; per-token clamping masks the over-allocated chunks.
+        self._kernel_body(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, Int32(0), stride_kv_block,
+            extra_kv_cache_u8, extra_indices, Int32(0),
+            num_main_chunks, stride_extra_kv_block,
+            topk_length, extra_topk_length,
+            has_extra=True, per_token_len=True,
+        )
+
+    @cute.jit
+    def _kernel_body(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        section_len: Int32,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_section_len: Int32,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+        topk_length: cute.Tensor,
+        extra_topk_length: cute.Tensor,
+        *,
+        has_extra: cutlass.Constexpr,
+        per_token_len: cutlass.Constexpr,
+    ):
+        t = self.traits
+        L = self.layout
+        tid = Int32(cute.arch.thread_idx()[0])
+        lane = cute.arch.lane_idx()
+        warp_id = tid >> Int32(5)
+
+        token_idx, head_block, split_idx = cute.arch.block_idx()
+        token_idx = Int32(token_idx)
+        head_block = Int32(head_block)
+        split_idx = Int32(split_idx)
+        # REMAINDER-block grids shift head_base to the tail head range; the offset
+        # const_expr is elided (==0) for the full-block / base path -> byte-identical.
+        if cutlass.const_expr(self.head_block_offset != 0):
+            head_block = head_block + Int32(self.head_block_offset)
+        head_base = head_block * Int32(t.hpb)
+
+        smem = cutlass_utils.SmemAllocator()
+        SharedStorage = get_unified_shared_storage_cls(t)
+        st = smem.allocate(SharedStorage)
+
+        q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
+        q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
+        kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
+        kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
+        reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+        reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
+        reduce_sum_addr = reduce_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+        w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
+        sm_p_full_addr = shared_ptr_to_u32(st.sm_p_full.data_ptr())
+
+        q_sc_view = st.q_sc.get_tensor(cute.make_layout(int(L.q_sc_bytes // 4)))
+        amax_view = st.reduce.get_tensor(cute.make_layout(int(L.reduce_bytes // 4)))
+        token_idx_view = st.token_idx.get_tensor(
+            cute.make_layout(int(L.token_idx_buf_bytes * L.token_idx_bufs // 4))
+        )
+        w_head_sc_view = st.w_head_sc.get_tensor(
+            cute.make_layout(int(L.w_head_sc_bytes // 4))
+        )
+
+        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        is_io = warp_id >= Int32(self.math_threads // 32)
+
+        kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
+        kv_rope_buf = Int32(L.kv_rope_buf_bytes)
+        kv_sc_buf = Int32(L.kv_sc_buf_bytes)
+        tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
+
+        # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
+        mbar_base = st.mbar.data_ptr()
+        n_buf = int(L.kv_bufs)
+
+        if tid == Int32(0):
+            for s in cutlass.range_constexpr(n_buf):
+                cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
+                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
+        cute.arch.barrier()  # full-CTA (288) structural fence.
+
+        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
+
+        # P10b PER-TOKEN section length: this CTA's section_len = clamp(
+        # topk_length[token_idx], 0, topk). Elided (per_token_len=False) on the
+        # uniform / byte-identical path -> the scalar section_len passed in is used
+        # unchanged. The main/extra chunk geometry (num_main_chunks, chunks_per_split)
+        # stays UNIFORM over the MAX topk; this per-token clamp is what masks the
+        # over-allocated chunks (their candidates fall past section_len -> S3 -inf).
+        if cutlass.const_expr(per_token_len):
+            topk_total = Int32(self.topk)
+            section_len = Int32(topk_length[token_idx])
+            if section_len < Int32(0):
+                section_len = Int32(0)
+            if section_len > topk_total:
+                section_len = topk_total
+            if cutlass.const_expr(has_extra):
+                extra_total = Int32(self.extra_topk)
+                extra_section_len = Int32(extra_topk_length[token_idx])
+                if extra_section_len < Int32(0):
+                    extra_section_len = Int32(0)
+                if extra_section_len > extra_total:
+                    extra_section_len = extra_total
+
+        # swa_indices for THIS token row: a 1-D (topk,) slice.
+        # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
+        # self.topk == 0 means there are NO main chunks (num_main_chunks
+        # ==0) and the main section is never gathered/scanned. cute.make_layout(0)
+        # is illegal (size must be strictly positive), so build a degenerate
+        # 1-extent main view instead -- it is never referenced because every
+        # ``ci < num_main_chunks(==0)`` branch is unreachable, so the kernel
+        # attends ONLY the extra section. This is a const_expr (concrete-shape
+        # trace), so the non-zero-main DSV4/GLM traces are byte-identical.
+        if cutlass.const_expr(self.topk == 0):
+            topk_row = cute.make_tensor(
+                swa_indices.iterator
+                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
+                cute.make_layout(1),
+            )
+        else:
+            topk_row = cute.make_tensor(
+                swa_indices.iterator
+                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
+                cute.make_layout(self.topk),
+            )
+        # extra_indices for THIS token row (DSV4 dual-cache). Built ONLY when
+        # has_extra (extra_indices is None otherwise); const_expr-elided so the
+        # no-extra trace never references the extra tensor.
+        if cutlass.const_expr(has_extra):
+            extra_row = cute.make_tensor(
+                extra_indices.iterator
+                + token_idx.to(Int64) * Int64(self.extra_indices_stride_row),
+                cute.make_layout(self.extra_topk),
+            )
+        else:
+            extra_row = topk_row
+        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        q_token = cute.make_tensor(
+            q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
+            cute.make_layout(
+                (self.num_heads, self.q_head_dim),
+                stride=(self.q_stride_head, self.q_stride_dim),
+            ),
+        )
+        warp_first_cand = warp_id * Int32(8)
+
+        # ════════════════════════════════════════════════════════════════════
+        # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
+        # ════════════════════════════════════════════════════════════════════
+        if is_io:
+            io_lane = lane
+            prod_phase = Int32(1)
+            prod_idx = Int32(0)
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                buf = Int32(lc) & Int32(1)
+
+                cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
+
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+                io_kw = dict(
+                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                    scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
+                    scale_format=t.scale_format,
+                )
+                # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
+                # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
+                # MAIN cache; chunks >= num_main_chunks gather from the EXTRA cache
+                # (different base ptr / page size / indices / stride). is_extra is
+                # uniform across the IO warp (derived from the chunk index) so the
+                # runtime branch is divergence-free. When has_extra=False this is
+                # const_expr-pinned to the main gather -> byte-identical PTX.
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_chunks:
+                        cis = ci - num_main_chunks
+                        g_start = cis * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > extra_section_len:
+                            g_end = extra_section_len
+                        io_issue_gather(
+                            extra_kv_cache_u8, extra_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.pbs_extra), stride_extra_kv_block, io_lane,
+                            **io_kw,
+                        )
+                    else:
+                        g_start = ci * Int32(_CAND_WINDOW)
+                        g_end = g_start + Int32(_CAND_WINDOW)
+                        if g_end > section_len:
+                            g_end = section_len
+                        io_issue_gather(
+                            kv_cache_u8, topk_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view,
+                            mbar_base + buf,
+                            g_start, g_end,
+                            Int32(self.page_block_size), stride_kv_block, io_lane,
+                            **io_kw,
+                        )
+                else:
+                    g_start = ci * Int32(_CAND_WINDOW)
+                    g_end = g_start + Int32(_CAND_WINDOW)
+                    if g_end > section_len:
+                        g_end = section_len
+                    io_issue_gather(
+                        kv_cache_u8, topk_row,
+                        kv_fp8_addr + buf * kv_fp8_buf,
+                        kv_rope_addr + buf * kv_rope_buf,
+                        kv_sc_addr + buf * kv_sc_buf,
+                        tok_buf_view,
+                        mbar_base + buf,
+                        g_start, g_end,
+                        Int32(self.page_block_size), stride_kv_block, io_lane,
+                        **io_kw,
+                    )
+                prod_idx += Int32(1)
+                if prod_idx == Int32(n_buf):
+                    prod_idx = Int32(0)
+                    prod_phase ^= Int32(1)
+
+        else:
+            # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
+            n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
+            s0_quantize_q_to_smem(
+                q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
+                head_base, Int32(self.valid_hpb), tid,
+                d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
+                quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
+                q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
+            )
+
+            accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
+            accr_frag = cute.make_rmem_tensor(4, Float32)
+            gmax_frag = cute.make_rmem_tensor(2, Float32)
+            gsum_frag = cute.make_rmem_tensor(2, Float32)
+            for k in cutlass.range_constexpr(n_acc_tiles * 4):
+                accn_frag[k] = Float32(0.0)
+            for k in cutlass.range_constexpr(4):
+                accr_frag[k] = Float32(0.0)
+            gmax_frag[0] = Float32(-1e30); gmax_frag[1] = Float32(-1e30)
+            gsum_frag[0] = Float32(0.0); gsum_frag[1] = Float32(0.0)
+
+            cons_phase = Int32(0)
+            cons_idx = Int32(0)
+
+            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+                ci = split_first_chunk + Int32(lc)
+                split_cand_start = ci * Int32(_CAND_WINDOW)
+                buf = Int32(lc) & Int32(1)
+
+                kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
+                kv_rope_b = kv_rope_addr + buf * kv_rope_buf
+                kv_sc_b = kv_sc_addr + buf * kv_sc_buf
+                tok_buf_view = cute.make_tensor(
+                    token_idx_view.iterator + buf * tok_buf_elems,
+                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                )
+
+                acc_nope = [
+                    [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                     accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                    for at in range(n_acc_tiles)
+                ]
+                acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+                global_max = [gmax_frag[0], gmax_frag[1]]
+                global_sum = [gsum_frag[0], gsum_frag[1]]
+
+                cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
+                # discarded the per-group e4m3 mantissa headroom and cost ~0.003
+                # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
+                # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
+                # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
+
+                qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                qk = s1_qk_nope_block_scaled(
+                    qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                    warp_first_cand, lane,
+                    num_scales=t.num_scales, quant_tile=t.quant_tile,
+                    q_nope_stride=t.q_nope_stride, kv_smem_stride=t.kv_smem_stride,
+                    scale_bytes_per_token=8, scale_format=t.scale_format,
+                )
+                qk = s2_qk_rope_bf16(
+                    qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
+                )
+
+                # Per-chunk section dispatch for the S3 mask: compare the
+                # candidate's offset WITHIN ITS SECTION against that section's
+                # length. has_extra=False uses the EXACT pre-P7c expressions
+                # (split_cand_start, section_len) verbatim -> byte-identical PTX.
+                # An extra chunk (ci >= num_main_chunks) re-bases the offset and
+                # swaps in the extra section length; the MATH (S0-S6b) above reads
+                # only the buffered smem, so it is section-agnostic.
+                if cutlass.const_expr(has_extra):
+                    sc_start = split_cand_start
+                    sec_len = section_len
+                    if ci >= num_main_chunks:
+                        sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                        sec_len = extra_section_len
+                    sc_end = sc_start + Int32(_CAND_WINDOW)
+                    if sc_end > sec_len:
+                        sc_end = sec_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        sc_start, sc_end, sec_len, sm_scale_log2, lane,
+                    )
+                else:
+                    split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                    if split_cand_end > section_len:
+                        split_cand_end = section_len
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        split_cand_start, split_cand_end, section_len,
+                        sm_scale_log2, lane,
+                    )
+
+                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                p, wr0, wr1 = s4_online_softmax(
+                    qk, p, acc_nope, acc_rope, global_max, global_sum,
+                    reduce_max_addr, reduce_sum_addr, False,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                    n_acc_tiles=n_acc_tiles,
+                )
+                w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
+
+                s5_fill_sm_p_full(
+                    w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
+                    bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+                acc_nope = s6_xv_nope(
+                    w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view, w_fp8_addr,
+                    warp_id, lane, tid,
+                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb, bi=t.bi,
+                    kv_smem_stride=t.kv_smem_stride, w_fp8_stride=t.bi + 16, n_warps=8,
+                    scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
+                    scale_format=t.scale_format,
+                    num_threads=self.math_threads, barrier_id=3,
+                )
+
+                # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
+                if cutlass.const_expr(t.v_has_rope):
+                    acc_rope = s6b_xv_rope(
+                        acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
+                        bi=t.bi, d_rope=t.d_rope, n_warps=8,
+                    )
+
+                for at in cutlass.range_constexpr(n_acc_tiles):
+                    accn_frag[at * 4 + 0] = acc_nope[at][0]
+                    accn_frag[at * 4 + 1] = acc_nope[at][1]
+                    accn_frag[at * 4 + 2] = acc_nope[at][2]
+                    accn_frag[at * 4 + 3] = acc_nope[at][3]
+                accr_frag[0] = acc_rope[0]; accr_frag[1] = acc_rope[1]
+                accr_frag[2] = acc_rope[2]; accr_frag[3] = acc_rope[3]
+                gmax_frag[0] = global_max[0]; gmax_frag[1] = global_max[1]
+                gsum_frag[0] = global_sum[0]; gsum_frag[1] = global_sum[1]
+
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                if tid == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                cons_idx += Int32(1)
+                if cons_idx == Int32(n_buf):
+                    cons_idx = Int32(0)
+                    cons_phase ^= Int32(1)
+
+            # ── S7: write this split's NORMALIZED partial + base-2 LSE into
+            #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
+            fin_acc_nope = [
+                [accn_frag[at * 4 + 0], accn_frag[at * 4 + 1],
+                 accn_frag[at * 4 + 2], accn_frag[at * 4 + 3]]
+                for at in range(n_acc_tiles)
+            ]
+            fin_acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
+            fin_gmax = [gmax_frag[0], gmax_frag[1]]
+            fin_gsum = [gsum_frag[0], gsum_frag[1]]
+
+            # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
+            # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
+            out_o = cute.make_tensor(
+                mid_out.iterator
+                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
+                cute.make_layout(
+                    (t.hpb, t.d_v),
+                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
+                ),
+            )
+            # mid_lse[token, head_base + h, split]: (HPB,) view.
+            out_lse = cute.make_tensor(
+                mid_lse.iterator
+                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
+            )
+            s7_epilogue(
+                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
+                warp_id, lane,
+                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
+                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
+                nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
+            )
+
+
+def _to_cute(x, dtype, align=16, dynamic_layout=False):
+    c = from_dlpack(x, assumed_align=align)
+    c.element_type = dtype
+    if dynamic_layout and x.ndim >= 1:
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if leading_dim is not None:
+            c = c.mark_layout_dynamic(leading_dim=leading_dim)
+    return c
+
+
+def _topk_bucket(topk: int) -> int:
+    """Coarse topk bucket for the compile key (chunks_per_split is the real
+    specialization driver; the bucket just keeps the key compact)."""
+    return 1 << (max(int(topk), 1) - 1).bit_length()
+
+
+def _sparse_mla_decode_grid_flat_launch(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    traits = make_unified_traits(
+        int(model_type),
+        int(compute_mode),
+        int(scale_format),
+    )
+    layout = make_smem_layout(traits)
+    q_head_dim = int(q_all.shape[-1])
+    rows = int(q_all.shape[0])
+    heads = int(q_all.shape[1])
+    hpb = int(traits.hpb)
+    d_v = int(traits.d_v)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    if per_token_len:
+        pertok_base = (
+            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(kv_flat, cutlass.Uint8, align=16),
+            _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
+            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
+            Float32(float(sm_scale) * LOG2_E),
+            _to_cute(swa_len_t, cutlass.Int32, align=4, dynamic_layout=True),
+            Int64(stride_kv_block),
+        )
+        if has_extra:
+            args = pertok_base + (
+                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4, dynamic_layout=True),
+                _to_cute(extra_len_t, cutlass.Int32, align=4, dynamic_layout=True),
+                Int32(num_main_chunks),
+                Int64(stride_extra_kv_block),
+                Int32(rows),
+                stream,
+            )
+        else:
+            args = pertok_base + (Int32(rows), stream)
     else:
-        sm_scale_tensor = torch.tensor([sm_scale], dtype=torch.float32, device=q_all.device)
-    if sm_scale_tensor.shape != (1,) or sm_scale_tensor.dtype != torch.float32:
-        raise ValueError("sm_scale tensor must have shape (1,) and dtype float32")
-    if sm_scale_tensor.device != q_all.device:
-        raise ValueError("sm_scale tensor must be on the same device as q_all")
+        base_args = (
+            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(kv_flat, cutlass.Uint8, align=16),
+            _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
+            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
+            Float32(float(sm_scale) * LOG2_E),
+            Int32(topk),
+            Int64(stride_kv_block),
+        )
+        if has_extra:
+            args = base_args + (
+                _to_cute(extra_kv_flat, cutlass.Uint8, align=16),
+                _to_cute(extra_indices_t, cutlass.Int32, align=4, dynamic_layout=True),
+                Int32(extra_topk),
+                Int32(num_main_chunks),
+                Int64(stride_extra_kv_block),
+                Int32(rows),
+                stream,
+            )
+        else:
+            args = base_args + (Int32(rows), stream)
 
-    head_tiles = (int(output.shape[1]) + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
-    kernel = _build_sparse_mla_kernel_for_shape(traits, head_tiles, bool(identity_page_table))
-    args = (
-        _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
-        _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
-        _to_kernel_tensor(kv_scales, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(active_token_counts, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(sm_scale_tensor, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
-        current_cuda_stream(),
-    )
-    # Use phantom tensors from workspace for stable cache keys when available.
-    _cq = getattr(workspace, "_contract_q", None)
-    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
-    _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_indexer_cache_seqlens", None)
-    _co = getattr(workspace, "_contract_output", None)
-    cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32, dynamic_dims=(0,)),
-        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
-        _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(
-            _cpt if _cpt is not None else page_table_1,
-            dynamic_dims=(0,),
-        ),
-        _tensor_meta_key(
-            _cnt if _cnt is not None else active_token_counts,
-            dynamic_dims=(0,),
-        ),
-        _tensor_meta_key(_co if _co is not None else output, dynamic_dims=(0,)),
+    kernel = UnifiedDecodeKernel(
         traits,
-        head_tiles,
-        str(output.dtype),
-        bool(identity_page_table),
+        layout,
+        int(swa_page_size),
+        int(chunks_per_split),
+        h_blocks=int(grid_h_blocks),
+        num_splits=int(num_splits),
+        num_heads=heads,
+        q_head_dim=q_head_dim,
+        topk=topk,
+        extra_topk=extra_topk,
+        q_stride=tuple(q_all.stride()),
+        swa_indices_stride0=int(swa_indices.stride(0)),
+        extra_indices_stride0=int(extra_indices_t.stride(0)),
+        mid_out_stride=tuple(mid_out.stride()),
+        mid_lse_stride=tuple(mid_lse.stride()),
+        has_extra=bool(has_extra),
+        pbs_extra=int(pbs_extra),
+        valid_hpb=int(valid_hpb),
+        head_block_offset=int(head_block_offset),
+        per_token_len=bool(per_token_len),
     )
-    compile_spec = KernelCompileSpec.from_key(
-        "attention.mla.sparse",
-        1,
-        cache_key,
-        labels=(
-            "q",
-            "kv_rows",
-            "kv_scales",
-            "page_table",
-            "active_token_counts",
-            "output",
-            "traits",
-            "head_tiles",
-            "output_dtype",
-            "identity_page_table",
+    spec_fields = [
+        key_field("model_type", traits.model_type),
+        key_field("compute_mode", traits.compute_mode),
+        key_field("scale_format", traits.scale_format),
+        key_field("num_heads", heads),
+        key_field("hpb", hpb),
+        key_field("valid_hpb", int(valid_hpb)),
+        key_field("head_block_offset", int(head_block_offset)),
+        key_field("grid_h_blocks", int(grid_h_blocks)),
+        key_field("num_splits", int(num_splits)),
+        key_field("chunks_per_split", int(chunks_per_split)),
+        key_field("page_block_size", int(swa_page_size)),
+        key_field("topk_bucket", _topk_bucket(topk)),
+        key_field("has_extra", int(has_extra)),
+        key_field("pbs_extra", int(pbs_extra)),
+        key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
+        key_field("per_token_len", int(per_token_len)),
+        tensor_key(
+            "q_all",
+            q_all,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(heads),
+                DimKey.exact(q_head_dim),
+            ),
         ),
+        tensor_key(
+            "swa_indices",
+            swa_indices,
+            dims=(DimKey.dynamic(), DimKey.bucket(topk)),
+        ),
+        tensor_key(
+            "mid_out",
+            mid_out,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(heads),
+                DimKey.bucket(num_splits),
+                DimKey.exact(d_v),
+            ),
+        ),
+        tensor_key(
+            "mid_lse",
+            mid_lse,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(heads),
+                DimKey.bucket(num_splits),
+            ),
+        ),
+    ]
+    if has_extra:
+        spec_fields.append(
+            tensor_key(
+                "extra_indices",
+                extra_indices_t,
+                dims=(DimKey.dynamic(), DimKey.bucket(max(extra_topk, 1))),
+            )
+        )
+    if per_token_len:
+        spec_fields.append(
+            tensor_key("topk_length", swa_len_t, dims=(DimKey.dynamic(),))
+        )
+        if has_extra:
+            spec_fields.append(
+                tensor_key(
+                    "extra_topk_length",
+                    extra_len_t,
+                    dims=(DimKey.dynamic(),),
+                )
+            )
+    compile_spec = KernelCompileSpec.from_fields(
+        "attention.mla.sm120.decode",
+        6,
+        *spec_fields,
     )
+    if per_token_len:
+        entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
+    else:
+        entry = kernel.call_extra if has_extra else kernel
     b12x_launch(
-        kernel,
+        entry,
         compile_spec=compile_spec,
         compile_args=args,
         runtime_args=args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::sparse_mla_sm120_decode_grid",
+    mutates_args=("mid_out", "mid_lse"),
+)
+def _sparse_mla_decode_grid_op(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    _sparse_mla_decode_grid_flat_launch(
+        q_all,
+        kv_flat,
+        swa_indices,
+        mid_out,
+        mid_lse,
+        swa_len_t,
+        extra_kv_flat,
+        extra_indices_t,
+        extra_len_t,
+        sm_scale,
+        model_type,
+        compute_mode,
+        scale_format,
+        swa_page_size,
+        topk,
+        extra_topk,
+        num_main_chunks,
+        num_splits,
+        chunks_per_split,
+        stride_kv_block,
+        pbs_extra,
+        stride_extra_kv_block,
+        grid_h_blocks,
+        valid_hpb,
+        head_block_offset,
+        has_extra,
+        per_token_len,
+    )
+
+
+@_sparse_mla_decode_grid_op.register_fake
+def _sparse_mla_decode_grid_fake(
+    q_all: torch.Tensor,
+    kv_flat: torch.Tensor,
+    swa_indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    swa_len_t: torch.Tensor,
+    extra_kv_flat: torch.Tensor,
+    extra_indices_t: torch.Tensor,
+    extra_len_t: torch.Tensor,
+    sm_scale: float,
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    swa_page_size: int,
+    topk: int,
+    extra_topk: int,
+    num_main_chunks: int,
+    num_splits: int,
+    chunks_per_split: int,
+    stride_kv_block: int,
+    pbs_extra: int,
+    stride_extra_kv_block: int,
+    grid_h_blocks: int,
+    valid_hpb: int,
+    head_block_offset: int,
+    has_extra: bool,
+    per_token_len: bool,
+) -> None:
+    return None
+
+
+def run_unified_decode(
+    *,
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    workspace,
+    sm_scale: float,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None = None,
+    indexed_indices: torch.Tensor | None = None,
+    indexed_topk_lengths: torch.Tensor | None = None,
+    indexed_page_size: int | None = None,
+    indexed_page_table: torch.Tensor | None = None,
+    attn_sink: torch.Tensor | None = None,
+    return_lse: bool = False,
+    lse_scale: str = "base2",
+    forced_num_splits: int | None = None,
+):
+    """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
+
+    Routes DSV4 (q_head_dim==512, UE8M0 footer) AND GLM_NSA (q_head_dim==576,
+    ARBITRARY_FP32 inline scales) to the SAME warp-specialized kernel via the
+    cute.constexpr traits branches (model_type/scale_format/v_has_rope). The
+    dispatch gate guarantees SM120; this entrypoint rejects unsupported features
+    so an accidental route never silently mis-computes.
+
+    DSV4 DUAL-CACHE (P7c): when ``indexed_k_cache`` / ``indexed_indices`` /
+    ``indexed_topk_lengths`` are supplied (the "extra"-tokens second KV pool), the
+    decode attends over the UNION of the MAIN paged topk cache and the EXTRA cache
+    in ONE online softmax. The chunk loop processes ``num_main_chunks =
+    ceil(topk/BI)`` main chunks (gathering from the main cache) then
+    ``num_extra_chunks = ceil(extra_topk/BI)`` extra chunks (gathering from
+    ``indexed_k_cache`` with ``indexed_page_size`` / its own per-block stride);
+    ``num_splits`` spans both. The extra cache is DSV4-only (GLM has no extra
+    section). With no extra cache the kernel is compiled with ``has_extra=False``
+    so the extra-section code is const_expr-elided (PTX byte-identical).
+    """
+    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
+
+    has_extra = (
+        indexed_k_cache is not None
+        or indexed_indices is not None
+        or indexed_topk_lengths is not None
+    )
+    # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream is
+    # raw-slot-id only; no page-table indirection). RAISE, not fallback. Checked
+    # BEFORE the has_extra branch so a mapped page table passed WITHOUT the extra
+    # trio is still a hard error (never silently ignored / silently routed).
+    if indexed_page_table is not None:
+        raise ValueError(
+            "SM120 sparse MLA decode: indexed_page_table (mapped extra pages) is "
+            "unsupported on SM120 sparse-MLA; upstream addresses the extra cache "
+            "by raw slot id only"
+        )
+    if has_extra:
+        # Partial dual-cache trio is a HARD ERROR (upstream ICHECKs extra_indices
+        # requires extra_kv_cache; sparse_mla_sm120.cu:171-174). NOT a fallback.
+        if (
+            indexed_k_cache is None
+            or indexed_indices is None
+            or indexed_page_size is None
+        ):
+            raise ValueError(
+                "SM120 sparse MLA decode dual-cache requires indexed_k_cache, "
+                "indexed_indices, and indexed_page_size together (partial extra "
+                "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
+            )
+        if int(q_all.shape[-1]) != _DSV4_HEAD_DIM:
+            raise ValueError(
+                "SM120 sparse MLA decode dual-cache (extra tokens) is DSV4-only "
+                "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
+            )
+
+    q_head_dim = int(q_all.shape[-1])
+    if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
+        raise NotImplementedError(
+            f"SM120 sparse MLA decode supports q_head_dim 512 (DSV4) or 576 (GLM); "
+            f"got {q_head_dim}"
+        )
+
+    rows, heads, _ = q_all.shape
+    hpb = 16
+    if heads <= 0:
+        raise ValueError(f"SM120 sparse MLA decode requires heads > 0, got {heads}")
+
+    # attn_sink [num_heads] f32: upstream applies it in the DECODE MERGE
+    # (sparse_mla_sm120_decode_dsv4.cu:128-129). Validate shape/dtype/device; the
+    # fold itself is wired into the split.py sink-merge below (no kernel change).
+    if attn_sink is not None:
+        attn_sink = attn_sink.detach()
+        if attn_sink.shape != (heads,):
+            raise ValueError(
+                f"SM120 sparse MLA decode attn_sink must have shape [{heads}], "
+                f"got {tuple(attn_sink.shape)}"
+            )
+        if attn_sink.dtype != torch.float32:
+            raise TypeError(
+                f"SM120 sparse MLA decode attn_sink must be float32, got {attn_sink.dtype}"
+            )
+        if attn_sink.device != q_all.device:
+            raise ValueError(
+                "SM120 sparse MLA decode attn_sink must be on the same device as q_all"
+            )
+        if not attn_sink.is_contiguous():
+            raise ValueError("SM120 sparse MLA decode attn_sink must be contiguous")
+    if lse_scale not in ("base2", "natural"):
+        raise ValueError(
+            f"SM120 sparse MLA decode lse_scale must be 'base2' or 'natural', got {lse_scale!r}"
+        )
+    # VALID_HPB<16 / non-multiple-of-16 heads (small-TP shards): upstream
+    # VALID_HPB=min(NUM_HEADS,HPB) (decode_dsv4_kernel.cuh:152) computes a full
+    # HPB=16 tile with zero-Q padding and gates writes to valid_hpb rows. We
+    # realise this with up to TWO grid launches: ``h_blocks_full`` full blocks
+    # (valid_hpb=16) plus one REMAINDER block (valid_hpb=heads%16) when heads is
+    # not a multiple of 16. heads in {8} -> 0 full blocks + 1 remainder block of
+    # valid_hpb=8. The base case (heads multiple of 16, e.g. 128) is a single
+    # full-block grid -> byte-identical to the pre-P10 kernel.
+    h_blocks_full = heads // hpb
+    rem_heads = heads % hpb
+    h_blocks = h_blocks_full + (1 if rem_heads else 0)
+
+    model_type, compute_mode, scale_format = infer_model_type(q_head_dim, swa_k_cache.dtype)
+    traits = make_unified_traits(model_type, compute_mode, scale_format)
+    d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
+
+    topk = int(swa_indices.shape[1])
+    extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
+    num_main_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+    max_chunks = int(workspace.max_chunks_per_row)
+
+    # ── P10b PER-TOKEN topk_length threading ──────────────────────────────────
+    # Decide whether to route to the per-token kernel (section_len read per CTA
+    # from a (rows,) int32 length tensor) or the byte-identical UNIFORM scalar
+    # path. The scalar path is taken when every token's length equals the full
+    # topk (the common decode contract: swa_topk_lengths[t] == topk for all t, OR
+    # the caller -1-pads indices past the length so the uniform full-topk section
+    # bound + the S3 idx<0 mask already realise the per-token length). For a
+    # GENUINELY-mixed-length batch (some topk_length[t] < topk) the per-token
+    # kernel reads each token's clamped length, so over-allocated chunks for short
+    # tokens are fully masked (-> mid_lse=-inf -> merge ignores). A batch is uniform
+    # ONLY when EVERY row's length >= the full section width (so the scalar bound
+    # already equals each clamped length); a single SHORT row (lt[0] < cap) is NOT
+    # uniform and must take the per-token clamp path.
+    def _length_tensor(lengths, name, cap):
+        if lengths is None:
+            return None, True
+        if not isinstance(lengths, torch.Tensor):
+            raise TypeError(f"SM120 sparse MLA decode {name} must be a torch.Tensor")
+        if lengths.shape != (rows,):
+            raise ValueError(
+                f"SM120 sparse MLA decode {name} must have shape [{rows}], "
+                f"got {tuple(lengths.shape)}"
+            )
+        lt = lengths.to(device=q_all.device, dtype=torch.int32).contiguous()
+        # CUDA serving must not read length values back to the host to choose a
+        # kernel. The per-token path reads each token's CLAMPED length in-kernel,
+        # so it is correct for uniform full-width rows and genuinely-short rows;
+        # it only skips the scalar fast path. NOTE: rows==1 is NOT automatically
+        # uniform here -- a single row whose length is SHORTER than the section
+        # width (lt[0] < cap) must still be clamped, so it is per-token, not
+        # scalar.
+        if q_all.is_cuda:
+            return lt, False
+        # Uniform iff every token's CLAMPED length is the full section width: then
+        # the scalar section bound (Int32(cap)) already equals every token's length
+        # -> byte-identical scalar path. A length >= cap clamps to cap in-kernel, so
+        # >= (not ==) is the correct full-section test (seqlen can exceed topk).
+        is_uniform = bool(torch.all(lt >= int(cap)).item())
+        return lt, is_uniform
+
+    swa_len_t, main_uniform = _length_tensor(swa_topk_lengths, "swa_topk_lengths", topk)
+    if has_extra:
+        extra_len_t, extra_uniform = _length_tensor(
+            indexed_topk_lengths, "indexed_topk_lengths", extra_topk
+        )
+    else:
+        extra_len_t, extra_uniform = None, True
+    # Per-token kernel only when there IS a length tensor that is not uniform.
+    per_token_len = (swa_len_t is not None and not main_uniform) or (
+        has_extra and extra_len_t is not None and not extra_uniform
+    )
+    if per_token_len:
+        # Both length tensors must exist for the per-token entries (the kernel reads
+        # topk_length[t] / extra_topk_length[t]). Synthesize a full-length tensor
+        # for whichever section is uniform / unset so the read collapses to topk.
+        if swa_len_t is None:
+            swa_len_t = torch.full((rows,), topk, dtype=torch.int32, device=q_all.device)
+        if has_extra and extra_len_t is None:
+            extra_len_t = torch.full(
+                (rows,), extra_topk, dtype=torch.int32, device=q_all.device
+            )
+    # SM count read at RUNTIME (RTX PRO 6000 Blackwell sm_120 et al.) -- feeds the
+    # FlashInfer-ported wave-balance tail-gap search. None if no CUDA device.
+    sm_count = None
+    if q_all.is_cuda:
+        sm_count = int(
+            torch.cuda.get_device_properties(q_all.device).multi_processor_count
+        )
+    num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
+        topk=topk,
+        max_chunks=max_chunks,
+        forced_num_splits=forced_num_splits,
+        num_tokens=rows,
+        h_blocks=h_blocks,
+        sm_count=sm_count,
+        extra_topk=extra_topk,
+    )
+    # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
+    # LAST_DECODE_PLAN["num_splits"]). Informational only.
+    LAST_DECODE_PLAN.clear()
+    LAST_DECODE_PLAN.update(
+        model_type=str(model_type),
+        topk=int(topk),
+        extra_topk=int(extra_topk),
+        has_extra=bool(has_extra),
+        num_main_chunks=int(num_main_chunks),
+        num_chunks=int(num_chunks),
+        num_splits=int(num_splits),
+        chunks_per_split=int(chunks_per_split),
+        num_tokens=int(rows),
+        h_blocks=int(h_blocks),
+        sm_count=(int(sm_count) if sm_count else None),
+        per_token_len=bool(per_token_len),
+    )
+    # Workspace mid_out/mid_lse must hold num_splits partials per (token, head).
+    if num_splits > max_chunks:
+        raise ValueError(
+            f"SM120 sparse MLA decode num_splits {num_splits} exceeds workspace "
+            f"max_chunks_per_row {max_chunks}"
+        )
+
+    if workspace.tmp_output is None or workspace.tmp_lse is None:
+        raise RuntimeError("SM120 sparse MLA decode workspace is missing mid_out/mid_lse")
+
+    # mid_out / mid_lse views over the workspace split buffers (the merge's
+    # exact tmp_output[rows,heads,chunks,dim] / tmp_lse[rows,heads,chunks]). The
+    # partial O dim is d_v (512) for both models.
+    mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
+    mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
+    has_empty_split_slots = (num_splits - 1) * chunks_per_split >= num_chunks
+    if has_empty_split_slots:
+        # Seed empty-split LSE = -inf so the merge skips splits with no chunks
+        # (and so partially-written rows are well-defined). The kernel overwrites
+        # every (token, head, split) it actually runs.
+        mid_lse.fill_(float("-inf"))
+
+    if model_type == ModelType.GLM_NSA:
+        # GLM cache: per-token 656B contiguous record; one paged "block" holds
+        # page_block_size tokens, so the per-block byte stride is pbs*656.
+        stride_kv_block = int(swa_page_size) * _GLM_KV_GMEM_STRIDE
+    else:
+        stride_kv_block = int(compressed_mla_page_nbytes(int(swa_page_size)))
+
+    # ── EXTRA (indexed) cache views. When there is no extra cache they alias the
+    #    main cache / main indices and the kernel's has_extra=False const_expr
+    #    elides the extra-section reads -> PTX byte-identical. ──
+    if has_extra:
+        pbs_extra = int(indexed_page_size)
+        # The extra cache uses the IDENTICAL DSV4 compressed packed byte layout, so
+        # its per-block stride is compressed_mla_page_nbytes(pbs_extra) (same as
+        # the main cache derives from swa_page_size). DSV4-only here.
+        stride_extra_kv_block = int(compressed_mla_page_nbytes(pbs_extra))
+        extra_kv_flat = indexed_k_cache.reshape(-1)
+        extra_indices_t = indexed_indices.contiguous()
+    else:
+        pbs_extra = 1
+        stride_extra_kv_block = 0
+        extra_kv_flat = swa_k_cache.reshape(-1)  # alias (never read when has_extra=False)
+        extra_indices_t = swa_indices            # alias (never read)
+
+    output = workspace.output_buffer[:rows, :heads, :d_v]
+
+    kv_flat = swa_k_cache.reshape(-1)
+    swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices
+    extra_len_for_op = extra_len_t if extra_len_t is not None else swa_indices
+
+    def _launch_grid(grid_h_blocks: int, valid_hpb: int, head_block_offset: int):
+        torch.ops.b12x.sparse_mla_sm120_decode_grid(
+            q_all,
+            kv_flat,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            swa_len_for_op,
+            extra_kv_flat,
+            extra_indices_t,
+            extra_len_for_op,
+            float(sm_scale),
+            int(model_type),
+            int(compute_mode),
+            int(scale_format),
+            int(swa_page_size),
+            int(topk),
+            int(extra_topk),
+            int(num_main_chunks),
+            int(num_splits),
+            int(chunks_per_split),
+            int(stride_kv_block),
+            int(pbs_extra),
+            int(stride_extra_kv_block),
+            int(grid_h_blocks),
+            int(valid_hpb),
+            int(head_block_offset),
+            bool(has_extra),
+            bool(per_token_len),
+        )
+
+    if h_blocks_full > 0:
+        # FULL HPB=16 head-blocks (the base path when heads is a multiple of 16).
+        _launch_grid(h_blocks_full, hpb, 0)
+    if rem_heads:
+        # REMAINDER tail head-block: a 1-block grid with valid_hpb=rem_heads at
+        # head_block offset h_blocks_full (so head_base = h_blocks_full*16).
+        _launch_grid(1, rem_heads, h_blocks_full)
+
+    # ── REUSED base-2 merge over the split axis -> final O. num_splits=1 is the
+    #    trivial 1-split merge (partial == final O). ──
+    from .merge import (
+        build_sparse_mla_split_decode_merge_binding,
+        run_sparse_mla_split_decode_merge,
+    )
+
+    if int(workspace.num_chunks_value or -1) != num_splits:
+        workspace.set_split_chunk_config(kv_chunk_size=_CAND_WINDOW, num_chunks=num_splits)
+
+    # When attn_sink is supplied, the merge SELECTS the sink-folding merge kernel
+    # (merge.py SparseMLASplitDecodeSinkMergeKernel) which applies the FlashMLA V4
+    # fold output *= sigmoid(lse_e - sink) directly into O (exactly upstream's
+    # sink-in-merge design, sparse_mla_sm120_decode_dsv4.cu:128-129). With no sink
+    # it is the plain base-2 merge -> PTX/numerics byte-identical to the base path.
+    merge_binding = build_sparse_mla_split_decode_merge_binding(
+        tmp_output=mid_out,
+        tmp_lse=mid_lse,
+        num_chunks_ptr=workspace.num_chunks_ptr,
+        output=output,
+        attn_sink=attn_sink,
+        scratch=workspace,
+    )
+    run_sparse_mla_split_decode_merge(binding=merge_binding)
+    if not return_lse:
+        return output
+
+    # return_lse: reconstruct the FINAL LSE from the per-split base-2 mid_lse
+    # (logsumexp over the split axis, base2->natural). mid_lse aliases
+    # workspace.tmp_lse[:rows,:heads,:num_splits], so reuse the shared helper.
+    from b12x.attention.mla.api import _final_lse_from_split_workspace
+
+    lse_natural = _final_lse_from_split_workspace(
+        workspace=workspace,
+        q_rows=rows,
+        num_heads=heads,
+        launch_num_chunks=num_splits,
+        scale="natural",
+    )
+    if attn_sink is not None:
+        # Fold the per-head sink into the LSE in the natural-log domain (the merge
+        # already folded it into O): lse' = log(exp(lse) + exp(sink)).
+        sink = attn_sink.float().view(1, heads)
+        lse_natural = torch.logaddexp(lse_natural.float(), sink)
+    if lse_scale == "base2":
+        return output, (lse_natural / _LN2)
+    return output, lse_natural
+
+
+def run_unified_prefill(*args, **kwargs):
+    """Active SM120 sparse-MLA DSV4 prefill (P8).
+
+    Thin re-export of ``prefill.run_unified_prefill`` (the correctness-first
+    single-pass DSV4 prefill that REUSES the proven 288-thread / 1-IO-warp decode
+    pipeline with a FINAL_BF16 epilogue). Imported lazily so launch.py has no hard
+    dependency on the prefill module's CuTe symbols at import time."""
+    from .prefill import run_unified_prefill as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def run_unified_merge(*args, **kwargs):
+    """Active SM120 sparse-MLA partial merge.
+
+    The active decode reuses merge.py's base-2 SparseMLASplitDecodeMergeKernel
+    directly (see run_unified_decode), so a separate merge entrypoint is not
+    needed; kept as a STUB for API symmetry."""
+    raise NotImplementedError(
+        "SM120 sparse MLA run_unified_merge: the decode reuses merge.py's merge "
+        "(run_sparse_mla_split_decode_merge) directly"
     )

@@ -106,7 +106,7 @@ def run_unified_prefill(
         # Genuinely-unsupported contract -> error like upstream (infer_model_type
         # ICHECKs d_qk in {512, 576}). NOT a legacy fallback.
         raise ValueError(
-            f"unified_sm120 prefill supports DSV4 (q_head_dim=512) or GLM_NSA "
+            f"SM120 sparse MLA prefill supports DSV4 (q_head_dim=512) or GLM_NSA "
             f"(q_head_dim=576); got q_head_dim={q_head_dim}"
         )
 
@@ -116,7 +116,7 @@ def run_unified_prefill(
         # VALID_HPB<16 small-TP shards are a separate (decode-landed) feature; until
         # ported in prefill this is an unsupported shape -> RAISE (not legacy).
         raise ValueError(
-            f"unified_sm120 prefill requires heads divisible by HPB={hpb}, got {heads}"
+            f"SM120 sparse MLA prefill requires heads divisible by HPB={hpb}, got {heads}"
         )
 
     model_type, compute_mode, scale_format = infer_model_type(q_head_dim, kv_cache.dtype)
@@ -136,13 +136,13 @@ def run_unified_prefill(
             or extra_page_block_size is None
         ):
             raise ValueError(
-                "unified_sm120 prefill dual-cache requires extra_kv_cache, "
+                "SM120 sparse MLA prefill dual-cache requires extra_kv_cache, "
                 "extra_indices, and extra_page_block_size together (partial extra "
                 "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
             )
         if model_type != ModelType.DSV4:
             raise ValueError(
-                "unified_sm120 prefill dual-cache (extra tokens) is DSV4-only "
+                "SM120 sparse MLA prefill dual-cache (extra tokens) is DSV4-only "
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
 
@@ -403,7 +403,7 @@ def run_unified_prefill(
     # No MG gate matched. There is NO decode-reuse fallback: an unsupported
     # prefill shape HARD-FAILS (matching upstream's raise-not-fallback contract).
     raise ValueError(
-        "unified_sm120 prefill: unsupported shape "
+        "SM120 sparse MLA prefill: unsupported shape "
         f"(model_type={int(model_type)}, heads={heads}, topk={topk}, "
         f"compute_mode={int(compute_mode)}, scale_format={int(scale_format)}, "
         f"has_extra={has_extra}, B12X_MLA_SM120_PREFILL_MG={'0' if not _mg_enabled else '1'}). "

@@ -44,7 +44,7 @@ from b12x.cute.fp4 import (
 )
 from b12x.cute.utils import current_cuda_stream
 
-from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
+from ..reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
 from .traits import SparseMLATraits, select_sparse_mla_traits
 
 

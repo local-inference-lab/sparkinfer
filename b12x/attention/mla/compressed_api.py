@@ -8,28 +8,17 @@ from typing import Literal
 import torch
 
 from .api import (
-    _final_lse_from_split_workspace,
     _get_mla_output_view,
-    _get_sm_scale_tensor,
-    _use_unified_sm120,
-    _validate_split_control_tensors,
+    _use_sm120_sparse_mla,
     _validate_tensor_storage_bounds,
 )
 from .compressed_config import (
     compressed_mla_split_chunks_for_contract,
-    compressed_mla_split_config_for_contract,
 )
 from .compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     compressed_mla_page_nbytes,
-)
-from .split import (
-    _compressed_mla_cache_byte_view,
-    build_compressed_mla_split_decode_forward_binding,
-    build_sparse_mla_split_decode_merge_binding,
-    run_compressed_mla_split_decode_forward,
-    run_sparse_mla_split_decode_merge,
 )
 
 
@@ -90,123 +79,27 @@ def compressed_mla_decode_forward(
 
     q3 = _normalize_compressed_q(q_all)
     rows, heads, _ = q3.shape
-    live_rows = rows
-
-    # Dispatch into the unified_sm120 backend (DSV4 decode). The unified kernel is
-    # the SM120 sparse-MLA path and supports the FULL upstream DSV4 decode surface:
-    #   * q_head_dim == COMPRESSED_MLA_HEAD_DIM == 512 (DSV4; NOT GLM q=576)
-    #   * MAIN cache, OR the DSV4 DUAL-CACHE (indexed/extra tokens) when the full
-    #     extra trio is provided together with indexed_page_size
-    #   * attn_sink fold (sink-in-merge, upstream design) and return_lse
-    #   * VALID_HPB<16 / non-multiple-of-16 head shards
-    # GENUINELY-UPSTREAM-UNSUPPORTED contracts RAISE (never fall back to legacy):
-    #   * a mapped indexed_page_table (upstream is raw-slot-id only)
-    #   * a partial dual-cache trio (upstream ICHECKs required-together)
-    # A non-512 q_head_dim here is a compressed-API contract error -> RAISE.
-    # When the flag is OFF / backend is None _use_unified_sm120 is False and the
-    # legacy path below stays byte-identical (that is the flag being off, not a
-    # fallback; the default-flip is a separate validated step).
-    if _use_unified_sm120(backend=backend, device=q3.device):
-        _unified_has_extra = (
-            indexed_k_cache is not None
-            or indexed_indices is not None
-            or indexed_topk_lengths is not None
+    if expected_num_q_heads is not None and heads != int(expected_num_q_heads):
+        raise ValueError(
+            f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
         )
-        if _unified_has_extra:
-            # Partial dual-cache trio is a HARD ERROR (upstream required-together
-            # ICHECK, sparse_mla_sm120.cu:171-174). NOT a fallback.
-            if not (
-                indexed_k_cache is not None
-                and indexed_indices is not None
-                and indexed_topk_lengths is not None
-                and indexed_page_size is not None
-            ):
-                raise ValueError(
-                    "SM120 sparse-MLA dual-cache decode requires indexed_k_cache, "
-                    "indexed_indices, indexed_topk_lengths, and indexed_page_size "
-                    "together (partial extra trio is unsupported, matching upstream "
-                    "sparse_mla_sm120.cu:171-174)"
-                )
-            # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream
-            # addresses the extra cache by raw slot id only). RAISE, not fallback.
-            if indexed_page_table is not None:
-                raise ValueError(
-                    "SM120 sparse-MLA decode does not support a mapped "
-                    "indexed_page_table (extra cache is raw-slot-id only on the "
-                    "unified backend, matching upstream FlashInfer)"
-                )
-        if int(q3.shape[-1]) != COMPRESSED_MLA_HEAD_DIM:
-            raise ValueError(
-                f"compressed_mla_decode_forward is DSV4 (q_head_dim="
-                f"{COMPRESSED_MLA_HEAD_DIM}) by construction; got q_head_dim="
-                f"{int(q3.shape[-1])}"
-            )
-        from . import unified_sm120
-
-        # PREFILL-LIKE modes (extend/verify/draft_extend) route to the single-pass
-        # DSV4 prefill (run_unified_prefill) -- upstream's num_tokens>64 prefill
-        # orchestrator -- instead of the legacy split-decode. Main cache OR the DSV4
-        # DUAL-CACHE (extra tokens) when the extra trio is provided. An unsupported
-        # prefill shape RAISEs inside run_unified_prefill (error like upstream, NOT
-        # a legacy fallback).
-        if scratch.mode in ("extend", "verify", "draft_extend"):
-            return _run_unified_sm120_compressed_prefill(
-                q3=q3,
-                swa_k_cache=swa_k_cache,
-                swa_indices=swa_indices,
-                swa_topk_lengths=swa_topk_lengths,
-                workspace=scratch,
-                sm_scale=sm_scale,
-                swa_page_size=swa_page_size,
-                indexed_k_cache=indexed_k_cache,
-                indexed_indices=indexed_indices,
-                indexed_topk_lengths=indexed_topk_lengths,
-                indexed_page_size=indexed_page_size,
-                attn_sink=attn_sink,
-                return_lse=return_lse,
-                lse_scale=lse_scale,
-                heads=heads,
-            )
-
-        return unified_sm120.run_unified_decode(
-            q_all=q3,
-            swa_k_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_topk_lengths,
-            workspace=scratch,
-            sm_scale=sm_scale,
-            swa_page_size=swa_page_size,
-            indexed_k_cache=indexed_k_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_topk_lengths,
-            indexed_page_size=indexed_page_size,
-            indexed_page_table=indexed_page_table,
-            attn_sink=attn_sink,
-            return_lse=return_lse,
-            lse_scale=lse_scale,
+    if int(q3.shape[-1]) != COMPRESSED_MLA_HEAD_DIM:
+        raise ValueError(
+            f"compressed_mla_decode_forward is DSV4 (q_head_dim="
+            f"{COMPRESSED_MLA_HEAD_DIM}) by construction; got q_head_dim="
+            f"{int(q3.shape[-1])}"
         )
-
+    if not _use_sm120_sparse_mla(backend=backend, device=q3.device):
+        raise RuntimeError(
+            "compressed sparse MLA requires the active SM120 sparse MLA kernel path; "
+            "legacy compressed sparse MLA kernels have been retired"
+        )
     swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
     _validate_compressed_cache_layout(
         swa_k_cache,
         page_size=swa_page_size,
         name="swa_k_cache",
     )
-    if expected_num_q_heads is not None and heads != int(expected_num_q_heads):
-        raise ValueError(
-            f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
-        )
-
-    if attn_sink is not None:
-        attn_sink = attn_sink.detach()
-        if attn_sink.shape != (heads,):
-            raise ValueError(f"attn_sink must have shape [{heads}], got {tuple(attn_sink.shape)}")
-        if attn_sink.device != q3.device:
-            raise ValueError(f"attn_sink device {attn_sink.device} does not match q_all device {q3.device}")
-        if attn_sink.dtype != torch.float32:
-            raise TypeError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
-        if not attn_sink.is_contiguous():
-            raise ValueError("attn_sink must be contiguous")
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     if swa_indices_2d.device != q3.device:
@@ -227,6 +120,11 @@ def compressed_mla_decode_forward(
             raise ValueError("indexed_k_cache, indexed_indices, and indexed_topk_lengths must be provided together")
         if indexed_page_size is None:
             raise ValueError("indexed_page_size is required when indexed_k_cache is provided")
+        if indexed_page_table is not None:
+            raise ValueError(
+                "SM120 sparse-MLA decode does not support a mapped indexed_page_table; "
+                "the extra cache is addressed by raw slot id"
+            )
         indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
         _validate_compressed_cache_layout(
             indexed_k_cache,
@@ -245,23 +143,21 @@ def compressed_mla_decode_forward(
         )
         if indexed_topk_lengths.device != q3.device:
             raise ValueError("indexed_topk_lengths must be on the same device as q_all")
-        if indexed_page_table is not None:
-            indexed_page_table_2d = _normalize_index_matrix(
-                indexed_page_table,
-                name="indexed_page_table",
-                allow_row_shared=True,
-            )
-            if indexed_page_table_2d.device != q3.device:
-                raise ValueError("indexed_page_table must be on the same device as q_all")
-            if indexed_page_table_2d.shape[0] != rows:
-                raise ValueError("indexed_page_table row count must match q_all")
-        else:
-            indexed_page_table_2d = None
     else:
         indexed_indices_2d = None
-        indexed_page_table_2d = None
         if indexed_page_table is not None:
             raise ValueError("indexed_page_table requires indexed_k_cache/indices/lengths")
+
+    if attn_sink is not None:
+        attn_sink = attn_sink.detach()
+        if attn_sink.shape != (heads,):
+            raise ValueError(f"attn_sink must have shape [{heads}], got {tuple(attn_sink.shape)}")
+        if attn_sink.device != q3.device:
+            raise ValueError(f"attn_sink device {attn_sink.device} does not match q_all device {q3.device}")
+        if attn_sink.dtype != torch.float32:
+            raise TypeError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+        if not attn_sink.is_contiguous():
+            raise ValueError("attn_sink must be contiguous")
 
     _validate_compressed_mla_scratch(
         scratch=scratch,
@@ -270,201 +166,45 @@ def compressed_mla_decode_forward(
         width=swa_indices_2d.shape[1] + (indexed_indices_2d.shape[1] if has_indexed else 0),
     )
 
-    if not has_indexed:
-        indexed_k_cache_for_kernel = swa_k_cache
-        indexed_indices_for_kernel = swa_indices_2d
-        indexed_lengths_for_kernel = swa_topk_lengths
-        indexed_page_size_for_kernel = int(swa_page_size)
-        indexed_page_table_for_kernel = swa_indices_2d
-        map_indexed_page_table = False
-    else:
-        assert indexed_k_cache is not None
-        assert indexed_indices_2d is not None
-        assert indexed_topk_lengths is not None
-        assert indexed_page_size is not None
-        indexed_k_cache_for_kernel = indexed_k_cache
-        indexed_indices_for_kernel = indexed_indices_2d
-        indexed_lengths_for_kernel = indexed_topk_lengths
-        indexed_page_size_for_kernel = int(indexed_page_size)
-        map_indexed_page_table = indexed_page_table_2d is not None
-        indexed_page_table_for_kernel = (
-            indexed_page_table_2d if map_indexed_page_table else indexed_indices_2d
+    if scratch.mode in ("extend", "verify", "draft_extend"):
+        return _run_sm120_compressed_prefill(
+            q3=q3,
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices_2d,
+            swa_topk_lengths=swa_topk_lengths,
+            workspace=scratch,
+            sm_scale=sm_scale,
+            swa_page_size=swa_page_size,
+            indexed_k_cache=indexed_k_cache if has_indexed else None,
+            indexed_indices=indexed_indices_2d,
+            indexed_topk_lengths=indexed_topk_lengths if has_indexed else None,
+            indexed_page_size=indexed_page_size if has_indexed else None,
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
         )
 
-    total_width = int(swa_indices_2d.shape[1]) + (
-        int(indexed_indices_2d.shape[1]) if has_indexed else 0
-    )
-    if scratch.tmp_output is None or scratch.tmp_lse is None:
-        raise RuntimeError("compressed MLA scratch is missing split buffers")
-    _validate_split_control_tensors(workspace=scratch)
+    from .kernel import run_unified_decode
 
-    graph_stable_split = scratch.fixed_capacity or scratch.use_cuda_graph
-    if graph_stable_split:
-        split_cfg = compressed_mla_split_config_for_contract(
-            rows=scratch.max_total_q,
-            width=scratch.topk,
-            max_chunks=scratch.max_chunks_per_row,
-        )
-    else:
-        split_cfg = compressed_mla_split_config_for_contract(
-            rows=rows,
-            width=total_width,
-            max_chunks=scratch.max_chunks_per_row,
-        )
-    graph_capture_active = q3.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-    if not graph_capture_active or not graph_stable_split:
-        scratch.set_split_chunk_config(
-            kv_chunk_size=split_cfg.chunk_size,
-            num_chunks=split_cfg.num_chunks,
-        )
-    elif scratch.kv_chunk_size_value is None or scratch.num_chunks_value is None:
-        raise RuntimeError("compressed MLA fixed scratch split config was not preplanned before graph capture")
-    elif int(scratch.kv_chunk_size_value) != int(split_cfg.chunk_size) or int(
-        scratch.num_chunks_value
-    ) != int(split_cfg.num_chunks):
-        raise RuntimeError(
-            "compressed MLA fixed scratch split config was not preplanned before graph capture: "
-            f"scratch has chunk_size={scratch.kv_chunk_size_value} "
-            f"num_chunks={scratch.num_chunks_value}, expected "
-            f"chunk_size={split_cfg.chunk_size} num_chunks={split_cfg.num_chunks}"
-        )
-    launch_num_chunks = (
-        scratch.max_chunks_per_row
-        if graph_stable_split
-        else split_cfg.num_chunks
-    )
-
-    output = _get_mla_output_view(
-        workspace=scratch,
+    return run_unified_decode(
         q_all=q3,
-        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
-    )
-    q_kernel = q3
-    swa_indices_kernel = swa_indices_2d
-    swa_lengths_kernel = swa_topk_lengths
-    indexed_indices_kernel = indexed_indices_for_kernel
-    indexed_lengths_kernel = indexed_lengths_for_kernel
-    indexed_page_table_kernel = indexed_page_table_for_kernel
-    output_kernel = output
-    if graph_stable_split:
-        if scratch.output_buffer is None:
-            raise RuntimeError("fixed compressed MLA scratch is missing output buffer")
-        if (
-            scratch.output_buffer.ndim != 3
-            or int(scratch.output_buffer.shape[0]) < int(scratch.max_total_q)
-            or int(scratch.output_buffer.shape[1]) < heads
-            or int(scratch.output_buffer.shape[2]) < COMPRESSED_MLA_HEAD_DIM
-        ):
-            raise ValueError(
-                "fixed compressed MLA scratch output buffer is too small: "
-                f"buffer={tuple(scratch.output_buffer.shape)} required>="
-                f"({int(scratch.max_total_q)}, {heads}, {COMPRESSED_MLA_HEAD_DIM})"
-            )
-        if int(q_kernel.shape[0]) == int(scratch.max_total_q):
-            output_kernel = scratch.output_buffer[
-                : scratch.max_total_q,
-                :heads,
-                :COMPRESSED_MLA_HEAD_DIM,
-            ]
-    fused_sink_output = attn_sink is not None and not return_lse
-    needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
-    direct_single_chunk_output = (
-        split_cfg.num_chunks == 1
-        and attn_sink is None
-        and not needs_lse
-    )
-    direct_sink_output = False
-    single_tile_chunks = split_cfg.chunk_size <= 64
-    sm_scale_tensor = _get_sm_scale_tensor(
-        workspace=scratch,
-        device=q3.device,
-        sm_scale=sm_scale,
-    )
-    launch_chunks_for_kernel = 1 if direct_single_chunk_output else int(launch_num_chunks)
-    _validate_compressed_launch_views(
-        tmp_output=output_kernel if direct_single_chunk_output else scratch.tmp_output,
-        tmp_lse=scratch.tmp_lse,
-        q_rows=int(q_kernel.shape[0]),
-        heads=heads,
-        launch_num_chunks=launch_chunks_for_kernel,
-        direct_output=direct_single_chunk_output,
-    )
-    forward_binding = build_compressed_mla_split_decode_forward_binding(
-        q_all=q_kernel,
         swa_k_cache=swa_k_cache,
-        swa_indices=swa_indices_kernel,
-        swa_lengths=swa_lengths_kernel,
-        indexed_k_cache=indexed_k_cache_for_kernel,
-        indexed_indices=indexed_indices_kernel,
-        indexed_lengths=indexed_lengths_kernel,
-        indexed_page_table=indexed_page_table_kernel,
-        sm_scale=sm_scale_tensor,
-        kv_chunk_size_ptr=scratch.kv_chunk_size_ptr,
-        num_chunks_ptr=scratch.num_chunks_ptr,
-        tmp_output=output_kernel if direct_single_chunk_output else scratch.tmp_output,
-        tmp_lse=scratch.tmp_lse,
-        launch_num_chunks=launch_chunks_for_kernel,
-        swa_page_size=int(swa_page_size),
-        swa_page_nbytes=compressed_mla_page_nbytes(int(swa_page_size)),
-        indexed_page_size=indexed_page_size_for_kernel,
-        indexed_page_nbytes=compressed_mla_page_nbytes(indexed_page_size_for_kernel),
-        has_indexed=has_indexed,
-        map_indexed_page_table=map_indexed_page_table,
-        scratch=scratch,
-        direct_output=direct_single_chunk_output,
-        single_tile_chunks=single_tile_chunks,
-        attn_sink=attn_sink,
-        direct_sink_output=direct_sink_output,
-    )
-    run_compressed_mla_split_decode_forward(binding=forward_binding)
-
-    if direct_single_chunk_output:
-        pass
-    elif split_cfg.num_chunks == 1 and attn_sink is None:
-        output_kernel.copy_(
-            scratch.tmp_output[
-                : int(q_kernel.shape[0]),
-                :heads,
-                0,
-                :COMPRESSED_MLA_HEAD_DIM,
-            ]
-        )
-    else:
-        merge_binding = build_sparse_mla_split_decode_merge_binding(
-            tmp_output=scratch.tmp_output,
-            tmp_lse=scratch.tmp_lse,
-            num_chunks_ptr=scratch.num_chunks_ptr,
-            output=output_kernel,
-            attn_sink=attn_sink if fused_sink_output else None,
-            scratch=scratch,
-        )
-        run_sparse_mla_split_decode_merge(binding=merge_binding)
-    if not needs_lse:
-        return output
-
-    lse_natural = _final_lse_from_split_workspace(
+        swa_indices=swa_indices_2d,
+        swa_topk_lengths=swa_topk_lengths,
         workspace=scratch,
-        q_rows=live_rows,
-        num_heads=heads,
-        launch_num_chunks=int(launch_num_chunks),
-        scale="natural",
+        sm_scale=sm_scale,
+        swa_page_size=swa_page_size,
+        indexed_k_cache=indexed_k_cache if has_indexed else None,
+        indexed_indices=indexed_indices_2d,
+        indexed_topk_lengths=indexed_topk_lengths if has_indexed else None,
+        indexed_page_size=indexed_page_size if has_indexed else None,
+        attn_sink=attn_sink,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
     )
-    if attn_sink is not None:
-        sink = attn_sink.float().view(1, heads)
-        lse_with_sink = torch.logaddexp(lse_natural.float(), sink)
-        scale = torch.exp(lse_natural.float() - lse_with_sink).view(live_rows, heads, 1)
-        output = (output.float() * scale).to(output.dtype)
-        lse_natural = lse_with_sink
-
-    if not return_lse:
-        return output
-    if lse_scale == "base2":
-        lse_natural.div_(_LN2)
-        return output, lse_natural
-    return output, lse_natural
 
 
-def _run_unified_sm120_compressed_prefill(
+def _run_sm120_compressed_prefill(
     *,
     q3: torch.Tensor,
     swa_k_cache: torch.Tensor,
@@ -480,10 +220,9 @@ def _run_unified_sm120_compressed_prefill(
     attn_sink: torch.Tensor | None,
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
-    heads: int,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
-    unified SM120 single-pass prefill (run_unified_prefill).
+    active SM120 single-pass prefill.
 
     Mirrors upstream's num_tokens>64 prefill orchestrator: ONE 384-thread CTA per
     (token, HPB head-group) over ALL topk tiles (FINAL_BF16 epilogue, no split-K
@@ -492,7 +231,7 @@ def _run_unified_sm120_compressed_prefill(
     are supported. An unsupported prefill shape RAISEs inside run_unified_prefill
     (error like upstream, NOT a legacy fallback).
     """
-    from . import unified_sm120
+    from .kernel import run_unified_prefill
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     output = _get_mla_output_view(
@@ -512,7 +251,7 @@ def _run_unified_sm120_compressed_prefill(
             extra_page_block_size=int(indexed_page_size),
         )
 
-    _, lse_base2 = unified_sm120.run_unified_prefill(
+    _, lse_base2 = run_unified_prefill(
         q=q3,
         kv_cache=swa_k_cache,
         topk_indices=swa_indices_2d,
@@ -669,6 +408,22 @@ def _validate_compressed_cache_layout(
             f"{name} page byte width must be {expected_page_nbytes} for page_size "
             f"{page_size}, got {int(cache.shape[1])}"
         )
+
+
+def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
+    if cache.dtype == torch.uint8:
+        byte_cache = cache
+    elif cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        byte_cache = cache.detach().view(torch.uint8)
+    else:
+        raise TypeError(
+            f"{name} must have dtype torch.uint8 or FP8 storage, got {cache.dtype}"
+        )
+    if byte_cache.ndim != 2:
+        raise ValueError(f"{name} must have shape [pages, page_bytes], got {tuple(cache.shape)}")
+    if not byte_cache.is_contiguous():
+        raise ValueError(f"{name} must be contiguous for compressed MLA")
+    return byte_cache
 
 
 def _validate_compressed_launch_views(

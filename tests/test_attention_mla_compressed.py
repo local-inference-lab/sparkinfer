@@ -3,10 +3,11 @@ from __future__ import annotations
 import inspect
 import math
 
+import pytest
 import torch
 
 import b12x.attention.mla.compressed_api as compressed_api_impl
-import b12x.attention.mla.split as mla_split_impl
+import b12x.attention.mla.merge as mla_split_impl
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.attention.workspace import (
     B12XAttentionArena,
@@ -87,7 +88,7 @@ def _make_split_merge_tensors(
 def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
     device = require_sm120()
     clear_compile_cache()
-    mla_split_impl.clear_sparse_mla_split_kernel_cache()
+    mla_split_impl.clear_sparse_mla_merge_kernel_cache()
 
     warm_args = _make_split_merge_tensors(
         rows=128,
@@ -371,13 +372,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
 ) -> None:
     device = require_sm120()
     clear_mla_caches()
-
-    # ESCAPE HATCH (mapped indexed_page_table): this test passes a mapped extra-cache
-    # indexed_page_table, which is genuinely-upstream-unsupported on the unified SM120
-    # backend (upstream FlashInfer addresses the extra cache by raw slot id only; the
-    # unified path correctly RAISEs). Pin the legacy escape hatch so the test exercises
-    # the legacy split internals it was written for, post P10 default-flip.
-    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
+    del monkeypatch
 
     contract_rows = 128
     contract_width = 2304
@@ -427,52 +422,15 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         max_page_table_width=page_table_width,
     )
 
-    calls: dict[str, int | bool] = {}
-
-    def fake_forward(**kwargs) -> None:
-        binding = kwargs["binding"]
-        calls["launch_num_chunks"] = int(binding.launch_num_chunks)
-        calls["direct_output"] = bool(binding.direct_output)
-        calls["swa_cache_is_u8"] = binding.swa_k_cache.dtype == torch.uint8
-        assert binding.q_all.shape[0] == contract_rows
-        assert binding.swa_indices.shape[0] == contract_rows
-        assert binding.swa_lengths.shape == (contract_rows,)
-        assert binding.indexed_indices.shape == (contract_rows, live_width)
-        assert binding.indexed_lengths.shape == (contract_rows,)
-        assert binding.indexed_page_table.shape == (contract_rows, page_table_width)
-
-    def fake_merge(**kwargs) -> None:
-        binding = kwargs["binding"]
-        assert binding.output.shape[0] == contract_rows
-        binding.output.zero_()
-        calls["merge"] = True
-
-    monkeypatch.setattr(
-        compressed_api_impl,
-        "run_compressed_mla_split_decode_forward",
-        fake_forward,
-    )
-    monkeypatch.setattr(
-        compressed_api_impl,
-        "run_sparse_mla_split_decode_merge",
-        fake_merge,
-    )
-
-    actual = compressed_api_impl.compressed_mla_decode_forward(
-        swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
-        binding=binding,
-        indexed_k_cache=indexed_cache,
-        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-
-    assert binding.scratch.kv_chunk_size_value == 1024
-    assert binding.scratch.num_chunks_value == 3
-    assert calls["launch_num_chunks"] == max_chunks_per_row
-    assert calls["direct_output"] is False
-    assert calls["swa_cache_is_u8"] is True
-    assert calls["merge"] is True
-    assert actual.shape == (live_rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM)
+    with torch.inference_mode(), torch.no_grad():
+        with pytest.raises(ValueError, match="mapped indexed_page_table"):
+            compressed_api_impl.compressed_mla_decode_forward(
+                swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
+                binding=binding,
+                indexed_k_cache=indexed_cache,
+                indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+                sm_scale=_SM_SCALE,
+            )
 
 
 @torch.inference_mode()
@@ -827,15 +785,9 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
 
 @torch.inference_mode()
-def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch) -> None:
+def test_compressed_mla_mapped_page_table_is_rejected() -> None:
     device = require_sm120()
     clear_mla_caches()
-
-    # ESCAPE HATCH (mapped indexed_page_table): passes a mapped extra-cache page table,
-    # genuinely-upstream-unsupported on the unified SM120 backend (raw-slot-id only;
-    # unified correctly RAISEs). Pin the legacy escape hatch so this exercises the
-    # legacy split internals it was written for, post P10 default-flip.
-    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     q = _make_q(rows=1, seed=181, device=device)
     swa_cache = torch.empty(
@@ -852,7 +804,7 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch
     swa_indices = torch.empty((1, 0), dtype=torch.int32, device=device)
     swa_lengths = torch.zeros((1,), dtype=torch.int32, device=device)
     indexed_lengths = torch.tensor([8], dtype=torch.int32, device=device)
-    binding_a = _make_compressed_binding(
+    binding = _make_compressed_binding(
         device=device,
         rows=1,
         topk=8,
@@ -866,71 +818,20 @@ def test_compressed_mla_page_table_width_does_not_resolve_new_kernel(monkeypatch
         use_cuda_graph=True,
     )
 
-    compressed_mla_decode_forward(
-        swa_k_cache=swa_cache,
-        binding=binding_a,
-        indexed_k_cache=indexed_cache,
-        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    torch.cuda.synchronize(device)
-
-    indexed_indices_b = torch.tensor(
-        [[0, 16, 17, 32, 33, 47, 48, 63]],
-        dtype=torch.int32,
-        device=device,
-    )
-    page_table_b = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
-    binding_b = binding_a.scratch.bind(
-        q=q,
-        swa_indices=swa_indices,
-        swa_lengths=swa_lengths,
-        indexed_indices=indexed_indices_b,
-        indexed_lengths=indexed_lengths,
-        indexed_page_table=page_table_b,
-    )
-    freeze_kernel_resolution("compressed MLA page-table width must be dynamic")
-    try:
-        actual = compressed_mla_decode_forward(
+    with pytest.raises(ValueError, match="mapped indexed_page_table"):
+        compressed_mla_decode_forward(
             swa_k_cache=swa_cache,
-            binding=binding_b,
+            binding=binding,
             indexed_k_cache=indexed_cache,
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
-        torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
-
-    expected = compressed_sparse_mla_reference(
-        q,
-        swa_cache,
-        swa_indices,
-        swa_lengths,
-        extra_k_cache=indexed_cache,
-        extra_indices=indexed_indices_b,
-        extra_topk_lengths=indexed_lengths,
-        extra_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(
-        actual.float().reshape(-1), expected.float().reshape(-1), dim=0
-    )
-    assert max_abs <= 0.10
-    assert cos.item() >= 0.9995
 
 
 @torch.inference_mode()
-def test_compressed_mla_accepts_row_shared_page_table(monkeypatch) -> None:
+def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
     device = require_sm120()
     clear_mla_caches()
-
-    # ESCAPE HATCH (mapped indexed_page_table): passes a row-shared mapped extra-cache
-    # page table, genuinely-upstream-unsupported on the unified SM120 backend
-    # (raw-slot-id only; unified correctly RAISEs). Pin the legacy escape hatch so this
-    # exercises the legacy split internals it was written for, post P10 default-flip.
-    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     rows = 3
     q = _make_q(rows=rows, seed=186, device=device)
@@ -976,44 +877,20 @@ def test_compressed_mla_accepts_row_shared_page_table(monkeypatch) -> None:
         use_cuda_graph=True,
     )
 
-    actual = compressed_mla_decode_forward(
-        swa_k_cache=swa_cache,
-        binding=binding,
-        indexed_k_cache=indexed_cache,
-        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    torch.cuda.synchronize(device)
-
-    expected = compressed_sparse_mla_reference(
-        q,
-        swa_cache,
-        swa_indices,
-        swa_lengths,
-        extra_k_cache=indexed_cache,
-        extra_indices=indexed_indices,
-        extra_topk_lengths=indexed_lengths,
-        extra_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(
-        actual.float().reshape(-1), expected.float().reshape(-1), dim=0
-    )
-    assert max_abs <= 0.10
-    assert cos.item() >= 0.9995
+    with pytest.raises(ValueError, match="mapped indexed_page_table"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            indexed_k_cache=indexed_cache,
+            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            sm_scale=_SM_SCALE,
+        )
 
 
 @torch.inference_mode()
-def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkeypatch) -> None:
+def test_compressed_mla_rejects_live_mapped_page_table() -> None:
     device = require_sm120()
     clear_mla_caches()
-
-    # ESCAPE HATCH (mapped indexed_page_table): passes a mapped extra-cache page table,
-    # genuinely-upstream-unsupported on the unified SM120 backend (raw-slot-id only;
-    # unified correctly RAISEs). Pin the legacy escape hatch so this exercises the
-    # legacy split internals it was written for, post P10 default-flip.
-    monkeypatch.setenv("B12X_MLA_SM120_UNIFIED", "0")
 
     indexed_cache = _make_cache(
         tokens=64,
@@ -1046,61 +923,11 @@ def test_compressed_mla_live_rows_do_not_resolve_new_split_forward_kernel(monkey
         indexed_page_table=page_table3,
         use_cuda_graph=False,
     )
-    compressed_mla_decode_forward(
-        swa_k_cache=swa_cache,
-        binding=binding3,
-        indexed_k_cache=indexed_cache,
-        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    torch.cuda.synchronize(device)
-
-    q1 = _make_q(rows=1, seed=194, device=device)
-    swa_indices1 = torch.empty((1, 0), dtype=torch.int32, device=device)
-    swa_lengths1 = torch.zeros((1,), dtype=torch.int32, device=device)
-    indexed_indices1 = torch.tensor(
-        [[0, 16, 17, 32, 33, 47, 48, 63]],
-        dtype=torch.int32,
-        device=device,
-    )
-    indexed_lengths1 = torch.tensor([8], dtype=torch.int32, device=device)
-    page_table1 = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
-    binding1 = binding3.scratch.bind(
-        q=q1,
-        swa_indices=swa_indices1,
-        swa_lengths=swa_lengths1,
-        indexed_indices=indexed_indices1,
-        indexed_lengths=indexed_lengths1,
-        indexed_page_table=page_table1,
-    )
-
-    freeze_kernel_resolution("compressed MLA live rows must be runtime")
-    try:
-        actual = compressed_mla_decode_forward(
+    with pytest.raises(ValueError, match="mapped indexed_page_table"):
+        compressed_mla_decode_forward(
             swa_k_cache=swa_cache,
-            binding=binding1,
+            binding=binding3,
             indexed_k_cache=indexed_cache,
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
-        torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
-
-    expected = compressed_sparse_mla_reference(
-        q1,
-        swa_cache,
-        swa_indices1,
-        swa_lengths1,
-        extra_k_cache=indexed_cache,
-        extra_indices=indexed_indices1,
-        extra_topk_lengths=indexed_lengths1,
-        extra_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-        sm_scale=_SM_SCALE,
-    )
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(
-        actual.float().reshape(-1), expected.float().reshape(-1), dim=0
-    )
-    assert max_abs <= 0.10
-    assert cos.item() >= 0.9995

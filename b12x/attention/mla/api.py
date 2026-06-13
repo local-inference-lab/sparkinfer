@@ -16,30 +16,12 @@ except ImportError:  # Keep the pure-PyTorch fallback usable outside vLLM images
     triton = None
     tl = None
 
-from .kernel import (
-    clear_sparse_mla_kernel_cache,
-    run_sparse_mla_kernel,
-    supports_sparse_mla_kernel,
-)
+from .merge import clear_sparse_mla_merge_kernel_cache
 from .reference import sparse_mla_reference
-from .split import (
-    clear_sparse_mla_split_kernel_cache,
-    forced_sparse_mla_split_decode_config_for_width,
-    run_sparse_mla_split_decode,
-    select_sparse_mla_split_decode_config,
-)
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
-# Dispatch into the unified_sm120 sparse-MLA backend. As of the P10 default-flip the
-# unified backend is the SM120+ CUDA DEFAULT: unset (or "1"/any truthy value) routes
-# unified; only B12X_MLA_SM120_UNIFIED=0 (env) or backend="legacy" (kwarg) forces the
-# legacy path (the escape hatch). The env value is re-read each call (via
-# _unified_enabled_by_env) so a monkeypatched os.environ in tests is honored without
-# re-import. Non-CUDA / pre-SM120 devices always stay legacy (outside the SM120 surface).
-_MLA_SM120_UNIFIED_ENV = "B12X_MLA_SM120_UNIFIED"
-_MLA_SM120_UNIFIED_BACKEND = "sm120_unified"
-_MLA_LEGACY_BACKEND = "legacy"
+_MLA_SM120_BACKEND = "sm120"
 # GLM_NSA uncompressed decode contract (q_head_dim = d_nope+d_rope = 512+64).
 _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
@@ -110,8 +92,7 @@ class MLASparseExtendMetadata:
 
 def clear_mla_caches() -> None:
     """Clear any cached MLA runtime state."""
-    clear_sparse_mla_kernel_cache()
-    clear_sparse_mla_split_kernel_cache()
+    clear_sparse_mla_merge_kernel_cache()
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
@@ -142,46 +123,15 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _unified_enabled_by_env() -> bool:
-    """Env half of the SM120 unified gate, default-ON.
-
-    Unset -> unified (the new SM120 default). Only the explicit off values
-    ("0"/"false"/"no"/"off") select the legacy escape hatch; any other value
-    (including "1") routes unified. Re-read each call so a monkeypatched
-    os.environ in tests is honored without re-import.
-    """
-    value = os.environ.get(_MLA_SM120_UNIFIED_ENV)
-    if value is None:
-        return True
-    return value.strip().lower() not in ("0", "false", "no", "off")
-
-
-def _use_unified_sm120(*, backend: str | None, device: torch.device) -> bool:
-    """Gate for the unified_sm120 backend (the SM120+ CUDA DEFAULT).
-
-    Routes unified when the backend is not forced legacy AND the env gate is on
-    (default-on; only B12X_MLA_SM120_UNIFIED=0 turns it off) AND the device is
-    SM120+ CUDA. backend="legacy" forces legacy and backend="sm120_unified"
-    forces unified regardless of the env value. The contract (q_head_dim) is
-    checked at the call site. Non-CUDA / pre-SM120 always returns False (legacy).
-    """
-    if backend is not None and backend not in (
-        _MLA_SM120_UNIFIED_BACKEND,
-        _MLA_LEGACY_BACKEND,
-    ):
+def _use_sm120_sparse_mla(*, backend: str | None, device: torch.device) -> bool:
+    """Return whether the active SM120 sparse MLA kernel path is available."""
+    if backend is not None and backend != _MLA_SM120_BACKEND:
         raise ValueError(
-            f"backend must be None, {_MLA_SM120_UNIFIED_BACKEND!r}, or "
-            f"{_MLA_LEGACY_BACKEND!r}, got {backend!r}"
+            f"backend must be None or {_MLA_SM120_BACKEND!r}; legacy sparse MLA "
+            f"kernels have been retired, got {backend!r}"
         )
-    if backend == _MLA_LEGACY_BACKEND:
-        return False
-    requested = backend == _MLA_SM120_UNIFIED_BACKEND or _unified_enabled_by_env()
-    if not requested:
-        return False
     if device.type != "cuda":
         return False
-    # Imported lazily: get_sm_version lives in b12x.cute.fp4 (CuTe surface) and we only
-    # need it on the opt-in path so the legacy import graph is unchanged.
     from b12x.cute.fp4 import get_sm_version
 
     return get_sm_version(device) >= 120
@@ -572,15 +522,11 @@ def _run_sparse_mla(
         raise ValueError(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
-    # The unified SM120 backend supports attn_sink together with return_lse (the
-    # sink folds into O in the merge and into the returned LSE). The legacy fused
-    # path is output-only, so the return_lse+attn_sink restriction applies ONLY
-    # when the unified path will NOT be taken.
-    _sm120_unified_route = _use_unified_sm120(backend=backend, device=q_all.device)
+    _sm120_route = _use_sm120_sparse_mla(backend=backend, device=q_all.device)
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
-        if return_lse and not _sm120_unified_route:
-            raise ValueError("fused sparse MLA attn_sink currently supports output-only calls")
+        if not _sm120_route:
+            raise ValueError("sparse MLA attn_sink requires the active SM120 kernel path")
         if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(q_all.shape[1]):
             raise ValueError(
                 f"attn_sink must have shape ({int(q_all.shape[1])},), got {tuple(attn_sink.shape)}"
@@ -624,33 +570,15 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
-    # Opt-in dispatch into the parallel unified_sm120 backend (DSV3.2 dropped; this is the
-    # GLM_NSA uncompressed q_head_dim==576 contract). Gated so the legacy path below is
-    # byte-identical when the flag is off and no backend kwarg is supplied.
-    #
-    # P7 SCOPE: the unified backend implements the DSV4 MAIN-CACHE compressed
-    # decode ONLY (routed via compressed_api.compressed_mla_decode_forward). The
-    # GLM_NSA uncompressed path here is DEFERRED to P7b -- so when the gate is on
-    # and the GLM contract is presented we raise NotImplementedError (never
-    # silently route an unsupported GLM call to the DSV4 kernel). q != 576 is a
-    # contract error.
-    if _use_unified_sm120(backend=backend, device=q_all.device):
+    if _sm120_route:
         q_head_dim = int(q_all.shape[-1])
         if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
             raise ValueError(
-                f"unified_sm120 sparse decode requires the GLM_NSA contract "
+                f"SM120 sparse MLA decode requires the GLM_NSA contract "
                 f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={q_head_dim}"
             )
-        # GLM_NSA (uncompressed q=576, ARBITRARY_FP32 inline scales) via the unified
-        # SM120 kernel (cute.constexpr GLM branches beside DSV4). The decode path
-        # covers the upstream DSV3.2/GLM decode surface (return_lse, attn_sink fold
-        # via sink-in-merge, VALID_HPB<16, multi-token rows with PER-TOKEN
-        # active_token_counts). The PREFILL-LIKE modes (extend/verify/draft_extend)
-        # route to the single-pass GLM prefill (run_unified_prefill, model_type==
-        # GLM_NSA) instead of the legacy split path; for an unsupported prefill shape
-        # run_unified_prefill RAISEs (error like upstream, NOT legacy).
         if workspace.mode in ("extend", "verify", "draft_extend"):
-            return _run_unified_sm120_prefill(
+            return _run_sm120_prefill(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 selected_indices=selected_indices,
@@ -662,7 +590,7 @@ def _run_sparse_mla(
                 return_lse=return_lse,
                 lse_scale=lse_scale,
             )
-        from .unified_sm120.launch import run_unified_decode
+        from .kernel import run_unified_decode
 
         return run_unified_decode(
             q_all=q_all,
@@ -677,161 +605,34 @@ def _run_sparse_mla(
             lse_scale=lse_scale,
             forced_num_splits=forced_num_splits,
         )
-    sm_scale_tensor = _get_sm_scale_tensor(
-        workspace=workspace, device=q_all.device, sm_scale=sm_scale
-    )
-    split_cfg = None
-    force_split = return_lse or attn_sink is not None or workspace.mode in ("extend", "verify", "draft_extend")
-    graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
-    split_cfg = select_sparse_mla_split_decode_config(
+    if _is_cuda_graph_capture_active(q_all.device):
+        raise RuntimeError(
+            "b12x MLA would use the PyTorch reference during CUDA graph capture; "
+            "the active SM120 sparse MLA kernel path is unavailable for this device"
+        )
+    if identity_page_table:
+        raise RuntimeError("identity page-table sparse MLA requires the active SM120 kernel path")
+    reference_kwargs = dict(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=selected_indices,
-        output_dtype=q_all.dtype,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
         v_head_dim=v_head_dim,
-        max_chunks=workspace.max_chunks_per_row,
     )
-    if (
-        force_split
-        and split_cfg is None
-        and q_all.device.type == "cuda"
-        and supports_sparse_mla_kernel(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=selected_indices,
-            v_head_dim=v_head_dim,
-        )
-    ):
-        forced_width = int(selected_indices.shape[1])
-        split_cfg = forced_sparse_mla_split_decode_config_for_width(
-            forced_width,
-            max_chunks=workspace.max_chunks_per_row,
-        )
-    if graph_stable_split and split_cfg is not None:
-        split_cfg = forced_sparse_mla_split_decode_config_for_width(
-            int(selected_indices.shape[1]),
-            max_chunks=workspace.max_chunks_per_row,
-        )
-    if not return_lse:
-        split_cfg = _apply_mla_prefill_strategy(
-            split_cfg=split_cfg,
-            workspace=workspace,
-            active_token_counts=active_token_counts,
-            device=q_all.device,
-            q_rows=int(q_all.shape[0]),
-            topk_width=int(selected_indices.shape[1]),
-        )
-    if split_cfg is not None:
-        if not _is_cuda_graph_capture_active(q_all.device) or not (
-            workspace.fixed_capacity or workspace.use_cuda_graph
-        ):
-            workspace.set_split_chunk_config(
-                kv_chunk_size=split_cfg.chunk_size,
-                num_chunks=split_cfg.num_chunks,
-            )
-        launch_num_chunks = (
-            workspace.max_chunks_per_row
-            if (workspace.fixed_capacity or workspace.use_cuda_graph)
-            else split_cfg.num_chunks
-        )
-        _validate_split_workspace_views(
-            workspace=workspace,
-            q_rows=int(q_all.shape[0]),
-            num_heads=int(q_all.shape[1]),
-            v_head_dim=int(v_head_dim),
-            launch_num_chunks=int(launch_num_chunks),
-        )
-        output = _get_mla_output_view(
-            workspace=workspace,
-            q_all=q_all,
-            v_head_dim=v_head_dim,
-        )
-        assert workspace.kv_chunk_size_ptr is not None
-        assert workspace.num_chunks_ptr is not None
-        run_sparse_mla_split_decode(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=selected_indices,
-            active_token_counts=active_token_counts,
-            sm_scale=sm_scale_tensor,
-            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
-            num_chunks_ptr=workspace.num_chunks_ptr,
-            tmp_output=workspace.tmp_output,
-            tmp_lse=workspace.tmp_lse,
-            output=output,
-            launch_num_chunks=launch_num_chunks,
-            attn_sink=attn_sink,
-            workspace=workspace,
-            identity_page_table=identity_page_table,
-        )
-        if return_lse:
-            lse = _final_lse_from_split_workspace(
-                workspace=workspace,
-                q_rows=int(q_all.shape[0]),
-                num_heads=int(q_all.shape[1]),
-                launch_num_chunks=int(launch_num_chunks),
-                scale=lse_scale,
-            )
-    elif supports_sparse_mla_kernel(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=selected_indices,
-        v_head_dim=v_head_dim,
-    ):
-        if return_lse:
-            raise RuntimeError(
-                "B12X sparse MLA LSE output requires the split path, but no split "
-                "configuration was available for this contract."
-            )
-        if attn_sink is not None:
-            raise RuntimeError(
-                "B12X sparse MLA attn_sink output requires the split path, but no split "
-                "configuration was available for this contract."
-            )
-        output = _get_mla_output_view(
-            workspace=workspace,
-            q_all=q_all,
-            v_head_dim=v_head_dim,
-        )
-        run_sparse_mla_kernel(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=selected_indices,
-            active_token_counts=active_token_counts,
-            sm_scale=sm_scale_tensor,
-            output=output,
-            workspace=workspace,
-            identity_page_table=identity_page_table,
-        )
-    else:
-        if _is_cuda_graph_capture_active(q_all.device):
-            raise RuntimeError(
-                "b12x MLA fell back to the PyTorch reference during CUDA graph capture; "
-                "the current q/kv/page-table contract is not supported by the compiled kernel path"
-            )
-        if identity_page_table:
-            raise RuntimeError("identity page-table sparse MLA requires the compiled CUDA kernel path")
-        reference_kwargs = dict(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=selected_indices,
-            active_token_counts=active_token_counts,
-            sm_scale=sm_scale,
-            v_head_dim=v_head_dim,
-        )
-        if return_lse:
-            reference_kwargs["return_lse"] = True
-        output = sparse_mla_reference(**reference_kwargs)
-        if return_lse:
-            output, lse = output
-            if lse_scale == "natural":
-                lse = lse * _LN2
+    if return_lse:
+        reference_kwargs["return_lse"] = True
+    output = sparse_mla_reference(**reference_kwargs)
+    if return_lse:
+        output, lse = output
+        if lse_scale == "natural":
+            lse = lse * _LN2
     if return_lse:
         return output, lse
     return output
 
 
-def _run_unified_sm120_prefill(
+def _run_sm120_prefill(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -844,17 +645,8 @@ def _run_unified_sm120_prefill(
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Route a prefill-like (extend/verify/draft_extend) call to the unified SM120
-    single-pass prefill (run_unified_prefill).
-
-    Mirrors upstream's num_tokens>64 prefill orchestrator: ONE 384-thread CTA per
-    (token, HPB head-group) over ALL topk tiles, FINAL_BF16 epilogue (no split-K
-    merge). DSV4 (q==512) and GLM_NSA (q==576) route by traits; per-token
-    ``active_token_counts`` is the per-token topk_length; attn_sink + return_lse are
-    supported. An unsupported prefill shape RAISEs inside run_unified_prefill
-    (error like upstream, NOT a legacy fallback).
-    """
-    from .unified_sm120.launch import run_unified_prefill
+    """Route a prefill-like call to the active SM120 single-pass prefill."""
+    from .kernel import run_unified_prefill
 
     output = _get_mla_output_view(
         workspace=workspace,

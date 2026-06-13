@@ -2426,7 +2426,7 @@ class UnifiedPrefillMGKernel:
                 )
 
 
-def _unified_sm120_prefill_mg_flat_launch(
+def _sparse_mla_prefill_mg_flat_launch(
     q: torch.Tensor,
     kv_flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2467,15 +2467,15 @@ def _unified_sm120_prefill_mg_flat_launch(
     head_offset = int(head_offset)
     heads_per_cta = int(layout.heads_per_cta)
     if active_heads <= 0:
-        raise ValueError(f"unified_sm120 MG prefill requires active_heads>0, got {active_heads}")
+        raise ValueError(f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}")
     if head_offset < 0 or head_offset + active_heads > total_heads:
         raise ValueError(
-            "unified_sm120 MG prefill head range out of bounds: "
+            "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
         )
     if active_heads % heads_per_cta != 0:
         raise ValueError(
-            "unified_sm120 MG prefill active head range must be divisible by "
+            "SM120 sparse MLA MG prefill active head range must be divisible by "
             f"heads_per_cta={heads_per_cta}; got active_heads={active_heads}"
         )
     replicate_h = active_heads // heads_per_cta
@@ -2484,7 +2484,7 @@ def _unified_sm120_prefill_mg_flat_launch(
     # has no extra-prologue arm and is forbidden.
     if bool(has_extra) and int(num_main_tiles) < 1:
         raise ValueError(
-            "unified_sm120 MG dual-cache prefill requires num_main_tiles>=1 "
+            "SM120 sparse MLA MG dual-cache prefill requires num_main_tiles>=1 "
             f"(topk>=1); got num_main_tiles={num_main_tiles}"
         )
     kernel = UnifiedPrefillMGKernel(
@@ -2582,7 +2582,7 @@ def _unified_sm120_prefill_mg_flat_launch(
             ]
         )
     compile_spec = KernelCompileSpec.from_fields(
-        "attention.mla.unified_sm120.prefill_mg",
+        "attention.mla.sm120.prefill_mg",
         1,
         *spec_fields,
     )
@@ -2591,10 +2591,10 @@ def _unified_sm120_prefill_mg_flat_launch(
 
 
 @torch.library.custom_op(
-    "b12x::unified_sm120_prefill_mg",
+    "b12x::sparse_mla_sm120_prefill_mg",
     mutates_args=("output", "lse_out"),
 )
-def _unified_sm120_prefill_mg_op(
+def _sparse_mla_prefill_mg_op(
     q: torch.Tensor,
     kv_flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2617,7 +2617,7 @@ def _unified_sm120_prefill_mg_op(
     # has_extra=False with the extra device args aliased to the main tensors (never
     # read under const_expr(has_extra=False)). Op signature is UNCHANGED so the
     # no-extra cache key and all existing callers are untouched.
-    _unified_sm120_prefill_mg_flat_launch(
+    _sparse_mla_prefill_mg_flat_launch(
         q,
         kv_flat,
         topk_indices,
@@ -2647,8 +2647,8 @@ def _unified_sm120_prefill_mg_op(
     )
 
 
-@_unified_sm120_prefill_mg_op.register_fake
-def _unified_sm120_prefill_mg_fake(
+@_sparse_mla_prefill_mg_op.register_fake
+def _sparse_mla_prefill_mg_fake(
     q: torch.Tensor,
     kv_flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2671,10 +2671,10 @@ def _unified_sm120_prefill_mg_fake(
 
 
 @torch.library.custom_op(
-    "b12x::unified_sm120_prefill_mg_dual",
+    "b12x::sparse_mla_sm120_prefill_mg_dual",
     mutates_args=("output", "lse_out"),
 )
-def _unified_sm120_prefill_mg_dual_op(
+def _sparse_mla_prefill_mg_dual_op(
     q: torch.Tensor,
     kv_flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2704,7 +2704,7 @@ def _unified_sm120_prefill_mg_dual_op(
     # DUAL-CACHE op (DSV4 has_extra union -> MG). SEPARATE op from the single-cache
     # one so the no-extra op signature / cache key stays byte-identical. has_extra
     # is implicitly True.
-    _unified_sm120_prefill_mg_flat_launch(
+    _sparse_mla_prefill_mg_flat_launch(
         q,
         kv_flat,
         topk_indices,
@@ -2734,8 +2734,8 @@ def _unified_sm120_prefill_mg_dual_op(
     )
 
 
-@_unified_sm120_prefill_mg_dual_op.register_fake
-def _unified_sm120_prefill_mg_dual_fake(
+@_sparse_mla_prefill_mg_dual_op.register_fake
+def _sparse_mla_prefill_mg_dual_fake(
     q: torch.Tensor,
     kv_flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2802,12 +2802,12 @@ def run_unified_prefill_mg(
     if has_extra:
         if extra_indices is None or extra_page_block_size is None:
             raise ValueError(
-                "unified_sm120 MG dual-cache prefill requires extra_kv_cache, "
+                "SM120 sparse MLA MG dual-cache prefill requires extra_kv_cache, "
                 "extra_indices, and extra_page_block_size together"
             )
         if is_glm:
             raise ValueError(
-                "unified_sm120 MG dual-cache prefill is DSV4-only "
+                "SM120 sparse MLA MG dual-cache prefill is DSV4-only "
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
     if scale_format is None:
@@ -2816,11 +2816,11 @@ def run_unified_prefill_mg(
     expected_qdim = _GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM
     if int(q.shape[-1]) != expected_qdim:
         raise ValueError(
-            f"unified_sm120 MG prefill ({'GLM' if is_glm else 'DSV4'}) expects "
+            f"SM120 sparse MLA MG prefill ({'GLM' if is_glm else 'DSV4'}) expects "
             f"q_head_dim={expected_qdim}, got {int(q.shape[-1])}"
         )
     if int(mg_n_hg) not in (1, 2):
-        raise ValueError(f"unified_sm120 MG prefill supports mg_n_hg in {{1, 2}}, got {mg_n_hg}")
+        raise ValueError(f"SM120 sparse MLA MG prefill supports mg_n_hg in {{1, 2}}, got {mg_n_hg}")
     num_tokens, heads, _ = q.shape
     total_heads = int(heads)
     if active_heads is None:
@@ -2828,10 +2828,10 @@ def run_unified_prefill_mg(
     active_heads = int(active_heads)
     head_offset = int(head_offset)
     if active_heads <= 0:
-        raise ValueError(f"unified_sm120 MG prefill requires active_heads>0, got {active_heads}")
+        raise ValueError(f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}")
     if head_offset < 0 or head_offset + active_heads > total_heads:
         raise ValueError(
-            "unified_sm120 MG prefill head range out of bounds: "
+            "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
         )
     traits = make_unified_traits(model_type, int(compute_mode), scale_format)
@@ -2841,7 +2841,7 @@ def run_unified_prefill_mg(
     heads_per_cta = int(mg_n_hg) * int(traits.hpb)
     if active_heads % heads_per_cta != 0:
         raise ValueError(
-            f"unified_sm120 MG prefill (mg_n_hg={mg_n_hg}) requires heads divisible "
+            f"SM120 sparse MLA MG prefill (mg_n_hg={mg_n_hg}) requires heads divisible "
             f"by {heads_per_cta}, got active_heads={active_heads}"
         )
 
@@ -2895,7 +2895,7 @@ def run_unified_prefill_mg(
                 device=device, dtype=torch.int32
             ).contiguous()
         if active_heads == total_heads and head_offset == 0:
-            torch.ops.b12x.unified_sm120_prefill_mg_dual(
+            torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
                 q,
                 kv_cache.reshape(-1),
                 topk_indices,
@@ -2923,7 +2923,7 @@ def run_unified_prefill_mg(
                 bool(row_xor),
             )
         else:
-            _unified_sm120_prefill_mg_flat_launch(
+            _sparse_mla_prefill_mg_flat_launch(
                 q,
                 kv_cache.reshape(-1),
                 topk_indices,
@@ -2956,7 +2956,7 @@ def run_unified_prefill_mg(
         return output, lse_out
 
     if active_heads == total_heads and head_offset == 0:
-        torch.ops.b12x.unified_sm120_prefill_mg(
+        torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
             kv_cache.reshape(-1),
             topk_indices,
@@ -2976,7 +2976,7 @@ def run_unified_prefill_mg(
             scale_format,
         )
     else:
-        _unified_sm120_prefill_mg_flat_launch(
+        _sparse_mla_prefill_mg_flat_launch(
             q,
             kv_cache.reshape(-1),
             topk_indices,
