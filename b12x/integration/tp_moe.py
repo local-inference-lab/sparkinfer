@@ -33,7 +33,18 @@ from b12x.moe.fused.relu2 import (
 )
 from b12x.moe.fused.silu import (
     MoEDynamicKernelSilu,
+    MoEDynamicKernelSwiGLUOAI,
     MoEMicroKernelSilu,
+    MoEMicroKernelSwiGLUOAI,
+)
+from b12x.moe.fused.activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    moe_activation_w1_rows,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
 )
 from b12x.moe.fused.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
@@ -201,6 +212,8 @@ class TPW4A16Workspace:
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
     planned_apply_router_weight_on_input: bool = False
     planned_swiglu_limit: float | None = None
+    planned_swiglu_alpha: float = 1.0
+    planned_swiglu_beta: float = 0.0
     planned_scale_format: str = "e4m3_k16"
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
@@ -356,6 +369,9 @@ class _TPCoreWorkspacePlan:
     implementation: str
     quant_mode: str
     activation: str
+    swiglu_limit: float | None = None
+    swiglu_alpha: float = 1.0
+    swiglu_beta: float = 0.0
     state_E: int
     weight_E: int
     routed_rows: int
@@ -392,6 +408,9 @@ class TPMoEPlan:
     implementation: str
     quant_mode: str
     activation: str
+    swiglu_limit: float | None = None
+    swiglu_alpha: float = 1.0
+    swiglu_beta: float = 0.0
     state_E: int
     weight_E: int
     routed_rows: int
@@ -422,6 +441,8 @@ class TPMoEScratchCaps:
     activation: str = "silu"
     apply_router_weight_on_input: bool = False
     swiglu_limit: float | None = None
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
     source_format: str = "modelopt_nvfp4"
     w13_layout: str = "w13"
     w4a16_weight_layout: str | None = None
@@ -448,12 +469,26 @@ class TPMoEScratchCaps:
                 max(int(self.route_num_experts), 0),
             )
         object.__setattr__(self, "quant_mode", _normalize_quant_mode(self.quant_mode))
+        object.__setattr__(self, "activation", normalize_moe_activation(self.activation))
+        limit, alpha, beta = _normalize_swiglu_params(
+            self.activation,
+            self.swiglu_limit,
+            self.swiglu_alpha,
+            self.swiglu_beta,
+        )
+        object.__setattr__(self, "swiglu_limit", limit)
+        object.__setattr__(self, "swiglu_alpha", alpha)
+        object.__setattr__(self, "swiglu_beta", beta)
         object.__setattr__(
             self,
             "source_format",
             _normalize_fp4_source_format(self.source_format),
         )
-        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+        object.__setattr__(
+            self,
+            "w13_layout",
+            _normalize_w13_layout_for_activation(self.activation, self.w13_layout),
+        )
         if self.w4a16_weight_layout is not None:
             object.__setattr__(
                 self,
@@ -509,6 +544,8 @@ class TPMoEScratchPlan:
         w13_layout: str = "w13",
         prepared_w4a16: object | None = None,
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
     ) -> "TPMoEFP4Binding":
         if int(a.shape[0]) > int(self.caps.max_tokens):
             raise ValueError(
@@ -567,6 +604,8 @@ class TPMoEScratchPlan:
             w13_layout=w13_layout,
             prepared_w4a16=prepared_w4a16,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
 
@@ -604,6 +643,8 @@ class TPMoEFP4Binding:
     w13_layout: str = "w13"
     prepared_w4a16: object | None = None
     swiglu_limit: float | None = None
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
     row_counts: torch.Tensor | None = None
     token_map: torch.Tensor | None = None
     token_weights: torch.Tensor | None = None
@@ -688,6 +729,9 @@ class TPMoESparseFP4Binding:
     fast_math: bool | None = None
     activation: str = "silu"
     quant_mode: str | None = None
+    swiglu_limit: float | None = None
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
 
     def run(self) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
         return b12x_sparse_moe_fp4(binding=self)
@@ -740,14 +784,27 @@ class _ActivationKernelSpec:
     is_gated: bool
     micro_kernel_cls: type
     dynamic_kernel_cls: type
+    default_w13_layout: str = "w13"
 
     def w1_rows(self, n: int) -> int:
         return (2 if self.is_gated else 1) * n
 
-    def make_micro_kernel(self, **kernel_kwargs):
+    def make_micro_kernel(self, *, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None, **kernel_kwargs):
+        if self.activation == SWIGLUOAI_UNINTERLEAVE:
+            kernel_kwargs.update(
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            )
         return self.micro_kernel_cls(**kernel_kwargs)
 
-    def make_dynamic_kernel(self, **kernel_kwargs):
+    def make_dynamic_kernel(self, *, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None, **kernel_kwargs):
+        if self.activation == SWIGLUOAI_UNINTERLEAVE:
+            kernel_kwargs.update(
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            )
         return self.dynamic_kernel_cls(**kernel_kwargs)
 
 
@@ -757,6 +814,13 @@ _ACTIVATION_KERNEL_SPECS = {
         is_gated=True,
         micro_kernel_cls=MoEMicroKernelSilu,
         dynamic_kernel_cls=MoEDynamicKernelSilu,
+    ),
+    SWIGLUOAI_UNINTERLEAVE: _ActivationKernelSpec(
+        activation=SWIGLUOAI_UNINTERLEAVE,
+        is_gated=True,
+        micro_kernel_cls=MoEMicroKernelSwiGLUOAI,
+        dynamic_kernel_cls=MoEDynamicKernelSwiGLUOAI,
+        default_w13_layout="w31",
     ),
     "relu2": _ActivationKernelSpec(
         activation="relu2",
@@ -869,6 +933,28 @@ def _normalize_w13_layout(w13_layout: str) -> str:
         ) from exc
 
 
+def _normalize_w13_layout_for_activation(activation: str, w13_layout: str) -> str:
+    activation = normalize_moe_activation(activation)
+    layout = _normalize_w13_layout(w13_layout)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        return "w31"
+    return layout
+
+
+def _normalize_swiglu_params(
+    activation: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+) -> tuple[float | None, float, float]:
+    activation = normalize_moe_activation(activation)
+    return (
+        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
+        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+    )
+
+
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
@@ -895,18 +981,18 @@ def _get_activation_kernel_spec(
 ) -> _ActivationKernelSpec:
     if _normalize_quant_mode(quant_mode) == "w4a16":
         raise ValueError("W4A16 dispatch uses b12x.moe.fused.w4a16.kernel directly")
+    if _is_w4a8_quant_mode(_normalize_quant_mode(quant_mode)) and activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "activation='swigluoai_uninterleave' is not supported for W4A8 MoE"
+        )
     try:
-        return _ACTIVATION_KERNEL_SPECS[activation]
+        return _ACTIVATION_KERNEL_SPECS[normalize_moe_activation(activation)]
     except KeyError as exc:
         raise ValueError(f"unsupported activation {activation!r}") from exc
 
 
 def _activation_w1_rows(activation: str, n: int) -> int:
-    if activation == "silu":
-        return 2 * n
-    if activation == "relu2":
-        return n
-    raise ValueError(f"unsupported activation {activation!r}")
+    return moe_activation_w1_rows(activation, n)
 
 
 # Override for the dynamic-kernel MMA tile (tile_m, tile_n). Set via the env
@@ -1469,6 +1555,8 @@ def _build_tp_moe_fp4_binding_from_views(
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> TPMoEFP4Binding:
     if a.ndim != 2:
         raise ValueError(
@@ -1489,8 +1577,15 @@ def _build_tp_moe_fp4_binding_from_views(
     quant_mode = _normalize_quant_mode(
         quant_mode if quant_mode is not None else plan.quant_mode
     )
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -1510,6 +1605,16 @@ def _build_tp_moe_fp4_binding_from_views(
         raise ValueError(
             f"scratch plan activation={plan.activation!r} cannot bind "
             f"activation={activation!r}"
+        )
+    if (
+        swiglu_limit != plan.swiglu_limit
+        or swiglu_alpha != plan.swiglu_alpha
+        or swiglu_beta != plan.swiglu_beta
+    ):
+        raise ValueError(
+            "scratch plan activation params do not match binding params: "
+            f"planned=(limit={plan.swiglu_limit}, alpha={plan.swiglu_alpha}, beta={plan.swiglu_beta}), "
+            f"binding=(limit={swiglu_limit}, alpha={swiglu_alpha}, beta={swiglu_beta})"
         )
 
     m, k = map(int, a.shape)
@@ -1571,6 +1676,8 @@ def _build_tp_moe_fp4_binding_from_views(
         w13_layout=w13_layout,
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     if plan.implementation == "w4a16":
         return TPMoEFP4Binding(
@@ -1703,8 +1810,17 @@ def _plan_core_workspace(
     w4a16_scale_format: str | None = None,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     if implementation == "w4a16":
         from b12x.moe.fused.w4a16.host import (
             _W4A16_ALLOWED_ROUTED_SIZES,
@@ -1772,6 +1888,8 @@ def _plan_core_workspace(
                 activation=activation,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
                 element_dtype=_w4a16_element_dtype(dtype),
                 weight_layout=weight_layout,
                 w13_layout=w13_layout,
@@ -1791,6 +1909,9 @@ def _plan_core_workspace(
             implementation=implementation,
             quant_mode=quant_mode,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_capacity,
@@ -1868,6 +1989,9 @@ def _plan_core_workspace(
             implementation=implementation,
             quant_mode=quant_mode,
             activation=activation_spec.activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_rows,
@@ -1934,6 +2058,9 @@ def _plan_core_workspace(
         implementation=implementation,
         quant_mode=quant_mode,
         activation=activation_spec.activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         state_E=state_E,
         weight_E=weight_E,
         routed_rows=routed_rows,
@@ -2135,6 +2262,9 @@ def _materialize_workspace_from_core_arena(
             implementation=plan.implementation,
             quant_mode=plan.quant_mode,
             activation=plan.activation,
+            planned_swiglu_limit=plan.swiglu_limit,
+            planned_swiglu_alpha=plan.swiglu_alpha,
+            planned_swiglu_beta=plan.swiglu_beta,
             state_E=plan.state_E,
             weight_E=plan.weight_E,
             max_rows=plan.max_rows,
@@ -2246,6 +2376,9 @@ def _alloc_workspace(
     max_rows: int,
     input_scales_static: bool,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     dynamic_physical_tiles: int | None = None,
     dynamic_task_capacity: int | None = None,
     pool: TPMoEWorkspacePool | None = None,
@@ -2264,6 +2397,9 @@ def _alloc_workspace(
         routed_rows=routed_rows,
         max_rows=max_rows,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
     )
@@ -2452,8 +2588,11 @@ def _get_weight_views(
     """
     global _LAST_WEIGHTS
     quant_mode = _normalize_quant_mode(quant_mode)
-    w13_layout = _normalize_w13_layout(w13_layout)
-    if w13_layout == "w31" and activation_spec.activation == "silu":
+    w13_layout = _normalize_w13_layout_for_activation(
+        activation_spec.activation,
+        w13_layout,
+    )
+    if w13_layout == "w31" and activation_spec.is_gated:
         _ensure_w13_kernel_order_inplace(
             w1_fp4, w1_blockscale, n=n, k=k, quant_mode=quant_mode
         )
@@ -2557,8 +2696,9 @@ def _get_w4a16_packed_weights(
 ):
     from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
 
+    activation = normalize_moe_activation(activation)
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -3047,8 +3187,18 @@ def _make_workspace_plan(
     dtype: torch.dtype,
     quant_mode: str = "nvfp4",
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     if quant_mode == "w4a16":
         _activation_w1_rows(activation, 1)
     else:
@@ -3094,6 +3244,9 @@ def _make_workspace_plan(
         implementation=implementation,
         quant_mode=quant_mode,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         state_E=state_E,
         weight_E=weight_E,
         routed_rows=routed_rows,
@@ -3299,6 +3452,8 @@ def _validate_frozen_w4a16_launch(
     plan: TPMoEPlan,
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     weight_layout: str,
     scale_format: str,
 ) -> None:
@@ -3326,6 +3481,16 @@ def _validate_frozen_w4a16_launch(
         raise RuntimeError(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
+        )
+    if float(swiglu_alpha) != float(workspace.planned_swiglu_alpha):
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace swiglu_alpha mismatch: "
+            f"requested={float(swiglu_alpha)}, planned={workspace.planned_swiglu_alpha}"
+        )
+    if float(swiglu_beta) != float(workspace.planned_swiglu_beta):
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace swiglu_beta mismatch: "
+            f"requested={float(swiglu_beta)}, planned={workspace.planned_swiglu_beta}"
         )
     planned_scale_format = _normalize_w4a16_scale_format(
         getattr(workspace, "planned_scale_format", "e4m3_k16")
@@ -3437,6 +3602,8 @@ def _resolve_workspace(
     input_scales_static: bool,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     weight_layout: str = "packed",
     scale_format: str = "e4m3_k16",
 ) -> object:
@@ -3586,6 +3753,8 @@ def _resolve_workspace(
             plan=plan,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
             scale_format=scale_format,
         )
@@ -3612,6 +3781,9 @@ def allocate_tp_moe_workspace(
     input_scales_static: bool = False,
     quant_mode: str | None = None,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> TPMoEWorkspace | TPW4A16Workspace:
     """Allocate reusable scratch covering one unchunked `b12x_moe_fp4` call."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -3641,6 +3813,9 @@ def allocate_tp_moe_workspace(
         dtype=a.dtype,
         quant_mode=quant_mode,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     effective_input_scales_static = input_scales_static or (
         a1_gscale.numel() == 1 and a2_gscale.numel() == 1
@@ -3661,6 +3836,9 @@ def allocate_tp_moe_workspace(
         max_rows=plan.max_rows,
         input_scales_static=effective_input_scales_static,
         activation=plan.activation,
+        swiglu_limit=plan.swiglu_limit,
+        swiglu_alpha=plan.swiglu_alpha,
+        swiglu_beta=plan.swiglu_beta,
         dynamic_physical_tiles=plan.dynamic_physical_tiles,
         dynamic_task_capacity=plan.dynamic_task_capacity,
     )
@@ -3682,6 +3860,8 @@ def plan_tp_moe_arena_layout(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
@@ -3689,8 +3869,15 @@ def plan_tp_moe_arena_layout(
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -3723,6 +3910,9 @@ def plan_tp_moe_arena_layout(
             dtype=dtype,
             quant_mode=quant_mode,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -3744,7 +3934,9 @@ def plan_tp_moe_arena_layout(
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=plan.swiglu_limit,
+            swiglu_alpha=plan.swiglu_alpha,
+            swiglu_beta=plan.swiglu_beta,
         )
         core_nbytes = max(core_nbytes, _core_workspace_nbytes(core_plan))
     if route_num_experts > 0:
@@ -3781,6 +3973,8 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         activation=caps.activation,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         swiglu_limit=caps.swiglu_limit,
+        swiglu_alpha=caps.swiglu_alpha,
+        swiglu_beta=caps.swiglu_beta,
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
         w4a16_weight_layout=caps.w4a16_weight_layout,
@@ -3797,6 +3991,9 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         dtype=caps.dtype,
         quant_mode=caps.quant_mode,
         activation=caps.activation,
+        swiglu_limit=caps.swiglu_limit,
+        swiglu_alpha=caps.swiglu_alpha,
+        swiglu_beta=caps.swiglu_beta,
     )
     core_workspace_plan = _plan_core_workspace(
         launch_plan.implementation,
@@ -3818,7 +4015,9 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_weight_layout=caps.w4a16_weight_layout,
         w4a16_scale_format=caps.w4a16_scale_format,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
-        swiglu_limit=caps.swiglu_limit,
+        swiglu_limit=launch_plan.swiglu_limit,
+        swiglu_alpha=launch_plan.swiglu_alpha,
+        swiglu_beta=launch_plan.swiglu_beta,
     )
     return TPMoEScratchPlan(
         caps=caps,
@@ -3848,6 +4047,8 @@ def _prewarm_w4a16_planned_launches(
     token_counts: tuple[int, ...],
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     w13_layout: str = "w13",
@@ -3932,6 +4133,8 @@ def _prewarm_w4a16_planned_launches(
                 sms=sms,
                 max_shared_mem=max_shared_mem,
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
                 weight_layout=weight_layout,
                 scale_format=scale_format,
                 w13_layout=w13_layout,
@@ -4049,6 +4252,8 @@ def _prewarm_w4a16_planned_launches(
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
                     weight_layout=weight_layout,
                     scale_format=scale_format,
                     w13_layout=w13_layout,
@@ -4088,6 +4293,8 @@ def materialize_tp_moe_arena_workspaces(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
@@ -4096,8 +4303,15 @@ def materialize_tp_moe_arena_workspaces(
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -4138,6 +4352,9 @@ def materialize_tp_moe_arena_workspaces(
             dtype=dtype,
             quant_mode=quant_mode,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -4159,7 +4376,9 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=plan.swiglu_limit,
+            swiglu_alpha=plan.swiglu_alpha,
+            swiglu_beta=plan.swiglu_beta,
         )
         required_nbytes = _core_workspace_nbytes(core_plan)
         key = _workspace_pool_key(
@@ -4192,7 +4411,11 @@ def materialize_tp_moe_arena_workspaces(
                     or existing.planned_apply_router_weight_on_input
                     != bool(apply_router_weight_on_input)
                     or existing.planned_swiglu_limit
-                    != _normalize_w4a16_swiglu_limit(swiglu_limit)
+                    != plan.swiglu_limit
+                    or existing.planned_swiglu_alpha
+                    != plan.swiglu_alpha
+                    or existing.planned_swiglu_beta
+                    != plan.swiglu_beta
                     or _normalize_w4a16_scale_format(
                         getattr(existing, "planned_scale_format", "e4m3_k16")
                     )
@@ -4250,15 +4473,17 @@ def materialize_tp_moe_arena_workspaces(
             materialized.planned_apply_router_weight_on_input = bool(
                 apply_router_weight_on_input
             )
-            materialized.planned_swiglu_limit = _normalize_w4a16_swiglu_limit(
-                swiglu_limit
-            )
+            materialized.planned_swiglu_limit = plan.swiglu_limit
+            materialized.planned_swiglu_alpha = plan.swiglu_alpha
+            materialized.planned_swiglu_beta = plan.swiglu_beta
             t_prewarm0 = time.perf_counter() if _B12X_TIMING else 0.0
             _prewarm_w4a16_planned_launches(
                 materialized,
                 token_counts=core_token_counts,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=materialized.planned_swiglu_limit,
+                swiglu_alpha=materialized.planned_swiglu_alpha,
+                swiglu_beta=materialized.planned_swiglu_beta,
                 scale_format=w4a16_scale_format,
                 weight_layout=w4a16_weight_layout,
                 w13_layout=w13_layout,
@@ -4331,6 +4556,8 @@ def build_tp_moe_fp4_binding(
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> TPMoEFP4Binding:
     workspace = scratch
     if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
@@ -4354,8 +4581,15 @@ def build_tp_moe_fp4_binding(
     quant_mode = _normalize_quant_mode(
         quant_mode if quant_mode is not None else workspace_quant_mode
     )
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     m, k = map(int, a.shape)
     num_topk = int(topk_ids.shape[1])
     if prepared_w4a16 is not None:
@@ -4390,6 +4624,9 @@ def build_tp_moe_fp4_binding(
             dtype=a.dtype,
             quant_mode=quant_mode,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
         workspace = _resolve_workspace(
             workspace,
@@ -4399,6 +4636,8 @@ def build_tp_moe_fp4_binding(
             input_scales_static=input_scales_static,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
             scale_format=scale_format,
         )
@@ -4426,6 +4665,8 @@ def build_tp_moe_fp4_binding(
         w13_layout=w13_layout,
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     if isinstance(workspace, TPW4A16Workspace):
         weight_layout = "packed"
@@ -4632,7 +4873,17 @@ def build_tp_moe_sparse_fp4_binding(
     fast_math: bool | None = None,
     activation: str = "silu",
     quant_mode: str | None = None,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> TPMoESparseFP4Binding:
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     if not isinstance(scratch, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
         raise TypeError(
             "scratch must be a TP MoE scratch object"
@@ -4674,6 +4925,9 @@ def build_tp_moe_sparse_fp4_binding(
         fast_math=fast_math,
         activation=activation,
         quant_mode=quant_mode,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
 
@@ -4755,6 +5009,9 @@ def _get_micro_kernel(
     activation: str = "silu",
     device: torch.device | None = None,
     quant_mode: str = "nvfp4",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
@@ -4772,6 +5029,9 @@ def _get_micro_kernel(
         single_token=single_token,
         dynamic_down_scale=dynamic_down_scale,
         a8_mx_mode=is_w4a8,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
     kernel_key = kernel.__cache_key__
@@ -5276,12 +5536,21 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     share_input_across_experts = bool(
         share_input_across_experts and quant_mode == "nvfp4"
     )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation_spec.activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     is_w4a8 = _is_w4a8_quant_mode(quant_mode)
@@ -5295,7 +5564,7 @@ def _get_dynamic_kernel(
     # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
     # inside one SF atom (env override for dev: B12X_DYNAMIC_SWAP_AB=0/1).
     swap_ab = bool(
-        quant_mode == "nvfp4" and activation == "silu"
+        quant_mode == "nvfp4" and activation_spec.is_gated
         and int(n) % 128 != 0 and int(n) % 32 == 0
     )
     _swap_env = os.environ.get("B12X_DYNAMIC_SWAP_AB")
@@ -5316,6 +5585,9 @@ def _get_dynamic_kernel(
         topk_ids_dtype,
         fast_math,
         activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
         dynamic_down_scale,
         share_input_across_experts,
         swap_ab,
@@ -5349,6 +5621,9 @@ def _get_dynamic_kernel(
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel_kwargs["swap_ab"] = swap_ab
+    kernel_kwargs["swiglu_limit"] = swiglu_limit
+    kernel_kwargs["swiglu_alpha"] = swiglu_alpha
+    kernel_kwargs["swiglu_beta"] = swiglu_beta
     if is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
@@ -5635,6 +5910,9 @@ def _launch_dynamic_flat(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -5658,6 +5936,9 @@ def _launch_dynamic_flat(
         activation=activation,
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     if volatile_launch_state:
         barrier_count.zero_()
@@ -5786,6 +6067,9 @@ def _tp_moe_dynamic_launch_op(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     _launch_dynamic_flat(
@@ -5841,6 +6125,9 @@ def _tp_moe_dynamic_launch_op(
         activation=activation,
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         volatile_launch_state=volatile_launch_state,
     )
 
@@ -5899,6 +6186,9 @@ def _tp_moe_dynamic_launch_fake(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     return None
@@ -5925,6 +6215,9 @@ def _launch_dynamic(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
 ) -> None:
     del stream
     torch.ops.b12x.tp_moe_dynamic_launch(
@@ -5980,6 +6273,9 @@ def _launch_dynamic(
         activation,
         quant_mode,
         bool(share_input_across_experts),
+        swiglu_limit,
+        float(swiglu_alpha),
+        float(swiglu_beta),
         workspace.volatile_launch_state,
     )
 
@@ -6011,6 +6307,9 @@ def _launch_compact_micro_flat(
     share_expert_scales: bool,
     activation: str,
     quant_mode: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -6030,6 +6329,9 @@ def _launch_compact_micro_flat(
         activation=activation,
         device=a.device,
         quant_mode=quant_mode,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     if not _compiled_direct_micro_accepts_block_dim(
         compiled,
@@ -6091,6 +6393,9 @@ def _tp_moe_compact_micro_launch_op(
     share_expert_scales: bool,
     activation: str,
     quant_mode: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     _launch_compact_micro_flat(
@@ -6119,6 +6424,9 @@ def _tp_moe_compact_micro_launch_op(
         share_expert_scales=share_expert_scales,
         activation=activation,
         quant_mode=quant_mode,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         volatile_launch_state=volatile_launch_state,
     )
 
@@ -6150,6 +6458,9 @@ def _tp_moe_compact_micro_launch_fake(
     share_expert_scales: bool,
     activation: str,
     quant_mode: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
     return None
@@ -6178,6 +6489,9 @@ def _launch_compact_static(
     share_expert_scales: bool = False,
     activation: str = "silu",
     quant_mode: str = "nvfp4",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     unit_scale_contract: bool = False,
 ) -> None:
     del stream, unit_scale_contract
@@ -6234,6 +6548,9 @@ def _launch_compact_static(
         bool(share_expert_scales),
         activation,
         quant_mode,
+        swiglu_limit,
+        float(swiglu_alpha),
+        float(swiglu_beta),
         workspace.volatile_launch_state,
     )
 
@@ -6270,6 +6587,8 @@ def b12x_moe_fp4(
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     binding: TPMoEFP4Binding | None = None,
 ) -> torch.Tensor:
     """MoE with shape-selected fused direct-micro or dynamic kernels.
@@ -6301,6 +6620,8 @@ def b12x_moe_fp4(
                 ("quant_mode", quant_mode),
                 ("prepared_w4a16", prepared_w4a16),
                 ("swiglu_limit", swiglu_limit),
+                ("swiglu_alpha", swiglu_alpha),
+                ("swiglu_beta", swiglu_beta),
             )
             if value is not None
         ]
@@ -6340,11 +6661,18 @@ def b12x_moe_fp4(
         fast_math = binding.fast_math
         activation = binding.activation
         quant_mode = binding.quant_mode
+        swiglu_limit = binding.swiglu_limit
+        swiglu_alpha = binding.swiglu_alpha
+        swiglu_beta = binding.swiglu_beta
         unit_scale_contract = binding.unit_scale_contract
         source_format = binding.source_format
         w13_layout = binding.w13_layout
         prepared_w4a16 = binding.prepared_w4a16
-        swiglu_limit = binding.swiglu_limit
+        _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
+        _validate_fp4_source_format_for_quant_mode(
+            source_format=_normalize_fp4_source_format(source_format),
+            quant_mode=_normalize_quant_mode(quant_mode),
+        )
         if binding.implementation == "static":
             workspace = TPCompactStaticWorkspace(
                 implementation=binding.implementation,
@@ -6482,8 +6810,15 @@ def b12x_moe_fp4(
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     source_format = _normalize_fp4_source_format(source_format)
-    w13_layout = _normalize_w13_layout(w13_layout)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -6520,7 +6855,15 @@ def b12x_moe_fp4(
         raise NotImplementedError(
             "apply_router_weight_on_input is not implemented in b12x_moe_fp4"
         )
-    if swiglu_limit is not None and quant_mode != "w4a16":
+    if activation == SWIGLUOAI_UNINTERLEAVE and _is_w4a8_quant_mode(quant_mode):
+        raise NotImplementedError(
+            "activation='swigluoai_uninterleave' is not supported for W4A8 MoE"
+        )
+    if (
+        swiglu_limit is not None
+        and activation != SWIGLUOAI_UNINTERLEAVE
+        and quant_mode != "w4a16"
+    ):
         raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
@@ -6610,6 +6953,9 @@ def b12x_moe_fp4(
                 dtype=a.dtype,
                 quant_mode=quant_mode,
                 activation=activation,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
             w4a16_workspace = _resolve_workspace(
                 workspace,
@@ -6619,6 +6965,8 @@ def b12x_moe_fp4(
                 input_scales_static=effective_input_scales_static,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
                 weight_layout=weight_layout,
                 scale_format=scale_format,
             )
@@ -6668,6 +7016,8 @@ def b12x_moe_fp4(
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
         )
@@ -6683,6 +7033,9 @@ def b12x_moe_fp4(
         dtype=a.dtype,
         quant_mode=quant_mode,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
     impl = plan.implementation
@@ -6749,6 +7102,8 @@ def b12x_moe_fp4(
                 unit_scale_contract=unit_scale_contract,
                 w13_layout=w13_layout,
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
         return chunk_output
 
@@ -6860,6 +7215,9 @@ def b12x_moe_fp4(
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             share_input_across_experts=(
                 quant_mode == "nvfp4" and a1_gscale.numel() == 1
             ),
@@ -6896,6 +7254,9 @@ def b12x_moe_fp4(
             ),
             activation=activation,
             quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             unit_scale_contract=unit_scale_contract,
         )
     return scatter_output
@@ -7487,6 +7848,9 @@ def b12x_sparse_moe_fp4(
         fast_math = binding.fast_math
         activation = binding.activation
         quant_mode = binding.quant_mode
+        swiglu_limit = binding.swiglu_limit
+        swiglu_alpha = binding.swiglu_alpha
+        swiglu_beta = binding.swiglu_beta
     else:
         raise TypeError("b12x_sparse_moe_fp4 requires binding")
     if hidden_states is None or experts is None or workspace is None:
@@ -7551,6 +7915,9 @@ def b12x_sparse_moe_fp4(
         quant_mode=quant_mode_arg,
         source_format=experts.source_format,
         w13_layout=experts.w13_layout,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     routed_output = b12x_moe_fp4(binding=moe_binding)
     if routed_scaling_factor != 1.0:

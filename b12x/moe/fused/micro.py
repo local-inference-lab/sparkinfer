@@ -44,6 +44,14 @@ from b12x.cute.fp4 import (
     threadfence,
     warp_reduce,
 )
+from b12x.moe.fused.activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
+)
 
 
 _BLOCK_SIZE = 16
@@ -307,10 +315,11 @@ class MoEMicroKernelBackend:
         a8_mx_mode: bool = False,
         scale_format: str = "e4m3_k16",
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
         w13_layout: str = "w13",
     ):
-        if activation not in {"silu", "relu2"}:
-            raise ValueError(f"unsupported activation {activation!r}")
+        activation = normalize_moe_activation(activation)
         if int(compile_time_phase) not in {0, 1}:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
         if scale_format not in {"e4m3_k16", "e8m0_k32"}:
@@ -321,8 +330,9 @@ class MoEMicroKernelBackend:
             raise ValueError(
                 "e8m0_k32 scales require the W4A16 or a8_mx micro mode"
             )
-        if swiglu_limit is not None and activation != "silu":
-            raise ValueError("swiglu_limit requires the gated (silu) activation")
+        swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
+        swiglu_alpha = normalize_swiglu_alpha_for_activation(activation, swiglu_alpha)
+        swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
         if w13_layout not in {"w13", "w31"}:
             raise ValueError(f"unsupported micro w13_layout {w13_layout!r}")
         self.scale_format = scale_format
@@ -332,10 +342,13 @@ class MoEMicroKernelBackend:
         self.w13_gate_first = w13_layout == "w31"
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
         self.sf_vec_size = sf_vec_size
         del fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = is_gated_moe_activation(activation)
+        self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token
@@ -367,6 +380,8 @@ class MoEMicroKernelBackend:
             self.w13_layout,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_alpha,
+            self.swiglu_beta,
             self._cfg,
             self.m_const,
             self.m1_fc2_onepass,
@@ -2022,10 +2037,15 @@ class MoEMicroKernelBackend:
                                 up_red = limit
                             if up_red < neg_limit:
                                 up_red = neg_limit
+                        sigmoid_arg = gate_red
+                        up_term = up_red
+                        if cutlass.const_expr(self.is_swigluoai):
+                            sigmoid_arg = Float32(self.swiglu_alpha) * gate_red
+                            up_term = up_red + Float32(self.swiglu_beta)
                         sigmoid = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-gate_red, fastmath=False)
+                            Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=False)
                         )
-                        activated = sigmoid * gate_red * up_red
+                        activated = sigmoid * gate_red * up_term
                     else:
                         relu_val = fmax_f32(gate_red, Float32(0.0))
                         activated = relu_val * relu_val

@@ -153,6 +153,10 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             down_sf,
             alpha,
             alpha,
+            w1_storage,
+            w2_storage,
+            alpha,
+            alpha,
             a,
             flat_ids,
             flat_weights,
@@ -171,6 +175,9 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             "silu",
             "nvfp4",
             False,
+            None,
+            1.0,
+            0.0,
             False,
         )
 
@@ -200,6 +207,9 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             False,
             "silu",
             "nvfp4",
+            None,
+            1.0,
+            0.0,
             False,
         )
 
@@ -242,6 +252,8 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             True,
             "e8m0_k32",
             False,
+            0.0,
+            1.0,
             0.0,
             "w13",
             0,
@@ -291,6 +303,8 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             120,
             101376,
             False,
+            0.0,
+            1.0,
             0.0,
             "modelopt",
             "e8m0_k32",

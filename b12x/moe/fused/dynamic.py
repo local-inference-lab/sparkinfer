@@ -88,6 +88,14 @@ from b12x.gemm.dense import (
     sm120_make_smem_layout_sfb,
 )
 from b12x.cute.fp4 import scatter_add_v4_bf16x2
+from b12x.moe.fused.activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
+)
 
 
 _SF_VEC_SIZE = 16
@@ -399,17 +407,31 @@ class MoEDynamicKernelBackend:
         share_input_across_experts: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
     ):
-        if activation not in {"silu", "relu2"}:
-            raise ValueError(f"unsupported activation {activation!r}")
+        activation = normalize_moe_activation(activation)
         if quant_recipe not in {"nvfp4", "w4a8_mx", "w4a8_nvfp4"}:
             raise ValueError(f"unsupported quant_recipe {quant_recipe!r}")
+        if quant_recipe != "nvfp4" and activation == SWIGLUOAI_UNINTERLEAVE:
+            raise NotImplementedError(
+                "activation='swigluoai_uninterleave' is not supported by W4A8 MoE"
+            )
+        swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
+        swiglu_alpha = normalize_swiglu_alpha_for_activation(activation, swiglu_alpha)
+        swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = is_gated_moe_activation(activation)
+        self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.has_swiglu_limit = swiglu_limit is not None
+        self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
         # w4a8 recipes: E4M3 activations (dynamic per-32 UE8M0 block scales)
         # against the same packed-FP4 weight bytes, computed on the FP8
         # m16n8k32 block-scale MMA. "w4a8_nvfp4" additionally applies the
@@ -437,7 +459,7 @@ class MoEDynamicKernelBackend:
         # non-128 per-shard n (e.g. 32 | 352) is legal and the gate-half base
         # rides the sub-128 M-atom SF slice instead of straddling N SF atoms.
         # FC2 stays in the normal orientation, so FC1 builds its own tiled_mma.
-        self.swap_ab = bool(swap_ab) and activation == "silu"
+        self.swap_ab = bool(swap_ab) and self.is_gated
         # FC1 swap produce-tile width (intermediate cols per swapped MMA tile).
         # 32: for any 32-aligned n the gate-half base n%128 in {0,32,64,96}, so
         # offset+32 <= 128 always fits one 128-row SF atom; and tile_m=32 keeps
@@ -685,6 +707,27 @@ class MoEDynamicKernelBackend:
             cute.append(self.sa_tile_shape_mk, ab_stage),
             order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
         )
+
+    @cute.jit
+    def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
+        if cutlass.const_expr(self.has_swiglu_limit):
+            limit = cutlass.Float32(self.swiglu_limit)
+            neg_limit = cutlass.Float32(-self.swiglu_limit)
+            if gate > limit:
+                gate = limit
+            if up > limit:
+                up = limit
+            if up < neg_limit:
+                up = neg_limit
+        sigmoid_arg = gate
+        up_term = up
+        if cutlass.const_expr(self.is_swigluoai):
+            sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
+            up_term = up + cutlass.Float32(self.swiglu_beta)
+        sigmoid = cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=self.fast_math)
+        )
+        return gate * sigmoid * up_term
 
     @cute.jit
     def _resident_grid_barrier(
@@ -2262,11 +2305,8 @@ class MoEDynamicKernelBackend:
                                     _tk = _c[1]
                                     _g = alpha_value * _g_mn[_am, _an]
                                     _u = alpha_value * _u_mn[_am, _an]
-                                    _sig = cute.arch.rcp_approx(
-                                        cutlass.Float32(1.0) + cute.math.exp(-_g, fastmath=self.fast_math)
-                                    )
                                     _int_col = _s * self._fc1_int_tile + _ir
-                                    _val = (_g * _sig * _u).to(cutlass.BFloat16)
+                                    _val = self._gated_activation_value(_g, _u).to(cutlass.BFloat16)
                                     if cutlass.const_expr(_n_total % self.tile_shape_mnk[1] != 0):
                                         if _int_base + _int_col >= Int32(_n_total):
                                             _val = cutlass.BFloat16(0.0)
@@ -2671,10 +2711,7 @@ class MoEDynamicKernelBackend:
                                             for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                                 g = alpha_value * gate_slice[elem_idx]
                                                 u = alpha_value * up_slice[elem_idx]
-                                                sigmoid_g = cute.arch.rcp_approx(
-                                                    cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math),
-                                                )
-                                                tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                                tRS_rD_slice[elem_idx] = self._gated_activation_value(g, u)
                                         else:
                                             for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                                 g = alpha_value * gate_slice[elem_idx]
@@ -2891,10 +2928,7 @@ class MoEDynamicKernelBackend:
                                             for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                                 g = alpha_value * gate_slice[elem_idx]
                                                 u = alpha_value * up_slice[elem_idx]
-                                                sigmoid_g = cute.arch.rcp_approx(
-                                                    cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math),
-                                                )
-                                                tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                                tRS_rD_slice[elem_idx] = self._gated_activation_value(g, u)
                                         else:
                                             for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                                 g = alpha_value * gate_slice[elem_idx]

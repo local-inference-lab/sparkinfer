@@ -75,6 +75,14 @@ from b12x.moe.fused.w4a16.host import (
     validate_activation,
 )
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.moe.fused.activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
+)
 from b12x.moe.fused.micro import MoEMicroKernelBackend, _direct_k_segments_for_k
 
 
@@ -164,12 +172,21 @@ def _e8m0_logical_tail_scale_n(size_n: int) -> int:
 
 
 def _normalize_swiglu_limit(swiglu_limit: float | None) -> float | None:
-    if swiglu_limit is None:
-        return None
-    limit = float(swiglu_limit)
-    if not math.isfinite(limit) or limit <= 0.0:
-        raise ValueError(f"swiglu_limit must be positive and finite, got {limit}")
-    return limit
+    return normalize_swiglu_limit_for_activation("silu", swiglu_limit)
+
+
+def _normalize_activation_swiglu_params(
+    activation: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+) -> tuple[float | None, float, float]:
+    activation = normalize_moe_activation(activation)
+    return (
+        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
+        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+    )
 
 
 def _w4a16_num_regs(
@@ -406,6 +423,8 @@ class W4A16ActivationCompileResult:
     intermediate_size: int
     activation: str
     swiglu_limit: float | None
+    swiglu_alpha: float
+    swiglu_beta: float
 
 
 @dataclass(frozen=True)
@@ -430,6 +449,8 @@ class W4A16FusedMoeCompileResult:
     element_dtype: str
     fast_math: bool
     swiglu_limit: float | None
+    swiglu_alpha: float
+    swiglu_beta: float
     fc1_tile_n: int
     fc1_tile_k: int
     fc2_tile_n: int
@@ -522,6 +543,8 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         single_token: bool,
         scale_format: str = "e4m3_k16",
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
         w13_layout: str = "w13",
     ):
         super().__init__(
@@ -537,6 +560,8 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
             w4a16_mode=True,
             scale_format=scale_format,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
         )
 
@@ -3480,16 +3505,22 @@ class W4A16FusedMoeKernel:
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
         weight_layout: str = "packed",
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         direct_topk_routes: bool = False,
         tc_decode_fused_sum: bool = False,
     ):
+        activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
-        swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
-        if swiglu_limit is not None and not is_gated:
-            raise ValueError("swiglu_limit requires a gated W4A16 activation")
+        swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         scale_format = _normalize_scale_format(scale_format)
@@ -3513,8 +3544,11 @@ class W4A16FusedMoeKernel:
         self.top_k = int(top_k)
         self.activation = activation
         self.activation_is_gated = is_gated
+        self.activation_is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
         self.weight_layout = weight_layout
         self.scale_format = scale_format
         self.w13_layout = w13_layout
@@ -3596,8 +3630,11 @@ class W4A16FusedMoeKernel:
             self.top_k,
             self.activation,
             self.activation_is_gated,
+            self.activation_is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_alpha,
+            self.swiglu_beta,
             self.weight_layout,
             self.scale_format,
             self.apply_router_weight_on_input,
@@ -3894,14 +3931,22 @@ class W4A16FusedMoeKernel:
                     cutlass.Float32
                 )
                 gate, up = self._clamp_swiglu_inputs(gate, up)
+                sigmoid_arg = gate
+                up_term = up
+                if cutlass.const_expr(self.activation_is_swigluoai):
+                    sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
+                    up_term = up + cutlass.Float32(self.swiglu_beta)
                 if cutlass.const_expr(self.fast_math):
-                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                    exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
-                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                    exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
                 silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
-                activated_bf16_flat[idx] = self._cast_elem(
-                    self._cast_elem(silu) * self._cast_elem(up)
-                )
+                if cutlass.const_expr(self.activation_is_swigluoai):
+                    activated_bf16_flat[idx] = self._cast_elem(silu * up_term)
+                else:
+                    activated_bf16_flat[idx] = self._cast_elem(
+                        self._cast_elem(silu) * self._cast_elem(up_term)
+                    )
             else:
                 x = fc1_bf16_flat[idx].to(cutlass.Float32)
                 if x < cutlass.Float32(0.0):
@@ -3920,11 +3965,17 @@ class W4A16ActivationKernel:
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
     ):
+        activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
-        swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
-        if swiglu_limit is not None and not is_gated:
-            raise ValueError("swiglu_limit requires a gated W4A16 activation")
+        swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if rows <= 0 or intermediate_size <= 0:
@@ -3933,8 +3984,11 @@ class W4A16ActivationKernel:
         self.intermediate_size = int(intermediate_size)
         self.activation = activation
         self.is_gated = is_gated
+        self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
@@ -3946,8 +4000,11 @@ class W4A16ActivationKernel:
             self.intermediate_size,
             self.activation,
             self.is_gated,
+            self.is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_alpha,
+            self.swiglu_beta,
             self.element_dtype,
             self.fast_math,
             self.cta_threads,
@@ -4013,14 +4070,22 @@ class W4A16ActivationKernel:
                     cutlass.Float32
                 )
                 gate, up = self._clamp_swiglu_inputs(gate, up)
+                sigmoid_arg = gate
+                up_term = up
+                if cutlass.const_expr(self.is_swigluoai):
+                    sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
+                    up_term = up + cutlass.Float32(self.swiglu_beta)
                 if cutlass.const_expr(self.fast_math):
-                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                    exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
-                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                    exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
                 silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
-                activated_flat[idx] = self._cast_elem(
-                    self._cast_elem(silu) * self._cast_elem(up)
-                )
+                if cutlass.const_expr(self.is_swigluoai):
+                    activated_flat[idx] = self._cast_elem(silu * up_term)
+                else:
+                    activated_flat[idx] = self._cast_elem(
+                        self._cast_elem(silu) * self._cast_elem(up_term)
+                    )
             else:
                 x = fc1_flat[idx].to(cutlass.Float32)
                 if x < cutlass.Float32(0.0):
@@ -4172,6 +4237,8 @@ def _small_m_direct_supported(
     activation: str,
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     element_dtype: str,
     weight_layout: str,
     w13_layout: str,
@@ -4180,14 +4247,21 @@ def _small_m_direct_supported(
 ) -> bool:
     if os.environ.get("B12X_W4A16_SMALL_M_DIRECT", "1") == "0":
         return False
-    if activation not in {"silu", "relu2"}:
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
+    if activation == SWIGLUOAI_UNINTERLEAVE and swiglu_limit is None:
         return False
     return (
         element_dtype == "bf16"
         and weight_layout == "modelopt"
         and w13_layout in ("w13", "w31")
         and not bool(apply_router_weight_on_input)
-        and (swiglu_limit is None or activation == "silu")
+        and (swiglu_limit is None or activation in ("silu", SWIGLUOAI_UNINTERLEAVE))
         and expert_map is None
         and _W4A16SmallMDirectKernel.is_supported(
             m=m,
@@ -4213,10 +4287,19 @@ def _compile_w4a16_small_m_direct(
     device: torch.device | None,
     scale_format: str = "e4m3_k16",
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     w13_layout: str = "w13",
 ) -> _W4A16SmallMDirectLaunch:
     if topk_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     cache_key = (
         "w4a16_small_m_direct",
         None if device is None else int(device.index or 0),
@@ -4230,6 +4313,8 @@ def _compile_w4a16_small_m_direct(
         topk_ids_dtype,
         scale_format,
         swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
         w13_layout,
     )
     cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
@@ -4244,6 +4329,8 @@ def _compile_w4a16_small_m_direct(
         single_token=(int(m) == 1),
         scale_format=scale_format,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
     )
     kernel.configure(
@@ -4478,6 +4565,8 @@ def compile_w4a16_fused_moe(
     sms: int,
     max_shared_mem: int,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     weight_layout: str = "packed",
     scale_format: str = "e4m3_k16",
     w13_layout: str = "w13",
@@ -4487,10 +4576,14 @@ def compile_w4a16_fused_moe(
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    activation = normalize_moe_activation(activation)
     is_gated = validate_activation(activation)
-    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
-    if swiglu_limit is not None and not is_gated:
-        raise ValueError("swiglu_limit requires a gated W4A16 activation")
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     if weight_layout == "modelopt":
@@ -4714,6 +4807,8 @@ def compile_w4a16_fused_moe(
         element_dtype=element_dtype,
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
         scale_format=scale_format,
         w13_layout=w13_layout,
@@ -4743,6 +4838,8 @@ def compile_w4a16_fused_moe(
         activation=activation,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         element_dtype=element_dtype,
         weight_layout=weight_layout,
         w13_layout=w13_layout,
@@ -4760,6 +4857,8 @@ def compile_w4a16_fused_moe(
                 topk_ids_dtype=ids_dtype,
                 scale_format=scale_format,
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
                 w13_layout=w13_layout,
                 device=torch.device("cuda", device) if device is not None else None,
             )
@@ -4933,6 +5032,8 @@ def compile_w4a16_fused_moe(
         element_dtype=element_dtype,
         fast_math=bool(fast_math),
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         fc1_tile_n=fc1_tile_n,
         fc1_tile_k=fc1_tile_k,
         fc2_tile_n=fc2_tile_n,
@@ -4966,12 +5067,18 @@ def compile_w4a16_activation(
     element_dtype: str = "bf16",
     fast_math: bool = True,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> W4A16ActivationCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    activation = normalize_moe_activation(activation)
     is_gated = validate_activation(activation)
-    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
-    if swiglu_limit is not None and not is_gated:
-        raise ValueError("swiglu_limit requires a gated W4A16 activation")
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     kernel = W4A16ActivationKernel(
         rows=rows,
         intermediate_size=intermediate_size,
@@ -4979,6 +5086,8 @@ def compile_w4a16_activation(
         element_dtype=element_dtype,
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     cache_key = (
         "w4a16_activation",
@@ -5021,6 +5130,8 @@ def compile_w4a16_activation(
         intermediate_size=intermediate_size,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     _ACTIVATION_CACHE[cache_key] = result
     return result
@@ -5095,6 +5206,8 @@ def _w4a16_small_m_direct_launch_flat(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     w13_layout: str,
     stream_int: int,
 ) -> None:
@@ -5110,6 +5223,8 @@ def _w4a16_small_m_direct_launch_flat(
         topk_ids_dtype=topk_ids.dtype,
         scale_format=scale_format,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
         device=a_input.device,
     )
@@ -5168,6 +5283,8 @@ def _w4a16_small_m_direct_launch_op(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     w13_layout: str,
     stream_int: int,
 ) -> None:
@@ -5195,6 +5312,8 @@ def _w4a16_small_m_direct_launch_op(
         scale_format=scale_format,
         has_swiglu_limit=has_swiglu_limit,
         swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
         stream_int=stream_int,
     )
@@ -5225,6 +5344,8 @@ def _w4a16_small_m_direct_launch_fake(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     w13_layout: str,
     stream_int: int,
 ) -> None:
@@ -5266,6 +5387,8 @@ def _w4a16_fused_moe_launch_flat(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
@@ -5290,6 +5413,8 @@ def _w4a16_fused_moe_launch_flat(
         sms=sms,
         max_shared_mem=max_shared_mem,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
         scale_format=scale_format,
         w13_layout=w13_layout,
@@ -5365,7 +5490,7 @@ def _w4a16_fused_persistent_grid_x(
     cap = int(sms) * int(fused.blocks_per_sm)
     if not direct_topk_routes or m <= 0:
         return max(cap, 1)
-    is_gated = activation in ("silu", "swiglu")
+    is_gated = is_gated_moe_activation(activation)
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     fc1_tile_n = int(getattr(fused, "fc1_tile_n", 0))
     if fc1_tile_n <= 0 or fc1_cols % fc1_tile_n != 0:
@@ -5427,6 +5552,8 @@ def _w4a16_fused_moe_launch_op(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
@@ -5469,6 +5596,8 @@ def _w4a16_fused_moe_launch_op(
         max_shared_mem=max_shared_mem,
         has_swiglu_limit=has_swiglu_limit,
         swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
         scale_format=scale_format,
         w13_layout=w13_layout,
@@ -5514,6 +5643,8 @@ def _w4a16_fused_moe_launch_fake(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
@@ -5765,14 +5896,20 @@ def run_w4a16_moe(
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
+    activation = normalize_moe_activation(activation)
     is_gated = validate_activation(activation)
-    swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
-    if swiglu_limit is not None and not is_gated:
-        raise ValueError("swiglu_limit requires a gated W4A16 activation")
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     element_dtype = _normalize_element_dtype(a_input.dtype)
     if output.dtype != a_input.dtype:
         raise TypeError(f"output must have dtype {a_input.dtype}, got {output.dtype}")
@@ -5846,6 +5983,8 @@ def run_w4a16_moe(
         activation=activation,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         element_dtype=element_dtype,
         weight_layout=weight_layout,
         w13_layout=w13_layout,
@@ -5915,6 +6054,8 @@ def run_w4a16_moe(
             scale_format,
             swiglu_limit is not None,
             float(swiglu_limit or 0.0),
+            float(swiglu_alpha),
+            float(swiglu_beta),
             w13_layout,
             int(stream),
         )
@@ -6083,6 +6224,8 @@ def run_w4a16_moe(
             sms=sms,
             max_shared_mem=max_shared_mem,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
             scale_format=scale_format,
             w13_layout=w13_layout,
@@ -6106,6 +6249,8 @@ def run_w4a16_moe(
             element_dtype,
             bool(fast_math),
             swiglu_limit,
+            float(swiglu_alpha),
+            float(swiglu_beta),
             weight_layout,
             scale_format,
             w13_layout,
@@ -6123,6 +6268,8 @@ def run_w4a16_moe(
             fused_launch.element_dtype,
             bool(fused_launch.fast_math),
             fused_launch.swiglu_limit,
+            float(fused_launch.swiglu_alpha),
+            float(fused_launch.swiglu_beta),
             getattr(fused_launch, "weight_layout", "packed"),
             getattr(fused_launch, "scale_format", "e4m3_k16"),
             getattr(
@@ -6230,6 +6377,8 @@ def run_w4a16_moe(
         max_shared_mem,
         swiglu_limit is not None,
         float(swiglu_limit or 0.0),
+        float(swiglu_alpha),
+        float(swiglu_beta),
         weight_layout,
         scale_format,
         w13_layout,

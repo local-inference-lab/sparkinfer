@@ -80,6 +80,8 @@ def _make_fp4_binding_from_kwargs(**kwargs) -> TPMoEFP4Binding:
         w13_layout=kwargs.get("w13_layout", "w13"),
         prepared_w4a16=kwargs.get("prepared_w4a16"),
         swiglu_limit=kwargs.get("swiglu_limit"),
+        swiglu_alpha=kwargs.get("swiglu_alpha"),
+        swiglu_beta=kwargs.get("swiglu_beta"),
     )
 
 
@@ -89,22 +91,23 @@ def _make_fp4_binding(
     routing: B12XTopKRouting,
     **kwargs,
 ) -> TPMoEFP4Binding:
-    return _make_fp4_binding_from_kwargs(
-        a=hidden_states,
-        a1_gscale=experts.a1_gscale,
-        w1_fp4=experts.w1_fp4,
-        w1_blockscale=experts.w1_blockscale,
-        w1_alphas=experts.w1_alphas,
-        a2_gscale=experts.a2_gscale,
-        w2_fp4=experts.w2_fp4,
-        w2_blockscale=experts.w2_blockscale,
-        w2_alphas=experts.w2_alphas,
-        topk_weights=routing.topk_weights,
-        topk_ids=routing.topk_ids,
-        source_format=experts.source_format,
-        w13_layout=experts.w13_layout,
-        **kwargs,
-    )
+    binding_kwargs = {
+        "a": hidden_states,
+        "a1_gscale": experts.a1_gscale,
+        "w1_fp4": experts.w1_fp4,
+        "w1_blockscale": experts.w1_blockscale,
+        "w1_alphas": experts.w1_alphas,
+        "a2_gscale": experts.a2_gscale,
+        "w2_fp4": experts.w2_fp4,
+        "w2_blockscale": experts.w2_blockscale,
+        "w2_alphas": experts.w2_alphas,
+        "topk_weights": routing.topk_weights,
+        "topk_ids": routing.topk_ids,
+        "source_format": experts.source_format,
+        "w13_layout": experts.w13_layout,
+    }
+    binding_kwargs.update(kwargs)
+    return _make_fp4_binding_from_kwargs(**binding_kwargs)
 
 
 def _make_sparse_binding(
@@ -267,6 +270,9 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["quant_mode"] = kwargs.get("quant_mode")
         captured["source_format"] = kwargs.get("source_format")
         captured["w13_layout"] = kwargs.get("w13_layout")
+        captured["swiglu_limit"] = kwargs.get("swiglu_limit")
+        captured["swiglu_alpha"] = kwargs.get("swiglu_alpha")
+        captured["swiglu_beta"] = kwargs.get("swiglu_beta")
         return _make_fp4_binding_from_kwargs(**kwargs)
 
     def fake_b12x_moe_fp4(*, binding):
@@ -284,7 +290,11 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         input_scales_are_reciprocal=True,
         input_scales_static=True,
         fast_math=False,
+        activation="swigluoai_uninterleave",
         quant_mode="w4a16",
+        swiglu_limit=5.0,
+        swiglu_alpha=1.5,
+        swiglu_beta=0.25,
     )
     with (
         patch.object(tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding),
@@ -297,10 +307,13 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "output": output,
         "input_scales_static": True,
         "fast_math": False,
-        "activation": "silu",
+        "activation": "swigluoai_uninterleave",
         "quant_mode": "w4a16",
         "source_format": "compressed_tensors",
         "w13_layout": "w13",
+        "swiglu_limit": 5.0,
+        "swiglu_alpha": 1.5,
+        "swiglu_beta": 0.25,
     }
 
 

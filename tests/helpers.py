@@ -62,6 +62,8 @@ def make_tp_moe_fp4_binding(
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -90,6 +92,8 @@ def make_tp_moe_fp4_binding(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             source_format=source_format,
             w13_layout=w13_layout,
         )
@@ -123,6 +127,8 @@ def make_tp_moe_fp4_binding(
         w13_layout=w13_layout,
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
 

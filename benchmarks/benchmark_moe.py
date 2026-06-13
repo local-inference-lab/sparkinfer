@@ -35,6 +35,15 @@ from b12x.moe.fused.reference import (
     moe_reference_w4a16_f32,
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
+from b12x.moe.fused.activations import (
+    SUPPORTED_MOE_ACTIVATIONS,
+    SWIGLUOAI_DEFAULT_ALPHA,
+    SWIGLUOAI_DEFAULT_BETA,
+    SWIGLUOAI_DEFAULT_LIMIT,
+    SWIGLUOAI_UNINTERLEAVE,
+    moe_activation_w1_rows,
+    normalize_moe_activation,
+)
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 from b12x.cute.utils import get_hardware_info
 from tests.w4a16_reference import moe_reference_w4a16
@@ -67,6 +76,21 @@ EP_RANK = 0
 _L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 _AUTO_L2_FLUSH_MULTIPLIER = 2
 _FALLBACK_L2_FLUSH_BYTES = 32 << 20
+BENCHMARK_ACTIVATION_CHOICES = sorted(SUPPORTED_MOE_ACTIVATIONS)
+
+
+@dataclass(frozen=True)
+class ActivationParams:
+    swiglu_limit: float | None = None
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
+
+    def kwargs(self) -> dict[str, float | None]:
+        return {
+            "swiglu_limit": self.swiglu_limit,
+            "swiglu_alpha": self.swiglu_alpha,
+            "swiglu_beta": self.swiglu_beta,
+        }
 
 
 def require_sm120() -> None:
@@ -265,6 +289,8 @@ class ModelProfile:
     default_quant_mode: str | None = None
     default_validate: str = "oracle"
     default_swiglu_limit: float | None = None
+    default_swiglu_alpha: float | None = None
+    default_swiglu_beta: float | None = None
     default_routing: str = "synthetic"
     shape: ShapeSpec | None = None
 
@@ -353,6 +379,18 @@ MODEL_PROFILES = {
         tp_size=2,
         hf_repo_id=None,
         default_model_path=pathlib.Path("/data/models/MiniMax-M2.7-NVFP4"),
+    ),
+    "minimax-m3": ModelProfile(
+        label="MiniMax-M3",
+        checkpoint_family="minimax_m3",
+        default_layer_idx=0,
+        tp_size=2,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path("/data/models/MiniMax-M3-NVFP4"),
+        default_activation=SWIGLUOAI_UNINTERLEAVE,
+        default_swiglu_limit=SWIGLUOAI_DEFAULT_LIMIT,
+        default_swiglu_alpha=SWIGLUOAI_DEFAULT_ALPHA,
+        default_swiglu_beta=SWIGLUOAI_DEFAULT_BETA,
     ),
 }
 
@@ -510,7 +548,7 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             tp_size=tp,
             tp_rank=tp_rank,
         )
-    if profile.checkpoint_family == "minimax_m2":
+    if profile.checkpoint_family in {"minimax_m2", "minimax_m3"}:
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["intermediate_size"],
@@ -562,8 +600,7 @@ def make_shape_only_expert_weights(
     layer_idx: int,
     activation: str,
 ) -> ExpertWeights:
-    if activation not in {"relu2", "silu"}:
-        raise ValueError("shape-only W4A16 profile expects relu2 or silu experts")
+    activation = normalize_moe_activation(activation)
     if spec.hidden_size % 16 != 0 or spec.I_tp % 16 != 0:
         raise ValueError(
             f"shape-only W4A16 profile requires K and I_tp divisible by 16, got K={spec.hidden_size}, I_tp={spec.I_tp}"
@@ -573,7 +610,7 @@ def make_shape_only_expert_weights(
     E = spec.num_experts
     K = spec.hidden_size
     I_tp = spec.I_tp
-    w13_rows = I_tp * (2 if activation == "silu" else 1)
+    w13_rows = moe_activation_w1_rows(activation, I_tp)
 
     print(
         f"  Creating synthetic shape-only experts (E={E}, K={K}, I_tp={I_tp}, activation={activation})...",
@@ -644,8 +681,7 @@ def load_expert_weights(
     checkpoint_family: str = "qwen",
     keep_flashinfer_oracle_copy: bool = False,
 ) -> ExpertWeights:
-    if activation not in {"silu", "relu2"}:
-        raise ValueError(f"unsupported activation {activation!r}")
+    activation = normalize_moe_activation(activation)
 
     device = torch.device("cuda")
     E = spec.num_experts
@@ -672,9 +708,11 @@ def load_expert_weights(
     cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
 
-    if checkpoint_family in {"qwen", "glm", "minimax_m2"}:
+    if checkpoint_family in {"qwen", "glm", "minimax_m2", "minimax_m3"}:
         if checkpoint_family in {"glm", "minimax_m2"} and activation != "silu":
             raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
+        if checkpoint_family == "minimax_m3" and activation != SWIGLUOAI_UNINTERLEAVE:
+            raise ValueError("minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts")
         if checkpoint_family == "qwen":
             cfg_num_experts = cfg["num_experts"]
             cfg_intermediate_size = cfg["moe_intermediate_size"]
@@ -682,7 +720,7 @@ def load_expert_weights(
             gate_proj = "gate_proj"
             up_proj = "up_proj"
             down_proj = "down_proj"
-        elif checkpoint_family == "minimax_m2":
+        elif checkpoint_family in {"minimax_m2", "minimax_m3"}:
             cfg_num_experts = cfg["num_local_experts"]
             cfg_intermediate_size = cfg["intermediate_size"]
             prefix = f"model.layers.{layer_idx}.block_sparse_moe.experts"
@@ -735,8 +773,13 @@ def load_expert_weights(
             down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(device)
         print(" done.")
 
-        w13_weight = torch.cat([up_w, gate_w], dim=1).contiguous()
-        w13_sf = torch.cat([up_sf, gate_sf], dim=1).contiguous()
+        if checkpoint_family == "minimax_m3":
+            w13_layout = "w31"
+            w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
+            w13_sf = torch.cat([gate_sf, up_sf], dim=1).contiguous()
+        else:
+            w13_weight = torch.cat([up_w, gate_w], dim=1).contiguous()
+            w13_sf = torch.cat([up_sf, gate_sf], dim=1).contiguous()
         w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
         w2_weight = down_w.contiguous()
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
@@ -1370,8 +1413,10 @@ def make_oracle_reference(
     topk_weights: torch.Tensor,
     *,
     activation: str,
-    swiglu_limit: float | None = None,
+    activation_params: ActivationParams | None = None,
 ) -> torch.Tensor:
+    activation = normalize_moe_activation(activation)
+    activation_params = activation_params or ActivationParams()
     spec = weights.spec
     quant_mode = quant_mode.lower()
     if quant_mode == "w4a16":
@@ -1395,7 +1440,7 @@ def make_oracle_reference(
                     spec.hidden_size,
                     spec.I_tp,
                     activation=activation,
-                    swiglu_limit=swiglu_limit,
+                    swiglu_limit=activation_params.swiglu_limit,
                 )
             return moe_reference_w4a16_fp4_e8m0_k32(
                 x,
@@ -1411,8 +1456,8 @@ def make_oracle_reference(
                 spec.hidden_size,
                 spec.I_tp,
                 activation=activation,
-                swiglu_limit=swiglu_limit,
                 w13_layout=weights.w13_layout,
+                **activation_params.kwargs(),
             )
         if oracle_mode == "f32":
             return moe_reference_w4a16_f32(
@@ -1429,10 +1474,15 @@ def make_oracle_reference(
                 spec.hidden_size,
                 spec.I_tp,
                 activation=activation,
-                swiglu_limit=swiglu_limit,
+                **activation_params.kwargs(),
             )
         if oracle_mode != "w4a16":
             raise ValueError(f"unsupported W4A16 oracle mode {oracle_mode!r}")
+        if activation == SWIGLUOAI_UNINTERLEAVE:
+            raise ValueError(
+                "--oracle-mode w4a16 does not support swigluoai_uninterleave; "
+                "use --oracle-mode f32"
+            )
         return moe_reference_w4a16(
             x,
             weights.w13_weight,
@@ -1469,6 +1519,7 @@ def make_oracle_reference(
         spec.hidden_size,
         spec.I_tp,
         activation=activation,
+        **activation_params.kwargs(),
     )
 
 
@@ -1491,6 +1542,12 @@ ORACLE_TOLERANCES = {
         "mean_abs": None,
         "cos_min": 0.9915,
     },
+    SWIGLUOAI_UNINTERLEAVE: {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9975,
+    },
 }
 
 W4A16_ORACLE_TOLERANCES = {
@@ -1505,6 +1562,12 @@ W4A16_ORACLE_TOLERANCES = {
         "rmse": None,
         "mean_abs": None,
         "cos_min": 0.9900,
+    },
+    SWIGLUOAI_UNINTERLEAVE: {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9975,
     },
 }
 
@@ -1625,12 +1688,15 @@ def allocate_layer_chain_workspace(
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     *,
+    activation: str,
+    activation_params: ActivationParams | None = None,
     quant_mode: str = "nvfp4",
 ):
     from b12x.integration.tp_moe import allocate_tp_moe_workspace
 
     if not weights_stack:
         raise ValueError("weights_stack must not be empty")
+    activation_params = activation_params or ActivationParams()
     return allocate_tp_moe_workspace(
         x,
         params_stack[0].a1_gscale,
@@ -1640,6 +1706,8 @@ def allocate_layer_chain_workspace(
         topk_ids_per_layer[0],
         input_scales_static=True,
         quant_mode=quant_mode,
+        activation=activation,
+        **activation_params.kwargs(),
     )
 
 
@@ -1651,6 +1719,7 @@ def run_moe_layer_chain(
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
     activation: str,
+    activation_params: ActivationParams | None = None,
     fast_math: bool,
     quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor] | None = None,
@@ -1667,6 +1736,7 @@ def run_moe_layer_chain(
         raise ValueError("layer-chain inputs must all have the same length")
     if output_buffers is not None and len(output_buffers) != len(weights_stack):
         raise ValueError("output_buffers must match the number of layers")
+    activation_params = activation_params or ActivationParams()
 
     layer_outputs: list[torch.Tensor] = []
     current = x
@@ -1694,6 +1764,7 @@ def run_moe_layer_chain(
             quant_mode=quant_mode,
             source_format=weights.source_format,
             w13_layout=weights.w13_layout,
+            **activation_params.kwargs(),
         )
         layer_outputs.append(current)
     return layer_outputs
@@ -1707,6 +1778,7 @@ def capture_moe_layer_chain(
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
     activation: str,
+    activation_params: ActivationParams | None = None,
     fast_math: bool,
     quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor],
@@ -1721,6 +1793,7 @@ def capture_moe_layer_chain(
             topk_ids_per_layer,
             topk_weights_per_layer,
             activation=activation,
+            activation_params=activation_params,
             fast_math=fast_math,
             quant_mode=quant_mode,
             output_buffers=output_buffers,
@@ -1755,6 +1828,7 @@ def bench_multilayer_graph_mode(
     device: torch.device,
 ) -> None:
     graph_num_layers = args.graph_num_layers
+    activation_params = args.activation_params
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     if graph_num_layers < 2:
         raise ValueError("--graph-num-layers must be at least 2 in multi-layer graph mode")
@@ -1831,6 +1905,8 @@ def bench_multilayer_graph_mode(
             params_stack,
             x_buf,
             topk_ids_bufs,
+            activation=args.activation,
+            activation_params=activation_params,
             quant_mode=args.quant_mode,
         )
 
@@ -1841,6 +1917,7 @@ def bench_multilayer_graph_mode(
             topk_ids_bufs,
             topk_weights_bufs,
             activation=args.activation,
+            activation_params=activation_params,
             fast_math=args.fast_math,
             quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
@@ -1854,6 +1931,7 @@ def bench_multilayer_graph_mode(
             topk_ids_bufs,
             topk_weights_bufs,
             activation=args.activation,
+            activation_params=activation_params,
             fast_math=args.fast_math,
             quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
@@ -1868,6 +1946,7 @@ def bench_multilayer_graph_mode(
                 topk_ids_bufs,
                 topk_weights_bufs,
                 activation=args.activation,
+                activation_params=activation_params,
                 fast_math=args.fast_math,
                 quant_mode=args.quant_mode,
                 output_buffers=eager_output_bufs,
@@ -1982,12 +2061,24 @@ def bench_e2e() -> None:
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
-    parser.add_argument("--activation", choices=["silu", "relu2"], default=None)
+    parser.add_argument("--activation", choices=BENCHMARK_ACTIVATION_CHOICES, default=None)
     parser.add_argument(
         "--swiglu-limit",
         type=float,
         default=None,
-        help="Clamp gated W4A16 SwiGLU inputs before silu/up multiply; defaults to the model profile value.",
+        help="Clamp gated SwiGLU inputs before activation; defaults to the model profile value.",
+    )
+    parser.add_argument(
+        "--swiglu-alpha",
+        type=float,
+        default=None,
+        help="SwiGLU-OAI sigmoid multiplier; defaults to the model profile value.",
+    )
+    parser.add_argument(
+        "--swiglu-beta",
+        type=float,
+        default=None,
+        help="SwiGLU-OAI up-shift term; defaults to the model profile value.",
     )
     parser.add_argument(
         "--quant-mode",
@@ -2064,16 +2155,29 @@ def bench_e2e() -> None:
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
         args.activation = model_profile.default_activation
+    args.activation = normalize_moe_activation(args.activation)
     if args.quant_mode is None:
         args.quant_mode = model_profile.default_quant_mode or quant_mode_default
     use_w4a16 = args.quant_mode == "w4a16"
     swiglu_limit = args.swiglu_limit if args.swiglu_limit is not None else model_profile.default_swiglu_limit
+    swiglu_alpha = args.swiglu_alpha if args.swiglu_alpha is not None else model_profile.default_swiglu_alpha
+    swiglu_beta = args.swiglu_beta if args.swiglu_beta is not None else model_profile.default_swiglu_beta
+    activation_params = ActivationParams(
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
+    args.activation_params = activation_params
     if args.validate is None:
         args.validate = model_profile.default_validate
     if args.reference is None:
-        args.reference = "none" if use_w4a16 else "flashinfer"
+        args.reference = "none" if use_w4a16 or args.activation != "silu" else "flashinfer"
     if args.oracle_mode is None:
-        args.oracle_mode = args.quant_mode
+        args.oracle_mode = (
+            "f32"
+            if use_w4a16 and args.activation == SWIGLUOAI_UNINTERLEAVE
+            else args.quant_mode
+        )
     keep_flashinfer_oracle_copy = args.validate == "oracle" and args.oracle_mode == "flashinfer"
     batch_sizes = (
         args.batch_sizes
@@ -2131,6 +2235,10 @@ def bench_e2e() -> None:
         print("W4A16 kernel: fused W4A16 FC1+FC2")
     if swiglu_limit is not None:
         print(f"SwiGLU limit: {swiglu_limit:g}")
+    if swiglu_alpha is not None:
+        print(f"SwiGLU alpha: {swiglu_alpha:g}")
+    if swiglu_beta is not None:
+        print(f"SwiGLU beta: {swiglu_beta:g}")
     if args.flush_l2:
         print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     else:
@@ -2278,7 +2386,6 @@ def bench_e2e() -> None:
             topk_ids_w,
             activation=args.activation,
             fast_math=args.fast_math,
-            swiglu_limit=swiglu_limit,
             intermediate_cache13=warmup_buffers.intermediate_cache13,
             intermediate_cache2=warmup_buffers.intermediate_cache2,
             output=warmup_buffers.output,
@@ -2288,6 +2395,7 @@ def bench_e2e() -> None:
             block_expert_ids=warmup_buffers.block_expert_ids,
             packed_route_count=warmup_buffers.packed_route_count,
             expert_offsets=warmup_buffers.expert_offsets,
+            **activation_params.kwargs(),
         )
     else:
         warmup_workspace = allocate_tp_moe_workspace_pool()
@@ -2310,6 +2418,7 @@ def bench_e2e() -> None:
             unit_scale_contract=unit_scale_contract,
             source_format=weights.source_format,
             w13_layout=weights.w13_layout,
+            **activation_params.kwargs(),
         )
     torch.cuda.synchronize()
     print(" done.")
@@ -2342,6 +2451,7 @@ def bench_e2e() -> None:
                 unit_scale_contract=unit_scale_contract,
                 source_format=rw.source_format,
                 w13_layout=rw.w13_layout,
+                **activation_params.kwargs(),
             )
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
@@ -2404,7 +2514,6 @@ def bench_e2e() -> None:
                         topk_ids_local,
                         activation=args.activation,
                         fast_math=args.fast_math,
-                        swiglu_limit=swiglu_limit,
                         intermediate_cache13=backend_w4a16_buffers.intermediate_cache13,
                         intermediate_cache2=backend_w4a16_buffers.intermediate_cache2,
                         output=backend_output,
@@ -2414,6 +2523,7 @@ def bench_e2e() -> None:
                         block_expert_ids=backend_w4a16_buffers.block_expert_ids,
                         packed_route_count=backend_w4a16_buffers.packed_route_count,
                         expert_offsets=backend_w4a16_buffers.expert_offsets,
+                        **activation_params.kwargs(),
                     )
                 return b12x_moe_fp4(
                     x,
@@ -2435,6 +2545,7 @@ def bench_e2e() -> None:
                     unit_scale_contract=unit_scale_contract,
                     source_format=weights.source_format,
                     w13_layout=weights.w13_layout,
+                    **activation_params.kwargs(),
                 )
 
             def impl_e2e() -> torch.Tensor:
@@ -2497,7 +2608,7 @@ def bench_e2e() -> None:
                 topk_ids,
                 topk_weights,
                 activation=args.activation,
-                swiglu_limit=swiglu_limit,
+                activation_params=activation_params,
             )
             print(
                 "  oracle:".ljust(28),
@@ -2708,6 +2819,7 @@ def bench_e2e() -> None:
                         unit_scale_contract=unit_scale_contract,
                         source_format=rw.source_format,
                         w13_layout=rw.w13_layout,
+                        **activation_params.kwargs(),
                     )
 
                 # Warm eager launches

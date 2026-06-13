@@ -6,10 +6,16 @@ from dataclasses import dataclass
 
 import torch
 
+from b12x.moe.fused.activations import (
+    SUPPORTED_MOE_ACTIVATIONS,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+)
+
 
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
-_SUPPORTED_ACTIVATIONS = {"silu", "relu2"}
+_SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
 
 @dataclass(frozen=True)
@@ -47,9 +53,8 @@ class W4A16BufferPlan:
 
 
 def validate_activation(activation: str) -> bool:
-    if activation not in _SUPPORTED_ACTIVATIONS:
-        raise ValueError(f"unsupported activation {activation!r}")
-    return activation == "silu"
+    activation = normalize_moe_activation(activation)
+    return is_gated_moe_activation(activation)
 
 
 def validate_w4a16_packed_inputs(

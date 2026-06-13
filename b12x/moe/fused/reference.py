@@ -4,6 +4,15 @@ from dataclasses import dataclass
 
 import torch
 from b12x.cute.fp4 import fp4_quantize_values_torch
+from b12x.moe.fused.activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    moe_activation_w1_rows,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
+)
 
 
 @dataclass(frozen=True)
@@ -126,14 +135,62 @@ def _validate_reference_inputs(
     I_tp: int,
     activation: str,
 ) -> None:
-    if activation not in {"silu", "relu2"}:
-        raise ValueError(f"unsupported activation {activation!r}")
-    expected_w1_rows = 2 * I_tp if activation == "silu" else I_tp
+    activation = normalize_moe_activation(activation)
+    expected_w1_rows = moe_activation_w1_rows(activation, I_tp)
     if w1_fp4.shape[1] != expected_w1_rows:
         raise ValueError(
             f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
             f"{activation!r}, got {w1_fp4.shape[1]}"
         )
+
+
+def _normalize_reference_swiglu_params(
+    activation: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+) -> tuple[str, float | None, float, float]:
+    activation = normalize_moe_activation(activation)
+    return (
+        activation,
+        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
+        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+    )
+
+
+def _gated_row_slices(
+    activation: str,
+    I_tp: int,
+    *,
+    w13_layout: str | None = None,
+) -> tuple[slice, slice]:
+    activation = normalize_moe_activation(activation)
+    if w13_layout is not None:
+        layout = _normalize_w13_layout(w13_layout)
+        if layout == "w31":
+            return slice(0, I_tp), slice(I_tp, 2 * I_tp)
+        return slice(I_tp, 2 * I_tp), slice(0, I_tp)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        return slice(0, I_tp), slice(I_tp, 2 * I_tp)
+    return slice(I_tp, 2 * I_tp), slice(0, I_tp)
+
+
+def _apply_gated_activation(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    activation: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+) -> torch.Tensor:
+    if swiglu_limit is not None:
+        gate = torch.clamp(gate, max=float(swiglu_limit))
+        up = torch.clamp(up, min=-float(swiglu_limit), max=float(swiglu_limit))
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        return gate * torch.sigmoid(float(swiglu_alpha) * gate) * (up + float(swiglu_beta))
+    return gate * torch.sigmoid(gate) * up
 
 
 def _make_fp4_lut(device: torch.device) -> torch.Tensor:
@@ -221,11 +278,13 @@ def _interleave_flashinfer_w1_w3_rows(
     intermediate_size: int,
     activation: str,
 ) -> torch.Tensor:
-    if activation != "silu":
+    activation = normalize_moe_activation(activation)
+    if not is_gated_moe_activation(activation):
         return tensor.contiguous()
-    w1 = tensor[:, :intermediate_size]
-    w3 = tensor[:, intermediate_size:]
-    return torch.stack([w3, w1], dim=2).reshape(tensor.shape).contiguous()
+    gate_rows, up_rows = _gated_row_slices(activation, intermediate_size)
+    gate = tensor[:, gate_rows]
+    up = tensor[:, up_rows]
+    return torch.stack([up, gate], dim=2).reshape(tensor.shape).contiguous()
 
 
 def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
@@ -247,12 +306,17 @@ def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
     Scale bytes stay E8M0 bytes; the final float8_e4m3fn dtype is only
     FlashInfer's ABI carrier for the interleaved byte storage.
     """
+    activation = normalize_moe_activation(activation)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "FlashInfer TRT-LLM FP4 preparation does not support swigluoai_uninterleave"
+        )
     _validate_reference_inputs(w13_fp4, I_tp, activation)
     if not w13_fp4.is_cuda or not w2_fp4.is_cuda:
         raise RuntimeError("FlashInfer TRT-LLM FP4 preparation requires CUDA tensors")
     if int(K) % 32 != 0 or int(I_tp) % 32 != 0:
         raise ValueError(f"FlashInfer MXFP4 prep requires K and I_tp divisible by 32, got K={K}, I_tp={I_tp}")
-    rows_w13 = 2 * int(I_tp) if activation == "silu" else int(I_tp)
+    rows_w13 = moe_activation_w1_rows(activation, I_tp)
     if tuple(w13_e8m0_scale.shape) != (int(w13_fp4.shape[0]), rows_w13, int(K) // 32):
         raise ValueError(
             f"w13_e8m0_scale must have shape {(int(w13_fp4.shape[0]), rows_w13, int(K) // 32)}, "
@@ -383,6 +447,11 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer(
     swiglu_limit: float | None = None,
     scale_byte_clamp: int | None = _E8M0_K32_BF16_MAX_SCALE_BYTE,
 ) -> torch.Tensor:
+    activation = normalize_moe_activation(activation)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
+        )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if int(E) != int(w1_fp4.shape[0]) or int(E) != int(w2_fp4.shape[0]):
         raise ValueError("E must match the expert dimension of w1_fp4 and w2_fp4")
@@ -425,6 +494,11 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
     activation: str = "silu",
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
+    activation = normalize_moe_activation(activation)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
+        )
     if x.dtype != torch.bfloat16:
         raise TypeError(f"FlashInfer W4A16 oracle expects BF16 activations, got {x.dtype}")
     if int(E) != int(prepared.w13.shape[0]) or int(E) != int(prepared.w2.shape[0]):
@@ -528,11 +602,22 @@ def _trace_nvfp4_route(
     expert_idx: int,
     router_weight: float,
     activation: str,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> MoERouteTrace:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
     fp4_lut = _make_fp4_lut(x_f32.device)
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
 
     x_dequant = _quantize_vec_to_fp4_dequant(
         x_f32,
@@ -547,23 +632,31 @@ def _trace_nvfp4_route(
     up_out = None
     if is_gated:
         w13_sf = unswizzle_block_scale(w1_blockscale_eid, 2 * I_tp, K // block_size)
+        gate_rows, up_rows = _gated_row_slices(activation, I_tp)
         up_dequant = _apply_block_scales(
-            _dequant_fp4(w1_fp4_eid[:I_tp], I_tp, K, fp4_lut),
-            w13_sf[:I_tp],
+            _dequant_fp4(w1_fp4_eid[up_rows], I_tp, K, fp4_lut),
+            w13_sf[up_rows],
             I_tp,
             K,
             block_size=block_size,
         )
         gate_dequant = _apply_block_scales(
-            _dequant_fp4(w1_fp4_eid[I_tp:], I_tp, K, fp4_lut),
-            w13_sf[I_tp:],
+            _dequant_fp4(w1_fp4_eid[gate_rows], I_tp, K, fp4_lut),
+            w13_sf[gate_rows],
             I_tp,
             K,
             block_size=block_size,
         )
         gate_out = (gate_dequant @ x_dequant) * alpha_fc1
         up_out = (up_dequant @ x_dequant) * alpha_fc1
-        intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
+        intermediate = _apply_gated_activation(
+            gate_out,
+            up_out,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        ).to(torch.bfloat16).float()
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
         fc1_dequant = _apply_block_scales(
@@ -634,7 +727,18 @@ def trace_moe_reference_nvfp4_route(
     token_idx: int,
     route_idx: int,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> MoERouteTrace:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if token_idx < 0 or token_idx >= x.shape[0]:
@@ -666,6 +770,9 @@ def trace_moe_reference_nvfp4_route(
         expert_idx=expert_idx,
         router_weight=router_weight,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
 
@@ -686,10 +793,21 @@ def moe_reference_f32(
     I_tp: int,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> torch.Tensor:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     del E
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
 
@@ -748,15 +866,23 @@ def moe_reference_f32(
 
             if is_gated:
                 w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                gate_rows, up_rows = _gated_row_slices(activation, I_tp)
                 up_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, up_rows], I_tp, K), w13_sf[up_rows], I_tp, K,
                 )
                 gate_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, gate_rows], I_tp, K), w13_sf[gate_rows], I_tp, K,
                 )
                 gate_out = (gate_dequant @ x_dequant) * alpha_fc1
                 up_out = (up_dequant @ x_dequant) * alpha_fc1
-                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+                intermediate = _apply_gated_activation(
+                    gate_out,
+                    up_out,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                )
             else:
                 w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
                 fc1_dequant = apply_block_scales(
@@ -791,12 +917,20 @@ def moe_reference_w4a16_f32(
     *,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> torch.Tensor:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     del E
-    is_gated = activation == "silu"
-    if swiglu_limit is not None and not is_gated:
-        raise ValueError("swiglu_limit requires a gated W4A16 activation")
+    is_gated = is_gated_moe_activation(activation)
 
     block_size = 16
     fp4_lut = _make_fp4_lut(x.device)
@@ -817,26 +951,31 @@ def moe_reference_w4a16_f32(
 
             if is_gated:
                 w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                gate_rows, up_rows = _gated_row_slices(activation, I_tp)
                 up_dequant = _apply_block_scales(
-                    _dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K, fp4_lut),
-                    w13_sf[:I_tp],
+                    _dequant_fp4(w1_fp4[eid, up_rows], I_tp, K, fp4_lut),
+                    w13_sf[up_rows],
                     I_tp,
                     K,
                     block_size=block_size,
                 )
                 gate_dequant = _apply_block_scales(
-                    _dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K, fp4_lut),
-                    w13_sf[I_tp:],
+                    _dequant_fp4(w1_fp4[eid, gate_rows], I_tp, K, fp4_lut),
+                    w13_sf[gate_rows],
                     I_tp,
                     K,
                     block_size=block_size,
                 )
                 gate_out = (gate_dequant @ x_f32) * alpha_fc1
                 up_out = (up_dequant @ x_f32) * alpha_fc1
-                if swiglu_limit is not None:
-                    gate_out = torch.clamp(gate_out, max=swiglu_limit)
-                    up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
-                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+                intermediate = _apply_gated_activation(
+                    gate_out,
+                    up_out,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                )
             else:
                 w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
                 fc1_dequant = _apply_block_scales(
@@ -878,15 +1017,23 @@ def moe_reference_w4a16_fp4_e8m0_k32(
     *,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     w13_layout: str = "w31",
 ) -> torch.Tensor:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if int(E) != int(w1_fp4.shape[0]) or int(E) != int(w2_fp4.shape[0]):
         raise ValueError("E must match the expert dimension of w1_fp4 and w2_fp4")
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     w13_layout = _normalize_w13_layout(w13_layout)
-    if swiglu_limit is not None and not is_gated:
-        raise ValueError("swiglu_limit requires a gated W4A16 activation")
 
     block_size = 32
     if int(K) % block_size != 0:
@@ -895,7 +1042,7 @@ def moe_reference_w4a16_fp4_e8m0_k32(
         raise ValueError(
             f"E8M0 K/32 oracle requires compact I_tp divisible by 8, got I_tp={I_tp}"
         )
-    w1_rows = 2 * int(I_tp) if is_gated else int(I_tp)
+    w1_rows = moe_activation_w1_rows(activation, I_tp)
     expected_w1_scale = (int(E), w1_rows, int(K) // block_size)
     expected_w2_scale = (int(E), int(K), (int(I_tp) + block_size - 1) // block_size)
     if tuple(w1_e8m0_scale.shape) != expected_w1_scale:
@@ -922,12 +1069,11 @@ def moe_reference_w4a16_fp4_e8m0_k32(
             w2_sf = _e8m0_scales_to_float(w2_e8m0_scale[eid])
             if is_gated:
                 w13_sf = _e8m0_scales_to_float(w1_e8m0_scale[eid])
-                if w13_layout == "w31":
-                    gate_rows = slice(0, I_tp)
-                    up_rows = slice(I_tp, 2 * I_tp)
-                else:
-                    up_rows = slice(0, I_tp)
-                    gate_rows = slice(I_tp, 2 * I_tp)
+                gate_rows, up_rows = _gated_row_slices(
+                    activation,
+                    I_tp,
+                    w13_layout=w13_layout,
+                )
                 up_dequant = _apply_block_scales(
                     _dequant_fp4(w1_fp4[eid, up_rows], I_tp, K, fp4_lut),
                     w13_sf[up_rows],
@@ -944,10 +1090,14 @@ def moe_reference_w4a16_fp4_e8m0_k32(
                 )
                 gate_out = (gate_dequant @ x_f32) * alpha_fc1
                 up_out = (up_dequant @ x_f32) * alpha_fc1
-                if swiglu_limit is not None:
-                    gate_out = torch.clamp(gate_out, max=swiglu_limit)
-                    up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
-                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+                intermediate = _apply_gated_activation(
+                    gate_out,
+                    up_out,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                )
             else:
                 w1_sf = _e8m0_scales_to_float(w1_e8m0_scale[eid])
                 fc1_dequant = _apply_block_scales(
@@ -990,7 +1140,18 @@ def moe_reference_nvfp4(
     I_tp: int,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> torch.Tensor:
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     m = x.shape[0]
     top_k = topk_ids.shape[1]
@@ -1017,6 +1178,9 @@ def moe_reference_nvfp4(
                 token_idx=t,
                 route_idx=k_idx,
                 activation=activation,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
             assert trace.expert_idx == eid
             output[t] += trace.routed_out_accum
@@ -1207,10 +1371,15 @@ def moe_reference_w4a8_mx(
     are unswizzled ``[E, rows, K/32]`` UE8M0 bytes; ``w*_alphas`` carry the
     per-expert weight global dequant scale (ones for MXFP4 sources).
     """
+    activation = normalize_moe_activation(activation)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "W4A8 MoE reference does not support swigluoai_uninterleave"
+        )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if K % 32 != 0 or I_tp % 32 != 0:
         raise ValueError("K and I_tp must be divisible by 32 for w4a8")
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     device = x.device
     fp4_lut = _make_fp4_lut(device)
     m = x.shape[0]
@@ -1271,9 +1440,14 @@ def trace_moe_reference_w4a8_route(
     activation: str = "silu",
 ) -> MoERouteTrace:
     """Single-route stage trace for the w4a8 oracle (kernel debugging aid)."""
+    activation = normalize_moe_activation(activation)
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        raise NotImplementedError(
+            "W4A8 MoE reference does not support swigluoai_uninterleave"
+        )
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     device = x.device
     fp4_lut = _make_fp4_lut(device)
 
