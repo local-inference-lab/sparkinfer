@@ -639,6 +639,9 @@ def paged_attention_forward(
                 f"page-stride tile counts, got {k_tiles_per_entry} vs {v_tiles_per_entry}"
             )
         page_tiles_per_entry = k_tiles_per_entry
+    single_request_decode_graph = False
+    single_qtile_decode_graph = False
+    regularized_decode_graph = False
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
@@ -657,6 +660,7 @@ def paged_attention_forward(
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
+            and not bool(plan.msa_block_sparse)
             and plan.gqa_group_size <= plan.cta_tile_q
             and workspace._decode_graph_chunk_pages_lut is not None
             and plan.num_qo_tiles == 1
@@ -672,7 +676,7 @@ def paged_attention_forward(
             and plan.page_table_shape[0] > 1
             and max(plan.qo_tile_indices, default=0) == 0
         )
-        regularized_decode_graph = bool(
+        regularized_decode_graph = (
             single_qtile_decode_graph and workspace._use_regular_decode_graph_replay
         )
         forward_kernel = _build_forward_kernel(
@@ -855,18 +859,16 @@ def paged_attention_forward(
         if use_capacity_contract and workspace._plan_output is not None
         else forward_output
     )
-    static_decode_graph_bucket = (
-        plan.mode == "decode" and plan.enable_cuda_graph and not plan.split_kv
-    )
-    dynamic_first_dim = (0,)
+    cuda_graph_decode = plan.mode == "decode" and plan.enable_cuda_graph
+    dynamic_first_dim = () if cuda_graph_decode else (0,)
     grid_worklist_dynamic_first_dim = (
-        () if static_decode_graph_bucket else dynamic_first_dim
+        () if cuda_graph_decode else dynamic_first_dim
     )
     forward_lse_dynamic_dims = (
-        (0,) if plan.split_kv else (1,)
+        dynamic_first_dim if plan.split_kv else (() if cuda_graph_decode else (1,))
     )
     forward_lse_dynamic_strides = (
-        () if plan.split_kv else (0,)
+        () if plan.split_kv or cuda_graph_decode else (0,)
     )
     forward_cache_key = [
         _traits_compile_key(traits),
@@ -875,6 +877,10 @@ def paged_attention_forward(
             bool(plan.split_kv),
             bool(plan.enable_cuda_graph),
             int(plan.gqa_group_size),
+            bool(single_request_decode_graph),
+            bool(single_qtile_decode_graph),
+            bool(regularized_decode_graph),
+            bool(plan.mode == "decode"),
             bool(use_native_fp8_qk),
             bool(use_native_fp8_pv),
             bool(decode_native_fp8_runtime_chunk_guard),
@@ -962,7 +968,17 @@ def paged_attention_forward(
     forward_cache_key.append(
         _tensor_meta_key(
             q2k_indices,
-            dynamic_dims=(() if static_decode_graph_bucket else (1,)),
+            dynamic_dims=(() if cuda_graph_decode else (1,)),
+            dynamic_strides=(
+                (0,)
+                if (
+                    not cuda_graph_decode
+                    and q2k_indices is not None
+                    and getattr(q2k_indices, "ndim", 0) >= 1
+                    and int(q2k_indices.shape[0]) == 1
+                )
+                else ()
+            ),
         )
     )
     cache_key_labels.append("q2k_indices")
@@ -1017,7 +1033,7 @@ def paged_attention_forward(
     forward_args.append(stream)
     forward_spec = KernelCompileSpec.from_key(
         "attention.paged.forward",
-        3,
+        5,
         tuple(forward_cache_key),
         labels=tuple(cache_key_labels),
     )
@@ -1090,17 +1106,18 @@ def paged_attention_forward(
             lse_arg,
             total_num_rows_arg,
         )
+        merge_dynamic_first_dim = () if cuda_graph_decode else (0,)
         merge_cache_key = (
-            _tensor_meta_key(workspace.tmp_output, dynamic_dims=(0,)),
-            _tensor_meta_key(workspace.tmp_lse, dynamic_dims=(0,)),
-            _tensor_meta_key(workspace.merge_indptr, dynamic_dims=(0,)),
-            _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
+            _tensor_meta_key(workspace.tmp_output, dynamic_dims=merge_dynamic_first_dim),
+            _tensor_meta_key(workspace.tmp_lse, dynamic_dims=merge_dynamic_first_dim),
+            _tensor_meta_key(workspace.merge_indptr, dynamic_dims=merge_dynamic_first_dim),
+            _tensor_meta_key(cache_seqlens, dynamic_dims=merge_dynamic_first_dim),
             _tensor_meta_key(workspace.kv_chunk_size_ptr),
-            _tensor_meta_key(output, dynamic_dims=(0,)),
+            _tensor_meta_key(output, dynamic_dims=merge_dynamic_first_dim),
             _tensor_meta_key(
                 workspace.lse,
-                dynamic_dims=(1,),
-                dynamic_strides=(0,),
+                dynamic_dims=(() if cuda_graph_decode else (1,)),
+                dynamic_strides=(() if cuda_graph_decode else (0,)),
             ),
             None
             if merge_regular_decode_graph
@@ -1112,7 +1129,7 @@ def paged_attention_forward(
         )
         merge_spec = KernelCompileSpec.from_key(
             "attention.paged.merge",
-            1,
+            2,
             merge_cache_key,
             labels=(
                 "tmp_output",

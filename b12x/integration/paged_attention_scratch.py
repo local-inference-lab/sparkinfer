@@ -828,6 +828,8 @@ class B12XPagedAttentionScratch:
             raise RuntimeError("decode graph scratch is missing kv_chunk_size_ptr")
         if self.total_num_rows_ptr is None:
             raise RuntimeError("decode graph scratch is missing total_num_rows_ptr")
+        if self.cu_seqlens_q is None:
+            raise RuntimeError("decode graph scratch is missing cu_seqlens_q")
         if self.block_valid_mask is None:
             raise RuntimeError("decode graph scratch is missing block_valid_mask")
         if self.kv_window_start_tokens is None:
@@ -872,6 +874,14 @@ class B12XPagedAttentionScratch:
                 kv_chunk_size=int(self._plan.kv_chunk_size),
                 page_size=self.page_size,
             )
+            batch = int(self.cache_seqlens.shape[0])
+            if int(self.cu_seqlens_q.shape[0]) < batch + 1:
+                raise RuntimeError(
+                    "decode graph cu_seqlens_q is smaller than the graph batch"
+                )
+            self.total_num_rows_ptr[:1].copy_(
+                self.cu_seqlens_q[batch : batch + 1]
+            )
         elif self._use_regular_decode_graph_replay:
             from b12x.attention.paged.graph_replay import (
                 update_regular_decode_graph_chunk_metadata_from_lut,
@@ -906,7 +916,10 @@ class B12XPagedAttentionScratch:
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
             )
-        if not torch.cuda.is_current_stream_capturing():
+        if (
+            not getattr(self._plan, "msa_block_sparse", False)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             self.total_num_rows_ptr[0] = int(self._plan.total_q)
         return self
 

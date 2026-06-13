@@ -44,7 +44,9 @@ def _msa_dense_mask_reference(
     q_offsets = [int(v) for v in cu_seqlens_q.detach().cpu().tolist()]
     scale = head_dim ** -0.5
 
-    for request_idx, (q_start, q_end) in enumerate(zip(q_offsets[:-1], q_offsets[1:])):
+    for request_idx, (q_start, q_end) in enumerate(
+        zip(q_offsets[:-1], q_offsets[1:], strict=False)
+    ):
         cache_len = int(cache_seqlens[request_idx].item())
         qo_len = q_end - q_start
         k_full, v_full = materialize_paged_kv_cache(
@@ -930,6 +932,832 @@ def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
         ).item()
         >= cos_min
     )
+
+
+@torch.inference_mode()
+def test_msa_decode_cuda_graph_captures_minimax_metadata_update_contract() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    batch = 4
+    page_size = 128
+    page_table_width = 80
+    num_pages = 512
+    lse_tol = 5e-2
+    cos_min = 0.995
+
+    def make_case(cache_lens: list[int], *, seed: int):
+        q_c, k_c, v_c, table_c, seqlens_c, cu_c = make_paged_inputs(
+            q_seqlens=[1] * batch,
+            cache_seqlens=cache_lens,
+            page_size=page_size,
+            q_heads=16,
+            kv_heads=1,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            seed=seed,
+            page_table_width=page_table_width,
+            num_pages=num_pages,
+        )
+        k_q, v_q, k_ds, v_ds = quantize_paged_kv_cache_e4m3(
+            k_c, v_c, table_c, seqlens_c
+        )
+        combined = torch.stack([k_q, v_q], dim=1)
+        k_q = combined[:, 0]
+        v_q = combined[:, 1]
+        assert not k_q.is_contiguous()
+        return (
+            q_c,
+            k_q,
+            v_q,
+            table_c,
+            seqlens_c,
+            cu_c,
+            k_ds,
+            v_ds,
+        )
+
+    (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+    ) = make_case([2048, 5000, 129, 4096], seed=1601)
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        total_q_capacity=batch,
+        seed=1602,
+        force_block0=True,
+    )
+    q2k_data_ptr = int(q2k_indices.data_ptr())
+    page_table_data_ptr = int(page_table.data_ptr())
+    cache_seqlens_data_ptr = int(cache_seqlens.data_ptr())
+    cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
+
+    scratch_plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=q.device,
+            mode="decode",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            head_dim_qk=q.shape[2],
+            head_dim_vo=v_cache.shape[3],
+            page_size=page_size,
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=page_table_width,
+            max_work_items=batch * 32,
+            max_partial_rows=batch * 32,
+            num_cache_pages=num_pages,
+            use_cuda_graph=True,
+            msa_block_sparse=True,
+        )
+    )
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=batch,
+        max_page_table_width=page_table_width,
+        max_cache_page_count=page_table_width,
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=q.device)
+        for shape, dtype in scratch_plan.shapes_and_dtypes()
+    )
+    output = torch.empty_like(q)
+
+    def bind_current():
+        return scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q2k_indices=q2k_indices,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    binding = bind_current()
+    out, lse = paged_attention_forward(binding=binding)
+    torch.cuda.synchronize()
+    ref_out, ref_lse = msa_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch.testing.assert_close(lse * math.log(2.0), ref_lse, rtol=lse_tol, atol=lse_tol)
+    assert (
+        torch.nn.functional.cosine_similarity(
+            out.to(torch.float32).reshape(-1),
+            ref_out.to(torch.float32).reshape(-1),
+            dim=0,
+        ).item()
+        >= cos_min
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        binding = bind_current()
+        paged_attention_forward(binding=binding)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    lse_view = binding.scratch.current_lse_view() * math.log(2.0)
+    torch.testing.assert_close(lse_view, ref_lse, rtol=lse_tol, atol=lse_tol)
+    assert (
+        torch.nn.functional.cosine_similarity(
+            output.to(torch.float32).reshape(-1),
+            ref_out.to(torch.float32).reshape(-1),
+            dim=0,
+        ).item()
+        >= cos_min
+    )
+
+    (
+        q_next,
+        k_next,
+        v_next,
+        page_table_next,
+        cache_seqlens_next,
+        cu_seqlens_q_next,
+        k_descale_next,
+        v_descale_next,
+    ) = make_case([1, 129, 2048, 5000], seed=1603)
+    q2k_next = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens_next,
+        cu_seqlens_q=cu_seqlens_q_next,
+        num_kv_heads=1,
+        total_q_capacity=batch,
+        seed=1604,
+        force_block0=True,
+    )
+    q.copy_(q_next)
+    k_cache.copy_(k_next)
+    v_cache.copy_(v_next)
+    page_table.copy_(page_table_next)
+    cache_seqlens.copy_(cache_seqlens_next)
+    cu_seqlens_q.copy_(cu_seqlens_q_next)
+    if k_descale is not None:
+        assert k_descale_next is not None
+        k_descale.copy_(k_descale_next)
+    if v_descale is not None:
+        assert v_descale_next is not None
+        v_descale.copy_(v_descale_next)
+    q2k_indices.copy_(q2k_next)
+    assert int(q2k_indices.data_ptr()) == q2k_data_ptr
+    assert int(page_table.data_ptr()) == page_table_data_ptr
+    assert int(cache_seqlens.data_ptr()) == cache_seqlens_data_ptr
+    assert int(cu_seqlens_q.data_ptr()) == cu_seqlens_q_data_ptr
+
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_out_next, ref_lse_next = msa_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    lse_next = binding.scratch.current_lse_view() * math.log(2.0)
+    torch.testing.assert_close(lse_next, ref_lse_next, rtol=lse_tol, atol=lse_tol)
+    assert (
+        torch.nn.functional.cosine_similarity(
+            output.to(torch.float32).reshape(-1),
+            ref_out_next.to(torch.float32).reshape(-1),
+            dim=0,
+        ).item()
+        >= cos_min
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
+    kv_dtype: str,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    page_size = 128
+    page_table_width = 1024
+    num_pages = 2048
+    lse_tol = 5e-2
+    cos_min = 0.995
+
+    def make_case(cache_len: int, *, seed: int):
+        q_c, k_c, v_c, table_c, seqlens_c, cu_c = make_paged_inputs(
+            q_seqlens=[1],
+            cache_seqlens=[cache_len],
+            page_size=page_size,
+            q_heads=16,
+            kv_heads=1,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            seed=seed,
+            page_table_width=page_table_width,
+            num_pages=num_pages,
+            vllm_combined_kv=kv_dtype == "bf16",
+        )
+        if kv_dtype == "bf16":
+            return (
+                q_c,
+                k_c,
+                v_c,
+                table_c,
+                seqlens_c,
+                cu_c,
+                None,
+                None,
+            )
+        k_q, v_q, k_ds, v_ds = quantize_paged_kv_cache_e4m3(
+            k_c, v_c, table_c, seqlens_c
+        )
+        combined = torch.stack([k_q, v_q], dim=1)
+        k_q = combined[:, 0]
+        v_q = combined[:, 1]
+        assert not k_q.is_contiguous()
+        return (
+            q_c,
+            k_q,
+            v_q,
+            table_c,
+            seqlens_c,
+            cu_c,
+            k_ds[:, 0].contiguous(),
+            v_ds[:, 0].contiguous(),
+        )
+
+    (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+    ) = make_case(1, seed=2001)
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        total_q_capacity=1,
+        seed=2002,
+        force_block0=True,
+    )
+    q2k_source = q2k_indices.clone()
+    q2k_data_ptr = int(q2k_indices.data_ptr())
+    q2k_source_data_ptr = int(q2k_source.data_ptr())
+    page_table_data_ptr = int(page_table.data_ptr())
+    cache_seqlens_data_ptr = int(cache_seqlens.data_ptr())
+    cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
+
+    scratch_plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=q.device,
+            mode="decode",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            head_dim_qk=q.shape[2],
+            head_dim_vo=v_cache.shape[3],
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_page_table_width=page_table_width,
+            max_work_items=32,
+            max_partial_rows=32,
+            num_cache_pages=k_cache.shape[0],
+            use_cuda_graph=True,
+            msa_block_sparse=True,
+        )
+    )
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=1,
+        max_page_table_width=page_table_width,
+        max_cache_page_count=page_table_width,
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=q.device)
+        for shape, dtype in scratch_plan.shapes_and_dtypes()
+    )
+    output = torch.empty_like(q)
+
+    def bind_current():
+        return scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q2k_indices=q2k_indices,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    paged_attention_forward(binding=bind_current())
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q2k_indices.copy_(q2k_source)
+        binding = bind_current()
+        paged_attention_forward(binding=binding)
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    (
+        q_next,
+        k_next,
+        v_next,
+        page_table_next,
+        cache_seqlens_next,
+        cu_seqlens_q_next,
+        k_descale_next,
+        v_descale_next,
+    ) = make_case(19, seed=2003)
+    q2k_next = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens_next,
+        cu_seqlens_q=cu_seqlens_q_next,
+        num_kv_heads=1,
+        total_q_capacity=1,
+        seed=2004,
+        force_block0=True,
+    )
+    q.copy_(q_next)
+    k_cache.copy_(k_next)
+    v_cache.copy_(v_next)
+    page_table.copy_(page_table_next)
+    cache_seqlens.copy_(cache_seqlens_next)
+    cu_seqlens_q.copy_(cu_seqlens_q_next)
+    if k_descale is not None:
+        assert k_descale_next is not None
+        k_descale.copy_(k_descale_next)
+    if v_descale is not None:
+        assert v_descale_next is not None
+        v_descale.copy_(v_descale_next)
+    q2k_source.copy_(q2k_next)
+    assert int(q2k_indices.data_ptr()) == q2k_data_ptr
+    assert int(q2k_source.data_ptr()) == q2k_source_data_ptr
+    assert int(page_table.data_ptr()) == page_table_data_ptr
+    assert int(cache_seqlens.data_ptr()) == cache_seqlens_data_ptr
+    assert int(cu_seqlens_q.data_ptr()) == cu_seqlens_q_data_ptr
+
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = msa_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    lse = binding.scratch.current_lse_view() * math.log(2.0)
+    torch.testing.assert_close(lse, ref_lse, rtol=lse_tol, atol=lse_tol)
+    assert (
+        torch.nn.functional.cosine_similarity(
+            output.to(torch.float32).reshape(-1),
+            ref_out.to(torch.float32).reshape(-1),
+            dim=0,
+        ).item()
+        >= cos_min
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
+    kv_dtype: str,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    bucket = 16
+    page_size = 128
+    page_table_width = 1024
+    num_pages = 2048
+    lse_tol = 5e-2
+    cos_min = 0.995
+
+    def make_case(cache_len: int, *, seed: int):
+        q_live, k_c, v_c, table_live, seqlens_live, _cu_live = make_paged_inputs(
+            q_seqlens=[1],
+            cache_seqlens=[cache_len],
+            page_size=page_size,
+            q_heads=16,
+            kv_heads=1,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            seed=seed,
+            page_table_width=page_table_width,
+            num_pages=num_pages,
+            vllm_combined_kv=kv_dtype == "bf16",
+        )
+        device = q_live.device
+        q_c = torch.zeros(
+            (bucket, q_live.shape[1], q_live.shape[2]),
+            dtype=q_live.dtype,
+            device=device,
+        )
+        q_c[0].copy_(q_live[0])
+        table_c = torch.zeros(
+            (bucket, page_table_width), dtype=torch.int32, device=device
+        )
+        table_c[0].copy_(table_live[0])
+        seqlens_c = torch.zeros((bucket,), dtype=torch.int32, device=device)
+        seqlens_c[0].copy_(seqlens_live[0])
+        cu_c = torch.ones((bucket + 1,), dtype=torch.int32, device=device)
+        cu_c[0] = 0
+
+        if kv_dtype == "bf16":
+            return q_c, k_c, v_c, table_c, seqlens_c, cu_c, None, None
+
+        k_q, v_q, k_ds, v_ds = quantize_paged_kv_cache_e4m3(
+            k_c, v_c, table_live, seqlens_live
+        )
+        combined = torch.stack([k_q, v_q], dim=1)
+        k_q = combined[:, 0]
+        v_q = combined[:, 1]
+        assert not k_q.is_contiguous()
+        k_ds_c = torch.ones(
+            (bucket, k_q.shape[2]), dtype=torch.float32, device=device
+        )
+        v_ds_c = torch.ones_like(k_ds_c)
+        k_ds_c[0].copy_(k_ds[0])
+        v_ds_c[0].copy_(v_ds[0])
+        return q_c, k_q, v_q, table_c, seqlens_c, cu_c, k_ds_c, v_ds_c
+
+    (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+    ) = make_case(1, seed=2101)
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        total_q_capacity=bucket,
+        seed=2102,
+        force_block0=True,
+    )
+    q2k_source = q2k_indices.clone()
+    live_cu_seqlens_q = torch.tensor(
+        [0, 1], dtype=torch.int32, device=q.device
+    )
+
+    scratch_plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=q.device,
+            mode="decode",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            head_dim_qk=q.shape[2],
+            head_dim_vo=v_cache.shape[3],
+            page_size=page_size,
+            max_total_q=bucket,
+            max_batch=bucket,
+            max_page_table_width=page_table_width,
+            max_work_items=bucket * 32,
+            max_partial_rows=bucket * 32,
+            num_cache_pages=k_cache.shape[0],
+            use_cuda_graph=True,
+            msa_block_sparse=True,
+        )
+    )
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=bucket,
+        max_page_table_width=page_table_width,
+        max_cache_page_count=page_table_width,
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=q.device)
+        for shape, dtype in scratch_plan.shapes_and_dtypes()
+    )
+    output = torch.empty_like(q)
+
+    def bind_current():
+        return scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q2k_indices=q2k_indices,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    def assert_live_row_matches_reference(binding) -> None:
+        ref_out, ref_lse = msa_attention_reference(
+            q[:1],
+            k_cache,
+            v_cache,
+            page_table[:1],
+            cache_seqlens[:1],
+            live_cu_seqlens_q,
+            q2k_indices,
+            k_descale=None if k_descale is None else k_descale[:1],
+            v_descale=None if v_descale is None else v_descale[:1],
+        )
+        lse = binding.scratch.current_lse_view()[:1] * math.log(2.0)
+        torch.testing.assert_close(lse, ref_lse, rtol=lse_tol, atol=lse_tol)
+        assert (
+            torch.nn.functional.cosine_similarity(
+                output[:1].to(torch.float32).reshape(-1),
+                ref_out.to(torch.float32).reshape(-1),
+                dim=0,
+            ).item()
+            >= cos_min
+        )
+        assert int(binding.scratch.total_num_rows_ptr.item()) == 1
+
+    paged_attention_forward(binding=bind_current())
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q2k_indices.copy_(q2k_source)
+        binding = bind_current()
+        paged_attention_forward(binding=binding)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_live_row_matches_reference(binding)
+
+    (
+        q_next,
+        k_next,
+        v_next,
+        page_table_next,
+        cache_seqlens_next,
+        cu_seqlens_q_next,
+        k_descale_next,
+        v_descale_next,
+    ) = make_case(19, seed=2103)
+    q2k_next = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens_next,
+        cu_seqlens_q=cu_seqlens_q_next,
+        num_kv_heads=1,
+        total_q_capacity=bucket,
+        seed=2104,
+        force_block0=True,
+    )
+    q.copy_(q_next)
+    k_cache.copy_(k_next)
+    v_cache.copy_(v_next)
+    page_table.copy_(page_table_next)
+    cache_seqlens.copy_(cache_seqlens_next)
+    cu_seqlens_q.copy_(cu_seqlens_q_next)
+    if k_descale is not None:
+        assert k_descale_next is not None
+        k_descale.copy_(k_descale_next)
+    if v_descale is not None:
+        assert v_descale_next is not None
+        v_descale.copy_(v_descale_next)
+    q2k_source.copy_(q2k_next)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_live_row_matches_reference(binding)
+
+
+def test_msa_decode_graph_metadata_skips_zero_length_padded_rows() -> None:
+    require_sm120()
+
+    from b12x.attention.paged.graph_replay import (
+        update_msa_decode_graph_chunk_metadata,
+    )
+
+    batch = 4
+    max_chunks_per_req = 32
+    capacity = batch * max_chunks_per_req
+    cache_seqlens = torch.tensor([19, 0, 0, 0], dtype=torch.int32, device="cuda")
+    request_indices = torch.full((capacity,), -1, dtype=torch.int32, device="cuda")
+    qo_tile_indices = torch.full_like(request_indices, -1)
+    kv_tile_indices = torch.full_like(request_indices, -1)
+    block_valid_mask = torch.full_like(request_indices, 7)
+    merge_indptr = torch.full((batch + 1,), -1, dtype=torch.int32, device="cuda")
+    o_indptr = torch.full_like(merge_indptr, -1)
+    kv_chunk_size_ptr = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    kv_window_start_tokens = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
+
+    update_msa_decode_graph_chunk_metadata(
+        cache_seqlens=cache_seqlens,
+        request_indices=request_indices,
+        qo_tile_indices=qo_tile_indices,
+        kv_tile_indices=kv_tile_indices,
+        merge_indptr=merge_indptr,
+        o_indptr=o_indptr,
+        block_valid_mask=block_valid_mask,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        kv_window_start_tokens=kv_window_start_tokens,
+        kv_chunk_size=128,
+        page_size=128,
+    )
+    torch.cuda.synchronize()
+
+    assert merge_indptr.cpu().tolist() == [0, 1, 1, 1, 1]
+    assert o_indptr.cpu().tolist() == [0, 1, 1, 1, 1]
+    assert int(kv_chunk_size_ptr.item()) == 128
+    assert kv_window_start_tokens.cpu().tolist() == [0, 0, 0, 0]
+    assert int(block_valid_mask[0].item()) == 1
+    assert int(block_valid_mask[1:].sum().item()) == 0
+    assert int(request_indices[0].item()) == 0
+    assert int(qo_tile_indices[0].item()) == 0
+    assert int(kv_tile_indices[0].item()) == 0
+
+
+def test_msa_decode_graph_compile_key_is_stable_across_minimax_batch_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    import b12x.attention.paged.api as paged_api
+
+    forward_specs: list[str] = []
+
+    def fake_launch(
+        _func,
+        *,
+        compile_spec,
+        compile_args,
+        runtime_args,
+        compile_kwargs=None,
+    ):
+        if compile_spec.kernel_id == "attention.paged.forward":
+            forward_specs.append(repr(compile_spec))
+
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+
+    for batch in (1, 2, 4, 8, 16):
+        page_table_width = 80
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+            make_paged_inputs(
+                q_seqlens=[1] * batch,
+                cache_seqlens=[5000] * batch,
+                page_size=128,
+                q_heads=16,
+                kv_heads=1,
+                head_dim=128,
+                dtype=torch.bfloat16,
+                seed=1700 + batch,
+                page_table_width=page_table_width,
+                num_pages=2048,
+                vllm_combined_kv=True,
+            )
+        )
+        q2k_indices = make_msa_q2k_indices(
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            num_kv_heads=1,
+            total_q_capacity=batch,
+            seed=1800 + batch,
+            force_block0=True,
+        )
+        scratch_plan = plan_paged_attention_scratch(
+            B12XPagedAttentionScratchCaps(
+                device=q.device,
+                mode="decode",
+                dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=q.shape[1],
+                num_kv_heads=k_cache.shape[2],
+                head_dim_qk=q.shape[2],
+                head_dim_vo=v_cache.shape[3],
+                page_size=k_cache.shape[1],
+                max_total_q=batch,
+                max_batch=batch,
+                max_page_table_width=page_table_width,
+                max_work_items=batch * 32,
+                max_partial_rows=batch * 32,
+                num_cache_pages=k_cache.shape[0],
+                use_cuda_graph=True,
+                msa_block_sparse=True,
+            )
+        )
+        scratch_plan.prepare_decode_graph_replay_state(
+            batch=batch,
+            max_page_table_width=page_table_width,
+            max_cache_page_count=page_table_width,
+        )
+        scratch = tuple(
+            torch.empty(shape, dtype=dtype, device=q.device)
+            for shape, dtype in scratch_plan.shapes_and_dtypes()
+        )
+        output = torch.empty_like(q)
+        binding = scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q2k_indices=q2k_indices,
+        )
+        paged_attention_forward(binding=binding)
+
+    assert len(forward_specs) == 5
+    assert len(set(forward_specs)) == 1
+
+
+def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    import b12x.attention.paged.api as paged_api
+
+    forward_specs: list[str] = []
+
+    def fake_launch(
+        _func,
+        *,
+        compile_spec,
+        compile_args,
+        runtime_args,
+        compile_kwargs=None,
+    ):
+        if compile_spec.kernel_id == "attention.paged.forward":
+            forward_specs.append(repr(compile_spec))
+
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[8, 4],
+        cache_seqlens=[128, 256],
+        page_size=128,
+        q_heads=16,
+        kv_heads=1,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        seed=1901,
+        page_table_width=8,
+        num_pages=32,
+        vllm_combined_kv=True,
+    )
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        seed=1902,
+        force_block0=True,
+    )
+
+    _run_msa_extend(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        msa_union_tile=False,
+    )
+
+    assert len(forward_specs) == 1
 
 
 def test_msa_decode_eager_bf16_page128_vllm_combined_cache_matches_reference() -> None:

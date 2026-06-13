@@ -191,26 +191,34 @@ def _capture_msa_case(
     chunk_pages: int,
     seed: int,
     warmup: int,
+    page_size: int = 64,
+    kv_dtype: str = "bf16",
 ) -> tuple[torch.cuda.CUDAGraph, int, int]:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
         cache_len=cache_len,
-        page_size=64,
+        page_size=page_size,
         q_heads=64,
         kv_heads=4,
         head_dim=128,
         dtype=torch.bfloat16,
         seed=seed,
     )
+    k_descale = None
+    v_descale = None
+    if kv_dtype == "fp8":
+        k_cache = k_cache.to(torch.float8_e4m3fn)
+        v_cache = v_cache.to(torch.float8_e4m3fn)
+        k_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
+        v_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
     q2k_indices = _make_msa_q2k_indices(
         batch=batch,
         cache_len=cache_len,
         kv_heads=4,
         device=q.device,
     )
-    active_chunks_per_req = (MSA_TOPK * MSA_BLOCK_TOKENS + int(chunk_pages) * 64 - 1) // (
-        int(chunk_pages) * 64
-    )
+    chunk_tokens = int(chunk_pages) * int(page_size)
+    active_chunks_per_req = (MSA_TOPK * MSA_BLOCK_TOKENS + chunk_tokens - 1) // chunk_tokens
     # MSA decode graph replay intentionally regularizes block-valid capacity to
     # the worst-case 64-token chunk fanout so all chunk policies share a stable
     # metadata shape.
@@ -245,14 +253,15 @@ def _capture_msa_case(
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         q2k_indices=q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     graph = _capture_graph(lambda: paged_attention_forward(binding=binding), warmup=warmup)
-    selected_tokens = _msa_effective_selected_tokens(cache_len)
-    active_chunks_per_req = (selected_tokens + int(chunk_pages) * 64 - 1) // (
-        int(chunk_pages) * 64
-    )
+    selected_tokens = _msa_effective_selected_tokens(cache_len, page_size=page_size)
+    active_chunks_per_req = (selected_tokens + chunk_tokens - 1) // chunk_tokens
     launch_ctas = batch * 4 * active_chunks_per_req
-    bytes_read = batch * 4 * selected_tokens * 128 * 2 * 2
+    elem_bytes = 1 if kv_dtype == "fp8" else 2
+    bytes_read = batch * 4 * selected_tokens * 128 * elem_bytes * 2
     return graph, launch_ctas, bytes_read
 
 
@@ -262,6 +271,7 @@ def _capture_dense_case(
     cache_len: int,
     seed: int,
     warmup: int,
+    kv_dtype: str = "bf16",
 ) -> tuple[torch.cuda.CUDAGraph, int, int]:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
@@ -273,6 +283,13 @@ def _capture_dense_case(
         dtype=torch.bfloat16,
         seed=seed,
     )
+    k_descale = None
+    v_descale = None
+    if kv_dtype == "fp8":
+        k_cache = k_cache.to(torch.float8_e4m3fn)
+        v_cache = v_cache.to(torch.float8_e4m3fn)
+        k_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
+        v_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
     pages = int(page_table.shape[1])
     scratch_plan = _make_scratch_plan(
         q=q,
@@ -302,10 +319,13 @@ def _capture_dense_case(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     graph = _capture_graph(lambda: paged_attention_forward(binding=binding), warmup=warmup)
     launch_ctas = batch * 4
-    bytes_read = batch * 4 * int(cache_len) * 128 * 2 * 2
+    elem_bytes = 1 if kv_dtype == "fp8" else 2
+    bytes_read = batch * 4 * int(cache_len) * 128 * elem_bytes * 2
     return graph, launch_ctas, bytes_read
 
 
@@ -327,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("results.msa_decode.tsv"))
     parser.add_argument("--skip-dense", action="store_true")
+    parser.add_argument("--page-size", type=int, default=64, choices=(64, 128))
+    parser.add_argument("--kv-dtype", type=str, default="bf16", choices=("bf16", "fp8"))
     parser.add_argument("--flush-l2", action="store_true", default=True)
     parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
@@ -340,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     header = (
-        "backend\tbatch\tcontext\tchunk_tokens\tmean_us\tmedian_us\tmin_us\t"
+        "backend\tpage_size\tkv_dtype\tbatch\tcontext\tchunk_tokens\tmean_us\tmedian_us\tmin_us\t"
         "effective_gbs\tlaunch_ctas\tbytes_read"
     )
     rows = [header]
@@ -350,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         for context in args.contexts:
             if not args.skip_dense:
                 graph, launch_ctas, bytes_read = _capture_dense_case(
+                    kv_dtype=args.kv_dtype,
                     batch=batch,
                     cache_len=context,
                     seed=args.seed + batch * 17 + context,
@@ -359,17 +382,19 @@ def main(argv: list[str] | None = None) -> int:
                 mean_us, median_us, min_us = _summarize(samples)
                 gbs = bytes_read / (mean_us * 1e-6) / 1e9
                 rows.append(
-                    f"dense\t{batch}\t{context}\t0\t{mean_us:.3f}\t{median_us:.3f}\t"
+                    f"dense\t64\t{args.kv_dtype}\t{batch}\t{context}\t0\t{mean_us:.3f}\t{median_us:.3f}\t"
                     f"{min_us:.3f}\t{gbs:.3f}\t{launch_ctas}\t{bytes_read}"
                 )
                 print(rows[-1])
             for chunk_tokens in args.chunks:
-                if chunk_tokens % 64 != 0:
-                    raise ValueError("MSA chunk tokens must be multiples of 64")
+                if chunk_tokens % args.page_size != 0:
+                    continue
                 graph, launch_ctas, bytes_read = _capture_msa_case(
+                    page_size=args.page_size,
+                    kv_dtype=args.kv_dtype,
                     batch=batch,
                     cache_len=context,
-                    chunk_pages=chunk_tokens // 64,
+                    chunk_pages=chunk_tokens // args.page_size,
                     seed=args.seed + batch * 31 + context + chunk_tokens,
                     warmup=args.warmup,
                 )
@@ -377,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
                 mean_us, median_us, min_us = _summarize(samples)
                 gbs = bytes_read / (mean_us * 1e-6) / 1e9
                 rows.append(
-                    f"msa\t{batch}\t{context}\t{chunk_tokens}\t{mean_us:.3f}\t{median_us:.3f}\t"
+                    f"msa\t{args.page_size}\t{args.kv_dtype}\t{batch}\t{context}\t{chunk_tokens}\t{mean_us:.3f}\t{median_us:.3f}\t"
                     f"{min_us:.3f}\t{gbs:.3f}\t{launch_ctas}\t{bytes_read}"
                 )
                 print(rows[-1])

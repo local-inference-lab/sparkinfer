@@ -395,6 +395,7 @@ def update_msa_decode_graph_metadata_fused_triton(
     cache_len = tl.load(cache_seqlens_ptr + batch_offsets, mask=batch_mask, other=0).to(
         tl.int32
     )
+    active = batch_mask & (cache_len > 0)
     visible_blocks = tl.maximum((cache_len + 127) // 128, 1)
     selected_blocks = tl.minimum(visible_blocks, 16)
     tail_tokens = tl.maximum(cache_len - (visible_blocks - 1) * 128, 1)
@@ -404,6 +405,7 @@ def update_msa_decode_graph_metadata_fused_triton(
     effective_pages = tl.maximum((selected_blocks - 1) * PAGES_PER_BLOCK + tail_pages, 1)
     selected_tokens = effective_pages * PAGE_SIZE
     num_chunks = tl.maximum((selected_tokens + kv_chunk_size - 1) // kv_chunk_size, 1)
+    num_chunks = tl.where(active, num_chunks, 0)
     prefix = tl.cumsum(tl.where(batch_mask, num_chunks, 0), 0)
 
     tl.store(merge_indptr_ptr, 0)
