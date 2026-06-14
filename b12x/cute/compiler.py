@@ -22,6 +22,8 @@ _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
 _COMPILE_MISSES = 0
+_VLLM_ENGINE_STARTED_ENV = "B12X_VLLM_ENGINE_STARTED"
+_POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
 
 
 @dataclass(frozen=True)
@@ -298,11 +300,24 @@ def _cute_compile_log_enabled() -> bool:
     return raw.lower() not in {"", "0", "false", "no", "off"}
 
 
+def _cute_compile_post_engine_start_log_enabled() -> bool:
+    marker = os.environ.get(_VLLM_ENGINE_STARTED_ENV, "")
+    if marker.lower() in {"", "0", "false", "no", "off"}:
+        return False
+    raw = os.environ.get(_POST_ENGINE_START_LOG_ENV)
+    if raw is None:
+        return True
+    return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
 def _cute_compile_stack_log_enabled() -> bool:
     raw = os.environ.get("B12X_LOG_CUTE_COMPILE_STACK", "")
     if raw:
         return raw.lower() not in {"0", "false", "no", "off"}
     raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
+    if raw.lower() in {"stack", "trace", "traceback", "full"}:
+        return True
+    raw = os.environ.get(_POST_ENGINE_START_LOG_ENV, "")
     return raw.lower() in {"stack", "trace", "traceback", "full"}
 
 
@@ -341,7 +356,9 @@ def _compile_target_name(func: Any) -> str:
         return f"{module}.{qualname}" if module else qualname
     if inspect.isfunction(unwrapped):
         module = getattr(unwrapped, "__module__", "")
-        qualname = getattr(unwrapped, "__qualname__", getattr(unwrapped, "__name__", ""))
+        qualname = getattr(
+            unwrapped, "__qualname__", getattr(unwrapped, "__name__", "")
+        )
         return f"{module}.{qualname}" if module else qualname
     target_type = type(func)
     module = getattr(target_type, "__module__", "")
@@ -493,9 +510,7 @@ def _tensor_key_log_value(
     return out
 
 
-def _cache_key_log_value(
-    value: Any, *, max_depth: int = 5, max_items: int = 32
-) -> Any:
+def _cache_key_log_value(value: Any, *, max_depth: int = 5, max_items: int = 32) -> Any:
     if max_depth <= 0:
         return _short_repr(value, max_len=120)
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -509,9 +524,13 @@ def _cache_key_log_value(
     if object_state is not None:
         return object_state
 
-    if isinstance(value, tuple) and value and all(
-        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
-        for item in value
+    if (
+        isinstance(value, tuple)
+        and value
+        and all(
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        )
     ):
         out: dict[str, Any] = {}
         for idx, (key, item_value) in enumerate(value):
@@ -671,7 +690,9 @@ def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
     return {name: value for name, value in env if value}
 
 
-def _compile_cache_payload_log_value(payload: tuple[object, ...] | None) -> dict[str, Any]:
+def _compile_cache_payload_log_value(
+    payload: tuple[object, ...] | None,
+) -> dict[str, Any]:
     if payload is None:
         return {}
     if len(payload) == 8 and payload[0] in {
@@ -759,12 +780,39 @@ def _format_cute_compile_stack() -> str:
 
     lines = ["[b12x cute.compile] python_stack (most recent call last):"]
     for frame in visible_frames:
-        lines.append(
-            f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
-        )
+        lines.append(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}')
         if frame.line:
             lines.append(f"    {frame.line.strip()}")
     return "\n".join(lines)
+
+
+def _log_cute_compile_event(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    event: str,
+    cache_status: str,
+    cache_payload: tuple[object, ...] | None = None,
+    reason: str | None = None,
+    cache_key: str | None = None,
+) -> None:
+    key_inputs = _compile_cache_payload_log_value(cache_payload)
+    reason_text = "" if reason is None else f"reason={reason} "
+    cache_key_text = "" if cache_key is None else f"cache_key={cache_key[:16]} "
+    print(
+        f"[b12x cute.compile] {event} "
+        f"{reason_text}"
+        f"target={_compile_target_name(func)} "
+        f"status={cache_status} "
+        f"{cache_key_text}"
+        f"attrs={_short_repr(_compile_target_attrs(func), max_len=1200)} "
+        f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
+        f"key_inputs={_short_repr(key_inputs, max_len=4000)}",
+        flush=True,
+    )
+    if _cute_compile_stack_log_enabled():
+        print(_format_cute_compile_stack(), flush=True)
 
 
 def _log_cute_compile_miss(
@@ -774,19 +822,19 @@ def _log_cute_compile_miss(
     *,
     cache_status: str,
     cache_payload: tuple[object, ...] | None = None,
+    reason: str | None = None,
+    cache_key: str | None = None,
 ) -> None:
-    key_inputs = _compile_cache_payload_log_value(cache_payload)
-    print(
-        "[b12x cute.compile] miss "
-        f"target={_compile_target_name(func)} "
-        f"status={cache_status} "
-        f"attrs={_short_repr(_compile_target_attrs(func), max_len=1200)} "
-        f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
-        f"key_inputs={_short_repr(key_inputs, max_len=4000)}",
-        flush=True,
+    _log_cute_compile_event(
+        func,
+        args,
+        kwargs,
+        event="miss",
+        cache_status=cache_status,
+        cache_payload=cache_payload,
+        reason=reason,
+        cache_key=cache_key,
     )
-    if _cute_compile_stack_log_enabled():
-        print(_format_cute_compile_stack(), flush=True)
 
 
 def _iter_fingerprint_files(root: Path) -> list[Path]:
@@ -1353,6 +1401,7 @@ def compile(
     if compiled is not None:
         return compiled
 
+    post_engine_start_log = _cute_compile_post_engine_start_log_enabled()
     payload = _compile_disk_cache_payload(
         compile_callable, func, args, kwargs, compile_spec
     )
@@ -1363,13 +1412,25 @@ def compile(
         if compiled is not None:
             with _MEMORY_CACHE_LOCK:
                 _DISK_CACHE_HITS += 1
+            if post_engine_start_log:
+                with suppress(Exception):
+                    _log_cute_compile_event(
+                        func,
+                        args,
+                        kwargs,
+                        event="disk-hit",
+                        cache_status="disk-cache-hit",
+                        cache_payload=payload,
+                        reason="post-engine-start",
+                        cache_key=cache_key,
+                    )
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
         cache_status = "disk-cache-miss"
     else:
         cache_status = "disk-cache-disabled"
 
-    if _cute_compile_log_enabled():
+    if _cute_compile_log_enabled() or post_engine_start_log:
         with suppress(Exception):
             _log_cute_compile_miss(
                 func,
@@ -1377,6 +1438,8 @@ def compile(
                 kwargs,
                 cache_status=cache_status,
                 cache_payload=payload,
+                reason="post-engine-start" if post_engine_start_log else None,
+                cache_key=cache_key,
             )
 
     with _MEMORY_CACHE_LOCK:
@@ -1388,9 +1451,7 @@ def compile(
         target=func,
         cache_key=compile_spec if compile_spec is not None else payload,
     )
-    call_kwargs = {
-        k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
-    }
+    call_kwargs = {k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"}
     compiled = compile_callable(func, *args, **call_kwargs)
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
