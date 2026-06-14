@@ -66,6 +66,7 @@ from b12x.attention.indexer.kernel import (
     _PAGED_TOKENS_PER_GROUP,
     _PAGED_WARPS_PER_CTA,
     _WARP_THREADS,
+    IndexerScoreMode,
     _compute_mxfp8_tile_partials,
     _load_index_k_page_scalar,
     _num_q_head_tiles,
@@ -1194,6 +1195,7 @@ class SparseNSAFusedIndexerKernel:
                                 s_partial_logits,
                                 token_group * Int32(_PAGED_TOKENS_PER_GROUP),
                                 head_tile_slot,
+                                IndexerScoreMode.NSA_RELU_SUM,
                             )
                     cute.arch.sync_threads()
                     if tx < score_threads:
