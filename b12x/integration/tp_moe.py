@@ -167,6 +167,7 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     routed_rows_capacity: int
     physical_tiles_capacity: int
     task_capacity: int
+    route_output: torch.Tensor
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
     input_gs: torch.Tensor
@@ -681,6 +682,7 @@ class TPMoEFP4Binding:
     task_slice_count: torch.Tensor | None = None
     task_valid_rows: torch.Tensor | None = None
     tile_write_count: torch.Tensor | None = None
+    route_output: torch.Tensor | None = None
     intermediate_cache13: torch.Tensor | None = None
     intermediate_cache2: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
@@ -836,6 +838,16 @@ def _env_flag(name: str, *, default: bool) -> bool:
     if value is None:
         return default
     return value not in ("", "0", "false", "False")
+
+
+def _dynamic_deterministic_output_enabled(
+    *, quant_mode: str, device: torch.device
+) -> bool:
+    if torch.device(device).type != "cuda":
+        return False
+    if _normalize_quant_mode(quant_mode) == "w4a16":
+        return False
+    return _env_flag("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", default=False)
 
 
 def default_moe_quant_mode() -> str:
@@ -1746,6 +1758,7 @@ def _build_tp_moe_fp4_binding_from_views(
             packed_a_storage_ptr=view_kwargs.packed_a_storage_ptr,
             physical_tiles_capacity=plan.dynamic_physical_tiles,
             task_capacity=plan.dynamic_task_capacity,
+            route_output=tensors["route_output"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
             input_gs=tensors["input_gs"],
@@ -2080,6 +2093,9 @@ def _plan_core_workspace(
             _TensorAllocSpec(
                 "token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"
             ),
+            _TensorAllocSpec(
+                "route_output", (max(int(routed_rows), 1), int(k)), dtype
+            ),
             _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
             _TensorAllocSpec(
                 "packed_input_scale", (dynamic_rows_padded, cols_pad_k), torch.uint8
@@ -2327,6 +2343,7 @@ def _materialize_workspace_from_core_arena(
         routed_rows_capacity=plan.routed_rows,
         physical_tiles_capacity=plan.dynamic_physical_tiles,
         task_capacity=plan.dynamic_task_capacity,
+        route_output=tensors["route_output"],
         token_map=tensors["token_map"],
         token_weights=tensors["token_weights"],
         packed_input=tensors["packed_input"],
@@ -4770,6 +4787,7 @@ def build_tp_moe_fp4_binding(
             routed_rows_capacity=workspace.routed_rows_capacity,
             physical_tiles_capacity=workspace.physical_tiles_capacity,
             task_capacity=workspace.task_capacity,
+            route_output=workspace.route_output,
             expert_write_rows=workspace.expert_write_rows,
             expert_tile_base=workspace.expert_tile_base,
             input_gs=workspace.input_gs,
@@ -5222,6 +5240,7 @@ class _DynamicMoELaunch:
         token_weights_ptr: cute.Pointer,
         num_tokens: cutlass.Int32,
         max_rows: cutlass.Int32,
+        scatter_rows: cutlass.Int32,
         rows_padded: cutlass.Int32,
         max_tasks: cutlass.Int32,
         max_phys_tiles: cutlass.Int32,
@@ -5241,7 +5260,7 @@ class _DynamicMoELaunch:
         )
         scatter_output = cute.make_tensor(
             scatter_ptr,
-            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+            layout=cute.make_layout((scatter_rows, self._k), stride=(self._k, 1)),
         )
         packed_a = cute.make_tensor(
             packed_a_ptr,
@@ -5536,6 +5555,7 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    deterministic_output: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -5591,6 +5611,7 @@ def _get_dynamic_kernel(
         dynamic_down_scale,
         share_input_across_experts,
         swap_ab,
+        bool(deterministic_output),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -5620,6 +5641,7 @@ def _get_dynamic_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+    kernel_kwargs["deterministic_output"] = bool(deterministic_output)
     kernel_kwargs["swap_ab"] = swap_ab
     kernel_kwargs["swiglu_limit"] = swiglu_limit
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
@@ -5841,6 +5863,7 @@ def _get_dynamic_kernel(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
@@ -5903,6 +5926,7 @@ def _launch_dynamic_flat(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
+    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -5910,6 +5934,7 @@ def _launch_dynamic_flat(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    deterministic_output: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -5936,6 +5961,7 @@ def _launch_dynamic_flat(
         activation=activation,
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -5999,6 +6025,7 @@ def _launch_dynamic_flat(
         _gptr(cutlass.Float32, token_weights, 4),
         m,
         max_rows,
+        scatter_rows,
         physical_tiles_capacity
         * _select_dynamic_tile_mn(
             m * num_topk, n, quant_mode, activation=activation
@@ -6060,6 +6087,7 @@ def _tp_moe_dynamic_launch_op(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
+    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -6067,6 +6095,7 @@ def _tp_moe_dynamic_launch_op(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    deterministic_output: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -6118,6 +6147,7 @@ def _tp_moe_dynamic_launch_op(
         num_topk=num_topk,
         routed_rows=routed_rows,
         max_rows=max_rows,
+        scatter_rows=scatter_rows,
         physical_tiles_capacity=physical_tiles_capacity,
         task_capacity=task_capacity,
         topk_ids_are_i32=topk_ids_are_i32,
@@ -6125,6 +6155,7 @@ def _tp_moe_dynamic_launch_op(
         activation=activation,
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -6179,6 +6210,7 @@ def _tp_moe_dynamic_launch_fake(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
+    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -6186,6 +6218,7 @@ def _tp_moe_dynamic_launch_fake(
     activation: str,
     quant_mode: str,
     share_input_across_experts: bool,
+    deterministic_output: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -6215,11 +6248,14 @@ def _launch_dynamic(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    deterministic_output: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
 ) -> None:
     del stream
+    kernel_output = workspace.route_output if deterministic_output else scatter_output
+    scatter_rows = routed_rows if deterministic_output else m
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
         workspace.packed_a_flat,
@@ -6258,7 +6294,7 @@ def _launch_dynamic(
         a,
         flat_ids,
         flat_weights,
-        scatter_output,
+        kernel_output,
         E,
         m,
         k,
@@ -6266,6 +6302,7 @@ def _launch_dynamic(
         num_topk,
         routed_rows,
         max_rows,
+        scatter_rows,
         workspace.physical_tiles_capacity,
         workspace.task_capacity,
         topk_ids_dtype == torch.int32,
@@ -6273,10 +6310,40 @@ def _launch_dynamic(
         activation,
         quant_mode,
         bool(share_input_across_experts),
+        bool(deterministic_output),
         swiglu_limit,
         float(swiglu_alpha),
         float(swiglu_beta),
         workspace.volatile_launch_state,
+    )
+
+
+def _launch_dynamic_topk_sum(
+    *,
+    route_output: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    num_topk: int,
+    k: int,
+    stream,
+) -> None:
+    from b12x.moe.fused.w4a16.kernel import compile_w4a16_topk_sum
+
+    element_dtype = _w4a16_element_dtype(output.dtype)
+    compile_w4a16_topk_sum(
+        m=m,
+        topk=num_topk,
+        hidden_size=k,
+        element_dtype=element_dtype,
+    )
+    torch.ops.b12x.w4a16_topk_sum_launch(
+        route_output,
+        output,
+        m,
+        num_topk,
+        k,
+        element_dtype,
+        int(stream),
     )
 
 
@@ -6757,6 +6824,7 @@ def b12x_moe_fp4(
                     binding, "physical_tiles_capacity"
                 ),
                 task_capacity=_require_binding_field(binding, "task_capacity"),
+                route_output=_require_binding_field(binding, "route_output"),
                 expert_write_rows=_require_binding_field(
                     binding, "expert_write_rows"
                 ),
@@ -7196,6 +7264,10 @@ def b12x_moe_fp4(
         raise ValueError("output must be contiguous")
 
     if impl == "dynamic":
+        deterministic_output = _dynamic_deterministic_output_enabled(
+            quant_mode=quant_mode,
+            device=device,
+        )
         _launch_dynamic(
             workspace=s,
             weights=wv,
@@ -7215,6 +7287,7 @@ def b12x_moe_fp4(
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
+            deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -7222,6 +7295,15 @@ def b12x_moe_fp4(
                 quant_mode == "nvfp4" and a1_gscale.numel() == 1
             ),
         )
+        if deterministic_output:
+            _launch_dynamic_topk_sum(
+                route_output=s.route_output,
+                output=scatter_output,
+                m=m,
+                num_topk=num_topk,
+                k=k,
+                stream=stream,
+            )
     else:
         _launch_compact_static(
             workspace=s,

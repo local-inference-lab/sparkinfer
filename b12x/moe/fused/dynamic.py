@@ -405,6 +405,7 @@ class MoEDynamicKernelBackend:
         activation: str = "silu",
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        deterministic_output: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         swiglu_limit: float | None = None,
@@ -454,6 +455,7 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
+        self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
         # MMA M-role (mirrors dense.py), so a sub-64 tile_n that divides a
         # non-128 per-shard n (e.g. 32 | 352) is legal and the gate-half base
@@ -1242,7 +1244,8 @@ class MoEDynamicKernelBackend:
         if flat_tid < num_experts + Int32(1):
             expert_tile_base[flat_tid] = Int32(0)
 
-        scatter_total_u32 = num_tokens * cols_u32
+        scatter_rows = Int32(scatter_output.shape[0])
+        scatter_total_u32 = scatter_rows * cols_u32
         scatter_vecs = scatter_total_u32 // Int32(4)
         zero_u32 = Uint32(0)
         zv = flat_tid
@@ -1363,7 +1366,10 @@ class MoEDynamicKernelBackend:
                                 )
                                 phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
                                 phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
-                                st_global_i32(get_ptr_as_int64(token_map, phys_row), token_idx)
+                                map_value = token_idx
+                                if cutlass.const_expr(self.deterministic_output):
+                                    map_value = pair_idx
+                                st_global_i32(get_ptr_as_int64(token_map, phys_row), map_value)
                                 st_global_f32(get_ptr_as_int64(token_weights, phys_row), weight)
                                 slot = route_slot_base + topk_slot
                                 _st_shared_i32(route_phys_rows_addr + slot * Int32(4), phys_row)
@@ -1505,7 +1511,10 @@ class MoEDynamicKernelBackend:
                                 )
                                 phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
                                 phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
-                                st_global_i32(get_ptr_as_int64(token_map, phys_row), token_idx)
+                                map_value = token_idx
+                                if cutlass.const_expr(self.deterministic_output):
+                                    map_value = pair_idx
+                                st_global_i32(get_ptr_as_int64(token_map, phys_row), map_value)
                                 st_global_f32(get_ptr_as_int64(token_weights, phys_row), weight)
 
                             row = cute.arch.shuffle_sync(row, Int32(0))
@@ -3390,17 +3399,46 @@ class MoEDynamicKernelBackend:
                                 sc_v7 = cutlass.Float32(
                                     sC[warp_m_base + local_row, local_col + Int32(7), epi_buffer]
                                 )
-                                scatter_add_v4_bf16x2(
-                                    get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
-                                    wv * sc_v0,
-                                    wv * sc_v1,
-                                    wv * sc_v2,
-                                    wv * sc_v3,
-                                    wv * sc_v4,
-                                    wv * sc_v5,
-                                    wv * sc_v6,
-                                    wv * sc_v7,
-                                )
+                                if cutlass.const_expr(self.deterministic_output):
+                                    scatter_output[tok, global_col] = cutlass.BFloat16(
+                                        wv * sc_v0
+                                    )
+                                    scatter_output[
+                                        tok, global_col + Int32(1)
+                                    ] = cutlass.BFloat16(wv * sc_v1)
+                                    scatter_output[
+                                        tok, global_col + Int32(2)
+                                    ] = cutlass.BFloat16(wv * sc_v2)
+                                    scatter_output[
+                                        tok, global_col + Int32(3)
+                                    ] = cutlass.BFloat16(wv * sc_v3)
+                                    scatter_output[
+                                        tok, global_col + Int32(4)
+                                    ] = cutlass.BFloat16(wv * sc_v4)
+                                    scatter_output[
+                                        tok, global_col + Int32(5)
+                                    ] = cutlass.BFloat16(wv * sc_v5)
+                                    scatter_output[
+                                        tok, global_col + Int32(6)
+                                    ] = cutlass.BFloat16(wv * sc_v6)
+                                    scatter_output[
+                                        tok, global_col + Int32(7)
+                                    ] = cutlass.BFloat16(wv * sc_v7)
+                                else:
+                                    scatter_add_v4_bf16x2(
+                                        get_ptr_as_int64(
+                                            scatter_output,
+                                            tok * scatter_N + global_col,
+                                        ),
+                                        wv * sc_v0,
+                                        wv * sc_v1,
+                                        wv * sc_v2,
+                                        wv * sc_v3,
+                                        wv * sc_v4,
+                                        wv * sc_v5,
+                                        wv * sc_v6,
+                                        wv * sc_v7,
+                                    )
                                 vec_idx += Int32(self.num_threads_per_warp)
 
                             # Post-scatter barrier: needed to ensure all warps

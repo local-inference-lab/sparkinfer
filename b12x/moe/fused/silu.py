@@ -62,6 +62,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         fast_math: bool = False,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        deterministic_output: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
     ):
@@ -72,6 +73,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             activation="silu",
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
         )
@@ -132,6 +134,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
         fast_math: bool = False,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        deterministic_output: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         swiglu_limit: float | None = None,
@@ -146,6 +149,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
             activation=activation,
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
             swiglu_limit=normalize_swiglu_limit_for_activation(activation, swiglu_limit),

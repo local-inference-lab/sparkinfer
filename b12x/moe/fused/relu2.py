@@ -56,6 +56,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         fast_math: bool = False,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        deterministic_output: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
     ):
@@ -66,6 +67,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             activation="relu2",
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
         )

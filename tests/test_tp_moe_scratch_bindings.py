@@ -28,6 +28,32 @@ def _caps() -> TPMoEScratchCaps:
     )
 
 
+def test_dynamic_deterministic_output_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+
+    assert not tp_moe_impl._dynamic_deterministic_output_enabled(
+        quant_mode="nvfp4",
+        device=torch.device("cuda"),
+    )
+
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+
+    assert tp_moe_impl._dynamic_deterministic_output_enabled(
+        quant_mode="nvfp4",
+        device=torch.device("cuda"),
+    )
+    assert not tp_moe_impl._dynamic_deterministic_output_enabled(
+        quant_mode="w4a16",
+        device=torch.device("cuda"),
+    )
+    assert not tp_moe_impl._dynamic_deterministic_output_enabled(
+        quant_mode="nvfp4",
+        device=torch.device("cpu"),
+    )
+
+
 def _runtime_tensors(m: int = 3, topk: int = 2):
     a = torch.empty((m, 128), dtype=torch.bfloat16)
     a1_gscale = torch.ones((8,), dtype=torch.float32)
@@ -277,7 +303,9 @@ def test_tp_moe_fp4_binding_rehydrates_dynamic_workspace_view(
     result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 
     assert result is output
+    assert binding.route_output is not None
     assert isinstance(calls["workspace"], tp_moe_impl.TPDynamicWorkspace)
+    assert calls["workspace"].route_output is binding.route_output
     assert calls["workspace"].input_gs is binding.input_gs
     assert calls["workspace"].task_ready is binding.task_ready
 
