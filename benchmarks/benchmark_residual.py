@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import math
+import os
 import pathlib
 import statistics
 import sys
+import types
 
 import torch
 import torch.nn.functional as F
@@ -21,8 +25,9 @@ from benchmarks.common import (
     require_sm120,
 )
 from b12x.integration import (
+    B12XMHCScratchCaps,
     b12x_mhc_post_pre,
-    empty_mhc_workspace,
+    plan_mhc_scratch,
 )
 
 
@@ -156,7 +161,115 @@ def _register_vllm_mhc_tilelang(vllm_path: pathlib.Path) -> None:
     vllm_root = str(vllm_path.expanduser().resolve())
     if vllm_root not in sys.path:
         sys.path.insert(1, vllm_root)
-    import vllm.model_executor.kernels.mhc.tilelang  # noqa: F401
+
+    try:
+        import tilelang  # noqa: F401
+    except ModuleNotFoundError:
+        vllm_site = next(
+            (
+                path
+                for path in (pathlib.Path(vllm_root) / ".venv" / "lib").glob(
+                    "python*/site-packages"
+                )
+                if (path / "tilelang").exists()
+            ),
+            None,
+        )
+        if vllm_site is None:
+            raise
+        sys.path.append(str(vllm_site))
+        import tilelang  # noqa: F401
+
+    def _package(name: str) -> types.ModuleType:
+        mod = sys.modules.get(name)
+        if mod is None:
+            mod = types.ModuleType(name)
+            mod.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[name] = mod
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", 1)
+            setattr(_package(parent_name), child_name, mod)
+        return mod
+
+    for package in (
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.kernels",
+        "vllm.model_executor.kernels.mhc",
+        "vllm.platforms",
+        "vllm.utils",
+    ):
+        _package(package)
+
+    class _CurrentPlatform:
+        def is_cuda_alike(self) -> bool:
+            return True
+
+        def is_cuda(self) -> bool:
+            return True
+
+        def is_arch_support_pdl(self) -> bool:
+            return True
+
+    sys.modules["vllm.platforms"].current_platform = _CurrentPlatform()
+
+    import_utils = types.ModuleType("vllm.utils.import_utils")
+    import_utils.has_tilelang = lambda: True
+    sys.modules["vllm.utils.import_utils"] = import_utils
+    setattr(sys.modules["vllm.utils"], "import_utils", import_utils)
+
+    math_utils = types.ModuleType("vllm.utils.math_utils")
+    math_utils.cdiv = lambda a, b: int(math.ceil(a / b))
+    sys.modules["vllm.utils.math_utils"] = math_utils
+    setattr(sys.modules["vllm.utils"], "math_utils", math_utils)
+
+    deep_gemm = types.ModuleType("vllm.utils.deep_gemm")
+    deep_gemm.is_deep_gemm_supported = lambda: False
+
+    def _no_deep_gemm(*_args, **_kwargs):
+        raise RuntimeError("DeepGEMM is disabled in the direct vLLM MHC loader")
+
+    deep_gemm.tf32_hc_prenorm_gemm = _no_deep_gemm
+    sys.modules["vllm.utils.deep_gemm"] = deep_gemm
+    setattr(sys.modules["vllm.utils"], "deep_gemm", deep_gemm)
+
+    torch_utils = types.ModuleType("vllm.utils.torch_utils")
+
+    def direct_register_custom_op(
+        *,
+        op_name: str,
+        op_func,
+        mutates_args,
+        fake_impl=None,
+    ) -> None:
+        registered = torch.library.custom_op(
+            f"vllm::{op_name}",
+            mutates_args=tuple(mutates_args),
+        )(op_func)
+        if fake_impl is not None:
+            registered.register_fake(fake_impl)
+
+    torch_utils.direct_register_custom_op = direct_register_custom_op
+    sys.modules["vllm.utils.torch_utils"] = torch_utils
+    setattr(sys.modules["vllm.utils"], "torch_utils", torch_utils)
+
+    def _load_module(module_name: str, path: pathlib.Path) -> None:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load module spec for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+    mhc_dir = pathlib.Path(vllm_root) / "vllm" / "model_executor" / "kernels" / "mhc"
+    _load_module(
+        "vllm.model_executor.kernels.mhc.tilelang_kernels",
+        mhc_dir / "tilelang_kernels.py",
+    )
+    _load_module(
+        "vllm.model_executor.kernels.mhc.tilelang",
+        mhc_dir / "tilelang.py",
+    )
 
     if not hasattr(torch.ops.vllm, "mhc_fused_post_pre_tilelang"):
         raise RuntimeError("vLLM mhc_fused_post_pre_tilelang custom op was not registered")
@@ -179,6 +292,28 @@ def main() -> None:
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
     parser.add_argument("--fuse-rmsnorm", action="store_true")
+    parser.add_argument(
+        "--expected-m",
+        type=int,
+        default=None,
+        help=(
+            "Expected/capture M used for mHC dispatch policy. Live --tokens may "
+            "be smaller; scratch is sized for max(tokens, expected_m)."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-bf16-mma",
+        action="store_true",
+        help="Use the opt-in native BF16 tensor-core prefill projection path.",
+    )
+    parser.add_argument(
+        "--prefill-block-m",
+        action="store_true",
+        help="Enable the block-M scalar prefill projection path explicitly.",
+    )
+    parser.add_argument("--no-prefill-block-m", action="store_true")
+    parser.add_argument("--prefill-block-m-size", type=int, default=2)
+    parser.add_argument("--prefill-tile-n", type=int, default=24)
     parser.add_argument("--norm-eps", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=91_500)
     parser.add_argument(
@@ -193,6 +328,16 @@ def main() -> None:
         help="Path to the vLLM checkout used for --compare-vllm.",
     )
     args = parser.parse_args()
+    if args.prefill_bf16_mma:
+        os.environ["B12X_MHC_PREFILL_BF16_MMA"] = "1"
+    if args.no_prefill_block_m:
+        os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "0"
+    elif args.prefill_block_m:
+        os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "1"
+    if args.prefill_block_m or not args.no_prefill_block_m:
+        os.environ["B12X_MHC_PREFILL_BLOCK_M_SIZE"] = str(args.prefill_block_m_size)
+        os.environ["B12X_MHC_PREFILL_TILE_N"] = str(args.prefill_tile_n)
+    prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
 
     device = require_sm120()
     if args.compare_vllm:
@@ -204,16 +349,33 @@ def main() -> None:
         seed=args.seed,
         device=device,
     )
-    fused_workspace = empty_mhc_workspace(
-        num_tokens=args.tokens,
-        hidden_size=args.hidden_size,
-        split_k=args.split_k,
-        device=device,
+    fn_bf16 = fn.to(torch.bfloat16).contiguous() if args.prefill_bf16_mma else None
+    scratch_tokens = max(args.tokens, args.expected_m or args.tokens)
+    fused_plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device=device,
+            max_tokens=scratch_tokens,
+            hidden_size=args.hidden_size,
+            split_k=args.split_k,
+        )
     )
-    fused_y = fused_workspace.y
-    fused_post = fused_workspace.post
-    fused_comb = fused_workspace.comb
-    fused_out = fused_workspace.out
+    fused_scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in fused_plan.shapes_and_dtypes()
+    )
+    fused_y = torch.empty((args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
+    fused_post = torch.empty((args.tokens, 4), dtype=torch.float32, device=device)
+    fused_comb = torch.empty((args.tokens, 4, 4), dtype=torch.float32, device=device)
+    fused_out = torch.empty((args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device)
+    fused_binding = fused_plan.bind(
+        scratch=fused_scratch,
+        tokens=args.tokens,
+        expected_m=args.expected_m,
+        y=fused_y,
+        post=fused_post,
+        comb=fused_comb,
+        out=fused_out,
+    )
     _, prev_post, prev_comb = _mhc_pre_reference(
         residual,
         fn,
@@ -248,13 +410,10 @@ def main() -> None:
             rms_eps=args.rms_eps,
             hc_eps=args.hc_eps,
             sinkhorn_iters=args.sinkhorn_iters,
-            workspace=fused_workspace,
-            residual_out=fused_out,
-            y_out=fused_y,
-            post_out=fused_post,
-            comb_out=fused_comb,
             norm_weight=norm_weight,
             norm_eps=args.norm_eps,
+            fn_bf16=fn_bf16,
+            binding=fused_binding,
             split_k=args.split_k,
             block_k=args.block_k,
             block_h=args.block_h,
@@ -307,6 +466,28 @@ def main() -> None:
         fused_post_max, _ = _error_stats(fused_post, post_ref)
         fused_comb_max, _ = _error_stats(fused_comb, comb_ref)
         fused_out_max, fused_out_rmse = _error_stats(fused_out, out_ref)
+        if args.prefill_bf16_mma:
+            assert fn_bf16 is not None
+            _, y_ref_bf16, post_ref_bf16, comb_ref_bf16 = _post_pre_reference(
+                x,
+                residual,
+                prev_post,
+                prev_comb,
+                fn_bf16.float(),
+                scale,
+                bias,
+                rms_eps=args.rms_eps,
+                hc_eps=args.hc_eps,
+                sinkhorn_iters=args.sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=args.norm_eps,
+            )
+            bf16ref_y_max, bf16ref_y_rmse = _error_stats(fused_y, y_ref_bf16)
+            bf16ref_post_max, _ = _error_stats(fused_post, post_ref_bf16)
+            bf16ref_comb_max, _ = _error_stats(fused_comb, comb_ref_bf16)
+        else:
+            bf16ref_y_max = bf16ref_y_rmse = float("nan")
+            bf16ref_post_max = bf16ref_comb_max = float("nan")
         if args.compare_vllm:
             assert vllm_out is not None and vllm_post is not None
             assert vllm_comb is not None and vllm_y is not None
@@ -320,6 +501,8 @@ def main() -> None:
     else:
         fused_y_max = fused_y_rmse = fused_post_max = fused_comb_max = float("nan")
         fused_out_max = fused_out_rmse = float("nan")
+        bf16ref_y_max = bf16ref_y_rmse = float("nan")
+        bf16ref_post_max = bf16ref_comb_max = float("nan")
         vllm_y_max = vllm_y_rmse = vllm_post_max = vllm_comb_max = float("nan")
         vllm_out_max = vllm_out_rmse = float("nan")
 
@@ -338,13 +521,25 @@ def main() -> None:
 
     line = (
         "residual_mhc "
-        f"mode={mode} tokens={args.tokens} hidden={args.hidden_size} "
+        f"mode={mode} tokens={args.tokens} expected_m={args.expected_m} "
+        f"hidden={args.hidden_size} "
         f"split_k={args.split_k} block_k={args.block_k} block_h={args.block_h} "
+        f"prefill_bf16_mma={args.prefill_bf16_mma} "
+        f"prefill_block_m={prefill_block_m_enabled} "
+        f"prefill_block_m_size={args.prefill_block_m_size} "
+        f"prefill_tile_n={args.prefill_tile_n} "
         f"post_pre_us={fused_median:.2f}/{fused_min:.2f} "
         f"fused_y_max={fused_y_max:.3g} fused_y_rmse={fused_y_rmse:.3g} "
         f"fused_post_max={fused_post_max:.3g} fused_comb_max={fused_comb_max:.3g} "
         f"fused_out_max={fused_out_max:.3g} fused_out_rmse={fused_out_rmse:.3g}"
     )
+    if args.prefill_bf16_mma:
+        line += (
+            f" bf16ref_y_max={bf16ref_y_max:.3g} "
+            f"bf16ref_y_rmse={bf16ref_y_rmse:.3g} "
+            f"bf16ref_post_max={bf16ref_post_max:.3g} "
+            f"bf16ref_comb_max={bf16ref_comb_max:.3g}"
+        )
     if args.compare_vllm:
         line += (
             f" vllm_post_pre_us={vllm_median:.2f}/{vllm_min:.2f} "

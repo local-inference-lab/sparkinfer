@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -74,6 +75,7 @@ class B12XMHCBinding:
     comb_buffer: torch.Tensor | None = None
     out: torch.Tensor | None = None
     split_k: int = MHC_DEFAULT_SPLIT_K
+    expected_m: int | None = None
 
     def pre(
         self,
@@ -120,6 +122,8 @@ class B12XMHCBinding:
         sinkhorn_iters: int,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        fn_bf16: torch.Tensor | None = None,
+        expected_m: int | None = None,
         block_k: int = MHC_DEFAULT_BLOCK_K,
         block_h: int = MHC_DEFAULT_BLOCK_H,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -136,6 +140,8 @@ class B12XMHCBinding:
             sinkhorn_iters=sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            fn_bf16=fn_bf16,
+            expected_m=expected_m,
             binding=self,
             block_k=block_k,
             block_h=block_h,
@@ -205,6 +211,7 @@ class B12XMHCScratchPlan:
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
         tokens: int | None = None,
+        expected_m: int | None = None,
         y: torch.Tensor | None = None,
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
@@ -215,6 +222,11 @@ class B12XMHCScratchPlan:
             raise ValueError(
                 f"tokens={live_tokens} exceeds MHC scratch capacity {self.caps.max_tokens}"
             )
+        expected_m = _canonicalize_mhc_expected_m(
+            expected_m,
+            min_tokens=live_tokens,
+            max_tokens=int(self.caps.max_tokens),
+        )
         partials = self._partials_from_scratch(scratch=scratch)[:live_tokens]
         _validate_mhc_binding_views(
             partials=partials,
@@ -235,6 +247,7 @@ class B12XMHCScratchPlan:
             comb_buffer=comb,
             out=out,
             split_k=int(self.caps.split_k),
+            expected_m=expected_m,
         )
 
 
@@ -254,6 +267,28 @@ def _validate_optional_view(
             f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
         )
     _require_contiguous(tensor, name=name)
+
+
+def _canonicalize_mhc_expected_m(
+    expected_m: int | None,
+    *,
+    min_tokens: int = 0,
+    max_tokens: int | None = None,
+) -> int | None:
+    if expected_m is None:
+        return None
+    expected = int(expected_m)
+    if expected <= 0:
+        raise ValueError(f"expected_m must be positive when provided, got {expected}")
+    if expected < int(min_tokens):
+        raise ValueError(
+            f"expected_m={expected} is smaller than live tokens={int(min_tokens)}"
+        )
+    if max_tokens is not None and expected > int(max_tokens):
+        raise ValueError(
+            f"expected_m={expected} exceeds MHC scratch capacity {int(max_tokens)}"
+        )
+    return expected
 
 
 def _validate_mhc_binding_views(
@@ -680,6 +715,8 @@ def b12x_mhc_post_pre(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    fn_bf16: torch.Tensor | None = None,
+    expected_m: int | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
     binding: B12XMHCBinding | None = None,
@@ -689,10 +726,10 @@ def b12x_mhc_post_pre(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Whether the caller owns the output/scratch buffers (binding or
     # explicit out tensors). When it does, the post-pre partial writes them in
-    # place (mutating op). When it does not (e.g. the torch.compile path passes
-    # nothing), we use the functional alloc op: it returns partials+residual_out
-    # with ZERO mutated args, avoiding the auto_functionalized 2-mutated-arg
-    # decomposition assertion. No is_compiling -- purely caller-intent.
+    # place (mutating op). When it does not and no expected_m policy is supplied
+    # (e.g. the torch.compile path passes nothing), we use the functional alloc
+    # op: it returns partials+residual_out with ZERO mutated args, avoiding the
+    # auto_functionalized 2-mutated-arg decomposition assertion.
     _caller_owned_buffers = (
         binding is not None
         or residual_out is not None
@@ -723,8 +760,21 @@ def b12x_mhc_post_pre(
         post_out = binding.post_buffer
         comb_out = binding.comb_buffer
         split_k = int(binding.split_k)
+        if (
+            expected_m is not None
+            and binding.expected_m is not None
+            and int(expected_m) != int(binding.expected_m)
+        ):
+            raise ValueError(
+                "expected_m does not match the mHC binding's expected_m: "
+                f"{expected_m} vs {binding.expected_m}"
+            )
+        if expected_m is None:
+            expected_m = binding.expected_m
 
     tokens, hidden_size, _ = _validate_pre_inputs(residual, fn, hc_scale, hc_base)
+    expected_m = _canonicalize_mhc_expected_m(expected_m, min_tokens=tokens)
+    policy_m = tokens if expected_m is None else expected_m
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
     if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
         raise ValueError(f"x and residual must both be torch.bfloat16, got {x.dtype} and {residual.dtype}")
@@ -866,9 +916,13 @@ def b12x_mhc_post_pre(
             run_mhc_finalize_gram,
             run_mhc_post_pre_functional,
             run_mhc_post_pre_partial,
+            run_mhc_post_pre_prefill_block_m_partial,
+            run_mhc_post_pre_prefill_gram,
+            run_mhc_post_pre_prefill_partial,
+            run_mhc_prefill_bf16_project,
         )
 
-        if not _caller_owned_buffers:
+        if not _caller_owned_buffers and expected_m is None:
             # No caller buffers (e.g. torch.compile): one functional op runs the
             # whole post_pre (partial + finalize) and returns fresh tensors, so
             # the compile graph carries ZERO auto_functionalized mHC nodes.
@@ -887,16 +941,77 @@ def b12x_mhc_post_pre(
                 norm_eps=float(norm_eps),
             )
 
-        run_mhc_post_pre_partial(
-            x=x,
-            residual=residual,
-            prev_post=prev_post,
-            prev_comb=prev_comb,
-            fn=fn,
-            partials=partials,
-            out=residual_out,
-            compute_gram=norm_weight is not None,
+        prefill_min_tokens = int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
+        use_prefill_bf16_mma = (
+            norm_weight is not None
+            and policy_m >= prefill_min_tokens
+            and fn_bf16 is not None
+            and os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "0") != "0"
         )
+        use_prefill_block_m = (
+            not use_prefill_bf16_mma
+            and norm_weight is not None
+            and policy_m >= prefill_min_tokens
+            and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
+        )
+        prefill_block_m_size = int(os.environ.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2"))
+        prefill_tile_n = int(os.environ.get("B12X_MHC_PREFILL_TILE_N", "24"))
+        use_prefill_compact = (
+            not use_prefill_bf16_mma
+            and not use_prefill_block_m
+            and norm_weight is not None
+            and policy_m >= prefill_min_tokens
+            and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
+        )
+        if use_prefill_bf16_mma:
+            run_mhc_post_pre_prefill_gram(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                partials=partials,
+                out=residual_out,
+            )
+            run_mhc_prefill_bf16_project(
+                out=residual_out,
+                fn_bf16=fn_bf16,
+                partials=partials,
+            )
+        elif use_prefill_block_m:
+            run_mhc_post_pre_prefill_block_m_partial(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                fn=fn,
+                partials=partials,
+                out=residual_out,
+                compute_gram=True,
+                block_m=prefill_block_m_size,
+                tile_n=prefill_tile_n,
+            )
+        elif use_prefill_compact:
+            run_mhc_post_pre_prefill_partial(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                fn=fn,
+                partials=partials,
+                out=residual_out,
+                compute_gram=True,
+            )
+        else:
+            run_mhc_post_pre_partial(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                fn=fn,
+                partials=partials,
+                out=residual_out,
+                compute_gram=norm_weight is not None,
+            )
         run_mhc_finalize_gram(
             residual=residual_out,
             partials=partials,
@@ -910,6 +1025,9 @@ def b12x_mhc_post_pre(
             sinkhorn_iters=sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
+            compact_partials=(
+                use_prefill_bf16_mma or use_prefill_block_m or use_prefill_compact
+            ),
         )
         return residual_out, post_out, comb_out, y_out
 
