@@ -559,6 +559,25 @@ def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:
     assert lut[8:] == (2, 2, 2, 2, 2, 2, 2, 2)
 
 
+def test_decode_graph_page128_reuses_page64_lut_policy() -> None:
+    kwargs = dict(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        batch=1,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        gqa_group_size=16,
+        max_effective_kv_pages=16,
+    )
+
+    assert decode_chunk_pages_for_graph(page_size=128, **kwargs) == (
+        decode_chunk_pages_for_graph(page_size=64, **kwargs)
+    )
+    assert build_decode_chunk_pages_lut(page_size=128, **kwargs) == (
+        build_decode_chunk_pages_lut(page_size=64, **kwargs)
+    )
+
+
 @pytest.mark.parametrize(
     ("q_seqlens", "cache_seqlens", "kv_dtype"),
     [

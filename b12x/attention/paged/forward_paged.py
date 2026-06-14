@@ -2514,8 +2514,6 @@ class PagedForwardKernel:
         self.page_tiles_per_entry = int(page_tiles_per_entry)
         if self.page_size not in (64, 128):
             raise ValueError(f"paged decode kernel supports page_size 64 or 128, got {self.page_size}")
-        if self.page_size == 128 and not self.msa_block_sparse:
-            raise ValueError("page_size=128 paged decode requires msa_block_sparse=True")
         if self.page_size == 64 and self.page_tiles_per_entry != 1:
             raise ValueError("page_size=64 paged decode requires page_tiles_per_entry=1")
         if self.page_tiles_per_entry < self.page_size // 64:

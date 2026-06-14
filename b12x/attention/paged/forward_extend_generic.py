@@ -2220,8 +2220,6 @@ class PagedForwardKernel:
         self.page_size = int(page_size)
         if self.page_size not in (64, 128):
             raise ValueError(f"paged extend kernel supports page_size 64 or 128, got {self.page_size}")
-        if self.page_size == 128 and not self.msa_block_sparse:
-            raise ValueError("page_size=128 paged extend requires msa_block_sparse=True")
         # Number of page-table entries that span one 128-token MSA block.
         self.entries_per_block = self.MSA_BLOCK_TOKENS // self.page_size
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
@@ -2237,6 +2235,9 @@ class PagedForwardKernel:
             if traits.num_warps_kv > 1 or self.kv_is_fp8
             else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
         )
+        # The extend TMA path indexes one 64-row source tile per page-table
+        # entry. Page-128 uses the byte-addressed copy path until extend TMA
+        # gets the decode kernel's page-entry flattening.
         base_use_paged_kv_tma_extend = (
             enable_paged_kv_tma
             and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
@@ -2251,6 +2252,7 @@ class PagedForwardKernel:
             and traits.cta_tile_q == 16
             and traits.num_mma_q == 1
             and traits.num_mma_kv == 1
+            and self.page_size == 64
         )
         self.use_paged_kv_tma_exact_plane_bf16_layout = base_use_paged_kv_tma_extend
         self.use_paged_k_tma = self.use_paged_kv_tma_exact_plane_bf16_layout

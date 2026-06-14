@@ -1757,7 +1757,7 @@ def test_msa_decode_graph_metadata_skips_zero_length_padded_rows() -> None:
     assert int(kv_tile_indices[0].item()) == 0
 
 
-def test_msa_decode_graph_compile_key_is_stable_across_minimax_batch_ladder(
+def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm120()
@@ -1780,48 +1780,26 @@ def test_msa_decode_graph_compile_key_is_stable_across_minimax_batch_ladder(
 
     monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
 
+    spec_by_batch: dict[int, str] = {}
     for batch in (1, 2, 4, 8, 16):
         page_table_width = 80
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-            make_paged_inputs(
-                q_seqlens=[1] * batch,
-                cache_seqlens=[5000] * batch,
-                page_size=128,
-                q_heads=16,
-                kv_heads=1,
-                head_dim=128,
-                dtype=torch.bfloat16,
-                seed=1700 + batch,
-                page_table_width=page_table_width,
-                num_pages=2048,
-                vllm_combined_kv=True,
-            )
-        )
-        q2k_indices = make_msa_q2k_indices(
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            num_kv_heads=1,
-            total_q_capacity=batch,
-            seed=1800 + batch,
-            force_block0=True,
-        )
         scratch_plan = plan_paged_attention_scratch(
             B12XPagedAttentionScratchCaps(
-                device=q.device,
+                device=torch.device("cuda"),
                 mode="decode",
-                dtype=q.dtype,
-                kv_dtype=k_cache.dtype,
-                num_q_heads=q.shape[1],
-                num_kv_heads=k_cache.shape[2],
-                head_dim_qk=q.shape[2],
-                head_dim_vo=v_cache.shape[3],
-                page_size=k_cache.shape[1],
+                dtype=torch.bfloat16,
+                kv_dtype=torch.bfloat16,
+                num_q_heads=16,
+                num_kv_heads=1,
+                head_dim_qk=128,
+                head_dim_vo=128,
+                page_size=128,
                 max_total_q=batch,
                 max_batch=batch,
                 max_page_table_width=page_table_width,
                 max_work_items=batch * 32,
                 max_partial_rows=batch * 32,
-                num_cache_pages=k_cache.shape[0],
+                num_cache_pages=2048,
                 use_cuda_graph=True,
                 msa_block_sparse=True,
             )
@@ -1831,26 +1809,60 @@ def test_msa_decode_graph_compile_key_is_stable_across_minimax_batch_ladder(
             max_page_table_width=page_table_width,
             max_cache_page_count=page_table_width,
         )
-        scratch = tuple(
-            torch.empty(shape, dtype=dtype, device=q.device)
-            for shape, dtype in scratch_plan.shapes_and_dtypes()
+        q2k_graph = torch.empty(
+            (1, batch, 16), dtype=torch.int32, device=torch.device("cuda")
         )
-        output = torch.empty_like(q)
-        binding = scratch_plan.bind(
-            scratch=scratch,
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            output=output,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            q2k_indices=q2k_indices,
-        )
-        paged_attention_forward(binding=binding)
+        batch_specs: list[str] = []
+        for cache_len, seed in ((129, 1700 + batch), (5000, 1800 + batch)):
+            q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+                make_paged_inputs(
+                    q_seqlens=[1] * batch,
+                    cache_seqlens=[cache_len] * batch,
+                    page_size=128,
+                    q_heads=16,
+                    kv_heads=1,
+                    head_dim=128,
+                    dtype=torch.bfloat16,
+                    seed=seed,
+                    page_table_width=page_table_width,
+                    num_pages=2048,
+                    vllm_combined_kv=True,
+                )
+            )
+            q2k_indices = make_msa_q2k_indices(
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                num_kv_heads=1,
+                total_q_capacity=batch,
+                seed=seed + 1000,
+                force_block0=True,
+            )
+            q2k_graph.copy_(q2k_indices)
+            scratch = tuple(
+                torch.empty(shape, dtype=dtype, device=q.device)
+                for shape, dtype in scratch_plan.shapes_and_dtypes()
+            )
+            output = torch.empty_like(q)
+            before = len(forward_specs)
+            binding = scratch_plan.bind(
+                scratch=scratch,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                output=output,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                q2k_indices=q2k_graph,
+            )
+            paged_attention_forward(binding=binding)
+            assert len(forward_specs) == before + 1
+            batch_specs.append(forward_specs[-1])
 
-    assert len(forward_specs) == 5
-    assert len(set(forward_specs)) == 1
+        assert len(set(batch_specs)) == 1
+        spec_by_batch[batch] = batch_specs[0]
+
+    assert len(set(spec_by_batch.values())) == len(spec_by_batch)
 
 
 def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
@@ -2051,7 +2063,7 @@ def test_msa_extend_qo_len_one_page128_vllm_combined_cache_matches_decode() -> N
     torch.testing.assert_close(extend_out, decode_out, rtol=3e-3, atol=3e-3)
 
 
-def test_paged_plan_rejects_page128_without_msa() -> None:
+def test_paged_plan_accepts_dense_page128() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1],
@@ -2063,16 +2075,17 @@ def test_paged_plan_rejects_page128_without_msa() -> None:
         dtype=torch.bfloat16,
         seed=1504,
     )
-    with pytest.raises(ValueError, match="page_size=128 only for MSA"):
-        create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            mode="decode",
-        )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        mode="decode",
+    )
+    assert plan.page_size == 128
+    assert plan.msa_block_sparse is False
 
 
 def test_paged_plan_accepts_page128_fp8_kv() -> None:

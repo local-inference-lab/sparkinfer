@@ -615,11 +615,9 @@ def paged_attention_forward(
     page_size = int(plan.page_size)
     page_tiles_per_entry = 1
     if page_size == 128:
-        if not bool(getattr(plan, "msa_block_sparse", False)):
-            raise ValueError("page_size=128 paged attention requires msa_block_sparse=True")
-        if k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or v_cache.dtype != k_cache.dtype:
+        if k_cache.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn) or v_cache.dtype != k_cache.dtype:
             raise ValueError(
-                "page_size=128 MSA paged attention requires matching bf16 or fp8 e4m3 K/V caches"
+                "page_size=128 paged attention requires matching fp16, bf16, or fp8 e4m3 K/V caches"
             )
         k_tiles_per_entry = _paged_kv_tiles_per_table_entry(
             k_cache,
@@ -635,7 +633,7 @@ def paged_attention_forward(
         )
         if k_tiles_per_entry != v_tiles_per_entry:
             raise ValueError(
-                "page_size=128 MSA paged attention requires K and V caches with equal "
+                "page_size=128 paged attention requires K and V caches with equal "
                 f"page-stride tile counts, got {k_tiles_per_entry} vs {v_tiles_per_entry}"
             )
         page_tiles_per_entry = k_tiles_per_entry

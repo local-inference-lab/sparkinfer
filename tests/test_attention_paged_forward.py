@@ -14,6 +14,7 @@ from benchmarks.benchmark_paged_attention import (
 from b12x.attention.paged.reference import paged_attention_reference
 from b12x.integration.attention import (
     B12XPagedAttentionScratchCaps,
+    clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
     plan_paged_attention_scratch,
@@ -305,6 +306,47 @@ def test_paged_forward_matches_reference_decode_short_context() -> None:
 
 
 @torch.inference_mode()
+def test_paged_forward_matches_reference_decode_dense_page128() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 1],
+        cache_seqlens=[200, 384],
+        page_size=128,
+        q_heads=64,
+        kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    assert workspace.plan.page_size == 128
+    assert workspace.plan.msa_block_sparse is False
+    output, lse_base2 = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert (lse_natural - ref_lse).abs().max().item() <= 0.05
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
 def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
@@ -508,6 +550,169 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_paged_forward_matches_reference_extend_dense_page128() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6, 5],
+        cache_seqlens=[256, 384],
+        page_size=128,
+        q_heads=64,
+        kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        disable_split_kv=True,
+    )
+    assert workspace.plan.page_size == 128
+    assert workspace.plan.msa_block_sparse is False
+    output, lse_base2 = workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    lse_natural = lse_base2 * math.log(2.0)
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert (lse_natural - ref_lse).abs().max().item() <= 0.05
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    import b12x.attention.paged.api as paged_api
+
+    forward_specs: list[str] = []
+
+    def fake_launch(
+        _func,
+        *,
+        compile_spec,
+        compile_args,
+        runtime_args,
+        compile_kwargs=None,
+    ):
+        if compile_spec.kernel_id == "attention.paged.forward":
+            forward_specs.append(repr(compile_spec))
+
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+
+    batch = 4
+    page_size = 128
+    page_table_width = 4
+    num_cache_pages = 64
+    max_total_q = 64
+    q_heads = 16
+    kv_heads = 1
+    head_dim = 128
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    k_cache = torch.randn(
+        num_cache_pages,
+        page_size,
+        kv_heads,
+        head_dim,
+        dtype=torch.float32,
+        device=device,
+    ).to(dtype)
+    v_cache = torch.randn_like(k_cache)
+    scratch_plan = plan_paged_attention_scratch(
+        B12XPagedAttentionScratchCaps(
+            device=device,
+            mode="extend",
+            dtype=dtype,
+            kv_dtype=dtype,
+            num_q_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=max_total_q,
+            max_batch=batch,
+            max_page_table_width=page_table_width,
+            max_work_items=128,
+            max_partial_rows=0,
+            num_cache_pages=num_cache_pages,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=scratch_dtype, device=device)
+        for shape, scratch_dtype in scratch_plan.shapes_and_dtypes()
+    )
+
+    def make_metadata(
+        q_lens: list[int],
+        cache_lens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_q = sum(q_lens)
+        q = torch.randn(total_q, q_heads, head_dim, dtype=dtype, device=device)
+        page_table = torch.empty(
+            batch, page_table_width, dtype=torch.int32, device=device
+        )
+        for req_idx, cache_len in enumerate(cache_lens):
+            req_pages = math.ceil(cache_len / page_size)
+            assert req_pages <= page_table_width
+            page_ids = torch.arange(
+                req_idx * page_table_width,
+                req_idx * page_table_width + req_pages,
+                dtype=torch.int32,
+                device=device,
+            )
+            page_table[req_idx, :req_pages] = page_ids
+            page_table[req_idx, req_pages:] = page_ids[-1]
+        cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.tensor(
+            [0, *torch.tensor(q_lens, dtype=torch.int32).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+        return q, page_table, cache_seqlens, cu_seqlens_q
+
+    for q_lens, cache_lens in (
+        ([3, 2, 1, 4], [129, 130, 131, 132]),
+        ([16, 8, 4, 1], [400, 401, 402, 403]),
+    ):
+        q, page_table, cache_seqlens, cu_seqlens_q = make_metadata(
+            q_lens,
+            cache_lens,
+        )
+        output = torch.empty_like(q)
+        binding = scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_total_q=q.shape[0],
+        )
+        paged_attention_forward(binding=binding)
+
+    assert len(forward_specs) == 2
+    assert len(set(forward_specs)) == 1
 
 
 @torch.inference_mode()

@@ -503,13 +503,19 @@ def chunk_pages_for_family(
             _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
         )
 
-    if mode not in ("decode", "verify") or not graph_chunk_policy or policy_batch is None or page_size != 64:
+    if (
+        mode not in ("decode", "verify")
+        or not graph_chunk_policy
+        or policy_batch is None
+        or page_size not in (64, 128)
+    ):
         return None
 
+    policy_page_size = 64 if page_size == 128 else page_size
     chunk_pages = heuristic_decode_graph_chunk_pages(
         kv_dtype=kv_dtype,
         batch=int(policy_batch),
-        page_size=page_size,
+        page_size=policy_page_size,
         head_dim_qk=head_dim_qk,
         head_dim_vo=head_dim_vo,
         gqa_group_size=gqa_group_size,
@@ -806,13 +812,8 @@ def create_paged_plan(
         raise ValueError("k_cache and v_cache structural shapes must match except head_dim")
     if head_dim_k != head_dim_qk:
         raise ValueError("primary paged backend expects head_dim_qk to match k_cache head_dim")
-    if page_size == 128:
-        if not msa_block_sparse:
-            raise ValueError(
-                "primary paged backend supports page_size=128 only for MSA block-sparse plans"
-            )
-    elif page_size != 64:
-        raise ValueError(f"primary paged backend expects page_size=64 (or 128 for MSA), got {page_size}")
+    if page_size not in (64, 128):
+        raise ValueError(f"primary paged backend expects page_size=64 or page_size=128, got {page_size}")
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     if tuple(cache_seqlens.shape) != (batch,):
@@ -961,6 +962,15 @@ def create_paged_plan(
         total_num_qo_tiles = _ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch - 1
     else:
         avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
+        if (
+            mode in ("extend", "verify")
+            and plan_budget is not None
+            and plan_budget.max_total_q is not None
+        ):
+            avg_packed_qo_len = max(
+                avg_packed_qo_len,
+                int(plan_budget.max_total_q) * gqa_group_size // max(batch, 1),
+            )
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
