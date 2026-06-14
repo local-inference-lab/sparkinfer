@@ -647,6 +647,157 @@ def test_msa_extend_eager_fp8_kv_matches_reference_varlen(
     assert cosine >= 0.995
 
 
+def test_msa_extend_eager_fp8_page128_minimax_vllm_shape_matches_reference() -> None:
+    require_sm120()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[396],
+        cache_seqlens=[396],
+        page_size=128,
+        q_heads=16,
+        kv_heads=1,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        seed=2301,
+        page_table_width=1024,
+        num_pages=64,
+    )
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        total_q_capacity=4096,
+        seed=2302,
+        force_block0=True,
+        poison_padding=True,
+    )
+
+    k_fp8 = k_cache.to(torch.float8_e4m3fn)
+    v_fp8 = v_cache.to(torch.float8_e4m3fn)
+    combined = torch.stack([k_fp8, v_fp8], dim=1)
+    k_fp8 = combined[:, 0]
+    v_fp8 = combined[:, 1]
+    assert not k_fp8.is_contiguous()
+
+    unit_descale = torch.ones((), dtype=torch.float32, device=q.device).expand(1)
+    assert int(unit_descale.stride(0)) == 0
+    out, lse = _run_msa_extend(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=unit_descale,
+        v_descale=unit_descale,
+    )
+    ref, ref_lse = msa_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=unit_descale,
+        v_descale=unit_descale,
+    )
+    torch.testing.assert_close(lse, ref_lse, rtol=5e-2, atol=5e-2)
+    cosine = torch.nn.functional.cosine_similarity(
+        out.to(torch.float32).reshape(-1),
+        ref.to(torch.float32).reshape(-1),
+        dim=0,
+    ).item()
+    assert cosine >= 0.995
+
+
+def test_msa_extend_fp8_worklist_capacity_is_compile_keyed() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[396],
+        cache_seqlens=[396],
+        page_size=128,
+        q_heads=16,
+        kv_heads=1,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        seed=2401,
+        page_table_width=1024,
+        num_pages=64,
+    )
+    k_fp8 = k_cache.to(torch.float8_e4m3fn)
+    v_fp8 = v_cache.to(torch.float8_e4m3fn)
+    combined = torch.stack([k_fp8, v_fp8], dim=1)
+    k_fp8 = combined[:, 0]
+    v_fp8 = combined[:, 1]
+    unit_descale = torch.ones((), dtype=torch.float32, device=q.device).expand(1)
+
+    q_small = q[:208]
+    cache_seqlens_small = torch.tensor([208], dtype=torch.int32, device=q.device)
+    cu_seqlens_small = torch.tensor([0, 208], dtype=torch.int32, device=q.device)
+    q2k_small = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens_small,
+        cu_seqlens_q=cu_seqlens_small,
+        num_kv_heads=1,
+        total_q_capacity=4096,
+        seed=2402,
+        force_block0=True,
+        poison_padding=True,
+    )
+    _run_msa_extend(
+        q_small,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens_small,
+        cu_seqlens_small,
+        q2k_small,
+        k_descale=unit_descale,
+        v_descale=unit_descale,
+    )
+
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=1,
+        total_q_capacity=4096,
+        seed=2403,
+        force_block0=True,
+        poison_padding=True,
+    )
+    out, lse = _run_msa_extend(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=unit_descale,
+        v_descale=unit_descale,
+    )
+    ref, ref_lse = msa_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=unit_descale,
+        v_descale=unit_descale,
+    )
+    torch.testing.assert_close(lse, ref_lse, rtol=5e-2, atol=5e-2)
+    cosine = torch.nn.functional.cosine_similarity(
+        out.to(torch.float32).reshape(-1),
+        ref.to(torch.float32).reshape(-1),
+        dim=0,
+    ).item()
+    assert cosine >= 0.995
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_extend_rejects_per_token_fp8(page_size: int) -> None:
     require_sm120()

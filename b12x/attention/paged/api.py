@@ -861,9 +861,11 @@ def paged_attention_forward(
     )
     cuda_graph_decode = plan.mode == "decode" and plan.enable_cuda_graph
     dynamic_first_dim = () if cuda_graph_decode else (0,)
-    grid_worklist_dynamic_first_dim = (
-        () if cuda_graph_decode else dynamic_first_dim
-    )
+    # The worklist length determines the CUTE launch grid below:
+    # grid=(mBlockValidMask.shape[0], ...). Keep it static in the compile key
+    # so a kernel compiled for a smaller eager prefill bucket is not reused for
+    # a larger one with too few CTAs.
+    grid_worklist_dynamic_first_dim = ()
     forward_lse_dynamic_dims = (
         dynamic_first_dim if plan.split_kv else (() if cuda_graph_decode else (1,))
     )
