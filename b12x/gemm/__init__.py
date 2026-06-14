@@ -11,6 +11,12 @@ from .block_fp8_linear import (
     prewarm_block_fp8_linear_mxfp8,
     quantize_block_fp8_linear_input_mxfp8,
 )
+from .mxfp8_linear import (
+    MXFP8LinearWeight,
+    is_mxfp8_linear_supported,
+    mxfp8_linear,
+    pack_mxfp8_linear_weight,
+)
 from .wo_projection import (
     MXFP8Rows,
     WOProjectionBinding,
@@ -44,6 +50,7 @@ __all__ = [
     "BlockFP8LinearScratchCaps",
     "BlockFP8LinearScratchPlan",
     "BlockFP8LinearWeight",
+    "MXFP8LinearWeight",
     "MXFP8Rows",
     "WOProjectionBinding",
     "WOProjectionInvRopeBinding",
@@ -58,8 +65,10 @@ __all__ = [
     "dense_gemm",
     "empty_dense_gemm_mnl_view",
     "empty_mxfp8_rows_for_dense_gemm",
+    "is_mxfp8_linear_supported",
     "pack_block_fp8_linear_weight_mxfp8",
     "pack_fp8_block_scaled_weight_mxfp8",
+    "pack_mxfp8_linear_weight",
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
     "plan_block_fp8_linear_scratch",
@@ -67,6 +76,7 @@ __all__ = [
     "prewarm_block_fp8_linear_mxfp8",
     "quantize_block_fp8_linear_input_mxfp8",
     "quantize_mxfp8_rows_torch",
+    "mxfp8_linear",
     "quantize_wo_a_input_inv_rope_mxfp8",
     "quantize_wo_a_input_mxfp8",
     "quantize_wo_b_input_mxfp8",
