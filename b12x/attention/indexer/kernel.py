@@ -515,7 +515,7 @@ def _compute_mxfp8_tile_partials(
     s_partial_logits: cute.Tensor,
     partial_row_base: Int32,
     head_tile_slot: Int32,
-    score_mode: cutlass.Constexpr[int],
+    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.NSA_RELU_SUM,
 ):
     group_id = lane // Int32(4)
     thread_id_in_group = lane % Int32(4)
