@@ -628,15 +628,18 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    k_cache = torch.randn(
-        num_cache_pages,
-        page_size,
-        kv_heads,
-        head_dim,
-        dtype=torch.float32,
-        device=device,
-    ).to(dtype)
-    v_cache = torch.randn_like(k_cache)
+    def make_kv_cache(pages: int) -> tuple[torch.Tensor, torch.Tensor]:
+        k_cache = torch.empty(
+            pages,
+            page_size,
+            kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        v_cache = torch.empty_like(k_cache)
+        return k_cache, v_cache
+
     scratch_plan = plan_paged_attention_scratch(
         B12XPagedAttentionScratchCaps(
             device=device,
@@ -689,29 +692,33 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
         )
         return q, page_table, cache_seqlens, cu_seqlens_q
 
-    for q_lens, cache_lens in (
-        ([3, 2, 1, 4], [129, 130, 131, 132]),
-        ([16, 8, 4, 1], [400, 401, 402, 403]),
+    for k_cache, v_cache in (
+        make_kv_cache(num_cache_pages),
+        make_kv_cache(num_cache_pages + 32),
     ):
-        q, page_table, cache_seqlens, cu_seqlens_q = make_metadata(
-            q_lens,
-            cache_lens,
-        )
-        output = torch.empty_like(q)
-        binding = scratch_plan.bind(
-            scratch=scratch,
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            output=output,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            active_total_q=q.shape[0],
-        )
-        paged_attention_forward(binding=binding)
+        for q_lens, cache_lens in (
+            ([3, 2, 1, 4], [129, 130, 131, 132]),
+            ([16, 8, 4, 1], [400, 401, 402, 403]),
+        ):
+            q, page_table, cache_seqlens, cu_seqlens_q = make_metadata(
+                q_lens,
+                cache_lens,
+            )
+            output = torch.empty_like(q)
+            binding = scratch_plan.bind(
+                scratch=scratch,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                output=output,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                active_total_q=q.shape[0],
+            )
+            paged_attention_forward(binding=binding)
 
-    assert len(forward_specs) == 2
+    assert len(forward_specs) == 4
     assert len(set(forward_specs)) == 1
 
 

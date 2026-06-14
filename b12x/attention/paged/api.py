@@ -294,6 +294,14 @@ def _tensor_meta_key(
     )
 
 
+def _paged_kv_cache_meta_key(
+    tensor: torch.Tensor | None,
+) -> tuple[tuple[object, ...], tuple[object, ...], str, tuple[str, int | None]] | None:
+    # K/V cache page capacity is runtime storage capacity. The selected kernel
+    # policy depends on page layout, dtype, heads, and strides, not total pages.
+    return _tensor_meta_key(tensor, dynamic_dims=(0,))
+
+
 def _traits_compile_key(traits: PagedForwardTraits) -> tuple[object, ...]:
     return (
         int(traits.cta_tile_q),
@@ -892,8 +900,8 @@ def paged_attention_forward(
             int(page_tiles_per_entry),
         ),
         _tensor_meta_key(q_cache_tensor, dynamic_dims=dynamic_first_dim),
-        _tensor_meta_key(k_cache),
-        _tensor_meta_key(v_cache),
+        _paged_kv_cache_meta_key(k_cache),
+        _paged_kv_cache_meta_key(v_cache),
         _tensor_meta_key(page_table, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(cache_seqlens, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(cu_seqlens_q, dynamic_dims=dynamic_first_dim),
