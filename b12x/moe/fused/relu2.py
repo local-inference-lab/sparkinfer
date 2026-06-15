@@ -21,6 +21,8 @@ class MoEMicroKernelRelu2(MoEMicroKernelBackend):
         single_token: bool = False,
         dynamic_down_scale: bool = False,
         a8_mx_mode: bool = False,
+        scale_format: str = "e4m3_k16",
+        e8m0_scale_layout: str = "packed",
     ):
         super().__init__(
             sf_vec_size,
@@ -33,6 +35,8 @@ class MoEMicroKernelRelu2(MoEMicroKernelBackend):
             single_token=single_token,
             dynamic_down_scale=dynamic_down_scale,
             a8_mx_mode=a8_mx_mode,
+            scale_format=scale_format,
+            e8m0_scale_layout=e8m0_scale_layout,
         )
 
     @classmethod
