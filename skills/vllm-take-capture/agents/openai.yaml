@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Capture"
+  short_description: "Capture and copy vLLM rank-0 profiles"
+  default_prompt: "Use $vllm-take-capture to take a capture from the running vLLM workload."
