@@ -17,10 +17,9 @@ from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import (
-    DimKey,
     KernelCompileSpec,
-    TensorKey,
     launch as b12x_launch,
+    tensor_compile_fact,
 )
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
@@ -328,13 +327,8 @@ def _tensor_compile_key(
     tensor: torch.Tensor,
     *,
     dynamic_dims: tuple[int, ...] = (),
-) -> TensorKey:
-    dynamic_dim_set = set(dynamic_dims)
-    dims = tuple(
-        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
-        for idx, dim in enumerate(tensor.shape)
-    )
-    return TensorKey.from_tensor(name, tensor, dims=dims)
+) -> tuple[object, ...]:
+    return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
 def _assume_paged_k_tma_source_aligned(t: cute.Tensor):

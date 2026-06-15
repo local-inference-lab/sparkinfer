@@ -22,9 +22,7 @@ from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import (
-    DimKey,
     KernelCompileSpec,
-    TensorKey,
     launch as b12x_launch,
 )
 from b12x.cute.fp4 import (
@@ -244,31 +242,6 @@ def _to_kernel_tensor(
     return cute_tensor
 
 
-def _tensor_compile_key(
-    name: str,
-    tensor: torch.Tensor,
-    *,
-    dynamic_dims: tuple[int, ...] = (),
-) -> TensorKey:
-    dynamic_dim_set = set(dynamic_dims)
-    dims = tuple(
-        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
-        for idx, dim in enumerate(tensor.shape)
-    )
-    return TensorKey.from_tensor(name, tensor, dims=dims)
-
-
-def _flat_tensor_compile_key(
-    name: str,
-    tensor: torch.Tensor,
-    *,
-    dynamic: bool = False,
-) -> TensorKey:
-    flat = tensor.reshape(-1)
-    dims = (DimKey.dynamic() if dynamic else DimKey.exact(int(flat.shape[0])),)
-    return TensorKey.from_tensor(name, flat, dims=dims)
-
-
 def _tensor_meta_key(
     tensor: torch.Tensor,
 ) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]]:
@@ -278,6 +251,68 @@ def _tensor_meta_key(
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
+
+
+def _contiguous_logits_compile_facts(
+    *,
+    variant: str,
+    tiled_output: bool,
+    score_mode: int,
+    q_u32: torch.Tensor,
+    weights: torch.Tensor,
+    k_quant_bytes: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    logits_out: torch.Tensor,
+    tile_logits: torch.Tensor,
+    block_k: int,
+    block_score_output: bool = False,
+    block_scores: torch.Tensor | None = None,
+    q_heads_batch: int | None = None,
+) -> tuple[object, ...]:
+    facts: list[object] = [
+        ("variant", variant),
+        ("tiled_output", bool(tiled_output)),
+        ("score_mode", int(score_mode)),
+        ("head_dim", _INDEX_HEAD_DIM),
+        ("q_heads", int(q_u32.shape[1])),
+        ("q_u32_cols", int(q_u32.shape[2])),
+        ("q_u32_stride_head", int(q_u32.stride(1))),
+        ("q_u32_stride_col", int(q_u32.stride(2))),
+        ("weights_stride_q", int(weights.stride(0))),
+        ("weights_stride_head", int(weights.stride(1))),
+        ("k_quant_stride_row", int(k_quant_bytes.stride(0))),
+        ("k_quant_stride_col", int(k_quant_bytes.stride(1))),
+        ("k_scale_stride", int(k_scale.stride(0))),
+        ("k_start_stride", int(k_start.stride(0))),
+        ("k_end_stride", int(k_end.stride(0))),
+        ("block_k", int(block_k)),
+        ("block_score_output", bool(block_score_output)),
+    ]
+    if q_heads_batch is not None:
+        facts.append(("q_heads_batch", int(q_heads_batch)))
+    if tiled_output:
+        tile_logits_flat = tile_logits.reshape(-1)
+        facts.append(("tile_logits_stride", int(tile_logits_flat.stride(0))))
+    else:
+        facts.extend(
+            [
+                ("logits_stride_q", int(logits_out.stride(0))),
+                ("logits_stride_k", int(logits_out.stride(1))),
+            ]
+        )
+    if block_scores is not None:
+        facts.extend(
+            [
+                ("block_scores_heads", int(block_scores.shape[0])),
+                ("block_scores_blocks", int(block_scores.shape[2])),
+                ("block_scores_stride_head", int(block_scores.stride(0))),
+                ("block_scores_stride_q", int(block_scores.stride(1))),
+                ("block_scores_stride_block", int(block_scores.stride(2))),
+            ]
+        )
+    return tuple(facts)
 
 
 def _pad_kv_rows(
@@ -3032,104 +3067,51 @@ def run_contiguous_logits_kernel(
                 "prefill512" if _prefill_block_k == _PREFILL512_BLOCK_K else "prefill"
             )
         )
-        cache_key = (
-            _tensor_compile_key(
-                "contiguous_q_u32", q_u32, dynamic_dims=(0,)
-            ),
-            _tensor_compile_key(
-                "contiguous_q_bytes",
-                q_bytes_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_weights",
-                weights_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_quant",
-                k_quant_bytes,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
-            _tensor_compile_key(
-                "contiguous_k_scale",
-                k_scale_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_start",
-                k_start_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_end", k_end_kernel, dynamic_dims=(0,)
-            ),
-            _tensor_compile_key(
-                "contiguous_logits", out_kernel, dynamic_dims=(0,)
-            ),
-            _flat_tensor_compile_key(
-                "contiguous_tile_logits",
-                tile_logits_kernel,
-                dynamic=True,
-            ),
+        q_heads_batch = (
             (
-                _flat_tensor_compile_key(
-                    "contiguous_block_scores",
-                    block_scores_kernel,
-                    dynamic=True,
-                )
-                if _prefill_block_k == _PREFILL_BLOCK_K
-                else ("contiguous_block_scores", "unused")
-            ),
-            (
-                _prefill_cache_variant,
-                _tiled_output,
-                score_mode,
-                False,
-            ),
+                _PREFILL512_H32_Q_HEADS_BATCH
+                if _prefill_cache_variant == "prefill512_h32"
+                else _PREFILL512_Q_HEADS_BATCH
+            )
+            if _prefill_block_k == _PREFILL512_BLOCK_K
+            else None
+        )
+        facts = _contiguous_logits_compile_facts(
+            variant=_prefill_cache_variant,
+            tiled_output=_tiled_output,
+            score_mode=score_mode,
+            q_u32=q_u32,
+            weights=weights_kernel,
+            k_quant_bytes=k_quant_bytes,
+            k_scale=k_scale_kernel,
+            k_start=k_start_kernel,
+            k_end=k_end_kernel,
+            logits_out=out_kernel,
+            tile_logits=tile_logits_kernel,
+            block_k=_prefill_block_k,
+            block_score_output=False,
+            q_heads_batch=q_heads_batch,
         )
     else:
-        cache_key = (
-            _tensor_compile_key(
-                "contiguous_q_u32", q_u32, dynamic_dims=(0,)
-            ),
-            _tensor_compile_key(
-                "contiguous_weights",
-                weights_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_quant",
-                k_quant_bytes,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
-            _tensor_compile_key(
-                "contiguous_k_scale",
-                k_scale_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_start",
-                k_start_kernel,
-                dynamic_dims=(0,),
-            ),
-            _tensor_compile_key(
-                "contiguous_k_end", k_end_kernel, dynamic_dims=(0,)
-            ),
-            _tensor_compile_key(
-                "contiguous_logits", out_kernel, dynamic_dims=(0,)
-            ),
-            _flat_tensor_compile_key(
-                "contiguous_tile_logits", tile_logits_kernel, dynamic=True
-            ),
-            ("decode", _tiled_output, score_mode),
+        facts = _contiguous_logits_compile_facts(
+            variant="decode",
+            tiled_output=_tiled_output,
+            score_mode=score_mode,
+            q_u32=q_u32,
+            weights=weights_kernel,
+            k_quant_bytes=k_quant_bytes,
+            k_scale=k_scale_kernel,
+            k_start=k_start_kernel,
+            k_end=k_end_kernel,
+            logits_out=out_kernel,
+            tile_logits=tile_logits_kernel,
+            block_k=_BLOCK_K,
+            block_score_output=False,
         )
-    compile_spec = KernelCompileSpec.from_key(
+    compile_spec = KernelCompileSpec.from_facts(
         "attention.indexer.contiguous_logits",
-        2,
-        cache_key,
+        3,
+        *facts,
     )
     b12x_launch(
         kernel,
@@ -3269,24 +3251,26 @@ def run_contiguous_block_scores_kernel(
         Int32(0),
         current_cuda_stream(),
     )
-    cache_key = (
-        _tensor_compile_key("contiguous_q_u32", q_u32, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_q_bytes", q_bytes, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_weights", weights_kernel, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_k_quant", k_quant_bytes, dynamic_dims=(0,)),
-        _tensor_compile_key("k_tma_prefill_desc_ptrs", k_tma_prefill_desc_ptrs),
-        _tensor_compile_key("contiguous_k_scale", k_scale_kernel, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_k_start", k_start_kernel, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_k_end", k_end_kernel, dynamic_dims=(0,)),
-        _tensor_compile_key("contiguous_dummy_logits", out_kernel, dynamic_dims=(0,)),
-        _flat_tensor_compile_key("contiguous_tile_logits", tile_logits_kernel, dynamic=True),
-        _tensor_compile_key("contiguous_block_scores", block_scores, dynamic_dims=(1,)),
-        ("prefill_msa_blockmax", False, IndexerScoreMode.MSA_BILINEAR, True),
+    facts = _contiguous_logits_compile_facts(
+        variant="prefill_msa_blockmax",
+        tiled_output=False,
+        score_mode=IndexerScoreMode.MSA_BILINEAR,
+        q_u32=q_u32,
+        weights=weights_kernel,
+        k_quant_bytes=k_quant_bytes,
+        k_scale=k_scale_kernel,
+        k_start=k_start_kernel,
+        k_end=k_end_kernel,
+        logits_out=out_kernel,
+        tile_logits=tile_logits_kernel,
+        block_k=_PREFILL_BLOCK_K,
+        block_score_output=True,
+        block_scores=block_scores,
     )
-    compile_spec = KernelCompileSpec.from_key(
+    compile_spec = KernelCompileSpec.from_facts(
         "attention.indexer.contiguous_block_scores",
-        1,
-        cache_key,
+        2,
+        *facts,
     )
     b12x_launch(
         kernel,

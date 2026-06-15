@@ -30,7 +30,11 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import DimKey, KernelCompileSpec, TensorKey, launch as b12x_launch
+from b12x.cute.compiler import (
+    KernelCompileSpec,
+    launch as b12x_launch,
+    tensor_compile_fact,
+)
 from b12x.cute.fp4 import shared_ptr_to_u32
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from b12x.cute.utils import current_cuda_stream
@@ -1555,7 +1559,7 @@ def _arg_sig(*tensors: torch.Tensor):
     return tuple((tuple(t.shape), str(t.dtype)) for t in tensors)
 
 
-def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> TensorKey:
+def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> tuple[object, ...]:
     dynamic_row_names = {
         "q",
         "w",
@@ -1574,12 +1578,7 @@ def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> TensorKey:
         if name in dynamic_row_names and int(tensor.ndim) >= 1
         else ()
     )
-    dynamic_dim_set = set(dynamic_dims)
-    dims = tuple(
-        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
-        for idx, dim in enumerate(tensor.shape)
-    )
-    return TensorKey.from_tensor(name, tensor, dims=dims)
+    return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
 def _launch_fused(kernel, cute_args, key_tensors, policy):

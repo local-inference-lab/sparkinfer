@@ -14,7 +14,12 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
 from b12x.attention.workspace import _SPLIT_MAX_CHUNKS
-from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    launch as b12x_launch,
+    tensor_compile_fact,
+)
 from b12x.cute.utils import current_cuda_stream
 
 from .decode_math import _exp2_approx_ftz_f32
@@ -160,24 +165,11 @@ def _tensor_compile_key(
     dynamic_dims: tuple[int, ...] = (),
     dynamic_strides: tuple[int, ...] = (),
 ) -> tuple[object, ...]:
-    dynamic_dim_set = set(dynamic_dims)
-    dynamic_stride_set = set(dynamic_strides)
-    dims = tuple(
-        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
-        for idx, dim in enumerate(tensor.shape)
-    )
-    strides = tuple(
-        DimKey.dynamic() if idx in dynamic_stride_set else DimKey.exact(int(stride))
-        for idx, stride in enumerate(tensor.stride())
-    )
-    return (
-        "tensor",
+    return tensor_compile_fact(
         name,
-        str(tensor.dtype),
-        int(tensor.ndim),
-        dims,
-        strides,
-        (tensor.device.type, tensor.device.index),
+        tensor,
+        dynamic_dims=dynamic_dims,
+        dynamic_strides=dynamic_strides,
     )
 
 

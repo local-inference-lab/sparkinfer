@@ -24,8 +24,8 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.cute.compiler import (
     DimKey,
     KernelCompileSpec,
-    TensorKey,
     launch as b12x_launch,
+    tensor_compile_fact,
 )
 from b12x.cute.fp4 import (
     atomic_add_shared_i32,
@@ -229,18 +229,13 @@ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
 
 
 def _tensor_compile_key(name, tensor, *, dynamic_dims=()):
-    dynamic_dim_set = set(dynamic_dims)
-    dims = tuple(
-        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
-        for idx, dim in enumerate(tensor.shape)
-    )
-    return TensorKey.from_tensor(name, tensor, dims=dims)
+    return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
 def _flat_tensor_compile_key(name, tensor, *, dynamic=False):
     flat = tensor.reshape(-1)
     dims = (DimKey.dynamic() if dynamic else DimKey.exact(int(flat.shape[0])),)
-    return TensorKey.from_tensor(name, flat, dims=dims)
+    return tensor_compile_fact(name, flat, dims=dims)
 
 
 def _tensor_meta_key(tensor, *, dynamic_dims=()):

@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import inspect
+import json
+import math
 import os
 import sys
 import traceback
 from collections import OrderedDict
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -22,6 +24,8 @@ _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
 _COMPILE_MISSES = 0
+_EXECUTOR_CACHE_LOCK = RLock()
+_EXECUTOR_CACHE_ATTR = "_b12x_cached_default_executor"
 _VLLM_ENGINE_STARTED_ENV = "B12X_VLLM_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
 
@@ -104,9 +108,60 @@ class KernelCompileSpec:
     kernel_id: str
     version: int
     fields: tuple[KeyField, ...] = ()
+    json_key: str = ""
+    hash_key: str = ""
+    legacy: bool = False
+
+    def __post_init__(self) -> None:
+        if self.json_key and self.hash_key:
+            return
+        json_key = _compile_spec_json(
+            self.kernel_id,
+            self.version,
+            _legacy_compile_spec_facts(self.kernel_id, self.version, self.fields),
+        )
+        object.__setattr__(self, "json_key", json_key)
+        object.__setattr__(self, "hash_key", _hash_json_key(json_key))
+        object.__setattr__(self, "legacy", True)
+
+    @staticmethod
+    def from_facts(
+        kernel_id: str,
+        version: int,
+        *facts: object,
+    ) -> "KernelCompileSpec":
+        json_key = _compile_spec_json(kernel_id, version, facts)
+        return KernelCompileSpec(
+            kernel_id=str(kernel_id),
+            version=int(version),
+            fields=(),
+            json_key=json_key,
+            hash_key=_hash_json_key(json_key),
+            legacy=False,
+        )
 
     @staticmethod
     def from_fields(
+        kernel_id: str,
+        version: int,
+        *fields: KeyField | tuple[str, object],
+    ) -> "KernelCompileSpec":
+        coerced_fields = tuple(_coerce_key_field(field) for field in fields)
+        if all(_is_json_pod(field.value) for field in coerced_fields):
+            return KernelCompileSpec.from_facts(
+                kernel_id,
+                version,
+                *((field.name, field.value) for field in coerced_fields),
+            )
+        return KernelCompileSpec(
+            kernel_id=kernel_id,
+            version=int(version),
+            fields=coerced_fields,
+            legacy=True,
+        )
+
+    @staticmethod
+    def from_legacy_fields(
         kernel_id: str,
         version: int,
         *fields: KeyField | tuple[str, object],
@@ -115,10 +170,41 @@ class KernelCompileSpec:
             kernel_id=kernel_id,
             version=int(version),
             fields=tuple(_coerce_key_field(field) for field in fields),
+            legacy=True,
         )
 
     @staticmethod
     def from_key(
+        kernel_id: str,
+        version: int,
+        key: tuple[object, ...],
+        *,
+        labels: tuple[str, ...] | None = None,
+    ) -> "KernelCompileSpec":
+        if labels is not None and len(labels) != len(key):
+            raise ValueError(
+                f"compile spec labels length {len(labels)} does not match "
+                f"key length {len(key)}"
+            )
+        if _is_json_pod(key):
+            facts = (
+                tuple((str(labels[idx]), value) for idx, value in enumerate(key))
+                if labels is not None
+                else key
+            )
+            return KernelCompileSpec.from_facts(kernel_id, version, *facts)
+        return KernelCompileSpec(
+            kernel_id=kernel_id,
+            version=int(version),
+            fields=tuple(
+                KeyField(labels[idx] if labels is not None else f"arg{idx}", value)
+                for idx, value in enumerate(key)
+            ),
+            legacy=True,
+        )
+
+    @staticmethod
+    def from_legacy_key(
         kernel_id: str,
         version: int,
         key: tuple[object, ...],
@@ -137,6 +223,7 @@ class KernelCompileSpec:
                 KeyField(labels[idx] if labels is not None else f"arg{idx}", value)
                 for idx, value in enumerate(key)
             ),
+            legacy=True,
         )
 
 
@@ -159,12 +246,209 @@ def tensor_key(
     align: int | None = None,
     layout: object = None,
 ) -> KeyField:
-    return KeyField(
-        name,
-        None
-        if tensor is None
-        else TensorKey.from_tensor(name, tensor, dims=dims, align=align, layout=layout),
+    if tensor is None:
+        value = None
+    else:
+        try:
+            value = tensor_compile_fact(
+                name,
+                tensor,
+                dims=dims,
+                align=align,
+                layout=layout,
+            )
+        except TypeError:
+            value = TensorKey.from_tensor(
+                name,
+                tensor,
+                dims=dims,
+                align=align,
+                layout=layout,
+            )
+    return KeyField(name, value)
+
+
+def dim_compile_fact(dim: DimKey | object) -> tuple[str, object]:
+    return _dim_policy_fact(dim)
+
+
+def _dim_policy_fact(dim: DimKey | object) -> tuple[str, object]:
+    if isinstance(dim, DimKey):
+        return ("dim", str(dim.kind), _json_pod(dim.value, path="dim.value"))
+    return ("dim", "exact", _json_pod(dim, path="dim.value"))
+
+
+def tensor_compile_fact(
+    name: str,
+    tensor: Any,
+    *,
+    dims: tuple[DimKey | object, ...] | None = None,
+    dynamic_dims: tuple[int, ...] = (),
+    strides: tuple[DimKey | object, ...] | None = None,
+    dynamic_strides: tuple[int, ...] = (),
+    align: int | None = None,
+    layout: object = None,
+) -> tuple[object, ...]:
+    shape = tuple(int(dim) for dim in tensor.shape)
+    if dims is None:
+        dynamic_dim_set = set(dynamic_dims)
+        dims = tuple(
+            DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(dim)
+            for idx, dim in enumerate(shape)
+        )
+    if len(dims) != len(shape):
+        raise ValueError(
+            f"tensor key {name!r} dim policy rank {len(dims)} "
+            f"does not match tensor rank {len(shape)}"
+        )
+
+    raw_strides = tuple(int(stride) for stride in tensor.stride())
+    if strides is None:
+        dynamic_stride_set = set(dynamic_strides)
+        strides = tuple(
+            DimKey.dynamic() if idx in dynamic_stride_set else DimKey.exact(stride)
+            for idx, stride in enumerate(raw_strides)
+        )
+    if len(strides) != len(raw_strides):
+        raise ValueError(
+            f"tensor key {name!r} stride policy rank {len(strides)} "
+            f"does not match tensor rank {len(raw_strides)}"
+        )
+
+    device = tensor.device
+    layout_fact = None if layout is None else _json_pod(layout, path="layout")
+    return (
+        "tensor",
+        str(name),
+        str(tensor.dtype),
+        len(shape),
+        tuple(_dim_policy_fact(dim) for dim in dims),
+        tuple(_dim_policy_fact(stride) for stride in strides),
+        (str(device.type), device.index),
+        None if align is None else int(align),
+        layout_fact,
     )
+
+
+def _is_json_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int, str)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _is_json_pod(value: Any) -> bool:
+    if _is_json_scalar(value):
+        return True
+    if isinstance(value, DimKey):
+        return _is_json_pod(value.value)
+    if isinstance(value, KeyField):
+        return _is_json_pod(value.value)
+    if isinstance(value, (TensorKey, KernelCompileSpec)):
+        return False
+    if isinstance(value, (tuple, list)):
+        return all(_is_json_pod(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_json_pod(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _json_pod(value: Any, *, path: str = "value") -> Any:
+    if _is_json_scalar(value):
+        return value
+    if isinstance(value, float):
+        raise TypeError(f"{path} must be finite for JSON compile specs")
+    if isinstance(value, DimKey):
+        return [
+            "dim",
+            str(value.kind),
+            _json_pod(value.value, path=f"{path}.value"),
+        ]
+    if isinstance(value, KeyField):
+        return [
+            "field",
+            str(value.name),
+            _json_pod(value.value, path=f"{path}.{value.name}"),
+        ]
+    if isinstance(value, (TensorKey, KernelCompileSpec)):
+        raise TypeError(
+            f"{path} contains legacy compile-key object {type(value).__name__}; "
+            "use explicit POD facts instead"
+        )
+    if isinstance(value, tuple):
+        return [
+            _json_pod(item, path=f"{path}[{idx}]")
+            for idx, item in enumerate(value)
+        ]
+    if isinstance(value, list):
+        return [
+            _json_pod(item, path=f"{path}[{idx}]")
+            for idx, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{path} dict key {key!r} is not a string")
+            out[key] = _json_pod(item, path=f"{path}.{key}")
+        return out
+    raise TypeError(
+        f"{path} contains non-POD compile fact "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def _json_dumps_pod(value: Any) -> str:
+    return json.dumps(
+        _json_pod(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def _hash_json_key(json_key: str) -> str:
+    return hashlib.sha256(json_key.encode("utf-8")).hexdigest()
+
+
+def _compile_spec_json(
+    kernel_id: str,
+    version: int,
+    facts: object,
+) -> str:
+    return _json_dumps_pod(
+        {
+            "facts": facts,
+            "kernel": str(kernel_id),
+            "version": int(version),
+        }
+    )
+
+
+def _legacy_compile_spec_facts(
+    kernel_id: str,
+    version: int,
+    fields: tuple[KeyField, ...],
+) -> tuple[object, ...]:
+    return (
+        "legacy",
+        str(kernel_id),
+        int(version),
+        tuple(_compile_spec_shape_key(field) for field in fields),
+    )
+
+
+def _compile_kwargs_json_key(kwargs: dict[str, Any]) -> tuple[str, str]:
+    if not kwargs:
+        return "", ""
+    try:
+        json_key = _json_dumps_pod(kwargs)
+    except TypeError:
+        json_key = _json_dumps_pod(_compile_spec_shape_key(kwargs))
+    return json_key, _hash_json_key(json_key)
 
 
 def _compile_spec_shape_key(value: Any) -> Any:
@@ -192,10 +476,11 @@ def _compile_spec_shape_key(value: Any) -> Any:
         return ("field", value.name, _compile_spec_shape_key(value.value))
     if isinstance(value, KernelCompileSpec):
         return (
-            "kernel_spec",
+            "kernel_spec_json" if not value.legacy else "kernel_spec_legacy_json",
             value.kernel_id,
             value.version,
-            tuple(_compile_spec_shape_key(field) for field in value.fields),
+            value.hash_key,
+            value.json_key,
         )
     if isinstance(value, (tuple, list)):
         return tuple(_compile_spec_shape_key(item) for item in value)
@@ -249,12 +534,13 @@ def _compile_memory_cache_key(
     compile_spec: KernelCompileSpec | None,
 ) -> object:
     if compile_spec is not None:
+        kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         key: tuple[object, ...] = (
-            "b12x_cute_memory_cache_v1_explicit_spec",
-            _compile_spec_shape_key(compile_spec),
+            "b12x_cute_memory_cache_v2_explicit_spec",
+            compile_spec.hash_key,
         )
-        if kwargs:
-            key += (_compile_spec_shape_key(kwargs),)
+        if kwargs_hash_key:
+            key += (kwargs_hash_key, kwargs_json_key)
         return key
 
     return hashlib.sha256(
@@ -695,6 +981,43 @@ def _compile_cache_payload_log_value(
 ) -> dict[str, Any]:
     if payload is None:
         return {}
+    if len(payload) == 10 and payload[0] == "b12x_cute_compile_cache_v5_explicit_spec":
+        (
+            _version,
+            target_key,
+            _b12x_fingerprint,
+            toolchain_key,
+            spec_hash,
+            spec_json,
+            kwargs_hash,
+            kwargs_json,
+            options_key,
+            env_key,
+        ) = payload
+
+        summary: dict[str, Any] = {
+            "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
+            "spec_hash": spec_hash,
+            "spec": spec_json,
+        }
+        if kwargs_hash:
+            summary["kwargs_hash"] = kwargs_hash
+            summary["kwargs"] = kwargs_json
+        if options_key:
+            summary["options"] = _cache_key_log_value(
+                options_key, max_depth=4, max_items=32
+            )
+        env_summary = (
+            _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
+        )
+        if env_summary:
+            summary["env"] = env_summary
+        if isinstance(toolchain_key, tuple):
+            toolchain_summary = _toolchain_log_value(toolchain_key)
+            if toolchain_summary:
+                summary["toolchain"] = toolchain_summary
+        return summary
+
     if len(payload) == 8 and payload[0] in {
         "b12x_cute_compile_cache_v3_explicit_spec",
         "b12x_cute_compile_cache_v4_explicit_spec",
@@ -766,6 +1089,38 @@ def _compile_cache_payload_log_value(
     return summary
 
 
+def _is_explicit_spec_payload(payload: tuple[object, ...] | None) -> bool:
+    return (
+        payload is not None
+        and len(payload) == 10
+        and payload[0] == "b12x_cute_compile_cache_v5_explicit_spec"
+    )
+
+
+def _cute_compile_arg_log_enabled() -> bool:
+    raw = os.environ.get("B12X_LOG_CUTE_COMPILE_ARGS", "")
+    return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _format_explicit_spec_log_details(summary: dict[str, Any]) -> str:
+    parts = []
+    if "spec_hash" in summary:
+        parts.append(f"spec_hash={summary['spec_hash']}")
+    if "spec" in summary:
+        parts.append(f"spec={summary['spec']}")
+    if "kwargs_hash" in summary:
+        parts.append(f"kwargs_hash={summary['kwargs_hash']}")
+    if "kwargs" in summary:
+        parts.append(f"kwargs={summary['kwargs']}")
+    if "options" in summary:
+        parts.append(f"options={_short_repr(summary['options'], max_len=1200)}")
+    if "env" in summary:
+        parts.append(f"env={_short_repr(summary['env'], max_len=1200)}")
+    if "toolchain" in summary:
+        parts.append(f"toolchain={_short_repr(summary['toolchain'], max_len=1200)}")
+    return " ".join(parts)
+
+
 def _format_cute_compile_stack() -> str:
     depth = _cute_compile_stack_log_depth()
     frames = traceback.extract_stack()[:-2]
@@ -800,6 +1155,29 @@ def _log_cute_compile_event(
     key_inputs = _compile_cache_payload_log_value(cache_payload)
     reason_text = "" if reason is None else f"reason={reason} "
     cache_key_text = "" if cache_key is None else f"cache_key={cache_key[:16]} "
+    if _is_explicit_spec_payload(cache_payload):
+        attrs_text = _short_repr(_compile_target_attrs(func), max_len=1200)
+        args_text = ""
+        if _cute_compile_arg_log_enabled():
+            args_text = (
+                f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
+            )
+        details = _format_explicit_spec_log_details(key_inputs)
+        print(
+            f"[b12x cute.compile] {event} "
+            f"{reason_text}"
+            f"target={_compile_target_name(func)} "
+            f"status={cache_status} "
+            f"{cache_key_text}"
+            f"attrs={attrs_text} "
+            f"{args_text}"
+            f"{details}",
+            flush=True,
+        )
+        if _cute_compile_stack_log_enabled():
+            print(_format_cute_compile_stack(), flush=True)
+        return
+
     print(
         f"[b12x cute.compile] {event} "
         f"{reason_text}"
@@ -1252,13 +1630,16 @@ def _compile_disk_cache_payload(
         compile_environment,
     ) = _static_compile_cache_context(compile_callable)
     if compile_spec is not None:
+        kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
-            "b12x_cute_compile_cache_v4_explicit_spec",
+            "b12x_cute_compile_cache_v5_explicit_spec",
             _explicit_spec_compile_target(func),
             package_fingerprint,
             runtime_toolchain,
-            _compile_spec_shape_key(compile_spec),
-            _compile_spec_shape_key(kwargs),
+            compile_spec.hash_key,
+            compile_spec.json_key,
+            kwargs_hash_key,
+            kwargs_json_key,
             compile_options,
             compile_environment,
         )
@@ -1293,6 +1674,28 @@ def _cache_prefix(cache_key: str) -> str:
 
 def _cache_object_path(cache_key: str) -> Path:
     return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
+
+
+def _cache_lock_path(cache_key: str) -> Path:
+    return _cache_object_path(cache_key).with_suffix(".lock")
+
+
+@contextmanager
+def _disk_cache_key_lock(cache_key: str):
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    lock_path = _cache_lock_path(cache_key)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _load_cute_compile_from_disk(cache_key: str):
@@ -1426,7 +1829,62 @@ def compile(
                     )
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
-        cache_status = "disk-cache-miss"
+
+        with _disk_cache_key_lock(cache_key):
+            compiled = _memory_cache_get(memory_cache_key)
+            if compiled is not None:
+                return compiled
+
+            compiled = _load_cute_compile_from_disk(cache_key)
+            if compiled is not None:
+                with _MEMORY_CACHE_LOCK:
+                    _DISK_CACHE_HITS += 1
+                if post_engine_start_log:
+                    with suppress(Exception):
+                        _log_cute_compile_event(
+                            func,
+                            args,
+                            kwargs,
+                            event="disk-hit-after-wait",
+                            cache_status="disk-cache-hit-after-wait",
+                            cache_payload=payload,
+                            reason="post-engine-start",
+                            cache_key=cache_key,
+                        )
+                _memory_cache_put(memory_cache_key, compiled)
+                return compiled
+
+            cache_status = "disk-cache-miss"
+
+            if _cute_compile_log_enabled() or post_engine_start_log:
+                with suppress(Exception):
+                    _log_cute_compile_miss(
+                        func,
+                        args,
+                        kwargs,
+                        cache_status=cache_status,
+                        cache_payload=payload,
+                        reason="post-engine-start" if post_engine_start_log else None,
+                        cache_key=cache_key,
+                    )
+
+            with _MEMORY_CACHE_LOCK:
+                _COMPILE_MISSES += 1
+            from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+
+            raise_if_kernel_resolution_frozen(
+                "cute.compile",
+                target=func,
+                cache_key=compile_spec if compile_spec is not None else payload,
+            )
+            call_kwargs = {
+                k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
+            }
+            compiled = compile_callable(func, *args, **call_kwargs)
+            with suppress(Exception):
+                _store_cute_compile_to_disk(cache_key, compiled)
+            _memory_cache_put(memory_cache_key, compiled)
+            return compiled
     else:
         cache_status = "disk-cache-disabled"
 
@@ -1460,11 +1918,39 @@ def compile(
     return compiled
 
 
+def _cached_default_executor(compiled: Any) -> Any | None:
+    if not hasattr(compiled, "_default_executor"):
+        return None
+
+    executor = getattr(compiled, _EXECUTOR_CACHE_ATTR, None)
+    if executor is not None:
+        return executor
+
+    with _EXECUTOR_CACHE_LOCK:
+        executor = getattr(compiled, _EXECUTOR_CACHE_ATTR, None)
+        if executor is not None:
+            return executor
+        executor = getattr(compiled, "_default_executor", None)
+        if executor is None:
+            to_executor = getattr(compiled, "to", None)
+            if to_executor is None:
+                return None
+            executor = to_executor(None)
+            with suppress(Exception):
+                compiled._default_executor = executor
+        with suppress(Exception):
+            setattr(compiled, _EXECUTOR_CACHE_ATTR, executor)
+        return executor
+
+
 def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
     if hasattr(compiled, "generate_execution_args") and hasattr(
         compiled, "run_compiled_program"
     ):
         execution_args, _ = compiled.generate_execution_args(*args)
+        executor = _cached_default_executor(compiled)
+        if executor is not None and hasattr(executor, "run_compiled_program"):
+            return executor.run_compiled_program(execution_args)
         return compiled.run_compiled_program(execution_args)
     return compiled(*args)
 

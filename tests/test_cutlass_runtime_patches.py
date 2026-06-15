@@ -4,12 +4,16 @@ import ctypes
 import inspect
 import warnings
 
+import pytest
+
 import b12x  # noqa: F401 - importing b12x applies the runtime patches under test.
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
+from cutlass.base_dsl.runtime import cuda as cutlass_cuda_runtime
 from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.compiler as cute_compiler
@@ -20,7 +24,9 @@ from b12x.cute.compiler import (
     _build_compile_disk_cache_key,
     _compile_disk_cache_payload,
     _structural_cache_key,
+    tensor_key,
 )
+from b12x.cute.runtime_patches import apply_cutlass_runtime_patches
 from b12x.cute.utils import make_ptr
 
 
@@ -41,6 +47,28 @@ def test_other_cutlass_warnings_still_emit() -> None:
 
     assert len(captured) == 1
     assert str(captured[0].message) == "some other warning"
+
+
+def test_cutlass_memory_debug_helpers_are_stubbed_when_disabled(monkeypatch) -> None:
+    if not hasattr(cutlass_cuda_runtime, "_memory_debug_snapshot") or not hasattr(
+        cutlass_cuda_runtime, "_memory_debug_log"
+    ):
+        pytest.skip("CUTLASS runtime has no memory debug snapshot helper")
+
+    monkeypatch.delenv("CUTLASS_DSL_CUDA_MEMORY_DEBUG", raising=False)
+    apply_cutlass_runtime_patches()
+
+    assert getattr(cutlass_cuda_runtime, "_b12x_memory_debug_patched", False)
+    assert cutlass_cuda_runtime._memory_debug_snapshot() == {
+        "free": None,
+        "total": None,
+        "used": None,
+        "torch_allocated": None,
+        "torch_reserved": None,
+        "external": None,
+        "device": None,
+    }
+    assert cutlass_cuda_runtime._memory_debug_log("test", {}) is None
 
 
 def test_cutlass_45_provides_sm121a_blockscaled_mma() -> None:
@@ -181,6 +209,128 @@ def test_explicit_compile_spec_changes_cache_key_when_policy_changes() -> None:
     assert key_a != key_b
 
 
+def test_pod_compile_spec_rejects_legacy_tensor_key() -> None:
+    tensor_key = TensorKey(
+        name="q",
+        dtype="torch.uint32",
+        rank=3,
+        dims=(DimKey.dynamic(), DimKey.exact(64), DimKey.exact(32)),
+        stride=(2048, 32, 1),
+        device=("cuda", 0),
+    )
+
+    with pytest.raises(TypeError, match="legacy compile-key object"):
+        KernelCompileSpec.from_facts("test.pod", 1, ("q", tensor_key))
+
+
+def test_pod_compile_spec_memory_key_does_not_recurse(monkeypatch) -> None:
+    spec = KernelCompileSpec.from_facts(
+        "test.pod.memory",
+        1,
+        ("variant", "prefill512"),
+        ("q_heads", 64),
+    )
+
+    def fail_shape_key(*args, **kwargs):
+        raise AssertionError("POD explicit spec should not use recursive shape key")
+
+    monkeypatch.setattr(cute_compiler, "_compile_spec_shape_key", fail_shape_key)
+
+    key = cute_compiler._compile_memory_cache_key(
+        cute.compile,
+        test_pod_compile_spec_memory_key_does_not_recurse,
+        (object(),),
+        {},
+        spec,
+    )
+
+    assert key == ("b12x_cute_memory_cache_v2_explicit_spec", spec.hash_key)
+
+
+def test_pod_compile_spec_disk_payload_uses_json_key(monkeypatch) -> None:
+    spec = KernelCompileSpec.from_facts(
+        "test.pod.disk",
+        1,
+        ("variant", "decode"),
+        ("q_heads", 8),
+    )
+
+    def fail_shape_key(*args, **kwargs):
+        raise AssertionError("POD explicit spec should not use recursive shape key")
+
+    monkeypatch.setattr(cute_compiler, "_compile_spec_shape_key", fail_shape_key)
+
+    payload = _compile_disk_cache_payload(
+        cute.compile,
+        test_pod_compile_spec_disk_payload_uses_json_key,
+        (object(),),
+        {},
+        compile_spec=spec,
+    )
+
+    assert payload[0] == "b12x_cute_compile_cache_v5_explicit_spec"
+    assert payload[4] == spec.hash_key
+    assert payload[5] == spec.json_key
+
+
+def test_tensor_key_helper_builds_pod_compile_spec(monkeypatch) -> None:
+    q = torch.empty((2, 64), dtype=torch.bfloat16)
+    spec = KernelCompileSpec.from_fields(
+        "test.tensor_key.pod",
+        1,
+        tensor_key(
+            "q",
+            q,
+            dims=(DimKey.dynamic(), DimKey.bucket(64)),
+            align=16,
+        ),
+    )
+
+    assert not spec.legacy
+    assert spec.fields == ()
+    assert '"dynamic"' in spec.json_key
+    assert '"bucket"' in spec.json_key
+
+    def fail_shape_key(*args, **kwargs):
+        raise AssertionError("POD tensor_key spec should not use recursive shape key")
+
+    monkeypatch.setattr(cute_compiler, "_compile_spec_shape_key", fail_shape_key)
+    key = cute_compiler._compile_memory_cache_key(
+        cute.compile,
+        test_tensor_key_helper_builds_pod_compile_spec,
+        (object(),),
+        {},
+        spec,
+    )
+
+    assert key == ("b12x_cute_memory_cache_v2_explicit_spec", spec.hash_key)
+
+
+def test_from_key_promotes_nested_pod_key_fields() -> None:
+    q = torch.empty((2, 64), dtype=torch.bfloat16)
+    tensor_fields = (
+        tensor_key(
+            "q",
+            q,
+            dims=(DimKey.dynamic(), DimKey.exact(64)),
+            align=16,
+        ),
+    )
+
+    spec = KernelCompileSpec.from_key(
+        "test.nested.key_fields",
+        1,
+        (
+            ("policy", "decode"),
+            tensor_fields,
+        ),
+    )
+
+    assert not spec.legacy
+    assert '"field"' in spec.json_key
+    assert '"q"' in spec.json_key
+
+
 def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
     capsys, monkeypatch
 ) -> None:
@@ -222,6 +372,73 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
     assert "python_stack" not in out
 
 
+def test_explicit_spec_compile_miss_log_is_pod_first(capsys, monkeypatch) -> None:
+    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_ARGS", raising=False)
+    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
+    monkeypatch.setenv("B12X_LOG_CUTE_COMPILES", "1")
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_facts(
+        "test.explicit.log",
+        1,
+        ("variant", "decode"),
+        ("q_heads", 8),
+    )
+
+    cute_compiler._log_cute_compile_miss(
+        FakeKernel(),
+        (fake, 7),
+        {},
+        cache_status="disk-cache-miss",
+        cache_payload=_compile_disk_cache_payload(
+            cute.compile, FakeKernel(), (fake, 7), {}, compile_spec=spec
+        ),
+        cache_key="abcdef0123456789",
+    )
+
+    out = capsys.readouterr().out
+    assert "[b12x cute.compile] miss" in out
+    assert "FakeKernel" in out
+    assert f"spec_hash={spec.hash_key}" in out
+    assert f"spec={spec.json_key}" in out
+    assert "key_inputs=" not in out
+    assert "args=" not in out
+
+
+def test_explicit_spec_compile_miss_log_can_include_args(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("B12X_LOG_CUTE_COMPILE_ARGS", "1")
+    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_facts(
+        "test.explicit.log.args",
+        1,
+        ("variant", "decode"),
+    )
+
+    cute_compiler._log_cute_compile_miss(
+        FakeKernel(),
+        (fake, 7),
+        {},
+        cache_status="disk-cache-miss",
+        cache_payload=_compile_disk_cache_payload(
+            cute.compile, FakeKernel(), (fake, 7), {}, compile_spec=spec
+        ),
+    )
+
+    out = capsys.readouterr().out
+    assert "args=" in out
+    assert "'shape': '(4, 8)'" in out
+
+
 def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
     monkeypatch.setenv("B12X_LOG_CUTE_COMPILE_STACK", "1")
 
@@ -246,6 +463,57 @@ def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
     assert "[b12x cute.compile] python_stack" in out
     assert "call_logger" in out
     assert "test_cutlass_runtime_patches.py" in out
+
+
+def test_run_compiled_reuses_cached_default_executor() -> None:
+    executor_calls = []
+
+    class FakeExecutor:
+        def run_compiled_program(self, exe_args):
+            executor_calls.append(tuple(exe_args))
+            return f"executor-call-{len(executor_calls)}"
+
+    class FakeCompiled:
+        def __init__(self) -> None:
+            self._default_executor = None
+            self.to_calls = 0
+
+        def generate_execution_args(self, *args):
+            return list(args), []
+
+        def to(self, device):
+            assert device is None
+            self.to_calls += 1
+            return FakeExecutor()
+
+        def run_compiled_program(self, exe_args):
+            raise AssertionError("run_compiled should use the cached executor")
+
+    compiled = FakeCompiled()
+
+    assert cute_compiler.run_compiled(compiled, (1, 2)) == "executor-call-1"
+    assert cute_compiler.run_compiled(compiled, (3,)) == "executor-call-2"
+    assert compiled.to_calls == 1
+    assert executor_calls == [(1, 2), (3,)]
+    assert compiled._default_executor is not None
+
+
+def test_run_compiled_falls_back_without_executor_factory() -> None:
+    class FakeCompiled:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate_execution_args(self, *args):
+            return list(args), []
+
+        def run_compiled_program(self, exe_args):
+            self.calls.append(tuple(exe_args))
+            return "fallback"
+
+    compiled = FakeCompiled()
+
+    assert cute_compiler.run_compiled(compiled, (1, 2)) == "fallback"
+    assert compiled.calls == [(1, 2)]
 
 
 def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
@@ -467,6 +735,41 @@ def test_b12x_compile_disk_hit_populates_memory_cache(monkeypatch) -> None:
     info = cute_compiler.compile_cache_info()
     assert info["disk_cache_hits"] == 1
     assert info["memory_cache_hits"] == 1
+
+
+def test_b12x_compile_rechecks_disk_after_cache_key_lock(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_CUTE_COMPILE_DISK_CACHE", raising=False)
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
+
+    compiled = object()
+    load_keys = []
+
+    def fake_load(cache_key):
+        load_keys.append(cache_key)
+        return compiled if len(load_keys) == 2 else None
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("disk recheck hit should not call cutlass compile")
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    spec = KernelCompileSpec.from_facts(
+        "test.disk.recheck",
+        1,
+        ("variant", "decode"),
+    )
+
+    monkeypatch.setattr(cute_compiler, "_load_cute_compile_from_disk", fake_load)
+    monkeypatch.setattr(cute, "compile", fail_compile)
+
+    assert cute_compiler.compile(FakeKernel(), 1, compile_spec=spec) is compiled
+    assert len(load_keys) == 2
+    info = cute_compiler.compile_cache_info()
+    assert info["disk_cache_hits"] == 1
+    assert info["compile_misses"] == 0
 
 
 def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> None:
