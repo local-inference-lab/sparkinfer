@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import statistics
@@ -30,6 +31,7 @@ from b12x.moe.fused.reference import (
     compare_to_reference,
     moe_reference_f32,
     moe_reference_nvfp4,
+    moe_reference_w4a8_mx,
     moe_reference_w4a16_fp4_e8m0_k32,
     moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
     moe_reference_w4a16_f32,
@@ -599,11 +601,14 @@ def make_shape_only_expert_weights(
     *,
     layer_idx: int,
     activation: str,
+    source_format: str = "modelopt_nvfp4",
 ) -> ExpertWeights:
     activation = normalize_moe_activation(activation)
-    if spec.hidden_size % 16 != 0 or spec.I_tp % 16 != 0:
+    scale_group = 32 if source_format == "fp4_e8m0_k32" else 16
+    if spec.hidden_size % scale_group != 0 or spec.I_tp % scale_group != 0:
         raise ValueError(
-            f"shape-only W4A16 profile requires K and I_tp divisible by 16, got K={spec.hidden_size}, I_tp={spec.I_tp}"
+            f"shape-only profile requires K and I_tp divisible by {scale_group}, "
+            f"got K={spec.hidden_size}, I_tp={spec.I_tp}"
         )
 
     device = torch.device("cuda")
@@ -617,20 +622,50 @@ def make_shape_only_expert_weights(
         end="",
         flush=True,
     )
-    w13_weight = torch.empty(E, w13_rows, K // 2, dtype=torch.uint8, device=device)
-    w13_weight.fill_(0x11)
-    w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
-    w2_weight.fill_(0x11)
+    if source_format == "fp4_e8m0_k32":
+        from benchmarks.benchmark_ds4_moe import _make_quantized_stack
 
-    w13_sf = torch.ones(E, w13_rows, K // 16, dtype=torch.float8_e4m3fn, device=device)
-    down_sf = torch.ones(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
-    w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
-    w2_blockscale_swizzled = swizzle_block_scale(down_sf)
+        gen = torch.Generator(device=device)
+        gen.manual_seed(10_000 + layer_idx)
+        w13_weight, w13_blockscale_swizzled = _make_quantized_stack(
+            E,
+            w13_rows,
+            K,
+            gen=gen,
+            device=device,
+        )
+        w2_weight, w2_blockscale_swizzled = _make_quantized_stack(
+            E,
+            K,
+            I_tp,
+            gen=gen,
+            device=device,
+        )
+        w13_layout = "w13"
+    else:
+        w13_weight = torch.empty(E, w13_rows, K // 2, dtype=torch.uint8, device=device)
+        w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
+        w13_weight.fill_(0x11)
+        w2_weight.fill_(0x11)
+        w13_sf = torch.ones(E, w13_rows, K // 16, dtype=torch.float8_e4m3fn, device=device)
+        down_sf = torch.ones(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+        w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
+        w2_blockscale_swizzled = swizzle_block_scale(down_sf)
+        w13_layout = "w31"
+
+    if source_format == "fp4_e8m0_k32":
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is None:
+            raise RuntimeError("shape-only E8M0/K32 scales require torch.float8_e8m0fnu")
 
     w13_permuted = w13_weight.permute(1, 2, 0)
-    w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), w13_rows, K)
     down_permuted = w2_weight.permute(1, 2, 0)
-    down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+    if source_format == "fp4_e8m0_k32":
+        w13_scale = w13_blockscale_swizzled
+        down_scale = w2_blockscale_swizzled
+    else:
+        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), w13_rows, K)
+        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
 
     w13_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
     w2_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
@@ -669,6 +704,8 @@ def make_shape_only_expert_weights(
         g2_alphas=g2_alphas,
         g1_alphas_per_expert=g1_alphas_per_expert,
         g2_alphas_per_expert=g2_alphas_per_expert,
+        source_format=source_format,
+        w13_layout=w13_layout,
     )
 
 
@@ -703,7 +740,15 @@ def load_expert_weights(
     oracle_flashinfer_weights = None
     w13_layout = "w31"
     if checkpoint_family in {"nano35_w4a16_shape", "dsv4f_shape"}:
-        return make_shape_only_expert_weights(spec, layer_idx=layer_idx, activation=activation)
+        shape_source_format = (
+            "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"
+        )
+        return make_shape_only_expert_weights(
+            spec,
+            layer_idx=layer_idx,
+            activation=activation,
+            source_format=shape_source_format,
+        )
 
     cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
@@ -1308,6 +1353,8 @@ def get_quant_mode_params(
     quant_mode = quant_mode.lower()
     if quant_mode == "nvfp4":
         return params
+    if quant_mode == "w4a8_mx":
+        return params
     if quant_mode == "w4a16":
         # W4A16 keeps activations in BF16, so remove the activation input
         # scale factor from the fused alpha and leave only the weight global
@@ -1498,6 +1545,28 @@ def make_oracle_reference(
             spec.I_tp,
             activation=activation,
         )
+    if quant_mode == "w4a8_mx":
+        if oracle_mode != "w4a8_mx":
+            raise ValueError("--oracle-mode w4a8_mx is required with --quant-mode w4a8_mx")
+        if weights.source_format != "fp4_e8m0_k32":
+            raise ValueError("--quant-mode w4a8_mx requires source_format='fp4_e8m0_k32'")
+        return moe_reference_w4a8_mx(
+            x,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled.view(torch.uint8),
+            None,
+            params.g1_alphas,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled.view(torch.uint8),
+            None,
+            params.g2_alphas,
+            topk_ids,
+            topk_weights,
+            spec.num_experts,
+            spec.hidden_size,
+            spec.I_tp,
+            activation=activation,
+        )
     if oracle_mode == "flashinfer":
         raise ValueError("--oracle-mode flashinfer requires --quant-mode w4a16 and source_format='fp4_e8m0_k32'")
     if oracle_mode == "w4a16":
@@ -1572,6 +1641,28 @@ W4A16_ORACLE_TOLERANCES = {
 }
 
 
+W4A8_ORACLE_TOLERANCES = {
+    "silu": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9980,
+    },
+    "relu2": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9915,
+    },
+    SWIGLUOAI_UNINTERLEAVE: {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9975,
+    },
+}
+
+
 def format_oracle_metrics(name: str, metrics: OracleMetrics) -> str:
     return (
         f"{name}: max_abs={metrics.max_abs:.5f} "
@@ -1590,8 +1681,23 @@ def check_oracle_metrics(
     oracle_mode: str = "nvfp4",
 ) -> list[str]:
     failures = []
+    metric_values = {
+        "max_abs": metrics.max_abs,
+        "rmse": metrics.rmse,
+        "mean_abs": metrics.mean_abs,
+        "cos": metrics.cos,
+    }
+    nonfinite = [name for name, value in metric_values.items() if not math.isfinite(value)]
+    if nonfinite:
+        failures.append(
+            f"  bs={batch_size} {label}: non-finite metrics "
+            f"{', '.join(nonfinite)}"
+        )
+        return failures
     if oracle_mode in {"w4a16", "flashinfer"}:
         tol = W4A16_ORACLE_TOLERANCES[activation]
+    elif oracle_mode == "w4a8_mx":
+        tol = W4A8_ORACLE_TOLERANCES[activation]
     else:
         tol = ORACLE_TOLERANCES[activation]
     if tol["max_abs"] is not None and metrics.max_abs > tol["max_abs"]:
@@ -1725,7 +1831,7 @@ def run_moe_layer_chain(
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
-    from b12x.integration.tp_moe import b12x_moe_fp4
+    from b12x.integration.tp_moe import b12x_moe_fp4, build_tp_moe_fp4_binding
 
     if not (
         len(weights_stack)
@@ -1744,21 +1850,21 @@ def run_moe_layer_chain(
         zip(weights_stack, params_stack, topk_ids_per_layer, topk_weights_per_layer, strict=True)
     ):
         output = None if output_buffers is None else output_buffers[layer_idx]
-        current = b12x_moe_fp4(
-            current,
-            params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            params.g1_alphas,
-            params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            params.g2_alphas,
-            topk_weights,
-            topk_ids,
+        binding = build_tp_moe_fp4_binding(
+            scratch=workspace,
+            a=current,
+            a1_gscale=params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=params.g1_alphas,
+            a2_gscale=params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=params.g2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             fast_math=fast_math,
             output=output,
-            workspace=workspace,
             input_scales_static=True,
             activation=activation,
             quant_mode=quant_mode,
@@ -1766,6 +1872,7 @@ def run_moe_layer_chain(
             w13_layout=weights.w13_layout,
             **activation_params.kwargs(),
         )
+        current = b12x_moe_fp4(binding=binding)
         layer_outputs.append(current)
     return layer_outputs
 
@@ -2082,12 +2189,14 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--quant-mode",
-        choices=["nvfp4", "w4a16"],
+        choices=["nvfp4", "w4a8_mx", "w4a16"],
         default=None,
         help=(
             "Backend math mode. w4a16 keeps activations BF16 and dequantizes "
-            "FP4 weights inline. If omitted, the model profile default is used, "
-            "otherwise B12X_MOE_FORCE_A16=1 changes the default to w4a16."
+            "FP4 weights inline; w4a8_mx dynamically quantizes activations to "
+            "MXFP8 and consumes E8M0/K32 FP4 weights. If omitted, the model "
+            "profile default is used, otherwise B12X_MOE_FORCE_A16=1 changes "
+            "the default to w4a16."
         ),
     )
     parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
@@ -2109,7 +2218,11 @@ def bench_e2e() -> None:
         ),
     )
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
-    parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32", "flashinfer"], default=None)
+    parser.add_argument(
+        "--oracle-mode",
+        choices=["nvfp4", "w4a8_mx", "w4a16", "f32", "flashinfer"],
+        default=None,
+    )
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
@@ -2159,6 +2272,7 @@ def bench_e2e() -> None:
     if args.quant_mode is None:
         args.quant_mode = model_profile.default_quant_mode or quant_mode_default
     use_w4a16 = args.quant_mode == "w4a16"
+    use_w4a8_mx = args.quant_mode == "w4a8_mx"
     swiglu_limit = args.swiglu_limit if args.swiglu_limit is not None else model_profile.default_swiglu_limit
     swiglu_alpha = args.swiglu_alpha if args.swiglu_alpha is not None else model_profile.default_swiglu_alpha
     swiglu_beta = args.swiglu_beta if args.swiglu_beta is not None else model_profile.default_swiglu_beta
@@ -2171,7 +2285,11 @@ def bench_e2e() -> None:
     if args.validate is None:
         args.validate = model_profile.default_validate
     if args.reference is None:
-        args.reference = "none" if use_w4a16 or args.activation != "silu" else "flashinfer"
+        args.reference = (
+            "none"
+            if use_w4a16 or use_w4a8_mx or args.activation != "silu"
+            else "flashinfer"
+        )
     if args.oracle_mode is None:
         args.oracle_mode = (
             "f32"
@@ -2193,8 +2311,14 @@ def bench_e2e() -> None:
         raise ValueError("--reference flashinfer is only valid with --quant-mode nvfp4")
     if args.reference == "flashinfer" and args.activation != "silu":
         raise ValueError("--reference flashinfer is only valid with --activation silu")
-    if model_profile.checkpoint_family == "deepseek_v4_flash" and not use_w4a16:
-        raise ValueError("DeepSeek V4 Flash FP4 checkpoint profile requires --quant-mode w4a16")
+    if (
+        model_profile.checkpoint_family == "deepseek_v4_flash"
+        and args.quant_mode not in {"w4a8_mx", "w4a16"}
+    ):
+        raise ValueError(
+            "DeepSeek V4 Flash FP4 checkpoint profile requires "
+            "--quant-mode w4a16 or w4a8_mx"
+        )
     if use_w4a16 and args.graph_mode != "single-op":
         raise ValueError("--quant-mode w4a16 currently supports --graph-mode single-op")
     if use_w4a16 and args.tp_parallel:
@@ -2347,9 +2471,9 @@ def bench_e2e() -> None:
     )
 
     from b12x.integration.tp_moe import (
-        allocate_tp_moe_workspace,
         allocate_tp_moe_workspace_pool,
         b12x_moe_fp4,
+        build_tp_moe_fp4_binding,
     )
     w4a16_moe = None
     if use_w4a16:
@@ -2399,19 +2523,20 @@ def bench_e2e() -> None:
         )
     else:
         warmup_workspace = allocate_tp_moe_workspace_pool()
-        b12x_moe_fp4(
-            x_warm,
-            params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            params.g1_alphas,
-            params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            params.g2_alphas,
-            topk_weights_w,
-            topk_ids_w,
-            workspace=warmup_workspace,
+        warmup_binding = build_tp_moe_fp4_binding(
+            scratch=warmup_workspace,
+            a=x_warm,
+            a1_gscale=params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=params.g1_alphas,
+            a2_gscale=params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=params.g2_alphas,
+            topk_weights=topk_weights_w,
+            topk_ids=topk_ids_w,
+            output=torch.empty_like(x_warm),
             fast_math=args.fast_math,
             activation=args.activation,
             quant_mode=args.quant_mode,
@@ -2420,6 +2545,7 @@ def bench_e2e() -> None:
             w13_layout=weights.w13_layout,
             **activation_params.kwargs(),
         )
+        b12x_moe_fp4(binding=warmup_binding)
     torch.cuda.synchronize()
     print(" done.")
 
@@ -2442,17 +2568,29 @@ def bench_e2e() -> None:
             rk_logits, rk_ids = torch.topk(rk_warm, rspec.top_k, dim=-1)
             rk_weights = torch.softmax(rk_logits, dim=-1)
             ws_r = allocate_tp_moe_workspace_pool()
-            b12x_moe_fp4(
-                x_r, rp.a1_gscale, rw.w13_weight, rw.w13_blockscale_swizzled,
-                rp.g1_alphas, rp.a2_gscale, rw.w2_weight, rw.w2_blockscale_swizzled,
-                rp.g2_alphas, rk_weights, rk_ids,
-                workspace=ws_r, fast_math=args.fast_math, activation=args.activation,
+            binding_r = build_tp_moe_fp4_binding(
+                scratch=ws_r,
+                a=x_r,
+                a1_gscale=rp.a1_gscale,
+                w1_fp4=rw.w13_weight,
+                w1_blockscale=rw.w13_blockscale_swizzled,
+                w1_alphas=rp.g1_alphas,
+                a2_gscale=rp.a2_gscale,
+                w2_fp4=rw.w2_weight,
+                w2_blockscale=rw.w2_blockscale_swizzled,
+                w2_alphas=rp.g2_alphas,
+                topk_weights=rk_weights,
+                topk_ids=rk_ids,
+                output=torch.empty_like(x_r),
+                fast_math=args.fast_math,
+                activation=args.activation,
                 quant_mode=args.quant_mode,
                 unit_scale_contract=unit_scale_contract,
                 source_format=rw.source_format,
                 w13_layout=rw.w13_layout,
                 **activation_params.kwargs(),
             )
+            b12x_moe_fp4(binding=binding_r)
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
 
@@ -2499,6 +2637,31 @@ def bench_e2e() -> None:
             if use_w4a16
             else None
         )
+        backend_binding = None
+        if not use_w4a16:
+            assert backend_workspace is not None
+            backend_binding = build_tp_moe_fp4_binding(
+                scratch=backend_workspace,
+                a=x,
+                a1_gscale=params.a1_gscale,
+                w1_fp4=weights.w13_weight,
+                w1_blockscale=weights.w13_blockscale_swizzled,
+                w1_alphas=params.g1_alphas,
+                a2_gscale=params.a2_gscale,
+                w2_fp4=weights.w2_weight,
+                w2_blockscale=weights.w2_blockscale_swizzled,
+                w2_alphas=params.g2_alphas,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                fast_math=args.fast_math,
+                output=backend_output,
+                activation=args.activation,
+                quant_mode=args.quant_mode,
+                unit_scale_contract=unit_scale_contract,
+                source_format=weights.source_format,
+                w13_layout=weights.w13_layout,
+                **activation_params.kwargs(),
+            )
 
         def make_backend_e2e() -> Callable[[], torch.Tensor]:
 
@@ -2525,28 +2688,12 @@ def bench_e2e() -> None:
                         expert_offsets=backend_w4a16_buffers.expert_offsets,
                         **activation_params.kwargs(),
                     )
-                return b12x_moe_fp4(
-                    x,
-                    params.a1_gscale,
-                    weights.w13_weight,
-                    weights.w13_blockscale_swizzled,
-                    params.g1_alphas,
-                    params.a2_gscale,
-                    weights.w2_weight,
-                    weights.w2_blockscale_swizzled,
-                    params.g2_alphas,
-                    topk_weights_local,
-                    topk_ids_local,
-                    workspace=backend_workspace,
-                    fast_math=args.fast_math,
-                    output=backend_output,
-                    activation=args.activation,
-                    quant_mode=args.quant_mode,
-                    unit_scale_contract=unit_scale_contract,
-                    source_format=weights.source_format,
-                    w13_layout=weights.w13_layout,
-                    **activation_params.kwargs(),
-                )
+                assert backend_binding is not None
+                if topk_ids_local is not backend_binding.topk_ids:
+                    backend_binding.topk_ids.copy_(topk_ids_local)
+                if topk_weights_local is not backend_binding.topk_weights:
+                    backend_binding.topk_weights.copy_(topk_weights_local)
+                return b12x_moe_fp4(binding=backend_binding)
 
             def impl_e2e() -> torch.Tensor:
                 if args.include_routing:
@@ -2806,21 +2953,34 @@ def bench_e2e() -> None:
                 tp_outputs = [torch.empty_like(tp_x[r]) for r in range(tp_n)]
                 tp_workspaces = [allocate_tp_moe_workspace_pool() for _ in range(tp_n)]
                 tp_streams = [torch.cuda.Stream() for _ in range(tp_n)]
-
-                def launch_tp_rank(r: int) -> None:
-                    _rspec, rw, rp = tp_parallel_ranks[r]
-                    b12x_moe_fp4(
-                        tp_x[r], rp.a1_gscale, rw.w13_weight, rw.w13_blockscale_swizzled,
-                        rp.g1_alphas, rp.a2_gscale, rw.w2_weight, rw.w2_blockscale_swizzled,
-                        rp.g2_alphas, tp_topk_weights[r], tp_topk_ids[r],
-                        workspace=tp_workspaces[r], output=tp_outputs[r],
-                        fast_math=args.fast_math, activation=args.activation,
+                tp_bindings = [
+                    build_tp_moe_fp4_binding(
+                        scratch=tp_workspaces[r],
+                        a=tp_x[r],
+                        a1_gscale=rp.a1_gscale,
+                        w1_fp4=rw.w13_weight,
+                        w1_blockscale=rw.w13_blockscale_swizzled,
+                        w1_alphas=rp.g1_alphas,
+                        a2_gscale=rp.a2_gscale,
+                        w2_fp4=rw.w2_weight,
+                        w2_blockscale=rw.w2_blockscale_swizzled,
+                        w2_alphas=rp.g2_alphas,
+                        topk_weights=tp_topk_weights[r],
+                        topk_ids=tp_topk_ids[r],
+                        output=tp_outputs[r],
+                        fast_math=args.fast_math,
+                        activation=args.activation,
                         quant_mode=args.quant_mode,
                         unit_scale_contract=unit_scale_contract,
                         source_format=rw.source_format,
                         w13_layout=rw.w13_layout,
                         **activation_params.kwargs(),
                     )
+                    for r, (_rspec, rw, rp) in enumerate(tp_parallel_ranks)
+                ]
+
+                def launch_tp_rank(r: int) -> None:
+                    b12x_moe_fp4(binding=tp_bindings[r])
 
                 # Warm eager launches
                 for r, stream in enumerate(tp_streams):
