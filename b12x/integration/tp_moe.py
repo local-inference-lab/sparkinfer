@@ -13,6 +13,8 @@ from typing import Any, Dict, Tuple
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import triton
+import triton.language as tl
 import torch
 import torch.nn.functional as F
 from torch.profiler import record_function
@@ -78,8 +80,6 @@ _DYNAMIC_SLICE_CHUNK = 1
 # micro<->dynamic selection cutover (_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT).
 _DYNAMIC_SMALL_TILE_MAX_PAIRS = 640
 _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
-_MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
-_MOE_FORCE_A8_ENV = "B12X_MOE_FORCE_A8"
 # W4A8 throughput tier (Marlin-port QMMA pipeline, b12x/moe/fused/w4a8/
 # pipeline.py): routed-rows floor above which dynamic-band w4a8_mx calls
 # dispatch to the tier. Measured on the DS4 bench (E=256 K=4096 I_tp=1024
@@ -93,7 +93,9 @@ _MOE_FORCE_A8_ENV = "B12X_MOE_FORCE_A8"
 # B12X_MOE_FORCE_W4A8_TIER=1 forces the tier below the floor (testing).
 _W4A8_TIER_MIN_ROUTED_ROWS_ENV = "B12X_W4A8_TIER_MIN_ROUTED_ROWS"
 _W4A8_TIER_FORCE_ENV = "B12X_MOE_FORCE_W4A8_TIER"
+_W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT = 4096
+_W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
@@ -320,6 +322,33 @@ class B12XFP4ExpertWeights:
 
 
 @dataclass(frozen=True, kw_only=True)
+class B12XPreparedW4A8TierWeights:
+    """W4A8 tier weights prepared from native FP4 source storage."""
+
+    w13_rp: torch.Tensor
+    w13_sfb: torch.Tensor
+    w2_rp: torch.Tensor
+    w2_sfb: torch.Tensor
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    params_dtype: torch.dtype
+    source_format: str = "fp4_e8m0_k32"
+    w13_layout: str = "w13"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp4_source_format(self.source_format),
+        )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+        object.__setattr__(self, "num_experts", int(self.num_experts))
+        object.__setattr__(self, "hidden_size", int(self.hidden_size))
+        object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
+
+
+@dataclass(frozen=True, kw_only=True)
 class B12XPreparedFP4MoEWeights:
     """Derived FP4 MoE weight representations prepared from a source contract."""
 
@@ -328,6 +357,7 @@ class B12XPreparedFP4MoEWeights:
     w1_runtime_alphas: torch.Tensor | None = None
     w2_runtime_alphas: torch.Tensor | None = None
     w4a16: Any | None = None
+    w4a8_tier: B12XPreparedW4A8TierWeights | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -469,7 +499,13 @@ class TPMoEScratchCaps:
                 "route_num_experts",
                 max(int(self.route_num_experts), 0),
             )
-        object.__setattr__(self, "quant_mode", _normalize_quant_mode(self.quant_mode))
+        source_format = _normalize_fp4_source_format(self.source_format)
+        object.__setattr__(self, "source_format", source_format)
+        object.__setattr__(
+            self,
+            "quant_mode",
+            _normalize_quant_mode_for_source(self.quant_mode, source_format),
+        )
         object.__setattr__(self, "activation", normalize_moe_activation(self.activation))
         limit, alpha, beta = _normalize_swiglu_params(
             self.activation,
@@ -480,11 +516,6 @@ class TPMoEScratchCaps:
         object.__setattr__(self, "swiglu_limit", limit)
         object.__setattr__(self, "swiglu_alpha", alpha)
         object.__setattr__(self, "swiglu_beta", beta)
-        object.__setattr__(
-            self,
-            "source_format",
-            _normalize_fp4_source_format(self.source_format),
-        )
         object.__setattr__(
             self,
             "w13_layout",
@@ -544,6 +575,7 @@ class TPMoEScratchPlan:
         source_format: str = "modelopt_nvfp4",
         w13_layout: str = "w13",
         prepared_w4a16: object | None = None,
+        prepared_w4a8: object | None = None,
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
@@ -604,6 +636,7 @@ class TPMoEScratchPlan:
             source_format=source_format,
             w13_layout=w13_layout,
             prepared_w4a16=prepared_w4a16,
+            prepared_w4a8=prepared_w4a8,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -643,6 +676,7 @@ class TPMoEFP4Binding:
     source_format: str = "modelopt_nvfp4"
     w13_layout: str = "w13"
     prepared_w4a16: object | None = None
+    prepared_w4a8: object | None = None
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
@@ -791,8 +825,15 @@ class _ActivationKernelSpec:
     def w1_rows(self, n: int) -> int:
         return (2 if self.is_gated else 1) * n
 
-    def make_micro_kernel(self, *, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None, **kernel_kwargs):
-        if self.activation == SWIGLUOAI_UNINTERLEAVE:
+    def make_micro_kernel(
+        self,
+        *,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        **kernel_kwargs,
+    ):
+        if self.is_gated:
             kernel_kwargs.update(
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
@@ -800,8 +841,15 @@ class _ActivationKernelSpec:
             )
         return self.micro_kernel_cls(**kernel_kwargs)
 
-    def make_dynamic_kernel(self, *, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None, **kernel_kwargs):
-        if self.activation == SWIGLUOAI_UNINTERLEAVE:
+    def make_dynamic_kernel(
+        self,
+        *,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        **kernel_kwargs,
+    ):
+        if self.is_gated:
             kernel_kwargs.update(
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
@@ -851,12 +899,7 @@ def _dynamic_deterministic_output_enabled(
 
 
 def default_moe_quant_mode() -> str:
-    # Force-overrides for callers that pass quant_mode=None. A8 wins over
-    # A16 when both are set (most-specific opt-in; A8 only exists for
-    # nvfp4-source checkpoints).
-    if _env_flag(_MOE_FORCE_A8_ENV, default=False):
-        return "w4a8_nvfp4"
-    return "w4a16" if _env_flag(_MOE_FORCE_A16_ENV, default=False) else "nvfp4"
+    return "nvfp4"
 
 
 _W4A8_QUANT_MODES = {"w4a8_mx", "w4a8_nvfp4"}
@@ -866,13 +909,17 @@ def _is_w4a8_quant_mode(quant_mode: str) -> bool:
     return quant_mode in _W4A8_QUANT_MODES
 
 
-def _normalize_quant_mode(quant_mode: str | None) -> str:
+def _normalize_quant_mode_requested(quant_mode: str | None) -> str:
     if quant_mode is None:
-        return default_moe_quant_mode()
-    normalized = quant_mode.lower()
+        return "nvfp4"
+    normalized = str(quant_mode).lower()
     if normalized not in {"nvfp4", "w4a16"} | _W4A8_QUANT_MODES:
         raise ValueError(f"unsupported quant_mode {quant_mode!r}")
     return normalized
+
+
+def _normalize_quant_mode(quant_mode: str | None) -> str:
+    return _normalize_quant_mode_requested(quant_mode)
 
 
 def _normalize_fp4_source_format(source_format: str) -> str:
@@ -890,6 +937,19 @@ def _normalize_fp4_source_format(source_format: str) -> str:
             "'fp4_e8m0_k32', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
+
+
+def _normalize_quant_mode_for_source(
+    quant_mode: str | None,
+    source_format: str,
+) -> str:
+    source_format = _normalize_fp4_source_format(source_format)
+    normalized = _normalize_quant_mode_requested(quant_mode)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=normalized,
+    )
+    return normalized
 
 
 def _normalize_w4a16_scale_format(scale_format: str) -> str:
@@ -970,12 +1030,20 @@ def _normalize_swiglu_params(
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
-    if source_format != "modelopt_nvfp4" and quant_mode != "w4a16":
-        raise ValueError(
-            f"source_format={source_format!r} is only supported with "
-            "quant_mode='w4a16'; the NVFP4 kernels currently support only "
-            "source_format='modelopt_nvfp4'"
-        )
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_requested(quant_mode)
+    if quant_mode == "w4a16":
+        return
+    if source_format == "modelopt_nvfp4":
+        return
+    if source_format == "fp4_e8m0_k32" and quant_mode == "w4a8_mx":
+        return
+    raise ValueError(
+        f"source_format={source_format!r} with quant_mode={quant_mode!r} is "
+        "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, "
+        "quant_mode='w4a8_mx' for source_format='fp4_e8m0_k32', or "
+        "source_format='modelopt_nvfp4' for NVFP4/W4A8-NVFP4 kernels"
+    )
 
 
 def _assert_reciprocal_input_scale_contract(
@@ -1566,6 +1634,7 @@ def _build_tp_moe_fp4_binding_from_views(
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
+    prepared_w4a8: object | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -1586,9 +1655,15 @@ def _build_tp_moe_fp4_binding_from_views(
             f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
         )
 
-    quant_mode = _normalize_quant_mode(
-        quant_mode if quant_mode is not None else plan.quant_mode
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_for_source(
+        quant_mode if quant_mode is not None else plan.quant_mode,
+        source_format,
     )
+    runtime_prepared_w4a16 = (
+        prepared_w4a16 if quant_mode == "w4a16" else None
+    )
+    unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -1596,7 +1671,6 @@ def _build_tp_moe_fp4_binding_from_views(
         swiglu_alpha,
         swiglu_beta,
     )
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
@@ -1631,7 +1705,10 @@ def _build_tp_moe_fp4_binding_from_views(
 
     m, k = map(int, a.shape)
     num_topk = int(topk_ids.shape[1])
-    if prepared_w4a16 is not None:
+    if prepared_w4a8 is not None and quant_mode == "w4a8_mx":
+        weight_E = int(prepared_w4a8.num_experts)
+        n = int(prepared_w4a8.intermediate_size)
+    elif prepared_w4a16 is not None:
         weight_E = int(prepared_w4a16.num_experts)
         n = int(prepared_w4a16.intermediate_size)
     else:
@@ -1683,10 +1760,11 @@ def _build_tp_moe_fp4_binding_from_views(
         fast_math=fast_math,
         activation=activation,
         quant_mode=quant_mode,
-        unit_scale_contract=bool(unit_scale_contract),
+        unit_scale_contract=unit_scale_contract,
         source_format=source_format,
         w13_layout=w13_layout,
-        prepared_w4a16=prepared_w4a16,
+        prepared_w4a16=runtime_prepared_w4a16,
+        prepared_w4a8=prepared_w4a8 if quant_mode == "w4a8_mx" else None,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -1826,7 +1904,8 @@ def _plan_core_workspace(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> _TPCoreWorkspacePlan:
-    quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -1842,7 +1921,6 @@ def _plan_core_workspace(
         )
         from b12x.moe.fused.w4a16.kernel import _small_m_direct_supported
 
-        source_format = _normalize_fp4_source_format(source_format)
         w13_layout = _normalize_w13_layout(w13_layout)
         scale_format = (
             _normalize_w4a16_scale_format(w4a16_scale_format)
@@ -2505,6 +2583,729 @@ def _as_e8m0_k32_grid(
     return grid.contiguous()
 
 
+def _w4a8_rp_shape(size_n: int, size_k: int) -> tuple[int, int, int, int, int, int]:
+    size_n = int(size_n)
+    size_k = int(size_k)
+    if size_n % 256 != 0 or size_k % 128 != 0:
+        raise ValueError(
+            "W4A8 tier weight repack requires N multiple of 256 and K "
+            f"multiple of 128; got N={size_n}, K={size_k}"
+        )
+    return (size_n // 256, size_k // 128, 4, 8, 32, 4)
+
+
+def _w4a8_sfb_shape(size_n: int, size_k: int) -> tuple[int, int, int, int]:
+    size_n = int(size_n)
+    size_k = int(size_k)
+    if size_n % 256 != 0 or size_k % 128 != 0:
+        raise ValueError(
+            "W4A8 tier scale repack requires N multiple of 256 and K "
+            f"multiple of 128; got N={size_n}, K={size_k}"
+        )
+    return (size_n // 256, size_k // 128, 32, 8)
+
+
+def _w4a16_packed_weight_shape(size_k: int, size_n: int) -> tuple[int, int]:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    if size_k % 16 != 0 or size_n % 64 != 0:
+        raise ValueError(
+            f"W4A16 packed weights require K,N multiples of 16,64; got "
+            f"K={size_k}, N={size_n}"
+        )
+    return (size_k // 16, (size_n // 64) * 128)
+
+
+@triton.jit
+def _w4a16_packed_to_qweight_kernel(
+    src,
+    q,
+    total_programs: tl.constexpr,
+    k_tiles: tl.constexpr,
+    n_tiles: tl.constexpr,
+    q_cols: tl.constexpr,
+    src_expert_stride: tl.constexpr,
+    q_expert_stride: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= total_programs:
+        return
+    tile = pid
+    expert = tile // (k_tiles * n_tiles)
+    rem = tile - expert * (k_tiles * n_tiles)
+    kt = rem // n_tiles
+    nt = rem - kt * n_tiles
+    offs = tl.arange(0, 128)
+    source_half = offs // 64
+    source_row = offs - source_half * 64
+    warp_id = source_row // 16
+    col_in_warp = source_row - warp_id * 16
+    col_group = col_in_warp // 8
+    tc_col = col_in_warp - col_group * 8
+    slot_base = col_group * 2 + source_half
+
+    values = tl.zeros((128,), tl.int32)
+    for row_pair in range(4):
+        th_id = tc_col * 4 + row_pair
+        source_lane = th_id * 4 + warp_id
+        word = tl.load(
+            src
+            + expert * src_expert_stride
+            + kt * (n_tiles * 128)
+            + nt * 128
+            + source_lane
+        )
+        low = (word >> (slot_base * 4)) & 0xF
+        high = (word >> ((slot_base + 4) * 4)) & 0xF
+        values |= low << (row_pair * 8)
+        values |= high << (row_pair * 8 + 4)
+
+    q_base = expert * q_expert_stride + (nt * 64 + source_row) * q_cols
+    tl.store(q + q_base + kt * 2 + source_half, values)
+
+
+@triton.jit
+def _qweight_to_w4a8_rp_kernel(
+    q,
+    dst,
+    total_programs: tl.constexpr,
+    n_tiles_256: tl.constexpr,
+    k_tiles_128: tl.constexpr,
+    q_cols: tl.constexpr,
+    rows: tl.constexpr,
+    q_expert_stride: tl.constexpr,
+    dst_expert_stride: tl.constexpr,
+    row_rotation: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= total_programs:
+        return
+    block_in_tile = pid % tl.cdiv(4096, BLOCK)
+    tile = pid // tl.cdiv(4096, BLOCK)
+    expert = tile // (n_tiles_256 * k_tiles_128)
+    rem = tile - expert * (n_tiles_256 * k_tiles_128)
+    nt = rem // k_tiles_128
+    kt = rem - nt * k_tiles_128
+    idx = block_in_tile * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < 4096
+
+    n8i = idx & 3
+    tmp = idx >> 2
+    combined = tmp & 31
+    cgrp = combined & 3
+    r8 = combined >> 2
+    tmp = tmp >> 5
+    n8c = tmp & 7
+    k32 = tmp >> 3
+
+    row = n8c * 32 + n8i * 8 + r8
+    src_row = nt * 256 + row + row_rotation
+    src_row = tl.where(src_row >= rows, src_row - rows, src_row)
+    src_col = kt * 16 + k32 * 4 + cgrp
+    values = tl.load(q + expert * q_expert_stride + src_row * q_cols + src_col)
+    dst_base = expert * dst_expert_stride + (nt * k_tiles_128 + kt) * 4096
+    tl.store(dst + dst_base + idx, values, mask=mask)
+
+
+@triton.jit
+def _e8m0_scale_to_grid_kernel(
+    scale,
+    grid,
+    total_elements: tl.constexpr,
+    rows: tl.constexpr,
+    scale_cols: tl.constexpr,
+    rows_pad: tl.constexpr,
+    scale_expert_stride: tl.constexpr,
+    grid_expert_stride: tl.constexpr,
+    source_is_logical: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < total_elements
+    expert = idx // (rows * scale_cols)
+    rem = idx - expert * (rows * scale_cols)
+    row = rem // scale_cols
+    col = rem - row * scale_cols
+
+    if source_is_logical:
+        src_off = expert * scale_expert_stride + row * scale_cols + col
+    else:
+        perm = (row % 8) * 8 + (row // 8) % 8
+        pre_row = (row // 64) * 64 + perm
+        flat = col * rows_pad + pre_row
+        group4 = flat // 4
+        byte = flat - group4 * 4
+        src_byte = tl.where(byte == 1, 2, tl.where(byte == 2, 1, byte))
+        src_off = expert * scale_expert_stride + group4 * 4 + src_byte
+    values = tl.load(scale + src_off, mask=mask, other=0)
+    values = tl.minimum(values, 247)
+    tl.store(
+        grid + expert * grid_expert_stride + row * scale_cols + col,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _grid_to_w4a8_sfb_kernel(
+    grid,
+    dst,
+    total_elements: tl.constexpr,
+    rows: tl.constexpr,
+    scale_cols: tl.constexpr,
+    n_tiles_256: tl.constexpr,
+    k_tiles_128: tl.constexpr,
+    grid_expert_stride: tl.constexpr,
+    dst_expert_stride: tl.constexpr,
+    row_rotation: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < total_elements
+    expert = idx // (rows * scale_cols)
+    local = idx - expert * (rows * scale_cols)
+
+    kb = local & 3
+    tmp = local >> 2
+    row8 = tmp & 7
+    tmp = tmp >> 3
+    n32 = tmp & 31
+    tmp = tmp >> 5
+    kt = tmp % k_tiles_128
+    nt = tmp // k_tiles_128
+
+    row = nt * 256 + n32 * 8 + row8 + row_rotation
+    row = tl.where(row >= rows, row - rows, row)
+    col = kt * 4 + kb
+    values = tl.load(grid + expert * grid_expert_stride + row * scale_cols + col)
+    tl.store(dst + expert * dst_expert_stride + local, values, mask=mask)
+
+
+def _w4a8_convert_scratch_nbytes() -> int:
+    raw = os.environ.get(_W4A8_CONVERT_SCRATCH_MB_ENV)
+    mb = _W4A8_CONVERT_SCRATCH_MB_DEFAULT
+    if raw is not None and raw.strip():
+        mb = max(1, int(raw))
+    return int(mb) << 20
+
+
+def _w4a8_convert_chunk_experts(
+    *,
+    weight_E: int,
+    scratch_elements_per_expert: int,
+    dtype: torch.dtype,
+) -> int:
+    per_expert = max(1, int(scratch_elements_per_expert)) * _dtype_nbytes(dtype)
+    chunk = _w4a8_convert_scratch_nbytes() // per_expert
+    return max(1, min(int(weight_E), int(chunk)))
+
+
+def _decode_w4a16_packed_expert_to_qweight(
+    packed_expert: torch.Tensor,
+    q_scratch: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+) -> None:
+    """Decode one W4A16-packed expert into a caller-owned qweight scratch."""
+    packed = packed_expert.view(torch.int32)
+    size_k = int(size_k)
+    size_n = int(size_n)
+    k_tiles = size_k // 16
+    n_tiles = size_n // 64
+    if tuple(packed.shape) != (k_tiles, n_tiles * 128):
+        raise ValueError(
+            f"packed expert must be {(k_tiles, n_tiles * 128)}, "
+            f"got {tuple(packed.shape)}"
+        )
+    if q_scratch.dtype != torch.int32 or tuple(q_scratch.shape) != (
+        size_n,
+        size_k // 8,
+    ):
+        raise ValueError(
+            f"q_scratch must be int32 {(size_n, size_k // 8)}, "
+            f"got {q_scratch.dtype} {tuple(q_scratch.shape)}"
+        )
+
+    src = packed.reshape(k_tiles, n_tiles, 128)
+    out_pos = torch.arange(128, device=packed.device, dtype=torch.long)
+    th_id = out_pos // 4
+    warp_id = out_pos % 4
+    tc_col = th_id // 4
+    tc_row = (th_id % 4) * 2
+    offsets = torch.tensor([0, 1, 8, 9], device=packed.device, dtype=torch.long)
+    pack_idx = torch.tensor(
+        [0, 2, 4, 6, 1, 3, 5, 7],
+        device=packed.device,
+        dtype=torch.long,
+    )
+    elem = tc_row[:, None] + offsets[None, :]
+    row = elem // 8
+    pos = elem % 8
+    col1 = (warp_id * 16 + tc_col)[:, None].expand(-1, 4)
+    col2 = col1 + 8
+    source_index = torch.cat(
+        [row * 64 + col1, row * 64 + col2],
+        dim=1,
+    )[:, pack_idx]
+    source_shift = (
+        torch.cat([pos, pos], dim=1)[:, pack_idx] * 4
+    ).to(torch.int32)
+    source_half = source_index // 64
+    source_col = source_index % 64
+
+    for kt in range(k_tiles):
+        cols = q_scratch[:, kt * 2 : (kt + 1) * 2]
+        cols.zero_()
+        cols_view = cols.view(n_tiles, 64, 2)
+        src_tile = src[kt]
+        for slot in range(8):
+            values = ((src_tile >> (slot * 4)) & 0xF) << source_shift[
+                :, slot
+            ].view(1, 128)
+            values = values.to(torch.int32)
+            for half in (0, 1):
+                mask = source_half[:, slot] == half
+                idx = source_col[:, slot][mask].view(1, -1).expand(
+                    n_tiles,
+                    -1,
+                )
+                cols_view[:, :, half].scatter_add_(1, idx, values[:, mask])
+
+
+def _copy_qweight_to_w4a8_rp_inplace(
+    dst: torch.Tensor,
+    qweight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    row_rotation: int | None = None,
+) -> None:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    nt = size_n // 256
+    kt = size_k // 128
+    if dst.dtype != torch.int32 or tuple(dst.shape) != _w4a8_rp_shape(size_n, size_k):
+        raise ValueError(
+            f"dst must be W4A8 rp int32 {_w4a8_rp_shape(size_n, size_k)}, "
+            f"got {dst.dtype} {tuple(dst.shape)}"
+        )
+    if qweight.dtype != torch.int32 or tuple(qweight.shape) != (size_n, size_k // 8):
+        raise ValueError(
+            f"qweight must be int32 {(size_n, size_k // 8)}, "
+            f"got {qweight.dtype} {tuple(qweight.shape)}"
+        )
+    rotation = 0 if row_rotation is None else int(row_rotation)
+    if rotation < 0 or rotation >= size_n:
+        raise ValueError(f"row_rotation={rotation} is invalid for N={size_n}")
+
+    dst_view = dst.view(nt, kt, 4, 8, 8, 4, 4)
+    wrap_tmp: torch.Tensor | None = None
+    for n_tile in range(nt):
+        src_start = (n_tile * 256 + rotation) % size_n
+        if src_start + 256 <= size_n:
+            block = qweight[src_start : src_start + 256]
+        else:
+            if wrap_tmp is None:
+                wrap_tmp = torch.empty(
+                    (256, size_k // 8),
+                    dtype=qweight.dtype,
+                    device=qweight.device,
+                )
+            first = size_n - src_start
+            wrap_tmp[:first].copy_(qweight[src_start:])
+            wrap_tmp[first:].copy_(qweight[: 256 - first])
+            block = wrap_tmp
+        src = block.reshape(8, 4, 8, kt, 4, 4).permute(3, 4, 0, 2, 5, 1)
+        dst_view[n_tile].copy_(src)
+
+
+def _logical_weight_to_w4a8_rp_inplace(
+    weight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    row_rotation: int | None = None,
+) -> torch.Tensor:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    if weight.dtype != torch.uint8 or tuple(weight.shape[1:]) != (
+        size_n,
+        size_k // 2,
+    ):
+        raise ValueError(
+            f"logical FP4 weight must be uint8 [E, {size_n}, {size_k // 2}], "
+            f"got {weight.dtype} {tuple(weight.shape)}"
+        )
+    rp_shape = _w4a8_rp_shape(size_n, size_k)
+    if weight.is_cuda:
+        weight_E = int(weight.shape[0])
+        q_cols = size_k // 8
+        chunk = _w4a8_convert_chunk_experts(
+            weight_E=weight_E,
+            scratch_elements_per_expert=size_n * q_cols,
+            dtype=torch.int32,
+        )
+        block = 1024
+        row_rot = 0 if row_rotation is None else int(row_rotation)
+        weight_i32 = weight.view(torch.int32)
+        dst_expert_stride = _tensor_numel(rp_shape)
+        blocks_per_tile = triton.cdiv(4096, block)
+        for e0 in range(0, weight_E, chunk):
+            e1 = min(weight_E, e0 + chunk)
+            q_scratch = torch.empty(
+                (e1 - e0, size_n, q_cols),
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            q_scratch.copy_(weight_i32[e0:e1].reshape(e1 - e0, size_n, q_cols))
+            total_programs = (e1 - e0) * (size_n // 256) * (size_k // 128)
+            total_programs *= blocks_per_tile
+            _qweight_to_w4a8_rp_kernel[(total_programs,)](
+                q_scratch,
+                weight_i32[e0:e1],
+                total_programs,
+                size_n // 256,
+                size_k // 128,
+                q_cols,
+                size_n,
+                size_n * q_cols,
+                dst_expert_stride,
+                row_rot,
+                BLOCK=block,
+                num_warps=4,
+            )
+        return weight_i32.view(weight_E, *rp_shape)
+
+    q_scratch = torch.empty(
+        (size_n, size_k // 8),
+        dtype=torch.int32,
+        device=weight.device,
+    )
+    weight_i32 = weight.view(torch.int32)
+    for expert in range(int(weight.shape[0])):
+        q_scratch.copy_(weight_i32[expert].reshape(size_n, size_k // 8))
+        dst = weight_i32[expert].view(rp_shape)
+        _copy_qweight_to_w4a8_rp_inplace(
+            dst,
+            q_scratch,
+            size_k=size_k,
+            size_n=size_n,
+            row_rotation=row_rotation,
+        )
+    return weight_i32.view(int(weight.shape[0]), *rp_shape)
+
+
+def _packed_w4a16_weight_to_w4a8_rp_inplace(
+    packed_weight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    row_rotation: int | None = None,
+) -> torch.Tensor:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    packed = packed_weight.view(torch.int32)
+    packed_shape = _w4a16_packed_weight_shape(size_k, size_n)
+    if packed.dim() != 3 or tuple(packed.shape[1:]) != packed_shape:
+        raise ValueError(
+            f"W4A16 packed weight must be [E, {packed_shape[0]}, "
+            f"{packed_shape[1]}], got {tuple(packed.shape)}"
+        )
+    rp_shape = _w4a8_rp_shape(size_n, size_k)
+    if packed.is_cuda:
+        weight_E = int(packed.shape[0])
+        q_cols = size_k // 8
+        chunk = _w4a8_convert_chunk_experts(
+            weight_E=weight_E,
+            scratch_elements_per_expert=size_n * q_cols,
+            dtype=torch.int32,
+        )
+        block = 1024
+        row_rot = 0 if row_rotation is None else int(row_rotation)
+        src_expert_stride = _tensor_numel(packed_shape)
+        dst_expert_stride = _tensor_numel(rp_shape)
+        blocks_per_tile = triton.cdiv(4096, block)
+        for e0 in range(0, weight_E, chunk):
+            e1 = min(weight_E, e0 + chunk)
+            q_scratch = torch.empty(
+                (e1 - e0, size_n, q_cols),
+                dtype=torch.int32,
+                device=packed.device,
+            )
+            total_decode = (e1 - e0) * (size_k // 16) * (size_n // 64)
+            _w4a16_packed_to_qweight_kernel[(total_decode,)](
+                packed[e0:e1],
+                q_scratch,
+                total_decode,
+                size_k // 16,
+                size_n // 64,
+                q_cols,
+                src_expert_stride,
+                size_n * q_cols,
+                num_warps=4,
+            )
+            total_pack = (e1 - e0) * (size_n // 256) * (size_k // 128)
+            total_pack *= blocks_per_tile
+            _qweight_to_w4a8_rp_kernel[(total_pack,)](
+                q_scratch,
+                packed[e0:e1],
+                total_pack,
+                size_n // 256,
+                size_k // 128,
+                q_cols,
+                size_n,
+                size_n * q_cols,
+                dst_expert_stride,
+                row_rot,
+                BLOCK=block,
+                num_warps=4,
+            )
+        return packed.view(weight_E, *rp_shape)
+
+    q_scratch = torch.empty(
+        (size_n, size_k // 8),
+        dtype=torch.int32,
+        device=packed.device,
+    )
+    for expert in range(int(packed.shape[0])):
+        _decode_w4a16_packed_expert_to_qweight(
+            packed[expert],
+            q_scratch,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        dst = packed[expert].view(rp_shape)
+        _copy_qweight_to_w4a8_rp_inplace(
+            dst,
+            q_scratch,
+            size_k=size_k,
+            size_n=size_n,
+            row_rotation=row_rotation,
+        )
+    return packed.view(int(packed.shape[0]), *rp_shape)
+
+
+def _recover_w4a16_e8m0_scale_expert(
+    scale: torch.Tensor,
+    grid_scratch: torch.Tensor,
+    *,
+    rows: int,
+    k_dim: int,
+) -> None:
+    rows = int(rows)
+    k_dim = int(k_dim)
+    scale_cols = k_dim // 32
+    packed = scale.view(torch.uint8)
+    if packed.dim() != 2 or int(packed.shape[0]) != scale_cols:
+        raise ValueError(
+            f"packed E8M0 scale expert must be [{scale_cols}, >= {rows}], "
+            f"got {tuple(packed.shape)}"
+        )
+    if int(packed.shape[1]) < rows or int(packed.shape[1]) % 64 != 0:
+        raise ValueError(
+            f"packed E8M0 scale expert second dim must be a multiple of 64 "
+            f"and >= {rows}, got {int(packed.shape[1])}"
+        )
+    if grid_scratch.dtype != torch.uint8 or tuple(grid_scratch.shape) != (
+        rows,
+        scale_cols,
+    ):
+        raise ValueError(
+            f"grid_scratch must be uint8 {(rows, scale_cols)}, "
+            f"got {grid_scratch.dtype} {tuple(grid_scratch.shape)}"
+        )
+
+    perm = torch.tensor(
+        [i + 8 * j for i in range(8) for j in range(8)],
+        dtype=torch.long,
+        device=packed.device,
+    )
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(64, dtype=torch.long, device=packed.device)
+
+    stage = torch.empty_like(packed)
+    stage.view(-1, 4).copy_(packed.view(-1, 4)[:, [0, 2, 1, 3]])
+    stage.copy_(stage.reshape(-1, 64)[:, inv_perm].reshape_as(stage))
+    grid_scratch.copy_(stage.transpose(0, 1)[:rows])
+
+
+def _copy_scale_grid_to_w4a8_sfb_inplace(
+    dst: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    rows: int,
+    k_dim: int,
+    row_rotation: int | None = None,
+) -> None:
+    rows = int(rows)
+    k_dim = int(k_dim)
+    nt = rows // 256
+    kt = k_dim // 128
+    if grid.dtype != torch.uint8 or tuple(grid.shape) != (rows, k_dim // 32):
+        raise ValueError(
+            f"scale grid must be uint8 {(rows, k_dim // 32)}, "
+            f"got {grid.dtype} {tuple(grid.shape)}"
+        )
+    dst_u8 = dst.view(torch.uint8).view(nt, kt, 32, 8, 4)
+    rotation = 0 if row_rotation is None else int(row_rotation)
+    if rotation < 0 or rotation >= rows:
+        raise ValueError(f"row_rotation={rotation} is invalid for rows={rows}")
+
+    wrap_tmp: torch.Tensor | None = None
+    for n_tile in range(nt):
+        src_start = (n_tile * 256 + rotation) % rows
+        if src_start + 256 <= rows:
+            block = grid[src_start : src_start + 256]
+        else:
+            if wrap_tmp is None:
+                wrap_tmp = torch.empty(
+                    (256, k_dim // 32),
+                    dtype=grid.dtype,
+                    device=grid.device,
+                )
+            first = rows - src_start
+            wrap_tmp[:first].copy_(grid[src_start:])
+            wrap_tmp[first:].copy_(grid[: 256 - first])
+            block = wrap_tmp
+        src = block.reshape(32, 8, kt, 4).permute(2, 0, 1, 3)
+        dst_u8[n_tile].copy_(src)
+
+
+def _e8m0_scale_to_w4a8_sfb_inplace(
+    scale: torch.Tensor,
+    *,
+    weight_E: int,
+    rows: int,
+    k_dim: int,
+    row_rotation: int | None = None,
+) -> torch.Tensor:
+    weight_E = int(weight_E)
+    rows = int(rows)
+    k_dim = int(k_dim)
+    scale_cols = k_dim // 32
+    scale_u8 = scale.view(torch.uint8)
+    is_logical, is_packed = _validate_e8m0_scale_w4a8_convertible(
+        scale_u8,
+        weight_E=weight_E,
+        rows=rows,
+        k_dim=k_dim,
+    )
+    sfb_shape = _w4a8_sfb_shape(rows, k_dim)
+    if scale.is_cuda:
+        scale_cols = k_dim // 32
+        rows_pad = rows if is_logical else int(scale_u8.shape[2])
+        if rows_pad != rows:
+            raise ValueError(
+                "W4A8 tier in-place scale conversion requires unpadded E8M0 "
+                f"scale storage; got rows={rows}, rows_pad={rows_pad}"
+            )
+        chunk = _w4a8_convert_chunk_experts(
+            weight_E=weight_E,
+            scratch_elements_per_expert=rows * scale_cols,
+            dtype=torch.uint8,
+        )
+        block = 256
+        row_rot = 0 if row_rotation is None else int(row_rotation)
+        total_per_expert = rows * scale_cols
+        source_stride = rows * scale_cols if is_logical else scale_cols * rows_pad
+        for e0 in range(0, weight_E, chunk):
+            e1 = min(weight_E, e0 + chunk)
+            chunk_experts = e1 - e0
+            grid_scratch = torch.empty(
+                (chunk_experts, rows, scale_cols),
+                dtype=torch.uint8,
+                device=scale.device,
+            )
+            total = chunk_experts * total_per_expert
+            _e8m0_scale_to_grid_kernel[(triton.cdiv(total, block),)](
+                scale_u8[e0:e1],
+                grid_scratch,
+                total,
+                rows,
+                scale_cols,
+                rows_pad,
+                source_stride,
+                total_per_expert,
+                is_logical,
+                BLOCK=block,
+                num_warps=4,
+            )
+            _grid_to_w4a8_sfb_kernel[(triton.cdiv(total, block),)](
+                grid_scratch,
+                scale_u8[e0:e1],
+                total,
+                rows,
+                scale_cols,
+                rows // 256,
+                k_dim // 128,
+                total_per_expert,
+                total_per_expert,
+                row_rot,
+                BLOCK=block,
+                num_warps=4,
+            )
+        return scale_u8.view(torch.int32).view(weight_E, *sfb_shape)
+
+    grid_scratch = torch.empty(
+        (rows, scale_cols),
+        dtype=torch.uint8,
+        device=scale.device,
+    )
+    for expert in range(weight_E):
+        if is_logical:
+            grid_scratch.copy_(scale_u8[expert])
+            grid_scratch.clamp_(max=247)
+        else:
+            _recover_w4a16_e8m0_scale_expert(
+                scale_u8[expert],
+                grid_scratch,
+                rows=rows,
+                k_dim=k_dim,
+            )
+        dst = scale_u8[expert].view(torch.int32).view(sfb_shape)
+        _copy_scale_grid_to_w4a8_sfb_inplace(
+            dst,
+            grid_scratch,
+            rows=rows,
+            k_dim=k_dim,
+            row_rotation=row_rotation,
+        )
+    return scale_u8.view(torch.int32).view(weight_E, *sfb_shape)
+
+
+def _validate_e8m0_scale_w4a8_convertible(
+    scale_u8: torch.Tensor,
+    *,
+    weight_E: int,
+    rows: int,
+    k_dim: int,
+) -> tuple[bool, bool]:
+    weight_E = int(weight_E)
+    rows = int(rows)
+    k_dim = int(k_dim)
+    scale_cols = k_dim // 32
+    logical_shape = (weight_E, rows, scale_cols)
+    packed_shape = (weight_E, scale_cols)
+    is_logical = scale_u8.dim() == 3 and tuple(scale_u8.shape) == logical_shape
+    is_packed = (
+        scale_u8.dim() == 3
+        and tuple(scale_u8.shape[:2]) == packed_shape
+        and int(scale_u8.shape[2]) >= rows
+        and int(scale_u8.shape[2]) % 64 == 0
+    )
+    if not is_logical and not is_packed:
+        raise ValueError(
+            "E8M0 scale must be logical [E, rows, K//32] or W4A16 packed "
+            f"[E, K//32, rows_pad]; got {tuple(scale_u8.shape)}"
+        )
+    _w4a8_sfb_shape(rows, k_dim)
+    return is_logical, is_packed
+
+
 def _swap_w13_scale_halves_inplace(
     blockscale: torch.Tensor, *, rows: int, cols_blocks: int
 ) -> None:
@@ -2826,6 +3627,127 @@ def _get_w4a8_tier_prepared(
     return prepared
 
 
+def _require_unit_weight_alphas(
+    w1_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    context: str,
+) -> None:
+    unit_alphas = bool(
+        torch.all(w1_global_scale == 1.0).item()
+        and torch.all(w2_global_scale == 1.0).item()
+    )
+    if not unit_alphas:
+        raise RuntimeError(f"{context} requires unit w1/w2 global scales")
+
+
+def _prepare_w4a8_tier_from_e8m0_source(
+    *,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    activation: str,
+    params_dtype: torch.dtype,
+    source_format: str,
+    w13_layout: str,
+) -> B12XPreparedW4A8TierWeights:
+    source_format = _normalize_fp4_source_format(source_format)
+    if source_format != "fp4_e8m0_k32":
+        raise ValueError(
+            "W4A8 tier preparation requires source_format='fp4_e8m0_k32', "
+            f"got {source_format!r}"
+        )
+    activation = normalize_moe_activation(activation)
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
+    _require_unit_weight_alphas(
+        w1_global_scale,
+        w2_global_scale,
+        context="W4A8 tier preparation",
+    )
+
+    if w1_fp4.dtype != torch.uint8 or w2_fp4.dtype != torch.uint8:
+        raise TypeError(
+            "W4A8 tier preparation requires logical uint8 FP4 weights; "
+            f"got w1={w1_fp4.dtype}, w2={w2_fp4.dtype}"
+        )
+    if w1_fp4.dim() != 3 or w2_fp4.dim() != 3:
+        raise ValueError(
+            "W4A8 tier preparation requires logical rank-3 FP4 weights; "
+            f"got w1={tuple(w1_fp4.shape)}, w2={tuple(w2_fp4.shape)}"
+        )
+    weight_E = int(w1_fp4.shape[0])
+    if int(w2_fp4.shape[0]) != weight_E:
+        raise ValueError(
+            "W4A8 tier preparation expert count mismatch: "
+            f"w1={int(w1_fp4.shape[0])}, w2={int(w2_fp4.shape[0])}"
+        )
+    k = int(w2_fp4.shape[1])
+    n = int(w2_fp4.shape[2]) * 2
+    if int(w1_fp4.shape[2]) * 2 != k:
+        raise ValueError(
+            "W4A8 tier preparation hidden size mismatch: "
+            f"w1 K={int(w1_fp4.shape[2]) * 2}, w2 K={k}"
+        )
+    w1_rows = _activation_w1_rows(activation, n)
+    expected_w1_shape = (weight_E, w1_rows, k // 2)
+    expected_w2_shape = (weight_E, k, n // 2)
+    if tuple(w1_fp4.shape) != expected_w1_shape:
+        raise ValueError(
+            "W4A8 tier preparation requires w1 logical shape "
+            f"{expected_w1_shape}; got {tuple(w1_fp4.shape)}"
+        )
+    if tuple(w2_fp4.shape) != expected_w2_shape:
+        raise ValueError(
+            "W4A8 tier preparation requires w2 logical shape "
+            f"{expected_w2_shape}; got {tuple(w2_fp4.shape)}"
+        )
+    _as_e8m0_k32_grid(w1_blockscale, w1_rows, k, name="w1_blockscale")
+    _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale")
+
+    row_rotation = (
+        n if w13_layout == "w31" and is_gated_moe_activation(activation) else None
+    )
+    w13_rp = _logical_weight_to_w4a8_rp_inplace(
+        w1_fp4,
+        size_k=k,
+        size_n=w1_rows,
+        row_rotation=row_rotation,
+    )
+    w2_rp = _logical_weight_to_w4a8_rp_inplace(
+        w2_fp4,
+        size_k=n,
+        size_n=k,
+    )
+    w13_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+        w1_blockscale,
+        weight_E=weight_E,
+        rows=w1_rows,
+        k_dim=k,
+        row_rotation=row_rotation,
+    )
+    w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+        w2_blockscale,
+        weight_E=weight_E,
+        rows=k,
+        k_dim=n,
+    )
+    return B12XPreparedW4A8TierWeights(
+        w13_rp=w13_rp,
+        w13_sfb=w13_sfb,
+        w2_rp=w2_rp,
+        w2_sfb=w2_sfb,
+        num_experts=weight_E,
+        hidden_size=k,
+        intermediate_size=n,
+        params_dtype=params_dtype,
+        source_format=source_format,
+        w13_layout=w13_layout,
+    )
+
+
 def _maybe_launch_w4a8_tier(
     *,
     a: torch.Tensor,
@@ -2846,20 +3768,25 @@ def _maybe_launch_w4a8_tier(
     routed_rows: int,
     activation: str,
     quant_mode: str,
+    source_format: str,
     w13_layout: str,
     apply_router_weight_on_input: bool,
     device: torch.device,
+    prepared_w4a8: object | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor | None:
     """Route a dynamic-band w4a8_mx call to the W4A8 throughput-tier pipeline.
 
-    Returns the output tensor when the tier handled the call, or None to fall
-    back to the dynamic kernel. Fallback / refusal conditions (v1):
+    Returns the output tensor when the tier handled the call, or None when the
+    caller's explicit quant mode can be served by the dynamic kernel instead.
+    Refusal conditions for prepared_w4a8 are hard errors. v1 conditions:
       - quant_mode != "w4a8_mx" (w4a8_nvfp4 needs residual scale grids and
         per-expert alphas the tier GEMM does not implement);
       - tier disabled: B12X_W4A8_TIER_MIN_ROUTED_ROWS=0;
-      - routed_rows below the floor (unless B12X_MOE_FORCE_W4A8_TIER=1) --
-        the tier's 48-row expert-run group padding loses to the dynamic
-        kernel at few routes/expert;
+      - routed_rows below the floor (unless B12X_MOE_FORCE_W4A8_TIER=1 or
+        prepared_w4a8 was supplied by the integration prepare path) -- the
+        tier's 48-row expert-run group padding loses to the dynamic kernel at
+        few routes/expert when the dynamic kernel has usable source tensors;
       - activation != "silu" (the tier act kernel is fused silu(gate)*up +
         MXFP8 quant only);
       - apply_router_weight_on_input (v1 applies topk weights in the final
@@ -2875,18 +3802,49 @@ def _maybe_launch_w4a8_tier(
     """
     if quant_mode != "w4a8_mx":
         return None
+    prepared_required = prepared_w4a8 is not None
+
+    def reject_prepared_w4a8(reason: str) -> None:
+        raise RuntimeError(f"B12X prepared W4A8 MoE cannot run: {reason}")
+
     min_routed = _w4a8_tier_min_routed_rows()
     if min_routed == 0:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "B12X_W4A8_TIER_MIN_ROUTED_ROWS=0 disables the required "
+                "W4A8 tier"
+            )
         return None
-    if routed_rows < min_routed and not _env_flag(_W4A8_TIER_FORCE_ENV, default=False):
+    if (
+        routed_rows < min_routed
+        and not prepared_required
+        and not _env_flag(_W4A8_TIER_FORCE_ENV, default=False)
+    ):
         return None
     if activation != "silu":
+        if prepared_required:
+            reject_prepared_w4a8(
+                f"W4A8 tier supports activation='silu', got {activation!r}"
+            )
         return None
     if apply_router_weight_on_input:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "apply_router_weight_on_input is unsupported by the W4A8 tier"
+            )
         return None
     if k % 256 != 0 or n % 128 != 0:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "W4A8 tier requires k % 256 == 0 and n % 128 == 0; "
+                f"got k={k}, n={n}"
+            )
         return None
     if topk_ids.dim() != 2 or topk_weights.dim() != 2:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "topk_ids and topk_weights must both be rank-2 tensors"
+            )
         return None
 
     from b12x.moe.fused.w4a8.pipeline import (
@@ -2897,21 +3855,30 @@ def _maybe_launch_w4a8_tier(
     capturing = torch.cuda.is_current_stream_capturing()
     # w31 sources: same one-time in-place flip to kernel order ([up; gate])
     # the dynamic path applies in _get_weight_views; the repack below reads
-    # the flipped storage. Idempotent per storage via the flip registry.
-    if w13_layout == "w31":
+    # the flipped storage. Explicit prepared_w4a8 has already folded this row
+    # rotation into its prepared views.
+    if w13_layout == "w31" and not prepared_required:
         _ensure_w13_kernel_order_inplace(
             w1_fp4, w1_blockscale, n=n, k=k, quant_mode=quant_mode
         )
-    prepared = _get_w4a8_tier_prepared(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        n=n,
-        k=k,
-    )
+    if prepared_w4a8 is not None:
+        prepared = {
+            "w13_rp": prepared_w4a8.w13_rp,
+            "w13_sfb": prepared_w4a8.w13_sfb,
+            "w2_rp": prepared_w4a8.w2_rp,
+            "w2_sfb": prepared_w4a8.w2_sfb,
+        }
+    else:
+        prepared = _get_w4a8_tier_prepared(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            n=n,
+            k=k,
+        )
     if prepared is None:
         return None
 
@@ -2976,6 +3943,7 @@ def _maybe_launch_w4a8_tier(
         topk_weights,
         ws,
         out=output,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -3032,12 +4000,13 @@ def prepare_b12x_fp4_moe_weights(
     params_dtype: torch.dtype | None = None,
     prepare_runtime_alphas: bool = False,
     prepare_w4a16: bool = False,
+    prepare_w4a8_tier: bool = False,
     reuse_input_storage: bool = False,
 ) -> B12XPreparedFP4MoEWeights:
     """Prepare B12X FP4 MoE runtime representations from a source contract."""
     source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout(w13_layout)
-    if not prepare_runtime_alphas and not prepare_w4a16:
+    if not prepare_runtime_alphas and not prepare_w4a16 and not prepare_w4a8_tier:
         raise ValueError(
             "prepare_b12x_fp4_moe_weights requires at least one requested "
             "representation"
@@ -3099,12 +4068,43 @@ def prepare_b12x_fp4_moe_weights(
             reuse_input_storage=reuse_input_storage,
         )
 
+    w4a8_tier = None
+    if prepare_w4a8_tier:
+        if (
+            w1_fp4 is None
+            or w1_blockscale is None
+            or w2_fp4 is None
+            or w2_blockscale is None
+        ):
+            raise ValueError(
+                "w1/w2 FP4 tensors and block scales are required to prepare W4A8"
+            )
+        if activation is None or params_dtype is None:
+            raise ValueError("activation and params_dtype are required for W4A8")
+        _validate_fp4_source_format_for_quant_mode(
+            source_format=source_format,
+            quant_mode="w4a8_mx",
+        )
+        w4a8_tier = _prepare_w4a8_tier_from_e8m0_source(
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_global_scale=w1_global_scale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_global_scale=w2_global_scale,
+            activation=activation,
+            params_dtype=params_dtype,
+            source_format=source_format,
+            w13_layout=w13_layout,
+        )
+
     return B12XPreparedFP4MoEWeights(
         source_format=source_format,
         w13_layout=w13_layout,
         w1_runtime_alphas=w1_runtime_alphas,
         w2_runtime_alphas=w2_runtime_alphas,
         w4a16=w4a16,
+        w4a8_tier=w4a8_tier,
     )
 
 
@@ -3885,7 +4885,8 @@ def plan_tp_moe_arena_layout(
     w4a16_scale_format: str | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
-    quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -3893,7 +4894,6 @@ def plan_tp_moe_arena_layout(
         swiglu_alpha,
         swiglu_beta,
     )
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
@@ -4319,7 +5319,8 @@ def materialize_tp_moe_arena_workspaces(
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
-    quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -4327,7 +5328,6 @@ def materialize_tp_moe_arena_workspaces(
         swiglu_alpha,
         swiglu_beta,
     )
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
@@ -4572,6 +5572,7 @@ def build_tp_moe_fp4_binding(
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
+    prepared_w4a8: object | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -4594,10 +5595,16 @@ def build_tp_moe_fp4_binding(
         raise ValueError(
             f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
         )
+    source_format = _normalize_fp4_source_format(source_format)
     workspace_quant_mode = getattr(workspace, "quant_mode", None)
-    quant_mode = _normalize_quant_mode(
-        quant_mode if quant_mode is not None else workspace_quant_mode
+    quant_mode = _normalize_quant_mode_for_source(
+        quant_mode if quant_mode is not None else workspace_quant_mode,
+        source_format,
     )
+    runtime_prepared_w4a16 = (
+        prepared_w4a16 if quant_mode == "w4a16" else None
+    )
+    unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -4605,11 +5612,13 @@ def build_tp_moe_fp4_binding(
         swiglu_alpha,
         swiglu_beta,
     )
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     m, k = map(int, a.shape)
     num_topk = int(topk_ids.shape[1])
-    if prepared_w4a16 is not None:
+    if prepared_w4a8 is not None and quant_mode == "w4a8_mx":
+        weight_E = int(prepared_w4a8.num_experts)
+        n = int(prepared_w4a8.intermediate_size)
+    elif prepared_w4a16 is not None:
         weight_E = int(prepared_w4a16.num_experts)
         n = int(prepared_w4a16.intermediate_size)
     else:
@@ -4677,22 +5686,32 @@ def build_tp_moe_fp4_binding(
         fast_math=fast_math,
         activation=activation,
         quant_mode=quant_mode,
-        unit_scale_contract=bool(unit_scale_contract),
+        unit_scale_contract=unit_scale_contract,
         source_format=source_format,
         w13_layout=w13_layout,
-        prepared_w4a16=prepared_w4a16,
+        prepared_w4a16=runtime_prepared_w4a16,
+        prepared_w4a8=prepared_w4a8 if quant_mode == "w4a8_mx" else None,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
     if isinstance(workspace, TPW4A16Workspace):
+        if quant_mode != "w4a16":
+            raise ValueError(
+                "TPW4A16Workspace cannot bind non-W4A16 quant_mode "
+                f"{quant_mode!r}"
+            )
         weight_layout = "packed"
         scale_format = "e4m3_k16"
-        if prepared_w4a16 is not None:
-            weight_layout = getattr(prepared_w4a16, "weight_layout", "packed")
+        if runtime_prepared_w4a16 is not None:
+            weight_layout = getattr(
+                runtime_prepared_w4a16,
+                "weight_layout",
+                "packed",
+            )
             scale_format = _normalize_w4a16_scale_format(
                 getattr(
-                    prepared_w4a16,
+                    runtime_prepared_w4a16,
                     "scale_format",
                     _w4a16_scale_format_for_source(source_format),
                 )
@@ -6653,6 +7672,7 @@ def b12x_moe_fp4(
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
+    prepared_w4a8: object | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -6666,7 +7686,11 @@ def b12x_moe_fp4(
     single launch.
     """
     workspace = None
+    binding_weight_E: int | None = None
+    binding_n: int | None = None
     if binding is not None:
+        binding_weight_E = int(binding.weight_E)
+        binding_n = int(binding.n)
         extras = [
             name
             for name, value in (
@@ -6686,6 +7710,7 @@ def b12x_moe_fp4(
                 ("fast_math", fast_math),
                 ("quant_mode", quant_mode),
                 ("prepared_w4a16", prepared_w4a16),
+                ("prepared_w4a8", prepared_w4a8),
                 ("swiglu_limit", swiglu_limit),
                 ("swiglu_alpha", swiglu_alpha),
                 ("swiglu_beta", swiglu_beta),
@@ -6735,11 +7760,11 @@ def b12x_moe_fp4(
         source_format = binding.source_format
         w13_layout = binding.w13_layout
         prepared_w4a16 = binding.prepared_w4a16
+        prepared_w4a8 = binding.prepared_w4a8
         _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
-        _validate_fp4_source_format_for_quant_mode(
-            source_format=_normalize_fp4_source_format(source_format),
-            quant_mode=_normalize_quant_mode(quant_mode),
-        )
+        source_format = _normalize_fp4_source_format(source_format)
+        quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
+        unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
         if binding.implementation == "static":
             workspace = TPCompactStaticWorkspace(
                 implementation=binding.implementation,
@@ -6747,7 +7772,7 @@ def b12x_moe_fp4(
                 # barrier scalars; the launch wrapper must re-zero them in-place each
                 # call (gated on volatile_launch_state), like the W4A16 path.
                 volatile_launch_state=True,
-                quant_mode=_normalize_quant_mode(binding.quant_mode),
+                quant_mode=quant_mode,
                 state_E=binding.state_E,
                 weight_E=binding.weight_E,
                 max_rows=binding.max_rows,
@@ -6794,7 +7819,7 @@ def b12x_moe_fp4(
                 # barrier scalars; the launch wrapper must re-zero them in-place each
                 # call (gated on volatile_launch_state), like the W4A16 path.
                 volatile_launch_state=True,
-                quant_mode=_normalize_quant_mode(binding.quant_mode),
+                quant_mode=quant_mode,
                 state_E=binding.state_E,
                 weight_E=binding.weight_E,
                 max_rows=binding.max_rows,
@@ -6877,7 +7902,14 @@ def b12x_moe_fp4(
         )
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
-    quant_mode = _normalize_quant_mode(quant_mode_arg)
+    source_format = _normalize_fp4_source_format(source_format)
+    quant_mode = _normalize_quant_mode_for_source(quant_mode_arg, source_format)
+    runtime_prepared_w4a16 = (
+        prepared_w4a16 if quant_mode == "w4a16" else None
+    )
+    runtime_prepared_w4a8 = prepared_w4a8 if quant_mode == "w4a8_mx" else None
+    prepared_w4a16_metadata = runtime_prepared_w4a16
+    unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -6885,7 +7917,6 @@ def b12x_moe_fp4(
         swiglu_alpha,
         swiglu_beta,
     )
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
@@ -6894,21 +7925,35 @@ def b12x_moe_fp4(
     num_topk = topk_ids.shape[1]
     m, k = a.shape
     device = a.device
-    if prepared_w4a16 is not None:
-        if quant_mode != "w4a16":
-            raise ValueError("prepared_w4a16 requires quant_mode='w4a16'")
-        prepared_hidden = int(prepared_w4a16.hidden_size)
+    if runtime_prepared_w4a8 is not None:
+        prepared_hidden = int(runtime_prepared_w4a8.hidden_size)
+        if prepared_hidden != k:
+            raise ValueError(
+                f"prepared_w4a8 hidden_size mismatch: expected {k}, got {prepared_hidden}"
+            )
+        prepared_dtype = getattr(runtime_prepared_w4a8, "params_dtype", a.dtype)
+        if prepared_dtype != a.dtype:
+            raise TypeError(
+                f"prepared_w4a8 was built for {prepared_dtype}, but a has dtype {a.dtype}"
+            )
+        weight_E = int(runtime_prepared_w4a8.num_experts)
+        n = int(runtime_prepared_w4a8.intermediate_size)
+    elif prepared_w4a16_metadata is not None:
+        prepared_hidden = int(prepared_w4a16_metadata.hidden_size)
         if prepared_hidden != k:
             raise ValueError(
                 f"prepared_w4a16 hidden_size mismatch: expected {k}, got {prepared_hidden}"
             )
-        prepared_dtype = getattr(prepared_w4a16, "params_dtype", a.dtype)
+        prepared_dtype = getattr(prepared_w4a16_metadata, "params_dtype", a.dtype)
         if prepared_dtype != a.dtype:
             raise TypeError(
                 f"prepared_w4a16 was built for {prepared_dtype}, but a has dtype {a.dtype}"
             )
-        weight_E = int(prepared_w4a16.num_experts)
-        n = int(prepared_w4a16.intermediate_size)
+        weight_E = int(prepared_w4a16_metadata.num_experts)
+        n = int(prepared_w4a16_metadata.intermediate_size)
+    elif binding_weight_E is not None and binding_n is not None:
+        weight_E = binding_weight_E
+        n = binding_n
     else:
         weight_E = w1_fp4.shape[0]
         n = w2_fp4.shape[2] * 2  # intermediate_size
@@ -6918,6 +7963,7 @@ def b12x_moe_fp4(
                 f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
                 f"{activation!r}, got {w1_fp4.shape[1]}"
             )
+    prepared_w4a16 = runtime_prepared_w4a16
     routed_rows = m * num_topk
     if apply_router_weight_on_input and quant_mode != "w4a16":
         raise NotImplementedError(
@@ -6927,12 +7973,6 @@ def b12x_moe_fp4(
         raise NotImplementedError(
             "activation='swigluoai_uninterleave' is not supported for W4A8 MoE"
         )
-    if (
-        swiglu_limit is not None
-        and activation != SWIGLUOAI_UNINTERLEAVE
-        and quant_mode != "w4a16"
-    ):
-        raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
     # Shared scalar input scales are weight-side constants in the benchmarked
@@ -7108,7 +8148,10 @@ def b12x_moe_fp4(
 
     impl = plan.implementation
     max_rows = plan.max_rows
-    if impl == "dynamic" and _is_w4a8_quant_mode(quant_mode):
+    if (
+        _is_w4a8_quant_mode(quant_mode)
+        and (impl == "dynamic" or runtime_prepared_w4a8 is not None)
+    ):
         # W4A8 throughput tier: prefill-band w4a8_mx routes to the Marlin-port
         # QMMA pipeline (placed before chunking -- the tier workspace is
         # capacity-sized per m and has no launch-ABI row limit). Returns None
@@ -7132,12 +8175,20 @@ def b12x_moe_fp4(
             routed_rows=routed_rows,
             activation=activation,
             quant_mode=quant_mode,
+            source_format=source_format,
             w13_layout=w13_layout,
             apply_router_weight_on_input=apply_router_weight_on_input,
             device=device,
+            prepared_w4a8=runtime_prepared_w4a8,
+            swiglu_limit=swiglu_limit,
         )
         if tier_out is not None:
             return tier_out
+        if runtime_prepared_w4a8 is not None:
+            raise RuntimeError(
+                "B12X prepared W4A8 MoE requires the W4A8 tier; "
+                f"selected implementation={impl!r}"
+            )
     if impl == "dynamic" and m > plan.max_tokens_per_launch:
         if not workspace_policy.can_chunk:
             raise ValueError(
@@ -7168,6 +8219,7 @@ def b12x_moe_fp4(
                 activation=activation,
                 quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
+                source_format=source_format,
                 w13_layout=w13_layout,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
@@ -7941,11 +8993,9 @@ def b12x_sparse_moe_fp4(
         )
 
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
-    quant_mode_arg = quant_mode
-    quant_mode_normalized = _normalize_quant_mode(quant_mode_arg)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=experts.source_format,
-        quant_mode=quant_mode_normalized,
+    quant_mode_normalized = _normalize_quant_mode_for_source(
+        quant_mode,
+        experts.source_format,
     )
 
     if routing is not None:
@@ -7994,7 +9044,7 @@ def b12x_sparse_moe_fp4(
         input_scales_static=input_scales_static,
         fast_math=fast_math,
         activation=activation,
-        quant_mode=quant_mode_arg,
+        quant_mode=quant_mode_normalized,
         source_format=experts.source_format,
         w13_layout=experts.w13_layout,
         swiglu_limit=swiglu_limit,

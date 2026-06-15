@@ -50,6 +50,7 @@ from .residual import (
 from .tp_moe import (
     B12XFP4ExpertWeights,
     B12XPreparedFP4MoEWeights,
+    B12XPreparedW4A8TierWeights,
     B12XTopKRouting,
     TPMoEFP4Binding,
     TPMoERouteBinding,
@@ -107,6 +108,7 @@ __all__ = [
     "plan_mhc_scratch",
     "B12XFP4ExpertWeights",
     "B12XPreparedFP4MoEWeights",
+    "B12XPreparedW4A8TierWeights",
     "B12XTopKRouting",
     "TPMoEFP4Binding",
     "TPMoERouteBinding",

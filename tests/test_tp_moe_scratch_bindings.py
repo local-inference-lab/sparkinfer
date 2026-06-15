@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -13,7 +15,9 @@ from b12x.integration import (
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     plan_tp_moe_scratch,
+    prepare_b12x_fp4_moe_weights,
 )
+from b12x.moe.fused.w4a8.gemm import repack_w4a8_weights
 
 
 def _caps() -> TPMoEScratchCaps:
@@ -26,6 +30,15 @@ def _caps() -> TPMoEScratchCaps:
         num_topk=2,
         dtype=torch.bfloat16,
     )
+
+
+def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "B12X_MOE_FORCE_A8",
+        "B12X_FORCE_MOE_A8",
+        "B12X_MOE_FORCE_A16",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_dynamic_deterministic_output_is_opt_in(
@@ -52,6 +65,177 @@ def test_dynamic_deterministic_output_is_opt_in(
         quant_mode="nvfp4",
         device=torch.device("cpu"),
     )
+
+
+def test_moe_force_envs_do_not_override_explicit_quant_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_moe_force_env(monkeypatch)
+    monkeypatch.setenv("B12X_MOE_FORCE_A8", "1")
+    monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+
+    assert tp_moe_impl.default_moe_quant_mode() == "nvfp4"
+    assert tp_moe_impl._normalize_quant_mode(None) == "nvfp4"
+    assert tp_moe_impl._normalize_quant_mode("nvfp4") == "nvfp4"
+    assert tp_moe_impl._normalize_quant_mode("w4a16") == "w4a16"
+    assert (
+        tp_moe_impl._normalize_quant_mode_for_source(
+            "w4a16",
+            "fp4_e8m0_k32",
+        )
+        == "w4a16"
+    )
+    caps = TPMoEScratchCaps(
+        device="cpu",
+        max_tokens=4,
+        weight_E=8,
+        k=128,
+        n=64,
+        num_topk=2,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+        source_format="fp4_e8m0_k32",
+    )
+
+    assert caps.quant_mode == "w4a16"
+
+
+def test_explicit_w4a8_mx_binds_prepared_metadata() -> None:
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            weight_E=8,
+            k=128,
+            n=64,
+            num_topk=2,
+            dtype=torch.bfloat16,
+            route_num_experts=0,
+            quant_mode="w4a8_mx",
+            source_format="fp4_e8m0_k32",
+            swiglu_limit=7.0,
+        )
+    )
+    scratch = _scratch_for_plan(plan)
+    prepared_w4a8 = SimpleNamespace(
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=64,
+        params_dtype=torch.bfloat16,
+        w13_rp=torch.empty((1,), dtype=torch.int32),
+        w13_sfb=torch.empty((1,), dtype=torch.int32),
+        w2_rp=torch.empty((1,), dtype=torch.int32),
+        w2_sfb=torch.empty((1,), dtype=torch.int32),
+    )
+    runtime_tensors = _runtime_tensors()
+    runtime_tensors["w1_fp4"] = torch.empty((0,), dtype=torch.uint8)
+    runtime_tensors["w1_blockscale"] = torch.empty((0,), dtype=torch.uint8)
+    runtime_tensors["w2_fp4"] = torch.empty((0,), dtype=torch.uint8)
+    runtime_tensors["w2_blockscale"] = torch.empty((0,), dtype=torch.uint8)
+
+    binding = plan.bind(
+        scratch=scratch,
+        **runtime_tensors,
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        prepared_w4a8=prepared_w4a8,
+        swiglu_limit=7.0,
+    )
+
+    assert binding.quant_mode == "w4a8_mx"
+    assert binding.weight_E == 8
+    assert binding.n == 64
+    assert binding.prepared_w4a16 is None
+    assert binding.prepared_w4a8 is prepared_w4a8
+    assert binding.swiglu_limit == 7.0
+
+
+def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
+    experts, k, n = 8, 256, 128
+    w1_rows = 2 * n
+    w1_source = (
+        torch.arange(experts * w1_rows * (k // 2), dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(experts, w1_rows, k // 2)
+    )
+    w2_source = (
+        torch.arange(experts * k * (n // 2), dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(experts, k, n // 2)
+    )
+    w1_scale = (
+        torch.arange(experts * w1_rows * (k // 32), dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(experts, w1_rows, k // 32)
+    )
+    w2_scale = (
+        torch.arange(experts * k * (n // 32), dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(experts, k, n // 32)
+    )
+    w1_original = w1_source.clone()
+    w2_original = w2_source.clone()
+    w1_scale_original = w1_scale.clone()
+    w2_scale_original = w2_scale.clone()
+
+    w1_expected = torch.cat([w1_original[:, n:], w1_original[:, :n]], dim=1)
+    w1_scale_expected = torch.cat(
+        [w1_scale_original[:, n:], w1_scale_original[:, :n]], dim=1
+    )
+    expected_w13_rp, expected_w13_sfb = repack_w4a8_weights(
+        w1_expected.contiguous(),
+        w1_scale_expected.clamp(max=247).contiguous(),
+    )
+    expected_w2_rp, expected_w2_sfb = repack_w4a8_weights(
+        w2_original.contiguous(),
+        w2_scale_original.clamp(max=247).contiguous(),
+    )
+
+    prepared = prepare_b12x_fp4_moe_weights(
+        source_format="fp4_e8m0_k32",
+        w13_layout="w31",
+        w1_fp4=w1_source,
+        w1_blockscale=w1_scale,
+        w1_global_scale=torch.ones((experts,), dtype=torch.float32),
+        w2_fp4=w2_source,
+        w2_blockscale=w2_scale,
+        w2_global_scale=torch.ones((experts,), dtype=torch.float32),
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        prepare_w4a8_tier=True,
+        reuse_input_storage=True,
+    )
+    w4a8 = prepared.w4a8_tier
+
+    assert w4a8 is not None
+    assert w4a8.num_experts == experts
+    assert w4a8.hidden_size == k
+    assert w4a8.intermediate_size == n
+    assert (
+        w4a8.w13_rp.untyped_storage().data_ptr()
+        == w1_source.untyped_storage().data_ptr()
+    )
+    assert (
+        w4a8.w2_rp.untyped_storage().data_ptr()
+        == w2_source.untyped_storage().data_ptr()
+    )
+    assert (
+        w4a8.w13_sfb.untyped_storage().data_ptr()
+        == w1_scale.untyped_storage().data_ptr()
+    )
+    assert (
+        w4a8.w2_sfb.untyped_storage().data_ptr()
+        == w2_scale.untyped_storage().data_ptr()
+    )
+    assert torch.equal(w4a8.w13_rp, expected_w13_rp)
+    assert torch.equal(w4a8.w13_sfb, expected_w13_sfb)
+    assert torch.equal(w4a8.w2_rp, expected_w2_rp)
+    assert torch.equal(w4a8.w2_sfb, expected_w2_sfb)
 
 
 def _runtime_tensors(m: int = 3, topk: int = 2):
