@@ -304,8 +304,14 @@ def main() -> None:
     parser.add_argument(
         "--prefill-bf16-mma",
         action="store_true",
-        help="Use the opt-in native BF16 tensor-core prefill projection path.",
+        help="Enable native BF16 tensor-core prefill projection when TF32 is disabled.",
     )
+    parser.add_argument(
+        "--prefill-tf32-mma",
+        action="store_true",
+        help="Enable native TF32 tensor-core prefill projection path.",
+    )
+    parser.add_argument("--no-prefill-tf32-mma", action="store_true")
     parser.add_argument(
         "--prefill-block-m",
         action="store_true",
@@ -328,6 +334,10 @@ def main() -> None:
         help="Path to the vLLM checkout used for --compare-vllm.",
     )
     args = parser.parse_args()
+    if args.no_prefill_tf32_mma:
+        os.environ["B12X_MHC_PREFILL_TF32_MMA"] = "0"
+    elif args.prefill_tf32_mma:
+        os.environ["B12X_MHC_PREFILL_TF32_MMA"] = "1"
     if args.prefill_bf16_mma:
         os.environ["B12X_MHC_PREFILL_BF16_MMA"] = "1"
     if args.no_prefill_block_m:
@@ -337,6 +347,14 @@ def main() -> None:
     if args.prefill_block_m or not args.no_prefill_block_m:
         os.environ["B12X_MHC_PREFILL_BLOCK_M_SIZE"] = str(args.prefill_block_m_size)
         os.environ["B12X_MHC_PREFILL_TILE_N"] = str(args.prefill_tile_n)
+    prefill_tf32_enabled = (
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_MMA",
+            os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1"),
+        )
+        != "0"
+    )
+    prefill_bf16_enabled = os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
     prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
 
     device = require_sm120()
@@ -524,7 +542,8 @@ def main() -> None:
         f"mode={mode} tokens={args.tokens} expected_m={args.expected_m} "
         f"hidden={args.hidden_size} "
         f"split_k={args.split_k} block_k={args.block_k} block_h={args.block_h} "
-        f"prefill_bf16_mma={args.prefill_bf16_mma} "
+        f"prefill_tf32_mma={prefill_tf32_enabled} "
+        f"prefill_bf16_mma={prefill_bf16_enabled} "
         f"prefill_block_m={prefill_block_m_enabled} "
         f"prefill_block_m_size={args.prefill_block_m_size} "
         f"prefill_tile_n={args.prefill_tile_n} "

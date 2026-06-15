@@ -308,6 +308,26 @@ def _use_mhc_prefill_bf16_project(
     )
 
 
+def _use_mhc_prefill_tf32_project(
+    *,
+    norm_weight: torch.Tensor | None,
+    policy_m: int,
+) -> bool:
+    prefill_bf16_min_tokens = os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384")
+    prefill_tf32_min_tokens = int(
+        os.environ.get("B12X_MHC_PREFILL_TF32_MIN_TOKENS", prefill_bf16_min_tokens)
+    )
+    prefill_tf32_enabled = os.environ.get(
+        "B12X_MHC_PREFILL_TF32_MMA",
+        os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1"),
+    )
+    return (
+        norm_weight is not None
+        and int(policy_m) >= prefill_tf32_min_tokens
+        and prefill_tf32_enabled != "0"
+    )
+
+
 def _validate_mhc_binding_views(
     *,
     partials: torch.Tensor | None,
@@ -937,6 +957,7 @@ def _b12x_mhc_post_pre_impl(
             run_mhc_post_pre_prefill_gram,
             run_mhc_post_pre_prefill_partial,
             run_mhc_prefill_bf16_project,
+            run_mhc_prefill_tf32_project,
         )
 
         if not _caller_owned_buffers and expected_m is None:
@@ -959,13 +980,18 @@ def _b12x_mhc_post_pre_impl(
             )
 
         prefill_min_tokens = int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
+        use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
+            norm_weight=norm_weight,
+            policy_m=policy_m,
+        )
         use_prefill_bf16_mma = _use_mhc_prefill_bf16_project(
             norm_weight=norm_weight,
             policy_m=policy_m,
             fn_bf16=fn_bf16,
-        )
+        ) and not use_prefill_tf32_mma
         use_prefill_block_m = (
-            not use_prefill_bf16_mma
+            not use_prefill_tf32_mma
+            and not use_prefill_bf16_mma
             and norm_weight is not None
             and policy_m >= prefill_min_tokens
             and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
@@ -973,13 +999,28 @@ def _b12x_mhc_post_pre_impl(
         prefill_block_m_size = int(os.environ.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2"))
         prefill_tile_n = int(os.environ.get("B12X_MHC_PREFILL_TILE_N", "24"))
         use_prefill_compact = (
-            not use_prefill_bf16_mma
+            not use_prefill_tf32_mma
+            and not use_prefill_bf16_mma
             and not use_prefill_block_m
             and norm_weight is not None
             and policy_m >= prefill_min_tokens
             and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
         )
-        if use_prefill_bf16_mma:
+        if use_prefill_tf32_mma:
+            run_mhc_post_pre_prefill_gram(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                partials=partials,
+                out=residual_out,
+            )
+            run_mhc_prefill_tf32_project(
+                out=residual_out,
+                fn=fn,
+                partials=partials,
+            )
+        elif use_prefill_bf16_mma:
             run_mhc_post_pre_prefill_gram(
                 x=x,
                 residual=residual,
@@ -1042,7 +1083,10 @@ def _b12x_mhc_post_pre_impl(
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
             compact_partials=(
-                use_prefill_bf16_mma or use_prefill_block_m or use_prefill_compact
+                use_prefill_tf32_mma
+                or use_prefill_bf16_mma
+                or use_prefill_block_m
+                or use_prefill_compact
             ),
         )
         return residual_out, post_out, comb_out, y_out

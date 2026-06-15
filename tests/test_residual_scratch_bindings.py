@@ -166,6 +166,68 @@ def test_mhc_prefill_bf16_project_policy_can_be_overridden(monkeypatch) -> None:
     )
 
 
+def test_mhc_prefill_tf32_project_policy_defaults_to_bf16_regime(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MMA", raising=False)
+    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", raising=False)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+
+    assert not residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=352,
+    )
+    assert residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=384,
+    )
+    assert not residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=None,
+        policy_m=4096,
+    )
+
+
+def test_mhc_prefill_tf32_project_policy_can_be_overridden(monkeypatch) -> None:
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
+    assert not residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=4096,
+    )
+
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
+    assert not residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=4096,
+    )
+
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "1")
+    assert residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=4096,
+    )
+
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
+    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "256")
+    assert residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=256,
+    )
+
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MIN_TOKENS", "512")
+    assert not residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=384,
+    )
+    assert residual_impl._use_mhc_prefill_tf32_project(
+        norm_weight=norm_weight,
+        policy_m=512,
+    )
+
+
 def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
     plan = plan_mhc_scratch(
         B12XMHCScratchCaps(

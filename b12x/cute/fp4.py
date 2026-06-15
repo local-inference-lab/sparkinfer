@@ -2464,6 +2464,82 @@ def bf16_mma_m16n8k16_f32(
 
 
 @dsl_user_op
+def f32_to_tf32_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Round one float32 value to TF32 format and return its 32-bit operand bits."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 tmp;
+                cvt.rna.tf32.f32 tmp, $1;
+                mov.b32 $0, tmp;
+            }
+            """,
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def tf32_mma_m16n8k8_f32(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Warp MMA helper for `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$10, $11, $12, $13};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
 def f16_mma_m16n8k16_f32(
     d0: Float32,
     d1: Float32,

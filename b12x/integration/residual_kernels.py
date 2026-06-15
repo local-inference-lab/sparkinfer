@@ -27,11 +27,13 @@ from b12x.cute.compiler import (
 )
 from b12x.cute.fp4 import (
     bf16_mma_m16n8k16_f32,
+    f32_to_tf32_bits,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ldmatrix_m8n8x4_b16,
     shared_ptr_to_u32,
     st_shared_u32,
+    tf32_mma_m16n8k8_f32,
 )
 from b12x.cute.utils import current_cuda_stream
 
@@ -63,9 +65,8 @@ _PREFILL_TMA_THREADS = (_PREFILL_TMA_COMPUTE_WARPS + 1) * 32
 _PREFILL_TMA_TILE_M = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128"))
 _PREFILL_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16"))
 _PREFILL_TMA_TILE_K = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64"))
+_PREFILL_TF32_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"))
 _PREFILL_TMA_STAGES = int(os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "3"))
-_PREFILL_TMA_MMA_REGS = int(os.getenv("B12X_MHC_PREFILL_TMA_MMA_REGS", "192"))
-_PREFILL_TMA_LOAD_REGS = int(os.getenv("B12X_MHC_PREFILL_TMA_LOAD_REGS", "40"))
 _POST_PRE_CHUNK = 12
 
 # --- Gram-trick split finalize (multi-CTA fuse_norm, no per-h norm reduction) -
@@ -179,6 +180,20 @@ def _to_kernel_tensor(
             cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
             cute_tensor.element_type = dtype
     return cute_tensor
+
+
+def _assume_tma_source_aligned(tensor: cute.Tensor) -> cute.Tensor:
+    divby = 128 // tensor.element_type.width
+    strides = []
+    for dim, stride in enumerate(tensor.stride):
+        if dim == 1 or isinstance(stride, int):
+            strides.append(stride)
+        else:
+            strides.append(cute.assume(stride, divby=divby))
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(tensor.shape, stride=tuple(strides)),
+    )
 
 
 def _tensor_meta_key(
@@ -1319,8 +1334,6 @@ class MHCPrefillBf16ProjectTmaKernel:
     tile_n = _PREFILL_TMA_TILE_N
     tile_k = _PREFILL_TMA_TILE_K
     num_stages = _PREFILL_TMA_STAGES
-    mma_registers = _PREFILL_TMA_MMA_REGS
-    load_registers = _PREFILL_TMA_LOAD_REGS
     buffer_align_bytes = 1024
 
     def __init__(
@@ -1424,16 +1437,18 @@ class MHCPrefillBf16ProjectTmaKernel:
         SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
         sA_tma_layout = cute.slice_(sA_layout, (None, None, 0))
         sB_tma_layout = cute.slice_(sB_layout, (None, None, 0))
+        out_tma = _assume_tma_source_aligned(out_flat)
+        fn_tma = _assume_tma_source_aligned(fn_bf16)
         tma_atom_A, tma_tensor_A = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            out_flat,
+            out_tma,
             sA_tma_layout,
             (self.tile_m, self.tile_k),
             num_multicast=1,
         )
         tma_atom_B, tma_tensor_B = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            fn_bf16,
+            fn_tma,
             sB_tma_layout,
             (self.tile_n, self.tile_k),
             num_multicast=1,
@@ -1486,14 +1501,7 @@ class MHCPrefillBf16ProjectTmaKernel:
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
 
         tma_copy_bytes = (
-            cute.size_in_bytes(
-                cutlass.BFloat16,
-                cute.slice_(sA_layout, (None, None, 0)),
-            )
-            + cute.size_in_bytes(
-                cutlass.BFloat16,
-                cute.slice_(sB_layout, (None, None, 0)),
-            )
+            (self.tile_m + self.tile_n) * self.tile_k * cutlass.BFloat16.width // 8
         )
         load_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.num_stages,
@@ -1535,7 +1543,6 @@ class MHCPrefillBf16ProjectTmaKernel:
         )
 
         if warp_idx < Int32(self.num_compute_warps):
-            cute.arch.setmaxregister_increase(self.mma_registers)
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
@@ -1600,13 +1607,326 @@ class MHCPrefillBf16ProjectTmaKernel:
                         ]
 
         elif warp_idx == Int32(self.producer_warp):
-            cute.arch.setmaxregister_decrease(self.load_registers)
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
             )
             for k_tile in cutlass.range_constexpr(self.k_tiles):
                 load_pipeline.producer_acquire(producer_state)
+                cute.copy(
+                    tma_atom_A,
+                    tAgA[(None, m_tile, k_tile)],
+                    tAsA[(None, producer_state.index)],
+                    tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                )
+                cute.copy(
+                    tma_atom_B,
+                    tBgB[(None, n_tile, k_tile)],
+                    tBsB[(None, producer_state.index)],
+                    tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                )
+                load_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+            load_pipeline.producer_tail(producer_state)
+
+
+class MHCPrefillTf32ProjectTmaKernel:
+    """TMA-fed TF32 tensor-core projection for compact mHC prefill partials."""
+
+    num_threads = _PREFILL_TMA_THREADS
+    num_compute_warps = _PREFILL_TMA_COMPUTE_WARPS
+    producer_warp = _PREFILL_TMA_COMPUTE_WARPS
+    tile_m = _PREFILL_TMA_TILE_M
+    tile_n = _PREFILL_TF32_TMA_TILE_N
+    tile_k = _PREFILL_TMA_TILE_K
+    num_stages = _PREFILL_TMA_STAGES
+    buffer_align_bytes = 1024
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = _HIDDEN,
+        split_k: int | None = None,
+    ):
+        self.hidden_size = int(hidden_size)
+        self.total_k = _MHC_MULT * self.hidden_size
+        self.split_k = (
+            _split_k_for_hidden(self.hidden_size)
+            if split_k is None
+            else int(split_k)
+        )
+        _validate_split_k(self.hidden_size, self.split_k)
+        if self.total_k % self.tile_k != 0:
+            raise ValueError(
+                f"total_k={self.total_k} must be divisible by TF32 TMA tile_k={self.tile_k}"
+            )
+        if self.tile_k % 8 != 0:
+            raise ValueError(f"TF32 TMA tile_k={self.tile_k} must be divisible by 8")
+        if self.tile_n != 8:
+            raise ValueError(
+                f"TF32 TMA tile_n={self.tile_n} must be 8 for m16n8k8 warp MMA"
+            )
+        m_per_mma_group = self.num_compute_warps * 16
+        if self.tile_m != m_per_mma_group:
+            raise ValueError(
+                f"TF32 TMA tile_m={self.tile_m} must equal "
+                f"num_compute_warps*16={m_per_mma_group}"
+            )
+        self.k_tiles = self.total_k // self.tile_k
+        self.n_tiles = (_MIXES + self.tile_n - 1) // self.tile_n
+
+    def _get_smem_layouts(self) -> tuple[cute.ComposedLayout, cute.Layout]:
+        a_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR,
+                cutlass.BFloat16,
+                self.tile_k,
+            ),
+            cutlass.BFloat16,
+        )
+        sA_layout = cute.tile_to_shape(
+            a_layout_atom,
+            (self.tile_m, self.tile_k, self.num_stages),
+            order=(0, 1, 2),
+        )
+        sB_layout = cute.make_layout(
+            (self.tile_n, self.tile_k, self.num_stages),
+            stride=(
+                self.tile_k,
+                1,
+                self.tile_n * self.tile_k,
+            ),
+        )
+        return sA_layout, sB_layout
+
+    def _get_shared_storage_cls(
+        self,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.Layout,
+    ):
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "mbar_ptr": cute.struct.MemRange[
+                cutlass.Int64,
+                self.num_stages * 2,
+            ],
+            "sA": cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(sA_layout)],
+                self.buffer_align_bytes,
+            ],
+            "sB": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(sB_layout)],
+                self.buffer_align_bytes,
+            ],
+        }
+        return cute.struct(SharedStorage)
+
+    @cute.jit
+    def __call__(
+        self,
+        out_flat: cute.Tensor,
+        fn: cute.Tensor,
+        partials: cute.Tensor,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        if const_expr(out_flat.element_type != cutlass.BFloat16):
+            raise TypeError("out_flat must be BFloat16")
+        if const_expr(fn.element_type != cutlass.Float32):
+            raise TypeError("fn must be Float32")
+        if const_expr(partials.element_type != cutlass.Float32):
+            raise TypeError("partials must be Float32")
+
+        sA_layout, sB_layout = self._get_smem_layouts()
+        SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
+        sA_tma_layout = cute.slice_(sA_layout, (None, None, 0))
+        sB_tma_layout = cute.slice_(sB_layout, (None, None, 0))
+        out_tma = _assume_tma_source_aligned(out_flat)
+        fn_tma = _assume_tma_source_aligned(fn)
+        tma_atom_A, tma_tensor_A = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            out_tma,
+            sA_tma_layout,
+            (self.tile_m, self.tile_k),
+            num_multicast=1,
+        )
+        tma_atom_B, tma_tensor_B = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            fn_tma,
+            sB_tma_layout,
+            (self.tile_n, self.tile_k),
+            num_multicast=1,
+        )
+        grid_m = (num_tokens + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+        self.kernel(
+            tma_tensor_A,
+            tma_tensor_B,
+            partials,
+            tma_atom_A,
+            tma_atom_B,
+            sA_layout,
+            sB_layout,
+            SharedStorage,
+            num_tokens,
+        ).launch(
+            grid=(grid_m, self.n_tiles, 1),
+            block=[self.num_threads, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        out_flat: cute.Tensor,
+        fn: cute.Tensor,
+        partials: cute.Tensor,
+        tma_atom_A: cute.CopyAtom,
+        tma_atom_B: cute.CopyAtom,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.Layout,
+        SharedStorage: cutlass.Constexpr,
+        num_tokens: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        m_tile, n_tile, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_A)
+            cpasync.prefetch_descriptor(tma_atom_B)
+
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
+        sB = storage.sB.get_tensor(sB_layout)
+
+        tma_copy_bytes = (
+            self.tile_m * self.tile_k * cutlass.BFloat16.width // 8
+            + self.tile_n * self.tile_k * cutlass.Float32.width // 8
+        )
+        load_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.num_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_compute_warps,
+            ),
+            tx_count=tma_copy_bytes,
+            barrier_storage=storage.mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        )
+        cute.arch.sync_threads()
+
+        gA = cute.local_tile(
+            out_flat,
+            (self.tile_m, self.tile_k),
+            (None, None),
+        )
+        gB = cute.local_tile(
+            fn,
+            (self.tile_n, self.tile_k),
+            (None, None),
+        )
+        cta_layout = cute.make_layout(1)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_A,
+            0,
+            cta_layout,
+            cute.group_modes(sA, 0, 2),
+            cute.group_modes(gA, 0, 2),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_B,
+            0,
+            cta_layout,
+            cute.group_modes(sB, 0, 2),
+            cute.group_modes(gB, 0, 2),
+        )
+
+        if warp_idx < Int32(self.num_compute_warps):
+            lane = tidx & Int32(31)
+            lane_group = lane >> Int32(2)
+            lane_in_group = lane & Int32(3)
+            lane_pair_base = lane_in_group * Int32(2)
+            warp_m_base = warp_idx * Int32(16)
+            row0 = warp_m_base + lane_group
+            row1 = row0 + Int32(8)
+            token0 = m_tile * Int32(self.tile_m) + row0
+            token1 = token0 + Int32(8)
+            mix0 = n_tile * Int32(self.tile_n) + lane_pair_base
+            mix1 = mix0 + Int32(1)
+            b_mix = n_tile * Int32(self.tile_n) + lane_group
+
+            d0 = Float32(0.0)
+            d1 = Float32(0.0)
+            d2 = Float32(0.0)
+            d3 = Float32(0.0)
+            consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                self.num_stages,
+            )
+            for _k_tile in range(0, self.k_tiles, 1, unroll=1):
+                load_pipeline.consumer_wait(consumer_state)
+                for kk in cutlass.range_constexpr(self.tile_k // 8):
+                    k0 = Int32(kk * 8)
+                    a_k0 = k0 + lane_in_group
+                    a_k1 = a_k0 + Int32(4)
+
+                    a0_f = Float32(0.0)
+                    a1_f = Float32(0.0)
+                    a2_f = Float32(0.0)
+                    a3_f = Float32(0.0)
+                    if token0 < num_tokens:
+                        a0_f = Float32(sA[row0, a_k0, consumer_state.index])
+                        a2_f = Float32(sA[row0, a_k1, consumer_state.index])
+                    if token1 < num_tokens:
+                        a1_f = Float32(sA[row1, a_k0, consumer_state.index])
+                        a3_f = Float32(sA[row1, a_k1, consumer_state.index])
+
+                    b0_f = Float32(0.0)
+                    b1_f = Float32(0.0)
+                    if b_mix < Int32(_MIXES):
+                        b0_f = Float32(sB[lane_group, a_k0, consumer_state.index])
+                        b1_f = Float32(sB[lane_group, a_k1, consumer_state.index])
+
+                    d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
+                        d0,
+                        d1,
+                        d2,
+                        d3,
+                        f32_to_tf32_bits(a0_f),
+                        f32_to_tf32_bits(a1_f),
+                        f32_to_tf32_bits(a2_f),
+                        f32_to_tf32_bits(a3_f),
+                        f32_to_tf32_bits(b0_f),
+                        f32_to_tf32_bits(b1_f),
+                    )
+                load_pipeline.consumer_release(consumer_state)
+                consumer_state.advance()
+
+            if token0 < num_tokens:
+                if mix0 < Int32(_MIXES):
+                    partials[token0, Int32(0), mix0 + Int32(1)] = d0
+                if mix1 < Int32(_MIXES):
+                    partials[token0, Int32(0), mix1 + Int32(1)] = d1
+            if token1 < num_tokens:
+                if mix0 < Int32(_MIXES):
+                    partials[token1, Int32(0), mix0 + Int32(1)] = d2
+                if mix1 < Int32(_MIXES):
+                    partials[token1, Int32(0), mix1 + Int32(1)] = d3
+
+        elif warp_idx == Int32(self.producer_warp):
+            producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                self.num_stages,
+            )
+            for _k_tile in range(0, self.k_tiles, 1, unroll=1):
+                load_pipeline.producer_acquire(producer_state)
+                k_tile = producer_state.count
                 cute.copy(
                     tma_atom_A,
                     tAgA[(None, m_tile, k_tile)],
@@ -2323,6 +2643,17 @@ def _prefill_bf16_project_tma_kernel(
     split_k: int,
 ) -> MHCPrefillBf16ProjectTmaKernel:
     return MHCPrefillBf16ProjectTmaKernel(
+        hidden_size=hidden_size,
+        split_k=split_k,
+    )
+
+
+@lru_cache(maxsize=16)
+def _prefill_tf32_project_kernel(
+    hidden_size: int,
+    split_k: int,
+) -> MHCPrefillTf32ProjectTmaKernel:
+    return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
     )
@@ -3192,8 +3523,6 @@ def _run_mhc_prefill_bf16_project_launch(
             ("stages", _PREFILL_TMA_STAGES),
             ("compute_warps", _PREFILL_TMA_COMPUTE_WARPS),
             ("threads", _PREFILL_TMA_THREADS),
-            ("mma_registers", _PREFILL_TMA_MMA_REGS),
-            ("load_registers", _PREFILL_TMA_LOAD_REGS),
             cache_key,
         )
         b12x_launch(
@@ -3296,6 +3625,126 @@ def run_mhc_prefill_bf16_project(
     torch.ops.b12x.mhc_prefill_bf16_project_launch(
         out,
         fn_bf16,
+        partials,
+    )
+
+
+def _run_mhc_prefill_tf32_project_launch(
+    *,
+    out: torch.Tensor,
+    fn: torch.Tensor,
+    partials: torch.Tensor,
+) -> None:
+    tokens = int(out.shape[0])
+    hidden_size = int(out.shape[2])
+    split_k = int(partials.shape[1])
+    _validate_split_k(hidden_size, split_k)
+    _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
+    _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
+    _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
+    if fn.dtype != torch.float32:
+        raise ValueError(f"fn must be torch.float32, got {fn.dtype}")
+    if fn.device != out.device or partials.device != out.device:
+        raise ValueError("fn, partials, and out must be on the same device")
+    if not fn.is_cuda:
+        raise ValueError("fn must be CUDA")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous for TF32 prefill projection")
+    if not fn.is_contiguous():
+        raise ValueError("fn must be contiguous")
+    out_flat = out.view(tokens, _MHC_MULT * hidden_size)
+    args = (
+        _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(fn, cutlass.Float32),
+        _to_kernel_tensor(
+            partials,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        Int32(tokens),
+        current_cuda_stream(),
+    )
+    cache_key = (
+        tensor_key(
+            "out_flat",
+            out_flat,
+            dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT * hidden_size)),
+        ),
+        tensor_key(
+            "fn",
+            fn,
+            dims=(DimKey.exact(_MIXES), DimKey.exact(_MHC_MULT * hidden_size)),
+        ),
+        tensor_key(
+            "partials",
+            partials,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(split_k),
+                DimKey.exact(_PARTIALS),
+            ),
+        ),
+    )
+    hidden_specialization = _hidden_specialization_name(hidden_size)
+    compile_name = (
+        "integration.residual.mhc_prefill_tf32_project_tma_"
+        f"{hidden_specialization}_m{_PREFILL_TMA_TILE_M}_n{_PREFILL_TF32_TMA_TILE_N}"
+    )
+    compile_key = (
+        ("hidden_size", hidden_size),
+        ("split_k", split_k),
+        ("tile_m", _PREFILL_TMA_TILE_M),
+        ("tile_n", _PREFILL_TF32_TMA_TILE_N),
+        ("tile_k", _PREFILL_TMA_TILE_K),
+        ("num_stages", _PREFILL_TMA_STAGES),
+        ("num_compute_warps", _PREFILL_TMA_COMPUTE_WARPS),
+        ("threads", _PREFILL_TMA_THREADS),
+        ("operand_layout", "tma_a_bf16_b_f32_tf32_m16n8k8_v1"),
+        cache_key,
+    )
+    b12x_launch(
+        _prefill_tf32_project_kernel(hidden_size, split_k),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        compile_args=args,
+        runtime_args=args,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::mhc_prefill_tf32_project_launch",
+    mutates_args=("partials",),
+)
+def _mhc_prefill_tf32_project_launch_op(
+    out: torch.Tensor,
+    fn: torch.Tensor,
+    partials: torch.Tensor,
+) -> None:
+    _run_mhc_prefill_tf32_project_launch(
+        out=out,
+        fn=fn,
+        partials=partials,
+    )
+
+
+@_mhc_prefill_tf32_project_launch_op.register_fake
+def _mhc_prefill_tf32_project_launch_fake(
+    out: torch.Tensor,
+    fn: torch.Tensor,
+    partials: torch.Tensor,
+) -> None:
+    return None
+
+
+def run_mhc_prefill_tf32_project(
+    *,
+    out: torch.Tensor,
+    fn: torch.Tensor,
+    partials: torch.Tensor,
+) -> None:
+    torch.ops.b12x.mhc_prefill_tf32_project_launch(
+        out,
+        fn,
         partials,
     )
 
