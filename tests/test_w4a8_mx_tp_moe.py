@@ -1,9 +1,9 @@
 """End-to-end w4a8_mx dispatch through b12x_moe_fp4 on synthetic MXFP4 weights.
 
 Gates the e8m0_k32 serving prepare: checkpoint-native per-K/32 E8M0 grids
-([E, rows, K//32] bytes) feed the dynamic w4a8_mx kernel directly — no vec16
-scale stack, no residual grids. The micro (tiny-decode) band is not wired for
-MXFP4 sources yet and must fail loudly rather than misread the grids.
+([E, rows, K//32] bytes) feed the w4a8_mx kernels directly — no vec16 scale
+stack, no residual grids. Tiny-decode uses the direct micro specialization with
+logical E8M0 scale-grid loads.
 """
 
 from __future__ import annotations
@@ -143,11 +143,36 @@ def test_w4a8_mx_w31_layout_flip() -> None:
         )
 
 
-def test_w4a8_mx_micro_band_raises() -> None:
+@pytest.mark.parametrize("m", [1, 4])
+def test_w4a8_mx_micro_band_matches_oracle(m: int) -> None:
     _skip_if_unavailable()
+    from b12x.integration import tp_moe
+
     weights = _weights()
-    with pytest.raises(NotImplementedError, match="w4a8_mx tiny-decode"):
-        _run(4, weights["w13_fp4"], weights["w13_mx"])
+    plan = tp_moe._make_workspace_plan(
+        num_tokens=m,
+        weight_E=_E,
+        k=_K,
+        n=_N,
+        num_topk=_TOPK,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        quant_mode="w4a8_mx",
+        activation="silu",
+    )
+    assert plan.implementation == "static"
+
+    out = _run(m, weights["w13_fp4"], weights["w13_mx"])
+    assert not _tier_dispatched(), "tiny-decode should not use the W4A8 tier"
+    ref = _oracle(m, weights)
+    n_out = out.float().norm().item()
+    assert n_out > 0.01, f"w4a8_mx micro output near-zero (norm={n_out})"
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.998, cos
+    n_ref = ref.float().norm().item()
+    assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
 # ---------------------------------------------------------------------------

@@ -909,6 +909,16 @@ def _is_w4a8_quant_mode(quant_mode: str) -> bool:
     return quant_mode in _W4A8_QUANT_MODES
 
 
+def _micro_scale_format_for_quant_mode(quant_mode: str) -> str:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    return "e8m0_k32" if quant_mode == "w4a8_mx" else "e4m3_k16"
+
+
+def _micro_e8m0_scale_layout_for_quant_mode(quant_mode: str) -> str:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    return "logical" if quant_mode == "w4a8_mx" else "packed"
+
+
 def _normalize_quant_mode_requested(quant_mode: str | None) -> str:
     if quant_mode is None:
         return "nvfp4"
@@ -3439,6 +3449,8 @@ def _get_weight_views(
     # Compact contiguous scale storage for the FC1 weights.
     w1_n = activation_spec.w1_rows(n)
     bs_u8 = w1_blockscale.view(torch.uint8)
+    w1_scale_storage = w1_blockscale
+    w2_scale_storage = w2_blockscale
     if quant_mode == "w4a8_mx":
         # MXFP4 sources carry checkpoint-native per-K/32 E8M0 grids
         # ([E, rows, K//32] bytes); there is no vec16 scale stack to view.
@@ -3447,6 +3459,8 @@ def _get_weight_views(
         # plumb valid addresses through the launch.
         w13_sf = _as_e8m0_k32_grid(w1_blockscale, w1_n, k, name="w1_blockscale")
         down_sf = _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale")
+        w1_scale_storage = w13_sf
+        w2_scale_storage = down_sf
     else:
         w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
         down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
@@ -3462,9 +3476,9 @@ def _get_weight_views(
         w1_alpha=w1_alphas,
         w2_alpha=w2_alphas,
         w1_storage=w1_fp4,
-        w1_scale_storage=w1_blockscale,
+        w1_scale_storage=w1_scale_storage,
         w2_storage=w2_fp4,
-        w2_scale_storage=w2_blockscale,
+        w2_scale_storage=w2_scale_storage,
     )
     # Keep as uint8 for dlpack compatibility — torch float4 types are not
     # supported by dlpack, and sglang may load weights as native float4.
@@ -6054,6 +6068,8 @@ def _get_micro_kernel(
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     is_w4a8 = _is_w4a8_quant_mode(quant_mode)
+    scale_format = _micro_scale_format_for_quant_mode(quant_mode)
+    e8m0_scale_layout = _micro_e8m0_scale_layout_for_quant_mode(quant_mode)
     dynamic_down_scale = _dynamic_down_scale_enabled() and not is_w4a8
 
     kernel = activation_spec.make_micro_kernel(
@@ -6066,6 +6082,8 @@ def _get_micro_kernel(
         single_token=single_token,
         dynamic_down_scale=dynamic_down_scale,
         a8_mx_mode=is_w4a8,
+        scale_format=scale_format,
+        e8m0_scale_layout=e8m0_scale_layout,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -6421,6 +6439,7 @@ class _DynamicMoEW4A8Launch:
         token_weights_ptr: cute.Pointer,
         num_tokens: cutlass.Int32,
         max_rows: cutlass.Int32,
+        scatter_rows: cutlass.Int32,
         rows_padded: cutlass.Int32,
         max_tasks: cutlass.Int32,
         max_phys_tiles: cutlass.Int32,
@@ -6440,7 +6459,7 @@ class _DynamicMoEW4A8Launch:
         )
         scatter_output = cute.make_tensor(
             scatter_ptr,
-            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+            layout=cute.make_layout((scatter_rows, self._k), stride=(self._k, 1)),
         )
         # E4M3 storage is one byte per element; the fp4-typed view spans 2k
         # nibble positions so the byte footprint is k per row.
@@ -8250,13 +8269,6 @@ def b12x_moe_fp4(
 
     if impl == "static":
         assert isinstance(s, TPCompactStaticWorkspace)
-        if quant_mode == "w4a8_mx":
-            # The micro a8_mx kernel consumes vec16 E4M3 scales; the
-            # e8m0_k32 micro wiring for MXFP4 sources is not threaded yet.
-            raise NotImplementedError(
-                "w4a8_mx tiny-decode (micro) serving is not wired yet; "
-                "w4a8_mx currently serves the dynamic band only"
-            )
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
@@ -8270,6 +8282,7 @@ def b12x_moe_fp4(
             n,
             k,
             activation_spec=activation_spec,
+            quant_mode=quant_mode,
             w13_layout=w13_layout,
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
