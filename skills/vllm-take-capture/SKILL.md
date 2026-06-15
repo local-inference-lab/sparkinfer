@@ -7,13 +7,17 @@ description: Capture a short live vLLM profile from an already-running workload.
 
 ## Default Workflow
 
-Run the helper immediately:
+Run the exact helper command immediately:
 
 ```bash
-python skills/vllm-take-capture/scripts/take_vllm_capture.py
+python skills/vllm-take-capture/scripts/take_vllm_capture.py --profile-dir /tmp/vllm-ds4-decode
 ```
 
-Do not query `/health`, `/v1/models`, metrics, or other discovery endpoints first. Assume the workload is already running and the server is `http://127.0.0.1:8000`.
+Do not do preflight work first. That means no `test -f`, `find`, `rg`, `ls`,
+server probing, cleanup, endpoint discovery, `/health`, `/v1/models`, metrics,
+or other validation before the capture command. Assume the helper path exists,
+the profile directory is `/tmp/vllm-ds4-decode`, the workload is already
+running, and the server is `http://127.0.0.1:8000`.
 
 The helper:
 
@@ -25,13 +29,17 @@ The helper:
 
 ## If Defaults Fail
 
-Only add options when the direct helper reports a concrete file-location problem:
+Only debug after the direct helper command fails. If it reports a concrete
+file-location problem, then adjust the profile directory:
 
 ```bash
 python skills/vllm-take-capture/scripts/take_vllm_capture.py --profile-dir /absolute/profile/dir
 ```
 
-Use `--wait-timeout` if the four-step capture needs more time to flush. Do not manually call `/stop_profile` unless the user explicitly asks for that override; the intended path is the profiler's configured `max_iterations=4` auto-stop.
+Use `--wait-timeout` only if the four-step capture needs more time to flush.
+Do not manually call `/stop_profile` unless the user explicitly asks for that
+override; the intended path is the profiler's configured `max_iterations=4`
+auto-stop.
 
 ## Notes
 
