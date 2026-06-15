@@ -54,6 +54,8 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.utils import (
+    cuda_stream_from_int_or_current,
+    cuda_stream_to_int,
     current_cuda_stream,
     cutlass_to_torch_dtype,
     get_cutlass_dtype,
@@ -2647,6 +2649,7 @@ def _get_compiled_dense_gemm(
         sfb_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
+        stream_int: Optional[int] = None,
     ) -> torch.Tensor:
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
@@ -2671,7 +2674,7 @@ def _get_compiled_dense_gemm(
                 ]
             ),
             m,
-            current_cuda_stream(),
+            cuda_stream_from_int_or_current(stream_int),
         )
         return c_tensor_gpu
 
@@ -2708,6 +2711,7 @@ def _dense_gemm_launch_flat(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    stream_int: Optional[int],
 ) -> None:
     policy = _DenseGemmPolicy(
         single_work_tile_per_cta=single_work_tile_per_cta,
@@ -2746,6 +2750,7 @@ def _dense_gemm_launch_flat(
         sfb_tensor_gpu=sfb_tensor_gpu,
         c_tensor_gpu=c_tensor_gpu,
         alpha_tensor_gpu=alpha_tensor_gpu,
+        stream_int=stream_int,
     )
 
 
@@ -2783,6 +2788,7 @@ def _dense_gemm_launch_op(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    stream_int: Optional[int],
 ) -> None:
     _dense_gemm_launch_flat(
         a_tensor_gpu,
@@ -2814,6 +2820,7 @@ def _dense_gemm_launch_op(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        stream_int,
     )
 
 
@@ -2848,6 +2855,7 @@ def _dense_gemm_launch_fake(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    stream_int: Optional[int],
 ) -> None:
     return None
 
@@ -2930,6 +2938,7 @@ def _dense_gemm_launch_functional_op(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    stream_int: Optional[int],
 ) -> torch.Tensor:
     m = int(a_tensor_gpu.shape[0])
     out = _empty_dense_gemm_output(
@@ -2983,6 +2992,7 @@ def _dense_gemm_launch_functional_op(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        stream_int,
     )
     if split_k_output and not split_k_atomic_bf16:
         _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
@@ -3020,6 +3030,7 @@ def _dense_gemm_launch_functional_fake(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    stream_int: Optional[int],
 ) -> torch.Tensor:
     del (
         b_tensor_gpu,
@@ -3047,6 +3058,7 @@ def _dense_gemm_launch_functional_fake(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        stream_int,
     )
     return _empty_dense_gemm_output(
         int(a_tensor_gpu.shape[0]),
@@ -3211,6 +3223,7 @@ def dense_gemm(
     expected_m: Optional[int] = None,
     load_path: Optional[Literal["tma", "cpasync"]] = None,
     swap_ab: Optional[bool] = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -3293,6 +3306,7 @@ def dense_gemm(
         kernel_c_l = l
     if alpha is None:
         alpha = _cached_alpha_one(a_torch.device)
+    stream_int = cuda_stream_to_int(stream)
     kernel_c_dtype_name = (
         "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
     )
@@ -3332,6 +3346,7 @@ def dense_gemm(
             policy.split_k_atomic_bf16,
             load_path,
             swap_ab,
+            stream_int,
         )
     split_storage = None
     split_scratch = None
@@ -3400,6 +3415,7 @@ def dense_gemm(
         policy.split_k_atomic_bf16,
         load_path,
         swap_ab,
+        stream_int,
     )
     result = out
     if split_k_output and not split_k_atomic_bf16:

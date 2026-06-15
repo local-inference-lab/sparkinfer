@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from b12x.cute.utils import cuda_stream_to_int
 from b12x.gemm.dense import dense_gemm
 from b12x.gemm.wo_projection import (
     MXFP8Rows,
@@ -62,8 +63,8 @@ class BlockFP8LinearBinding:
     # kernel matches the regime this binding serves.
     expected_m: int | None = None
 
-    def run(self) -> torch.Tensor:
-        return block_fp8_linear_mxfp8(binding=self)
+    def run(self, *, stream: object = None) -> torch.Tensor:
+        return block_fp8_linear_mxfp8(binding=self, stream=stream)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -609,6 +610,7 @@ def _block_fp8_linear_mxfp8_fused_op(
     in_features: int,
     out_features: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
     # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
     # one op, so the token-shaped activation MXFP8 views (x_q.values/scale_mma)
@@ -626,6 +628,7 @@ def _block_fp8_linear_mxfp8_fused_op(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
+        stream=stream_int,
     )[:, :, 0]
 
 
@@ -638,7 +641,9 @@ def _block_fp8_linear_mxfp8_fused_fake(
     in_features: int,
     out_features: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
+    del stream_int
     return torch.empty(
         (source_2d.shape[0], out_features),
         dtype=source_2d.dtype,
@@ -653,6 +658,7 @@ def block_fp8_linear_mxfp8(
     bias: torch.Tensor | None = None,
     binding: BlockFP8LinearBinding | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run a serialized block-FP8 linear through the native b12x MXFP8 GEMM.
 
@@ -698,6 +704,7 @@ def block_fp8_linear_mxfp8(
         )
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
+    stream_int = cuda_stream_to_int(stream)
 
     if binding is None:
         # No caller-owned buffers (e.g. the torch.compile path): one fully opaque
@@ -712,6 +719,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
+            stream_int,
         )
         if bias is not None:
             output = output + bias
@@ -748,6 +756,7 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
         expected_m=expected_m,
+        stream=stream,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
     if bias is not None:
@@ -776,6 +785,7 @@ def prewarm_block_fp8_linear_mxfp8(
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> None:
     """Compile and warm the native block-FP8 linear kernels for planned M values.
 
@@ -824,7 +834,7 @@ def prewarm_block_fp8_linear_mxfp8(
                 output=output,
                 expected_m=expected_m,
             )
-            block_fp8_linear_mxfp8(binding=binding)
+            block_fp8_linear_mxfp8(binding=binding, stream=stream)
         torch.cuda.synchronize(device)
 
 

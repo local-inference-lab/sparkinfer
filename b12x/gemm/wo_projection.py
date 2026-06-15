@@ -14,6 +14,7 @@ from b12x.attention.workspace import (
     _materialize_arena_view,
     _wo_mxfp8_scale_physical_shape,
 )
+from b12x.cute.utils import cuda_stream_to_int
 from b12x.gemm.dense import dense_gemm
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
@@ -75,8 +76,8 @@ class WOProjectionBinding:
     # the n>1536 path). None keeps the M-independent default tile.
     expected_m: int | None = None
 
-    def run(self) -> torch.Tensor:
-        return wo_projection_mxfp8(binding=self)
+    def run(self, *, stream: object = None) -> torch.Tensor:
+        return wo_projection_mxfp8(binding=self, stream=stream)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,8 +97,8 @@ class WOProjectionInvRopeBinding:
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
 
-    def run(self) -> torch.Tensor:
-        return wo_projection_inv_rope_mxfp8(binding=self)
+    def run(self, *, stream: object = None) -> torch.Tensor:
+        return wo_projection_inv_rope_mxfp8(binding=self, stream=stream)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2017,6 +2018,7 @@ def wo_a_dense_gemm_mxfp8(
     out: torch.Tensor | None = None,
     alpha: torch.Tensor | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run WO-A as grouped MXFP8 dense GEMM.
 
@@ -2054,6 +2056,7 @@ def wo_a_dense_gemm_mxfp8(
         alpha=alpha,
         mma_tiler_mn=mma_tiler_mn,
         expected_m=expected_m,
+        stream=stream,
     )
 
 
@@ -2064,6 +2067,7 @@ def wo_b_dense_gemm_mxfp8(
     out: torch.Tensor | None = None,
     alpha: torch.Tensor | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run group-major WO-B as MXFP8 dense GEMM.
 
@@ -2106,6 +2110,7 @@ def wo_b_dense_gemm_mxfp8(
         out=out,
         alpha=alpha,
         expected_m=expected_m,
+        stream=stream,
     )
 
 
@@ -2116,6 +2121,7 @@ def wo_projection_mxfp8(
     return_3d: bool = False,
     binding: WOProjectionBinding | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run the native MXFP8 WO-A/WO-B projection.
 
@@ -2175,6 +2181,7 @@ def wo_projection_mxfp8(
         out=tmp,
         alpha=alpha_one,
         expected_m=expected_m,
+        stream=stream,
     )
     quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
     wo_b_dense_gemm_mxfp8(
@@ -2183,6 +2190,7 @@ def wo_projection_mxfp8(
         out=output,
         alpha=alpha_one,
         expected_m=expected_m,
+        stream=stream,
     )
     if return_3d:
         return output
@@ -2211,6 +2219,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     nope_dim: int,
     rope_dim: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
     # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
     # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
@@ -2236,10 +2245,20 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         nope_dim=nope_dim,
         rope_dim=rope_dim,
     )
-    tmp = wo_a_dense_gemm_mxfp8(x_q, weights.wo_a, alpha=alpha_one, expected_m=expected_m)
+    tmp = wo_a_dense_gemm_mxfp8(
+        x_q,
+        weights.wo_a,
+        alpha=alpha_one,
+        expected_m=expected_m,
+        stream=stream_int,
+    )
     tmp_q = quantize_wo_b_input_mxfp8(tmp)
     return wo_b_dense_gemm_mxfp8(
-        tmp_q, weights.wo_b, alpha=alpha_one, expected_m=expected_m
+        tmp_q,
+        weights.wo_b,
+        alpha=alpha_one,
+        expected_m=expected_m,
+        stream=stream_int,
     )
 
 
@@ -2262,7 +2281,9 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     nope_dim: int,
     rope_dim: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
+    del stream_int
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
 
 
@@ -2278,6 +2299,7 @@ def wo_projection_inv_rope_mxfp8(
     return_3d: bool = False,
     binding: WOProjectionInvRopeBinding | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run WO projection from attention output without BF16 inverse-RoPE storage."""
 
@@ -2374,6 +2396,7 @@ def wo_projection_inv_rope_mxfp8(
         nope_dim,
         rope_dim,
         expected_m,
+        cuda_stream_to_int(stream),
     )
     if return_3d:
         return output

@@ -176,35 +176,74 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     )
     calls = {}
 
-    def fake_quantize_a(o_arg, positions_arg, cos_sin_cache_arg, **kwargs):
+    def fake_fused(
+        o_arg,
+        positions_arg,
+        cos_sin_cache_arg,
+        wo_a_values,
+        wo_a_scale_rows,
+        wo_a_scale_mma,
+        wo_b_values,
+        wo_b_scale_rows,
+        wo_b_scale_mma,
+        groups,
+        group_width,
+        rank,
+        hidden,
+        heads_per_group,
+        nope_dim,
+        rope_dim,
+        expected_m,
+        stream_int,
+    ):
         calls["o"] = o_arg
         calls["positions"] = positions_arg
         calls["cos_sin_cache"] = cos_sin_cache_arg
-        calls["x_q_out"] = kwargs["out"]
-        return kwargs["out"]
+        calls["wo_a_values"] = wo_a_values
+        calls["wo_a_scale_rows"] = wo_a_scale_rows
+        calls["wo_a_scale_mma"] = wo_a_scale_mma
+        calls["wo_b_values"] = wo_b_values
+        calls["wo_b_scale_rows"] = wo_b_scale_rows
+        calls["wo_b_scale_mma"] = wo_b_scale_mma
+        calls["groups"] = groups
+        calls["group_width"] = group_width
+        calls["rank"] = rank
+        calls["hidden"] = hidden
+        calls["heads_per_group"] = heads_per_group
+        calls["nope_dim"] = nope_dim
+        calls["rope_dim"] = rope_dim
+        calls["expected_m"] = expected_m
+        calls["stream_int"] = stream_int
+        return torch.empty((o_arg.shape[0], hidden, 1), dtype=o_arg.dtype)
 
-    monkeypatch.setattr(wo_impl, "quantize_wo_a_input_inv_rope_mxfp8", fake_quantize_a)
     monkeypatch.setattr(
-        wo_impl,
-        "wo_a_dense_gemm_mxfp8",
-        lambda x_q, wo_a, *, out, expected_m=None, **kwargs: out,
+        wo_impl.torch.ops.b12x,
+        "wo_projection_inv_rope_mxfp8_fused",
+        fake_fused,
     )
-    monkeypatch.setattr(wo_impl, "quantize_wo_b_input_mxfp8", lambda tmp, *, out: out)
 
-    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None, **kwargs):
-        out.zero_()
-        return out
-
-    monkeypatch.setattr(wo_impl, "wo_b_dense_gemm_mxfp8", fake_wo_b)
-
-    out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding)
+    out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)
 
     assert isinstance(binding, WOProjectionInvRopeBinding)
     assert not hasattr(binding, "workspace")
     assert calls["o"] is o
     assert calls["positions"] is positions
     assert calls["cos_sin_cache"] is cos_sin_cache
-    assert calls["x_q_out"] is binding.x_q
+    assert calls["wo_a_values"] is weights.wo_a.values
+    assert calls["wo_a_scale_rows"] is weights.wo_a.scale_rows
+    assert calls["wo_a_scale_mma"] is weights.wo_a.scale_mma
+    assert calls["wo_b_values"] is weights.wo_b.values
+    assert calls["wo_b_scale_rows"] is weights.wo_b.scale_rows
+    assert calls["wo_b_scale_mma"] is weights.wo_b.scale_mma
+    assert calls["groups"] == 2
+    assert calls["group_width"] == 128
+    assert calls["rank"] == 64
+    assert calls["hidden"] == 256
+    assert calls["heads_per_group"] == 1
+    assert calls["nope_dim"] == 96
+    assert calls["rope_dim"] == 32
+    assert calls["expected_m"] == 3
+    assert calls["stream_int"] == 123
     assert out.shape == (3, 256, 1)
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 import torch
 
+from b12x.cute.utils import cuda_stream_to_int
 from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
 from b12x.gemm.dense import dense_gemm
 from b12x.gemm.wo_projection import (
@@ -176,6 +177,7 @@ def _mxfp8_linear_fused_op(
     padded_in_features: int,
     out_features: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
     del weight_scale_rows
     tokens = int(source_2d.shape[0])
@@ -192,6 +194,7 @@ def _mxfp8_linear_fused_op(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
+        stream=stream_int,
         **_dense_gemm_kwargs_for_n(out_features),
     )[:, :, 0]
 
@@ -206,7 +209,9 @@ def _mxfp8_linear_fused_fake(
     padded_in_features: int,
     out_features: int,
     expected_m: int,
+    stream_int: int | None,
 ) -> torch.Tensor:
+    del stream_int
     del weight_values, weight_scale_rows, weight_scale_mma
     del in_features, padded_in_features, expected_m
     return torch.empty(
@@ -222,6 +227,7 @@ def mxfp8_linear(
     *,
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Run a ModelOpt MXFP8 linear through the native b12x dense GEMM path."""
 
@@ -251,6 +257,7 @@ def mxfp8_linear(
             packed_weight.padded_in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
+            cuda_stream_to_int(stream),
         )
     if bias is not None:
         output = output + bias

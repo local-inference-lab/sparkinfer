@@ -100,6 +100,23 @@ def current_cuda_stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
+def cuda_stream_to_int(stream: object | None) -> int | None:
+    """Return a raw CUDA stream handle, preserving None as a caller fallback."""
+    if stream is None:
+        return None
+    cuda_stream = getattr(stream, "cuda_stream", None)
+    if cuda_stream is not None:
+        return int(cuda_stream)
+    return int(stream)
+
+
+def cuda_stream_from_int_or_current(stream_int: int | None) -> cuda.CUstream:
+    """Use a supplied raw CUDA stream handle, or fall back to Torch's current stream."""
+    if stream_int is None:
+        return current_cuda_stream()
+    return cuda.CUstream(int(stream_int))
+
+
 # Cache for HardwareInfo - it's expensive to create on every call
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
 
