@@ -27,6 +27,9 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
         single_token: bool = False,
         dynamic_down_scale: bool = False,
         a8_mx_mode: bool = False,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
     ):
         super().__init__(
             sf_vec_size,
@@ -39,6 +42,9 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
             single_token=single_token,
             dynamic_down_scale=dynamic_down_scale,
             a8_mx_mode=a8_mx_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
     @classmethod
@@ -65,6 +71,9 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         deterministic_output: bool = False,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
     ):
         super().__init__(
             sf_vec_size,
@@ -76,6 +85,9 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             deterministic_output=deterministic_output,
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
 
@@ -108,8 +120,12 @@ class MoEMicroKernelSwiGLUOAI(MoEMicroKernelBackend):
             single_token=single_token,
             dynamic_down_scale=dynamic_down_scale,
             a8_mx_mode=a8_mx_mode,
-            swiglu_limit=normalize_swiglu_limit_for_activation(activation, swiglu_limit),
-            swiglu_alpha=normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+            swiglu_limit=normalize_swiglu_limit_for_activation(
+                activation, swiglu_limit
+            ),
+            swiglu_alpha=normalize_swiglu_alpha_for_activation(
+                activation, swiglu_alpha
+            ),
             swiglu_beta=normalize_swiglu_beta_for_activation(activation, swiglu_beta),
         )
 
@@ -152,8 +168,12 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
             deterministic_output=deterministic_output,
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
-            swiglu_limit=normalize_swiglu_limit_for_activation(activation, swiglu_limit),
-            swiglu_alpha=normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+            swiglu_limit=normalize_swiglu_limit_for_activation(
+                activation, swiglu_limit
+            ),
+            swiglu_alpha=normalize_swiglu_alpha_for_activation(
+                activation, swiglu_alpha
+            ),
             swiglu_beta=normalize_swiglu_beta_for_activation(activation, swiglu_beta),
         )
 

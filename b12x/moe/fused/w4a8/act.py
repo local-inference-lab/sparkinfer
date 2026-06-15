@@ -19,6 +19,8 @@ worst-case route capacity.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -41,6 +43,8 @@ def _silu_mul_mxfp8_quant_kernel(
     values_stride_t,
     scales_stride_t,
     HAS_VALID_ROWS: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
     BLOCK: tl.constexpr,
     BPP: tl.constexpr,
 ):
@@ -56,6 +60,9 @@ def _silu_mul_mxfp8_quant_kernel(
 
     up = tl.load(fc1 + token * fc1_stride_t + offs).to(tl.float32)
     gate = tl.load(fc1 + token * fc1_stride_t + n_cols + offs).to(tl.float32)
+    if HAS_SWIGLU_LIMIT:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.minimum(tl.maximum(up, -SWIGLU_LIMIT), SWIGLU_LIMIT)
     y = (gate / (1.0 + tl.exp(-gate))) * up  # silu(gate) * up, fp32
     payload, byte = mxfp8_quant_block(tl.reshape(y, (BPP, BLOCK)))
     tl.store(
@@ -73,6 +80,7 @@ def silu_mul_mxfp8_quantize_rows(
     out_values: torch.Tensor | None = None,
     out_scales: torch.Tensor | None = None,
     valid_rows: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``fc1_out [rows, 2n]`` -> ``(q [rows, n] e4m3, sf [rows, n/32] u8)``.
 
@@ -103,6 +111,14 @@ def silu_mul_mxfp8_quantize_rows(
         raise ValueError("output rows must be contiguous")
     if valid_rows is not None and valid_rows.dtype != torch.int32:
         raise TypeError("valid_rows must be an int32 device scalar")
+    has_swiglu_limit = swiglu_limit is not None
+    swiglu_limit_value = 0.0
+    if has_swiglu_limit:
+        swiglu_limit_value = float(swiglu_limit)
+        if not math.isfinite(swiglu_limit_value) or swiglu_limit_value <= 0.0:
+            raise ValueError(
+                f"swiglu_limit must be positive and finite, got {swiglu_limit_value}"
+            )
     bpp = pick_blocks_per_program(blocks_per_row)
     supers_per_row = blocks_per_row // bpp
     num_programs = rows * supers_per_row
@@ -119,6 +135,8 @@ def silu_mul_mxfp8_quantize_rows(
             out_values.stride(0),
             out_scales.stride(0),
             HAS_VALID_ROWS=valid_rows is not None,
+            HAS_SWIGLU_LIMIT=has_swiglu_limit,
+            SWIGLU_LIMIT=swiglu_limit_value,
             BLOCK=_MX_BLOCK,
             BPP=bpp,
             num_warps=1,

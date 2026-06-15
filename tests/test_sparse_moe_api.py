@@ -418,7 +418,7 @@ def test_sparse_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
         raise AssertionError("expected deprecated reciprocal flag validation to fire")
 
 
-def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
+def test_sparse_moe_fp4_env_force_overrides_to_w4a16(monkeypatch) -> None:
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4)
@@ -452,7 +452,7 @@ def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
             )
         )
 
-    assert captured == [None, "nvfp4"]
+    assert captured == ["w4a16", "w4a16"]
 
 
 def test_sparse_moe_fp4_scales_output_in_place() -> None:

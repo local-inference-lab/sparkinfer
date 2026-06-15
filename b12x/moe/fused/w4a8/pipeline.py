@@ -231,6 +231,7 @@ def w4a8_tier_forward(
     workspace: dict,
     *,
     out: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
     stage_events: list | None = None,
 ) -> torch.Tensor:
     """One MoE layer forward; see the module docstring for the contract.
@@ -311,6 +312,7 @@ def w4a8_tier_forward(
         out_values=ws["act_q"],
         out_scales=ws["act_sf"],
         valid_rows=ws["count"],
+        swiglu_limit=swiglu_limit,
     )
     _mark("act_quant")
 
