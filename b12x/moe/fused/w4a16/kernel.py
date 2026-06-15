@@ -83,7 +83,7 @@ from b12x.moe.fused.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from b12x.moe.fused.micro import MoEMicroKernelBackend, _direct_k_segments_for_k
+from b12x.moe.fused.micro import MoEMicroKernelBackend
 
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
@@ -487,7 +487,7 @@ class _W4A16SmallMDirectLaunch(NamedTuple):
 class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
     """Decode-sized W4A16 specialization using the native ModelOpt layout."""
 
-    _SUPPORTED_M = (1, 2, 4, 8)
+    _SUPPORTED_M = tuple(range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1))
 
     @classmethod
     def is_supported(
@@ -500,17 +500,11 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         num_experts: int,
         scale_format: str = "e4m3_k16",
     ) -> bool:
-        # E8M0 reads the shared packed scale grid. Both block axes must be /32,
-        # and the FC1 aligned fast paths k_segments in {2,6,12} are not yet
-        # converted to packed addressing (k_segments==8 and the general path are),
-        # so fall back to the main W4A16 GEMM for those shapes.
+        # E8M0 reads the shared packed scale grid. Both block axes must be /32.
         if scale_format == "e8m0_k32":
-            k_segments = _direct_k_segments_for_k(int(hidden_size))
-            k_segments_aligned = (int(hidden_size) // 16) == k_segments * 32
             scale_block_ok = (
                 int(hidden_size) % 32 == 0
                 and int(intermediate_size) % 32 == 0
-                and not (k_segments_aligned and k_segments in (2, 6, 12))
             )
         else:
             scale_block_ok = True
@@ -4258,6 +4252,8 @@ def _small_m_direct_supported(
         return False
     return (
         element_dtype == "bf16"
+        # Packed serving weights use the W4A16 TC-decode path for small M.
+        # The direct micro kernel is kept limited to native ModelOpt weights.
         and weight_layout == "modelopt"
         and w13_layout in ("w13", "w31")
         and not bool(apply_router_weight_on_input)

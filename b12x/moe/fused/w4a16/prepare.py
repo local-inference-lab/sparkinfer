@@ -861,9 +861,9 @@ def prepare_w4a16_e8m0_native_weights(
     Keeps the FP4 weights resident as a single copy (``weight_layout="modelopt"``)
     and carries two small scale forms so one object serves both kernels:
     ``w13_scale``/``w2_scale`` are the packed E8M0 grid the main W4A16 GEMM reads
-    at med/large M, and ``micro_*`` are the K/16 swizzled grid the small-M micro
-    decode kernel reads. ``run_w4a16_moe`` routes small M to micro and the rest to
-    the main W4A16 kernel automatically.
+    at med/large M, and ``micro_*`` are packed E8M0 grids in the native row order
+    that the small-M micro decode kernel reads. ``run_w4a16_moe`` routes small M
+    to micro and the rest to the main W4A16 kernel automatically.
     """
     w13_layout = _normalize_w13_layout(w13_layout)
     shape = validate_w4a16_packed_inputs(
@@ -908,6 +908,16 @@ def prepare_w4a16_e8m0_native_weights(
         row_rotation=w13_row_rotation,
         padded_size_n=padded_w13_scale_n,
     )
+    micro_w13_scale = (
+        packed_w13_scale
+        if w13_row_rotation is None
+        else _pack_e8m0_k32_scales(
+            w13_scale,
+            size_k=hidden_size,
+            size_n=w13_rows,
+            padded_size_n=padded_w13_scale_n,
+        )
+    )
     packed_w2_scale = _pack_e8m0_k32_scales(
         w2_scale,
         size_k=intermediate_size,
@@ -933,7 +943,7 @@ def prepare_w4a16_e8m0_native_weights(
         params_dtype=params_dtype,
         source_format="fp4_e8m0_k32",
         scale_format="e8m0_k32",
-        micro_w13_scale=packed_w13_scale,
+        micro_w13_scale=micro_w13_scale,
         micro_w13_global_scale=w13_global,
         micro_w2_scale=packed_w2_scale,
         micro_w2_global_scale=w2_global,

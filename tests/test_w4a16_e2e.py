@@ -234,6 +234,30 @@ def _assert_matches_oracle(
     assert metrics.cos >= min_cos, metrics
 
 
+@pytest.mark.parametrize("scale_format", ["e4m3_k16", "e8m0_k32"])
+@pytest.mark.parametrize("m", [1, 3, 8])
+def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
+    m: int,
+    scale_format: str,
+) -> None:
+    assert not _small_m_direct_supported(
+        m=m,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=8,
+        topk=2,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout="packed",
+        w13_layout="packed",
+        scale_format=scale_format,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
