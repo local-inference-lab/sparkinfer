@@ -513,7 +513,7 @@ def _canonicalize_post_mix_input(
     return post
 
 
-def b12x_mhc_pre(
+def _b12x_mhc_pre_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -716,7 +716,7 @@ def b12x_mhc_pre(
     )
 
 
-def b12x_mhc_post_pre(
+def _b12x_mhc_post_pre_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
     prev_post: torch.Tensor,
@@ -1059,7 +1059,7 @@ def b12x_mhc_post_pre(
     )
 
 
-def b12x_mhc_post(
+def _b12x_mhc_post_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
     prev_post: torch.Tensor,
@@ -1148,6 +1148,387 @@ def b12x_mhc_post(
         "b12x_mhc_post is served only by the post-only mHC kernel, which "
         f"supports hidden_size in {MHC_SUPPORTED_HIDDEN_SIZES}; "
         f"got hidden_size={hidden_size}"
+    )
+
+
+@torch.library.custom_op(
+    "b12x::mhc_pre_planned_functional",
+    mutates_args=(),
+)
+def _mhc_pre_planned_functional_op(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+    split_k: int,
+    block_k: int,
+    block_h: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _b12x_mhc_pre_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=float(rms_eps),
+        hc_eps=float(hc_eps),
+        sinkhorn_iters=int(sinkhorn_iters),
+        norm_weight=norm_weight if fuse_norm else None,
+        norm_eps=float(norm_eps),
+        split_k=int(split_k),
+        block_k=int(block_k),
+        block_h=int(block_h),
+    )
+
+
+@_mhc_pre_planned_functional_op.register_fake
+def _mhc_pre_planned_functional_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    fuse_norm: bool,
+    split_k: int,
+    block_k: int,
+    block_h: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del fn, hc_scale, hc_base, norm_weight
+    del rms_eps, hc_eps, sinkhorn_iters, norm_eps, fuse_norm
+    del split_k, block_k, block_h
+    tokens = residual.shape[0]
+    hidden_size = residual.shape[2]
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, MHC_MULT, MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    return y, post, comb
+
+
+@torch.library.custom_op(
+    "b12x::mhc_post_pre_planned_functional",
+    mutates_args=(),
+)
+def _mhc_post_pre_planned_functional_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    has_fn_bf16: bool,
+    expected_m: int,
+    has_expected_m: bool,
+    fuse_norm: bool,
+    split_k: int,
+    block_k: int,
+    block_h: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _b12x_mhc_post_pre_impl(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=float(rms_eps),
+        hc_eps=float(hc_eps),
+        sinkhorn_iters=int(sinkhorn_iters),
+        fn_bf16=fn_bf16 if has_fn_bf16 else None,
+        expected_m=int(expected_m) if has_expected_m else None,
+        norm_weight=norm_weight if fuse_norm else None,
+        norm_eps=float(norm_eps),
+        split_k=int(split_k),
+        block_k=int(block_k),
+        block_h=int(block_h),
+    )
+
+
+@_mhc_post_pre_planned_functional_op.register_fake
+def _mhc_post_pre_planned_functional_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    has_fn_bf16: bool,
+    expected_m: int,
+    has_expected_m: bool,
+    fuse_norm: bool,
+    split_k: int,
+    block_k: int,
+    block_h: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del x, prev_post, prev_comb, fn, hc_scale, hc_base, fn_bf16, norm_weight
+    del rms_eps, hc_eps, sinkhorn_iters, norm_eps, has_fn_bf16
+    del expected_m, has_expected_m, fuse_norm, split_k, block_k, block_h
+    tokens = residual.shape[0]
+    hidden_size = residual.shape[2]
+    residual_out = torch.empty_like(residual)
+    y = torch.empty(
+        (tokens, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    post = torch.empty(
+        (tokens, MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb = torch.empty(
+        (tokens, MHC_MULT, MHC_MULT),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    return residual_out, post, comb, y
+
+
+@torch.library.custom_op(
+    "b12x::mhc_post_planned_functional",
+    mutates_args=(),
+)
+def _mhc_post_planned_functional_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+) -> torch.Tensor:
+    return _b12x_mhc_post_impl(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+    )
+
+
+@_mhc_post_planned_functional_op.register_fake
+def _mhc_post_planned_functional_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+) -> torch.Tensor:
+    del x, prev_post, prev_comb
+    return torch.empty_like(residual)
+
+
+def b12x_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    y_out: torch.Tensor | None = None,
+    post_out: torch.Tensor | None = None,
+    comb_out: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+    binding: B12XMHCBinding | None = None,
+    split_k: int = MHC_DEFAULT_SPLIT_K,
+    block_k: int = MHC_DEFAULT_BLOCK_K,
+    block_h: int = MHC_DEFAULT_BLOCK_H,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    compiling = torch.compiler.is_compiling()
+    no_caller_owned_buffers = (
+        binding is None and y_out is None and post_out is None and comb_out is None
+    )
+    if compiling and no_caller_owned_buffers:
+        norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
+        return torch.ops.b12x.mhc_pre_planned_functional(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight_for_kernel,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            norm_weight is not None,
+            int(split_k),
+            int(block_k),
+            int(block_h),
+        )
+    if compiling:
+        raise RuntimeError(
+            "b12x_mhc_pre must be opaque to torch.compile; caller-owned mHC "
+            "buffers are not supported inside Dynamo."
+        )
+    return _b12x_mhc_pre_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        y_out=y_out,
+        post_out=post_out,
+        comb_out=comb_out,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        binding=binding,
+        split_k=split_k,
+        block_k=block_k,
+        block_h=block_h,
+    )
+
+
+def b12x_mhc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    residual_out: torch.Tensor | None = None,
+    y_out: torch.Tensor | None = None,
+    post_out: torch.Tensor | None = None,
+    comb_out: torch.Tensor | None = None,
+    fn_bf16: torch.Tensor | None = None,
+    expected_m: int | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+    binding: B12XMHCBinding | None = None,
+    split_k: int = MHC_DEFAULT_SPLIT_K,
+    block_k: int = MHC_DEFAULT_BLOCK_K,
+    block_h: int = MHC_DEFAULT_BLOCK_H,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    compiling = torch.compiler.is_compiling()
+    no_caller_owned_buffers = (
+        binding is None
+        and residual_out is None
+        and y_out is None
+        and post_out is None
+        and comb_out is None
+    )
+    if compiling and no_caller_owned_buffers:
+        fn_bf16_for_kernel = fn_bf16 if fn_bf16 is not None else fn
+        norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
+        return torch.ops.b12x.mhc_post_pre_planned_functional(
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            fn,
+            hc_scale,
+            hc_base,
+            fn_bf16_for_kernel,
+            norm_weight_for_kernel,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            fn_bf16 is not None,
+            0 if expected_m is None else int(expected_m),
+            expected_m is not None,
+            norm_weight is not None,
+            int(split_k),
+            int(block_k),
+            int(block_h),
+        )
+    if compiling:
+        raise RuntimeError(
+            "b12x_mhc_post_pre must be opaque to torch.compile; caller-owned "
+            "mHC buffers are not supported inside Dynamo."
+        )
+    return _b12x_mhc_post_pre_impl(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        residual_out=residual_out,
+        y_out=y_out,
+        post_out=post_out,
+        comb_out=comb_out,
+        fn_bf16=fn_bf16,
+        expected_m=expected_m,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        binding=binding,
+        split_k=split_k,
+        block_k=block_k,
+        block_h=block_h,
+    )
+
+
+def b12x_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    compiling = torch.compiler.is_compiling()
+    if compiling and out is None:
+        return torch.ops.b12x.mhc_post_planned_functional(
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+        )
+    if compiling:
+        raise RuntimeError(
+            "b12x_mhc_post must be opaque to torch.compile; caller-owned mHC "
+            "outputs are not supported inside Dynamo."
+        )
+    return _b12x_mhc_post_impl(
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        out=out,
     )
 
 
