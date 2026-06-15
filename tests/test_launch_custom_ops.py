@@ -91,6 +91,7 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             4,
             1e-6,
             True,
+            False,
         )
 
 

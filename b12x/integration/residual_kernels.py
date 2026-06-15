@@ -8,10 +8,14 @@ import os
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
+import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
 from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
+from cutlass.utils import LayoutEnum
 
 from b12x.cute.compiler import (
     DimKey,
@@ -54,6 +58,14 @@ _PREFILL_MMA_THREADS = 32
 _PREFILL_MMA_TILE_M = 16
 _PREFILL_MMA_TILE_N = 8
 _PREFILL_MMA_TILE_K = 16
+_PREFILL_TMA_COMPUTE_WARPS = int(os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "8"))
+_PREFILL_TMA_THREADS = (_PREFILL_TMA_COMPUTE_WARPS + 1) * 32
+_PREFILL_TMA_TILE_M = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128"))
+_PREFILL_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16"))
+_PREFILL_TMA_TILE_K = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64"))
+_PREFILL_TMA_STAGES = int(os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "3"))
+_PREFILL_TMA_MMA_REGS = int(os.getenv("B12X_MHC_PREFILL_TMA_MMA_REGS", "192"))
+_PREFILL_TMA_LOAD_REGS = int(os.getenv("B12X_MHC_PREFILL_TMA_LOAD_REGS", "40"))
 _POST_PRE_CHUNK = 12
 
 # --- Gram-trick split finalize (multi-CTA fuse_norm, no per-h norm reduction) -
@@ -109,6 +121,45 @@ def _hidden_specialization_name(hidden_size: int) -> str:
     return f"hidden{hidden_size}"
 
 
+def _convert_layout_acc_mn(
+    acc_layout: cute.Layout,
+    transpose: bool = False,
+) -> cute.Layout:
+    acc_layout_col_major = cute.make_layout(acc_layout.shape)
+    shape = (
+        (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
+        (
+            acc_layout_col_major.shape[0][0],
+            *acc_layout_col_major.shape[0][2:],
+            acc_layout_col_major.shape[2],
+        ),
+        *acc_layout_col_major.shape[3:],
+    )
+    stride = (
+        (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),
+        (
+            acc_layout_col_major.stride[0][0],
+            *acc_layout_col_major.stride[0][2:],
+            acc_layout_col_major.stride[2],
+        ),
+        *acc_layout_col_major.stride[3:],
+    )
+    if const_expr(transpose):
+        shape = (shape[1], shape[0], *shape[2:])
+        stride = (stride[1], stride[0], *stride[2:])
+    return cute.composition(acc_layout, cute.make_layout(shape, stride=stride))
+
+
+def _reshape_acc_to_mn(
+    acc: cute.Tensor,
+    transpose: bool = False,
+) -> cute.Tensor:
+    return cute.make_tensor(
+        acc.iterator,
+        _convert_layout_acc_mn(acc.layout, transpose=transpose),
+    )
+
+
 def _to_kernel_tensor(
     tensor: torch.Tensor,
     dtype: type[cutlass.Numeric],
@@ -126,6 +177,7 @@ def _to_kernel_tensor(
         )
         if leading_dim is not None:
             cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+            cute_tensor.element_type = dtype
     return cute_tensor
 
 
@@ -1227,6 +1279,351 @@ class MHCPostPrePrefillGramKernel:
                 partials[token, Int32(1), gp] = gtotal
 
 
+@cute.jit
+def _mhc_warp_mma_gemm(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCsA: cute.Tensor,
+    tCsB: cute.Tensor,
+    smem_thr_copy_A: cute.TiledCopy,
+    smem_thr_copy_B: cute.TiledCopy,
+):
+    tCrA_copy_view = smem_thr_copy_A.retile(tCrA)
+    tCrB_copy_view = smem_thr_copy_B.retile(tCrB)
+    cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
+    cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
+    for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
+        if k < cute.size(tCsA.shape[2]) - 1:
+            cute.copy(
+                smem_thr_copy_A,
+                tCsA[None, None, k + 1],
+                tCrA_copy_view[None, None, k + 1],
+            )
+            cute.copy(
+                smem_thr_copy_B,
+                tCsB[None, None, k + 1],
+                tCrB_copy_view[None, None, k + 1],
+            )
+        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+
+
+class MHCPrefillBf16ProjectTmaKernel:
+    """TMA-fed BF16 tensor-core projection for compact mHC prefill partials."""
+
+    num_threads = _PREFILL_TMA_THREADS
+    num_compute_warps = _PREFILL_TMA_COMPUTE_WARPS
+    producer_warp = _PREFILL_TMA_COMPUTE_WARPS
+    tile_m = _PREFILL_TMA_TILE_M
+    tile_n = _PREFILL_TMA_TILE_N
+    tile_k = _PREFILL_TMA_TILE_K
+    num_stages = _PREFILL_TMA_STAGES
+    mma_registers = _PREFILL_TMA_MMA_REGS
+    load_registers = _PREFILL_TMA_LOAD_REGS
+    buffer_align_bytes = 1024
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = _HIDDEN,
+        split_k: int | None = None,
+    ):
+        self.hidden_size = int(hidden_size)
+        self.total_k = _MHC_MULT * self.hidden_size
+        self.split_k = (
+            _split_k_for_hidden(self.hidden_size)
+            if split_k is None
+            else int(split_k)
+        )
+        _validate_split_k(self.hidden_size, self.split_k)
+        if self.total_k % self.tile_k != 0:
+            raise ValueError(
+                f"total_k={self.total_k} must be divisible by TMA tile_k={self.tile_k}"
+            )
+        m_per_mma_group = self.num_compute_warps * 16
+        if self.tile_m % m_per_mma_group != 0:
+            raise ValueError(
+                f"tile_m={self.tile_m} must be divisible by "
+                f"num_compute_warps*16={m_per_mma_group}"
+            )
+        self.k_tiles = self.total_k // self.tile_k
+        self.n_tiles = (_MIXES + self.tile_n - 1) // self.tile_n
+
+    def _get_tiled_mma(self) -> cute.TiledMma:
+        return cute.make_tiled_mma(
+            warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
+            (self.num_compute_warps, 1, 1),
+            permutation_mnk=(self.num_compute_warps * 16, self.tile_n, 16),
+        )
+
+    def _get_smem_layouts(self) -> tuple[cute.ComposedLayout, cute.ComposedLayout]:
+        a_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR,
+                cutlass.BFloat16,
+                self.tile_k,
+            ),
+            cutlass.BFloat16,
+        )
+        b_layout_atom = a_layout_atom
+        sA_layout = cute.tile_to_shape(
+            a_layout_atom,
+            (self.tile_m, self.tile_k, self.num_stages),
+            order=(0, 1, 2),
+        )
+        sB_layout = cute.tile_to_shape(
+            b_layout_atom,
+            (self.tile_n, self.tile_k, self.num_stages),
+            order=(0, 1, 2),
+        )
+        return sA_layout, sB_layout
+
+    def _get_shared_storage_cls(
+        self,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.ComposedLayout,
+    ):
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "mbar_ptr": cute.struct.MemRange[
+                cutlass.Int64,
+                self.num_stages * 2,
+            ],
+            "sA": cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(sA_layout)],
+                self.buffer_align_bytes,
+            ],
+            "sB": cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(sB_layout)],
+                self.buffer_align_bytes,
+            ],
+        }
+        return cute.struct(SharedStorage)
+
+    @cute.jit
+    def __call__(
+        self,
+        out_flat: cute.Tensor,
+        fn_bf16: cute.Tensor,
+        partials: cute.Tensor,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        if const_expr(out_flat.element_type != cutlass.BFloat16):
+            raise TypeError("out_flat must be BFloat16")
+        if const_expr(fn_bf16.element_type != cutlass.BFloat16):
+            raise TypeError("fn_bf16 must be BFloat16")
+        if const_expr(partials.element_type != cutlass.Float32):
+            raise TypeError("partials must be Float32")
+
+        sA_layout, sB_layout = self._get_smem_layouts()
+        tiled_mma = self._get_tiled_mma()
+        SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
+        sA_tma_layout = cute.slice_(sA_layout, (None, None, 0))
+        sB_tma_layout = cute.slice_(sB_layout, (None, None, 0))
+        tma_atom_A, tma_tensor_A = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            out_flat,
+            sA_tma_layout,
+            (self.tile_m, self.tile_k),
+            num_multicast=1,
+        )
+        tma_atom_B, tma_tensor_B = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            fn_bf16,
+            sB_tma_layout,
+            (self.tile_n, self.tile_k),
+            num_multicast=1,
+        )
+        grid_m = (num_tokens + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+        self.kernel(
+            tma_tensor_A,
+            tma_tensor_B,
+            partials,
+            tma_atom_A,
+            tma_atom_B,
+            sA_layout,
+            sB_layout,
+            tiled_mma,
+            SharedStorage,
+            num_tokens,
+        ).launch(
+            grid=(grid_m, self.n_tiles, 1),
+            block=[self.num_threads, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        out_flat: cute.Tensor,
+        fn_bf16: cute.Tensor,
+        partials: cute.Tensor,
+        tma_atom_A: cute.CopyAtom,
+        tma_atom_B: cute.CopyAtom,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.ComposedLayout,
+        tiled_mma: cute.TiledMma,
+        SharedStorage: cutlass.Constexpr,
+        num_tokens: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        m_tile, n_tile, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_A)
+            cpasync.prefetch_descriptor(tma_atom_B)
+
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
+        sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
+
+        tma_copy_bytes = (
+            cute.size_in_bytes(
+                cutlass.BFloat16,
+                cute.slice_(sA_layout, (None, None, 0)),
+            )
+            + cute.size_in_bytes(
+                cutlass.BFloat16,
+                cute.slice_(sB_layout, (None, None, 0)),
+            )
+        )
+        load_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.num_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_compute_warps,
+            ),
+            tx_count=tma_copy_bytes,
+            barrier_storage=storage.mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        )
+        cute.arch.sync_threads()
+
+        gA = cute.local_tile(
+            out_flat,
+            (self.tile_m, self.tile_k),
+            (None, None),
+        )
+        gB = cute.local_tile(
+            fn_bf16,
+            (self.tile_n, self.tile_k),
+            (None, None),
+        )
+        cta_layout = cute.make_layout(1)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_A,
+            0,
+            cta_layout,
+            cute.group_modes(sA, 0, 2),
+            cute.group_modes(gA, 0, 2),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_B,
+            0,
+            cta_layout,
+            cute.group_modes(sB, 0, 2),
+            cute.group_modes(gB, 0, 2),
+        )
+
+        if warp_idx < Int32(self.num_compute_warps):
+            cute.arch.setmaxregister_increase(self.mma_registers)
+            consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                self.num_stages,
+            )
+            thr_mma = tiled_mma.get_slice(tidx)
+            tCsA = thr_mma.partition_A(sA)
+            tCsB = thr_mma.partition_B(sB)
+            tCrA = thr_mma.make_fragment_A(tCsA[None, None, None, 0])
+            tCrB = thr_mma.make_fragment_B(tCsB[None, None, None, 0])
+            acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
+            acc = cute.make_fragment(acc_shape, Float32)
+            acc.fill(0.0)
+            smem_copy_atom_A = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                cutlass.BFloat16,
+            )
+            smem_copy_atom_B = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                cutlass.BFloat16,
+            )
+            smem_thr_copy_A = cute.make_tiled_copy_A(
+                smem_copy_atom_A,
+                tiled_mma,
+            ).get_slice(tidx)
+            smem_thr_copy_B = cute.make_tiled_copy_B(
+                smem_copy_atom_B,
+                tiled_mma,
+            ).get_slice(tidx)
+            tSsA = smem_thr_copy_A.partition_S(sA)
+            tSsB = smem_thr_copy_B.partition_S(sB)
+
+            for _k_tile in cutlass.range_constexpr(self.k_tiles):
+                load_pipeline.consumer_wait(consumer_state)
+                _mhc_warp_mma_gemm(
+                    thr_mma,
+                    acc,
+                    tCrA,
+                    tCrB,
+                    tSsA[None, None, None, consumer_state.index],
+                    tSsB[None, None, None, consumer_state.index],
+                    smem_thr_copy_A,
+                    smem_thr_copy_B,
+                )
+                load_pipeline.consumer_release(consumer_state)
+                consumer_state.advance()
+
+            acc_mn = _reshape_acc_to_mn(acc)
+            coord_mn = _reshape_acc_to_mn(
+                thr_mma.partition_C(
+                    cute.make_identity_tensor((self.tile_m, self.tile_n))
+                )
+            )
+            for acc_m in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
+                for acc_n in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
+                    coord = coord_mn[acc_m, acc_n]
+                    token = m_tile * Int32(self.tile_m) + coord[0]
+                    mix = n_tile * Int32(self.tile_n) + coord[1]
+                    if token < num_tokens and mix < Int32(_MIXES):
+                        partials[token, Int32(0), mix + Int32(1)] = acc_mn[
+                            acc_m,
+                            acc_n,
+                        ]
+
+        elif warp_idx == Int32(self.producer_warp):
+            cute.arch.setmaxregister_decrease(self.load_registers)
+            producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                self.num_stages,
+            )
+            for k_tile in cutlass.range_constexpr(self.k_tiles):
+                load_pipeline.producer_acquire(producer_state)
+                cute.copy(
+                    tma_atom_A,
+                    tAgA[(None, m_tile, k_tile)],
+                    tAsA[(None, producer_state.index)],
+                    tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                )
+                cute.copy(
+                    tma_atom_B,
+                    tBgB[(None, n_tile, k_tile)],
+                    tBsB[(None, producer_state.index)],
+                    tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                )
+                load_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+            load_pipeline.producer_tail(producer_state)
+
+
 class MHCPrefillBf16ProjectKernel:
     """BF16 tensor-core projection for compact mHC prefill partials."""
 
@@ -1915,6 +2312,17 @@ def _prefill_bf16_project_kernel(
     split_k: int,
 ) -> MHCPrefillBf16ProjectKernel:
     return MHCPrefillBf16ProjectKernel(
+        hidden_size=hidden_size,
+        split_k=split_k,
+    )
+
+
+@lru_cache(maxsize=16)
+def _prefill_bf16_project_tma_kernel(
+    hidden_size: int,
+    split_k: int,
+) -> MHCPrefillBf16ProjectTmaKernel:
+    return MHCPrefillBf16ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
     )
@@ -2733,6 +3141,68 @@ def _run_mhc_prefill_bf16_project_launch(
         raise ValueError("fn_bf16 must be CUDA")
     if not fn_bf16.is_contiguous():
         raise ValueError("fn_bf16 must be contiguous")
+    if os.getenv("B12X_MHC_PREFILL_BF16_TMA", "1") != "0":
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous for TMA BF16 prefill projection")
+        out_flat = out.view(tokens, _MHC_MULT * hidden_size)
+        args = (
+            _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
+            _to_kernel_tensor(fn_bf16, cutlass.BFloat16),
+            _to_kernel_tensor(
+                partials,
+                cutlass.Float32,
+                assumed_align=4,
+                dynamic_layout=True,
+            ),
+            Int32(tokens),
+            current_cuda_stream(),
+        )
+        cache_key = (
+            tensor_key(
+                "out_flat",
+                out_flat,
+                dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT * hidden_size)),
+            ),
+            tensor_key(
+                "fn_bf16",
+                fn_bf16,
+                dims=(DimKey.exact(_MIXES), DimKey.exact(_MHC_MULT * hidden_size)),
+            ),
+            tensor_key(
+                "partials",
+                partials,
+                dims=(
+                    DimKey.dynamic(),
+                    DimKey.exact(split_k),
+                    DimKey.exact(_PARTIALS),
+                ),
+            ),
+        )
+        hidden_specialization = _hidden_specialization_name(hidden_size)
+        compile_name = (
+            "integration.residual.mhc_prefill_bf16_project_tma_"
+            f"{hidden_specialization}_m{_PREFILL_TMA_TILE_M}_n{_PREFILL_TMA_TILE_N}"
+        )
+        compile_key = (
+            ("hidden_size", hidden_size),
+            ("split_k", split_k),
+            ("tile_m", _PREFILL_TMA_TILE_M),
+            ("tile_n", _PREFILL_TMA_TILE_N),
+            ("tile_k", _PREFILL_TMA_TILE_K),
+            ("stages", _PREFILL_TMA_STAGES),
+            ("compute_warps", _PREFILL_TMA_COMPUTE_WARPS),
+            ("threads", _PREFILL_TMA_THREADS),
+            ("mma_registers", _PREFILL_TMA_MMA_REGS),
+            ("load_registers", _PREFILL_TMA_LOAD_REGS),
+            cache_key,
+        )
+        b12x_launch(
+            _prefill_bf16_project_tma_kernel(hidden_size, split_k),
+            compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+            compile_args=args,
+            runtime_args=args,
+        )
+        return
     args = (
         _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(fn_bf16, cutlass.BFloat16),

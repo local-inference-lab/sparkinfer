@@ -291,6 +291,23 @@ def _canonicalize_mhc_expected_m(
     return expected
 
 
+def _use_mhc_prefill_bf16_project(
+    *,
+    norm_weight: torch.Tensor | None,
+    policy_m: int,
+    fn_bf16: torch.Tensor | None,
+) -> bool:
+    prefill_bf16_min_tokens = int(
+        os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384")
+    )
+    return (
+        norm_weight is not None
+        and int(policy_m) >= prefill_bf16_min_tokens
+        and fn_bf16 is not None
+        and os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
+    )
+
+
 def _validate_mhc_binding_views(
     *,
     partials: torch.Tensor | None,
@@ -942,11 +959,10 @@ def b12x_mhc_post_pre(
             )
 
         prefill_min_tokens = int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
-        use_prefill_bf16_mma = (
-            norm_weight is not None
-            and policy_m >= prefill_min_tokens
-            and fn_bf16 is not None
-            and os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "0") != "0"
+        use_prefill_bf16_mma = _use_mhc_prefill_bf16_project(
+            norm_weight=norm_weight,
+            policy_m=policy_m,
+            fn_bf16=fn_bf16,
         )
         use_prefill_block_m = (
             not use_prefill_bf16_mma
