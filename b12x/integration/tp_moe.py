@@ -218,6 +218,7 @@ class TPW4A16Workspace:
     planned_swiglu_alpha: float = 1.0
     planned_swiglu_beta: float = 0.0
     planned_scale_format: str = "e4m3_k16"
+    planned_collect_activation_amax: bool = False
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     # TC-decode fused-sum launches, keyed by exact token count (only the small-M
@@ -478,6 +479,7 @@ class TPMoEScratchCaps:
     w13_layout: str = "w13"
     w4a16_weight_layout: str | None = None
     w4a16_scale_format: str | None = None
+    collect_activation_amax: bool = False
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -533,6 +535,9 @@ class TPMoEScratchCaps:
                 "w4a16_scale_format",
                 _normalize_w4a16_scale_format(self.w4a16_scale_format),
             )
+        object.__setattr__(
+            self, "collect_activation_amax", bool(self.collect_activation_amax)
+        )
         object.__setattr__(self, "frozen", bool(self.frozen))
 
 
@@ -579,6 +584,8 @@ class TPMoEScratchPlan:
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        activation_amax: torch.Tensor | None = None,
+        layer_idx: int | None = None,
     ) -> "TPMoEFP4Binding":
         if int(a.shape[0]) > int(self.caps.max_tokens):
             raise ValueError(
@@ -640,6 +647,8 @@ class TPMoEScratchPlan:
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            activation_amax=activation_amax,
+            layer_idx=layer_idx,
         )
 
 
@@ -680,6 +689,8 @@ class TPMoEFP4Binding:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    activation_amax: torch.Tensor | None = None
+    layer_idx: int | None = None
     row_counts: torch.Tensor | None = None
     token_map: torch.Tensor | None = None
     token_weights: torch.Tensor | None = None
@@ -768,6 +779,8 @@ class TPMoESparseFP4Binding:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    activation_amax: torch.Tensor | None = None
+    layer_idx: int | None = None
 
     def run(self) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
         return b12x_sparse_moe_fp4(binding=self)
@@ -1648,6 +1661,8 @@ def _build_tp_moe_fp4_binding_from_views(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ) -> TPMoEFP4Binding:
     if a.ndim != 2:
         raise ValueError(
@@ -1778,6 +1793,8 @@ def _build_tp_moe_fp4_binding_from_views(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
     )
     if plan.implementation == "w4a16":
         return TPMoEFP4Binding(
@@ -4487,6 +4504,7 @@ def _validate_frozen_w4a16_launch(
     swiglu_beta: float,
     weight_layout: str,
     scale_format: str,
+    collect_activation_amax: bool = False,
 ) -> None:
     scale_format = _normalize_w4a16_scale_format(scale_format)
     token_count = int(plan.max_tokens_per_launch)
@@ -4532,13 +4550,19 @@ def _validate_frozen_w4a16_launch(
             f"requested={scale_format!r}, planned={planned_scale_format!r}"
         )
     fused = workspace.planned_fused_moe_launches.get(
-        (weight_layout, scale_format, planned_capacity)
+        (weight_layout, scale_format, planned_capacity, bool(collect_activation_amax))
     )
+    if fused is None and not bool(collect_activation_amax):
+        fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, scale_format, planned_capacity)
+        )
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(
             (weight_layout, planned_capacity)
         )
         if (
+            not bool(collect_activation_amax)
+            and
             scale_format == "e4m3_k16"
             and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
         ):
@@ -4546,6 +4570,8 @@ def _validate_frozen_w4a16_launch(
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
         if (
+            not bool(collect_activation_amax)
+            and
             scale_format == "e4m3_k16"
             and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
         ):
@@ -4554,7 +4580,8 @@ def _validate_frozen_w4a16_launch(
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
             f"for capacity={planned_capacity}, weight_layout={weight_layout!r}, "
-            f"scale_format={scale_format!r}"
+            f"scale_format={scale_format!r}, "
+            f"collect_activation_amax={bool(collect_activation_amax)}"
         )
     if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
@@ -4569,9 +4596,11 @@ def _w4a16_preplanned_launches(
     token_count: int,
     weight_layout: str,
     scale_format: str = "e4m3_k16",
+    collect_activation_amax: bool = False,
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
     scale_format = _normalize_w4a16_scale_format(scale_format)
+    collect_activation_amax = bool(collect_activation_amax)
     if not workspace.planned_token_counts:
         return None, None
     # Prefer a preplanned TC-decode launch for an exact small-M decode size. It
@@ -4580,6 +4609,8 @@ def _w4a16_preplanned_launches(
     from b12x.moe.fused.w4a16.kernel import _TC_DECODE_MAX_M
 
     if (
+        not collect_activation_amax
+        and
         weight_layout == "packed"
         and token_count <= _TC_DECODE_MAX_M
     ):
@@ -4596,13 +4627,19 @@ def _w4a16_preplanned_launches(
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
     fused = workspace.planned_fused_moe_launches.get(
-        (weight_layout, scale_format, planned_capacity)
+        (weight_layout, scale_format, planned_capacity, collect_activation_amax)
     )
+    if fused is None and not collect_activation_amax:
+        fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, scale_format, planned_capacity)
+        )
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(
             (weight_layout, planned_capacity)
         )
         if (
+            not collect_activation_amax
+            and
             scale_format == "e4m3_k16"
             and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
         ):
@@ -4610,6 +4647,8 @@ def _w4a16_preplanned_launches(
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
         if (
+            not collect_activation_amax
+            and
             scale_format == "e4m3_k16"
             and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
         ):
@@ -4619,7 +4658,8 @@ def _w4a16_preplanned_launches(
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
             f"capacity={planned_capacity}, weight_layout={weight_layout!r}, "
-            f"scale_format={scale_format!r}"
+            f"scale_format={scale_format!r}, "
+            f"collect_activation_amax={collect_activation_amax}"
         )
     return fused, topk_sum
 
@@ -4637,6 +4677,7 @@ def _resolve_workspace(
     swiglu_beta: float = 0.0,
     weight_layout: str = "packed",
     scale_format: str = "e4m3_k16",
+    collect_activation_amax: bool = False,
 ) -> object:
     scale_format = _normalize_w4a16_scale_format(scale_format)
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
@@ -4788,6 +4829,7 @@ def _resolve_workspace(
             swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
             scale_format=scale_format,
+            collect_activation_amax=collect_activation_amax,
         )
 
     if isinstance(resolved, TPDynamicWorkspace):
@@ -4897,6 +4939,7 @@ def plan_tp_moe_arena_layout(
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
     w4a16_scale_format: str | None = None,
+    collect_activation_amax: bool = False,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     source_format = _normalize_fp4_source_format(source_format)
@@ -5010,6 +5053,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w13_layout=caps.w13_layout,
         w4a16_weight_layout=caps.w4a16_weight_layout,
         w4a16_scale_format=caps.w4a16_scale_format,
+        collect_activation_amax=caps.collect_activation_amax,
     )
     capacity_tokens = max(layout.core_token_counts or (int(caps.max_tokens),))
     launch_plan = _make_workspace_plan(
@@ -5083,6 +5127,7 @@ def _prewarm_w4a16_planned_launches(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     w13_layout: str = "w13",
+    collect_activation_amax: bool = False,
 ) -> None:
     """Resolve every W4A16 kernel shape owned by a frozen arena.
 
@@ -5096,6 +5141,7 @@ def _prewarm_w4a16_planned_launches(
     scale_format = _normalize_w4a16_scale_format(scale_format)
     weight_layout = _normalize_w4a16_weight_layout(weight_layout)
     w13_layout = _normalize_w13_layout(w13_layout)
+    collect_activation_amax = bool(collect_activation_amax)
 
     from b12x.moe.fused.w4a16.host import (
         max_packed_route_slots,
@@ -5129,7 +5175,8 @@ def _prewarm_w4a16_planned_launches(
         # fused-sum launch variant for the supported decode sizes so the binding
         # can dispatch to it instead of the general fused launch.
         build_tc_decode = bool(
-            weight_layout == "packed"
+            not collect_activation_amax
+            and weight_layout == "packed"
             and element_dtype == "bf16"
         )
         for token_count in token_counts:
@@ -5148,7 +5195,7 @@ def _prewarm_w4a16_planned_launches(
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
             t_shape = time.perf_counter() if _B12X_TIMING else 0.0
             fused_launches[
-                (weight_layout, scale_format, token_count)
+                (weight_layout, scale_format, token_count, collect_activation_amax)
             ] = compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=workspace.k,
@@ -5169,6 +5216,7 @@ def _prewarm_w4a16_planned_launches(
                 weight_layout=weight_layout,
                 scale_format=scale_format,
                 w13_layout=w13_layout,
+                collect_activation_amax=collect_activation_amax,
             )
             t_fused = time.perf_counter() if _B12X_TIMING else 0.0
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
@@ -5296,6 +5344,7 @@ def _prewarm_w4a16_planned_launches(
         workspace.planned_topk_sum_launches = topk_sum_launches
         workspace.planned_tc_decode_launches = tc_decode_launches
         workspace.planned_scale_format = scale_format
+        workspace.planned_collect_activation_amax = collect_activation_amax
     if _B12X_TIMING:
         t_done = time.perf_counter()
         total_ms = (t_done - t0) * 1000.0
@@ -5330,6 +5379,7 @@ def materialize_tp_moe_arena_workspaces(
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
     w4a16_scale_format: str | None = None,
+    collect_activation_amax: bool = False,
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
@@ -5357,6 +5407,7 @@ def materialize_tp_moe_arena_workspaces(
         if w4a16_weight_layout is not None
         else _w4a16_weight_layout_for_source(source_format)
     )
+    collect_activation_amax = bool(collect_activation_amax)
 
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
@@ -5451,6 +5502,10 @@ def materialize_tp_moe_arena_workspaces(
                         getattr(existing, "planned_scale_format", "e4m3_k16")
                     )
                     != w4a16_scale_format
+                    or bool(
+                        getattr(existing, "planned_collect_activation_amax", False)
+                    )
+                    != collect_activation_amax
                 ):
                     pass
                 else:
@@ -5507,6 +5562,7 @@ def materialize_tp_moe_arena_workspaces(
             materialized.planned_swiglu_limit = plan.swiglu_limit
             materialized.planned_swiglu_alpha = plan.swiglu_alpha
             materialized.planned_swiglu_beta = plan.swiglu_beta
+            materialized.planned_collect_activation_amax = collect_activation_amax
             t_prewarm0 = time.perf_counter() if _B12X_TIMING else 0.0
             _prewarm_w4a16_planned_launches(
                 materialized,
@@ -5518,6 +5574,7 @@ def materialize_tp_moe_arena_workspaces(
                 scale_format=w4a16_scale_format,
                 weight_layout=w4a16_weight_layout,
                 w13_layout=w13_layout,
+                collect_activation_amax=collect_activation_amax,
             )
             if _B12X_TIMING:
                 prewarm_ms += (time.perf_counter() - t_prewarm0) * 1000.0
@@ -5590,6 +5647,8 @@ def build_tp_moe_fp4_binding(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ) -> TPMoEFP4Binding:
     workspace = scratch
     if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
@@ -5618,6 +5677,7 @@ def build_tp_moe_fp4_binding(
     runtime_prepared_w4a16 = (
         prepared_w4a16 if quant_mode == "w4a16" else None
     )
+    collect_activation_amax = activation_amax is not None
     unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
@@ -5680,6 +5740,7 @@ def build_tp_moe_fp4_binding(
             swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
             scale_format=scale_format,
+            collect_activation_amax=collect_activation_amax,
         )
     common_kwargs = dict(
         a=a,
@@ -5708,6 +5769,8 @@ def build_tp_moe_fp4_binding(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
     )
     if isinstance(workspace, TPW4A16Workspace):
         if quant_mode != "w4a16":
@@ -5738,6 +5801,7 @@ def build_tp_moe_fp4_binding(
             token_count=m,
             weight_layout=weight_layout,
             scale_format=scale_format,
+            collect_activation_amax=collect_activation_amax,
         )
         return TPMoEFP4Binding(
             **common_kwargs,
@@ -5927,6 +5991,8 @@ def build_tp_moe_sparse_fp4_binding(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ) -> TPMoESparseFP4Binding:
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
@@ -5979,6 +6045,8 @@ def build_tp_moe_sparse_fp4_binding(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
     )
 
 
@@ -7695,6 +7763,8 @@ def b12x_moe_fp4(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
     binding: TPMoEFP4Binding | None = None,
 ) -> torch.Tensor:
     """MoE with shape-selected fused direct-micro or dynamic kernels.
@@ -7733,6 +7803,8 @@ def b12x_moe_fp4(
                 ("swiglu_limit", swiglu_limit),
                 ("swiglu_alpha", swiglu_alpha),
                 ("swiglu_beta", swiglu_beta),
+                ("activation_amax", activation_amax),
+                ("layer_idx", layer_idx),
             )
             if value is not None
         ]
@@ -7775,6 +7847,8 @@ def b12x_moe_fp4(
         swiglu_limit = binding.swiglu_limit
         swiglu_alpha = binding.swiglu_alpha
         swiglu_beta = binding.swiglu_beta
+        activation_amax = binding.activation_amax
+        layer_idx = binding.layer_idx
         unit_scale_contract = binding.unit_scale_contract
         source_format = binding.source_format
         w13_layout = binding.w13_layout
@@ -7941,6 +8015,10 @@ def b12x_moe_fp4(
         source_format=source_format,
         quant_mode=quant_mode,
     )
+    if activation_amax is not None and quant_mode != "w4a16":
+        raise NotImplementedError(
+            "activation_amax calibration is only supported for W4A16"
+        )
     num_topk = topk_ids.shape[1]
     m, k = a.shape
     device = a.device
@@ -8096,6 +8174,7 @@ def b12x_moe_fp4(
                 swiglu_beta=swiglu_beta,
                 weight_layout=weight_layout,
                 scale_format=scale_format,
+                collect_activation_amax=activation_amax is not None,
             )
             if not isinstance(w4a16_workspace, TPW4A16Workspace):
                 raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -8112,6 +8191,7 @@ def b12x_moe_fp4(
                 token_count=m,
                 weight_layout=weight_layout,
                 scale_format=scale_format,
+                collect_activation_amax=activation_amax is not None,
             )
         if not topk_weights.is_contiguous():
             if torch.cuda.is_current_stream_capturing():
@@ -8142,6 +8222,8 @@ def b12x_moe_fp4(
             block_expert_ids=block_expert_ids,
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
+            activation_amax=activation_amax,
+            layer_idx=layer_idx,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -8936,6 +9018,8 @@ def b12x_sparse_moe_fp4(
     fast_math: bool | None = None,
     activation: str = "silu",
     quant_mode: str | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
     binding: TPMoESparseFP4Binding | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
     """Sparse-block FP4 MoE wrapper above the routed-expert TP primitive.
@@ -8960,6 +9044,8 @@ def b12x_sparse_moe_fp4(
                 ("input_scales_are_reciprocal", input_scales_are_reciprocal),
                 ("fast_math", fast_math),
                 ("quant_mode", quant_mode),
+                ("activation_amax", activation_amax),
+                ("layer_idx", layer_idx),
             )
             if value is not None
         ]
@@ -8998,6 +9084,8 @@ def b12x_sparse_moe_fp4(
         swiglu_limit = binding.swiglu_limit
         swiglu_alpha = binding.swiglu_alpha
         swiglu_beta = binding.swiglu_beta
+        activation_amax = binding.activation_amax
+        layer_idx = binding.layer_idx
     else:
         raise TypeError("b12x_sparse_moe_fp4 requires binding")
     if hidden_states is None or experts is None or workspace is None:
@@ -9063,6 +9151,8 @@ def b12x_sparse_moe_fp4(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
     )
     routed_output = b12x_moe_fp4(binding=moe_binding)
     if routed_scaling_factor != 1.0:

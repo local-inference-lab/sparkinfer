@@ -395,6 +395,8 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         activation=activation,
         apply_router_weight_on_input=False,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=None,
+        swiglu_beta=None,
         element_dtype="bf16",
         weight_layout="modelopt",
         w13_layout=w13_layout,
@@ -504,6 +506,8 @@ def test_w4a16_e8m0_native_large_m_uses_main_gemm(
         activation=activation,
         apply_router_weight_on_input=False,
         swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
         element_dtype="bf16",
         weight_layout="modelopt",
         w13_layout=w13_layout,
@@ -604,6 +608,8 @@ def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
         activation=activation,
         apply_router_weight_on_input=False,
         swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
         element_dtype="bf16",
         weight_layout="modelopt",
         w13_layout="w31",
@@ -1040,6 +1046,226 @@ def test_w4a16_small_m_packed_direct_topk_routes_matches_oracle(m: int) -> None:
     )
     torch.cuda.synchronize()
 
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_activation_amax_calibration_tracks_routed_inputs_and_fc2_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(20260616)
+    experts, hidden_size, intermediate_size = 4, 128, 128
+    m, topk, activation = 3, 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1], [2, 3], [0, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    activation_amax = torch.zeros((2, experts, 2), dtype=torch.float32, device="cuda")
+    activation_amax[0].fill_(123.0)
+    compile_calls: list[dict[str, object]] = []
+
+    def spy_compile_w4a16_fused_moe(**kwargs):
+        compile_calls.append(dict(kwargs))
+        return compile_w4a16_fused_moe(**kwargs)
+
+    monkeypatch.setattr(
+        "b12x.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
+        spy_compile_w4a16_fused_moe,
+    )
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        activation_amax=activation_amax,
+        layer_idx=1,
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    assert compile_calls
+    assert any(bool(call["collect_activation_amax"]) for call in compile_calls)
+    assert not any(bool(call["direct_topk_routes"]) for call in compile_calls)
+    assert not any(bool(call["tc_decode_fused_sum"]) for call in compile_calls)
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+    expected_amax = torch.zeros((experts, 2), dtype=torch.float32, device="cuda")
+    activated_rows = buffers.intermediate_cache2.view(-1, intermediate_size)
+    flat_ids = topk_ids.view(-1)
+    route_tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    route_indices = torch.arange(m * topk, device="cuda")
+    for expert in range(experts):
+        mask = flat_ids == expert
+        if bool(mask.any().item()):
+            expected_amax[expert, 0] = x[route_tokens[mask]].float().abs().max()
+            expected_amax[expert, 1] = (
+                activated_rows[route_indices[mask]].float().abs().max()
+            )
+
+    torch.testing.assert_close(activation_amax[1], expected_amax, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        activation_amax[0],
+        torch.full_like(activation_amax[0], 123.0),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_activation_amax_forces_main_kernel_over_native_small_m_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(20260617)
+    experts, hidden_size, intermediate_size = 4, 128, 128
+    rows = intermediate_size * 2
+    m, topk, activation = 2, 2, "silu"
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    assert _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout="w13",
+        scale_format="e8m0_k32",
+    )
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout="w13",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    activation_amax = torch.zeros((1, experts, 2), dtype=torch.float32, device="cuda")
+    compile_calls: list[dict[str, object]] = []
+
+    def spy_compile_w4a16_fused_moe(**kwargs):
+        compile_calls.append(dict(kwargs))
+        return compile_w4a16_fused_moe(**kwargs)
+
+    monkeypatch.setattr(
+        "b12x.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
+        spy_compile_w4a16_fused_moe,
+    )
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        activation_amax=activation_amax,
+        layer_idx=0,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        w13_layout="w13",
+    )
+    torch.cuda.synchronize()
+
+    assert compile_calls
+    assert any(bool(call["collect_activation_amax"]) for call in compile_calls)
+    assert not any(bool(call["direct_topk_routes"]) for call in compile_calls)
+    assert not any(bool(call["tc_decode_fused_sum"]) for call in compile_calls)
+    assert bool((activation_amax > 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
 
 

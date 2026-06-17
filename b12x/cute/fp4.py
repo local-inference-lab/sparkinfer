@@ -1167,6 +1167,30 @@ def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_max_global_f32_nonnegative(addr: Int64, val: Float32, *, loc=None, ip=None):
+    """No-return global max reduction for a non-negative fp32 value.
+
+    Non-negative IEEE-754 float ordering matches unsigned integer bit ordering,
+    so this emits a no-return u32 max reduction on the value's bit pattern.
+    Callers must initialize the destination with a non-negative fp32 value.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .u32 vi; mov.b32 vi, $1; red.relaxed.gpu.global.max.u32 [$0], vi; }",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def atomic_cas_global_i32(addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
     """Global memory int32 atomic compare-and-swap. Returns old value."""
     return Int32(

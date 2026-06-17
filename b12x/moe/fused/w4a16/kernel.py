@@ -25,6 +25,8 @@ from b12x.cute.fp4 import (
     broadcast_f32_to_bfloat2,
     cp_async4_shared_global,
     cp_async4_shared_global_pred,
+    fabs_f32,
+    fmax_f32,
     f16_mma_m16n8k16_f32,
     f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
     half2_to_float2_scaled,
@@ -33,6 +35,7 @@ from b12x.cute.fp4 import (
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_v4_f32,
+    ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
     ld_shared_v2_u32,
@@ -50,17 +53,20 @@ from b12x.cute.fp4 import (
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
     red_add_global_release_i32,
+    red_max_global_f32_nonnegative,
     shared_ptr_to_u32,
     st_global_v4_u32,
     st_global_i32,
     st_global_v4_f32,
     st_shared_bf16_from_f32,
     st_shared_f16_from_f32,
+    st_shared_f32,
     st_shared_i32,
     st_shared_u32,
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
+    warp_reduce,
 )
 from b12x.cute.utils import current_cuda_stream, make_ptr
 from b12x.moe.fused.w4a16.route_pack import (
@@ -463,6 +469,7 @@ class W4A16FusedMoeCompileResult:
     direct_topk_routes: bool = False
     scale_format: str = "e4m3_k16"
     tc_decode_fused_sum: bool = False
+    collect_activation_amax: bool = False
 
 
 @dataclass(frozen=True)
@@ -3506,6 +3513,7 @@ class W4A16FusedMoeKernel:
         w13_layout: str = "w13",
         direct_topk_routes: bool = False,
         tc_decode_fused_sum: bool = False,
+        collect_activation_amax: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -3524,6 +3532,11 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        self.collect_activation_amax = bool(collect_activation_amax)
+        if self.collect_activation_amax and bool(direct_topk_routes):
+            raise ValueError("activation amax collection requires route-packed W4A16")
+        if self.collect_activation_amax and self.tc_decode_fused_sum:
+            raise ValueError("activation amax collection is incompatible with TC-decode")
         if self.tc_decode_fused_sum and not bool(direct_topk_routes):
             raise ValueError("tc_decode_fused_sum requires direct_topk_routes")
         if self.tc_decode_fused_sum and element_dtype != "bf16":
@@ -3536,6 +3549,7 @@ class W4A16FusedMoeKernel:
         self.fc1_cols = int(fc1_cols)
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
+        self.moe_block_size = int(moe_block_size)
         self.activation = activation
         self.activation_is_gated = is_gated
         self.activation_is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
@@ -3636,6 +3650,7 @@ class W4A16FusedMoeKernel:
             self.element_dtype,
             self.fast_math,
             self.direct_topk_routes,
+            self.collect_activation_amax,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
@@ -3682,6 +3697,8 @@ class W4A16FusedMoeKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
+        layer_idx: cutlass.Int32,
         topk_weights_ptr: cute.Pointer,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
@@ -3715,6 +3732,8 @@ class W4A16FusedMoeKernel:
             packed_route_indices,
             block_expert_ids,
             packed_route_count,
+            activation_amax_flat,
+            layer_idx,
             topk_weights_flat,
             fc1_c_tmp_f32_flat,
             fc2_c_tmp_f32_flat,
@@ -3742,6 +3761,8 @@ class W4A16FusedMoeKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
+        layer_idx: cutlass.Int32,
         topk_weights_flat: cute.Tensor,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
@@ -3840,6 +3861,21 @@ class W4A16FusedMoeKernel:
                 active_m,
             )
         self._grid_barrier(locks_i32_flat, tid, grid_x)
+        if cutlass.const_expr(self.collect_activation_amax):
+            self._collect_activation_amax_epilogue(
+                a_bf16_flat,
+                activated_bf16_flat,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                activation_amax_flat,
+                layer_idx,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+            )
         if cutlass.const_expr(self.zero_fc2_output):
             self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
@@ -3901,6 +3937,118 @@ class W4A16FusedMoeKernel:
         while idx < total:
             fc2_bf16_flat[idx] = zero
             idx += stride
+
+    @cute.jit
+    def _reduce_and_red_activation_amax(
+        self,
+        local_max: cutlass.Float32,
+        activation_amax_flat: cute.Tensor,
+        layer_idx: cutlass.Int32,
+        expert_idx: Int32,
+        slot: Int32,
+        smem_base: Int32,
+        tid: Int32,
+    ):
+        lane = tid & Int32(31)
+        warp_idx = tid // Int32(32)
+        warp_amax = warp_reduce(local_max, fmax_f32)
+        if lane == Int32(0):
+            st_shared_f32(smem_base + warp_idx * Int32(4), warp_amax)
+        cute.arch.sync_threads()
+
+        if warp_idx == Int32(0):
+            block_amax = cutlass.Float32(0.0)
+            if lane < Int32(self.cta_threads // 32):
+                block_amax = ld_shared_f32(smem_base + lane * Int32(4))
+            block_amax = warp_reduce(block_amax, fmax_f32)
+            if lane == Int32(0) and block_amax > cutlass.Float32(0.0):
+                out_idx = (
+                    (layer_idx * Int32(self.num_experts) + expert_idx) * Int32(2)
+                    + slot
+                )
+                red_max_global_f32_nonnegative(
+                    get_ptr_as_int64(activation_amax_flat, out_idx),
+                    block_amax,
+                )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _collect_activation_amax_epilogue(
+        self,
+        a_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
+        layer_idx: cutlass.Int32,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        live_routes = active_m * Int32(self.top_k)
+        route_count = packed_route_count[Int32(0)].to(Int32)
+        route_blocks = (
+            route_count + Int32(self.moe_block_size) - Int32(1)
+        ) // Int32(self.moe_block_size)
+        expert_idx = cta
+        while expert_idx < Int32(self.num_experts):
+            local_fc1 = cutlass.Float32(0.0)
+            local_fc2 = cutlass.Float32(0.0)
+            has_route_block = Int32(0)
+            block_idx = Int32(0)
+            while block_idx < route_blocks:
+                block_expert = block_expert_ids[block_idx].to(Int32)
+                if block_expert == expert_idx:
+                    has_route_block = Int32(1)
+                    route_pos = block_idx * Int32(self.moe_block_size)
+                    route_stop = route_pos + Int32(self.moe_block_size)
+                    if route_stop > route_count:
+                        route_stop = route_count
+                    while route_pos < route_stop:
+                        route_idx = packed_route_indices[route_pos].to(Int32)
+                        if route_idx >= Int32(0) and route_idx < live_routes:
+                            token_idx = route_idx // Int32(self.top_k)
+                            fc1_col = tid
+                            while fc1_col < Int32(self.hidden_size):
+                                v1 = a_bf16_flat[
+                                    token_idx * Int32(self.hidden_size) + fc1_col
+                                ].to(cutlass.Float32)
+                                local_fc1 = fmax_f32(local_fc1, fabs_f32(v1))
+                                fc1_col += Int32(self.cta_threads)
+
+                            fc2_col = tid
+                            while fc2_col < Int32(self.intermediate_size):
+                                v2 = activated_bf16_flat[
+                                    route_idx * Int32(self.intermediate_size) + fc2_col
+                                ].to(cutlass.Float32)
+                                local_fc2 = fmax_f32(local_fc2, fabs_f32(v2))
+                                fc2_col += Int32(self.cta_threads)
+                        route_pos += Int32(1)
+                block_idx += Int32(1)
+
+            if has_route_block != Int32(0):
+                self._reduce_and_red_activation_amax(
+                    local_fc1,
+                    activation_amax_flat,
+                    layer_idx,
+                    expert_idx,
+                    Int32(0),
+                    smem_base,
+                    tid,
+                )
+                self._reduce_and_red_activation_amax(
+                    local_fc2,
+                    activation_amax_flat,
+                    layer_idx,
+                    expert_idx,
+                    Int32(1),
+                    smem_base,
+                    tid,
+                )
+            expert_idx += grid_x
 
     @cute.jit
     def _run_activation(
@@ -4568,6 +4716,7 @@ def compile_w4a16_fused_moe(
     w13_layout: str = "w13",
     direct_topk_routes: bool = False,
     tc_decode_fused_sum: bool = False,
+    collect_activation_amax: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -4589,6 +4738,11 @@ def compile_w4a16_fused_moe(
         w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
     tc_decode_fused_sum = bool(tc_decode_fused_sum)
+    collect_activation_amax = bool(collect_activation_amax)
+    if collect_activation_amax and (direct_topk_routes or tc_decode_fused_sum):
+        raise ValueError(
+            "W4A16 activation amax collection requires the route-packed fused path"
+        )
     # The TC-decode path validates M in {1,2,4,8} itself and uses direct-topk
     # routing for the whole {1,2,4,8} range, so it lifts the default decode cap.
     direct_topk_m_cap = (
@@ -4810,6 +4964,7 @@ def compile_w4a16_fused_moe(
         w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        collect_activation_amax=collect_activation_amax,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -4825,7 +4980,7 @@ def compile_w4a16_fused_moe(
             blocks_per_sm=kernel.blocks_per_sm,
         )
 
-    if _small_m_direct_supported(
+    if (not collect_activation_amax) and _small_m_direct_supported(
         m=size_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -4957,6 +5112,11 @@ def compile_w4a16_fused_moe(
         (1,),
         assumed_align=4,
     )
+    activation_amax_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (num_experts * 2,),
+        assumed_align=4,
+    )
     topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
     fc1_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -5002,6 +5162,8 @@ def compile_w4a16_fused_moe(
         packed_routes_fake,
         block_experts_fake,
         route_count_fake,
+        activation_amax_fake,
+        0,
         topk_fake,
         fc1_c_tmp_fake,
         fc2_c_tmp_fake,
@@ -5042,6 +5204,7 @@ def compile_w4a16_fused_moe(
         direct_topk_routes=kernel.direct_topk_routes,
         scale_format=scale_format,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        collect_activation_amax=collect_activation_amax,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -5362,6 +5525,8 @@ def _w4a16_fused_moe_launch_flat(
     packed_route_indices: torch.Tensor,
     block_expert_ids: torch.Tensor,
     packed_route_count: torch.Tensor,
+    activation_amax: torch.Tensor | None,
+    layer_idx: int,
     topk_weights: torch.Tensor,
     fc1_scratch: torch.Tensor,
     fc2_scratch: torch.Tensor,
@@ -5390,9 +5555,16 @@ def _w4a16_fused_moe_launch_flat(
     w13_layout: str,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    collect_activation_amax: bool,
     stream_int: int,
 ) -> None:
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
+    collect_activation_amax = bool(collect_activation_amax)
+    if collect_activation_amax and activation_amax is None:
+        raise ValueError("activation_amax is required for calibrated W4A16 launch")
+    activation_amax_arg = (
+        activation_amax.view(-1) if activation_amax is not None else w13_global_scale
+    )
     fused = compile_w4a16_fused_moe(
         size_m=size_m,
         hidden_size=hidden_size,
@@ -5416,6 +5588,7 @@ def _w4a16_fused_moe_launch_flat(
         w13_layout=w13_layout,
         direct_topk_routes=bool(direct_topk_routes),
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        collect_activation_amax=collect_activation_amax,
     )
     fused.compiled(
         make_ptr(
@@ -5436,6 +5609,8 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices,
         block_expert_ids,
         packed_route_count,
+        activation_amax_arg,
+        int(layer_idx),
         make_ptr(
             cutlass.Float32,
             topk_weights.data_ptr(),
@@ -5571,6 +5746,8 @@ def _w4a16_fused_moe_launch_op(
         packed_route_indices=packed_route_indices,
         block_expert_ids=block_expert_ids,
         packed_route_count=packed_route_count,
+        activation_amax=None,
+        layer_idx=0,
         topk_weights=topk_weights,
         fc1_scratch=fc1_scratch,
         fc2_scratch=fc2_scratch,
@@ -5599,6 +5776,7 @@ def _w4a16_fused_moe_launch_op(
         w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        collect_activation_amax=False,
         stream_int=stream_int,
     )
 
@@ -5646,6 +5824,151 @@ def _w4a16_fused_moe_launch_fake(
     w13_layout: str,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    stream_int: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_fused_moe_calibrated_launch",
+    mutates_args="unknown",
+)
+def _w4a16_fused_moe_calibrated_launch_op(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    activation_amax: torch.Tensor,
+    layer_idx: int,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    stream_int: int,
+) -> None:
+    _w4a16_fused_moe_launch_flat(
+        a_input=a_input,
+        w13_arg=w13_arg,
+        w2_arg=w2_arg,
+        fc1_out=fc1_out,
+        activated=activated,
+        fc2_out=fc2_out,
+        w13_scale_i32=w13_scale_i32,
+        w2_scale_i32=w2_scale_i32,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
+        topk_weights=topk_weights,
+        fc1_scratch=fc1_scratch,
+        fc2_scratch=fc2_scratch,
+        workspace=workspace,
+        m=m,
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        zero_fc2_output=zero_fc2_output,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        direct_topk_routes=False,
+        tc_decode_fused_sum=False,
+        collect_activation_amax=True,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_fused_moe_calibrated_launch_op.register_fake
+def _w4a16_fused_moe_calibrated_launch_fake(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    activation_amax: torch.Tensor,
+    layer_idx: int,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
     stream_int: int,
 ) -> None:
     return None
@@ -5785,6 +6108,44 @@ def _validate_expert_map(
         )
 
 
+def _validate_activation_amax(
+    activation_amax: torch.Tensor | None,
+    *,
+    layer_idx: int | None,
+    num_experts: int,
+    device: torch.device,
+) -> int | None:
+    if activation_amax is None:
+        if layer_idx is not None:
+            raise ValueError("layer_idx requires activation_amax")
+        return None
+    if layer_idx is None:
+        raise ValueError("layer_idx is required when activation_amax is provided")
+    if activation_amax.dtype != torch.float32:
+        raise TypeError("activation_amax must be torch.float32")
+    if activation_amax.device != device:
+        raise ValueError("activation_amax must be on the same device as a_input")
+    if not activation_amax.is_cuda:
+        raise ValueError("activation_amax must be a CUDA tensor")
+    if not activation_amax.is_contiguous():
+        raise ValueError("activation_amax must be contiguous")
+    if activation_amax.ndim != 3 or int(activation_amax.shape[2]) != 2:
+        raise ValueError(
+            "activation_amax must have shape [num_layers, num_experts, 2]"
+        )
+    if int(activation_amax.shape[1]) < int(num_experts):
+        raise ValueError(
+            "activation_amax expert dimension is smaller than the local expert count"
+        )
+    layer = int(layer_idx)
+    if layer < 0 or layer >= int(activation_amax.shape[0]):
+        raise ValueError(
+            f"layer_idx {layer} is out of bounds for activation_amax with "
+            f"{int(activation_amax.shape[0])} layers"
+        )
+    return layer
+
+
 def _compile_w4a16_gemm_launch(
     *,
     size_m: int,
@@ -5889,6 +6250,8 @@ def run_w4a16_moe(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
     swiglu_limit: float | None = None,
@@ -5958,6 +6321,13 @@ def run_w4a16_moe(
         raise ValueError(f"output must have shape {(m, hidden_size)}")
     if expert_map is not None and int(expert_map.numel()) < int(prepared.num_experts):
         raise ValueError("expert_map cannot be shorter than the local expert count")
+    layer_idx_int = _validate_activation_amax(
+        activation_amax,
+        layer_idx=layer_idx,
+        num_experts=int(prepared.num_experts),
+        device=a_input.device,
+    )
+    collect_activation_amax = activation_amax is not None
 
     route_num_experts = (
         int(expert_map.numel()) if expert_map is not None else int(prepared.num_experts)
@@ -5970,7 +6340,7 @@ def run_w4a16_moe(
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
     stream = current_cuda_stream() if stream is None else stream
-    if _small_m_direct_supported(
+    if (not collect_activation_amax) and _small_m_direct_supported(
         m=m,
         hidden_size=hidden_size,
         intermediate_size=int(prepared.intermediate_size),
@@ -6066,7 +6436,8 @@ def run_w4a16_moe(
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
-        (fused_launch is None or preplanned_tc_decode)
+        (not collect_activation_amax)
+        and (fused_launch is None or preplanned_tc_decode)
         and weight_layout == "packed"
         and expert_map is None
         and is_gated
@@ -6080,7 +6451,8 @@ def run_w4a16_moe(
         topk_ids = topk_ids.to(torch.int32)
 
     direct_topk_eligible = (
-        (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
+        (not collect_activation_amax)
+        and (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
         and weight_layout == "packed"
         and expert_map is None
     )
@@ -6227,6 +6599,7 @@ def run_w4a16_moe(
             w13_layout=w13_layout,
             direct_topk_routes=use_direct_topk_routes,
             tc_decode_fused_sum=use_tc_decode,
+            collect_activation_amax=collect_activation_amax,
         )
     else:
         if int(fused_launch.size_m) < m:
@@ -6251,6 +6624,7 @@ def run_w4a16_moe(
             scale_format,
             w13_layout,
             bool(use_direct_topk_routes),
+            bool(collect_activation_amax),
             block_size_m,
         )
         actual_fused = (
@@ -6276,6 +6650,7 @@ def run_w4a16_moe(
                 else "packed",
             ),
             bool(getattr(fused_launch, "direct_topk_routes", False)),
+            bool(getattr(fused_launch, "collect_activation_amax", False)),
             int(fused_launch.moe_block_size),
         )
         if actual_fused != expected_fused or int(fused_launch.max_m_blocks) < int(
@@ -6338,7 +6713,7 @@ def run_w4a16_moe(
     else:
         w13_arg = prepared.w13.view(torch.int32).view(-1)
         w2_arg = prepared.w2.view(torch.int32).view(-1)
-    torch.ops.b12x.w4a16_fused_moe_launch(
+    launch_common = (
         a_input,
         w13_arg,
         w2_arg,
@@ -6352,6 +6727,8 @@ def run_w4a16_moe(
         packed_route_indices,
         block_expert_ids,
         packed_route_count,
+    )
+    launch_tail = (
         topk_weights,
         fc1_scratch,
         fc2_scratch,
@@ -6378,10 +6755,25 @@ def run_w4a16_moe(
         weight_layout,
         scale_format,
         w13_layout,
-        bool(use_direct_topk_routes),
-        bool(use_tc_decode),
-        int(stream),
     )
+    if collect_activation_amax:
+        assert activation_amax is not None
+        assert layer_idx_int is not None
+        torch.ops.b12x.w4a16_fused_moe_calibrated_launch(
+            *launch_common,
+            activation_amax,
+            int(layer_idx_int),
+            *launch_tail,
+            int(stream),
+        )
+    else:
+        torch.ops.b12x.w4a16_fused_moe_launch(
+            *launch_common,
+            *launch_tail,
+            bool(use_direct_topk_routes),
+            bool(use_tc_decode),
+            int(stream),
+        )
 
     if use_tc_decode:
         # FC2 already wrote the top-k-summed result into `output`.

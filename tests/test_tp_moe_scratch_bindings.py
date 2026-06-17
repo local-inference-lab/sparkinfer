@@ -399,6 +399,133 @@ def test_w4a16_topk6_bucket_materializes_with_planned_scratch(
     assert binding.topk_sum_launch is not None
 
 
+def test_w4a16_materialize_can_prewarm_activation_amax_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+    fused = object()
+
+    def _fake_w4a16_prewarm(
+        workspace, *, token_counts, collect_activation_amax=False, **_kwargs
+    ) -> None:
+        captured["collect_activation_amax"] = bool(collect_activation_amax)
+        workspace.planned_fused_moe_launches = {
+            ("packed", "e4m3_k16", int(token_count), bool(collect_activation_amax)): fused
+            for token_count in token_counts
+        }
+        workspace.planned_topk_sum_launches = {
+            int(token_count): object() for token_count in token_counts
+        }
+        workspace.planned_collect_activation_amax = bool(collect_activation_amax)
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_prewarm_w4a16_planned_launches",
+        _fake_w4a16_prewarm,
+    )
+    pool = tp_moe_impl.allocate_tp_moe_workspace_pool(frozen=True)
+
+    tp_moe_impl.materialize_tp_moe_arena_workspaces(
+        pool,
+        max_tokens=4,
+        weight_E=8,
+        k=128,
+        n=64,
+        num_topk=2,
+        device="cpu",
+        dtype=torch.bfloat16,
+        core_token_counts=(4,),
+        quant_mode="w4a16",
+        collect_activation_amax=True,
+    )
+
+    workspace = next(iter(pool.workspaces.values()))
+    selected, topk_sum = tp_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        scale_format="e4m3_k16",
+        collect_activation_amax=True,
+    )
+
+    assert captured["collect_activation_amax"] is True
+    assert workspace.planned_collect_activation_amax is True
+    assert selected is fused
+    assert topk_sum is not None
+
+
+def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            weight_E=8,
+            k=128,
+            n=64,
+            num_topk=2,
+            dtype=torch.bfloat16,
+            route_num_experts=0,
+            quant_mode="w4a16",
+        )
+    )
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+    activation_amax = torch.zeros((3, 8, 2), dtype=torch.float32)
+    output = torch.empty_like(tensors["a"])
+    prepared = SimpleNamespace(
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=64,
+        params_dtype=torch.bfloat16,
+        is_gated=True,
+        weight_layout="packed",
+        scale_format="e4m3_k16",
+    )
+    binding = plan.bind(
+        scratch=scratch,
+        **tensors,
+        output=output,
+        quant_mode="w4a16",
+        prepared_w4a16=prepared,
+        activation_amax=activation_amax,
+        layer_idx=2,
+    )
+    calls = {}
+
+    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
+
+    def _fake_run_w4a16(*args, **kwargs):
+        calls.update(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(w4a16_kernel, "run_w4a16_moe", _fake_run_w4a16)
+
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
+
+    assert result is output
+    assert calls["activation_amax"] is activation_amax
+    assert calls["layer_idx"] == 2
+
+
+def test_activation_amax_is_w4a16_only() -> None:
+    plan = plan_tp_moe_scratch(_caps())
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+    activation_amax = torch.zeros((1, 8, 2), dtype=torch.float32)
+    binding = plan.bind(
+        scratch=scratch,
+        **tensors,
+        activation_amax=activation_amax,
+        layer_idx=0,
+    )
+
+    with pytest.raises(NotImplementedError, match="only supported for W4A16"):
+        tp_moe_impl.b12x_moe_fp4(binding=binding)
+
+
 def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)

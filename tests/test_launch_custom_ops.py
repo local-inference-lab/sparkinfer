@@ -304,6 +304,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
         route_count = torch.empty((1,), dtype=torch.int32)
         scratch = torch.empty((1024,), dtype=torch.float32)
         workspace = torch.empty((512,), dtype=torch.int32)
+        activation_amax = torch.empty((2, 4, 2), dtype=torch.float32)
 
         torch.ops.b12x.w4a16_fused_moe_launch(
             a,
@@ -347,6 +348,51 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             "w13",
             False,
             False,
+            0,
+        )
+
+        torch.ops.b12x.w4a16_fused_moe_calibrated_launch(
+            a,
+            w13_u8,
+            w2_u8,
+            fc1_out,
+            activated,
+            fc2_out,
+            scale_i32,
+            scale_i32,
+            global_scale,
+            global_scale,
+            packed_routes,
+            block_experts,
+            route_count,
+            activation_amax,
+            1,
+            topk_weights,
+            scratch,
+            scratch,
+            workspace,
+            2,
+            2,
+            128,
+            64,
+            4,
+            2,
+            "silu",
+            False,
+            False,
+            16,
+            4,
+            "bf16",
+            True,
+            120,
+            101376,
+            False,
+            0.0,
+            1.0,
+            0.0,
+            "modelopt",
+            "e8m0_k32",
+            "w13",
             0,
         )
 
