@@ -42,7 +42,14 @@ _PAGED_INDEX_CACHE_ROW_BYTES = PAGED_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
 _PAGED_INDEX_CACHE_DATA_BYTES = PAGED_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "q_rows",
+        "page_table_width",
+        "source_page_offset",
+        "cache_row_stride_bytes",
+    ]
+)
 def _gather_shared_paged_supertile_kernel(
     index_k_cache,
     real_page_table,
