@@ -553,6 +553,7 @@ def index_topk_fp8(
     topk: int | None = None,
     expected_num_q_heads: int | None = None,
     out_indices: torch.Tensor | None = None,
+    out_scores: torch.Tensor | None = None,
     supertile_k: int | None = None,
 ) -> torch.Tensor:
     """Indexer top-k selection over the paged FP8 index cache.
@@ -563,7 +564,9 @@ def index_topk_fp8(
     run_contiguous_logits_kernel). Routes the few-row decode case onto the fused
     score+select kernel (no external top-k blob) and otherwise scores into a
     tiled-logits supertile and folds the shared `run_tiled_topk` selector.
-    Returns top-k indices per query row.
+    Returns top-k indices per query row. When ``out_scores`` is provided, it is
+    filled with the float32 top-k scores corresponding position-for-position to
+    the returned indices.
     """
 
     metadata, scratch, binding_active_width = _resolve_binding_metadata(
@@ -598,12 +601,14 @@ def index_topk_fp8(
     if topk is None:
         if out_indices is not None:
             topk = int(out_indices.shape[1])
+        elif out_scores is not None:
+            topk = int(out_scores.shape[1])
         else:
             topk = int(getattr(scratch, "topk", 0))
             if topk <= 0:
                 raise RuntimeError(
                     "paged index supertile top-k requires topk, out_indices, "
-                    "or a bound scratch with topk capacity"
+                    "out_scores, or a bound scratch with topk capacity"
                 )
     topk = int(topk)
     if out_indices is not None:
@@ -614,6 +619,16 @@ def index_topk_fp8(
             )
         if out_indices.dtype != torch.int32 or not out_indices.is_contiguous():
             raise ValueError("out_indices must be contiguous torch.int32")
+    if out_scores is not None:
+        if out_scores.shape != (q_rows, topk):
+            raise ValueError(
+                f"out_scores must have shape {(q_rows, topk)}, got "
+                f"{tuple(out_scores.shape)}"
+            )
+        if out_scores.dtype != torch.float32 or not out_scores.is_contiguous():
+            raise ValueError("out_scores must be contiguous torch.float32")
+        if out_scores.device != q_fp8.device:
+            raise ValueError("out_scores device must match q_fp8")
 
     page_table_width = int(metadata.real_page_table.shape[1])
 
@@ -640,6 +655,7 @@ def index_topk_fp8(
             num_heads=indexer_heads,
             topk=topk,
             out_indices=out_indices,
+            out_values=out_scores,
             pack_values=cache[0],
             pack_indices=cache[1],
             merge_state=cache[2],
@@ -683,7 +699,7 @@ def index_topk_fp8(
     scratch_values, scratch_raw_indices = scratch.get_indexer_contiguous_topk_buffers(
         row_count=q_rows,
     )
-    final_values = scratch_values[:, :topk]
+    final_values = out_scores if out_scores is not None else scratch_values[:, :topk]
     final_raw_indices = out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
     if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (q_rows, topk):
         raise ValueError(

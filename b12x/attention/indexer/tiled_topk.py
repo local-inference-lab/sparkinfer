@@ -1185,14 +1185,11 @@ def run_row_topk(
     flat_input = row_logits.reshape(-1)
     flat_values = topk_values.reshape(-1).contiguous()
     flat_indices = topk_indices.reshape(-1).contiguous()
-    # Row top-k is always a single-chunk (is_first) selection — carry is unread, but
-    # the shared kernel signature still requires the tensors.
-    carry_values = torch.empty(
-        (num_q_rows, topk), dtype=torch.float32, device=row_logits.device
-    )
-    carry_indices = torch.empty(
-        (num_q_rows, topk), dtype=torch.int32, device=row_logits.device
-    )
+    # Row top-k is always a single-chunk (is_first) selection. The carry path is
+    # constexpr-elided, so alias the unread carry tensors to the outputs instead
+    # of allocating throwaways inside graph-captured serving paths.
+    carry_values = topk_values
+    carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
     kernel = _build_row_topk_kernel(topk)

@@ -80,6 +80,28 @@ def _expected_paged_index_topk(
     return raw
 
 
+def _paged_index_logits(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens: torch.Tensor,
+) -> torch.Tensor:
+    return paged_index_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(
+            q_fp8.shape[0],
+            dtype=torch.int32,
+            device=q_fp8.device,
+        ),
+        seqlens_per_query=seqlens,
+    )
+
+
 def _bind_paged_indexer(
     *,
     device: torch.device,
@@ -286,6 +308,7 @@ def test_index_topk_fp8_graph_matches_reference(
         / 3
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    actual_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
 
     def prepare(page_starts: list[int], seqlens_list: list[int]):
         live_table = _make_real_page_table(
@@ -325,6 +348,7 @@ def test_index_topk_fp8_graph_matches_reference(
         expected_num_q_heads=num_heads,
         binding=binding,
         out_indices=actual,
+        out_scores=actual_scores,
         supertile_k=512,
     )
     torch.cuda.synchronize(device)
@@ -339,6 +363,7 @@ def test_index_topk_fp8_graph_matches_reference(
             expected_num_q_heads=num_heads,
             binding=binding,
             out_indices=actual,
+            out_scores=actual_scores,
             supertile_k=512,
         )
     graph.replay()
@@ -355,6 +380,19 @@ def test_index_topk_fp8_graph_matches_reference(
         torch.sort(actual, dim=1).values,
         torch.sort(expected_raw0, dim=1).values,
     )
+    logits0 = _paged_index_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=graph_real_page_table,
+        seqlens=graph_seqlens,
+    )
+    torch.testing.assert_close(
+        actual_scores,
+        torch.gather(logits0, 1, actual.to(torch.int64)),
+        rtol=0,
+        atol=1e-2,
+    )
 
     prepare([4, 8], [640, 768])
     graph.replay()
@@ -370,6 +408,19 @@ def test_index_topk_fp8_graph_matches_reference(
     assert torch.equal(
         torch.sort(actual, dim=1).values,
         torch.sort(expected_raw1, dim=1).values,
+    )
+    logits1 = _paged_index_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=graph_real_page_table,
+        seqlens=graph_seqlens,
+    )
+    torch.testing.assert_close(
+        actual_scores,
+        torch.gather(logits1, 1, actual.to(torch.int64)),
+        rtol=0,
+        atol=1e-2,
     )
 
 
