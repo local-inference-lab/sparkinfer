@@ -235,6 +235,50 @@ def run_unified_prefill(
                 model_type=ModelType.GLM_NSA,
                 scale_format=ScaleFormat.ARBITRARY_FP32,
             )
+        if heads > hpb and heads % (2 * hpb) == hpb:
+            # GLM TP/DCP layouts can produce odd 16-head multiples after virtual
+            # padding, e.g. TP6/DCP3 -> 48 and TP6/DCP6 -> 80. The MG kernel
+            # supports paired 32-head launches and single 16-head launches; run
+            # both over disjoint output/LSE head ranges instead of rejecting.
+            from .prefill_mg import run_unified_prefill_mg
+
+            paired_heads = heads - hpb
+            run_unified_prefill_mg(
+                q=q,
+                kv_cache=kv_cache,
+                topk_indices=topk_indices,
+                sm_scale=sm_scale,
+                page_block_size=page_block_size,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                output=output,
+                lse_out=lse_out,
+                stride_kv_block=stride_kv_block,
+                compute_mode=ComputeMode.FP8,
+                mg_n_hg=2,
+                model_type=ModelType.GLM_NSA,
+                scale_format=ScaleFormat.ARBITRARY_FP32,
+                active_heads=paired_heads,
+                head_offset=0,
+            )
+            return run_unified_prefill_mg(
+                q=q,
+                kv_cache=kv_cache,
+                topk_indices=topk_indices,
+                sm_scale=sm_scale,
+                page_block_size=page_block_size,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                output=output,
+                lse_out=lse_out,
+                stride_kv_block=stride_kv_block,
+                compute_mode=ComputeMode.FP8,
+                mg_n_hg=1,
+                model_type=ModelType.GLM_NSA,
+                scale_format=ScaleFormat.ARBITRARY_FP32,
+                active_heads=hpb,
+                head_offset=paired_heads,
+            )
     _mg_base = (
         _mg_enabled
         and not has_extra
