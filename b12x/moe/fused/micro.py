@@ -414,7 +414,9 @@ class MoEMicroKernelBackend:
         """Decode one block-scale byte to f32 (E8M0 in MXFP4 mode, else E4M3)."""
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             return cvt_e8m0_to_f32(byte)
-        return cvt_w4a16_packed_e4m3_scale_to_f32(byte)
+        if cutlass.const_expr(self.w4a16_mode):
+            return cvt_w4a16_packed_e4m3_scale_to_f32(byte)
+        return cvt_e4m3_to_f32_via_f16(byte)
 
     @cute.jit
     def _scale_word_to_f32x4(
