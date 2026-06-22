@@ -6390,7 +6390,7 @@ def run_w4a16_moe(
             or micro_w2_global is None
         ):
             raise RuntimeError(
-                "W4A16 small-M direct path requires native ModelOpt micro scale metadata"
+                "W4A16 small-M direct path requires prepared micro scale metadata"
             )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
