@@ -221,6 +221,22 @@ def _process_nvfp4_packed_global_scale(
     return global_scale * (2.0 ** (exponent_bias - 7))
 
 
+def _process_nvfp4_micro_global_scale_from_packed(
+    packed_global_scale: torch.Tensor,
+    *,
+    a_dtype: torch.dtype,
+) -> torch.Tensor:
+    if a_dtype == torch.float16:
+        target_exponent = 5
+    elif a_dtype == torch.bfloat16:
+        target_exponent = 8
+    else:
+        raise TypeError(f"unsupported W4A16 activation dtype {a_dtype}")
+    fp4_exponent = 2
+    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
+    return (packed_global_scale * (2.0 ** (-exponent_bias))).to(torch.float32).contiguous()
+
+
 def _normalize_source_format(source_format: str) -> str:
     if source_format.lower() == "mxfp4_native":
         raise ValueError(
@@ -836,10 +852,16 @@ def prepare_w4a16_modelopt_native_weights(
         is_gated=is_gated,
         params_dtype=params_dtype,
         source_format=source_format,
-        micro_w13_scale=w13_blockscale.contiguous(),
-        micro_w13_global_scale=native_w13_global_scale.contiguous(),
-        micro_w2_scale=w2_blockscale.contiguous(),
-        micro_w2_global_scale=native_w2_global_scale.contiguous(),
+        micro_w13_scale=packed_w13_scale,
+        micro_w13_global_scale=_process_nvfp4_micro_global_scale_from_packed(
+            packed_w13_global_scale,
+            a_dtype=params_dtype,
+        ),
+        micro_w2_scale=packed_w2_scale,
+        micro_w2_global_scale=_process_nvfp4_micro_global_scale_from_packed(
+            packed_w2_global_scale,
+            a_dtype=params_dtype,
+        ),
         w13_layout=w13_layout,
     )
 

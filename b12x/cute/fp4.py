@@ -3437,6 +3437,38 @@ def cvt_e4m3_to_f32_via_f16(
 
 
 @dsl_user_op
+def cvt_w4a16_packed_e4m3_scale_to_f32(
+    packed_byte: Uint32, *, loc=None, ip=None
+) -> Float32:
+    """Scalar mirror of packed_dequant_e4m3x4_to_bfloat2x2 for W4A16 scales."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(packed_byte).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 bits, tmp;
+                .reg .b16 bf;
+                and.b32 bits, $1, 0x80;
+                shl.b32 bits, bits, 7;
+                and.b32 tmp, $1, 0x7f;
+                shl.b32 tmp, tmp, 4;
+                or.b32 bits, bits, tmp;
+                cvt.u16.u32 bf, bits;
+                cvt.f32.bf16 $0, bf;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def dequant_kv_e4m3_pair_to_bf16x2(
     p0: Uint32, p1: Uint32, scale_f: Float32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
