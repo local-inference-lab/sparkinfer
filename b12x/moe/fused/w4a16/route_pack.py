@@ -20,6 +20,65 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 128
 _SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT = 65536
 
 
+_FAST_COUNT_BLOCK_T = 1024
+
+
+@triton.jit
+def _w4a16_route_count_kernel(
+    topk_ids,
+    expert_map,
+    counts,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Parallel atomic histogram of routes per (mapped) expert.
+
+    Multi-program replacement for the single-CTA count loop in
+    ``_pack_topk_routes_prefix_kernel`` -- same expert-id resolution as the
+    sort kernel (expert_map aware). Writes ``counts[NUM_EXPERTS]``."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
+        tl.int32
+    )
+    valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    tl.atomic_add(counts + ids, 1, sem="relaxed", mask=valid)
+
+
+@triton.jit
+def _w4a16_route_prefix_from_counts_kernel(
+    counts,
+    packed_route_count,
+    expert_offsets,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Tiny over-experts block-padded prefix from precomputed counts.
+
+    Emits exactly the ``expert_offsets`` / ``packed_route_count`` contract of
+    ``_pack_topk_routes_prefix_kernel`` (clean block-padded prefix; the sort
+    kernel later advances expert_offsets in place)."""
+    experts = tl.arange(0, BLOCK_E)
+    mask = experts < NUM_EXPERTS
+    counts_v = tl.load(counts + experts, mask=mask, other=0)
+    padded = ((counts_v + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    padded = tl.where(mask, padded, 0)
+    inclusive = tl.cumsum(padded, axis=0)
+    prefix = inclusive - padded
+    total = tl.sum(padded, axis=0)
+    tl.store(expert_offsets + experts, prefix, mask=mask)
+    tl.store(expert_offsets + NUM_EXPERTS, total)
+    tl.store(packed_route_count, total)
+
+
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
@@ -347,20 +406,51 @@ def pack_topk_routes_by_expert(
                 triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
             ),
         )
-        _pack_topk_routes_prefix_kernel[(1,)](
-            topk_ids,
-            expert_map_tensor,
-            packed_route_count,
-            expert_offsets,
-            numel,
-            NUMEL_CAPACITY=numel_capacity,
-            BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
-            HAS_EXPERT_MAP=expert_map is not None,
-            BLOCK_E=block_e,
-            BLOCK_T=_COUNT_BLOCK_T,
-            num_warps=8,
-        )
+        if not torch.cuda.is_current_stream_capturing():
+            # FAST (eager prefill): parallel atomic count + tiny over-experts
+            # block-padded prefix, replacing the single-CTA count+prefix
+            # (~7-31x measured at prefill). Only the large path (routes > 4096,
+            # i.e. > 512 tokens) reaches here, and cudagraph capture is bounded
+            # to <=128 tokens (the small-prefix path), so this scratch alloc is
+            # never captured. The slow single-CTA kernel stays as the defensive
+            # captured-path fallback below.
+            expert_counts = torch.zeros(
+                int(num_experts), dtype=torch.int32, device=topk_ids.device
+            )
+            _w4a16_route_count_kernel[(triton.cdiv(numel, _FAST_COUNT_BLOCK_T),)](
+                topk_ids,
+                expert_map_tensor,
+                expert_counts,
+                numel,
+                NUM_EXPERTS=int(num_experts),
+                HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_T=_FAST_COUNT_BLOCK_T,
+                num_warps=4,
+            )
+            _w4a16_route_prefix_from_counts_kernel[(1,)](
+                expert_counts,
+                packed_route_count,
+                expert_offsets,
+                BLOCK_SIZE=int(block_size),
+                NUM_EXPERTS=int(num_experts),
+                BLOCK_E=block_e,
+                num_warps=4,
+            )
+        else:
+            _pack_topk_routes_prefix_kernel[(1,)](
+                topk_ids,
+                expert_map_tensor,
+                packed_route_count,
+                expert_offsets,
+                numel,
+                NUMEL_CAPACITY=numel_capacity,
+                BLOCK_SIZE=int(block_size),
+                NUM_EXPERTS=int(num_experts),
+                HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_E=block_e,
+                BLOCK_T=_COUNT_BLOCK_T,
+                num_warps=8,
+            )
         _pack_topk_routes_post_prefix_kernel[post_prefix_grid](
             packed_route_indices,
             block_expert_ids,
