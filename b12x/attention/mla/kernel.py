@@ -1247,7 +1247,18 @@ def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
     # are non-contiguous [blocks, page_bytes] tensors whose storage_offset points
     # at this layer's payload inside a larger packed block. Do not reshape those:
     # reshape would materialize a contiguous copy and lose the packed layout.
-    return cache.reshape(-1) if cache.is_contiguous() else cache
+    if cache.is_contiguous():
+        return cache.reshape(-1)
+    if cache.ndim < 2:
+        return cache
+
+    # Kernels compute raw byte offsets as block * stride_kv_block + in-page byte.
+    # Give Cute a 1-D view over the physical byte span for this layer so
+    # pointer+offset arithmetic stays raw-address based while preserving the
+    # original storage_offset. The explicit stride_kv_block argument still
+    # carries the packed block stride; this view only defines the base pointer.
+    span = (int(cache.shape[0]) - 1) * int(cache.stride(0)) + int(cache.shape[1])
+    return torch.as_strided(cache, size=(span,), stride=(1,))
 
 
 def _cache_block_stride_bytes(
