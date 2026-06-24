@@ -100,6 +100,33 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
     return c
 
 
+def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
+    return cache.reshape(-1) if cache.is_contiguous() else cache
+
+
+def _cache_block_stride_bytes(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    is_glm: bool,
+) -> int:
+    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
+
+    if is_glm:
+        expected = int(page_size) * _GLM_IO_STRIDE
+    else:
+        expected = int(compressed_mla_page_nbytes(int(page_size)))
+    if cache.ndim >= 2:
+        stride = int(cache.stride(0)) * int(cache.element_size())
+        if stride < expected:
+            raise ValueError(
+                f"SM120 sparse MLA prefill cache block stride {stride} is "
+                f"smaller than page payload {expected}"
+            )
+        return stride
+    return expected
+
+
 def _topk_bucket(topk: int) -> int:
     return 1 << (max(int(topk), 1) - 1).bit_length()
 
@@ -2765,9 +2792,6 @@ def _sparse_mla_prefill_mg_dual_fake(
     return None
 
 
-_GLM_KV_GMEM_STRIDE = 656
-
-
 def run_unified_prefill_mg(
     *,
     q: torch.Tensor,
@@ -2792,8 +2816,6 @@ def run_unified_prefill_mg(
     active_heads: int | None = None,
     head_offset: int = 0,
 ):
-    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
-
     model_type = int(model_type)
     is_glm = model_type == ModelType.GLM_NSA
     # DSV4 dual-cache (has_extra) union. all-or-none + DSV4-only (GLM has no extra
@@ -2860,12 +2882,11 @@ def run_unified_prefill_mg(
         attn_sink_t = torch.zeros(1, dtype=torch.float32, device=device)
 
     if stride_kv_block is None:
-        if is_glm:
-            # GLM cache: per-token 656B contiguous record; a paged "block" holds
-            # page_block_size tokens, so the per-block byte stride is pbs*656.
-            stride_kv_block = int(page_block_size) * _GLM_KV_GMEM_STRIDE
-        else:
-            stride_kv_block = int(compressed_mla_page_nbytes(int(page_block_size)))
+        stride_kv_block = _cache_block_stride_bytes(
+            kv_cache,
+            page_size=int(page_block_size),
+            is_glm=bool(is_glm),
+        )
 
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()
@@ -2880,7 +2901,11 @@ def run_unified_prefill_mg(
         # its per-token length. row_xor = (pbs_extra == 2) (FI USE_WFP8_ROW_XOR).
         pbs_extra = int(extra_page_block_size)
         if stride_extra_kv_block is None:
-            stride_extra_kv_block = int(compressed_mla_page_nbytes(pbs_extra))
+            stride_extra_kv_block = _cache_block_stride_bytes(
+                extra_kv_cache,
+                page_size=pbs_extra,
+                is_glm=False,
+            )
         extra_topk = int(extra_indices.shape[1])
         num_extra_tiles = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         num_tiles = num_main_tiles + num_extra_tiles
@@ -2897,13 +2922,13 @@ def run_unified_prefill_mg(
         if active_heads == total_heads and head_offset == 0:
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
                 q,
-                kv_cache.reshape(-1),
+                _cache_base_tensor(kv_cache),
                 topk_indices,
                 topk_length,
                 attn_sink_t,
                 output,
                 lse_out,
-                extra_kv_cache.reshape(-1),
+                _cache_base_tensor(extra_kv_cache),
                 extra_indices_t,
                 extra_len_t,
                 float(sm_scale),
@@ -2925,13 +2950,13 @@ def run_unified_prefill_mg(
         else:
             _sparse_mla_prefill_mg_flat_launch(
                 q,
-                kv_cache.reshape(-1),
+                _cache_base_tensor(kv_cache),
                 topk_indices,
                 topk_length,
                 attn_sink_t,
                 output,
                 lse_out,
-                extra_kv_cache.reshape(-1),
+                _cache_base_tensor(extra_kv_cache),
                 extra_indices_t,
                 extra_len_t,
                 float(sm_scale),
@@ -2958,7 +2983,7 @@ def run_unified_prefill_mg(
     if active_heads == total_heads and head_offset == 0:
         torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
-            kv_cache.reshape(-1),
+            _cache_base_tensor(kv_cache),
             topk_indices,
             topk_length,
             attn_sink_t,
@@ -2978,13 +3003,13 @@ def run_unified_prefill_mg(
     else:
         _sparse_mla_prefill_mg_flat_launch(
             q,
-            kv_cache.reshape(-1),
+            _cache_base_tensor(kv_cache),
             topk_indices,
             topk_length,
             attn_sink_t,
             output,
             lse_out,
-            kv_cache.reshape(-1),  # extra_kv_flat alias (never read)
+            _cache_base_tensor(kv_cache),  # extra_kv_flat alias (never read)
             topk_indices,          # extra_indices alias (never read)
             topk_length,           # extra_len alias (never read)
             float(sm_scale),
