@@ -681,6 +681,16 @@ def index_topk_fp8(
             "paged index supertile top-k scratch page-table capacity is too small: "
             f"need={page_table_width}, have={getattr(scratch, 'max_page_table_width', None)}"
         )
+    if (
+        route == "packed_contiguous"
+        and int(index_k_cache.stride(0)) != int(_PAGED_INDEX_CACHE_ROW_BYTES)
+    ):
+        # DS4 packed KV stores each layer as a strided view into a larger
+        # per-block allocation. The packed-contiguous prefill scorer first gathers
+        # a shared supertile into contiguous scratch; that path is only valid for
+        # physically contiguous page rows. The tiled scorer consumes the runtime
+        # cache stride and keeps the vLLM packed-KV layout intact.
+        route = "paged_tiled"
     use_shared_prefill_scorer = route == "packed_contiguous"
     topk_block_k = (
         int(getattr(binding, "prefill_block_k", 0) or getattr(scratch, "prefill_block_k", 0))
