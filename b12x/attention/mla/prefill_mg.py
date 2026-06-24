@@ -101,7 +101,17 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
 
 
 def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
-    return cache.reshape(-1) if cache.is_contiguous() else cache
+    if cache.is_contiguous():
+        return cache.reshape(-1)
+    if cache.ndim < 2:
+        return cache
+
+    # Packed vLLM DS4 cache views are [blocks, page_bytes] with a storage_offset
+    # into a larger per-block allocation. The MG kernels do raw pointer-offset
+    # indexing, so expose the physical byte span for this layer as a 1-D view
+    # and keep the packed block stride in the explicit stride argument.
+    span = (int(cache.shape[0]) - 1) * int(cache.stride(0)) + int(cache.shape[1])
+    return torch.as_strided(cache, size=(span,), stride=(1,))
 
 
 def _cache_block_stride_bytes(
