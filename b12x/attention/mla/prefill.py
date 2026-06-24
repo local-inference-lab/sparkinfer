@@ -41,6 +41,29 @@ _GLM_HEAD_DIM = 576
 _GLM_KV_GMEM_STRIDE = 656
 
 
+def _cache_block_stride_bytes(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    model_type: ModelType,
+) -> int:
+    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
+
+    if model_type == ModelType.GLM_NSA:
+        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
+    else:
+        expected = int(compressed_mla_page_nbytes(int(page_size)))
+    if cache.ndim >= 2:
+        stride = int(cache.stride(0)) * int(cache.element_size())
+        if stride < expected:
+            raise ValueError(
+                f"SM120 sparse MLA cache block stride {stride} is smaller than "
+                f"page payload {expected}"
+            )
+        return stride
+    return expected
+
+
 def run_unified_prefill(
     *,
     q: torch.Tensor,
@@ -97,8 +120,6 @@ def run_unified_prefill(
 
     Returns (O[T, heads, D_V=512] bf16, lse[T, heads] f32 base-2).
     """
-    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
-
     del workspace  # prefill is single-pass; no split/merge workspace needed.
 
     q_head_dim = int(q.shape[-1])
@@ -155,12 +176,11 @@ def run_unified_prefill(
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
 
     if stride_kv_block is None:
-        if model_type == ModelType.GLM_NSA:
-            # GLM cache: per-token 656B contiguous record; a paged "block" holds
-            # page_block_size tokens, so the per-block byte stride is pbs*656.
-            stride_kv_block = int(page_block_size) * _GLM_KV_GMEM_STRIDE
-        else:
-            stride_kv_block = int(compressed_mla_page_nbytes(int(page_block_size)))
+        stride_kv_block = _cache_block_stride_bytes(
+            kv_cache,
+            page_size=int(page_block_size),
+            model_type=model_type,
+        )
 
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()

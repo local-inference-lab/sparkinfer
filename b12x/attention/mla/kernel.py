@@ -1242,6 +1242,37 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
     return c
 
 
+def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
+    # Contiguous cache can use the historical flat view. Packed vLLM cache views
+    # are non-contiguous [blocks, page_bytes] tensors whose storage_offset points
+    # at this layer's payload inside a larger packed block. Do not reshape those:
+    # reshape would materialize a contiguous copy and lose the packed layout.
+    return cache.reshape(-1) if cache.is_contiguous() else cache
+
+
+def _cache_block_stride_bytes(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    model_type: int,
+) -> int:
+    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
+
+    if int(model_type) == int(ModelType.GLM_NSA):
+        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
+    else:
+        expected = int(compressed_mla_page_nbytes(int(page_size)))
+    if cache.ndim >= 2:
+        stride = int(cache.stride(0)) * int(cache.element_size())
+        if stride < expected:
+            raise ValueError(
+                f"SM120 sparse MLA cache block stride {stride} is smaller than "
+                f"page payload {expected}"
+            )
+        return stride
+    return expected
+
+
 def _topk_bucket(topk: int) -> int:
     """Coarse topk bucket for the compile key (chunks_per_split is the real
     specialization driver; the bucket just keeps the key compact)."""
@@ -1582,8 +1613,6 @@ def run_unified_decode(
     section). With no extra cache the kernel is compiled with ``has_extra=False``
     so the extra-section code is const_expr-elided (PTX byte-identical).
     """
-    from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
-
     has_extra = (
         indexed_k_cache is not None
         or indexed_indices is not None
@@ -1791,33 +1820,33 @@ def run_unified_decode(
         # every (token, head, split) it actually runs.
         mid_lse.fill_(float("-inf"))
 
-    if model_type == ModelType.GLM_NSA:
-        # GLM cache: per-token 656B contiguous record; one paged "block" holds
-        # page_block_size tokens, so the per-block byte stride is pbs*656.
-        stride_kv_block = int(swa_page_size) * _GLM_KV_GMEM_STRIDE
-    else:
-        stride_kv_block = int(compressed_mla_page_nbytes(int(swa_page_size)))
+    stride_kv_block = _cache_block_stride_bytes(
+        swa_k_cache,
+        page_size=int(swa_page_size),
+        model_type=int(model_type),
+    )
 
     # ── EXTRA (indexed) cache views. When there is no extra cache they alias the
     #    main cache / main indices and the kernel's has_extra=False const_expr
     #    elides the extra-section reads -> PTX byte-identical. ──
     if has_extra:
         pbs_extra = int(indexed_page_size)
-        # The extra cache uses the IDENTICAL DSV4 compressed packed byte layout, so
-        # its per-block stride is compressed_mla_page_nbytes(pbs_extra) (same as
-        # the main cache derives from swa_page_size). DSV4-only here.
-        stride_extra_kv_block = int(compressed_mla_page_nbytes(pbs_extra))
-        extra_kv_flat = indexed_k_cache.reshape(-1)
+        stride_extra_kv_block = _cache_block_stride_bytes(
+            indexed_k_cache,
+            page_size=pbs_extra,
+            model_type=int(model_type),
+        )
+        extra_kv_flat = _cache_base_tensor(indexed_k_cache)
         extra_indices_t = indexed_indices.contiguous()
     else:
         pbs_extra = 1
         stride_extra_kv_block = 0
-        extra_kv_flat = swa_k_cache.reshape(-1)  # alias (never read when has_extra=False)
+        extra_kv_flat = _cache_base_tensor(swa_k_cache)  # alias (never read when has_extra=False)
         extra_indices_t = swa_indices            # alias (never read)
 
     output = workspace.output_buffer[:rows, :heads, :d_v]
 
-    kv_flat = swa_k_cache.reshape(-1)
+    kv_flat = _cache_base_tensor(swa_k_cache)
     swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices
     extra_len_for_op = extra_len_t if extra_len_t is not None else swa_indices
 

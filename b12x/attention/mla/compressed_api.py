@@ -421,8 +421,11 @@ def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.
         )
     if byte_cache.ndim != 2:
         raise ValueError(f"{name} must have shape [pages, page_bytes], got {tuple(cache.shape)}")
-    if not byte_cache.is_contiguous():
-        raise ValueError(f"{name} must be contiguous for compressed MLA")
+    if int(byte_cache.stride(1)) != 1:
+        raise ValueError(
+            f"{name} page payload must be contiguous in the last dimension, "
+            f"got stride {tuple(byte_cache.stride())}"
+        )
     return byte_cache
 
 
