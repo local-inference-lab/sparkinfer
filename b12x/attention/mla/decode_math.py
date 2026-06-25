@@ -309,6 +309,7 @@ def s1_qk_nope_block_scaled(
     kv_smem_stride: cutlass.Constexpr,  # 464
     scale_bytes_per_token: cutlass.Constexpr,  # 8
     scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -357,6 +358,7 @@ def s1_qk_nope_block_scaled(
     sfa_head = gid + (lane & Int32(1)) * Int32(8)
     # sfb candidate row = warp_first_cand + gid (the N-tile base + gid). nt=0.
     sfb_cand = warp_first_cand + gid
+    hi = cutlass.const_expr(valid_hpb > 8)
 
     for blk in cutlass.range_constexpr(num_scales):
         # sfa = exponent byte of the FP32 pow2 Q scale for this (head, blk).
@@ -405,8 +407,9 @@ def s1_qk_nope_block_scaled(
         if cutlass.const_expr(scale_format == 0):
             qk[0] = acc0
             qk[1] = acc1
-            qk[2] = acc2
-            qk[3] = acc3
+            if cutlass.const_expr(hi):
+                qk[2] = acc2
+                qk[3] = acc3
         else:
             # GLM: post-MMA FP32 scale by the per-candidate arbitrary fp32 group
             # scale (legacy _accumulate_scaled_score_frag). c0 -> qk[0]/qk[2];
@@ -420,8 +423,9 @@ def s1_qk_nope_block_scaled(
                 + glm_scale_base + Int32(blk) * Int32(4)))
             qk[0] = qk[0] + acc0 * ks0
             qk[1] = qk[1] + acc1 * ks1
-            qk[2] = qk[2] + acc2 * ks0
-            qk[3] = qk[3] + acc3 * ks1
+            if cutlass.const_expr(hi):
+                qk[2] = qk[2] + acc2 * ks0
+                qk[3] = qk[3] + acc3 * ks1
     return qk
 
 
@@ -437,6 +441,7 @@ def s2_qk_rope_bf16(
     lane: Int32,
     *,
     d_rope: cutlass.Constexpr,        # 64
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S2: accumulate Q_rope . K_rope into qk[0..3] via D_ROPE/16=4 bf16 MMAs.
 
@@ -450,6 +455,7 @@ def s2_qk_rope_bf16(
     a_col = (lane >> Int32(4)) * Int32(8)
     # Each lane's K-rope entry = warp_first_cand + gid (nt=0).
     entry = warp_first_cand + gid
+    hi = cutlass.const_expr(valid_hpb > 8)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -467,8 +473,9 @@ def s2_qk_rope_bf16(
         )
         qk[0] = d0
         qk[1] = d1
-        qk[2] = d2
-        qk[3] = d3
+        if cutlass.const_expr(hi):
+            qk[2] = d2
+            qk[3] = d3
     return qk
 
 
@@ -776,6 +783,7 @@ def s6_xv_nope(
     scale_format: cutlass.Constexpr = 0,    # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -811,6 +819,7 @@ def s6_xv_nope(
     warp_first_cand = warp_id * Int32(8)
     cand_e0 = warp_first_cand + tid * Int32(2)
     cand_e1 = cand_e0 + Int32(1)
+    hi = cutlass.const_expr(valid_hpb > 8)
 
     glm_scale_base = Int32(n_v_chunks) * Int32(v_chunk)  # == D_NOPE (GLM)
 
@@ -830,17 +839,18 @@ def s6_xv_nope(
         vsc0 = _vsc(cand_e0, vc)
         vsc1 = _vsc(cand_e1, vc)
         m0 = fmax_f32(fabs_f32(w_pre[0] * vsc0), fabs_f32(w_pre[1] * vsc1))
-        m1 = fmax_f32(fabs_f32(w_pre[2] * vsc0), fabs_f32(w_pre[3] * vsc1))
         w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
         sc0_addr = w_head_sc_base + (Int32(vc) * Int32(hpb) + gid) * Int32(4)
-        sc1_addr = w_head_sc_base + (Int32(vc) * Int32(hpb) + gid + Int32(8)) * Int32(4)
         atomic_max_shared_f32(sc0_addr, m0)
-        atomic_max_shared_f32(sc1_addr, m1)
+        if cutlass.const_expr(hi):
+            m1 = fmax_f32(fabs_f32(w_pre[2] * vsc0), fabs_f32(w_pre[3] * vsc1))
+            sc1_addr = w_head_sc_base + (Int32(vc) * Int32(hpb) + gid + Int32(8)) * Int32(4)
+            atomic_max_shared_f32(sc1_addr, m1)
     cute.arch.barrier(**bar_kw)
 
     # --- (2) normalize w_head_sc -> max(.,1e-10)/FP8_MAX. ---
     i = tid_flat
-    while i < Int32(n_v_chunks * hpb):
+    while i < Int32(n_v_chunks * valid_hpb):
         w_head_sc_view[i] = fmax_f32(w_head_sc_view[i], Float32(1e-10)) * Float32(1.0 / _FP8_MAX)
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
@@ -852,21 +862,23 @@ def s6_xv_nope(
         for vc in cutlass.range_constexpr(n_v_chunks):
             w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
             si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
-            si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
             vsc0 = _vsc(cand_e0, vc)
             vsc1 = _vsc(cand_e1, vc)
             f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
             f01 = _quant_e4m3_byte(w_pre[1] * vsc1 * si0)
-            f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
-            f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
             st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
             st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
-            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
-            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
+            if cutlass.const_expr(hi):
+                si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+                f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
+                f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
+                st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
+                st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
             cute.arch.barrier(**bar_kw)
 
             sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
-            sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+            if cutlass.const_expr(hi):
+                sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
             # A (W) ldmatrix.x4 row/col -- ldmatrix_load_A_fp8 (nt-invariant).
             a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
             a_col = (lane >> Int32(4)) * Int32(16)
@@ -888,8 +900,9 @@ def s6_xv_nope(
                 at = vc * nt_per_warp_xv + nt
                 acc_nope[at][0] = acc_nope[at][0] + xv0 * sc0
                 acc_nope[at][1] = acc_nope[at][1] + xv1 * sc0
-                acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
-                acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
+                if cutlass.const_expr(hi):
+                    acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
+                    acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
         return acc_nope
 
     # GLM (ARBITRARY_FP32, P10f): 2-pass W (HIGH + LOW e4m3 residual) -> ~7 mantissa
@@ -898,9 +911,10 @@ def s6_xv_nope(
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
         si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
-        si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
         sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
-        sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+        if cutlass.const_expr(hi):
+            si1 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+            sc1 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
         vsc0 = _vsc(cand_e0, vc)
         vsc1 = _vsc(cand_e1, vc)
         a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -908,8 +922,9 @@ def s6_xv_nope(
         # normalized W (= w_pre * V_scale / w_head_sc), the e4m3 quant target.
         wn00 = w_pre[0] * vsc0 * si0
         wn01 = w_pre[1] * vsc1 * si0
-        wn10 = w_pre[2] * vsc0 * si1
-        wn11 = w_pre[3] * vsc1 * si1
+        if cutlass.const_expr(hi):
+            wn10 = w_pre[2] * vsc0 * si1
+            wn11 = w_pre[3] * vsc1 * si1
         # per-nt fp32 accumulators, carried across the W hi/lo passes.
         xv = [[Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
               for _ in range(nt_per_warp_xv)]
@@ -921,17 +936,20 @@ def s6_xv_nope(
                 # LOW residual = e4m3(Wn - dequant(hi_byte)); halves W's quant error.
                 f00 = _quant_e4m3_residual_byte(wn00)
                 f01 = _quant_e4m3_residual_byte(wn01)
-                f10 = _quant_e4m3_residual_byte(wn10)
-                f11 = _quant_e4m3_residual_byte(wn11)
+                if cutlass.const_expr(hi):
+                    f10 = _quant_e4m3_residual_byte(wn10)
+                    f11 = _quant_e4m3_residual_byte(wn11)
             else:
                 f00 = _quant_e4m3_byte(wn00)
                 f01 = _quant_e4m3_byte(wn01)
-                f10 = _quant_e4m3_byte(wn10)
-                f11 = _quant_e4m3_byte(wn11)
+                if cutlass.const_expr(hi):
+                    f10 = _quant_e4m3_byte(wn10)
+                    f11 = _quant_e4m3_byte(wn11)
             st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8))
             st_shared_u8(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8))
-            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
-            st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
+            if cutlass.const_expr(hi):
+                st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0, f10.to(cutlass.Uint8))
+                st_shared_u8(w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1, f11.to(cutlass.Uint8))
             cute.arch.barrier(**bar_kw)
 
             for nt in cutlass.range_constexpr(nt_per_warp_xv):
@@ -957,8 +975,9 @@ def s6_xv_nope(
             at = vc * nt_per_warp_xv + nt
             acc_nope[at][0] = acc_nope[at][0] + xv[nt][0] * sc0
             acc_nope[at][1] = acc_nope[at][1] + xv[nt][1] * sc0
-            acc_nope[at][2] = acc_nope[at][2] + xv[nt][2] * sc1
-            acc_nope[at][3] = acc_nope[at][3] + xv[nt][3] * sc1
+            if cutlass.const_expr(hi):
+                acc_nope[at][2] = acc_nope[at][2] + xv[nt][2] * sc1
+                acc_nope[at][3] = acc_nope[at][3] + xv[nt][3] * sc1
     return acc_nope
 
 

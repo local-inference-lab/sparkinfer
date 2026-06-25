@@ -112,9 +112,9 @@ def run_unified_prefill(
 
     num_tokens, heads, _ = q.shape
     hpb = 16
-    if heads % hpb != 0:
-        # VALID_HPB<16 small-TP shards are a separate (decode-landed) feature; until
-        # ported in prefill this is an unsupported shape -> RAISE (not legacy).
+    if heads % hpb != 0 and not (0 < heads < hpb):
+        # VALID_HPB<16 is supported only for the single small-TP shard. Other
+        # non-multiple-of-16 layouts still need an explicit split/tail launcher.
         raise ValueError(
             f"SM120 sparse MLA prefill requires heads divisible by HPB={hpb}, got {heads}"
         )
@@ -199,10 +199,9 @@ def run_unified_prefill(
     # arms (post-MMA fp32 QK scale, raw-V + 2-pass-W XV, no XV-rope) and the
     # 656/528 KV geometry -- all const_expr-selected in the SAME MG kernel. Route
     # GLM prefill OFF the slow per-head-block decode-reuse path onto MG:
-    #   heads == 16        -> MG_N_HG=1 (single-group MG)
+    #   heads <= 16        -> MG_N_HG=1 (single-group MG; heads<16 uses VALID_HPB)
     #   heads % 32 == 0    -> MG_N_HG=2 (32/64/128)
-    # heads == 8 (MG_N_HG=1 + VALID_HPB=8) is a follow-on (the heads%16!=0 entry
-    # guard rejects it before here). topk in {512,1024,2048}.
+    # topk in {512,1024,2048}.
     _mg_glm = (
         _mg_enabled
         and not has_extra
@@ -212,7 +211,7 @@ def run_unified_prefill(
     if _mg_glm and topk in (512, 1024, 2048):
         if heads % (2 * hpb) == 0:
             _glm_n_hg = 2
-        elif heads == hpb:
+        elif heads <= hpb:
             _glm_n_hg = 1
         else:
             _glm_n_hg = 0
