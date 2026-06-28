@@ -26,15 +26,16 @@ from b12x.attention.indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
 from b12x.integration.mla import (
+    B12XSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
+    plan_sparse_mla_scratch,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
@@ -795,7 +796,7 @@ def _make_mla_inputs(
     return q_all, k_nope_pool, k_rope_pool, kv_cache
 
 
-def _make_mla_workspace(
+def _make_mla_binding(
     *,
     mode: str,
     cfg: GLMDecodeContractConfig,
@@ -803,18 +804,34 @@ def _make_mla_workspace(
     topk: int,
     max_total_q: int,
     max_batch: int,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
-        mode=mode,
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=cfg.num_local_heads,
-        head_dim=cfg.q_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
-        max_total_q=max_total_q,
-        max_batch=max_batch,
+    q_all: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
+):
+    plan = plan_sparse_mla_scratch(
+        B12XSparseMLAScratchCaps(
+            mode=mode,
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=cfg.num_local_heads,
+            head_dim=cfg.q_head_dim,
+            v_head_dim=cfg.kv_lora_rank,
+            max_width=topk,
+            max_q_rows=max_total_q,
+            max_batch=max_batch,
+            page_size=cfg.page_size,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch_storage = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    return plan.bind(
+        scratch=scratch_storage,
+        q=q_all,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
     )
 
 
@@ -1048,14 +1065,19 @@ def _run_decode_case(
         nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
         max_seq_len_k=aligned_graph_width,
     )
-    mla_workspace = _make_mla_workspace(
+    mla_binding = _make_mla_binding(
         mode="decode",
         cfg=cfg,
         device=device,
         topk=case.topk,
         max_total_q=case.total_q,
         max_batch=case.batch_size,
+        q_all=q_all,
+        selected_indices=mla_metadata.page_table_1,
+        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
+    mla_workspace = mla_binding.scratch
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -1066,12 +1088,8 @@ def _run_decode_case(
 
     def run_mla():
         return sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=mla_metadata.page_table_1,
-            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-            workspace=mla_workspace,
+            binding=mla_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
@@ -1092,13 +1110,15 @@ def _run_decode_case(
             topk=case.topk,
             backend=decode_topk_backend,
         )
-        return sparse_mla_decode_forward(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=topk_indices,
+        step_binding = mla_workspace.bind(
+            q=q_all,
+            selected_indices=topk_indices,
             cache_seqlens_int32=graph_cache_seqlens,
             nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-            workspace=mla_workspace,
+        )
+        return sparse_mla_decode_forward(
+            kv_cache=kv_cache,
+            binding=step_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
@@ -1571,14 +1591,19 @@ def _run_prefill_or_verify_case(
         max_seq_len_k=aligned_graph_width,
         mode=mla_metadata_mode,
     )
-    mla_workspace = _make_mla_workspace(
+    mla_binding = _make_mla_binding(
         mode=mla_workspace_mode,
         cfg=cfg,
         device=device,
         topk=case.topk,
         max_total_q=case.total_q,
         max_batch=case.batch_size,
+        q_all=q_all,
+        selected_indices=mla_metadata.selected_token_offsets,
+        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
+    mla_workspace = mla_binding.scratch
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
         kv_cache=mla_kv_cache,
@@ -1598,25 +1623,23 @@ def _run_prefill_or_verify_case(
 
     def run_mla():
         return sparse_mla_extend_forward(
-            q_all=q_all,
             kv_cache=mla_kv_cache,
-            selected_token_offsets=mla_metadata.selected_token_offsets,
-            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-            workspace=mla_workspace,
+            binding=mla_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
 
     def run_step():
         topk_indices = run_indexer()
-        return sparse_mla_extend_forward(
-            q_all=q_all,
-            kv_cache=mla_kv_cache,
-            selected_token_offsets=topk_indices,
+        step_binding = mla_workspace.bind(
+            q=q_all,
+            selected_indices=topk_indices,
             cache_seqlens_int32=graph_batch_cache_seqlens,
             nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-            workspace=mla_workspace,
+        )
+        return sparse_mla_extend_forward(
+            kv_cache=mla_kv_cache,
+            binding=step_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )

@@ -31,6 +31,7 @@ if _SM120PORT not in sys.path:
     sys.path.insert(0, _SM120PORT)
 import dsv4_ref  # noqa: E402
 import dsv4_extra_ref  # noqa: E402
+import prefill_ref  # noqa: E402
 import glm_ref  # noqa: E402
 
 import b12x.attention.mla.api as mla_api
@@ -972,6 +973,55 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
     cos = _cosine(got, exp)
     assert cos > 0.999, f"DSV4 dual-cache prefill heads=80 O cos={cos}"
     assert (got - exp).abs().max().item() < 2e-2
+
+
+@torch.inference_mode()
+def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
+    """DSV4 prefill heads=8 uses a single MG group with VALID_HPB=8 and must not
+    read or reduce the zero-padded upper half of the HPB=16 tile."""
+    device = require_sm120_sparse_mla()
+    from b12x.attention.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads, topk = 16, 8, 128
+    num_blocks = 8
+    case = prefill_ref.make_dsv4_prefill_case(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        num_blocks=num_blocks,
+        page_block_size=_DSV4_PAGE,
+        with_sink=False,
+        invalidate_half=True,
+        device=device,
+        seed=8128,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, num_blocks)
+    idx = case["topk_indices"].contiguous()
+    lengths = case["topk_lengths"].contiguous()
+
+    O, lse = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    torch.cuda.synchronize()
+
+    got = O.float()
+    exp = case["expected_O"].float()
+    got_lse = lse.float()
+    exp_lse = case["expected_lse"].float()
+    assert got.shape == (num_tokens, num_heads, _DSV4_HEAD_DIM)
+    assert torch.isfinite(got).all()
+    assert torch.isfinite(got_lse).all()
+    assert (O != 0).any()
+    cos = _cosine(got, exp)
+    assert cos > 0.999, f"DSV4 prefill heads=8 O cos={cos}"
+    assert (got - exp).abs().max().item() < 2e-2
+    assert (got_lse - exp_lse).abs().max().item() < 5e-2
 
 
 @torch.inference_mode()

@@ -237,6 +237,7 @@ def s2_qk_rope_global_mg_dsv4(
     *,
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """Fused DSV4 QK-RoPE.
 
@@ -331,6 +332,7 @@ def s2_qk_rope_regs_mg_glm(
     *,
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """GLM MG QK-RoPE. Mirrors ``s2_qk_rope_regs_mg_dsv4`` (registerized Q-rope A,
     KV-rope B from global) but with the GLM record geometry and the GLM B-operand
@@ -344,6 +346,7 @@ def s2_qk_rope_regs_mg_glm(
     entry = warp_first_cand + gid
     idx = Int32(token_idx_view[entry])
     rope_base = _glm_rope_base_off(idx, page_block_size, stride_kv_block)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -352,12 +355,17 @@ def s2_qk_rope_regs_mg_glm(
         b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
         b1 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8))
         base = Int32(ks) * Int32(4)
-        qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
             qk0[0], qk0[1], qk0[2], qk0[3],
             q_rope_regs0[base + 0], q_rope_regs0[base + 1],
             q_rope_regs0[base + 2], q_rope_regs0[base + 3],
             b0, b1,
         )
+        qk0[0] = d0
+        qk0[1] = d1
+        if cutlass.const_expr(hi0):
+            qk0[2] = d2
+            qk0[3] = d3
         if cutlass.const_expr(n_hg == 2):
             qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
                 qk1[0], qk1[1], qk1[2], qk1[3],
@@ -395,13 +403,18 @@ def s0_load_q_bf16_to_smem_mg(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S0 (BF16): cooperative gmem->smem BF16 copy of Q-NoPE + Q-rope for the
     ``n_hg`` head groups. Counterpart to ``s0_quantize_q_to_smem`` -- NO FP8
     quant, no amax/scale (FlashInfer ``load_q_bf16_to_smem``). All HPB heads of
     each group are valid (heads % HPB == 0). The cooperative loops span
     ``n_hg * hpb * d_*`` (one group for n_hg==1); the per-group g==1 store target
-    selection const_expr-elides for n_hg==1 since the loop never reaches g==1."""
+    selection const_expr-elides for n_hg==1 since the loop never reaches g==1.
+
+    ``valid_hpb`` is smaller than ``hpb`` only for the heads==8 small-TP shard.
+    Those inactive rows are zero-filled so the M=16 QK MMA remains well-defined
+    while the epilogue gates stores to the real rows only."""
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
 
     # Q-NoPE -> bf16 smem (all groups). group g head h dim d.
@@ -415,7 +428,12 @@ def s0_load_q_bf16_to_smem_mg(
         if cutlass.const_expr(n_hg == 2):
             if g != Int32(0):
                 dst = q_nope_bf16_g1_addr
-        val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
+        if cutlass.const_expr(valid_hpb == hpb):
+            val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
+        else:
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
         st_shared_bf16_from_f32(dst + (h * Int32(q_nope_bf16_stride) + d) * Int32(2), val)
         i += Int32(num_threads)
 
@@ -430,7 +448,12 @@ def s0_load_q_bf16_to_smem_mg(
         if cutlass.const_expr(n_hg == 2):
             if g != Int32(0):
                 dst = q_rope_g1_addr
-        val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
+        if cutlass.const_expr(valid_hpb == hpb):
+            val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
+        else:
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
         st_shared_bf16_from_f32(dst + (h * Int32(d_rope) + d) * Int32(2), val)
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
@@ -760,6 +783,7 @@ def s4_online_softmax_mg2(
     barrier_id: cutlass.Constexpr,
     n_acc_tiles: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S4 online softmax with FlashInfer-style deferred row sums. Every group-1
     statement is gated inline behind ``const_expr(n_hg == 2)`` so the n_hg==2
@@ -767,32 +791,38 @@ def s4_online_softmax_mg2(
     n_hg==1 cleanly elides all qk1/acc1/rope1/gs1/reduce1 work (single HPB head
     group; the cross-warp reduce spans tid_flat < hpb, group 0 only)."""
     two = cutlass.const_expr(n_hg == 2)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+    reduce_heads = cutlass.const_expr(n_hg * hpb if n_hg == 2 else valid_hpb)
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
     lm00 = fmax_f32(qk0[0], qk0[1])
-    lm01 = fmax_f32(qk0[2], qk0[3])
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(qk0[2], qk0[3])
     if cutlass.const_expr(two):
         lm10 = fmax_f32(qk1[0], qk1[1])
         lm11 = fmax_f32(qk1[2], qk1[3])
     lm00 = fmax_f32(lm00, cute.arch.shuffle_sync_bfly(lm00, offset=2))
-    lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=2))
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=2))
     if cutlass.const_expr(two):
         lm10 = fmax_f32(lm10, cute.arch.shuffle_sync_bfly(lm10, offset=2))
         lm11 = fmax_f32(lm11, cute.arch.shuffle_sync_bfly(lm11, offset=2))
     lm00 = fmax_f32(lm00, cute.arch.shuffle_sync_bfly(lm00, offset=1))
-    lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=1))
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=1))
     if cutlass.const_expr(two):
         lm10 = fmax_f32(lm10, cute.arch.shuffle_sync_bfly(lm10, offset=1))
         lm11 = fmax_f32(lm11, cute.arch.shuffle_sync_bfly(lm11, offset=1))
 
     if tid == Int32(0):
         st_shared_f32(reduce0_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), lm00)
-        st_shared_f32(
-            reduce0_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
-            lm01,
-        )
+        if cutlass.const_expr(hi0):
+            st_shared_f32(
+                reduce0_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
+                lm01,
+            )
         if cutlass.const_expr(two):
             st_shared_f32(reduce1_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), lm10)
             st_shared_f32(
@@ -801,9 +831,13 @@ def s4_online_softmax_mg2(
             )
     cute.arch.barrier(**bar_kw)
 
-    if tid_flat < Int32(n_hg * hpb):
-        group = tid_flat // Int32(hpb)
-        h = tid_flat - group * Int32(hpb)
+    if tid_flat < Int32(reduce_heads):
+        if cutlass.const_expr(two):
+            group = tid_flat // Int32(hpb)
+            h = tid_flat - group * Int32(hpb)
+        else:
+            group = Int32(0)
+            h = tid_flat
         rmax = reduce0_max_addr
         if cutlass.const_expr(two):
             if group != Int32(0):
@@ -816,18 +850,21 @@ def s4_online_softmax_mg2(
     cute.arch.barrier(**bar_kw)
 
     blm00 = ld_shared_f32(reduce0_max_addr + gid * Int32(4))
-    blm01 = ld_shared_f32(reduce0_max_addr + (gid + Int32(8)) * Int32(4))
+    if cutlass.const_expr(hi0):
+        blm01 = ld_shared_f32(reduce0_max_addr + (gid + Int32(8)) * Int32(4))
     if cutlass.const_expr(two):
         blm10 = ld_shared_f32(reduce1_max_addr + gid * Int32(4))
         blm11 = ld_shared_f32(reduce1_max_addr + (gid + Int32(8)) * Int32(4))
 
     ngm00 = fmax_f32(gm0[0], blm00)
-    ngm01 = fmax_f32(gm0[1], blm01)
+    if cutlass.const_expr(hi0):
+        ngm01 = fmax_f32(gm0[1], blm01)
     if cutlass.const_expr(two):
         ngm10 = fmax_f32(gm1[0], blm10)
         ngm11 = fmax_f32(gm1[1], blm11)
     alpha00 = _exp2_approx_ftz_f32(gm0[0] - ngm00)
-    alpha01 = _exp2_approx_ftz_f32(gm0[1] - ngm01)
+    if cutlass.const_expr(hi0):
+        alpha01 = _exp2_approx_ftz_f32(gm0[1] - ngm01)
     if cutlass.const_expr(two):
         alpha10 = _exp2_approx_ftz_f32(gm1[0] - ngm10)
         alpha11 = _exp2_approx_ftz_f32(gm1[1] - ngm11)
@@ -835,8 +872,9 @@ def s4_online_softmax_mg2(
     for vc in cutlass.range_constexpr(n_acc_tiles):
         acc0[vc][0] = acc0[vc][0] * alpha00
         acc0[vc][1] = acc0[vc][1] * alpha00
-        acc0[vc][2] = acc0[vc][2] * alpha01
-        acc0[vc][3] = acc0[vc][3] * alpha01
+        if cutlass.const_expr(hi0):
+            acc0[vc][2] = acc0[vc][2] * alpha01
+            acc0[vc][3] = acc0[vc][3] * alpha01
         if cutlass.const_expr(two):
             acc1[vc][0] = acc1[vc][0] * alpha10
             acc1[vc][1] = acc1[vc][1] * alpha10
@@ -844,8 +882,9 @@ def s4_online_softmax_mg2(
             acc1[vc][3] = acc1[vc][3] * alpha11
     rope0[0] = rope0[0] * alpha00
     rope0[1] = rope0[1] * alpha00
-    rope0[2] = rope0[2] * alpha01
-    rope0[3] = rope0[3] * alpha01
+    if cutlass.const_expr(hi0):
+        rope0[2] = rope0[2] * alpha01
+        rope0[3] = rope0[3] * alpha01
     if cutlass.const_expr(two):
         rope1[0] = rope1[0] * alpha10
         rope1[1] = rope1[1] * alpha10
@@ -853,15 +892,20 @@ def s4_online_softmax_mg2(
         rope1[3] = rope1[3] * alpha11
 
     gs0[0] = gs0[0] * alpha00
-    gs0[1] = gs0[1] * alpha01
+    if cutlass.const_expr(hi0):
+        gs0[1] = gs0[1] * alpha01
     if cutlass.const_expr(two):
         gs1[0] = gs1[0] * alpha10
         gs1[1] = gs1[1] * alpha11
 
     p0[0] = _exp2_approx_ftz_f32(qk0[0] - ngm00)
     p0[1] = _exp2_approx_ftz_f32(qk0[1] - ngm00)
-    p0[2] = _exp2_approx_ftz_f32(qk0[2] - ngm01)
-    p0[3] = _exp2_approx_ftz_f32(qk0[3] - ngm01)
+    if cutlass.const_expr(hi0):
+        p0[2] = _exp2_approx_ftz_f32(qk0[2] - ngm01)
+        p0[3] = _exp2_approx_ftz_f32(qk0[3] - ngm01)
+    else:
+        p0[2] = Float32(0.0)
+        p0[3] = Float32(0.0)
     if cutlass.const_expr(two):
         p1[0] = _exp2_approx_ftz_f32(qk1[0] - ngm10)
         p1[1] = _exp2_approx_ftz_f32(qk1[1] - ngm10)
@@ -869,28 +913,33 @@ def s4_online_softmax_mg2(
         p1[3] = _exp2_approx_ftz_f32(qk1[3] - ngm11)
 
     ls00 = p0[0] + p0[1]
-    ls01 = p0[2] + p0[3]
+    if cutlass.const_expr(hi0):
+        ls01 = p0[2] + p0[3]
     if cutlass.const_expr(two):
         ls10 = p1[0] + p1[1]
         ls11 = p1[2] + p1[3]
     ls00 = ls00 + cute.arch.shuffle_sync_bfly(ls00, offset=2)
-    ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=2)
+    if cutlass.const_expr(hi0):
+        ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=2)
     if cutlass.const_expr(two):
         ls10 = ls10 + cute.arch.shuffle_sync_bfly(ls10, offset=2)
         ls11 = ls11 + cute.arch.shuffle_sync_bfly(ls11, offset=2)
     ls00 = ls00 + cute.arch.shuffle_sync_bfly(ls00, offset=1)
-    ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=1)
+    if cutlass.const_expr(hi0):
+        ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=1)
     if cutlass.const_expr(two):
         ls10 = ls10 + cute.arch.shuffle_sync_bfly(ls10, offset=1)
         ls11 = ls11 + cute.arch.shuffle_sync_bfly(ls11, offset=1)
 
     gs0[0] = gs0[0] + ls00
-    gs0[1] = gs0[1] + ls01
+    if cutlass.const_expr(hi0):
+        gs0[1] = gs0[1] + ls01
     if cutlass.const_expr(two):
         gs1[0] = gs1[0] + ls10
         gs1[1] = gs1[1] + ls11
     gm0[0] = ngm00
-    gm0[1] = ngm01
+    if cutlass.const_expr(hi0):
+        gm0[1] = ngm01
     if cutlass.const_expr(two):
         gm1[0] = ngm10
         gm1[1] = ngm11
@@ -919,21 +968,25 @@ def s4_finalize_row_sum_mg2(
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """Final cross-warp row-sum reduction for deferred MG softmax. Group-1
     statements gate inline behind ``const_expr(n_hg == 2)`` (n_hg==2 trace
     unchanged); n_hg==1 reduces only group 0 (tid_flat < hpb)."""
     two = cutlass.const_expr(n_hg == 2)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+    reduce_heads = cutlass.const_expr(n_hg * hpb if n_hg == 2 else valid_hpb)
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
     if tid == Int32(0):
         st_shared_f32(reduce0_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs0[0])
-        st_shared_f32(
-            reduce0_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
-            gs0[1],
-        )
+        if cutlass.const_expr(hi0):
+            st_shared_f32(
+                reduce0_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
+                gs0[1],
+            )
         if cutlass.const_expr(two):
             st_shared_f32(reduce1_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs1[0])
             st_shared_f32(
@@ -942,9 +995,13 @@ def s4_finalize_row_sum_mg2(
             )
     cute.arch.barrier(**bar_kw)
 
-    if tid_flat < Int32(n_hg * hpb):
-        group = tid_flat // Int32(hpb)
-        h = tid_flat - group * Int32(hpb)
+    if tid_flat < Int32(reduce_heads):
+        if cutlass.const_expr(two):
+            group = tid_flat // Int32(hpb)
+            h = tid_flat - group * Int32(hpb)
+        else:
+            group = Int32(0)
+            h = tid_flat
         rsum = reduce0_sum_addr
         if cutlass.const_expr(two):
             if group != Int32(0):
@@ -958,7 +1015,8 @@ def s4_finalize_row_sum_mg2(
     cute.arch.barrier(**bar_kw)
 
     gs0[0] = ld_shared_f32(reduce0_sum_addr + gid * Int32(4))
-    gs0[1] = ld_shared_f32(reduce0_sum_addr + (gid + Int32(8)) * Int32(4))
+    if cutlass.const_expr(hi0):
+        gs0[1] = ld_shared_f32(reduce0_sum_addr + (gid + Int32(8)) * Int32(4))
     if cutlass.const_expr(two):
         gs1[0] = ld_shared_f32(reduce1_sum_addr + gid * Int32(4))
         gs1[1] = ld_shared_f32(reduce1_sum_addr + (gid + Int32(8)) * Int32(4))
@@ -1238,6 +1296,7 @@ class UnifiedPrefillMGKernel:
         extra_indices_stride0=0,
         row_xor=False,
         head_offset=0,
+        valid_hpb=None,
     ):
         self.traits = traits
         self.layout = layout
@@ -1270,6 +1329,7 @@ class UnifiedPrefillMGKernel:
         self.extra_indices_stride_row = int(extra_indices_stride0)
         self.row_xor = bool(row_xor)
         self.head_offset = int(head_offset)
+        self.valid_hpb = int(traits.hpb if valid_hpb is None else valid_hpb)
         # MG head-group count (1 for heads==16, 2 for heads % 32 == 0). Derived
         # from the layout (heads_per_cta // hpb) and threaded as a compile-time
         # const so every group-1 op const_expr-elides for n_hg==1.
@@ -1787,6 +1847,7 @@ class UnifiedPrefillMGKernel:
                     num_threads=self.math_threads,
                     barrier_id=2,
                     n_hg=n_hg,
+                    valid_hpb=self.valid_hpb,
                 )
                 q_rope_regs0 = preload_q_rope_regs_mg(q_rope_g0, lane, d_rope=t.d_rope)
                 if cutlass.const_expr(n_hg == 2):
@@ -1804,7 +1865,7 @@ class UnifiedPrefillMGKernel:
                     q_rope_g0,
                     amax_view,
                     head_base,
-                    Int32(t.hpb),
+                    Int32(self.valid_hpb),
                     tid,
                     d_nope=t.d_nope,
                     d_rope=t.d_rope,
@@ -2033,6 +2094,7 @@ class UnifiedPrefillMGKernel:
                         kv_smem_stride=L.kv_smem_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
+                        valid_hpb=self.valid_hpb,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         qk1 = s1_qk_nope_block_scaled(
@@ -2049,6 +2111,7 @@ class UnifiedPrefillMGKernel:
                             kv_smem_stride=L.kv_smem_stride,
                             scale_bytes_per_token=8,
                             scale_format=t.scale_format,
+                            valid_hpb=t.hpb,
                         )
                     if cutlass.const_expr(is_glm):
                         # GLM QK-RoPE: Q-rope A from preloaded registers, KV-rope B
@@ -2067,6 +2130,7 @@ class UnifiedPrefillMGKernel:
                             rope_stride,
                             d_rope=t.d_rope,
                             n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
                         )
                     else:
                         # Fused QK-RoPE: KV-RoPE B operand gathered ONCE per CTA tile
@@ -2085,6 +2149,7 @@ class UnifiedPrefillMGKernel:
                             rope_stride,
                             d_rope=t.d_rope,
                             n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
                         )
                 qk0 = s3_mask_and_scale(
                     qk0,
@@ -2136,6 +2201,7 @@ class UnifiedPrefillMGKernel:
                     barrier_id=3,
                     n_acc_tiles=n_acc_tiles,
                     n_hg=n_hg,
+                    valid_hpb=self.valid_hpb,
                 )
                 w_pre0 = [p0[0] * wr00, p0[1] * wr00, p0[2] * wr01, p0[3] * wr01]
                 w_pre1 = [p1[0] * wr10, p1[1] * wr10, p1[2] * wr11, p1[3] * wr11]
@@ -2157,8 +2223,18 @@ class UnifiedPrefillMGKernel:
                     # atomicMaxes against uninitialized smem (catastrophic on cold
                     # launch) and later tiles never reset it (stale max bias).
                     i_hs = tid
-                    while i_hs < Int32(n_hg * t.n_v_chunks * t.hpb):
-                        w_head_sc_view_all[i_hs] = Float32(0.0)
+                    while i_hs < Int32(n_hg * t.n_v_chunks * self.valid_hpb):
+                        group_span = Int32(t.n_v_chunks * self.valid_hpb)
+                        g_hs = i_hs // group_span
+                        rem_hs = i_hs - g_hs * group_span
+                        vc_hs = rem_hs // Int32(self.valid_hpb)
+                        h_hs = rem_hs - vc_hs * Int32(self.valid_hpb)
+                        slot_hs = (
+                            g_hs * Int32(t.n_v_chunks * t.hpb)
+                            + vc_hs * Int32(t.hpb)
+                            + h_hs
+                        )
+                        w_head_sc_view_all[slot_hs] = Float32(0.0)
                         i_hs += Int32(self.math_threads)
                     cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                     acc0 = s6_xv_nope(
@@ -2183,6 +2259,7 @@ class UnifiedPrefillMGKernel:
                         scale_format=t.scale_format,
                         num_threads=self.math_threads,
                         barrier_id=3,
+                        valid_hpb=self.valid_hpb,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         acc1 = s6_xv_nope(
@@ -2207,6 +2284,7 @@ class UnifiedPrefillMGKernel:
                             scale_format=t.scale_format,
                             num_threads=self.math_threads,
                             barrier_id=3,
+                            valid_hpb=t.hpb,
                         )
                 else:
                     acc0, acc1 = s6_xv_nope_mg_dsv4(
@@ -2351,6 +2429,7 @@ class UnifiedPrefillMGKernel:
                 num_threads=self.math_threads,
                 barrier_id=3,
                 n_hg=n_hg,
+                valid_hpb=self.valid_hpb,
             )
             gsum0_frag[0] = final_sum0[0]
             gsum0_frag[1] = final_sum0[1]
@@ -2373,7 +2452,7 @@ class UnifiedPrefillMGKernel:
                 + token_idx.to(Int64) * Int64(self.output_stride_row)
                 + head_base.to(Int64) * Int64(self.output_stride_head),
                 cute.make_layout(
-                    (t.hpb, t.d_v),
+                    (self.valid_hpb, t.d_v),
                     stride=(self.output_stride_head, self.output_stride_dim),
                 ),
             )
@@ -2381,7 +2460,7 @@ class UnifiedPrefillMGKernel:
                 out_lse.iterator
                 + token_idx.to(Int64) * Int64(self.out_lse_stride_row)
                 + head_base.to(Int64) * Int64(self.out_lse_stride_head),
-                cute.make_layout((t.hpb,), stride=(self.out_lse_stride_head,)),
+                cute.make_layout((self.valid_hpb,), stride=(self.out_lse_stride_head,)),
             )
             s7_epilogue(
                 fin0,
@@ -2397,7 +2476,7 @@ class UnifiedPrefillMGKernel:
                 d_nope=t.d_nope,
                 d_rope=t.d_rope,
                 n_warps=8,
-                valid_hpb=t.hpb,
+                valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 epilogue_mode=EPILOGUE_FINAL_BF16,
@@ -2510,12 +2589,18 @@ def _sparse_mla_prefill_mg_flat_launch(
             "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
         )
-    if active_heads % heads_per_cta != 0:
+    if active_heads % heads_per_cta == 0:
+        valid_hpb = int(traits.hpb)
+        replicate_h = active_heads // heads_per_cta
+    elif int(mg_n_hg) == 1 and active_heads == int(traits.hpb) // 2:
+        valid_hpb = active_heads
+        replicate_h = 1
+    else:
         raise ValueError(
             "SM120 sparse MLA MG prefill active head range must be divisible by "
-            f"heads_per_cta={heads_per_cta}; got active_heads={active_heads}"
+            f"heads_per_cta={heads_per_cta} (or active_heads==hpb//2 with "
+            f"mg_n_hg==1 for the 8-head shard); got active_heads={active_heads}"
         )
-    replicate_h = active_heads // heads_per_cta
     # DSV4 dual-cache MG: the union puts tile 0 in the MAIN section, so
     # num_main_tiles MUST be >= 1 (topk==128 => 2). All-extra (num_main_tiles==0)
     # has no extra-prologue arm and is forbidden.
@@ -2544,6 +2629,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         extra_indices_stride0=int(extra_indices_t.stride(0)),
         row_xor=bool(row_xor),
         head_offset=head_offset,
+        valid_hpb=valid_hpb,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     base_args = (
@@ -2577,6 +2663,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("num_heads", total_heads),
         key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
+        key_field("valid_hpb", int(valid_hpb)),
         key_field("num_tiles", int(num_tiles)),
         key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
@@ -2868,13 +2955,16 @@ def run_unified_prefill_mg(
         )
     traits = make_unified_traits(model_type, int(compute_mode), scale_format)
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
-    # covers a single-group launch, including the 16-head tail of an odd-multiple
-    # dual-cache split. The caller picks mg_n_hg and active head range.
+    # covers a single-group launch, including 16-head tails and the heads==8
+    # valid_hpb shard. The caller picks mg_n_hg and active head range.
     heads_per_cta = int(mg_n_hg) * int(traits.hpb)
-    if active_heads % heads_per_cta != 0:
+    full_head_tile = active_heads % heads_per_cta == 0
+    valid_hpb_shard = int(mg_n_hg) == 1 and active_heads == int(traits.hpb) // 2
+    if not full_head_tile and not valid_hpb_shard:
         raise ValueError(
             f"SM120 sparse MLA MG prefill (mg_n_hg={mg_n_hg}) requires heads divisible "
-            f"by {heads_per_cta}, got active_heads={active_heads}"
+            f"by {heads_per_cta} (or active_heads==hpb//2 with mg_n_hg==1 for the "
+            f"8-head shard), got active_heads={active_heads}"
         )
 
     topk = int(topk_indices.shape[1])
@@ -2929,7 +3019,7 @@ def run_unified_prefill_mg(
             extra_len_t = extra_topk_length.to(
                 device=device, dtype=torch.int32
             ).contiguous()
-        if active_heads == total_heads and head_offset == 0:
+        if full_head_tile and active_heads == total_heads and head_offset == 0:
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
                 q,
                 _cache_base_tensor(kv_cache),
@@ -2990,7 +3080,7 @@ def run_unified_prefill_mg(
             )
         return output, lse_out
 
-    if active_heads == total_heads and head_offset == 0:
+    if full_head_tile and active_heads == total_heads and head_offset == 0:
         torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
             _cache_base_tensor(kv_cache),

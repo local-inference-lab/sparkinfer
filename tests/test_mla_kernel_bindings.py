@@ -219,6 +219,7 @@ def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None
         topk_indices=topk_indices,
         sm_scale=0.1,
         page_block_size=64,
+        stride_kv_block=37440,
         extra_kv_cache=extra_kv_cache,
         extra_indices=extra_indices,
         extra_page_block_size=2,
@@ -239,8 +240,197 @@ def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None
     assert calls[1]["lse_out"] is lse
 
 
+def test_glm_prefill_partitions_120_heads_as_32_16_8(monkeypatch) -> None:
+    __import__("b12x.attention.mla.prefill")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill import run_unified_prefill
+    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+
+    topk = 2048
+    q = torch.empty((2, 120, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 656), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+
+    output, lse = run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=41984,
+    )
+
+    assert output.shape == (2, 120, 512)
+    assert lse.shape == (2, 120)
+    assert [call["mg_n_hg"] for call in calls] == [2, 1, 1]
+    assert [call["active_heads"] for call in calls] == [96, 16, 8]
+    assert [call["head_offset"] for call in calls] == [0, 96, 112]
+    assert {call["compute_mode"] for call in calls} == {ComputeMode.FP8}
+    assert {call["model_type"] for call in calls} == {ModelType.GLM_NSA}
+    assert {call["scale_format"] for call in calls} == {ScaleFormat.ARBITRARY_FP32}
+
+
+def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
+    __import__("b12x.attention.mla.prefill")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill import run_unified_prefill
+    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+
+    topk = 128
+    q = torch.empty((2, 24, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+
+    run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=37440,
+    )
+
+    assert [call["mg_n_hg"] for call in calls] == [1, 1]
+    assert [call["active_heads"] for call in calls] == [16, 8]
+    assert [call["head_offset"] for call in calls] == [0, 16]
+    assert {call["compute_mode"] for call in calls} == {ComputeMode.BF16}
+    assert {call["model_type"] for call in calls} == {ModelType.DSV4}
+    assert {call["scale_format"] for call in calls} == {ScaleFormat.UE8M0_BYTE}
+
+
+def test_sm120_prefill_dual_partitions_40_heads_with_8_tail(monkeypatch) -> None:
+    __import__("b12x.attention.mla.prefill")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill import run_unified_prefill
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+
+    topk = 128
+    q = torch.empty((2, 40, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+    extra_kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    extra_indices = torch.zeros((2, 128), dtype=torch.int32)
+
+    run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=37440,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_page_block_size=2,
+    )
+
+    assert [call["mg_n_hg"] for call in calls] == [2, 1]
+    assert [call["active_heads"] for call in calls] == [32, 8]
+    assert [call["head_offset"] for call in calls] == [0, 32]
+    assert calls[0]["extra_kv_cache"] is extra_kv_cache
+    assert calls[1]["extra_kv_cache"] is extra_kv_cache
+
+
+def test_glm_tp8_prefill_routes_to_single_group_mg(monkeypatch) -> None:
+    __import__("b12x.attention.mla.prefill")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill import run_unified_prefill
+    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+
+    topk = 2048
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 656), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+
+    output, lse = run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=41984,
+    )
+
+    assert len(calls) == 1
+    assert output.shape == (2, 8, 512)
+    assert lse.shape == (2, 8)
+    assert calls[0]["mg_n_hg"] == 1
+    assert calls[0]["compute_mode"] == ComputeMode.FP8
+    assert calls[0]["model_type"] == ModelType.GLM_NSA
+    assert calls[0]["scale_format"] == ScaleFormat.ARBITRARY_FP32
+
+
+def test_prefill_mg_heads8_uses_flat_valid_hpb_launcher(monkeypatch) -> None:
+    __import__("b12x.attention.mla.prefill_mg")
+    import b12x.attention.mla.prefill_mg as prefill_mg
+    from b12x.attention.mla.prefill_mg import run_unified_prefill_mg
+    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+
+    calls = []
+
+    def fake_flat_launch(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+
+    monkeypatch.setattr(prefill_mg, "_sparse_mla_prefill_mg_flat_launch", fake_flat_launch)
+
+    topk = 2048
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 656), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32)
+
+    output, lse = run_unified_prefill_mg(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=41984,
+        compute_mode=ComputeMode.FP8,
+        mg_n_hg=1,
+        model_type=ModelType.GLM_NSA,
+        scale_format=ScaleFormat.ARBITRARY_FP32,
+    )
+
+    assert len(calls) == 1
+    assert output.shape == (2, 8, 512)
+    assert lse.shape == (2, 8)
+    assert calls[0]["active_heads"] == 8
+    assert calls[0]["head_offset"] == 0
+
+
 def test_sm120_prefill_dual_non_eligible_raises() -> None:
-    # DSV4 dual-cache prefill is MG-only (topk==128, heads divisible by 16);
+    # DSV4 dual-cache prefill is MG-only (topk==128, heads divisible by 8);
     # everything else RAISEs (the decode-reuse has_extra fallback was removed).
     # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
     # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).
@@ -261,6 +451,7 @@ def test_sm120_prefill_dual_non_eligible_raises() -> None:
             topk_indices=topk_indices,
             sm_scale=0.1,
             page_block_size=64,
+            stride_kv_block=37440,
             extra_kv_cache=extra_kv_cache,
             extra_indices=extra_indices,
             extra_page_block_size=2,
