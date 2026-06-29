@@ -27,7 +27,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.cute.compiler import (
@@ -192,7 +192,7 @@ def _load_flat_k_tile_wide(
 def _load_permute_k_page_g2s(
     k_quant_bytes: cute.Tensor,  # [pages, 64, 128] uint8 (16B-aligned base)
     page_id: Int32,
-    page_stride_bytes: Int32,  # dim-0 byte stride; 8192 for contiguous K, 8448 for
+    page_stride_bytes: Int64,  # dim-0 byte stride; 8192 for contiguous K, 8448 for
                                # the packed paged cache (64*128 quant + 64*4 scales / page)
     k_perm_base_addr: Int32,
     tx: Int32,
@@ -207,7 +207,7 @@ def _load_permute_k_page_g2s(
     stride is 8448, not the contiguous 8192) — using a hardcoded stride reads the
     wrong page for the packed layout. It stays 16B-aligned (8448 = 16*528).
     """
-    page_elem_base = page_id * page_stride_bytes
+    page_elem_base = Int64(page_id) * page_stride_bytes
     linear = tx
     total = Int32(_PAGE_SIZE * (_INDEX_HEAD_DIM // 16))
     while linear < total:
@@ -215,7 +215,9 @@ def _load_permute_k_page_g2s(
         vec_idx = linear - row * Int32(_INDEX_HEAD_DIM // 16)
         g_addr = get_ptr_as_int64(
             k_quant_bytes,
-            page_elem_base + row * Int32(_INDEX_HEAD_DIM) + vec_idx * Int32(16),
+            page_elem_base
+            + Int64(row) * Int64(_INDEX_HEAD_DIM)
+            + Int64(vec_idx) * Int64(16),
         )
         v0, v1, v2, v3 = ld_global_v4_u32(g_addr)
         dst_addr = _smem_addr_from_b128_offset(
@@ -1148,7 +1150,7 @@ class SparseNSAFusedIndexerKernel:
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
                     # Fused g2s load + permute (no linear staging, no repack pass).
                     _load_permute_k_page_g2s(
-                        k_quant_bytes, page_id, Int32(self.k_quant_page_stride),
+                        k_quant_bytes, page_id, Int64(self.k_quant_page_stride),
                         k_page_perm_base_addr, tx, Int32(_RADIX_THREADS),
                     )
                     scale_idx = tx
