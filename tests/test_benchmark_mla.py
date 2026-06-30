@@ -101,6 +101,23 @@ def test_target_glm52_prefill4k_ctx16k_preset_sets_target_shape() -> None:
     assert args.cache_page_stride_bytes == 0
 
 
+def test_flashinfer_reference_is_opt_in() -> None:
+    assert benchmark_mla._parse_args([]).reference == "none"
+    assert (
+        benchmark_mla._parse_args(["--reference", "flashinfer"]).reference
+        == "flashinfer"
+    )
+
+
+def test_flashinfer_paged_kv_view_is_zero_copy() -> None:
+    cache = torch.empty((128, 1, 656), dtype=torch.uint8)
+
+    paged = benchmark_mla._flashinfer_paged_kv_view(cache, page_size=64)
+
+    assert paged.shape == (2, 64, 656)
+    assert paged.data_ptr() == cache.data_ptr()
+
+
 def test_target_glm52_preset_preserves_explicit_packed_stride_regression() -> None:
     args = benchmark_mla._parse_args(
         [
@@ -154,6 +171,42 @@ def test_render_case_line_reports_public_step_metrics() -> None:
     assert "indexer=" in line
     assert "mla=" in line
     assert "idx_bk=decode" in line
+
+
+def test_render_case_line_reports_flashinfer_race_and_correctness() -> None:
+    report = benchmark_mla.CaseReport(
+        case=benchmark_mla.DecodeCase(
+            mode="prefill",
+            batch_size=1,
+            cache_len=16384,
+            topk=2048,
+            q_len=4096,
+        ),
+        mla_us=200.0,
+        flashinfer_mla_us=250.0,
+        mla_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.01,
+            rmse=0.001,
+            cos=0.9999,
+        ),
+        flashinfer_mla_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.02,
+            rmse=0.002,
+            cos=0.9998,
+        ),
+        b12x_vs_flashinfer_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.02,
+            rmse=0.002,
+            cos=0.9998,
+        ),
+    )
+
+    line = benchmark_mla._render_case_line(report)
+
+    assert "fi_mla=  250.00 us" in line
+    assert "b12x/fi=0.800x" in line
+    assert "fi_cos=0.9998000" in line
+    assert "b12x_fi_cos=0.9998000" in line
 
 
 def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
@@ -221,6 +274,25 @@ def test_render_summary_lines_reports_geomeans() -> None:
     assert lines[5] == "  step geo:    500.00 us"
     assert lines[6] == "  meta geo:    200.00 us"
     assert lines[7] == "  replay geo:  200.00 us"
+
+
+def test_render_summary_lines_reports_flashinfer_ratio_direction() -> None:
+    report = benchmark_mla.CaseReport(
+        case=benchmark_mla.DecodeCase(
+            mode="prefill",
+            batch_size=1,
+            cache_len=16384,
+            topk=2048,
+            q_len=4096,
+        ),
+        mla_us=200.0,
+        flashinfer_mla_us=250.0,
+    )
+
+    lines = benchmark_mla._render_summary_lines([report])
+
+    assert "  flashinfer:  250.00 us" in lines
+    assert "  b12x/fi:     0.800x (<1 means b12x faster)" in lines
 
 
 def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:

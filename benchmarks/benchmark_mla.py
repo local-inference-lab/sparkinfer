@@ -18,11 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.mla.legacy.split import (
-    run_sparse_mla_split_decode_forward,
-    run_sparse_mla_split_decode_merge,
-    select_sparse_mla_split_decode_config,
-)
+from b12x.attention.mla.legacy.split import select_sparse_mla_split_decode_config
 from b12x.attention.indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
@@ -114,13 +110,8 @@ MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
 _RAGGED_TOPK_CHUNK = 4096
-_MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
-_MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
-_MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
 _NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
 _NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
-_MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
-_MLA_SINGLE_PASS_TARGET_TOPK = 2048
 
 
 def _align_up(value: int, multiple: int) -> int:
@@ -335,12 +326,15 @@ class CaseReport:
     graph_width: int = 0
     cache_page_stride_bytes: int = 0
     step_samples_us: tuple[float, ...] = ()
+    mla_samples_us: tuple[float, ...] = ()
+    flashinfer_mla_samples_us: tuple[float, ...] = ()
     metadata_us: float = 0.0
     replay_us: float = 0.0
     indexer_us: float = 0.0
     indexer_logits_us: float = 0.0
     indexer_topk_us: float = 0.0
     mla_us: float = 0.0
+    flashinfer_mla_us: float = 0.0
     mla_forward_us: float = 0.0
     mla_merge_us: float = 0.0
     split_enabled: bool = False
@@ -353,6 +347,8 @@ class CaseReport:
     mla_sanity: SanityMetrics = field(
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
     )
+    flashinfer_mla_sanity: SanityMetrics | None = None
+    b12x_vs_flashinfer_sanity: SanityMetrics | None = None
 
     @property
     def total_us(self) -> float:
@@ -361,6 +357,14 @@ class CaseReport:
         ):
             return self.indexer_us + self.mla_us
         return self.metadata_us + self.replay_us
+
+    @property
+    def mla_ratio_vs_flashinfer(self) -> float:
+        """B12X latency divided by FlashInfer latency; lower is faster."""
+
+        if self.flashinfer_mla_us <= 0.0:
+            return 0.0
+        return self.mla_us / self.flashinfer_mla_us
 
 
 class BenchmarkFailure(RuntimeError):
@@ -458,61 +462,6 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.cache_page_stride_bytes is None:
         args.cache_page_stride_bytes = 0
     return args
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _resolve_mla_prefill_strategy() -> str:
-    if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
-        return "single"
-    if _env_flag(_MLA_FORCE_SPLIT_ENV):
-        return "split"
-    value = os.environ.get(_MLA_STRATEGY_ENV, "auto").strip().lower()
-    if value in ("auto", ""):
-        return "auto"
-    if value in ("single", "single-pass", "nonsplit", "onepass"):
-        return "single"
-    if value == "split":
-        return "split"
-    raise ValueError(
-        f"{_MLA_STRATEGY_ENV} must be auto, split, or single-pass/nonsplit; got {value!r}"
-    )
-
-
-def _apply_benchmark_mla_split_strategy(
-    *,
-    split_cfg,
-    workspace_mode: str,
-    cache_seqlens: torch.Tensor,
-    device: torch.device,
-    max_batch: int,
-    q_rows: int,
-    topk_width: int,
-):
-    if split_cfg is None:
-        return None
-    strategy = _resolve_mla_prefill_strategy()
-    if strategy == "single":
-        return None
-    if strategy == "split":
-        return split_cfg
-    if (
-        workspace_mode in ("extend", "verify", "draft_extend")
-        and max_batch == 1
-        and q_rows >= _MLA_SINGLE_PASS_TARGET_Q_ROWS
-        and topk_width >= _MLA_SINGLE_PASS_TARGET_TOPK
-    ):
-        return None
-    if (
-        workspace_mode in ("extend", "verify", "draft_extend")
-        and not (device.type == "cuda" and torch.cuda.is_current_stream_capturing())
-    ):
-        max_cache_seqlens = int(cache_seqlens.max())
-        if max_cache_seqlens <= 4096:
-            return None
-    return split_cfg
 
 
 def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
@@ -622,6 +571,29 @@ def _compare(a: torch.Tensor, b: torch.Tensor) -> SanityMetrics:
         rmse=torch.sqrt(diff.square().mean()).item(),
         cos=cos,
     )
+
+
+def _check_mla_sanity(
+    *,
+    case: DecodeCase,
+    label: str,
+    metrics: SanityMetrics,
+) -> None:
+    if metrics.max_abs > MLA_MAX_ABS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} max_abs {metrics.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+        )
+    if metrics.rmse > MLA_RMSE_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} rmse {metrics.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
+        )
+    if metrics.cos < MLA_COS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} cos {metrics.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        )
 
 
 def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
@@ -978,6 +950,156 @@ def _make_mla_inputs(
     return q_all, k_nope_pool, k_rope_pool, kv_cache
 
 
+def _flashinfer_paged_kv_view(
+    kv_cache: torch.Tensor,
+    *,
+    page_size: int,
+) -> torch.Tensor:
+    """Expose b12x's packed GLM records through FlashInfer's paged view."""
+
+    record_bytes = 656
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] != record_bytes:
+        raise ValueError(
+            "FlashInfer GLM sparse MLA requires a uint8 cache with 656-byte records"
+        )
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[1] != 1 or kv_cache.shape[2] != page_size:
+            raise ValueError(
+                "unexpected 4-D MLA cache shape for FlashInfer: "
+                f"{tuple(kv_cache.shape)}"
+            )
+        return kv_cache
+    if kv_cache.ndim != 3:
+        raise ValueError(
+            f"unexpected MLA cache rank for FlashInfer: {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.shape[1] == page_size:
+        return kv_cache
+    if kv_cache.shape[1] != 1 or kv_cache.shape[0] % page_size != 0:
+        raise ValueError(
+            "cannot form FlashInfer pages from MLA cache shape "
+            f"{tuple(kv_cache.shape)} with page_size={page_size}"
+        )
+    flat_records = kv_cache[:, 0, :]
+    if not flat_records.is_contiguous():
+        raise ValueError(
+            "token-major MLA cache must be contiguous to form a zero-copy "
+            "FlashInfer paged view"
+        )
+    paged = flat_records.view(-1, page_size, record_bytes)
+    if paged.data_ptr() != kv_cache.data_ptr():
+        raise RuntimeError("FlashInfer cache adapter unexpectedly copied the KV cache")
+    return paged
+
+
+def _make_flashinfer_sparse_mla_race(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: float,
+    page_size: int,
+):
+    """Build a graph-stable FlashInfer main sparse-MLA launch and output."""
+
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _SparseMLAPagedAttentionRunner,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "--reference flashinfer requires FlashInfer main with the SM120 "
+            "sparse-MLA kernels (PR #3395 or newer)"
+        ) from exc
+
+    if q_all.dtype != torch.bfloat16 or q_all.shape[-1] != 576:
+        raise ValueError(
+            "FlashInfer GLM sparse MLA requires BF16 queries with head dim 576"
+        )
+    if selected_indices.dtype != torch.int32 or selected_indices.ndim != 2:
+        raise ValueError("FlashInfer sparse indices must be a rank-2 int32 tensor")
+    if active_token_counts.dtype != torch.int32 or active_token_counts.ndim != 1:
+        raise ValueError("FlashInfer active top-k lengths must be rank-1 int32")
+    if selected_indices.shape[0] != q_all.shape[0]:
+        raise ValueError("FlashInfer sparse index rows must match query rows")
+    if active_token_counts.shape[0] != q_all.shape[0]:
+        raise ValueError("FlashInfer top-k lengths must match query rows")
+
+    flashinfer_kv_cache = _flashinfer_paged_kv_view(
+        kv_cache,
+        page_size=page_size,
+    )
+    indices = selected_indices.contiguous()
+    topk_lengths = active_token_counts.contiguous()
+    output = torch.empty(
+        (q_all.shape[0], q_all.shape[1], 512),
+        dtype=torch.bfloat16,
+        device=q_all.device,
+    )
+    out_lse = torch.empty(
+        (q_all.shape[0], q_all.shape[1]),
+        dtype=torch.float32,
+        device=q_all.device,
+    )
+    runner = _SparseMLAPagedAttentionRunner(
+        max_num_tokens=q_all.shape[0],
+        max_num_heads=q_all.shape[1],
+        kv_scale_format="arbitrary_fp32",
+        device=q_all.device,
+    )
+
+    mid_out = None
+    mid_lse = None
+    if q_all.shape[0] <= 64:
+        num_splits = (selected_indices.shape[1] + 63) // 64
+        mid_out = torch.empty(
+            (q_all.shape[0], q_all.shape[1], num_splits, 512),
+            dtype=torch.bfloat16,
+            device=q_all.device,
+        )
+        mid_lse = torch.empty(
+            (q_all.shape[0], q_all.shape[1], num_splits),
+            dtype=torch.float32,
+            device=q_all.device,
+        )
+
+    def run_flashinfer_mla() -> torch.Tensor:
+        runner.run(
+            q_all,
+            flashinfer_kv_cache,
+            indices,
+            output,
+            float(sm_scale),
+            topk_length=topk_lengths,
+            out_lse=out_lse,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+        return output
+
+    return run_flashinfer_mla, output
+
+
+def _flashinfer_reference_identity() -> tuple[str, str]:
+    """Validate the optional main-only reference and report its exact build."""
+
+    try:
+        import flashinfer
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _SparseMLAPagedAttentionRunner,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "--reference flashinfer requires FlashInfer main with the SM120 "
+            "sparse-MLA kernels (PR #3395 or newer)"
+        ) from exc
+    del _SparseMLAPagedAttentionRunner
+    version = str(getattr(flashinfer, "__version__", "unknown"))
+    revision = str(getattr(flashinfer, "__git_version__", "unknown"))
+    return version, revision
+
+
 def _make_mla_binding(
     *,
     mode: str,
@@ -1071,6 +1193,7 @@ def _run_decode_case(
     l2_flush,
     skip_indexer_logits_fill: bool,
     decode_topk_backend: str,
+    reference: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -1283,6 +1406,20 @@ def _run_decode_case(
             v_head_dim=cfg.kv_lora_rank,
         )
 
+    run_flashinfer_mla = None
+    flashinfer_output = None
+    if reference == "flashinfer":
+        run_flashinfer_mla, flashinfer_output = _make_flashinfer_sparse_mla_race(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            selected_indices=actual_topk,
+            active_token_counts=graph_nsa_cache_seqlens,
+            sm_scale=cfg.sm_scale,
+            page_size=cfg.page_size,
+        )
+    elif reference != "none":
+        raise ValueError(f"unsupported MLA reference {reference!r}")
+
     def run_step():
         topk_indices = _select_paged_topk_from_logits(
             logits=paged_decode_logits(
@@ -1322,22 +1459,25 @@ def _run_decode_case(
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
+    if run_flashinfer_mla is not None:
+        run_flashinfer_mla()
     torch.cuda.synchronize()
     mla_sanity = _compare(actual_output, expected_output)
-    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+    _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
+    flashinfer_mla_sanity = None
+    b12x_vs_flashinfer_sanity = None
+    if flashinfer_output is not None:
+        flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
+        _check_mla_sanity(
+            case=case,
+            label="FlashInfer MLA",
+            metrics=flashinfer_mla_sanity,
         )
-    if mla_sanity.rmse > MLA_RMSE_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
-        )
-    if mla_sanity.cos < MLA_COS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        _check_mla_sanity(
+            case=case,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -1390,6 +1530,20 @@ def _run_decode_case(
     )
     mla_us = statistics.median(mla_stats["replay_us"])
 
+    flashinfer_mla_stats = None
+    flashinfer_mla_us = 0.0
+    if run_flashinfer_mla is not None:
+        prepare_decode_graph()
+        flashinfer_mla_stats = _capture_and_bench_cuda_graph(
+            run_flashinfer_mla,
+            warmup=warmup,
+            replays=replays,
+            l2_flush=l2_flush,
+        )
+        flashinfer_mla_us = statistics.median(
+            flashinfer_mla_stats["replay_us"]
+        )
+
     clear_indexer_caches()
     clear_mla_caches()
     step_stats = _capture_and_bench_cuda_graph(
@@ -1411,18 +1565,27 @@ def _run_decode_case(
                 strict=True,
             )
         ),
+        mla_samples_us=tuple(mla_stats["replay_us"]),
+        flashinfer_mla_samples_us=(
+            ()
+            if flashinfer_mla_stats is None
+            else tuple(flashinfer_mla_stats["replay_us"])
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
+        flashinfer_mla_us=flashinfer_mla_us,
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
         indexer_logits_fill=preinitialize_indexer_logits,
         indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
+        flashinfer_mla_sanity=flashinfer_mla_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -1441,6 +1604,7 @@ def _run_prefill_or_verify_case(
     skip_indexer_logits_fill: bool,
     use_tiled_topk: bool,
     prefill_indexer_layout: str,
+    reference: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -1933,22 +2097,11 @@ def _run_prefill_or_verify_case(
         nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
     mla_workspace = mla_binding.scratch
-    split_cfg = select_sparse_mla_split_decode_config(
-        q_all=q_all,
-        kv_cache=mla_kv_cache,
-        page_table_1=mla_selected_indices,
-        output_dtype=q_all.dtype,
-        v_head_dim=cfg.kv_lora_rank,
-    )
-    split_cfg = _apply_benchmark_mla_split_strategy(
-        split_cfg=split_cfg,
-        workspace_mode=mla_workspace_mode,
-        cache_seqlens=graph_batch_cache_seqlens,
-        device=device,
-        max_batch=case.batch_size,
-        q_rows=case.total_q,
-        topk_width=int(mla_selected_indices.shape[1]),
-    )
+    # The integration planner routes every extend/verify binding through the
+    # single-pass SM120 prefill kernel. Keep the benchmark report aligned with
+    # that planner-owned serving route instead of reviving the legacy split
+    # path solely for component timing.
+    split_cfg = None
 
     def run_mla():
         return sparse_mla_extend_forward(
@@ -1957,6 +2110,20 @@ def _run_prefill_or_verify_case(
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
+
+    run_flashinfer_mla = None
+    flashinfer_output = None
+    if reference == "flashinfer":
+        run_flashinfer_mla, flashinfer_output = _make_flashinfer_sparse_mla_race(
+            q_all=q_all,
+            kv_cache=mla_kv_cache,
+            selected_indices=mla_selected_indices,
+            active_token_counts=graph_nsa_cache_seqlens,
+            sm_scale=cfg.sm_scale,
+            page_size=cfg.page_size,
+        )
+    elif reference != "none":
+        raise ValueError(f"unsupported MLA reference {reference!r}")
 
     def run_step():
         topk_indices = map_indexer_topk(run_indexer())
@@ -1983,22 +2150,25 @@ def _run_prefill_or_verify_case(
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
+    if run_flashinfer_mla is not None:
+        run_flashinfer_mla()
     torch.cuda.synchronize()
     mla_sanity = _compare(actual_output, expected_output)
-    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+    _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
+    flashinfer_mla_sanity = None
+    b12x_vs_flashinfer_sanity = None
+    if flashinfer_output is not None:
+        flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
+        _check_mla_sanity(
+            case=case,
+            label="FlashInfer MLA",
+            metrics=flashinfer_mla_sanity,
         )
-    if mla_sanity.rmse > MLA_RMSE_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
-        )
-    if mla_sanity.cos < MLA_COS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        _check_mla_sanity(
+            case=case,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -2071,79 +2241,21 @@ def _run_prefill_or_verify_case(
         l2_flush=l2_flush,
     )
     mla_us = statistics.median(mla_stats["replay_us"])
+    flashinfer_mla_stats = None
+    flashinfer_mla_us = 0.0
+    if run_flashinfer_mla is not None:
+        prepare_verify_graph()
+        flashinfer_mla_stats = _capture_and_bench_cuda_graph(
+            run_flashinfer_mla,
+            warmup=warmup,
+            replays=replays,
+            l2_flush=l2_flush,
+        )
+        flashinfer_mla_us = statistics.median(
+            flashinfer_mla_stats["replay_us"]
+        )
     mla_forward_us = 0.0
     mla_merge_us = 0.0
-    if split_cfg is not None:
-        sm_scale_tensor = torch.empty((1,), dtype=torch.float32, device=device)
-        sm_scale_tensor[0] = cfg.sm_scale
-        if mla_workspace.tmp_output is None or mla_workspace.tmp_lse is None:
-            raise RuntimeError("workspace is missing split MLA buffers")
-        if mla_workspace.kv_chunk_size_ptr is None or mla_workspace.num_chunks_ptr is None:
-            raise RuntimeError("workspace is missing split MLA chunk pointers")
-        launch_num_chunks = (
-            mla_workspace.max_chunks_per_row
-            if (mla_workspace.fixed_capacity or mla_workspace.use_cuda_graph)
-            else split_cfg.num_chunks
-        )
-        split_output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], cfg.kv_lora_rank),
-            dtype=q_all.dtype,
-            device=q_all.device,
-        )
-
-        def prepare_mla_components() -> None:
-            prepare_verify_graph()
-            mla_workspace.set_split_chunk_config(
-                kv_chunk_size=split_cfg.chunk_size,
-                num_chunks=split_cfg.num_chunks,
-            )
-
-        prepare_mla_components()
-
-        def run_mla_forward_component():
-            run_sparse_mla_split_decode_forward(
-                q_all=q_all,
-                kv_cache=mla_kv_cache,
-                page_table_1=mla_selected_indices,
-                active_token_counts=graph_nsa_cache_seqlens,
-                sm_scale=sm_scale_tensor,
-                kv_chunk_size_ptr=mla_workspace.kv_chunk_size_ptr,
-                num_chunks_ptr=mla_workspace.num_chunks_ptr,
-                tmp_output=mla_workspace.tmp_output,
-                tmp_lse=mla_workspace.tmp_lse,
-                launch_num_chunks=launch_num_chunks,
-                workspace=mla_workspace,
-            )
-
-        def run_mla_merge_component():
-            run_sparse_mla_split_decode_merge(
-                tmp_output=mla_workspace.tmp_output,
-                tmp_lse=mla_workspace.tmp_lse,
-                num_chunks_ptr=mla_workspace.num_chunks_ptr,
-                output=split_output,
-                workspace=mla_workspace,
-            )
-
-        run_mla_forward_component()
-        torch.cuda.synchronize()
-        mla_forward_stats = _capture_and_bench_cuda_graph(
-            run_mla_forward_component,
-            warmup=warmup,
-            replays=replays,
-            prepare=prepare_mla_components,
-            l2_flush=l2_flush,
-        )
-        mla_forward_us = statistics.median(mla_forward_stats["replay_us"])
-        run_mla_forward_component()
-        torch.cuda.synchronize()
-        mla_merge_stats = _capture_and_bench_cuda_graph(
-            run_mla_merge_component,
-            warmup=warmup,
-            replays=replays,
-            prepare=prepare_mla_components,
-            l2_flush=l2_flush,
-        )
-        mla_merge_us = statistics.median(mla_merge_stats["replay_us"])
 
     clear_indexer_caches()
     clear_mla_caches()
@@ -2178,12 +2290,19 @@ def _run_prefill_or_verify_case(
                 strict=True,
             )
         ),
+        mla_samples_us=tuple(mla_stats["replay_us"]),
+        flashinfer_mla_samples_us=(
+            ()
+            if flashinfer_mla_stats is None
+            else tuple(flashinfer_mla_stats["replay_us"])
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
+        flashinfer_mla_us=flashinfer_mla_us,
         mla_forward_us=mla_forward_us,
         mla_merge_us=mla_merge_us,
         split_enabled=split_cfg is not None,
@@ -2202,6 +2321,8 @@ def _run_prefill_or_verify_case(
         ),
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
+        flashinfer_mla_sanity=flashinfer_mla_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -2249,6 +2370,7 @@ def collect_case_reports(
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 decode_topk_backend=args.decode_topk_backend,
+                reference=args.reference,
             )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
@@ -2265,6 +2387,7 @@ def collect_case_reports(
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 use_tiled_topk=args.use_tiled_topk,
                 prefill_indexer_layout=args.prefill_indexer_layout,
+                reference=args.reference,
             )
         )
         case_seed += 17
@@ -2291,6 +2414,24 @@ def _render_case_line(report: CaseReport) -> str:
             f" mla_rmse={report.mla_sanity.rmse:.6g}"
             f" mla_cos={report.mla_sanity.cos:.7f}"
         )
+    reference_desc = ""
+    if report.flashinfer_mla_us > 0.0:
+        reference_desc = (
+            f" fi_mla={report.flashinfer_mla_us:8.2f} us"
+            f" b12x/fi={report.mla_ratio_vs_flashinfer:.3f}x"
+        )
+    if report.flashinfer_mla_sanity is not None:
+        reference_desc += (
+            f" fi_max_abs={report.flashinfer_mla_sanity.max_abs:.6g}"
+            f" fi_rmse={report.flashinfer_mla_sanity.rmse:.6g}"
+            f" fi_cos={report.flashinfer_mla_sanity.cos:.7f}"
+        )
+    if report.b12x_vs_flashinfer_sanity is not None:
+        reference_desc += (
+            f" b12x_fi_max_abs={report.b12x_vs_flashinfer_sanity.max_abs:.6g}"
+            f" b12x_fi_rmse={report.b12x_vs_flashinfer_sanity.rmse:.6g}"
+            f" b12x_fi_cos={report.b12x_vs_flashinfer_sanity.cos:.7f}"
+        )
     return (
         f"glm52-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
         f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d}{row_ctx_desc} "
@@ -2311,6 +2452,7 @@ def _render_case_line(report: CaseReport) -> str:
         f"idx_init={fill_flag} "
         f"idx_topk_path={topk_path}"
         f"{sanity_desc}"
+        f"{reference_desc}"
     )
 
 
@@ -2324,7 +2466,7 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
     mla_geo = _geomean([report.mla_us for report in reports])
     mla_forward_geo = _geomean([report.mla_forward_us for report in reports])
     mla_merge_geo = _geomean([report.mla_merge_us for report in reports])
-    return [
+    lines = [
         "Summary",
         f"  cases: {len(reports)}",
         f"  total geo:   {total_geo:.2f} us",
@@ -2338,6 +2480,23 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
         f"  mla fwd:     {mla_forward_geo:.2f} us",
         f"  mla merge:   {mla_merge_geo:.2f} us",
     ]
+    reference_reports = [
+        report for report in reports if report.flashinfer_mla_us > 0.0
+    ]
+    if reference_reports:
+        flashinfer_geo = _geomean(
+            [report.flashinfer_mla_us for report in reference_reports]
+        )
+        ratio_geo = _geomean(
+            [report.mla_ratio_vs_flashinfer for report in reference_reports]
+        )
+        lines.extend(
+            [
+                f"  flashinfer:  {flashinfer_geo:.2f} us",
+                f"  b12x/fi:     {ratio_geo:.3f}x (<1 means b12x faster)",
+            ]
+        )
+    return lines
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2360,6 +2519,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=pathlib.Path,
         default=None,
         help="optional Hugging Face config.json override; default is the built-in GLM-5.2 contract",
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("none", "flashinfer"),
+        default="none",
+        help=(
+            "optional sparse-MLA kernel race; flashinfer requires FlashInfer "
+            "main with the SM120 GLM sparse kernels"
+        ),
     )
     parser.add_argument(
         "--modes",
@@ -2408,7 +2576,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--print-raw-samples",
         action="store_true",
-        help="print every end-to-end step sample after each case",
+        help="print every step, b12x MLA, and reference MLA replay sample",
     )
     parser.add_argument("--seed", type=int, default=70_000)
     parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
@@ -2487,6 +2655,18 @@ def main(argv: list[str] | None = None) -> int:
         else "off"
     )
     print(f"L2 flush: {flush_desc}")
+    if args.reference == "flashinfer":
+        try:
+            flashinfer_version, flashinfer_revision = (
+                _flashinfer_reference_identity()
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            "FlashInfer reference: "
+            f"version={flashinfer_version} commit={flashinfer_revision}"
+        )
     try:
         reports = collect_case_reports(args, device=device)
     except BenchmarkFailure as exc:
@@ -2498,6 +2678,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.print_raw_samples:
             raw_us = ",".join(f"{sample:.2f}" for sample in report.step_samples_us)
             print(f"  step_raw_us=[{raw_us}]")
+            mla_raw_us = ",".join(
+                f"{sample:.2f}" for sample in report.mla_samples_us
+            )
+            print(f"  mla_raw_us=[{mla_raw_us}]")
+            if report.flashinfer_mla_samples_us:
+                flashinfer_raw_us = ",".join(
+                    f"{sample:.2f}"
+                    for sample in report.flashinfer_mla_samples_us
+                )
+                print(f"  flashinfer_mla_raw_us=[{flashinfer_raw_us}]")
     for line in _render_summary_lines(reports):
         print(line)
     return 0
