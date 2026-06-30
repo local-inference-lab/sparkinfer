@@ -27,10 +27,12 @@ from b12x.cute.compiler import (
 )
 from b12x.cute.fp4 import (
     bf16_mma_m16n8k16_f32,
+    bfloat2_to_float2_scaled,
     f32_to_tf32_bits,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ldmatrix_m8n8x4_b16,
+    pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
     st_shared_u32,
     tf32_mma_m16n8k8_f32,
@@ -53,7 +55,13 @@ _PARTIALS_PER_CTA = 2
 # CTAs) maximizes fn-read parallelism without excess grid-scheduling overhead.
 _POST_PRE_PARTIALS_PER_CTA = 4
 _THREADS = 128
-_PREFILL_THREADS = 512
+_PREFILL_THREADS = int(os.getenv("B12X_MHC_PREFILL_THREADS", "512"))
+_PREFILL_GRAM_THREADS = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_GRAM_THREADS",
+        os.getenv("B12X_MHC_PREFILL_THREADS", "1024"),
+    )
+)
 _PREFILL_BLOCK_M = 2
 _PREFILL_BLOCK_TILE_N = 24
 _PREFILL_MMA_THREADS = 32
@@ -65,8 +73,56 @@ _PREFILL_TMA_THREADS = (_PREFILL_TMA_COMPUTE_WARPS + 1) * 32
 _PREFILL_TMA_TILE_M = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128"))
 _PREFILL_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16"))
 _PREFILL_TMA_TILE_K = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64"))
-_PREFILL_TF32_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"))
 _PREFILL_TMA_STAGES = int(os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "3"))
+_PREFILL_TF32_TMA_M_WARPS = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_M_WARPS",
+        os.getenv(
+            "B12X_MHC_PREFILL_TF32_TMA_WARPS",
+            os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "1"),
+        ),
+    )
+)
+_PREFILL_TF32_TMA_N_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
+)
+_PREFILL_TF32_TMA_COMPUTE_WARPS = (
+    _PREFILL_TF32_TMA_M_WARPS * _PREFILL_TF32_TMA_N_WARPS
+)
+_PREFILL_TF32_TMA_THREADS = (_PREFILL_TF32_TMA_COMPUTE_WARPS + 1) * 32
+_PREFILL_TF32_TMA_TILE_M = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_TILE_M",
+        os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
+    )
+)
+_PREFILL_TF32_TMA_TILE_N = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
+)
+_PREFILL_TF32_TMA_TILE_K = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
+        os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "256"),
+    )
+)
+_PREFILL_TF32_TMA_STAGES = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_STAGES",
+        os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "1"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
+)
+_PREFILL_TF32_TMA_CHUNK_M_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
+)
+_PREFILL_TF32_TMA_CHUNK_TILE_M = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
+)
+_PREFILL_FINALIZE_THREADS = int(
+    os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
+)
 _POST_PRE_CHUNK = 12
 
 # --- Gram-trick split finalize (multi-CTA fuse_norm, no per-h norm reduction) -
@@ -78,7 +134,7 @@ _POST_PRE_CHUNK = 12
 #   0:(0,0) 1:(1,1) 2:(2,2) 3:(3,3) 4:(0,1) 5:(0,2) 6:(0,3) 7:(1,2) 8:(1,3) 9:(2,3)
 _GRAM_PAIRS = 10
 _GRAM_ROW0 = 32  # gram[tile] stored at partials[token, 32 + tile, 0:10]
-# 1024 threads/CTA -> 4 hidden tiles (CTAs); fastest finalize in the sweep.
+# 1024 threads cover one hidden tile per loop iteration.
 _GRAM_BLOCK_H = 1024
 
 
@@ -328,6 +384,29 @@ def _post_pre_prefill_storage_cls(compute_gram: bool = False):
         ]
     PostPrePrefillStorage.__annotations__ = annotations
     return cute.struct(PostPrePrefillStorage)
+
+
+@lru_cache(maxsize=1)
+def _post_pre_prefill_gram_storage_cls():
+    class PostPrePrefillGramStorage:
+        pass
+
+    nwarps = _PREFILL_GRAM_THREADS // 32
+    PostPrePrefillGramStorage.__annotations__ = {
+        "gram_sums": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _GRAM_PAIRS * nwarps],
+            16,
+        ],
+        "post_coeff": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _MHC_MULT],
+            16,
+        ],
+        "comb_coeff": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _MHC_MULT * _MHC_MULT],
+            16,
+        ],
+    }
+    return cute.struct(PostPrePrefillGramStorage)
 
 
 @lru_cache(maxsize=1)
@@ -1126,7 +1205,7 @@ class MHCPostPrePrefillBlockMPartialKernel:
 class MHCPostPrePrefillGramKernel:
     """Full-hidden post + compact Gram kernel for tensor-core prefill paths."""
 
-    num_threads = _PREFILL_THREADS
+    num_threads = _PREFILL_GRAM_THREADS
     gram_pairs = _GRAM_PAIRS
 
     def __init__(
@@ -1147,7 +1226,9 @@ class MHCPostPrePrefillGramKernel:
                 f"hidden_size={self.hidden_size} must be divisible by "
                 f"prefill threads={self.num_threads}"
             )
-        self.hidden_iters = self.hidden_size // self.num_threads
+        self.hidden_pair_iters = (
+            self.hidden_size // 2 + self.num_threads - 1
+        ) // self.num_threads
 
     @cute.jit
     def __call__(
@@ -1195,15 +1276,24 @@ class MHCPostPrePrefillGramKernel:
         warp = tidx // Int32(32)
         nwarps = self.num_threads // 32
         smem = cutlass_utils.SmemAllocator()
-        storage = smem.allocate(_post_pre_prefill_storage_cls(True))
-        warp_sums = storage.warp_sums.get_tensor(
-            cute.make_layout((_PARTIALS, nwarps), stride=(nwarps, 1))
-        )
+        storage = smem.allocate(_post_pre_prefill_gram_storage_cls())
         gram_sums = storage.gram_sums.get_tensor(
             cute.make_layout((_GRAM_PAIRS, nwarps), stride=(nwarps, 1))
         )
+        post_coeff = storage.post_coeff.get_tensor(
+            cute.make_layout((_MHC_MULT,), stride=(1,))
+        )
+        comb_coeff = storage.comb_coeff.get_tensor(
+            cute.make_layout((_MHC_MULT, _MHC_MULT), stride=(_MHC_MULT, 1))
+        )
+        if tidx < Int32(_MHC_MULT):
+            post_coeff[tidx] = prev_post[token, tidx]
+        if tidx < Int32(_MHC_MULT * _MHC_MULT):
+            source = tidx // Int32(_MHC_MULT)
+            target = tidx - source * Int32(_MHC_MULT)
+            comb_coeff[source, target] = prev_comb[token, source, target]
+        cute.arch.sync_threads()
 
-        sqsum = Float32(0.0)
         gvals = cute.make_rmem_tensor(
             cute.make_layout((_GRAM_PAIRS,), stride=(1,)),
             Float32,
@@ -1211,80 +1301,151 @@ class MHCPostPrePrefillGramKernel:
         for gp in cutlass.range_constexpr(_GRAM_PAIRS):
             gvals[gp] = Float32(0.0)
 
-        for hidden_iter in cutlass.range_constexpr(self.hidden_iters):
-            h = Int32(hidden_iter * self.num_threads) + tidx
-            xh = Float32(x[token, h])
-            rin0 = Float32(residual[token, Int32(0), h])
-            rin1 = Float32(residual[token, Int32(1), h])
-            rin2 = Float32(residual[token, Int32(2), h])
-            rin3 = Float32(residual[token, Int32(3), h])
-            o0 = (
-                Float32(prev_post[token, Int32(0)]) * xh
-                + Float32(prev_comb[token, Int32(0), Int32(0)]) * rin0
-                + Float32(prev_comb[token, Int32(1), Int32(0)]) * rin1
-                + Float32(prev_comb[token, Int32(2), Int32(0)]) * rin2
-                + Float32(prev_comb[token, Int32(3), Int32(0)]) * rin3
-            ).to(cutlass.BFloat16)
-            o1 = (
-                Float32(prev_post[token, Int32(1)]) * xh
-                + Float32(prev_comb[token, Int32(0), Int32(1)]) * rin0
-                + Float32(prev_comb[token, Int32(1), Int32(1)]) * rin1
-                + Float32(prev_comb[token, Int32(2), Int32(1)]) * rin2
-                + Float32(prev_comb[token, Int32(3), Int32(1)]) * rin3
-            ).to(cutlass.BFloat16)
-            o2 = (
-                Float32(prev_post[token, Int32(2)]) * xh
-                + Float32(prev_comb[token, Int32(0), Int32(2)]) * rin0
-                + Float32(prev_comb[token, Int32(1), Int32(2)]) * rin1
-                + Float32(prev_comb[token, Int32(2), Int32(2)]) * rin2
-                + Float32(prev_comb[token, Int32(3), Int32(2)]) * rin3
-            ).to(cutlass.BFloat16)
-            o3 = (
-                Float32(prev_post[token, Int32(3)]) * xh
-                + Float32(prev_comb[token, Int32(0), Int32(3)]) * rin0
-                + Float32(prev_comb[token, Int32(1), Int32(3)]) * rin1
-                + Float32(prev_comb[token, Int32(2), Int32(3)]) * rin2
-                + Float32(prev_comb[token, Int32(3), Int32(3)]) * rin3
-            ).to(cutlass.BFloat16)
-            out[token, Int32(0), h] = o0
-            out[token, Int32(1), h] = o1
-            out[token, Int32(2), h] = o2
-            out[token, Int32(3), h] = o3
+        token = Int32(token)
+        out_u32 = cute.recast_tensor(out, Uint32)
+        for hidden_pair_iter in cutlass.range_constexpr(self.hidden_pair_iters):
+            h = Int32(2 * hidden_pair_iter * self.num_threads) + tidx * Int32(2)
+            if h < Int32(self.hidden_size):
+                x_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        x,
+                        token * Int32(self.hidden_size) + h,
+                    )
+                )
+                rin0_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size) + h,
+                    )
+                )
+                rin1_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(self.hidden_size)
+                        + h,
+                    )
+                )
+                rin2_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(2 * self.hidden_size)
+                        + h,
+                    )
+                )
+                rin3_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(3 * self.hidden_size)
+                        + h,
+                    )
+                )
+                x0, x1 = bfloat2_to_float2_scaled(x_pair, Float32(1.0))
+                rin00, rin01 = bfloat2_to_float2_scaled(
+                    rin0_pair, Float32(1.0)
+                )
+                rin10, rin11 = bfloat2_to_float2_scaled(
+                    rin1_pair, Float32(1.0)
+                )
+                rin20, rin21 = bfloat2_to_float2_scaled(
+                    rin2_pair, Float32(1.0)
+                )
+                rin30, rin31 = bfloat2_to_float2_scaled(
+                    rin3_pair, Float32(1.0)
+                )
 
-            r0 = Float32(o0)
-            r1 = Float32(o1)
-            r2 = Float32(o2)
-            r3 = Float32(o3)
-            sqsum += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
-            gvals[0] += r0 * r0
-            gvals[1] += r1 * r1
-            gvals[2] += r2 * r2
-            gvals[3] += r3 * r3
-            gvals[4] += r0 * r1
-            gvals[5] += r0 * r2
-            gvals[6] += r0 * r3
-            gvals[7] += r1 * r2
-            gvals[8] += r1 * r3
-            gvals[9] += r2 * r3
+                o_values = cute.make_rmem_tensor(
+                    cute.make_layout((_MHC_MULT, 2), stride=(2, 1)),
+                    Float32,
+                )
+                for pair_lane in cutlass.range_constexpr(2):
+                    xh = x0
+                    rin0 = rin00
+                    rin1 = rin10
+                    rin2 = rin20
+                    rin3 = rin30
+                    if const_expr(pair_lane == 1):
+                        xh = x1
+                        rin0 = rin01
+                        rin1 = rin11
+                        rin2 = rin21
+                        rin3 = rin31
+                    o_values[0, pair_lane] = (
+                        Float32(post_coeff[0]) * xh
+                        + Float32(comb_coeff[0, 0]) * rin0
+                        + Float32(comb_coeff[1, 0]) * rin1
+                        + Float32(comb_coeff[2, 0]) * rin2
+                        + Float32(comb_coeff[3, 0]) * rin3
+                    )
+                    o_values[1, pair_lane] = (
+                        Float32(post_coeff[1]) * xh
+                        + Float32(comb_coeff[0, 1]) * rin0
+                        + Float32(comb_coeff[1, 1]) * rin1
+                        + Float32(comb_coeff[2, 1]) * rin2
+                        + Float32(comb_coeff[3, 1]) * rin3
+                    )
+                    o_values[2, pair_lane] = (
+                        Float32(post_coeff[2]) * xh
+                        + Float32(comb_coeff[0, 2]) * rin0
+                        + Float32(comb_coeff[1, 2]) * rin1
+                        + Float32(comb_coeff[2, 2]) * rin2
+                        + Float32(comb_coeff[3, 2]) * rin3
+                    )
+                    o_values[3, pair_lane] = (
+                        Float32(post_coeff[3]) * xh
+                        + Float32(comb_coeff[0, 3]) * rin0
+                        + Float32(comb_coeff[1, 3]) * rin1
+                        + Float32(comb_coeff[2, 3]) * rin2
+                        + Float32(comb_coeff[3, 3]) * rin3
+                    )
 
-        sqsum = _warp_allreduce_sum(sqsum)
+                o0_pair = pack_f32x2_to_bfloat2(o_values[0, 0], o_values[0, 1])
+                o1_pair = pack_f32x2_to_bfloat2(o_values[1, 0], o_values[1, 1])
+                o2_pair = pack_f32x2_to_bfloat2(o_values[2, 0], o_values[2, 1])
+                o3_pair = pack_f32x2_to_bfloat2(o_values[3, 0], o_values[3, 1])
+                out_h = h // Int32(2)
+                out_u32[token, Int32(0), out_h] = o0_pair
+                out_u32[token, Int32(1), out_h] = o1_pair
+                out_u32[token, Int32(2), out_h] = o2_pair
+                out_u32[token, Int32(3), out_h] = o3_pair
+
+                r00, r01 = bfloat2_to_float2_scaled(o0_pair, Float32(1.0))
+                r10, r11 = bfloat2_to_float2_scaled(o1_pair, Float32(1.0))
+                r20, r21 = bfloat2_to_float2_scaled(o2_pair, Float32(1.0))
+                r30, r31 = bfloat2_to_float2_scaled(o3_pair, Float32(1.0))
+                gvals[0] += r00 * r00
+                gvals[1] += r10 * r10
+                gvals[2] += r20 * r20
+                gvals[3] += r30 * r30
+                gvals[4] += r00 * r10
+                gvals[5] += r00 * r20
+                gvals[6] += r00 * r30
+                gvals[7] += r10 * r20
+                gvals[8] += r10 * r30
+                gvals[9] += r20 * r30
+                gvals[0] += r01 * r01
+                gvals[1] += r11 * r11
+                gvals[2] += r21 * r21
+                gvals[3] += r31 * r31
+                gvals[4] += r01 * r11
+                gvals[5] += r01 * r21
+                gvals[6] += r01 * r31
+                gvals[7] += r11 * r21
+                gvals[8] += r11 * r31
+                gvals[9] += r21 * r31
+
         for gp in cutlass.range_constexpr(_GRAM_PAIRS):
             gvals[gp] = _warp_allreduce_sum(gvals[gp])
 
         if lane == Int32(0):
-            warp_sums[0, warp] = sqsum
             for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                 gram_sums[gp, warp] = gvals[gp]
         cute.arch.sync_threads()
 
         if tidx == Int32(0):
-            total = Float32(0.0)
-            src_warp = Int32(0)
-            while src_warp < Int32(nwarps):
-                total += Float32(warp_sums[0, src_warp])
-                src_warp += Int32(1)
-            partials[token, Int32(0), Int32(0)] = total
-
+            total_sq = Float32(0.0)
             for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                 gtotal = Float32(0.0)
                 src = Int32(0)
@@ -1292,6 +1453,9 @@ class MHCPostPrePrefillGramKernel:
                     gtotal += Float32(gram_sums[gp, src])
                     src += Int32(1)
                 partials[token, Int32(1), gp] = gtotal
+                if gp < 4:
+                    total_sq += gtotal
+            partials[token, Int32(0), Int32(0)] = total_sq
 
 
 @cute.jit
@@ -1633,13 +1797,15 @@ class MHCPrefillBf16ProjectTmaKernel:
 class MHCPrefillTf32ProjectTmaKernel:
     """TMA-fed TF32 tensor-core projection for compact mHC prefill partials."""
 
-    num_threads = _PREFILL_TMA_THREADS
-    num_compute_warps = _PREFILL_TMA_COMPUTE_WARPS
-    producer_warp = _PREFILL_TMA_COMPUTE_WARPS
-    tile_m = _PREFILL_TMA_TILE_M
+    num_threads = _PREFILL_TF32_TMA_THREADS
+    num_m_warps = _PREFILL_TF32_TMA_M_WARPS
+    num_n_warps = _PREFILL_TF32_TMA_N_WARPS
+    num_compute_warps = _PREFILL_TF32_TMA_COMPUTE_WARPS
+    producer_warp = _PREFILL_TF32_TMA_COMPUTE_WARPS
+    tile_m = _PREFILL_TF32_TMA_TILE_M
     tile_n = _PREFILL_TF32_TMA_TILE_N
-    tile_k = _PREFILL_TMA_TILE_K
-    num_stages = _PREFILL_TMA_STAGES
+    tile_k = _PREFILL_TF32_TMA_TILE_K
+    num_stages = _PREFILL_TF32_TMA_STAGES
     buffer_align_bytes = 1024
 
     def __init__(
@@ -1647,7 +1813,25 @@ class MHCPrefillTf32ProjectTmaKernel:
         *,
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
+        chunk_geometry: bool = False,
     ):
+        self.num_m_warps = (
+            _PREFILL_TF32_TMA_CHUNK_M_WARPS
+            if chunk_geometry
+            else _PREFILL_TF32_TMA_M_WARPS
+        )
+        self.num_n_warps = _PREFILL_TF32_TMA_N_WARPS
+        self.num_compute_warps = self.num_m_warps * self.num_n_warps
+        self.producer_warp = self.num_compute_warps
+        self.num_threads = (self.num_compute_warps + 1) * 32
+        self.tile_m = (
+            _PREFILL_TF32_TMA_CHUNK_TILE_M
+            if chunk_geometry
+            else _PREFILL_TF32_TMA_TILE_M
+        )
+        self.tile_n = _PREFILL_TF32_TMA_TILE_N
+        self.tile_k = _PREFILL_TF32_TMA_TILE_K
+        self.num_stages = _PREFILL_TF32_TMA_STAGES
         self.hidden_size = int(hidden_size)
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
@@ -1662,11 +1846,17 @@ class MHCPrefillTf32ProjectTmaKernel:
             )
         if self.tile_k % 8 != 0:
             raise ValueError(f"TF32 TMA tile_k={self.tile_k} must be divisible by 8")
-        if self.tile_n != 8:
+        if self.tile_n <= 0 or self.tile_n % 8 != 0:
             raise ValueError(
-                f"TF32 TMA tile_n={self.tile_n} must be 8 for m16n8k8 warp MMA"
+                f"TF32 TMA tile_n={self.tile_n} must be a positive multiple of 8 "
+                "for m16n8k8 warp MMA"
             )
-        m_per_mma_group = self.num_compute_warps * 16
+        if self.num_n_warps <= 0 or (self.tile_n // 8) % self.num_n_warps != 0:
+            raise ValueError(
+                f"TF32 TMA N warps={self.num_n_warps} must divide "
+                f"tile_n/8={self.tile_n // 8}"
+            )
+        m_per_mma_group = self.num_m_warps * 16
         if self.tile_m != m_per_mma_group:
             raise ValueError(
                 f"TF32 TMA tile_m={self.tile_m} must equal "
@@ -1674,6 +1864,8 @@ class MHCPrefillTf32ProjectTmaKernel:
             )
         self.k_tiles = self.total_k // self.tile_k
         self.n_tiles = (_MIXES + self.tile_n - 1) // self.tile_n
+        self.n_mma_tiles = self.tile_n // 8
+        self.n_mma_tiles_per_warp = self.n_mma_tiles // self.num_n_warps
 
     def _get_smem_layouts(self) -> tuple[cute.ComposedLayout, cute.Layout]:
         a_layout_atom = warpgroup.make_smem_layout_atom(
@@ -1848,23 +2040,22 @@ class MHCPrefillTf32ProjectTmaKernel:
         )
 
         if warp_idx < Int32(self.num_compute_warps):
+            warp_m = warp_idx // Int32(self.num_n_warps)
+            warp_n = warp_idx % Int32(self.num_n_warps)
             lane = tidx & Int32(31)
             lane_group = lane >> Int32(2)
             lane_in_group = lane & Int32(3)
             lane_pair_base = lane_in_group * Int32(2)
-            warp_m_base = warp_idx * Int32(16)
+            warp_m_base = warp_m * Int32(16)
             row0 = warp_m_base + lane_group
             row1 = row0 + Int32(8)
             token0 = m_tile * Int32(self.tile_m) + row0
             token1 = token0 + Int32(8)
-            mix0 = n_tile * Int32(self.tile_n) + lane_pair_base
-            mix1 = mix0 + Int32(1)
-            b_mix = n_tile * Int32(self.tile_n) + lane_group
-
-            d0 = Float32(0.0)
-            d1 = Float32(0.0)
-            d2 = Float32(0.0)
-            d3 = Float32(0.0)
+            acc = cute.make_rmem_tensor(
+                cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
+                Float32,
+            )
+            acc.fill(0.0)
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
@@ -1887,37 +2078,79 @@ class MHCPrefillTf32ProjectTmaKernel:
                         a1_f = Float32(sA[row1, a_k0, consumer_state.index])
                         a3_f = Float32(sA[row1, a_k1, consumer_state.index])
 
-                    b0_f = Float32(0.0)
-                    b1_f = Float32(0.0)
-                    if b_mix < Int32(_MIXES):
-                        b0_f = Float32(sB[lane_group, a_k0, consumer_state.index])
-                        b1_f = Float32(sB[lane_group, a_k1, consumer_state.index])
+                    a0_tf32 = f32_to_tf32_bits(a0_f)
+                    a1_tf32 = f32_to_tf32_bits(a1_f)
+                    a2_tf32 = f32_to_tf32_bits(a2_f)
+                    a3_tf32 = f32_to_tf32_bits(a3_f)
+                    for warp_mma_n in cutlass.range_constexpr(
+                        self.n_mma_tiles_per_warp
+                    ):
+                        mma_n = (
+                            Int32(warp_mma_n * self.num_n_warps)
+                            + warp_n
+                        )
+                        b_mix_local = Int32(mma_n * 8) + lane_group
+                        b_mix = (
+                            n_tile * Int32(self.tile_n)
+                            + b_mix_local
+                        )
+                        b0_f = Float32(0.0)
+                        b1_f = Float32(0.0)
+                        if b_mix < Int32(_MIXES):
+                            b0_f = Float32(
+                                sB[b_mix_local, a_k0, consumer_state.index]
+                            )
+                            b1_f = Float32(
+                                sB[b_mix_local, a_k1, consumer_state.index]
+                            )
 
-                    d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
-                        d0,
-                        d1,
-                        d2,
-                        d3,
-                        f32_to_tf32_bits(a0_f),
-                        f32_to_tf32_bits(a1_f),
-                        f32_to_tf32_bits(a2_f),
-                        f32_to_tf32_bits(a3_f),
-                        f32_to_tf32_bits(b0_f),
-                        f32_to_tf32_bits(b1_f),
-                    )
+                        d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
+                            acc[warp_mma_n, 0],
+                            acc[warp_mma_n, 1],
+                            acc[warp_mma_n, 2],
+                            acc[warp_mma_n, 3],
+                            a0_tf32,
+                            a1_tf32,
+                            a2_tf32,
+                            a3_tf32,
+                            f32_to_tf32_bits(b0_f),
+                            f32_to_tf32_bits(b1_f),
+                        )
+                        acc[warp_mma_n, 0] = d0
+                        acc[warp_mma_n, 1] = d1
+                        acc[warp_mma_n, 2] = d2
+                        acc[warp_mma_n, 3] = d3
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
-            if token0 < num_tokens:
-                if mix0 < Int32(_MIXES):
-                    partials[token0, Int32(0), mix0 + Int32(1)] = d0
-                if mix1 < Int32(_MIXES):
-                    partials[token0, Int32(0), mix1 + Int32(1)] = d1
-            if token1 < num_tokens:
-                if mix0 < Int32(_MIXES):
-                    partials[token1, Int32(0), mix0 + Int32(1)] = d2
-                if mix1 < Int32(_MIXES):
-                    partials[token1, Int32(0), mix1 + Int32(1)] = d3
+            for warp_mma_n in cutlass.range_constexpr(
+                self.n_mma_tiles_per_warp
+            ):
+                mma_n = Int32(warp_mma_n * self.num_n_warps) + warp_n
+                mix0 = (
+                    n_tile * Int32(self.tile_n)
+                    + Int32(mma_n * 8)
+                    + lane_pair_base
+                )
+                mix1 = mix0 + Int32(1)
+                if token0 < num_tokens:
+                    if mix0 < Int32(_MIXES):
+                        partials[token0, Int32(0), mix0 + Int32(1)] = acc[
+                            warp_mma_n, 0
+                        ]
+                    if mix1 < Int32(_MIXES):
+                        partials[token0, Int32(0), mix1 + Int32(1)] = acc[
+                            warp_mma_n, 1
+                        ]
+                if token1 < num_tokens:
+                    if mix0 < Int32(_MIXES):
+                        partials[token1, Int32(0), mix0 + Int32(1)] = acc[
+                            warp_mma_n, 2
+                        ]
+                    if mix1 < Int32(_MIXES):
+                        partials[token1, Int32(0), mix1 + Int32(1)] = acc[
+                            warp_mma_n, 3
+                        ]
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
@@ -2083,8 +2316,10 @@ class MHCFinalizeGramKernel:
 
     The partial kernel (compute_gram=True) provides G[m,m'] in partials rows
     [32, 64), so sum_h y^2 = pre^T G pre is a scalar -- no per-h norm reduction.
-    Each CTA owns one hidden tile, redundantly reduces partials+Gram and runs the
-    Sinkhorn (cheap), then writes its y tile in a single pass (no cross-CTA sync).
+    Each CTA owns one or more hidden tiles, redundantly reduces partials+Gram and
+    runs the Sinkhorn (cheap), then writes its y tiles without cross-CTA sync.
+    Compact prefill partials use one CTA per token because prefill has enough
+    token parallelism and this avoids repeating the scalar finalize per tile.
     """
 
     num_threads = _GRAM_BLOCK_H
@@ -2112,12 +2347,17 @@ class MHCFinalizeGramKernel:
         compact_partials: bool = False,
     ):
         self.hidden_size = int(hidden_size)
+        self.num_threads = (
+            _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H
+        )
+        self.block_h = self.num_threads
         if self.hidden_size % self.block_h != 0:
             raise ValueError(
                 f"hidden_size={self.hidden_size} must be divisible by "
                 f"finalize block_h={self.block_h}"
             )
         self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
+        self.hidden_tiles = self.hidden_size // self.block_h
         self.source_warps = (self.source_tiles + 31) // 32
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
@@ -2135,6 +2375,12 @@ class MHCFinalizeGramKernel:
         # (no Gram reduction, no RMSNorm). The partial then skips the Gram.
         self.fuse_norm = bool(fuse_norm)
         self.compact_partials = bool(compact_partials)
+        self.tiles_per_cta = self.hidden_tiles if self.compact_partials else 1
+        if self.compact_partials and self.hidden_size % (2 * self.num_threads) != 0:
+            raise ValueError(
+                f"hidden_size={self.hidden_size} must be divisible by "
+                f"2 * prefill finalize threads={2 * self.num_threads}"
+            )
 
     @cute.jit
     def __call__(
@@ -2163,7 +2409,7 @@ class MHCFinalizeGramKernel:
         ):
             raise TypeError("norm_weight must be BFloat16 or Float32")
         self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight).launch(
-            grid=(self.hidden_size // self.block_h, num_tokens, 1),
+            grid=(self.hidden_tiles // self.tiles_per_cta, num_tokens, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -2180,8 +2426,8 @@ class MHCFinalizeGramKernel:
         comb: cute.Tensor,
         norm_weight: cute.Tensor,
     ):
-        tile_h, token, _ = cute.arch.block_idx()
-        tile_h = Int32(tile_h)
+        tile_group, token, _ = cute.arch.block_idx()
+        tile_group = Int32(tile_group)
         tidx = Int32(cute.arch.thread_idx()[0])
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(_finalize_storage_cls(self.num_threads, False))
@@ -2332,7 +2578,7 @@ class MHCFinalizeGramKernel:
             post1 = two / (one + cute.math.exp(-(mixes[5] * s1 + Float32(bias[5])), fastmath=True))
             post2 = two / (one + cute.math.exp(-(mixes[6] * s1 + Float32(bias[6])), fastmath=True))
             post3 = two / (one + cute.math.exp(-(mixes[7] * s1 + Float32(bias[7])), fastmath=True))
-            if tile_h == Int32(0):
+            if tile_group == Int32(0):
                 post[token, 0] = post0
                 post[token, 1] = post1
                 post[token, 2] = post2
@@ -2502,7 +2748,7 @@ class MHCFinalizeGramKernel:
                 c23 = c23 * inv_col3
                 c33 = c33 * inv_col3
 
-            if tile_h == Int32(0):
+            if tile_group == Int32(0):
                 comb[token, 0, 0] = c00
                 comb[token, 0, 1] = c01
                 comb[token, 0, 2] = c02
@@ -2548,22 +2794,88 @@ class MHCFinalizeGramKernel:
         p1 = Float32(s_pre[1])
         p2 = Float32(s_pre[2])
         p3 = Float32(s_pre[3])
-        h = tile_h * Int32(self.block_h) + tidx
-        ro0 = Float32(residual[token, 0, h])
-        ro1 = Float32(residual[token, 1, h])
-        ro2 = Float32(residual[token, 2, h])
-        ro3 = Float32(residual[token, 3, h])
-        # Round y_prenorm to bf16 before applying the norm, matching the
-        # reference (and vLLM), so the only difference is the (negligible)
-        # fp32-vs-bf16 sum-of-squares used for rms.
-        y_pre = (p0 * ro0 + p1 * ro1 + p2 * ro2 + p3 * ro3).to(cutlass.BFloat16)
-        if const_expr(self.fuse_norm):
-            rms = Float32(s_post[0])
-            y[token, h] = (
-                Float32(y_pre) * rms * Float32(norm_weight[h])
-            ).to(cutlass.BFloat16)
+        if const_expr(self.compact_partials):
+            y_u32 = cute.recast_tensor(y, Uint32)
+            for pair_iter in cutlass.range_constexpr(
+                self.hidden_size // (2 * self.num_threads)
+            ):
+                h = Int32(2 * pair_iter * self.num_threads) + tidx * Int32(2)
+                residual_base = token * Int32(_MHC_MULT * self.hidden_size) + h
+                ro0_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(residual, residual_base)
+                )
+                ro1_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        residual_base + Int32(self.hidden_size),
+                    )
+                )
+                ro2_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        residual_base + Int32(2 * self.hidden_size),
+                    )
+                )
+                ro3_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        residual_base + Int32(3 * self.hidden_size),
+                    )
+                )
+                ro00, ro01 = bfloat2_to_float2_scaled(ro0_pair, Float32(1.0))
+                ro10, ro11 = bfloat2_to_float2_scaled(ro1_pair, Float32(1.0))
+                ro20, ro21 = bfloat2_to_float2_scaled(ro2_pair, Float32(1.0))
+                ro30, ro31 = bfloat2_to_float2_scaled(ro3_pair, Float32(1.0))
+                norm0 = Float32(1.0)
+                norm1 = Float32(1.0)
+                if const_expr(self.fuse_norm):
+                    if const_expr(norm_weight.element_type == cutlass.BFloat16):
+                        norm_pair = ld_global_nc_u32(
+                            get_ptr_as_int64(norm_weight, h)
+                        )
+                        norm0, norm1 = bfloat2_to_float2_scaled(
+                            norm_pair,
+                            Float32(1.0),
+                        )
+                    else:
+                        norm0 = Float32(norm_weight[h])
+                        norm1 = Float32(norm_weight[h + Int32(1)])
+                y_pre0 = (
+                    p0 * ro00 + p1 * ro10 + p2 * ro20 + p3 * ro30
+                ).to(cutlass.BFloat16)
+                y_pre1 = (
+                    p0 * ro01 + p1 * ro11 + p2 * ro21 + p3 * ro31
+                ).to(cutlass.BFloat16)
+                y0 = Float32(y_pre0)
+                y1 = Float32(y_pre1)
+                if const_expr(self.fuse_norm):
+                    rms = Float32(s_post[0])
+                    y0 = y0 * rms * norm0
+                    y1 = y1 * rms * norm1
+                y_u32[token, h // Int32(2)] = pack_f32x2_to_bfloat2(y0, y1)
         else:
-            y[token, h] = y_pre
+            first_tile_h = tile_group * Int32(self.tiles_per_cta)
+            for tile_iter in cutlass.range_constexpr(self.tiles_per_cta):
+                h = (
+                    first_tile_h + Int32(tile_iter)
+                ) * Int32(self.block_h) + tidx
+                ro0 = Float32(residual[token, 0, h])
+                ro1 = Float32(residual[token, 1, h])
+                ro2 = Float32(residual[token, 2, h])
+                ro3 = Float32(residual[token, 3, h])
+                # Round y_prenorm to bf16 before applying the norm, matching the
+                # reference (and vLLM), so the only difference is the (negligible)
+                # fp32-vs-bf16 sum-of-squares used for rms.
+                y_pre = (p0 * ro0 + p1 * ro1 + p2 * ro2 + p3 * ro3).to(
+                    cutlass.BFloat16
+                )
+                if const_expr(self.fuse_norm):
+                    rms = Float32(s_post[0])
+                    y[token, h] = (
+                        Float32(y_pre) * rms * Float32(norm_weight[h])
+                    ).to(cutlass.BFloat16)
+                else:
+                    y[token, h] = y_pre
 
 
 @lru_cache(maxsize=64)
@@ -2652,10 +2964,12 @@ def _prefill_bf16_project_tma_kernel(
 def _prefill_tf32_project_kernel(
     hidden_size: int,
     split_k: int,
+    chunk_geometry: bool = False,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
+        chunk_geometry=chunk_geometry,
     )
 
 
@@ -3382,12 +3696,13 @@ def _run_mhc_post_pre_prefill_gram_launch(
     hidden_specialization = _hidden_specialization_name(hidden_size)
     compile_name = (
         "integration.residual.mhc_post_pre_prefill_gram_"
-        f"{hidden_specialization}_threads{_PREFILL_THREADS}"
+        f"{hidden_specialization}_threads{_PREFILL_GRAM_THREADS}"
     )
     compile_key = (
+        ("impl", "bf16x2_io_coeff_smem_v2"),
         ("hidden_size", hidden_size),
         ("split_k", split_k),
-        ("threads", _PREFILL_THREADS),
+        ("threads", _PREFILL_GRAM_THREADS),
         cache_key,
     )
     b12x_launch(
@@ -3653,6 +3968,12 @@ def _run_mhc_prefill_tf32_project_launch(
     if not fn.is_contiguous():
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
+    chunk_geometry = tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+    kernel = _prefill_tf32_project_kernel(
+        hidden_size,
+        split_k,
+        chunk_geometry,
+    )
     args = (
         _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(fn, cutlass.Float32),
@@ -3689,22 +4010,26 @@ def _run_mhc_prefill_tf32_project_launch(
     hidden_specialization = _hidden_specialization_name(hidden_size)
     compile_name = (
         "integration.residual.mhc_prefill_tf32_project_tma_"
-        f"{hidden_specialization}_m{_PREFILL_TMA_TILE_M}_n{_PREFILL_TF32_TMA_TILE_N}"
+        f"{hidden_specialization}_m{kernel.tile_m}_n{kernel.tile_n}"
     )
     compile_key = (
         ("hidden_size", hidden_size),
         ("split_k", split_k),
-        ("tile_m", _PREFILL_TMA_TILE_M),
-        ("tile_n", _PREFILL_TF32_TMA_TILE_N),
-        ("tile_k", _PREFILL_TMA_TILE_K),
-        ("num_stages", _PREFILL_TMA_STAGES),
-        ("num_compute_warps", _PREFILL_TMA_COMPUTE_WARPS),
-        ("threads", _PREFILL_TMA_THREADS),
-        ("operand_layout", "tma_a_bf16_b_f32_tf32_m16n8k8_v1"),
+        ("chunk_geometry", chunk_geometry),
+        ("chunk_min_tokens", _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS),
+        ("tile_m", kernel.tile_m),
+        ("tile_n", kernel.tile_n),
+        ("tile_k", kernel.tile_k),
+        ("num_stages", kernel.num_stages),
+        ("num_m_warps", kernel.num_m_warps),
+        ("num_n_warps", kernel.num_n_warps),
+        ("num_compute_warps", kernel.num_compute_warps),
+        ("threads", kernel.num_threads),
+        ("operand_layout", "tma_a_bf16_b_f32_tf32_m16n8k8_v3"),
         cache_key,
     )
     b12x_launch(
-        _prefill_tf32_project_kernel(hidden_size, split_k),
+        kernel,
         compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
         compile_args=args,
         runtime_args=args,
@@ -4207,7 +4532,12 @@ def _run_mhc_finalize_gram_launch(
         else ("norm_weight", None)
     )
     common_key_tail = (
-        ("impl", "finalize_gram_multicta_v2"),
+        (
+            "impl",
+            "prefill_finalize_gram_bf16x2_io_v3"
+            if compact_partials
+            else "finalize_gram_multicta_v2",
+        ),
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
         ("compact_partials", compact_partials),
@@ -4261,7 +4591,10 @@ def _run_mhc_finalize_gram_launch(
         suffix = "_compact" if compact_partials else ""
         compile_name = f"integration.residual.mhc_finalize_gram_hidden4096{suffix}"
         compile_key = (
-            ("block_h", _GRAM_BLOCK_H),
+            (
+                "block_h",
+                _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H,
+            ),
             ("source_tiles", _SOURCE_TILES),
             ("gram_row0", _GRAM_ROW0),
             *common_key_tail,
@@ -4275,7 +4608,10 @@ def _run_mhc_finalize_gram_launch(
         compile_key = (
             ("hidden_size", hidden_size),
             ("split_k", split_k),
-            ("block_h", _GRAM_BLOCK_H),
+            (
+                "block_h",
+                _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H,
+            ),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("gram_row0", hidden_size // _SOURCE_TILE_H),
             *common_key_tail,
