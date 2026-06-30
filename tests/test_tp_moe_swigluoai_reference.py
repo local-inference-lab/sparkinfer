@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from b12x.cute.fp4 import pack_grouped_fp4_values, swizzle_block_scale
-from b12x.integration.tp_moe import TPMoEFP4Binding, b12x_moe_fp4
+from b12x.integration.tp_moe import (
+    B12XFP4ExpertWeights,
+    TPMoEFP4Binding,
+    _PreparedWeightRepresentation,
+    b12x_moe_fp4,
+    plan_b12x_fp4_moe_weights,
+)
 from b12x.moe.fused.activations import (
     SWIGLUOAI_DEFAULT_ALPHA,
     SWIGLUOAI_DEFAULT_BETA,
@@ -165,16 +172,57 @@ def test_swigluoai_w4a16_f32_reference_matches_small_topk_torch_moe() -> None:
 
 def test_fp4_binding_owns_swigluoai_params() -> None:
     hidden, intermediate, experts, topk = 16, 16, 1, 1
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="modelopt_nvfp4",
+        activation=SWIGLUOAI_UNINTERLEAVE,
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    layout = weight_plan.required_weight_layout("w4a16")
+    assert layout is not None
+    w1_fp4 = torch.zeros(
+        experts, 2 * intermediate, hidden // 2, dtype=torch.uint8
+    )
+    w1_blockscale = torch.zeros(experts, 1, dtype=torch.uint8)
+    w1_alphas = torch.ones(experts, dtype=torch.float32)
+    w2_fp4 = torch.zeros(
+        experts, hidden, intermediate // 2, dtype=torch.uint8
+    )
+    w2_blockscale = torch.zeros(experts, 1, dtype=torch.uint8)
+    w2_alphas = torch.ones(experts, dtype=torch.float32)
+    payload = SimpleNamespace(
+        w13=w1_fp4,
+        w13_scale=w1_blockscale,
+        w13_global_scale=w1_alphas,
+        w2=w2_fp4,
+        w2_scale=w2_blockscale,
+        w2_global_scale=w2_alphas,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    expert_weights = B12XFP4ExpertWeights(
+        plan=weight_plan,
+        a1_gscale=torch.ones(experts, dtype=torch.float32),
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=torch.ones(experts, dtype=torch.float32),
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=layout,
+            value=payload,
+        ),
+    )
     binding = TPMoEFP4Binding(
         a=torch.zeros(1, hidden, dtype=torch.bfloat16),
-        a1_gscale=torch.ones(experts, dtype=torch.float32),
-        w1_fp4=torch.zeros(experts, 2 * intermediate, hidden // 2, dtype=torch.uint8),
-        w1_blockscale=torch.zeros(experts, 1, dtype=torch.uint8),
-        w1_alphas=torch.ones(experts, dtype=torch.float32),
-        a2_gscale=torch.ones(experts, dtype=torch.float32),
-        w2_fp4=torch.zeros(experts, hidden, intermediate // 2, dtype=torch.uint8),
-        w2_blockscale=torch.zeros(experts, 1, dtype=torch.uint8),
-        w2_alphas=torch.ones(experts, dtype=torch.float32),
+        experts=expert_weights,
         topk_weights=torch.ones(1, topk, dtype=torch.float32),
         topk_ids=torch.zeros(1, topk, dtype=torch.int32),
         implementation="test",
@@ -186,11 +234,10 @@ def test_fp4_binding_owns_swigluoai_params() -> None:
         num_topk=topk,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        activation=SWIGLUOAI_UNINTERLEAVE,
         swiglu_limit=SWIGLUOAI_DEFAULT_LIMIT,
         swiglu_alpha=SWIGLUOAI_DEFAULT_ALPHA,
         swiglu_beta=SWIGLUOAI_DEFAULT_BETA,
     )
 
-    with pytest.raises(ValueError, match="swiglu_alpha"):
+    with pytest.raises(TypeError):
         b12x_moe_fp4(binding=binding, swiglu_alpha=2.0)

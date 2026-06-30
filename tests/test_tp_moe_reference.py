@@ -34,17 +34,6 @@ from b12x.integration.tp_moe import (
 )
 
 
-def _clear_codegen_artifacts() -> None:
-    root = pathlib.Path(__file__).resolve().parents[1]
-    for pattern in (
-        "cutlass___call___b12xmoefusedstatic*.ptx",
-        "cutlass___call___b12xmoefusedstatic*.cubin",
-        "cutlass___call___b12xmoefusedstatic*.sass",
-    ):
-        for path in root.glob(pattern):
-            path.unlink(missing_ok=True)
-
-
 def _unswizzle_block_scale(swizzled_scale: torch.Tensor, rows: int, cols_blocks: int) -> torch.Tensor:
     cols_padded = ((cols_blocks + 3) // 4) * 4
     rows_padded = ((rows + 127) // 128) * 128
@@ -258,29 +247,9 @@ def _make_b12x_moe_binding(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ):
-    from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+    from tests.helpers import make_tp_moe_fp4_binding, prepare_tp_moe_fp4_experts
 
-    plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            max_tokens=int(x.shape[0]),
-            weight_E=int(weights.w13_weight.shape[0]),
-            k=int(x.shape[1]),
-            n=int(weights.w2_weight.shape[2]) * 2,
-            num_topk=int(topk_ids.shape[1]),
-            device=x.device,
-            dtype=x.dtype,
-            core_token_counts=(int(x.shape[0]),),
-            route_num_experts=0,
-            source_format=weights.source_format,
-            w13_layout=weights.w13_layout,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[idx].device)
-        for idx, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
-    )
-    return plan.bind(
-        scratch=scratch,
+    experts = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=scale_params.a1_gscale,
         w1_fp4=weights.w13_weight,
@@ -290,11 +259,16 @@ def _make_b12x_moe_binding(
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=scale_params.g2_alphas,
+        source_format=weights.source_format,
+        w13_layout=weights.w13_layout,
+    )
+
+    return make_tp_moe_fp4_binding(
+        a=x,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         input_scales_static=True,
-        source_format=weights.source_format,
-        w13_layout=weights.w13_layout,
     )
 
 
@@ -389,7 +363,6 @@ def main() -> None:
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--trials", type=int, default=1)
     args = parser.parse_args()
-    args.impls = ["b12x" if impl in {"static", "dynamic"} else impl for impl in args.impls]
     if args.scale_contract == "per-expert" and "flashinfer" in args.impls:
         raise ValueError("flashinfer does not support --scale-contract per-expert")
 
@@ -409,7 +382,6 @@ def main() -> None:
         load_expert_weights(MODEL_PATH, spec, layer_idx=layer_idx)
         for layer_idx in args.layer_indices
     ]
-    _clear_codegen_artifacts()
     clear_tp_moe_caches()
     torch.cuda.empty_cache()
 
@@ -492,7 +464,9 @@ def main() -> None:
                     args.scale_contract,
                     clear_state_between_calls=args.clear_state_between_calls,
                 )
-                for seq_idx, (weights, ref, out) in enumerate(zip(weights_sequence, refs, outs)):
+                for seq_idx, (weights, ref, out) in enumerate(
+                    zip(weights_sequence, refs, outs, strict=True)
+                ):
                     diff = (out.float() - ref.float()).abs()
                     out_norm = out.float().norm().item()
                     cos = F.cosine_similarity(

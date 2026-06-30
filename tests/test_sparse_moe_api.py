@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import b12x.integration.tp_moe as tp_moe
@@ -14,6 +15,8 @@ from b12x.integration.tp_moe import (
     b12x_sparse_moe_fp4,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
+    plan_b12x_fp4_moe_weights,
+    _PreparedWeightRepresentation,
 )
 
 
@@ -22,17 +25,61 @@ def _make_experts(
     num_experts: int = 3,
     *,
     source_format: str = "modelopt_nvfp4",
+    activation: str = "silu",
+    quant_mode: str | None = None,
 ) -> B12XFP4ExpertWeights:
-    return B12XFP4ExpertWeights(
-        a1_gscale=torch.ones(num_experts, dtype=torch.float32),
-        w1_fp4=torch.zeros(num_experts, 4, max(1, hidden_size // 2), dtype=torch.uint8),
-        w1_blockscale=torch.zeros(num_experts, 1, dtype=torch.float32),
-        w1_alphas=torch.ones(num_experts, dtype=torch.float32),
-        a2_gscale=torch.ones(num_experts, dtype=torch.float32),
-        w2_fp4=torch.zeros(num_experts, hidden_size, 1, dtype=torch.uint8),
-        w2_blockscale=torch.zeros(num_experts, 1, dtype=torch.float32),
-        w2_alphas=torch.ones(num_experts, dtype=torch.float32),
+    from types import SimpleNamespace
+
+    quant_mode = quant_mode or (
+        "w4a16" if source_format == "compressed_tensors" else "nvfp4"
+    )
+    w1_fp4 = torch.zeros(
+        num_experts, 4, max(1, hidden_size // 2), dtype=torch.uint8
+    )
+    w2_fp4 = torch.zeros(num_experts, hidden_size, 1, dtype=torch.uint8)
+    w1_alphas = torch.ones(num_experts, dtype=torch.float32)
+    w2_alphas = torch.ones(num_experts, dtype=torch.float32)
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes=quant_mode,
         source_format=source_format,
+        activation=activation,
+        params_dtype=torch.float32,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=2,
+    )
+    layout = plan.required_weight_layout(quant_mode)
+    w1_blockscale = torch.zeros(num_experts, 1, dtype=torch.float32)
+    w2_blockscale = torch.zeros(num_experts, 1, dtype=torch.float32)
+    representation = None
+    if layout is not None:
+        payload = SimpleNamespace(
+            w13=w1_fp4,
+            w13_scale=w1_blockscale,
+            w13_global_scale=w1_alphas,
+            w2=w2_fp4,
+            w2_scale=w2_blockscale,
+            w2_global_scale=w2_alphas,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=2,
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode=quant_mode,
+            layout=layout,
+            value=payload,
+        )
+    return B12XFP4ExpertWeights(
+        plan=plan,
+        a1_gscale=torch.ones(num_experts, dtype=torch.float32),
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=torch.ones(num_experts, dtype=torch.float32),
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        representation=representation,
     )
 
 
@@ -42,27 +89,20 @@ def _make_scratch():
 
 def _make_fp4_binding_from_kwargs(**kwargs) -> TPMoEFP4Binding:
     a = kwargs["a"]
-    w1_fp4 = kwargs["w1_fp4"]
-    w2_fp4 = kwargs["w2_fp4"]
+    experts = kwargs["experts"]
     topk_ids = kwargs["topk_ids"]
+    mode = kwargs.get("quant_mode") or next(iter(experts.plan.quant_modes))
     return TPMoEFP4Binding(
         a=a,
-        a1_gscale=kwargs["a1_gscale"],
-        w1_fp4=w1_fp4,
-        w1_blockscale=kwargs["w1_blockscale"],
-        w1_alphas=kwargs["w1_alphas"],
-        a2_gscale=kwargs["a2_gscale"],
-        w2_fp4=w2_fp4,
-        w2_blockscale=kwargs["w2_blockscale"],
-        w2_alphas=kwargs["w2_alphas"],
+        experts=experts,
         topk_weights=kwargs["topk_weights"],
         topk_ids=topk_ids,
         implementation="test",
-        state_E=int(w1_fp4.shape[0]),
-        weight_E=int(w1_fp4.shape[0]),
+        state_E=experts.num_experts,
+        weight_E=experts.num_experts,
         max_rows=int(a.shape[0]),
         k=int(a.shape[1]),
-        n=int(w2_fp4.shape[2]) * 2,
+        n=experts.intermediate_size,
         num_topk=int(topk_ids.shape[1]),
         device=a.device,
         dtype=a.dtype,
@@ -70,15 +110,10 @@ def _make_fp4_binding_from_kwargs(**kwargs) -> TPMoEFP4Binding:
             kwargs.get("apply_router_weight_on_input", False)
         ),
         output=kwargs.get("output"),
-        input_scales_are_reciprocal=kwargs.get("input_scales_are_reciprocal"),
         input_scales_static=bool(kwargs.get("input_scales_static", False)),
         fast_math=kwargs.get("fast_math"),
-        activation=kwargs.get("activation", "silu"),
-        quant_mode=kwargs.get("quant_mode"),
+        quant_mode=mode,
         unit_scale_contract=bool(kwargs.get("unit_scale_contract", False)),
-        source_format=kwargs.get("source_format", "modelopt_nvfp4"),
-        w13_layout=kwargs.get("w13_layout", "w13"),
-        prepared_w4a16=kwargs.get("prepared_w4a16"),
         swiglu_limit=kwargs.get("swiglu_limit"),
         swiglu_alpha=kwargs.get("swiglu_alpha"),
         swiglu_beta=kwargs.get("swiglu_beta"),
@@ -93,18 +128,9 @@ def _make_fp4_binding(
 ) -> TPMoEFP4Binding:
     binding_kwargs = {
         "a": hidden_states,
-        "a1_gscale": experts.a1_gscale,
-        "w1_fp4": experts.w1_fp4,
-        "w1_blockscale": experts.w1_blockscale,
-        "w1_alphas": experts.w1_alphas,
-        "a2_gscale": experts.a2_gscale,
-        "w2_fp4": experts.w2_fp4,
-        "w2_blockscale": experts.w2_blockscale,
-        "w2_alphas": experts.w2_alphas,
+        "experts": experts,
         "topk_weights": routing.topk_weights,
         "topk_ids": routing.topk_ids,
-        "source_format": experts.source_format,
-        "w13_layout": experts.w13_layout,
     }
     binding_kwargs.update(kwargs)
     return _make_fp4_binding_from_kwargs(**binding_kwargs)
@@ -253,9 +279,14 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
     torch.testing.assert_close(captured["topk_weights"], routing.topk_weights)
 
 
-def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
+def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
     hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
+    experts = _make_experts(
+        hidden_size=4,
+        source_format="compressed_tensors",
+        activation="swigluoai_uninterleave",
+        quant_mode="w4a16",
+    )
     routing = B12XTopKRouting(
         topk_weights=torch.ones(2, 2, dtype=torch.float32),
         topk_ids=torch.zeros(2, 2, dtype=torch.int64),
@@ -266,10 +297,8 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["output"] = kwargs.get("output")
         captured["input_scales_static"] = kwargs.get("input_scales_static")
         captured["fast_math"] = kwargs.get("fast_math")
-        captured["activation"] = kwargs.get("activation")
+        captured["experts"] = kwargs.get("experts")
         captured["quant_mode"] = kwargs.get("quant_mode")
-        captured["source_format"] = kwargs.get("source_format")
-        captured["w13_layout"] = kwargs.get("w13_layout")
         captured["swiglu_limit"] = kwargs.get("swiglu_limit")
         captured["swiglu_alpha"] = kwargs.get("swiglu_alpha")
         captured["swiglu_beta"] = kwargs.get("swiglu_beta")
@@ -287,10 +316,8 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         experts,
         routing=routing,
         output=output,
-        input_scales_are_reciprocal=True,
         input_scales_static=True,
         fast_math=False,
-        activation="swigluoai_uninterleave",
         quant_mode="w4a16",
         swiglu_limit=5.0,
         swiglu_alpha=1.5,
@@ -303,18 +330,14 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         actual = b12x_sparse_moe_fp4(binding=binding)
 
     assert actual is output
-    assert captured == {
-        "output": output,
-        "input_scales_static": True,
-        "fast_math": False,
-        "activation": "swigluoai_uninterleave",
-        "quant_mode": "w4a16",
-        "source_format": "compressed_tensors",
-        "w13_layout": "w13",
-        "swiglu_limit": 5.0,
-        "swiglu_alpha": 1.5,
-        "swiglu_beta": 0.25,
-    }
+    assert captured["output"] is output
+    assert captured["experts"] is experts
+    assert captured["input_scales_static"] is True
+    assert captured["fast_math"] is False
+    assert captured["quant_mode"] == "w4a16"
+    assert captured["swiglu_limit"] == 5.0
+    assert captured["swiglu_alpha"] == 1.5
+    assert captured["swiglu_beta"] == 0.25
 
 
 def test_fp4_expert_weights_default_to_modelopt_nvfp4_source_format() -> None:
@@ -325,7 +348,7 @@ def test_fp4_expert_weights_default_to_modelopt_nvfp4_source_format() -> None:
 
 def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
     hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4)
+    experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
     routing = B12XTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
@@ -335,18 +358,13 @@ def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
         experts,
         routing,
         quant_mode="nvfp4",
-        source_format="compressed_tensors",
     )
-
-    try:
+    with pytest.raises(ValueError) as exc_info:
         b12x_moe_fp4(binding=binding)
-    except ValueError as exc:
-        message = str(exc)
-        assert "source_format='compressed_tensors'" in message
-        assert "quant_mode='w4a16'" in message
-        assert "source_format='modelopt_nvfp4'" in message
-    else:
-        raise AssertionError("expected compressed_tensors NVFP4 validation to fire")
+
+    message = str(exc_info.value)
+    assert "source_format='compressed_tensors'" in message
+    assert "quant_mode='nvfp4'" in message
 
 
 def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
@@ -356,69 +374,20 @@ def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
-    binding = _make_sparse_binding(
-        hidden_states,
-        experts,
-        routing=routing,
-        quant_mode="nvfp4",
-    )
+    with pytest.raises(ValueError) as exc_info:
+        _make_sparse_binding(
+            hidden_states,
+            experts,
+            routing=routing,
+            quant_mode="nvfp4",
+        )
 
-    try:
-        b12x_sparse_moe_fp4(binding=binding)
-    except ValueError as exc:
-        message = str(exc)
-        assert "source_format='compressed_tensors'" in message
-        assert "quant_mode='w4a16'" in message
-        assert "source_format='modelopt_nvfp4'" in message
-    else:
-        raise AssertionError("expected compressed_tensors NVFP4 validation to fire")
+    message = str(exc_info.value)
+    assert "quant_mode='nvfp4'" in message
+    assert "prepared-weight plan ['w4a16']" in message
 
 
-def test_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
-    hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4)
-    routing = B12XTopKRouting(
-        topk_weights=torch.ones(2, 1, dtype=torch.float32),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
-    )
-    binding = _make_fp4_binding(
-        hidden_states,
-        experts,
-        routing,
-        input_scales_are_reciprocal=False,
-    )
-
-    try:
-        b12x_moe_fp4(binding=binding)
-    except AssertionError as exc:
-        assert "input_scales_are_reciprocal is deprecated" in str(exc)
-    else:
-        raise AssertionError("expected deprecated reciprocal flag validation to fire")
-
-
-def test_sparse_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
-    hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4)
-    routing = B12XTopKRouting(
-        topk_weights=torch.ones(2, 1, dtype=torch.float32),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
-    )
-    binding = _make_sparse_binding(
-        hidden_states,
-        experts,
-        routing=routing,
-        input_scales_are_reciprocal=False,
-    )
-
-    try:
-        b12x_sparse_moe_fp4(binding=binding)
-    except AssertionError as exc:
-        assert "input_scales_are_reciprocal is deprecated" in str(exc)
-    else:
-        raise AssertionError("expected deprecated reciprocal flag validation to fire")
-
-
-def test_sparse_moe_fp4_env_force_overrides_to_w4a16(monkeypatch) -> None:
+def test_sparse_moe_fp4_prepared_plan_ignores_runtime_force_env(monkeypatch) -> None:
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4)
@@ -452,7 +421,7 @@ def test_sparse_moe_fp4_env_force_overrides_to_w4a16(monkeypatch) -> None:
             )
         )
 
-    assert captured == ["w4a16", "w4a16"]
+    assert captured == ["nvfp4", "nvfp4"]
 
 
 def test_sparse_moe_fp4_scales_output_in_place() -> None:

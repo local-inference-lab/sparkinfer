@@ -4,10 +4,11 @@ import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
-import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
+    plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
 )
+from b12x.moe.execution import PreparedWeightLayout
 from b12x.moe.fused.w4a16.host import (
     reorder_w13_to_gate_up,
     unswizzle_expert_scales,
@@ -18,7 +19,6 @@ from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
 )
-from .helpers import run_tp_moe_fp4
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
@@ -77,21 +77,32 @@ def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_accepts_w13_layout(
     w2_global_scale = torch.tensor([3.0, 5.0], dtype=torch.float32)
     a1_gscale = torch.tensor([0.5, 0.25], dtype=torch.float32)
     a2_gscale = torch.tensor([1.0 / 3.0, 0.2], dtype=torch.float32)
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=64,
+        w13_layout=w13_layout,
+    )
 
     prepared = prepare_b12x_fp4_moe_weights(
-        source_format="modelopt_nvfp4",
-        w13_layout=w13_layout,
+        plan=plan,
         w1_global_scale=w1_global_scale,
         a1_gscale=a1_gscale,
         w2_global_scale=w2_global_scale,
         a2_gscale=a2_gscale,
-        prepare_runtime_alphas=True,
+        w1_fp4=torch.empty((2, 128, 64), dtype=torch.uint8),
+        w1_blockscale=torch.empty((2, 1), dtype=torch.uint8),
+        w2_fp4=torch.empty((2, 128, 32), dtype=torch.uint8),
+        w2_blockscale=torch.empty((2, 1), dtype=torch.uint8),
+        params_dtype=torch.bfloat16,
     )
 
-    assert prepared.w1_runtime_alphas is not None
-    assert prepared.w2_runtime_alphas is not None
-    w1_runtime = prepared.w1_runtime_alphas
-    w2_runtime = prepared.w2_runtime_alphas
+    w1_runtime = prepared.w1_alphas
+    w2_runtime = prepared.w2_alphas
     assert w1_runtime.shape == (2,)
     assert w2_runtime.shape == (2,)
     assert prepared.w13_layout == w13_layout
@@ -389,28 +400,15 @@ def test_mxfp4_native_source_format_is_removed() -> None:
 
 
 def test_fp4_e8m0_k32_is_rejected_by_w4a4_quant_mode() -> None:
-    a = torch.empty((1, 4), dtype=torch.bfloat16)
-    scale = torch.empty((1, 1), dtype=torch.uint8)
-    alpha = torch.ones((1,), dtype=torch.float32)
-    topk_weights = torch.ones((1, 1), dtype=torch.float32)
-    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
-
     with pytest.raises(ValueError, match="quant_mode='w4a16'"):
-        run_tp_moe_fp4(
-            a=a,
-            a1_gscale=alpha,
-            w1_fp4=torch.empty((1, 4, 2), dtype=torch.uint8),
-            w1_blockscale=scale,
-            w1_alphas=alpha,
-            a2_gscale=alpha,
-            w2_fp4=torch.empty((1, 4, 2), dtype=torch.uint8),
-            w2_blockscale=scale,
-            w2_alphas=alpha,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            quant_mode="nvfp4",
+        plan_b12x_fp4_moe_weights(
+            quant_modes="nvfp4",
             source_format="fp4_e8m0_k32",
             activation="relu2",
+            params_dtype=torch.bfloat16,
+            num_experts=1,
+            hidden_size=4,
+            intermediate_size=4,
         )
 
 
@@ -595,8 +593,18 @@ def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
         w2_alphas,
         activation=activation,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
         source_format="modelopt_nvfp4",
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+    prepared = prepare_b12x_fp4_moe_weights(
+        plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
         w1_global_scale=w13_alphas,
@@ -605,12 +613,9 @@ def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
         w2_blockscale=w2_blockscale,
         w2_global_scale=w2_alphas,
         a2_gscale=a2_gscale,
-        activation=activation,
         params_dtype=torch.bfloat16,
-        prepare_w4a16=True,
-        reuse_input_storage=True,
     )
-    actual = prepared.w4a16
+    actual = prepared.representation_for("w4a16")
 
     assert actual is not None
     assert actual.w13.data_ptr() == w13.data_ptr()
@@ -648,17 +653,17 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
-    expected = prepare_w4a16_weights(
-        w13,
-        w13_blockscale,
-        w13_alphas,
-        w2,
-        w2_blockscale,
-        w2_alphas,
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes=("nvfp4", "w4a16"),
+        source_format="modelopt_nvfp4",
         activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
     )
     prepared = prepare_b12x_fp4_moe_weights(
-        source_format="modelopt_nvfp4",
+        plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
         w1_global_scale=w13_alphas,
@@ -667,29 +672,17 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
         w2_blockscale=w2_blockscale,
         w2_global_scale=w2_alphas,
         a2_gscale=a2_gscale,
-        activation=activation,
         params_dtype=torch.bfloat16,
-        prepare_runtime_alphas=True,
-        prepare_w4a16=True,
     )
-    actual = prepared.w4a16
+    actual = prepared.representation_for("w4a16")
 
     assert actual is not None
-    assert prepared.w1_runtime_alphas is not None
-    assert prepared.w2_runtime_alphas is not None
-    torch.testing.assert_close(prepared.w1_runtime_alphas, w13_alphas / a1_gscale)
-    torch.testing.assert_close(prepared.w2_runtime_alphas, w2_alphas / a2_gscale)
-    assert actual.weight_layout == "packed"
+    torch.testing.assert_close(prepared.w1_alphas, w13_alphas / a1_gscale)
+    torch.testing.assert_close(prepared.w2_alphas, w2_alphas / a2_gscale)
+    assert actual.weight_layout == "modelopt"
     assert actual.source_format == "modelopt_nvfp4"
-    for name in (
-        "w13",
-        "w13_scale",
-        "w13_global_scale",
-        "w2",
-        "w2_scale",
-        "w2_global_scale",
-    ):
-        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+    assert actual.w13.untyped_storage().data_ptr() == w13.untyped_storage().data_ptr()
+    assert actual.w2.untyped_storage().data_ptr() == w2.untyped_storage().data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -769,22 +762,27 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
-    expected_prepared = prepare_b12x_fp4_moe_weights(
+    expected = prepare_w4a16_weights(
+        w13.clone(),
+        w13_blockscale,
+        w13_alphas,
+        w2.clone(),
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+    )
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
         source_format="modelopt_nvfp4",
-        w1_fp4=w13.clone(),
-        w1_blockscale=w13_blockscale,
-        w1_global_scale=w13_alphas,
-        a1_gscale=a1_gscale,
-        w2_fp4=w2.clone(),
-        w2_blockscale=w2_blockscale,
-        w2_global_scale=w2_alphas,
-        a2_gscale=a2_gscale,
         activation=activation,
         params_dtype=torch.bfloat16,
-        prepare_w4a16=True,
+        num_experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
     actual_prepared = prepare_b12x_fp4_moe_weights(
-        source_format="modelopt_nvfp4",
+        plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
         w1_global_scale=w13_alphas,
@@ -793,13 +791,9 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
         w2_blockscale=w2_blockscale,
         w2_global_scale=w2_alphas,
         a2_gscale=a2_gscale,
-        activation=activation,
         params_dtype=torch.bfloat16,
-        prepare_w4a16=True,
-        reuse_input_storage=True,
     )
-    expected = expected_prepared.w4a16
-    actual = actual_prepared.w4a16
+    actual = actual_prepared.representation_for("w4a16")
 
     assert expected is not None
     assert actual is not None

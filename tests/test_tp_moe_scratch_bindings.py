@@ -14,22 +14,47 @@ from b12x.integration import (
     TPMoESparseFP4Binding,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
+    plan_b12x_fp4_moe_weights,
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
 )
-from b12x.moe.fused.w4a8.gemm import repack_w4a8_weights
+from b12x.moe.execution import PreparedWeightLayout
+from b12x.moe.fused.w4a8.weights import repack_w4a8_weights
 
 
-def _caps() -> TPMoEScratchCaps:
-    return TPMoEScratchCaps(
+def _weight_plan(
+    quant_mode: str = "nvfp4",
+    *,
+    source_format: str = "modelopt_nvfp4",
+    experts: int = 8,
+    k: int = 128,
+    n: int = 64,
+    activation: str = "silu",
+    w4a16_layout: PreparedWeightLayout | None = None,
+):
+    return plan_b12x_fp4_moe_weights(
+        quant_modes=quant_mode,
+        source_format=source_format,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=n,
+        w4a16_layout=w4a16_layout,
+    )
+
+
+def _caps(**overrides) -> TPMoEScratchCaps:
+    weight_plan = overrides.pop("weight_plan", None) or _weight_plan()
+    values = dict(
         device="cpu",
         max_tokens=4,
-        weight_E=8,
-        k=128,
-        n=64,
         num_topk=2,
-        dtype=torch.bfloat16,
+        weight_plan=weight_plan,
+        quant_mode=next(iter(weight_plan.quant_modes)),
     )
+    values.update(overrides)
+    return TPMoEScratchCaps(**values)
 
 
 def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,68 +111,54 @@ def test_moe_force_envs_do_not_override_explicit_quant_mode(
         )
         == "w4a16"
     )
-    caps = TPMoEScratchCaps(
-        device="cpu",
-        max_tokens=4,
-        weight_E=8,
-        k=128,
-        n=64,
-        num_topk=2,
-        dtype=torch.bfloat16,
-        quant_mode="w4a16",
-        source_format="fp4_e8m0_k32",
+    caps = _caps(
+        weight_plan=_weight_plan(
+            "w4a16",
+            source_format="fp4_e8m0_k32",
+        )
     )
 
     assert caps.quant_mode == "w4a16"
 
 
 def test_explicit_w4a8_mx_binds_prepared_metadata() -> None:
+    weight_plan = _weight_plan(
+        "w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        k=256,
+        n=128,
+    )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            device="cpu",
-            max_tokens=4,
-            weight_E=8,
-            k=128,
-            n=64,
-            num_topk=2,
-            dtype=torch.bfloat16,
+        _caps(
+            weight_plan=weight_plan,
             route_num_experts=0,
-            quant_mode="w4a8_mx",
-            source_format="fp4_e8m0_k32",
             swiglu_limit=7.0,
         )
     )
     scratch = _scratch_for_plan(plan)
     prepared_w4a8 = SimpleNamespace(
         num_experts=8,
-        hidden_size=128,
-        intermediate_size=64,
+        hidden_size=256,
+        intermediate_size=128,
         params_dtype=torch.bfloat16,
         w13_rp=torch.empty((1,), dtype=torch.int32),
         w13_sfb=torch.empty((1,), dtype=torch.int32),
         w2_rp=torch.empty((1,), dtype=torch.int32),
         w2_sfb=torch.empty((1,), dtype=torch.int32),
     )
-    runtime_tensors = _runtime_tensors()
-    runtime_tensors["w1_fp4"] = torch.empty((0,), dtype=torch.uint8)
-    runtime_tensors["w1_blockscale"] = torch.empty((0,), dtype=torch.uint8)
-    runtime_tensors["w2_fp4"] = torch.empty((0,), dtype=torch.uint8)
-    runtime_tensors["w2_blockscale"] = torch.empty((0,), dtype=torch.uint8)
+    runtime_tensors = _runtime_tensors(k=256, n=128)
+    experts = _experts(runtime_tensors, weight_plan, prepared_w4a8)
 
     binding = plan.bind(
         scratch=scratch,
-        **runtime_tensors,
-        quant_mode="w4a8_mx",
-        source_format="fp4_e8m0_k32",
-        prepared_w4a8=prepared_w4a8,
-        swiglu_limit=7.0,
+        **_binding_args(runtime_tensors, experts),
     )
 
     assert binding.quant_mode == "w4a8_mx"
     assert binding.weight_E == 8
-    assert binding.n == 64
-    assert binding.prepared_w4a16 is None
-    assert binding.prepared_w4a8 is prepared_w4a8
+    assert binding.n == 128
+    assert binding.experts is experts
+    assert experts.representation_for("w4a8_mx") is prepared_w4a8
     assert binding.swiglu_limit == 7.0
 
 
@@ -196,21 +207,29 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
         w2_scale_original.clamp(max=247).contiguous(),
     )
 
-    prepared = prepare_b12x_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=n,
         w13_layout="w31",
+    )
+    prepared = prepare_b12x_fp4_moe_weights(
+        plan=weight_plan,
         w1_fp4=w1_source,
         w1_blockscale=w1_scale,
         w1_global_scale=torch.ones((experts,), dtype=torch.float32),
+        a1_gscale=torch.ones((experts,), dtype=torch.float32),
         w2_fp4=w2_source,
         w2_blockscale=w2_scale,
         w2_global_scale=torch.ones((experts,), dtype=torch.float32),
-        activation="silu",
+        a2_gscale=torch.ones((experts,), dtype=torch.float32),
         params_dtype=torch.bfloat16,
-        prepare_w4a8_tier=True,
-        reuse_input_storage=True,
     )
-    w4a8 = prepared.w4a8_tier
+    w4a8 = prepared.representation_for("w4a8_mx")
 
     assert w4a8 is not None
     assert w4a8.num_experts == experts
@@ -238,16 +257,23 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
     assert torch.equal(w4a8.w2_sfb, expected_w2_sfb)
 
 
-def _runtime_tensors(m: int = 3, topk: int = 2):
-    a = torch.empty((m, 128), dtype=torch.bfloat16)
-    a1_gscale = torch.ones((8,), dtype=torch.float32)
-    w1_fp4 = torch.empty((8, 128, 64), dtype=torch.uint8)
-    w1_blockscale = torch.empty((8, 1, 1), dtype=torch.uint8)
-    w1_alphas = torch.ones((8,), dtype=torch.float32)
-    a2_gscale = torch.ones((8,), dtype=torch.float32)
-    w2_fp4 = torch.empty((8, 128, 32), dtype=torch.uint8)
-    w2_blockscale = torch.empty((8, 1, 1), dtype=torch.uint8)
-    w2_alphas = torch.ones((8,), dtype=torch.float32)
+def _runtime_tensors(
+    m: int = 3,
+    topk: int = 2,
+    *,
+    experts: int = 8,
+    k: int = 128,
+    n: int = 64,
+):
+    a = torch.empty((m, k), dtype=torch.bfloat16)
+    a1_gscale = torch.ones((experts,), dtype=torch.float32)
+    w1_fp4 = torch.empty((experts, 2 * n, k // 2), dtype=torch.uint8)
+    w1_blockscale = torch.empty((experts, 1, 1), dtype=torch.uint8)
+    w1_alphas = torch.ones((experts,), dtype=torch.float32)
+    a2_gscale = torch.ones((experts,), dtype=torch.float32)
+    w2_fp4 = torch.empty((experts, k, n // 2), dtype=torch.uint8)
+    w2_blockscale = torch.empty((experts, 1, 1), dtype=torch.uint8)
+    w2_alphas = torch.ones((experts,), dtype=torch.float32)
     topk_weights = torch.empty((m, topk), dtype=torch.float32)
     topk_ids = torch.empty((m, topk), dtype=torch.int32)
     return {
@@ -265,17 +291,102 @@ def _runtime_tensors(m: int = 3, topk: int = 2):
     }
 
 
-def _experts(tensors: dict[str, torch.Tensor]) -> B12XFP4ExpertWeights:
+def _experts(
+    tensors: dict[str, torch.Tensor],
+    weight_plan=None,
+    payload: object | None = None,
+) -> B12XFP4ExpertWeights:
+    if weight_plan is None:
+        weight_plan = _weight_plan(
+            experts=int(tensors["w1_fp4"].shape[0]),
+            k=int(tensors["w2_fp4"].shape[1]),
+            n=int(tensors["w2_fp4"].shape[2]) * 2,
+        )
+    representation = None
+    for mode in weight_plan.quant_modes:
+        layout = weight_plan.required_weight_layout(mode)
+        if layout is None:
+            continue
+        if payload is None:
+            payload = SimpleNamespace()
+        if mode == "w4a8_mx":
+            defaults = {
+                "w13_rp": tensors["w1_fp4"],
+                "w13_sfb": tensors["w1_blockscale"],
+                "w2_rp": tensors["w2_fp4"],
+                "w2_sfb": tensors["w2_blockscale"],
+            }
+        else:
+            defaults = {
+                "w13": tensors["w1_fp4"],
+                "w13_scale": tensors["w1_blockscale"],
+                "w13_global_scale": tensors["w1_alphas"],
+                "w2": tensors["w2_fp4"],
+                "w2_scale": tensors["w2_blockscale"],
+                "w2_global_scale": tensors["w2_alphas"],
+                "weight_layout": (
+                    "modelopt"
+                    if layout is PreparedWeightLayout.SOURCE_NATIVE
+                    else "packed"
+                ),
+                "scale_format": (
+                    "e8m0_k32"
+                    if weight_plan.source_format == "fp4_e8m0_k32"
+                    else "e4m3_k16"
+                ),
+            }
+        defaults.update(
+            num_experts=weight_plan.num_experts,
+            hidden_size=weight_plan.hidden_size,
+            intermediate_size=weight_plan.intermediate_size,
+            params_dtype=torch.bfloat16,
+            is_gated=True,
+        )
+        for name, value in defaults.items():
+            if not hasattr(payload, name):
+                setattr(payload, name, value)
+        assert representation is None
+        representation = tp_moe_impl._PreparedWeightRepresentation(
+            quant_mode=mode,
+            layout=layout,
+            value=payload,
+        )
+    canonical_w1 = tensors["w1_fp4"]
+    canonical_s1 = tensors["w1_blockscale"]
+    canonical_w2 = tensors["w2_fp4"]
+    canonical_s2 = tensors["w2_blockscale"]
+    if representation is not None and weight_plan.discards_source_parameters:
+        value = representation.value
+        canonical_w1 = getattr(value, "w13_rp", getattr(value, "w13", None))
+        canonical_s1 = getattr(
+            value, "w13_sfb", getattr(value, "w13_scale", None)
+        )
+        canonical_w2 = getattr(value, "w2_rp", getattr(value, "w2", None))
+        canonical_s2 = getattr(value, "w2_sfb", getattr(value, "w2_scale", None))
     return B12XFP4ExpertWeights(
+        plan=weight_plan,
         a1_gscale=tensors["a1_gscale"],
-        w1_fp4=tensors["w1_fp4"],
-        w1_blockscale=tensors["w1_blockscale"],
+        w1_fp4=canonical_w1,
+        w1_blockscale=canonical_s1,
         w1_alphas=tensors["w1_alphas"],
         a2_gscale=tensors["a2_gscale"],
-        w2_fp4=tensors["w2_fp4"],
-        w2_blockscale=tensors["w2_blockscale"],
+        w2_fp4=canonical_w2,
+        w2_blockscale=canonical_s2,
         w2_alphas=tensors["w2_alphas"],
+        representation=representation,
     )
+
+
+def _binding_args(
+    tensors: dict[str, torch.Tensor],
+    experts: B12XFP4ExpertWeights,
+) -> dict[str, object]:
+    return {
+        "a": tensors["a"],
+        "experts": experts,
+        "topk_weights": tensors["topk_weights"],
+        "topk_ids": tensors["topk_ids"],
+    }
 
 
 def _scratch_for_plan(plan):
@@ -300,16 +411,7 @@ def test_tp_moe_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
 
 
 def test_tp_moe_scratch_plan_can_skip_route_scratch() -> None:
-    caps = TPMoEScratchCaps(
-        device="cpu",
-        max_tokens=4,
-        weight_E=8,
-        k=128,
-        n=64,
-        num_topk=2,
-        dtype=torch.bfloat16,
-        route_num_experts=0,
-    )
+    caps = _caps(route_num_experts=0)
     plan = plan_tp_moe_scratch(caps)
 
     assert plan.layout.route_workspace_nbytes == 0
@@ -322,13 +424,17 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
 ) -> None:
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
 
-    base_caps = dict(
-        device="cpu",
-        weight_E=256,
+    weight_plan = _weight_plan(
+        "w4a16",
+        experts=256,
         k=4096,
         n=7168,
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+    base_caps = dict(
+        device="cpu",
+        weight_plan=weight_plan,
         num_topk=8,
-        dtype=torch.bfloat16,
         route_num_experts=0,
         quant_mode="w4a16",
     )
@@ -354,49 +460,34 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
 
 
-def test_w4a16_topk6_bucket_materializes_with_planned_scratch(
+def test_w4a16_topk6_bucket_binds_with_planned_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _fake_w4a16_prewarm(workspace, *, token_counts, **_kwargs) -> None:
-        workspace.planned_fused_moe_launches = {
-            ("packed", "e4m3_k16", int(token_count)): object()
-            for token_count in token_counts
-        }
-        workspace.planned_topk_sum_launches = {
-            int(token_count): object() for token_count in token_counts
-        }
-
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
-    monkeypatch.setattr(
-        tp_moe_impl,
-        "_prewarm_w4a16_planned_launches",
-        _fake_w4a16_prewarm,
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            device="cpu",
+        _caps(
+            weight_plan=weight_plan,
             max_tokens=15,
-            weight_E=8,
-            k=128,
-            n=64,
             num_topk=6,
-            dtype=torch.bfloat16,
             core_token_counts=(15,),
             route_num_experts=0,
-            quant_mode="w4a16",
         )
     )
     scratch = _scratch_for_plan(plan)
 
+    tensors = _runtime_tensors(m=15, topk=6)
     binding = plan.bind(
         scratch=scratch,
-        **_runtime_tensors(m=15, topk=6),
-        quant_mode="w4a16",
+        **_binding_args(tensors, _experts(tensors, weight_plan)),
     )
 
     assert binding.implementation == "w4a16"
-    assert binding.fused_launch is not None
-    assert binding.topk_sum_launch is not None
+    assert binding.routed_rows_capacity is not None
+    assert binding.routed_rows_capacity >= 15 * 6
 
 
 def test_w4a16_materialize_can_prewarm_activation_amax_variant(
@@ -425,19 +516,20 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
         _fake_w4a16_prewarm,
     )
     pool = tp_moe_impl.allocate_tp_moe_workspace_pool(frozen=True)
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
 
     tp_moe_impl.materialize_tp_moe_arena_workspaces(
         pool,
-        max_tokens=4,
-        weight_E=8,
-        k=128,
-        n=64,
-        num_topk=2,
-        device="cpu",
-        dtype=torch.bfloat16,
-        core_token_counts=(4,),
-        quant_mode="w4a16",
-        collect_activation_amax=True,
+        caps=_caps(
+            max_tokens=4,
+            weight_plan=weight_plan,
+            core_token_counts=(4,),
+            route_num_experts=0,
+            collect_activation_amax=True,
+        ),
     )
 
     workspace = next(iter(pool.workspaces.values()))
@@ -458,24 +550,18 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
 def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            device="cpu",
-            max_tokens=4,
-            weight_E=8,
-            k=128,
-            n=64,
-            num_topk=2,
-            dtype=torch.bfloat16,
-            route_num_experts=0,
-            quant_mode="w4a16",
-        )
+        _caps(weight_plan=weight_plan, route_num_experts=0)
     )
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
     activation_amax = torch.zeros((3, 8, 2), dtype=torch.float32)
     output = torch.empty_like(tensors["a"])
-    prepared = SimpleNamespace(
+    payload = SimpleNamespace(
         num_experts=8,
         hidden_size=128,
         intermediate_size=64,
@@ -486,10 +572,8 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     )
     binding = plan.bind(
         scratch=scratch,
-        **tensors,
+        **_binding_args(tensors, _experts(tensors, weight_plan, payload)),
         output=output,
-        quant_mode="w4a16",
-        prepared_w4a16=prepared,
         activation_amax=activation_amax,
         layer_idx=2,
     )
@@ -517,7 +601,7 @@ def test_activation_amax_is_w4a16_only() -> None:
     activation_amax = torch.zeros((1, 8, 2), dtype=torch.float32)
     binding = plan.bind(
         scratch=scratch,
-        **tensors,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
         activation_amax=activation_amax,
         layer_idx=0,
     )
@@ -531,7 +615,10 @@ def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
 
-    binding = plan.bind(scratch=scratch, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+    )
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert binding.row_counts is not None
@@ -545,7 +632,10 @@ def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
 
-    binding = plan.bind(scratch=scratch, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+    )
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
@@ -557,28 +647,32 @@ def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
     assert binding.topk_ids is tensors["topk_ids"]
 
 
-def test_tp_moe_fp4_binding_rehydrates_static_workspace_view(
+def test_tp_moe_fp4_binding_rehydrates_micro_workspace_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
     output = torch.empty_like(tensors["a"])
-    binding = plan.bind(scratch=scratch, output=output, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+        output=output,
+    )
     calls = {}
 
     monkeypatch.setattr(tp_moe_impl, "current_cuda_stream", lambda: None)
     monkeypatch.setattr(tp_moe_impl, "_get_weight_views", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         tp_moe_impl,
-        "_launch_compact_static",
+        "_launch_micro",
         lambda **kwargs: calls.update(kwargs),
     )
 
     result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 
     assert result is output
-    assert isinstance(calls["workspace"], tp_moe_impl.TPCompactStaticWorkspace)
+    assert isinstance(calls["workspace"], tp_moe_impl.TPMicroWorkspace)
     assert calls["workspace"].active_expert_count is binding.active_expert_count
     assert calls["workspace"].micro_intermediate is binding.micro_intermediate
 
@@ -586,21 +680,16 @@ def test_tp_moe_fp4_binding_rehydrates_static_workspace_view(
 def test_tp_moe_fp4_binding_rehydrates_dynamic_workspace_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    caps = TPMoEScratchCaps(
-        device="cpu",
-        max_tokens=400,
-        weight_E=8,
-        k=128,
-        n=64,
-        num_topk=2,
-        dtype=torch.bfloat16,
-        route_num_experts=0,
-    )
+    caps = _caps(max_tokens=400, route_num_experts=0)
     plan = plan_tp_moe_scratch(caps)
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors(m=400)
     output = torch.empty_like(tensors["a"])
-    binding = plan.bind(scratch=scratch, output=output, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+        output=output,
+    )
     calls = {}
 
     monkeypatch.setattr(tp_moe_impl, "current_cuda_stream", lambda: None)
@@ -643,23 +732,20 @@ def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
         _fail_materialize,
     )
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            device="cpu",
-            max_tokens=4,
-            weight_E=8,
-            k=128,
-            n=64,
-            num_topk=2,
-            dtype=torch.bfloat16,
-            route_num_experts=0,
-            quant_mode="w4a16",
-        )
+        _caps(weight_plan=weight_plan, route_num_experts=0)
     )
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
 
-    binding = plan.bind(scratch=scratch, **tensors, quant_mode="w4a16")
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, weight_plan)),
+    )
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
@@ -674,7 +760,10 @@ def test_tp_moe_plan_bind_fp4_returns_common_binding_type() -> None:
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
 
-    binding = plan.bind(scratch=scratch, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+    )
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert not hasattr(binding, "workspace")
@@ -727,7 +816,11 @@ def test_tp_moe_sparse_fp4_builder_returns_common_binding_type() -> None:
 def test_tp_moe_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
-    binding = plan.bind(scratch=scratch, **_runtime_tensors())
+    tensors = _runtime_tensors()
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+    )
     calls = {}
     sentinel = object()
 
@@ -791,9 +884,12 @@ def test_tp_moe_fp4_binding_owns_runtime_tensors() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
-    binding = plan.bind(scratch=scratch, **tensors)
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+    )
 
-    with pytest.raises(ValueError, match="binding owns runtime tensors"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_moe_fp4(tensors["a"], binding=binding)
 
 
@@ -806,7 +902,7 @@ def test_tp_moe_route_binding_owns_runtime_tensors() -> None:
         gate_weight=gate_weight,
     )
 
-    with pytest.raises(ValueError, match="route binding owns runtime tensors"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_route_experts_fast(hidden_states, binding=binding)
 
 
@@ -824,7 +920,7 @@ def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="sparse FP4 binding owns runtime tensors"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_sparse_moe_fp4(
             tensors["a"],
             experts=experts,
@@ -833,15 +929,15 @@ def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
 
 
 def test_tp_moe_fp4_entrypoint_requires_tensors_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires binding"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_moe_fp4()
 
 
 def test_tp_moe_route_entrypoint_requires_inputs_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires binding"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_route_experts_fast()
 
 
 def test_tp_moe_sparse_fp4_entrypoint_requires_inputs_or_binding() -> None:
-    with pytest.raises(TypeError, match="requires binding"):
+    with pytest.raises(TypeError):
         tp_moe_impl.b12x_sparse_moe_fp4()

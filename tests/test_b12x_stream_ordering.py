@@ -12,7 +12,7 @@ from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, be
 from b12x.integration.tp_moe import clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference
 
-from .helpers import require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -57,7 +57,7 @@ def _run_b12x(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    return run_tp_moe_fp4(
+    experts = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=weights.w13_input_scale_quant,
         w1_fp4=weights.w13_weight,
@@ -67,6 +67,10 @@ def _run_b12x(
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas,
+    )
+    return run_tp_moe_fp4(
+        a=x,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
@@ -90,7 +94,9 @@ def _launch_on_stream(
         provider = None
     elif force_stream == "default":
         default_stream = torch.cuda.default_stream(x_src.device)
-        provider = lambda: _driver_stream(default_stream)
+
+        def provider() -> cuda.CUstream:
+            return _driver_stream(default_stream)
     else:
         raise ValueError(f"Unsupported force_stream: {force_stream}")
 

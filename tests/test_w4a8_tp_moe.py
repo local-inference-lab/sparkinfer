@@ -24,7 +24,7 @@ from benchmarks.benchmark_moe import (
     load_expert_weights,
     make_routed_inputs,
 )
-from tests.helpers import run_tp_moe_fp4
+from tests.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
 
 def _skip_if_unavailable() -> None:
@@ -76,7 +76,8 @@ def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
     spec = _make_spec()
     weights = _weights()
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
-    out = run_tp_moe_fp4(
+    mode = quant_mode or "nvfp4"
+    experts = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=weights.w13_input_scale_quant_per_expert,
         w1_fp4=weights.w13_weight,
@@ -86,10 +87,15 @@ def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
+        quant_mode=mode,
+    )
+    out = run_tp_moe_fp4(
+        a=x,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         input_scales_static=True,
-        quant_mode=quant_mode,
+        quant_mode=mode,
     )
     torch.cuda.synchronize()
     return out

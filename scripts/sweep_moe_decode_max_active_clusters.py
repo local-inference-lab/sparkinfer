@@ -13,7 +13,7 @@ For each routed-row point this script:
 - records every source `(num_tokens, top_k)` pair that maps to that routed-row
   count,
 - chooses one representative pair to execute,
-- sweeps `MAX_ACTIVE_CLUSTERS` for `micro`, `static`, and `dynamic`
+- sweeps `MAX_ACTIVE_CLUSTERS` for the `micro` and `dynamic` regimes
   independently,
 - uses a persistent process pool so every worker participates in each routed-row
   sweep,
@@ -42,31 +42,31 @@ import torch
 
 from benchmarks.benchmark_moe import (
     MODEL_PATH,
-    ExpertWeights,
     ModelSpec,
-    ScaleContractParams,
     get_scale_contract_params,
     load_expert_weights,
     make_routed_inputs,
+    prepare_b12x_benchmark_weights,
     require_sm120,
 )
 from b12x.cute.utils import get_max_active_clusters, get_num_sm
 from b12x.integration.tp_moe import (
+    B12XFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
     b12x_moe_fp4,
+    build_tp_moe_fp4_binding,
     clear_tp_moe_caches,
+    select_tp_moe_backend,
 )
 
 
 TP_SIZE = 4
 TP_RANK = 0
-_MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
-_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _SUMMARY = False
 _VERBOSE = False
 _WORKER_GPU_ID = 0
 _WORKER_SPEC_CACHE: dict[int, ModelSpec] = {}
-_WORKER_WEIGHT_CACHE: dict[tuple[str, str], tuple[ExpertWeights, ScaleContractParams]] = {}
+_WORKER_EXPERT_CACHE: dict[tuple[str, str], B12XFP4ExpertWeights] = {}
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,10 @@ def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
         graph.replay()
         ends[idx].record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) for start, end in zip(starts, ends)]
+    return [
+        start.elapsed_time(end)
+        for start, end in zip(starts, ends, strict=True)
+    ]
 
 
 def _mean_ci(
@@ -182,7 +185,7 @@ def _parse_backends(raw: str) -> list[str]:
     values = [part.strip().lower() for part in raw.split(",") if part.strip()]
     if not values:
         raise ValueError("expected at least one backend in --backends")
-    valid = ("micro", "static", "dynamic")
+    valid = ("micro", "dynamic")
     parsed: list[str] = []
     for value in values:
         if value not in valid:
@@ -192,27 +195,12 @@ def _parse_backends(raw: str) -> list[str]:
     return parsed
 
 
-def _micro_compact_cutover_pairs() -> int:
-    value = os.environ.get("B12X_MICRO_COMPACT_CUTOVER_PAIRS") or os.environ.get("B12X_MICRO_CUTOVER_TOKENS")
-    return _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT if value is None else max(0, int(value))
-
-
-def _static_compact_cutover_pairs() -> int:
-    value = (
-        os.environ.get("B12X_STATIC_COMPACT_CUTOVER_PAIRS")
-        or os.environ.get("B12X_DYNAMIC_STATIC_CUTOVER_PAIRS")
-        or os.environ.get("B12X_LEVEL10_STATIC_CUTOVER_PAIRS")
-    )
-    return _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT if value is None else max(0, int(value))
-
-
 def _effective_backend(*, num_tokens: int, top_k: int) -> str:
-    routed_rows = int(num_tokens) * int(top_k)
-    if routed_rows > _static_compact_cutover_pairs():
-        return "dynamic"
-    if routed_rows <= _micro_compact_cutover_pairs():
-        return "micro"
-    return "static"
+    return select_tp_moe_backend(
+        num_tokens=int(num_tokens),
+        num_topk=int(top_k),
+        quant_mode="nvfp4",
+    )
 
 
 def _build_sweep_points(*, token_list: list[int], top_k_list: list[int]) -> list[SweepPoint]:
@@ -271,14 +259,9 @@ def _temporary_backend_env(
     requested_mac: int,
 ) -> Iterator[None]:
     env_names = (
-        "B12X_STATIC_MAX_ACTIVE_CLUSTERS",
         "B12X_MICRO_MAX_ACTIVE_CLUSTERS",
         "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
-        "B12X_MICRO_COMPACT_CUTOVER_PAIRS",
-        "B12X_MICRO_CUTOVER_TOKENS",
-        "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
-        "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
-        "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
+        "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS",
     )
     previous = {name: os.environ.get(name) for name in env_names}
     try:
@@ -286,14 +269,15 @@ def _temporary_backend_env(
             os.environ.pop(name, None)
         os.environ[_mac_env_name(backend)] = str(requested_mac)
         if backend == "micro":
-            os.environ["B12X_STATIC_COMPACT_CUTOVER_PAIRS"] = str(max(1, point.routed_rows + 1))
-            os.environ["B12X_MICRO_COMPACT_CUTOVER_PAIRS"] = str(max(1, point.routed_rows))
-        elif backend == "static":
-            os.environ["B12X_STATIC_COMPACT_CUTOVER_PAIRS"] = str(max(1, point.routed_rows + 1))
-            os.environ["B12X_MICRO_COMPACT_CUTOVER_PAIRS"] = str(max(0, point.routed_rows - 1))
+            if point.num_tokens > 8:
+                raise ValueError(
+                    "micro is only defined for workloads with at most 8 tokens"
+                )
+            os.environ["B12X_MICRO_DYNAMIC_CUTOVER_PAIRS"] = str(
+                point.routed_rows + 1
+            )
         elif backend == "dynamic":
-            os.environ["B12X_STATIC_COMPACT_CUTOVER_PAIRS"] = str(max(0, point.routed_rows - 1))
-            os.environ["B12X_MICRO_COMPACT_CUTOVER_PAIRS"] = "0"
+            os.environ["B12X_MICRO_DYNAMIC_CUTOVER_PAIRS"] = "0"
         else:
             raise ValueError(f"unsupported backend override: {backend}")
         yield
@@ -385,8 +369,7 @@ def _capture_and_measure_candidate(
     args: argparse.Namespace,
     point: SweepPoint,
     spec: ModelSpec,
-    weights: ExpertWeights,
-    params: ScaleContractParams,
+    experts: B12XFP4ExpertWeights,
     backend: str,
     requested_mac: int,
     device: torch.device,
@@ -398,30 +381,31 @@ def _capture_and_measure_candidate(
         device,
     )
     output = torch.empty_like(x)
-    workspace = allocate_tp_moe_workspace_pool()
     env_name = _mac_env_name(backend)
-
-    def run() -> None:
-        b12x_moe_fp4(
-            x,
-            params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            params.g1_alphas,
-            params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            params.g2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
-            fast_math=args.fast_math,
-            output=output,
-            input_scales_static=True,
-        )
 
     with _temporary_backend_env(point=point, backend=backend, requested_mac=requested_mac):
         clear_tp_moe_caches()
+        workspace = allocate_tp_moe_workspace_pool()
+        binding = build_tp_moe_fp4_binding(
+            scratch=workspace,
+            a=x,
+            experts=experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            fast_math=args.fast_math,
+            output=output,
+            input_scales_static=True,
+            quant_mode="nvfp4",
+        )
+        if binding.implementation != backend:
+            raise RuntimeError(
+                f"requested {backend!r}, planner selected "
+                f"{binding.implementation!r}"
+            )
+
+        def run() -> None:
+            b12x_moe_fp4(binding=binding)
+
         graph = _capture_graph(run, warmup=args.warmup)
         samples_ms = _bench_graph(graph, replays=args.replays)
     return _candidate_summary(
@@ -435,9 +419,9 @@ def _capture_and_measure_candidate(
 
 
 def _reset_worker_cache() -> None:
-    global _WORKER_SPEC_CACHE, _WORKER_WEIGHT_CACHE
+    global _WORKER_SPEC_CACHE, _WORKER_EXPERT_CACHE
     _WORKER_SPEC_CACHE = {}
-    _WORKER_WEIGHT_CACHE = {}
+    _WORKER_EXPERT_CACHE = {}
     clear_tp_moe_caches()
     gc.collect()
     if torch.cuda.is_available():
@@ -459,8 +443,8 @@ def _ensure_worker_context(
     model_path: pathlib.Path,
     top_k: int,
     scale_contract: str,
-) -> tuple[ModelSpec, ExpertWeights, ScaleContractParams]:
-    global _WORKER_SPEC_CACHE, _WORKER_WEIGHT_CACHE
+) -> tuple[ModelSpec, B12XFP4ExpertWeights]:
+    global _WORKER_SPEC_CACHE, _WORKER_EXPERT_CACHE
     require_sm120()
     torch.empty(1, device="cuda")
     spec = _WORKER_SPEC_CACHE.get(int(top_k))
@@ -468,16 +452,20 @@ def _ensure_worker_context(
         spec = _build_spec(top_k=top_k)
         _WORKER_SPEC_CACHE[int(top_k)] = spec
     weight_cache_key = (str(model_path), str(scale_contract))
-    cached_weights = _WORKER_WEIGHT_CACHE.get(weight_cache_key)
-    if cached_weights is None:
+    experts = _WORKER_EXPERT_CACHE.get(weight_cache_key)
+    if experts is None:
         # Expert weights are shape-independent with respect to top_k. Keep one
-        # resident bundle per worker and rebuild only the cheap ModelSpec.
+        # prepared owner per worker and rebuild only the cheap ModelSpec.
         weights = load_expert_weights(model_path, spec)
         params = get_scale_contract_params(weights, scale_contract)
-        _WORKER_WEIGHT_CACHE[weight_cache_key] = (weights, params)
-    else:
-        weights, params = cached_weights
-    return spec, weights, params
+        experts, _ = prepare_b12x_benchmark_weights(
+            weights,
+            params,
+            quant_mode="nvfp4",
+            activation="silu",
+        )
+        _WORKER_EXPERT_CACHE[weight_cache_key] = experts
+    return spec, experts
 
 
 def _chunk_candidates(values: list[int], *, chunk_count: int) -> list[list[int]]:
@@ -504,7 +492,7 @@ def _worker_measure_mac_chunk(task: dict[str, object]) -> dict[str, object]:
     model_path = pathlib.Path(str(task["model_path"]))
 
     device = torch.device("cuda")
-    spec, weights, params = _ensure_worker_context(
+    spec, experts = _ensure_worker_context(
         model_path=model_path,
         top_k=point.top_k,
         scale_contract=args.scale_contract,
@@ -517,8 +505,7 @@ def _worker_measure_mac_chunk(task: dict[str, object]) -> dict[str, object]:
                     args=args,
                     point=point,
                     spec=spec,
-                    weights=weights,
-                    params=params,
+                    experts=experts,
                     backend=backend,
                     requested_mac=requested_mac,
                     device=device,
@@ -609,7 +596,7 @@ def _evaluate_point_parallel(
 
     all_summaries.sort(key=lambda summary: (summary.backend, int(summary.requested_max_active_clusters)))
     backend_results: dict[str, dict[str, object]] = {}
-    for backend in ("micro", "static", "dynamic"):
+    for backend in active_backends:
         backend_summaries = [summary for summary in all_summaries if summary.backend == backend]
         best_summary, tied_summaries, preferred_summary = _select_backend_winners(backend_summaries)
         if preferred_summary is None:
@@ -632,7 +619,7 @@ def _evaluate_point_parallel(
             "best_ci_high_us": None if best_summary is None else float(best_summary.ci_high_us),
         }
 
-    runtime_result = backend_results[runtime_selected_backend]
+    runtime_result = backend_results.get(runtime_selected_backend)
     return {
         "routed_rows": int(point.routed_rows),
         "num_tokens": int(point.num_tokens),
@@ -649,12 +636,18 @@ def _evaluate_point_parallel(
         "source_backends": source_backend_set,
         "backend_ambiguous": len(source_backend_set) > 1,
         "backend_results": backend_results,
-        "preferred_winner": runtime_result["preferred_winner"],
-        "tied_winners": runtime_result["tied_winners"],
-        "all_candidates": runtime_result["all_candidates"],
-        "best_mean_us": runtime_result["best_mean_us"],
-        "best_ci_low_us": runtime_result["best_ci_low_us"],
-        "best_ci_high_us": runtime_result["best_ci_high_us"],
+        "preferred_winner": (
+            None if runtime_result is None else runtime_result["preferred_winner"]
+        ),
+        "tied_winners": [] if runtime_result is None else runtime_result["tied_winners"],
+        "all_candidates": [] if runtime_result is None else runtime_result["all_candidates"],
+        "best_mean_us": None if runtime_result is None else runtime_result["best_mean_us"],
+        "best_ci_low_us": (
+            None if runtime_result is None else runtime_result["best_ci_low_us"]
+        ),
+        "best_ci_high_us": (
+            None if runtime_result is None else runtime_result["best_ci_high_us"]
+        ),
     }
 
 
@@ -666,7 +659,7 @@ def _render_output_payload(
     candidate_macs: list[int],
 ) -> dict[str, object]:
     return {
-        "version": 2,
+        "version": 3,
         "config": {
             "token_list": [int(value) for value in args.token_list_values],
             "top_k_list": [int(value) for value in args.top_k_list_values],
@@ -680,8 +673,6 @@ def _render_output_payload(
             "replays": int(args.replays),
             "ci_level": float(args.ci_level),
             "seed": int(args.seed),
-            "micro_compact_cutover_pairs": int(_micro_compact_cutover_pairs()),
-            "static_compact_cutover_pairs": int(_static_compact_cutover_pairs()),
             "mac_limit": int(_mac_limit()),
         },
         "points": point_payloads,
@@ -711,7 +702,7 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true")
     parser.add_argument("--token-list", type=str, required=True)
     parser.add_argument("--top-k-list", type=str, required=True)
-    parser.add_argument("--backends", type=str, default="micro,static,dynamic")
+    parser.add_argument("--backends", type=str, default="micro,dynamic")
     parser.add_argument("--candidate-max-active-clusters", type=str, default="1,16")
     parser.add_argument("--parallel-workers", type=int, default=0)
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
@@ -856,10 +847,13 @@ def main() -> None:
 
     if args.summary:
         print()
-        print("routed_rows\truntime_backend\tmicro_mac\tstatic_mac\tdynamic_mac")
+        print("routed_rows\truntime_backend\tmicro_mac\tdynamic_mac")
         for point_payload in point_payloads:
             def _preferred_mac(backend: str) -> str:
-                preferred = point_payload["backend_results"][backend]["preferred_winner"]
+                backend_result = point_payload["backend_results"].get(backend)
+                if backend_result is None:
+                    return "-"
+                preferred = backend_result["preferred_winner"]
                 if preferred is None:
                     return "-"
                 return str(preferred["requested_max_active_clusters"])
@@ -867,7 +861,6 @@ def main() -> None:
             print(
                 f"{point_payload['routed_rows']}\t{point_payload['runtime_selected_backend']}\t"
                 f"{_preferred_mac('micro')}\t"
-                f"{_preferred_mac('static')}\t"
                 f"{_preferred_mac('dynamic')}"
             )
 

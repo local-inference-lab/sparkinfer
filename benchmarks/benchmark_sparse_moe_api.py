@@ -32,11 +32,13 @@ from benchmarks.benchmark_moe import (
 )
 from b12x.integration.tp_moe import (
     B12XFP4ExpertWeights,
-    allocate_tp_moe_workspace,
-    b12x_moe_fp4,
-    b12x_route_experts_fast,
-    b12x_sparse_moe_fp4,
+    allocate_tp_moe_workspace_pool,
+    build_tp_moe_fp4_binding,
+    build_tp_moe_route_binding,
+    build_tp_moe_sparse_fp4_binding,
     clear_tp_moe_caches,
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
 
 
@@ -52,16 +54,35 @@ def _make_spec() -> ModelSpec:
 
 
 def _pack_experts(weights) -> B12XFP4ExpertWeights:
-    return B12XFP4ExpertWeights(
-        a1_gscale=weights.w13_input_scale_quant_per_expert,
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="nvfp4",
+        source_format=weights.source_format,
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=weights.spec.num_experts,
+        hidden_size=weights.spec.hidden_size,
+        intermediate_size=weights.spec.I_tp,
+        w13_layout=weights.w13_layout,
+    )
+    prepared = prepare_b12x_fp4_moe_weights(
+        plan=plan,
+        w1_global_scale=(
+            weights.g1_alphas_per_expert
+            * weights.w13_input_scale_quant_per_expert
+        ),
+        w2_global_scale=(
+            weights.g2_alphas_per_expert
+            * weights.w2_input_scale_quant_per_expert
+        ),
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
-        w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_quant_per_expert,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
-        w2_alphas=weights.g2_alphas_per_expert,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        params_dtype=torch.bfloat16,
     )
+    return prepared
 
 
 def _manual_route(
@@ -152,15 +173,7 @@ def main() -> None:
         for m in _pick_batch_sizes(args):
             hidden_states = make_input_activations(spec, m, seed=args.seed + m, device=device)
             _, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
-            workspace = allocate_tp_moe_workspace(
-                hidden_states,
-                weights.w13_input_scale_quant_per_expert,
-                weights.w13_weight,
-                weights.w2_input_scale_quant_per_expert,
-                weights.w2_weight,
-                topk_ids,
-                input_scales_static=True,
-            )
+            workspace = allocate_tp_moe_workspace_pool()
 
             routed_output = torch.empty_like(hidden_states)
             manual_output = torch.empty_like(hidden_states)
@@ -185,6 +198,39 @@ def main() -> None:
             )
             manual_topk_ids = torch.empty(m, spec.top_k, dtype=torch.int64, device=device)
             manual_topk_weights = torch.empty(m, spec.top_k, dtype=torch.float32, device=device)
+            route_binding = build_tp_moe_route_binding(
+                scratch=workspace,
+                hidden_states=hidden_states,
+                top_k=spec.top_k,
+                gate_weight=gate_weight,
+            )
+            routed_binding = build_tp_moe_fp4_binding(
+                scratch=workspace,
+                a=hidden_states,
+                experts=experts,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=routed_output,
+                input_scales_static=True,
+            )
+            manual_binding = build_tp_moe_fp4_binding(
+                scratch=workspace,
+                a=hidden_states,
+                experts=experts,
+                topk_weights=manual_topk_weights,
+                topk_ids=manual_topk_ids,
+                output=manual_output,
+                input_scales_static=True,
+            )
+            sparse_binding = build_tp_moe_sparse_fp4_binding(
+                scratch=workspace,
+                hidden_states=hidden_states,
+                experts=experts,
+                top_k=spec.top_k,
+                gate_weight=gate_weight,
+                output=sparse_output,
+                input_scales_static=True,
+            )
 
             def manual_route_only() -> None:
                 torch.mm(hidden_states, gate_weight.t(), out=manual_router_logits)
@@ -198,68 +244,20 @@ def main() -> None:
                 torch.softmax(manual_topk_logits_f32, dim=-1, out=manual_topk_weights)
 
             def route_api_only() -> None:
-                b12x_route_experts_fast(
-                    hidden_states,
-                    top_k=spec.top_k,
-                    gate_weight=gate_weight,
-                    workspace=workspace,
-                )
+                route_binding.run()
 
             def tp_only() -> torch.Tensor:
-                return b12x_moe_fp4(
-                    hidden_states,
-                    weights.w13_input_scale_quant_per_expert,
-                    weights.w13_weight,
-                    weights.w13_blockscale_swizzled,
-                    weights.g1_alphas_per_expert,
-                    weights.w2_input_scale_quant_per_expert,
-                    weights.w2_weight,
-                    weights.w2_blockscale_swizzled,
-                    weights.g2_alphas_per_expert,
-                    topk_weights,
-                    topk_ids,
-                    output=routed_output,
-                    workspace=workspace,
-                    input_scales_static=True,
-                )
+                return routed_binding.run()
 
             def manual_e2e() -> torch.Tensor:
                 manual_route_only()
-                return b12x_moe_fp4(
-                    hidden_states,
-                    weights.w13_input_scale_quant_per_expert,
-                    weights.w13_weight,
-                    weights.w13_blockscale_swizzled,
-                    weights.g1_alphas_per_expert,
-                    weights.w2_input_scale_quant_per_expert,
-                    weights.w2_weight,
-                    weights.w2_blockscale_swizzled,
-                    weights.g2_alphas_per_expert,
-                    manual_topk_weights,
-                    manual_topk_ids,
-                    output=manual_output,
-                    workspace=workspace,
-                    input_scales_static=True,
-                )
+                return manual_binding.run()
 
             def sparse_api() -> None:
-                b12x_sparse_moe_fp4(
-                    hidden_states,
-                    experts=experts,
-                    workspace=workspace,
-                    top_k=spec.top_k,
-                    gate_weight=gate_weight,
-                    output=sparse_output,
-                    input_scales_static=True,
-                )
+                sparse_binding.run()
 
             manual_route_only()
-            route_api = b12x_route_experts_fast(
-                hidden_states,
-                top_k=spec.top_k,
-                gate_weight=gate_weight,
-                workspace=workspace,
-            )
+            route_api = route_binding.run()
             manual_e2e()
             sparse_api()
             torch.cuda.synchronize()

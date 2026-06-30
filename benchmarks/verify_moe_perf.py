@@ -19,10 +19,17 @@ from benchmarks.benchmark_moe import (
     get_scale_contract_params,
     load_expert_weights,
     make_l2_flush_fn,
+    prepare_b12x_benchmark_weights,
     require_sm120,
     resolve_l2_flush_bytes,
 )
-from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4, clear_tp_moe_caches
+from b12x.integration.tp_moe import (
+    B12XFP4ExpertWeights,
+    allocate_tp_moe_workspace_pool,
+    b12x_moe_fp4,
+    build_tp_moe_fp4_binding,
+    clear_tp_moe_caches,
+)
 
 
 DEFAULT_BATCH_SIZES = [1, 4, 32, 80]
@@ -61,9 +68,7 @@ def _measure_batch(
     *,
     batch_size: int,
     spec: ModelSpec,
-    weights,
-    params,
-    activation: str,
+    experts: B12XFP4ExpertWeights,
     warmup: int,
     iters: int,
     repeats: int,
@@ -78,25 +83,20 @@ def _measure_batch(
     topk_weights = torch.softmax(topk_logits, dim=-1)
     output = torch.empty_like(x)
     workspace = allocate_tp_moe_workspace_pool()
+    binding = build_tp_moe_fp4_binding(
+        scratch=workspace,
+        a=x,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        fast_math=fast_math,
+        output=output,
+        input_scales_static=True,
+        quant_mode="nvfp4",
+    )
 
     def launch() -> torch.Tensor:
-        return b12x_moe_fp4(
-            x,
-            params.a1_gscale,
-            weights.w13_weight,
-            weights.w13_blockscale_swizzled,
-            params.g1_alphas,
-            params.a2_gscale,
-            weights.w2_weight,
-            weights.w2_blockscale_swizzled,
-            params.g2_alphas,
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
-            fast_math=fast_math,
-            output=output,
-            activation=activation,
-        )
+        return b12x_moe_fp4(binding=binding)
 
     eager_stats = bench_repeated(
         launch,
@@ -149,8 +149,19 @@ def main() -> None:
         tp_rank=0,
     )
     clear_tp_moe_caches()
-    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=args.layer_idx)
+    weights = load_expert_weights(
+        MODEL_PATH,
+        spec,
+        layer_idx=args.layer_idx,
+        activation=args.activation,
+    )
     params = get_scale_contract_params(weights, args.scale_contract)
+    experts, _ = prepare_b12x_benchmark_weights(
+        weights,
+        params,
+        quant_mode="nvfp4",
+        activation=args.activation,
+    )
 
     results = {
         "activation": args.activation,
@@ -169,9 +180,7 @@ def main() -> None:
         results["batch_sizes"][str(batch_size)] = _measure_batch(
             batch_size=batch_size,
             spec=spec,
-            weights=weights,
-            params=params,
-            activation=args.activation,
+            experts=experts,
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,

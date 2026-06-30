@@ -25,7 +25,11 @@ from benchmarks.benchmark_moe import (
     make_multilayer_routing_case,
     make_routed_inputs,
 )
-from tests.helpers import make_tp_moe_fp4_binding, run_tp_moe_fp4
+from tests.helpers import (
+    make_tp_moe_fp4_binding,
+    prepare_tp_moe_fp4_experts,
+    run_tp_moe_fp4,
+)
 
 
 def _skip_if_unavailable() -> None:
@@ -59,20 +63,16 @@ def _load_multilayer_weights() -> tuple:
 
 
 def _make_layer_chain_bindings(
-    weights_stack,
-    params_stack,
+    experts_stack,
     x: torch.Tensor,
     topk_ids_per_layer: list[torch.Tensor],
     topk_weights_per_layer: list[torch.Tensor],
     output_buffers: list[torch.Tensor],
     *,
-    activation: str,
     fast_math: bool,
 ):
     if not (
-        len(weights_stack)
-        == len(params_stack)
-        == len(topk_ids_per_layer)
+        len(experts_stack) == len(topk_ids_per_layer)
         == len(topk_weights_per_layer)
         == len(output_buffers)
     ):
@@ -80,9 +80,8 @@ def _make_layer_chain_bindings(
 
     bindings = []
     current = x
-    for weights, params, topk_ids, topk_weights, output in zip(
-        weights_stack,
-        params_stack,
+    for experts, topk_ids, topk_weights, output in zip(
+        experts_stack,
         topk_ids_per_layer,
         topk_weights_per_layer,
         output_buffers,
@@ -90,23 +89,13 @@ def _make_layer_chain_bindings(
     ):
         binding = make_tp_moe_fp4_binding(
             a=current,
-            a1_gscale=params.a1_gscale,
-            w1_fp4=weights.w13_weight,
-            w1_blockscale=weights.w13_blockscale_swizzled,
-            w1_alphas=params.g1_alphas,
-            a2_gscale=params.a2_gscale,
-            w2_fp4=weights.w2_weight,
-            w2_blockscale=weights.w2_blockscale_swizzled,
-            w2_alphas=params.g2_alphas,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             fast_math=fast_math,
             output=output,
             input_scales_static=True,
-            activation=activation,
             quant_mode="nvfp4",
-            source_format=weights.source_format,
-            w13_layout=weights.w13_layout,
         )
         bindings.append(binding)
         current = output
@@ -133,7 +122,7 @@ def test_moe_nonzero(m):
     weights = load_expert_weights(MODEL_PATH, spec)
 
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=99, device=device)
-    out = run_tp_moe_fp4(
+    experts = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=weights.w13_input_scale_quant_per_expert,
         w1_fp4=weights.w13_weight,
@@ -143,6 +132,10 @@ def test_moe_nonzero(m):
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
+    )
+    out = run_tp_moe_fp4(
+        a=x,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         input_scales_static=True,
@@ -173,7 +166,7 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     topk_ids_buf = topk_ids0.clone()
     topk_weights_buf = topk_weights0.clone()
     graph_output = torch.empty_like(x_buf)
-    graph_binding = make_tp_moe_fp4_binding(
+    experts = prepare_tp_moe_fp4_experts(
         a=x_buf,
         a1_gscale=weights.w13_input_scale_quant_per_expert,
         w1_fp4=weights.w13_weight,
@@ -183,6 +176,10 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
+    )
+    graph_binding = make_tp_moe_fp4_binding(
+        a=x_buf,
+        experts=experts,
         topk_weights=topk_weights_buf,
         topk_ids=topk_ids_buf,
         output=graph_output,
@@ -209,14 +206,7 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
 
         eager_out = run_tp_moe_fp4(
             a=x,
-            a1_gscale=weights.w13_input_scale_quant_per_expert,
-            w1_fp4=weights.w13_weight,
-            w1_blockscale=weights.w13_blockscale_swizzled,
-            w1_alphas=weights.g1_alphas_per_expert,
-            a2_gscale=weights.w2_input_scale_quant_per_expert,
-            w2_fp4=weights.w2_weight,
-            w2_blockscale=weights.w2_blockscale_swizzled,
-            w2_alphas=weights.g2_alphas_per_expert,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             input_scales_static=True,
@@ -247,6 +237,23 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     num_layers = len(weights_stack)
 
     x_buf = make_input_activations(spec, m, seed=10_000 + m, device=device)
+    experts_stack = [
+        prepare_tp_moe_fp4_experts(
+            a=x_buf,
+            a1_gscale=params.a1_gscale,
+            w1_fp4=weights.w13_weight,
+            w1_blockscale=weights.w13_blockscale_swizzled,
+            w1_alphas=params.g1_alphas,
+            a2_gscale=params.a2_gscale,
+            w2_fp4=weights.w2_weight,
+            w2_blockscale=weights.w2_blockscale_swizzled,
+            w2_alphas=params.g2_alphas,
+            activation="silu",
+            source_format=weights.source_format,
+            w13_layout=weights.w13_layout,
+        )
+        for weights, params in zip(weights_stack, params_stack, strict=True)
+    ]
     initial_case = make_multilayer_routing_case(
         spec,
         m,
@@ -260,22 +267,18 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     graph_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     graph_bindings = _make_layer_chain_bindings(
-        weights_stack,
-        params_stack,
+        experts_stack,
         x_buf,
         topk_ids_bufs,
         topk_weights_bufs,
-        activation="silu",
         fast_math=True,
         output_buffers=graph_output_bufs,
     )
     eager_bindings = _make_layer_chain_bindings(
-        weights_stack,
-        params_stack,
+        experts_stack,
         x_buf,
         topk_ids_bufs,
         topk_weights_bufs,
-        activation="silu",
         fast_math=True,
         output_buffers=eager_output_bufs,
     )

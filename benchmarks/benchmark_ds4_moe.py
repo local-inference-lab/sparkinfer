@@ -174,75 +174,9 @@ def _bench_fi_cutlass(
     return start.elapsed_time(end) / iters
 
 
-def _bench_w4a8_tier(
-    weights: dict,
-    m: int,
-    *,
-    iters: int,
-    warmup: int,
-    device: torch.device,
-) -> float:
-    """W4A8 throughput-tier pipeline (b12x/moe/fused/w4a8/pipeline.py).
-
-    Prepare (weight repack + capacity workspace + first-call compile) is
-    OUTSIDE timing; the timed launch covers route_pack + mxfp8 quant + FC1
-    gather GEMM + fused act/quant + FC2 GEMM + weighted topk sum -- the same
-    work FlashInfer's cutlass_fused_moe call performs internally.
-    """
-    from b12x.moe.fused.w4a8.pipeline import (
-        build_w4a8_tier_workspace,
-        prepare_w4a8_tier_weights,
-        w4a8_tier_forward,
-    )
-
-    gen = torch.Generator(device=device)
-    gen.manual_seed(1000 + m)
-    x = (torch.randn(m, DS4_K, generator=gen, device=device) * 2.0).to(torch.bfloat16)
-    logits = torch.randn(m, DS4_E, generator=gen, device=device)
-    topk_logits, topk_ids = torch.topk(logits, DS4_TOPK, dim=-1)
-    topk_weights = torch.softmax(topk_logits, dim=-1).float()
-    topk_ids = topk_ids.to(torch.int32)
-
-    prep = prepare_w4a8_tier_weights(
-        weights["w13_fp4"], weights["w13_mx"], weights["w2_fp4"], weights["w2_mx"]
-    )
-    ws = build_w4a8_tier_workspace(
-        m=m,
-        hidden_size=DS4_K,
-        intermediate_size=DS4_I_TP,
-        num_experts=DS4_E,
-        topk=DS4_TOPK,
-        device=device,
-    )
-
-    def launch():
-        w4a8_tier_forward(
-            x,
-            prep["w13_rp"],
-            prep["w13_sfb"],
-            prep["w2_rp"],
-            prep["w2_sfb"],
-            topk_ids,
-            topk_weights,
-            ws,
-        )
-
-    for _ in range(warmup):
-        launch()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        launch()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 def _bench_b12x(
     mode: str,
-    weights: dict,
+    experts,
     m: int,
     *,
     iters: int,
@@ -252,6 +186,7 @@ def _bench_b12x(
     from b12x.integration.tp_moe import (
         allocate_tp_moe_workspace_pool,
         b12x_moe_fp4,
+        build_tp_moe_fp4_binding,
         clear_tp_moe_caches,
     )
 
@@ -265,34 +200,20 @@ def _bench_b12x(
     topk_ids = topk_ids.to(torch.int32)
     out = torch.empty(m, DS4_K, dtype=torch.bfloat16, device=device)
 
-    if mode == "w4a16":
-        kwargs = dict(
-            quant_mode="w4a16",
-            source_format="fp4_e8m0_k32",
-        )
-    else:
-        kwargs = dict(quant_mode=mode)
-
     workspace = allocate_tp_moe_workspace_pool()
+    binding = build_tp_moe_fp4_binding(
+        scratch=workspace,
+        a=x,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=out,
+        input_scales_static=True,
+        quant_mode=mode,
+    )
 
     def launch():
-        b12x_moe_fp4(
-            x,
-            weights["input_scale"],
-            weights["w13_fp4"],
-            weights["w13_mx"],
-            weights["alphas"],
-            weights["input_scale"],
-            weights["w2_fp4"],
-            weights["w2_mx"],
-            weights["alphas"],
-            topk_weights,
-            topk_ids,
-            workspace=workspace,
-            output=out,
-            input_scales_static=True,
-            **kwargs,
-        )
+        b12x_moe_fp4(binding=binding)
 
     for _ in range(warmup):
         launch()
@@ -305,6 +226,41 @@ def _bench_b12x(
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
+
+
+def _prepare_b12x_experts(mode: str, source_weights: dict):
+    """Transfer one private source copy into the mode's canonical owner."""
+    from b12x.integration.tp_moe import (
+        plan_b12x_fp4_moe_weights,
+        prepare_b12x_fp4_moe_weights,
+    )
+
+    owned = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in source_weights.items()
+    }
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes=mode,
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=DS4_E,
+        hidden_size=DS4_K,
+        intermediate_size=DS4_I_TP,
+        w13_layout="w13",
+    )
+    return prepare_b12x_fp4_moe_weights(
+        plan=plan,
+        w1_global_scale=owned["alphas"],
+        w2_global_scale=owned["alphas"],
+        w1_fp4=owned["w13_fp4"],
+        w1_blockscale=owned["w13_mx"],
+        w2_fp4=owned["w2_fp4"],
+        w2_blockscale=owned["w2_mx"],
+        a1_gscale=owned["input_scale"],
+        a2_gscale=owned["input_scale"],
+        params_dtype=torch.bfloat16,
+    )
 
 
 def main() -> None:
@@ -333,6 +289,11 @@ def main() -> None:
         DS4_E, DS4_K, DS4_I_TP, seed=args.seed, device=device
     )
     modes = [s.strip() for s in args.modes.split(",") if s.strip()]
+    experts_by_mode = {
+        mode: _prepare_b12x_experts(mode, weights)
+        for mode in modes
+        if mode != "fi_cutlass"
+    }
     ms_list = [int(s) for s in args.m.split(",") if s.strip()]
     print(f"{'m':>7} | " + " | ".join(f"{mode:>22}" for mode in modes))
     for m in ms_list:
@@ -342,13 +303,14 @@ def main() -> None:
                 ms = _bench_fi_cutlass(
                     weights, m, iters=args.iters, warmup=args.warmup, device=device
                 )
-            elif mode == "w4a8_tier":
-                ms = _bench_w4a8_tier(
-                    weights, m, iters=args.iters, warmup=args.warmup, device=device
-                )
             else:
                 ms = _bench_b12x(
-                    mode, weights, m, iters=args.iters, warmup=args.warmup, device=device
+                    mode,
+                    experts_by_mode[mode],
+                    m,
+                    iters=args.iters,
+                    warmup=args.warmup,
+                    device=device,
                 )
             tflops = moe_flops(m, DS4_K, DS4_I_TP, DS4_TOPK) / (ms * 1e-3) / 1e12
             cells.append(f"{ms:8.3f} ms {tflops:6.1f} TF")

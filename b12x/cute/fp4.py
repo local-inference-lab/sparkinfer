@@ -519,35 +519,6 @@ def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def st_global_v4_u32(
-    base_ptr: Int64,
-    v0: Uint32,
-    v1: Uint32,
-    v2: Uint32,
-    v3: Uint32,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Store 128 bits (4 x uint32) to global memory."""
-    llvm.inline_asm(
-        None,
-        [
-            Int64(base_ptr).ir_value(loc=loc, ip=ip),
-            Uint32(v0).ir_value(loc=loc, ip=ip),
-            Uint32(v1).ir_value(loc=loc, ip=ip),
-            Uint32(v2).ir_value(loc=loc, ip=ip),
-            Uint32(v3).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
 def st_global_u8(base_ptr: Int64, value: Uint8, *, loc=None, ip=None):
     """Store 8 bits to global memory."""
     llvm.inline_asm(
@@ -2958,6 +2929,70 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
 
 
 @dsl_user_op
+def mxfp8_mma_m16n8k32_f32_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 block-scaled QMMA with E4M3 A and E2M1 B containers."""
+    asm = f"""
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0
+        {{$0, $1, $2, $3}},
+        {{$4, $5, $6, $7}},
+        {{$8, $9}},
+        {{$0, $1, $2, $3}},
+        {{$10}},
+        {{{int(bid_a)}, {int(tid_a)}}},
+        {{$11}},
+        {{{int(bid_b)}, {int(tid_b)}}};
+        """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
+
+
+@dsl_user_op
 def mma_m16n8k32_f32_e4m3(
     d0: Float32,
     d1: Float32,
@@ -3684,6 +3719,43 @@ def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def e2m1x8_to_qmma_e2m1x8(
+    packed_u32: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Spread eight packed FP4 nibbles into QMMA E2M1 byte containers.
+
+    The SM120 f8f6f4 instruction expects one E2M1 value per byte with the
+    original nibble in bits 5:2.  This six-instruction spread is cheaper than
+    losslessly relabeling every value as E4M3 when no residual multiplier is
+    required.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed_u32).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 s, t;
+            shl.b32 s, $2, 2;
+            shr.u32 t, $2, 2;
+            prmt.b32 $0, s, t, 0x5140;
+            prmt.b32 $1, s, t, 0x7362;
+            and.b32 $0, $0, 0x3C3C3C3C;
+            and.b32 $1, $1, 0x3C3C3C3C;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
 
 
 @dsl_user_op

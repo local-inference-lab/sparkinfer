@@ -28,6 +28,8 @@ from b12x.integration import (
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     clear_tp_moe_caches,
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
 import b12x.integration.tp_moe as tp_moe_impl
 from tests.helpers import run_tp_moe_fp4
@@ -58,16 +60,35 @@ def _load_qwen_case() -> tuple[ModelSpec, object, torch.Tensor]:
 
 
 def _pack_experts(weights) -> B12XFP4ExpertWeights:
-    return B12XFP4ExpertWeights(
-        a1_gscale=weights.w13_input_scale_quant_per_expert,
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="nvfp4",
+        source_format=weights.source_format,
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=weights.spec.num_experts,
+        hidden_size=weights.spec.hidden_size,
+        intermediate_size=weights.spec.I_tp,
+        w13_layout=weights.w13_layout,
+    )
+    prepared = prepare_b12x_fp4_moe_weights(
+        plan=plan,
+        w1_global_scale=(
+            weights.g1_alphas_per_expert
+            * weights.w13_input_scale_quant_per_expert
+        ),
+        w2_global_scale=(
+            weights.g2_alphas_per_expert
+            * weights.w2_input_scale_quant_per_expert
+        ),
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
-        w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_quant_per_expert,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
-        w2_alphas=weights.g2_alphas_per_expert,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        params_dtype=torch.bfloat16,
     )
+    return prepared
 
 
 def _make_scratch():
@@ -193,14 +214,7 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
     torch.testing.assert_close(routing.topk_weights, topk_weights)
     routed_manual_output = run_tp_moe_fp4(
         a=hidden_states,
-        a1_gscale=weights.w13_input_scale_quant_per_expert,
-        w1_fp4=weights.w13_weight,
-        w1_blockscale=weights.w13_blockscale_swizzled,
-        w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_quant_per_expert,
-        w2_fp4=weights.w2_weight,
-        w2_blockscale=weights.w2_blockscale_swizzled,
-        w2_alphas=weights.g2_alphas_per_expert,
+        experts=experts,
         topk_weights=routing.topk_weights,
         topk_ids=routing.topk_ids,
         input_scales_static=True,
@@ -243,14 +257,7 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
     torch.testing.assert_close(routing.topk_weights, topk_weights)
     routed_manual_output = run_tp_moe_fp4(
         a=hidden_states,
-        a1_gscale=weights.w13_input_scale_quant_per_expert,
-        w1_fp4=weights.w13_weight,
-        w1_blockscale=weights.w13_blockscale_swizzled,
-        w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_quant_per_expert,
-        w2_fp4=weights.w2_weight,
-        w2_blockscale=weights.w2_blockscale_swizzled,
-        w2_alphas=weights.g2_alphas_per_expert,
+        experts=experts,
         topk_weights=routing.topk_weights,
         topk_ids=routing.topk_ids,
         input_scales_static=True,

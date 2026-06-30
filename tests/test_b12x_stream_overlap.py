@@ -9,7 +9,7 @@ from b12x.integration.tp_moe import (
 )
 from b12x.moe.fused.reference import compare_to_reference
 
-from .helpers import require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -63,7 +63,7 @@ def _run_once(
     topk_weights: torch.Tensor,
     weights,
 ) -> torch.Tensor:
-    return run_tp_moe_fp4(
+    experts = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=weights.w13_input_scale_quant,
         w1_fp4=weights.w13_weight,
@@ -73,6 +73,10 @@ def _run_once(
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas,
+    )
+    return run_tp_moe_fp4(
+        a=x,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     ).clone()
@@ -87,7 +91,7 @@ def _launch_with_alias_consumer(
     weights,
 ) -> torch.Tensor:
     with torch.cuda.stream(stream):
-        alias = run_tp_moe_fp4(
+        experts = prepare_tp_moe_fp4_experts(
             a=x,
             a1_gscale=weights.w13_input_scale_quant,
             w1_fp4=weights.w13_weight,
@@ -97,6 +101,10 @@ def _launch_with_alias_consumer(
             w2_fp4=weights.w2_weight,
             w2_blockscale=weights.w2_blockscale_swizzled,
             w2_alphas=weights.g2_alphas,
+        )
+        alias = run_tp_moe_fp4(
+            a=x,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
         )

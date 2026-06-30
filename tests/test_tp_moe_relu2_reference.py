@@ -8,13 +8,13 @@ from b12x.integration import tp_moe
 from b12x.integration.tp_moe import clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
-from .helpers import require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
 
 
 BACKEND_CASES = [
-    ("micro", 2, 10_000, 10_000),
-    ("static", 128, 10_000, 0),
-    ("dynamic", 768, 0, 0),
+    ("micro", 2, 10_000),
+    ("dynamic_mid", 128, 10_000),
+    ("dynamic_large", 768, 0),
 ]
 
 
@@ -84,8 +84,7 @@ def _run_activation_case(
     *,
     activation: str,
     m: int,
-    static_cutover: int,
-    micro_cutover: int,
+    micro_dynamic_cutover: int,
     fast_math: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = require_sm120()
@@ -123,35 +122,36 @@ def _run_activation_case(
         n,
         activation=activation,
     )
+    experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        activation=activation,
+    )
 
-    prev_static_cutover = dict(tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE)
-    prev_micro_cutover = tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE
+    previous_cutover = dict(tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE)
     try:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = static_cutover
-        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = micro_cutover
+        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE["nvfp4"] = micro_dynamic_cutover
 
         output = run_tp_moe_fp4(
             a=x,
-            a1_gscale=a1_gscale,
-            w1_fp4=w1_fp4,
-            w1_blockscale=w1_blockscale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2_fp4,
-            w2_blockscale=w2_blockscale,
-            w2_alphas=w2_alphas,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             input_scales_static=True,
-            activation=activation,
             fast_math=fast_math,
         )
         torch.cuda.synchronize()
     finally:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.update(prev_static_cutover)
-        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = prev_micro_cutover
+        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.update(previous_cutover)
 
     return output, reference
 
@@ -164,7 +164,7 @@ def _run_single_token_multi_expert_micro_case(
     device = require_sm120()
     torch.manual_seed(7)
 
-    m, E, k, n, topk = 1, 4, 128, 128, 3
+    m, E, k, n = 1, 4, 128, 128
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     topk_ids = torch.tensor([[3, 1, 2]], device=device, dtype=topk_ids_dtype)
     topk_logits = torch.tensor([[0.2, -0.1, 0.4]], device=device, dtype=torch.float32)
@@ -197,41 +197,42 @@ def _run_single_token_multi_expert_micro_case(
         n,
         activation=activation,
     )
+    experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        activation=activation,
+    )
 
-    prev_static_cutover = dict(tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE)
-    prev_micro_cutover = tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE
+    previous_cutover = dict(tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE)
     try:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE["nvfp4"] = 128
-        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = 10_000
+        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE["nvfp4"] = 128
 
         output = run_tp_moe_fp4(
             a=x,
-            a1_gscale=a1_gscale,
-            w1_fp4=w1_fp4,
-            w1_blockscale=w1_blockscale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2_fp4,
-            w2_blockscale=w2_blockscale,
-            w2_alphas=w2_alphas,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             input_scales_static=True,
-            activation=activation,
             fast_math=False,
         )
         torch.cuda.synchronize()
     finally:
         clear_tp_moe_caches()
-        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.update(prev_static_cutover)
-        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = prev_micro_cutover
+        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.update(previous_cutover)
 
     return output, reference
 
 
 @pytest.mark.parametrize(
-    ("backend", "m", "static_cutover", "micro_cutover"),
+    ("backend", "m", "micro_dynamic_cutover"),
     BACKEND_CASES,
 )
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
@@ -239,14 +240,12 @@ def test_activation_exact_path_matches_reference_across_backends(
     activation: str,
     backend: str,
     m: int,
-    static_cutover: int,
-    micro_cutover: int,
+    micro_dynamic_cutover: int,
 ) -> None:
     output, reference = _run_activation_case(
         activation=activation,
         m=m,
-        static_cutover=static_cutover,
-        micro_cutover=micro_cutover,
+        micro_dynamic_cutover=micro_dynamic_cutover,
         fast_math=False,
     )
     metrics = compare_to_reference(output, reference)
@@ -255,20 +254,18 @@ def test_activation_exact_path_matches_reference_across_backends(
 
 
 @pytest.mark.parametrize(
-    ("backend", "m", "static_cutover", "micro_cutover"),
+    ("backend", "m", "micro_dynamic_cutover"),
     BACKEND_CASES,
 )
 def test_relu2_matches_reference_across_backends(
     backend: str,
     m: int,
-    static_cutover: int,
-    micro_cutover: int,
+    micro_dynamic_cutover: int,
 ) -> None:
     output, reference = _run_activation_case(
         activation="relu2",
         m=m,
-        static_cutover=static_cutover,
-        micro_cutover=micro_cutover,
+        micro_dynamic_cutover=micro_dynamic_cutover,
         fast_math=True,
     )
     metrics = compare_to_reference(output, reference)

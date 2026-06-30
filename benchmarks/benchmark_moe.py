@@ -156,7 +156,10 @@ def bench_events(
         fn()
         ends[i].record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) for start, end in zip(starts, ends)]
+    return [
+        start.elapsed_time(end)
+        for start, end in zip(starts, ends, strict=True)
+    ]
 
 
 def fmt_us(times_ms: list[float]) -> str:
@@ -354,6 +357,22 @@ MODEL_PROFILES = {
             top_k=8,
         ),
     ),
+    "dsv4f-nvfp4": ModelProfile(
+        label="DSV4F NVFP4 (shape)",
+        checkpoint_family="dsv4f_nvfp4_shape",
+        default_layer_idx=0,
+        tp_size=2,
+        hf_repo_id=None,
+        default_activation="silu",
+        default_quant_mode="nvfp4",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=6144,
+            intermediate_size=2048,
+            num_experts=256,
+            top_k=8,
+        ),
+    ),
     "deepseek-v4-flash": ModelProfile(
         label="DeepSeek V4 Flash",
         checkpoint_family="deepseek_v4_flash",
@@ -419,7 +438,7 @@ def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
     return None
 
 
-def _default_legacy_model_path() -> pathlib.Path:
+def _default_model_path() -> pathlib.Path:
     local_qwen_path = pathlib.Path("/data/models/Qwen3.5-397B-A17B-NVFP4")
     if local_qwen_path.is_dir():
         return local_qwen_path
@@ -462,7 +481,7 @@ def resolve_model_path(
         f"no default path found for {profile.label}; pass --model-path explicitly"
     )
 
-MODEL_PATH = _default_legacy_model_path()
+MODEL_PATH = _default_model_path()
 
 
 @dataclass
@@ -739,7 +758,11 @@ def load_expert_weights(
     oracle_w2_scale = None
     oracle_flashinfer_weights = None
     w13_layout = "w31"
-    if checkpoint_family in {"nano35_w4a16_shape", "dsv4f_shape"}:
+    if checkpoint_family in {
+        "nano35_w4a16_shape",
+        "dsv4f_shape",
+        "dsv4f_nvfp4_shape",
+    }:
         shape_source_format = (
             "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"
         )
@@ -1180,6 +1203,17 @@ def make_input_activations(
     return x.to(device=device, dtype=torch.bfloat16)
 
 
+def normalize_kernel_routing(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the graph-safe routing tensor contract used by serving."""
+    return (
+        topk_ids.to(dtype=torch.int32).contiguous(),
+        topk_weights.to(dtype=torch.float32).contiguous(),
+    )
+
+
 def make_routed_inputs(
     spec: ModelSpec,
     m: int,
@@ -1197,6 +1231,7 @@ def make_routed_inputs(
     ).to(device=device)
     topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
     topk_weights = torch.softmax(topk_logits, dim=-1)
+    topk_ids, topk_weights = normalize_kernel_routing(topk_ids, topk_weights)
     return x, topk_ids, topk_weights
 
 
@@ -1240,7 +1275,7 @@ def compute_model_gate_routing(
     if score_func != "softmax" and weights.gate_norm_topk_prob:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     topk_weights = topk_weights * weights.gate_route_scale
-    return topk_ids, topk_weights
+    return normalize_kernel_routing(topk_ids, topk_weights)
 
 
 def make_profile_routed_inputs(
@@ -1259,6 +1294,45 @@ def make_profile_routed_inputs(
         raise ValueError(f"unsupported routing source {profile.default_routing!r}")
     _x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed, device)
     return x, topk_ids, topk_weights
+
+
+def make_benchmark_case(
+    profile: ModelProfile,
+    weights: ExpertWeights,
+    spec: ModelSpec,
+    m: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Build a reproducible validation/timing case without retaining it."""
+
+    x = make_input_activations(spec, m, seed, device)
+    if profile.default_routing == "model":
+        topk_ids, topk_weights = compute_model_gate_routing(
+            weights,
+            x,
+            seed=seed + 1,
+        )
+        return x, topk_ids, topk_weights, None
+    if profile.default_routing != "synthetic":
+        raise ValueError(f"unsupported routing source {profile.default_routing!r}")
+    routing_generator = torch.Generator(device="cpu")
+    routing_generator.manual_seed(seed + 1)
+    routing_logits = torch.randn(
+        m,
+        spec.num_experts,
+        generator=routing_generator,
+        dtype=torch.float32,
+    ).to(device=device)
+    topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
+    topk_weights = torch.softmax(topk_logits, dim=-1)
+    topk_ids, topk_weights = normalize_kernel_routing(topk_ids, topk_weights)
+    return x, topk_ids, topk_weights, routing_logits
 
 
 def _make_structured_routing_ids(
@@ -1317,7 +1391,7 @@ def make_multilayer_routing_case(
             layer_idx=layer_idx,
             pattern=pattern,
             seed=seed,
-        ).to(device=device)
+        ).to(device=device, dtype=torch.int32)
         weight_generator = torch.Generator(device="cpu")
         weight_generator.manual_seed(seed + layer_idx * 1009 + 7)
         topk_logits = torch.randn(m, spec.top_k, generator=weight_generator, dtype=torch.float32)
@@ -1381,6 +1455,91 @@ def get_w4a16_prepare_scales(
             weights.source_format,
         )
     return params.g1_alphas, params.g2_alphas, weights.source_format
+
+
+def plan_b12x_benchmark_weights(
+    weights: ExpertWeights,
+    *,
+    quant_mode: str,
+    activation: str,
+    w4a16_native: bool = False,
+):
+    """Choose the benchmark's sole authoritative weight layout."""
+    from b12x.integration import plan_b12x_fp4_moe_weights
+    from b12x.moe.execution import PreparedWeightLayout
+
+    quant_mode = quant_mode.lower()
+    return plan_b12x_fp4_moe_weights(
+        quant_modes=quant_mode,
+        source_format=weights.source_format,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=weights.spec.num_experts,
+        hidden_size=weights.spec.hidden_size,
+        intermediate_size=weights.spec.I_tp,
+        w13_layout=weights.w13_layout,
+        w4a16_layout=(
+            PreparedWeightLayout.SOURCE_NATIVE
+            if quant_mode == "w4a16" and w4a16_native
+            else None
+        ),
+    )
+
+
+def prepare_b12x_benchmark_weights(
+    weights: ExpertWeights,
+    params: ScaleContractParams,
+    *,
+    quant_mode: str,
+    activation: str,
+    w4a16_native: bool = False,
+    plan=None,
+):
+    """Execute the benchmark's planner-selected authoritative layout."""
+    from b12x.integration import prepare_b12x_fp4_moe_weights
+
+    quant_mode = quant_mode.lower()
+    if plan is None:
+        plan = plan_b12x_benchmark_weights(
+            weights,
+            quant_mode=quant_mode,
+            activation=activation,
+            w4a16_native=w4a16_native,
+        )
+    if quant_mode == "w4a16":
+        w1_global_scale, w2_global_scale, _ = get_w4a16_prepare_scales(
+            weights,
+            params,
+        )
+    elif quant_mode == "w4a8_mx":
+        w1_global_scale = torch.ones_like(params.g1_alphas)
+        w2_global_scale = torch.ones_like(params.g2_alphas)
+    else:
+        # NVFP4 runtime alpha = input_scale * weight_global_scale, while the
+        # public activation scale is reciprocal input_scale.
+        w1_global_scale = params.g1_alphas * params.a1_gscale
+        w2_global_scale = params.g2_alphas * params.a2_gscale
+
+    experts = prepare_b12x_fp4_moe_weights(
+        plan=plan,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        a1_gscale=params.a1_gscale,
+        a2_gscale=params.a2_gscale,
+        params_dtype=torch.bfloat16,
+    )
+    if experts.plan.prepares_runtime_alphas:
+        params = ScaleContractParams(
+            a1_gscale=experts.a1_gscale,
+            a2_gscale=experts.a2_gscale,
+            g1_alphas=experts.w1_alphas,
+            g2_alphas=experts.w2_alphas,
+        )
+    return experts, params
 
 
 def get_w4a16_oracle_params(
@@ -1788,43 +1947,18 @@ def compare_graph_replay_outputs(
     return metrics
 
 
-def allocate_layer_chain_workspace(
-    weights_stack: Sequence[ExpertWeights],
-    params_stack: Sequence[ScaleContractParams],
-    x: torch.Tensor,
-    topk_ids_per_layer: Sequence[torch.Tensor],
-    *,
-    activation: str,
-    activation_params: ActivationParams | None = None,
-    quant_mode: str = "nvfp4",
-):
-    from b12x.integration.tp_moe import allocate_tp_moe_workspace
+def allocate_layer_chain_workspace():
+    from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
 
-    if not weights_stack:
-        raise ValueError("weights_stack must not be empty")
-    activation_params = activation_params or ActivationParams()
-    return allocate_tp_moe_workspace(
-        x,
-        params_stack[0].a1_gscale,
-        weights_stack[0].w13_weight,
-        params_stack[0].a2_gscale,
-        weights_stack[0].w2_weight,
-        topk_ids_per_layer[0],
-        input_scales_static=True,
-        quant_mode=quant_mode,
-        activation=activation,
-        **activation_params.kwargs(),
-    )
+    return allocate_tp_moe_workspace_pool()
 
 
 def run_moe_layer_chain(
-    weights_stack: Sequence[ExpertWeights],
-    params_stack: Sequence[ScaleContractParams],
+    experts_stack: Sequence[object],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    activation: str,
     activation_params: ActivationParams | None = None,
     fast_math: bool,
     quant_mode: str = "nvfp4",
@@ -1834,42 +1968,35 @@ def run_moe_layer_chain(
     from b12x.integration.tp_moe import b12x_moe_fp4, build_tp_moe_fp4_binding
 
     if not (
-        len(weights_stack)
-        == len(params_stack)
-        == len(topk_ids_per_layer)
+        len(experts_stack) == len(topk_ids_per_layer)
         == len(topk_weights_per_layer)
     ):
         raise ValueError("layer-chain inputs must all have the same length")
-    if output_buffers is not None and len(output_buffers) != len(weights_stack):
+    if output_buffers is not None and len(output_buffers) != len(experts_stack):
         raise ValueError("output_buffers must match the number of layers")
     activation_params = activation_params or ActivationParams()
 
     layer_outputs: list[torch.Tensor] = []
     current = x
-    for layer_idx, (weights, params, topk_ids, topk_weights) in enumerate(
-        zip(weights_stack, params_stack, topk_ids_per_layer, topk_weights_per_layer, strict=True)
+    for layer_idx, (experts, topk_ids, topk_weights) in enumerate(
+        zip(
+            experts_stack,
+            topk_ids_per_layer,
+            topk_weights_per_layer,
+            strict=True,
+        )
     ):
         output = None if output_buffers is None else output_buffers[layer_idx]
         binding = build_tp_moe_fp4_binding(
             scratch=workspace,
             a=current,
-            a1_gscale=params.a1_gscale,
-            w1_fp4=weights.w13_weight,
-            w1_blockscale=weights.w13_blockscale_swizzled,
-            w1_alphas=params.g1_alphas,
-            a2_gscale=params.a2_gscale,
-            w2_fp4=weights.w2_weight,
-            w2_blockscale=weights.w2_blockscale_swizzled,
-            w2_alphas=params.g2_alphas,
+            experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             fast_math=fast_math,
             output=output,
             input_scales_static=True,
-            activation=activation,
             quant_mode=quant_mode,
-            source_format=weights.source_format,
-            w13_layout=weights.w13_layout,
             **activation_params.kwargs(),
         )
         current = b12x_moe_fp4(binding=binding)
@@ -1878,13 +2005,11 @@ def run_moe_layer_chain(
 
 
 def capture_moe_layer_chain(
-    weights_stack: Sequence[ExpertWeights],
-    params_stack: Sequence[ScaleContractParams],
+    experts_stack: Sequence[object],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    activation: str,
     activation_params: ActivationParams | None = None,
     fast_math: bool,
     quant_mode: str = "nvfp4",
@@ -1894,12 +2019,10 @@ def capture_moe_layer_chain(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_moe_layer_chain(
-            weights_stack,
-            params_stack,
+            experts_stack,
             x,
             topk_ids_per_layer,
             topk_weights_per_layer,
-            activation=activation,
             activation_params=activation_params,
             fast_math=fast_math,
             quant_mode=quant_mode,
@@ -1960,7 +2083,7 @@ def bench_multilayer_graph_mode(
     print("Backend: b12x")
     print(f"Quant mode: {args.quant_mode}")
     print(f"Layers: {layer_start}..{layer_start + graph_num_layers - 1}")
-    print(f"Patterns: disjoint, overlap, random")
+    print("Patterns: disjoint, overlap, random")
     print()
 
     _clear_b12x_caches()
@@ -1973,10 +2096,21 @@ def bench_multilayer_graph_mode(
         checkpoint_family=profile.checkpoint_family,
         keep_flashinfer_oracle_copy=args.validate == "oracle" and args.oracle_mode == "flashinfer",
     )
-    params_stack = [
-        get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
-        for weights in weights_stack
-    ]
+    experts_stack: list[object] = []
+    for weights in weights_stack:
+        params = get_quant_mode_params(
+            weights,
+            args.scale_contract,
+            args.quant_mode,
+        )
+        experts, _ = prepare_b12x_benchmark_weights(
+            weights,
+            params,
+            quant_mode=args.quant_mode,
+            activation=args.activation,
+            w4a16_native=args.w4a16_native,
+        )
+        experts_stack.append(experts)
 
     scenario_specs = [
         ("disjoint", "disjoint", 1100),
@@ -2007,23 +2141,13 @@ def bench_multilayer_graph_mode(
         topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
         graph_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
         eager_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
-        shared_workspace = allocate_layer_chain_workspace(
-            weights_stack,
-            params_stack,
-            x_buf,
-            topk_ids_bufs,
-            activation=args.activation,
-            activation_params=activation_params,
-            quant_mode=args.quant_mode,
-        )
+        shared_workspace = allocate_layer_chain_workspace()
 
         run_moe_layer_chain(
-            weights_stack,
-            params_stack,
+            experts_stack,
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            activation=args.activation,
             activation_params=activation_params,
             fast_math=args.fast_math,
             quant_mode=args.quant_mode,
@@ -2032,12 +2156,10 @@ def bench_multilayer_graph_mode(
         )
         torch.cuda.synchronize()
         graph = capture_moe_layer_chain(
-            weights_stack,
-            params_stack,
+            experts_stack,
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            activation=args.activation,
             activation_params=activation_params,
             fast_math=args.fast_math,
             quant_mode=args.quant_mode,
@@ -2047,12 +2169,10 @@ def bench_multilayer_graph_mode(
 
         def eager_chain() -> None:
             run_moe_layer_chain(
-                weights_stack,
-                params_stack,
+                experts_stack,
                 x_buf,
                 topk_ids_bufs,
                 topk_weights_bufs,
-                activation=args.activation,
                 activation_params=activation_params,
                 fast_math=args.fast_math,
                 quant_mode=args.quant_mode,
@@ -2398,69 +2518,79 @@ def bench_e2e() -> None:
     )
     print(f"Source format: {weights.source_format}")
     params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
-    backend_w4a16_prepared = None
+    weight_plan = plan_b12x_benchmark_weights(
+        weights,
+        quant_mode=args.quant_mode,
+        activation=args.activation,
+        w4a16_native=args.w4a16_native,
+    )
+    precomputed_oracles: dict[int, torch.Tensor] = {}
+    if args.validate == "oracle" and weight_plan.reuses_source_storage:
+        print(
+            "  Precomputing oracle outputs before destructive weight "
+            "preparation...",
+            end="",
+            flush=True,
+        )
+        for batch_size in batch_sizes:
+            oracle_x, oracle_ids, oracle_topk, _ = make_benchmark_case(
+                model_profile,
+                weights,
+                spec,
+                batch_size,
+                42 + batch_size,
+                device,
+            )
+            oracle_output = make_oracle_reference(
+                args.oracle_mode,
+                args.quant_mode,
+                oracle_x,
+                weights,
+                params,
+                oracle_ids,
+                oracle_topk,
+                activation=args.activation,
+                activation_params=activation_params,
+            )
+            # Outputs are the only state retained across the ownership
+            # transfer.  Keep them off-device; never retain a second model.
+            precomputed_oracles[batch_size] = oracle_output.detach().cpu()
+            del oracle_x, oracle_ids, oracle_topk, oracle_output
+        torch.cuda.synchronize()
+        # FlashInfer validation may have prepared a test-only alternate model
+        # representation.  It must not survive into B12X preparation/runtime.
+        weights.oracle_flashinfer_weights = None
+        weights.oracle_w13_weight = None
+        weights.oracle_w13_scale = None
+        weights.oracle_w2_weight = None
+        weights.oracle_w2_scale = None
+        torch.cuda.empty_cache()
+        print(" done.")
+    experts, params = prepare_b12x_benchmark_weights(
+        weights,
+        params,
+        quant_mode=args.quant_mode,
+        activation=args.activation,
+        w4a16_native=args.w4a16_native,
+        plan=weight_plan,
+    )
+    backend_w4a16_weights = None
     make_backend_w4a16_buffers = None
     if use_w4a16:
         from b12x.moe.fused.w4a16.prepare import (
             make_w4a16_packed_buffers as make_w4a16_buffers,
-            prepare_w4a16_e8m0_native_weights,
-            prepare_w4a16_modelopt_native_weights,
-            prepare_w4a16_packed_weights as prepare_w4a16_weights,
         )
 
-        w4a16_g1, w4a16_g2, source_format = get_w4a16_prepare_scales(
-            weights,
-            params,
+        backend_w4a16_weights = experts.representation_for("w4a16")
+        assert backend_w4a16_weights is not None
+        print(
+            "W4A16 preparation: "
+            f"{experts.plan.storage_policy.value}, "
+            f"layout={experts.plan.required_weight_layout('w4a16').value}"
         )
-        if args.w4a16_native:
-            # Native (modelopt) prep so small-M routes to the micro decode kernel.
-            # The micro kernel handles both w13 and w31 (gate_up) natively, so the
-            # source layout (DeepSeek V4 Flash is w31) is passed through as-is.
-            if source_format == "fp4_e8m0_k32":
-                backend_w4a16_prepared = prepare_w4a16_e8m0_native_weights(
-                    weights.w13_weight,
-                    weights.w13_blockscale_swizzled,
-                    w4a16_g1,
-                    weights.w2_weight,
-                    weights.w2_blockscale_swizzled,
-                    w4a16_g2,
-                    activation=args.activation,
-                    params_dtype=torch.bfloat16,
-                    w13_layout=weights.w13_layout,
-                )
-            else:
-                backend_w4a16_prepared = prepare_w4a16_modelopt_native_weights(
-                    weights.w13_weight,
-                    weights.w13_blockscale_swizzled,
-                    w4a16_g1,
-                    weights.w2_weight,
-                    weights.w2_blockscale_swizzled,
-                    w4a16_g2,
-                    activation=args.activation,
-                    params_dtype=torch.bfloat16,
-                    source_format=source_format,
-                    w13_layout=weights.w13_layout,
-                )
-            print(
-                "W4A16 prep: native (micro decode path enabled for small M, "
-                f"w13_layout={weights.w13_layout})"
-            )
-        else:
-            backend_w4a16_prepared = prepare_w4a16_weights(
-                weights.w13_weight,
-                weights.w13_blockscale_swizzled,
-                w4a16_g1,
-                weights.w2_weight,
-                weights.w2_blockscale_swizzled,
-                w4a16_g2,
-                activation=args.activation,
-                params_dtype=torch.bfloat16,
-                source_format=source_format,
-                w13_layout=weights.w13_layout,
-            )
         print(
             "W4A16 scale format: "
-            f"{getattr(backend_w4a16_prepared, 'scale_format', source_format)}"
+            f"{getattr(backend_w4a16_weights, 'scale_format', weights.source_format)}"
         )
         make_backend_w4a16_buffers = make_w4a16_buffers
 
@@ -2494,10 +2624,10 @@ def bench_e2e() -> None:
     )
     if use_w4a16:
         assert w4a16_moe is not None
-        assert backend_w4a16_prepared is not None
+        assert backend_w4a16_weights is not None
         assert make_backend_w4a16_buffers is not None
         warmup_buffers = make_backend_w4a16_buffers(
-            backend_w4a16_prepared,
+            backend_w4a16_weights,
             m=x_warm.shape[0],
             topk=spec.top_k,
             dtype=torch.bfloat16,
@@ -2505,7 +2635,7 @@ def bench_e2e() -> None:
         )
         w4a16_moe(
             x_warm,
-            backend_w4a16_prepared,
+            backend_w4a16_weights,
             topk_weights_w,
             topk_ids_w,
             activation=args.activation,
@@ -2526,23 +2656,13 @@ def bench_e2e() -> None:
         warmup_binding = build_tp_moe_fp4_binding(
             scratch=warmup_workspace,
             a=x_warm,
-            a1_gscale=params.a1_gscale,
-            w1_fp4=weights.w13_weight,
-            w1_blockscale=weights.w13_blockscale_swizzled,
-            w1_alphas=params.g1_alphas,
-            a2_gscale=params.a2_gscale,
-            w2_fp4=weights.w2_weight,
-            w2_blockscale=weights.w2_blockscale_swizzled,
-            w2_alphas=params.g2_alphas,
+            experts=experts,
             topk_weights=topk_weights_w,
             topk_ids=topk_ids_w,
             output=torch.empty_like(x_warm),
             fast_math=args.fast_math,
-            activation=args.activation,
             quant_mode=args.quant_mode,
             unit_scale_contract=unit_scale_contract,
-            source_format=weights.source_format,
-            w13_layout=weights.w13_layout,
             **activation_params.kwargs(),
         )
         b12x_moe_fp4(binding=warmup_binding)
@@ -2550,9 +2670,9 @@ def bench_e2e() -> None:
     print(" done.")
 
     # ---- TP-parallel setup ----
-    tp_parallel_ranks: list[tuple[ModelSpec, ExpertWeights, ScaleContractParams]] = []
+    tp_parallel_ranks: list[tuple[ModelSpec, object]] = []
     if args.tp_parallel and spec.tp_size > 1:
-        print(f"  Loading TP-parallel ranks...", end="", flush=True)
+        print("  Loading TP-parallel ranks...", end="", flush=True)
         for r in range(spec.tp_size):
             rspec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size, tp_rank=r)
             rw = load_expert_weights(
@@ -2560,34 +2680,31 @@ def bench_e2e() -> None:
                 activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
             )
             rp = get_quant_mode_params(rw, args.scale_contract, args.quant_mode)
-            tp_parallel_ranks.append((rspec, rw, rp))
+            rexperts, _ = prepare_b12x_benchmark_weights(
+                rw,
+                rp,
+                quant_mode=args.quant_mode,
+                activation=args.activation,
+            )
+            tp_parallel_ranks.append((rspec, rexperts))
         # Warm up each rank's kernel
-        for r, (rspec, rw, rp) in enumerate(tp_parallel_ranks):
+        for rspec, rexperts in tp_parallel_ranks:
             x_r = torch.randn(1, rspec.hidden_size, dtype=torch.bfloat16, device=device)
             rk_warm = torch.randn(1, rspec.num_experts, dtype=torch.float32, device=device)
             rk_logits, rk_ids = torch.topk(rk_warm, rspec.top_k, dim=-1)
             rk_weights = torch.softmax(rk_logits, dim=-1)
+            rk_ids, rk_weights = normalize_kernel_routing(rk_ids, rk_weights)
             ws_r = allocate_tp_moe_workspace_pool()
             binding_r = build_tp_moe_fp4_binding(
                 scratch=ws_r,
                 a=x_r,
-                a1_gscale=rp.a1_gscale,
-                w1_fp4=rw.w13_weight,
-                w1_blockscale=rw.w13_blockscale_swizzled,
-                w1_alphas=rp.g1_alphas,
-                a2_gscale=rp.a2_gscale,
-                w2_fp4=rw.w2_weight,
-                w2_blockscale=rw.w2_blockscale_swizzled,
-                w2_alphas=rp.g2_alphas,
+                experts=rexperts,
                 topk_weights=rk_weights,
                 topk_ids=rk_ids,
                 output=torch.empty_like(x_r),
                 fast_math=args.fast_math,
-                activation=args.activation,
                 quant_mode=args.quant_mode,
                 unit_scale_contract=unit_scale_contract,
-                source_format=rw.source_format,
-                w13_layout=rw.w13_layout,
                 **activation_params.kwargs(),
             )
             b12x_moe_fp4(binding=binding_r)
@@ -2602,15 +2719,14 @@ def bench_e2e() -> None:
         print(f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)")
         print(f"{'=' * 70}")
 
-        torch.manual_seed(42 + batch_size)
-        x = make_input_activations(spec, batch_size, 42 + batch_size, device)
-        routing_logits = None
-        if model_profile.default_routing == "model":
-            topk_ids, topk_weights = compute_model_gate_routing(weights, x, seed=43 + batch_size)
-        else:
-            routing_logits = torch.randn(batch_size, spec.num_experts, dtype=torch.float32, device=device)
-            topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
-            topk_weights = torch.softmax(topk_logits, dim=-1)
+        x, topk_ids, topk_weights, routing_logits = make_benchmark_case(
+            model_profile,
+            weights,
+            spec,
+            batch_size,
+            42 + batch_size,
+            device,
+        )
 
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
             if model_profile.default_routing == "model":
@@ -2618,7 +2734,7 @@ def bench_e2e() -> None:
             assert routing_logits is not None
             timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
             timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
-            return timed_topk_ids, timed_topk_weights
+            return normalize_kernel_routing(timed_topk_ids, timed_topk_weights)
 
         backend_output = torch.empty_like(x)
         backend_workspace = (
@@ -2628,7 +2744,7 @@ def bench_e2e() -> None:
         )
         backend_w4a16_buffers = (
             make_backend_w4a16_buffers(
-                backend_w4a16_prepared,
+                backend_w4a16_weights,
                 m=batch_size,
                 topk=spec.top_k,
                 dtype=torch.bfloat16,
@@ -2643,23 +2759,13 @@ def bench_e2e() -> None:
             backend_binding = build_tp_moe_fp4_binding(
                 scratch=backend_workspace,
                 a=x,
-                a1_gscale=params.a1_gscale,
-                w1_fp4=weights.w13_weight,
-                w1_blockscale=weights.w13_blockscale_swizzled,
-                w1_alphas=params.g1_alphas,
-                a2_gscale=params.a2_gscale,
-                w2_fp4=weights.w2_weight,
-                w2_blockscale=weights.w2_blockscale_swizzled,
-                w2_alphas=params.g2_alphas,
+                experts=experts,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 fast_math=args.fast_math,
                 output=backend_output,
-                activation=args.activation,
                 quant_mode=args.quant_mode,
                 unit_scale_contract=unit_scale_contract,
-                source_format=weights.source_format,
-                w13_layout=weights.w13_layout,
                 **activation_params.kwargs(),
             )
 
@@ -2668,11 +2774,11 @@ def bench_e2e() -> None:
             def impl_launch(topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor) -> torch.Tensor:
                 if use_w4a16:
                     assert w4a16_moe is not None
-                    assert backend_w4a16_prepared is not None
+                    assert backend_w4a16_weights is not None
                     assert backend_w4a16_buffers is not None
                     return w4a16_moe(
                         x,
-                        backend_w4a16_prepared,
+                        backend_w4a16_weights,
                         topk_weights_local,
                         topk_ids_local,
                         activation=args.activation,
@@ -2746,17 +2852,21 @@ def bench_e2e() -> None:
 
         oracle_ref = None
         if args.validate == "oracle":
-            oracle_ref = make_oracle_reference(
-                args.oracle_mode,
-                args.quant_mode,
-                x,
-                weights,
-                params,
-                topk_ids,
-                topk_weights,
-                activation=args.activation,
-                activation_params=activation_params,
-            )
+            precomputed = precomputed_oracles.pop(batch_size, None)
+            if precomputed is not None:
+                oracle_ref = precomputed.to(device=device)
+            else:
+                oracle_ref = make_oracle_reference(
+                    args.oracle_mode,
+                    args.quant_mode,
+                    x,
+                    weights,
+                    params,
+                    topk_ids,
+                    topk_weights,
+                    activation=args.activation,
+                    activation_params=activation_params,
+                )
             print(
                 "  oracle:".ljust(28),
                 f"norm={oracle_ref.float().norm().item():.5f}",
@@ -2942,11 +3052,11 @@ def bench_e2e() -> None:
             print(f"  {label} (CUDA graph):".ljust(28), end="", flush=True)
             try:
                 # Per-rank inputs, outputs, workspaces
-                tp_x = [torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device) for rs, _, _ in tp_parallel_ranks]
-                tp_routing = [torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device) for rs, _, _ in tp_parallel_ranks]
+                tp_x = [torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device) for rs, _ in tp_parallel_ranks]
+                tp_routing = [torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device) for rs, _ in tp_parallel_ranks]
                 tp_topk_ids: list[torch.Tensor] = []
                 tp_topk_weights: list[torch.Tensor] = []
-                for r_routing, (rspec, _, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
+                for r_routing, (rspec, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
                     r_logits, r_ids = torch.topk(r_routing, rspec.top_k, dim=-1)
                     tp_topk_ids.append(r_ids)
                     tp_topk_weights.append(torch.softmax(r_logits, dim=-1))
@@ -2957,26 +3067,16 @@ def bench_e2e() -> None:
                     build_tp_moe_fp4_binding(
                         scratch=tp_workspaces[r],
                         a=tp_x[r],
-                        a1_gscale=rp.a1_gscale,
-                        w1_fp4=rw.w13_weight,
-                        w1_blockscale=rw.w13_blockscale_swizzled,
-                        w1_alphas=rp.g1_alphas,
-                        a2_gscale=rp.a2_gscale,
-                        w2_fp4=rw.w2_weight,
-                        w2_blockscale=rw.w2_blockscale_swizzled,
-                        w2_alphas=rp.g2_alphas,
+                        experts=rexperts,
                         topk_weights=tp_topk_weights[r],
                         topk_ids=tp_topk_ids[r],
                         output=tp_outputs[r],
                         fast_math=args.fast_math,
-                        activation=args.activation,
                         quant_mode=args.quant_mode,
                         unit_scale_contract=unit_scale_contract,
-                        source_format=rw.source_format,
-                        w13_layout=rw.w13_layout,
                         **activation_params.kwargs(),
                     )
-                    for r, (_rspec, rw, rp) in enumerate(tp_parallel_ranks)
+                    for r, (_rspec, rexperts) in enumerate(tp_parallel_ranks)
                 ]
 
                 def launch_tp_rank(r: int) -> None:

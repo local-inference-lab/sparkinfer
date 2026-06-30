@@ -10,8 +10,10 @@ from b12x.cute.fp4 import (
     swizzle_block_scale,
 )
 from b12x.integration.tp_moe import (
+    plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
 )
+from b12x.moe.execution import PreparedWeightLayout
 from b12x.moe.fused.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
@@ -33,7 +35,7 @@ from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
 )
-from tests.helpers import run_tp_moe_fp4
+from tests.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
@@ -747,8 +749,7 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
         )
         topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
         a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-
-        nvfp4 = run_tp_moe_fp4(
+        nvfp4_experts = prepare_tp_moe_fp4_experts(
             a=x,
             a1_gscale=a_gscale,
             w1_fp4=w13,
@@ -758,12 +759,18 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
             w2_fp4=w2,
             w2_blockscale=w2_blockscale,
             w2_alphas=w2_global_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
             activation=activation,
             quant_mode="nvfp4",
         )
-        w4a16 = run_tp_moe_fp4(
+
+        nvfp4 = run_tp_moe_fp4(
+            a=x,
+            experts=nvfp4_experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_mode="nvfp4",
+        )
+        w4a16_experts = prepare_tp_moe_fp4_experts(
             a=x,
             a1_gscale=a_gscale,
             w1_fp4=w13,
@@ -773,11 +780,15 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
             w2_fp4=w2,
             w2_blockscale=w2_blockscale,
             w2_alphas=w2_global_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
             activation=activation,
             quant_mode="w4a16",
-            source_format="modelopt_nvfp4",
+        )
+        w4a16 = run_tp_moe_fp4(
+            a=x,
+            experts=w4a16_experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_mode="w4a16",
         )
         nvfp4_reference = moe_reference_nvfp4(
             x,
@@ -1457,7 +1468,7 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
     topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
     output = torch.empty_like(x)
-    actual = run_tp_moe_fp4(
+    prepared = prepare_tp_moe_fp4_experts(
         a=x,
         a1_gscale=a1_gscale,
         w1_fp4=w13,
@@ -1467,12 +1478,16 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
         w2_fp4=w2,
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_global_scale,
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    actual = run_tp_moe_fp4(
+        a=x,
+        experts=prepared,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         output=output,
-        activation=activation,
         quant_mode="w4a16",
-        source_format="modelopt_nvfp4",
     )
     expected = _reference_w4a16(
         x,
@@ -1504,20 +1519,29 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         weights
     )
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-    prepared = prepare_b12x_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
         source_format="modelopt_nvfp4",
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+    prepared = prepare_b12x_fp4_moe_weights(
+        plan=weight_plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
         w1_global_scale=w13_global_scale,
+        a1_gscale=a_gscale,
         w2_fp4=w2,
         w2_blockscale=w2_blockscale,
         w2_global_scale=w2_global_scale,
-        activation=activation,
+        a2_gscale=a_gscale,
         params_dtype=torch.bfloat16,
-        prepare_w4a16=True,
-        reuse_input_storage=True,
     )
-    assert prepared.w4a16 is not None
+    assert prepared.representation_for("w4a16") is not None
 
     cases = [
         (1, 1, 1, torch.int32, 0.25),
@@ -1557,21 +1581,11 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
             output = torch.empty_like(x)
             actual = run_tp_moe_fp4(
                 a=x,
-                a1_gscale=a_gscale,
-                w1_fp4=w13,
-                w1_blockscale=w13_blockscale,
-                w1_alphas=w13_global_scale,
-                a2_gscale=a_gscale,
-                w2_fp4=w2,
-                w2_blockscale=w2_blockscale,
-                w2_alphas=w2_global_scale,
+                experts=prepared,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 output=output,
-                activation=activation,
                 quant_mode="w4a16",
-                source_format="modelopt_nvfp4",
-                prepared_w4a16=prepared.w4a16,
             )
             torch.cuda.synchronize()
             assert actual is output
@@ -1864,20 +1878,26 @@ def test_tp_moe_w4a16_dispatch_uses_native_path() -> None:
     topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
     output = torch.empty_like(x)
-    actual = run_tp_moe_fp4(
+    a_gscale = torch.ones((), dtype=torch.float32, device="cuda")
+    prepared = prepare_tp_moe_fp4_experts(
         a=x,
-        a1_gscale=torch.ones((), dtype=torch.float32, device="cuda"),
+        a1_gscale=a_gscale,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
         w1_alphas=w13_global_scale,
-        a2_gscale=torch.ones((), dtype=torch.float32, device="cuda"),
+        a2_gscale=a_gscale,
         w2_fp4=w2,
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_global_scale,
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    actual = run_tp_moe_fp4(
+        a=x,
+        experts=prepared,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         output=output,
-        activation=activation,
         quant_mode="w4a16",
     )
     expected = _reference_w4a16(

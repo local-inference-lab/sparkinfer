@@ -83,6 +83,7 @@ def _run_w4a8_dynamic(
     n: int,
     top_k: int,
     seed: int,
+    tile_m: int = _TILE_M,
     return_launcher: bool = False,
 ):
     device = torch.device("cuda")
@@ -136,8 +137,8 @@ def _run_w4a8_dynamic(
     # ---- workspace ----
     # Worst-case physical tiles: every expert pays one partial tile plus the
     # full tiles its routed rows occupy.
-    phys_tiles = E + (m * top_k + _TILE_M - 1) // _TILE_M
-    rows_padded = phys_tiles * _TILE_M
+    phys_tiles = E + (m * top_k + tile_m - 1) // tile_m
+    rows_padded = phys_tiles * tile_m
     gate_tile_cnt = (w1_n // _TILE_N) // (2 if is_gated else 1)
     max_tasks = phys_tiles * max(gate_tile_cnt, 1)
     mac = 4
@@ -145,11 +146,16 @@ def _run_w4a8_dynamic(
     packed_a = torch.zeros(rows_padded * K, dtype=torch.uint8, device=device)
     # Sized for the (unused) vec16 SF TMA descriptor view: rows * K/8 bytes.
     scale_flat = torch.zeros(rows_padded * (K // 8), dtype=torch.uint8, device=device)
-    z1 = lambda: torch.zeros(1, dtype=torch.int32, device=device)
+    def z1():
+        return torch.zeros(1, dtype=torch.int32, device=device)
+
     barrier_count, barrier_epoch = z1(), z1()
     pair_head, producers_done, all_pub = z1(), z1(), z1()
     task_head, task_tail = z1(), z1()
-    zt = lambda: torch.zeros(max_tasks, dtype=torch.int32, device=device)
+
+    def zt():
+        return torch.zeros(max_tasks, dtype=torch.int32, device=device)
+
     task_ready, task_expert, task_m_tile = zt(), zt(), zt()
     task_slice_begin, task_slice_count, task_valid_rows = zt(), zt(), zt()
     tile_write_count = torch.zeros(phys_tiles, dtype=torch.int32, device=device)
@@ -164,7 +170,7 @@ def _run_w4a8_dynamic(
 
     kernel = MoEDynamicKernelBackend(
         16,
-        (_TILE_M, _TILE_N),
+        (tile_m, _TILE_N),
         activation=activation,
         quant_recipe=recipe,
     )
@@ -177,8 +183,13 @@ def _run_w4a8_dynamic(
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype, (K, n, E), stride_order=(1, 0, 2), assumed_align=16
     )
-    fake_ptr_u8 = lambda: make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
-    fake_ptr_i32 = lambda: make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    def fake_ptr_u8():
+        return make_ptr(
+            cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+
+    def fake_ptr_i32():
+        return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
 
     compiled = b12x_compile(
         launch,
@@ -203,7 +214,7 @@ def _run_w4a8_dynamic(
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1,
         current_cuda_stream(),
         dsl_compile_options=_OPT_LEVEL_2,
     )
@@ -240,6 +251,7 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Float32, token_weights, 4),
         m,
         m * top_k,
+        m,
         rows_padded,
         max_tasks,
         phys_tiles,
@@ -279,7 +291,7 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.BFloat16, scatter_output),
                 _gptr(cutlass.Int32, token_map, 4),
                 _gptr(cutlass.Float32, token_weights, 4),
-                m, m * top_k, rows_padded, max_tasks, phys_tiles, mac,
+                m, m * top_k, m, rows_padded, max_tasks, phys_tiles, mac,
                 current_cuda_stream(),
             )
         return scatter_output, reference, _relaunch
@@ -303,6 +315,37 @@ def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("activation", ["silu", "relu2"])
+def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
+    activation: str,
+) -> None:
+    """Exercise the production M16/four-MMA/two-DMA regime directly."""
+    require_sm120()
+    kernel = MoEDynamicKernelBackend(
+        16,
+        (16, _TILE_N),
+        activation=activation,
+        quant_recipe="w4a8_mx",
+    )
+    assert kernel.atom_shape == (1, 4, 1)
+    assert kernel.num_mma_warps == 4
+    assert kernel.num_dma_warps == 2
+    out, ref = _run_w4a8_dynamic(
+        recipe="w4a8_mx",
+        activation=activation,
+        E=4,
+        m=17,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=29,
+        tile_m=16,
+    )
+    metrics = compare_to_reference(out.float(), ref)
+    assert metrics.cos > 0.999, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_boundary_m_sizes() -> None:
     require_sm120()
     for m in (1, 3, 127, 129):
@@ -322,7 +365,6 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     device = torch.device("cuda")
     torch.manual_seed(7)
     E, m, K, n, top_k = 4, 8, 256, 128, 2
-    is_gated = True
     w1_n = 2 * n
 
     x = (torch.randn(m, K, device=device) * 2.0).to(torch.bfloat16)
@@ -350,11 +392,16 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     max_tasks = phys_tiles
     packed_a = torch.zeros(rows_padded * K, dtype=torch.uint8, device=device)
     scale_flat = torch.zeros(rows_padded * (K // 8), dtype=torch.uint8, device=device)
-    z1 = lambda: torch.zeros(1, dtype=torch.int32, device=device)
+    def z1():
+        return torch.zeros(1, dtype=torch.int32, device=device)
+
     barrier_count, barrier_epoch = z1(), z1()
     pair_head, producers_done, all_pub = z1(), z1(), z1()
     task_head, task_tail = z1(), z1()
-    zt = lambda: torch.zeros(max_tasks, dtype=torch.int32, device=device)
+
+    def zt():
+        return torch.zeros(max_tasks, dtype=torch.int32, device=device)
+
     task_ready, task_expert, task_m_tile = zt(), zt(), zt()
     task_slice_begin, task_slice_count, task_valid_rows = zt(), zt(), zt()
     tile_write_count = torch.zeros(phys_tiles, dtype=torch.int32, device=device)
@@ -376,8 +423,14 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype, (K, n, E), stride_order=(1, 0, 2), assumed_align=16
     )
-    fake_ptr_u8 = lambda: make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
-    fake_ptr_i32 = lambda: make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    def fake_ptr_u8():
+        return make_ptr(
+            cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+
+    def fake_ptr_i32():
+        return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+
     compiled = b12x_compile(
         launch,
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -400,7 +453,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1,
         current_cuda_stream(),
         dsl_compile_options=_OPT_LEVEL_2,
     )
@@ -436,7 +489,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.BFloat16, scatter_output),
             _gptr(cutlass.Int32, token_map, 4),
             _gptr(cutlass.Float32, token_weights, 4),
-            m, m * top_k, rows_padded, max_tasks, phys_tiles, 4,
+            m, m * top_k, m, rows_padded, max_tasks, phys_tiles, 4,
             current_cuda_stream(),
         )
 
@@ -455,9 +508,8 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph):
-            _launch()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph):
+        _launch()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 

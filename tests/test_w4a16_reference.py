@@ -483,7 +483,7 @@ def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
     )
 
     plan = tp_moe._plan_core_workspace(
-        "static",
+        "micro",
         "nvfp4",
         state_E=128,
         weight_E=128,
