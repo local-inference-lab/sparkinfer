@@ -31,6 +31,10 @@ This is intentionally conservative:
 
 It spans the full M-tile set {16,32,64,128} x 128, so a single dynamic kernel
 covers the decode and prefill bands.
+
+Native W4A8 M=1 is a compile-time regime within that family: the resident grid
+quantizes one input row, derives FC1 and FC2 work arithmetically, and skips the
+route histogram and task queue while consuming the same prepared weights.
 """
 
 from __future__ import annotations
@@ -643,6 +647,7 @@ class MoEDynamicKernelBackend:
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        direct_routing: bool = False,
         materialize_intermediate: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
@@ -691,18 +696,44 @@ class MoEDynamicKernelBackend:
         self.is_w4a8 = quant_recipe != "nvfp4"
         self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
         self.w4a8_repacked = bool(w4a8_repacked)
+        self.direct_routing = bool(direct_routing)
         self.materialize_intermediate = bool(materialize_intermediate)
+        self.w4a8_m1_materialized = bool(
+            self.w4a8_repacked
+            and self.direct_routing
+            and self.materialize_intermediate
+            and mma_tiler_mn == (16, 128)
+        )
         if self.w4a8_repacked and quant_recipe != "w4a8_mx":
             raise ValueError("repacked W4A8 weights are only valid for w4a8_mx")
         if self.materialize_intermediate and not (
             self.w4a8_repacked
             and quant_recipe == "w4a8_mx"
-            and mma_tiler_mn == (32, 128)
+            and mma_tiler_mn in {(16, 128), (32, 128)}
             and work_source != _WORK_SOURCE_READY_QUEUE
         ):
             raise ValueError(
                 "materialized-intermediate execution currently requires the "
-                "repacked W4A8 MX M32 non-streaming specialization"
+                "repacked W4A8 MX M16/M32 non-streaming specialization"
+            )
+        if self.direct_routing and not (
+            (
+                quant_recipe == "nvfp4"
+                or (self.w4a8_repacked and quant_recipe == "w4a8_mx")
+            )
+            and work_source != _WORK_SOURCE_READY_QUEUE
+            and (
+                not self.materialize_intermediate
+                or (
+                    self.w4a8_repacked
+                    and quant_recipe == "w4a8_mx"
+                    and mma_tiler_mn == (16, 128)
+                )
+            )
+        ):
+            raise ValueError(
+                "direct routing requires non-streaming NVFP4 or repacked "
+                "W4A8 MX (materialized execution is M16-only)"
             )
         if self.is_w4a8 and swap_ab:
             raise ValueError("w4a8 recipes do not support swap_ab yet")
@@ -1190,7 +1221,7 @@ class MoEDynamicKernelBackend:
         rows_capacity: Int32,
         intermediate_tiles: Int32,
     ):
-        """Persist one M32 x K128 MXFP8 activation tile.
+        """Persist one M-tile x K128 MXFP8 activation tile.
 
         Payload rows remain plain E4M3 bytes.  The four UE8M0 bytes for a
         K128 slice are stored as one u32.  Keeping the scale word intact is
@@ -1343,7 +1374,7 @@ class MoEDynamicKernelBackend:
         intermediate_tiles: Int32,
         output_tiles: Int32,
     ):
-        """Full-K M32xN256 phase-B task with direct weighted scatter."""
+        """Full-K MxN256 phase-B task with direct weighted scatter."""
 
         lane = tid & Int32(31)
         stage_a_bytes = Int32(self.tile_shape_mnk[0] * (128 + 4))
@@ -1374,10 +1405,11 @@ class MoEDynamicKernelBackend:
         cute.arch.cp_async_commit_group()
 
         if warp_idx < Int32(self.num_mma_warps):
-            # Two M16 blocks x eight N8 fragments per warp.  This flat rmem
+            # M/16 blocks x eight N8 fragments per warp.  This flat rmem
             # shape is deliberately the register-friendly representation used
             # throughout the dense W4A8 specialization.
-            facc = cute.make_rmem_tensor((2, 8, 4), cutlass.Float32)
+            m_blocks = self.tile_shape_mnk[0] // 16
+            facc = cute.make_rmem_tensor((m_blocks, 8, 4), cutlass.Float32)
             facc.fill(0.0)
             q = lane >> Int32(2)
             c = lane & Int32(3)
@@ -1417,8 +1449,8 @@ class MoEDynamicKernelBackend:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.sync_threads()
 
-                asc = cute.make_rmem_tensor((2,), Uint32)
-                for blk in cutlass.range_constexpr(2):
+                asc = cute.make_rmem_tensor((m_blocks,), Uint32)
+                for blk in cutlass.range_constexpr(m_blocks):
                     sf_row = Int32(blk * 16) + q + (
                         (lane & Int32(1)) << Int32(3)
                     )
@@ -1428,8 +1460,8 @@ class MoEDynamicKernelBackend:
 
                 for kb in cutlass.range_constexpr(4):
                     u_phys = (Int32(kb * 2) + (c >> Int32(1))) ^ q
-                    a_frag = cute.make_rmem_tensor((2, 4), Uint32)
-                    for blk in cutlass.range_constexpr(2):
+                    a_frag = cute.make_rmem_tensor((m_blocks, 4), Uint32)
+                    for blk in cutlass.range_constexpr(m_blocks):
                         a_lo = (
                             sa_base
                             + Int32(blk * 16 * 128)
@@ -1468,7 +1500,7 @@ class MoEDynamicKernelBackend:
                             sfb_word = ld_shared_u32(
                                 sfb_base + ((n8 * Int32(8) + q) << Int32(2))
                             )
-                            for blk in cutlass.range_constexpr(2):
+                            for blk in cutlass.range_constexpr(m_blocks):
                                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                     facc[blk, nt, 0],
                                     facc[blk, nt, 1],
@@ -1508,7 +1540,7 @@ class MoEDynamicKernelBackend:
             )
             for nt in cutlass.range_constexpr(8):
                 col = col_base + Int32(nt * 8)
-                for blk in cutlass.range_constexpr(2):
+                for blk in cutlass.range_constexpr(m_blocks):
                     row_lo = Int32(blk * 16) + q
                     row_hi = row_lo + Int32(8)
                     if row_lo < valid_rows:
@@ -1573,7 +1605,6 @@ class MoEDynamicKernelBackend:
                 cute.arch.sync_threads()
                 intermediate_slice += Int32(1)
 
-    @cute.jit
     def _publish_ready_tasks(
         self,
         task_tail: cute.Tensor,
@@ -2187,13 +2218,14 @@ class MoEDynamicKernelBackend:
         # Phase 0: cooperative init — zero routing state, queue state, and output.
         task_capacity = Int32(task_ready.shape[0])
         tile_write_slots = Int32(tile_write_count.shape[0])
-        i = flat_tid
-        while i < num_experts:
-            row_counts[i] = Int32(0)
-            expert_write_rows[i] = Int32(0)
-            i += flat_stride
-        if flat_tid < num_experts + Int32(1):
-            expert_tile_base[flat_tid] = Int32(0)
+        if cutlass.const_expr(not self.direct_routing):
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                expert_write_rows[i] = Int32(0)
+                i += flat_stride
+            if flat_tid < num_experts + Int32(1):
+                expert_tile_base[flat_tid] = Int32(0)
 
         scatter_rows = Int32(scatter_output.shape[0])
         scatter_total_u32 = scatter_rows * cols_u32
@@ -2232,37 +2264,80 @@ class MoEDynamicKernelBackend:
             task_head[Int32(0)] = Int32(0)
             task_tail[Int32(0)] = Int32(0)
 
+        if cutlass.const_expr(self.w4a8_m1_materialized):
+            # Fixed M=1 preparation is itself a grid-sized arithmetic domain:
+            # one thread per K32 quantization block, plus one thread per route.
+            # Fold it into phase 0 so the existing resident barrier publishes
+            # both the cleared output and the prepared input in one step.
+            m1_blk_idx = flat_tid
+            while m1_blk_idx < mx_blocks_per_row:
+                m1_block_start = m1_blk_idx * Int32(32)
+                m1_values, m1_block_max = _load_bf16x32_to_f32(
+                    a_input, m1_block_start,
+                )
+                m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                    m1_values, m1_block_max,
+                )
+                for m1_payload_pair in cutlass.range_constexpr(4):
+                    m1_packed64 = (
+                        Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
+                    ) | Uint64(m1_payload[m1_payload_pair * 2])
+                    st_global_u64(
+                        get_ptr_as_int64(
+                            packed_a_storage,
+                            m1_block_start + Int32(m1_payload_pair * 8),
+                        ),
+                        m1_packed64,
+                    )
+                scale_storage[m1_blk_idx] = Uint8(
+                    m1_mx_scale_byte & Uint32(0xFF)
+                )
+                m1_blk_idx += flat_stride
+
+            if flat_tid < total_pairs:
+                m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
+                token_map[m1_physical_row] = Int32(0)
+                token_weights[m1_physical_row] = topk_weights[flat_tid].to(
+                    cutlass.Float32
+                )
+
         cute.arch.sync_threads()
         self._resident_grid_barrier(
             barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
         )
 
-        # Phase 1: histogram routed rows per expert.
-        hist_idx = flat_tid
-        while hist_idx < total_pairs:
-            expert_id = topk_ids[hist_idx].to(Int32)
-            atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
-            hist_idx += flat_stride
+        # General grouped execution compacts routes by expert.  Tiny direct-
+        # routing decode instead gives every routed pair its own physical M tile:
+        # this removes the histogram, serial expert prefix, and two resident-
+        # grid barriers while retaining the exact same compute/task body.
+        if cutlass.const_expr(not self.direct_routing):
+            hist_idx = flat_tid
+            while hist_idx < total_pairs:
+                expert_id = topk_ids[hist_idx].to(Int32)
+                atomic_add_global_i32(
+                    get_ptr_as_int64(row_counts, expert_id), Int32(1)
+                )
+                hist_idx += flat_stride
 
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
+            self._resident_grid_barrier(
+                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+            )
 
-        if flat_tid == Int32(0):
-            tile_acc = Int32(0)
-            expert_idx = Int32(0)
-            while expert_idx < num_experts:
-                expert_tile_base[expert_idx] = tile_acc
-                rows = row_counts[expert_idx]
-                tile_acc += (
-                    rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
-                ) // Int32(self.tile_shape_mnk[0])
-                expert_idx += Int32(1)
-            expert_tile_base[num_experts] = tile_acc
+            if flat_tid == Int32(0):
+                tile_acc = Int32(0)
+                expert_idx = Int32(0)
+                while expert_idx < num_experts:
+                    expert_tile_base[expert_idx] = tile_acc
+                    rows = row_counts[expert_idx]
+                    tile_acc += (
+                        rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                    ) // Int32(self.tile_shape_mnk[0])
+                    expert_idx += Int32(1)
+                expert_tile_base[num_experts] = tile_acc
 
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
+            self._resident_grid_barrier(
+                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+            )
 
         # Phase 2: warp-private route/pack producers into compact physical tiles.
         lane_id = Int32(tidx) & Int32(31)
@@ -2284,7 +2359,9 @@ class MoEDynamicKernelBackend:
         shared_route_phys_rows = cute.make_rmem_tensor((8,), Int32)
         route_output_base = cute.make_rmem_tensor((8,), Int32)
         route_scale_base = cute.make_rmem_tensor((8,), Int32)
-        produce_active = Int32(1)
+        produce_active = Int32(0) if cutlass.const_expr(
+            self.w4a8_m1_materialized
+        ) else Int32(1)
         while produce_active > Int32(0):
             batch_base = Int32(0)
             if is_cta_leader > Int32(0):
@@ -2333,12 +2410,24 @@ class MoEDynamicKernelBackend:
                                 pair_idx = token_idx * num_topk + topk_slot
                                 expert_id = topk_ids[pair_idx].to(Int32)
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
-                                row = atomic_add_global_i32(
-                                    get_ptr_as_int64(expert_write_rows, expert_id),
-                                    Int32(1),
+                                if cutlass.const_expr(self.direct_routing):
+                                    row = Int32(0)
+                                    phys_tile = pair_idx
+                                else:
+                                    row = atomic_add_global_i32(
+                                        get_ptr_as_int64(
+                                            expert_write_rows, expert_id
+                                        ),
+                                        Int32(1),
+                                    )
+                                    phys_tile = (
+                                        expert_tile_base[expert_id]
+                                        + row // Int32(self.tile_shape_mnk[0])
+                                    )
+                                phys_row = (
+                                    phys_tile * Int32(self.tile_shape_mnk[0])
+                                    + row % Int32(self.tile_shape_mnk[0])
                                 )
-                                phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
-                                phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
                                 map_value = token_idx
                                 if cutlass.const_expr(self.deterministic_output):
                                     map_value = pair_idx
@@ -2456,6 +2545,12 @@ class MoEDynamicKernelBackend:
                                                 packed64,
                                             )
                                         else:
+                                            # CuTe loop-carried values must have
+                                            # a concrete type before entering a
+                                            # dynamic while.  Keep the address
+                                            # offset in rmem and update it for
+                                            # each routed copy below.
+                                            output_offset = Int32(0)
                                             topk_slot = Int32(0)
                                             while topk_slot < num_topk:
                                                 slot = route_slot_base + topk_slot
@@ -2634,11 +2729,20 @@ class MoEDynamicKernelBackend:
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
 
                             if lane_id == Int32(0):
-                                row = atomic_add_global_i32(
-                                    get_ptr_as_int64(expert_write_rows, expert_id),
-                                    Int32(1),
-                                )
-                                phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
+                                if cutlass.const_expr(self.direct_routing):
+                                    row = Int32(0)
+                                    phys_tile = pair_idx
+                                else:
+                                    row = atomic_add_global_i32(
+                                        get_ptr_as_int64(
+                                            expert_write_rows, expert_id
+                                        ),
+                                        Int32(1),
+                                    )
+                                    phys_tile = (
+                                        expert_tile_base[expert_id]
+                                        + row // Int32(self.tile_shape_mnk[0])
+                                    )
                                 phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
                                 map_value = token_idx
                                 if cutlass.const_expr(self.deterministic_output):
@@ -2753,52 +2857,77 @@ class MoEDynamicKernelBackend:
                                         )
                         warp_item += Int32(1)
 
-        cute.arch.sync_threads()
-        # Conservative publish fence before the last-producer CTA flushes any
-        # partial tiles. All producer threads in the CTA must have ordered
-        # their global writes before lane 0 can publish work.
-        _threadfence()
-        cute.arch.sync_threads()
+        if cutlass.const_expr(not self.w4a8_m1_materialized):
+            cute.arch.sync_threads()
+            # Conservative publish fence before the last-producer CTA flushes
+            # any partial tiles. All producer threads in the CTA must order
+            # their global writes before lane 0 can publish work.
+            _threadfence()
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.work_is_streaming):
             # The active materialized sources rendezvous once, publish every
             # physical tile, then consume a fully addressable work domain.
-            self._resident_grid_barrier(
-                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-            )
+            if cutlass.const_expr(not self.w4a8_m1_materialized):
+                self._resident_grid_barrier(
+                    barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+                )
 
-            if is_cta_leader > Int32(0):
-                expert_flush = Int32(bidz)
-                while expert_flush < num_experts:
-                    rows_remaining = row_counts[expert_flush]
-                    m_tile_offset = Int32(0)
-                    while rows_remaining > Int32(0):
-                        valid_rows = rows_remaining
-                        if valid_rows > Int32(self.tile_shape_mnk[0]):
-                            valid_rows = Int32(self.tile_shape_mnk[0])
+            if (
+                is_cta_leader > Int32(0)
+                and cutlass.const_expr(not self.w4a8_m1_materialized)
+            ):
+                if cutlass.const_expr(self.direct_routing):
+                    pair_flush = Int32(bidz)
+                    while pair_flush < total_pairs:
+                        expert_flush = topk_ids[pair_flush].to(Int32)
                         self._publish_deferred_tasks(
                             task_expert, task_valid_rows,
                             route_gate_tile_cnt, task_slice_chunk,
-                            expert_flush, expert_tile_base[expert_flush] + m_tile_offset, valid_rows,
+                            expert_flush, pair_flush, Int32(1),
                         )
-                        rows_remaining -= Int32(self.tile_shape_mnk[0])
-                        m_tile_offset += Int32(1)
-                    expert_flush += Int32(gdim_z)
+                        pair_flush += Int32(gdim_z)
+                else:
+                    expert_flush = Int32(bidz)
+                    while expert_flush < num_experts:
+                        rows_remaining = row_counts[expert_flush]
+                        m_tile_offset = Int32(0)
+                        while rows_remaining > Int32(0):
+                            valid_rows = rows_remaining
+                            if valid_rows > Int32(self.tile_shape_mnk[0]):
+                                valid_rows = Int32(self.tile_shape_mnk[0])
+                            self._publish_deferred_tasks(
+                                task_expert, task_valid_rows,
+                                route_gate_tile_cnt, task_slice_chunk,
+                                expert_flush,
+                                expert_tile_base[expert_flush] + m_tile_offset,
+                                valid_rows,
+                            )
+                            rows_remaining -= Int32(self.tile_shape_mnk[0])
+                            m_tile_offset += Int32(1)
+                        expert_flush += Int32(gdim_z)
 
-            if flat_tid == Int32(0):
+            if (
+                flat_tid == Int32(0)
+                and cutlass.const_expr(not self.w4a8_m1_materialized)
+            ):
+                materialized_tail = expert_tile_base[num_experts]
+                if cutlass.const_expr(self.direct_routing):
+                    materialized_tail = total_pairs
                 st_global_i32(
                     get_ptr_as_int64(task_tail, Int32(0)),
-                    expert_tile_base[num_experts] * materialized_num_groups,
+                    materialized_tail * materialized_num_groups,
                 )
 
-            self._resident_grid_barrier(
-                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-            )
-            if flat_tid == Int32(0):
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
+            if cutlass.const_expr(not self.w4a8_m1_materialized):
+                self._resident_grid_barrier(
+                    barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
                 )
+                if flat_tid == Int32(0):
+                    _st_global_release_i32(
+                        get_ptr_as_int64(all_work_published, Int32(0)),
+                        Int32(1),
+                    )
         elif is_cta_leader > Int32(0):
             prev_done = atomic_add_global_i32(
                 get_ptr_as_int64(producers_done_count, Int32(0)),
@@ -2947,7 +3076,7 @@ class MoEDynamicKernelBackend:
         phase1_output_tile_cnt = output_tile_cnt
         if cutlass.const_expr(self.materialize_intermediate):
             # Phase A stops after activation quantization.  Phase B below owns
-            # the full-K FC2 contraction with a finer (M32, N256) work domain.
+            # the full-K FC2 contraction with a finer (M, N256) work domain.
             phase1_output_tile_cnt = Int32(0)
         rows_capacity = Int32(packed_a_storage.shape[0]) // cols
 
@@ -3189,13 +3318,35 @@ class MoEDynamicKernelBackend:
         work_item = cute.make_rmem_tensor((_WORK_ITEM_FIELDS,), Int32)
         materialized_slot = Int32(bidz)
         materialized_tail = Int32(0)
-        if cutlass.const_expr(self.work_is_persistent_grid):
+        if cutlass.const_expr(self.w4a8_m1_materialized):
+            materialized_tail = total_pairs * route_gate_tile_cnt
+        elif cutlass.const_expr(self.work_is_persistent_grid):
             materialized_tail = _ld_global_acquire_i32(
                 get_ptr_as_int64(task_tail, Int32(0))
             )
         consumer_live = Int32(1)
         while consumer_live > Int32(0):
-            if cutlass.const_expr(self.work_is_persistent_grid):
+            if cutlass.const_expr(self.w4a8_m1_materialized):
+                # Fixed M=1 domain: one item per (route, intermediate K128
+                # slice).  The slot itself is all the scheduling metadata.
+                cute.arch.sync_threads()
+                has_task = Int32(0)
+                is_done = Int32(0)
+                if materialized_slot < materialized_tail:
+                    route_idx = materialized_slot // route_gate_tile_cnt
+                    route_slice = (
+                        materialized_slot - route_idx * route_gate_tile_cnt
+                    )
+                    work_item[_WORK_EXPERT] = topk_ids[route_idx].to(Int32)
+                    work_item[_WORK_M_TILE] = route_idx
+                    work_item[_WORK_SLICE_BEGIN] = route_slice
+                    work_item[_WORK_SLICE_COUNT] = Int32(1)
+                    work_item[_WORK_VALID_ROWS] = Int32(1)
+                    has_task = Int32(1)
+                else:
+                    is_done = Int32(1)
+                materialized_slot += Int32(gdim_z)
+            elif cutlass.const_expr(self.work_is_persistent_grid):
                 # A real grid scheduler needs no queue-control emulation: all
                 # threads in a CTA share the arithmetic slot, decode it into
                 # registers, and use the rendezvous only to finish the prior
@@ -3320,7 +3471,10 @@ class MoEDynamicKernelBackend:
                 )
                 _ld_global_acquire_i32(get_ptr_as_int64(task_ready, claimed_slot))
             if has_task > Int32(0):
-                if cutlass.const_expr(not self.work_is_persistent_grid):
+                if cutlass.const_expr(
+                    not self.work_is_persistent_grid
+                    and not self.w4a8_m1_materialized
+                ):
                     self._load_shared_work_item(work_item, ctrl_base_addr)
                 task_m_tile_idx_cache = work_item[_WORK_M_TILE]
                 task_valid_rows_cache = work_item[_WORK_VALID_ROWS]
@@ -5776,49 +5930,86 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(self.materialize_intermediate):
             # Every phase-A task has now published its MXFP8 activation tile.
             # Phase B is a dense, uniform domain: one full-K task per physical
-            # M32 tile and N256 output tile.  A deterministic grid-stride walk
+            # M tile and N256 output tile.  A deterministic grid-stride walk
             # gives each resident CTA balanced work without returning to the
             # atomic queue used for irregular/streaming phase-A tasks.
             self._resident_grid_barrier(
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
-            phase2_output_tiles = output_tile_cnt // Int32(2)
-            phase2_m_tiles = expert_tile_base[num_experts]
-            phase2_tail = phase2_m_tiles * phase2_output_tiles
-            phase2_slot = Int32(bidz)
-            while phase2_slot < phase2_tail:
-                phase2_m_tile = phase2_slot // phase2_output_tiles
-                phase2_output_tile = (
-                    phase2_slot - phase2_m_tile * phase2_output_tiles
-                )
-                phase1_meta = phase2_m_tile * materialized_num_groups
-                phase2_expert = task_expert[phase1_meta].to(Int32)
-                phase2_valid_rows = task_valid_rows[phase1_meta].to(Int32)
-                self._run_w4a8_materialized_fc2(
-                    intermediate_u32,
-                    down_rp,
-                    down_sfb_rp,
-                    scatter_output,
-                    token_map,
-                    token_weights,
-                    down_alpha,
-                    global_scale,
-                    sa_flat_addr,
-                    w4a8_sb0,
-                    w4a8_sb1,
-                    w4a8_sfbb,
-                    Int32(tidx),
-                    warp_idx,
-                    phase2_m_tile,
-                    phase2_expert,
-                    phase2_output_tile,
-                    phase2_valid_rows,
-                    rows_capacity,
-                    gate_tile_cnt,
-                    phase2_output_tiles,
-                )
-                cute.arch.sync_threads()
-                phase2_slot += Int32(gdim_z)
+            phase2_packed_output_tiles = output_tile_cnt // Int32(2)
+            if cutlass.const_expr(self.w4a8_m1_materialized):
+                phase2_tail = total_pairs * phase2_packed_output_tiles
+                phase2_slot = Int32(bidz)
+                while phase2_slot < phase2_tail:
+                    phase2_m_tile = phase2_slot // phase2_packed_output_tiles
+                    phase2_output_tile = (
+                        phase2_slot
+                        - phase2_m_tile * phase2_packed_output_tiles
+                    )
+                    phase2_expert = topk_ids[phase2_m_tile].to(Int32)
+                    self._run_w4a8_materialized_fc2(
+                        intermediate_u32,
+                        down_rp,
+                        down_sfb_rp,
+                        scatter_output,
+                        token_map,
+                        token_weights,
+                        down_alpha,
+                        global_scale,
+                        sa_flat_addr,
+                        w4a8_sb0,
+                        w4a8_sb1,
+                        w4a8_sfbb,
+                        Int32(tidx),
+                        warp_idx,
+                        phase2_m_tile,
+                        phase2_expert,
+                        phase2_output_tile,
+                        Int32(1),
+                        rows_capacity,
+                        gate_tile_cnt,
+                        phase2_packed_output_tiles,
+                    )
+                    cute.arch.sync_threads()
+                    phase2_slot += Int32(gdim_z)
+            else:
+                phase2_m_tiles = expert_tile_base[num_experts]
+                phase2_tail = phase2_m_tiles * phase2_packed_output_tiles
+                phase2_slot = Int32(bidz)
+                while phase2_slot < phase2_tail:
+                    phase2_m_tile = phase2_slot // phase2_packed_output_tiles
+                    phase2_output_tile = (
+                        phase2_slot
+                        - phase2_m_tile * phase2_packed_output_tiles
+                    )
+                    phase1_meta = phase2_m_tile * materialized_num_groups
+                    phase2_expert = task_expert[phase1_meta].to(Int32)
+                    phase2_valid_rows = task_valid_rows[phase1_meta].to(Int32)
+                    self._run_w4a8_materialized_fc2(
+                        intermediate_u32,
+                        down_rp,
+                        down_sfb_rp,
+                        scatter_output,
+                        token_map,
+                        token_weights,
+                        down_alpha,
+                        global_scale,
+                        sa_flat_addr,
+                        w4a8_sb0,
+                        w4a8_sb1,
+                        w4a8_sfbb,
+                        Int32(tidx),
+                        warp_idx,
+                        phase2_m_tile,
+                        phase2_expert,
+                        phase2_output_tile,
+                        phase2_valid_rows,
+                        rows_capacity,
+                        gate_tile_cnt,
+                        phase2_packed_output_tiles,
+                    )
+                    cute.arch.sync_threads()
+                    phase2_slot += Int32(gdim_z)
         return
 
 

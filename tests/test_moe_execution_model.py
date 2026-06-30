@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x.integration import tp_moe as tp_moe_impl
 from b12x.integration import plan_b12x_fp4_moe_weights, plan_tp_moe_execution
 from b12x.moe.execution import (
     GemmEngine,
@@ -228,6 +229,46 @@ def test_workspace_plan_uses_weight_plan_source_contract() -> None:
 
     assert plan.spec.source_format == "fp4_e8m0_k32"
     assert plan.spec.source_weight_scale is ScaleEncoding.E8M0_K32
+
+
+def test_native_w4a8_m1_alone_selects_fixed_materialized_regime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M=1 specializes unified dynamic; neighboring decode sizes do not."""
+
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "materialized_queue")
+    monkeypatch.setenv("B12X_DYNAMIC_W4A8_MATERIALIZED", "1")
+    common = dict(
+        quant_mode="w4a8_mx",
+        activation="silu",
+        num_experts=256,
+        k=6144,
+        n=1024,
+        w4a8_repacked=True,
+        share_input_across_experts=True,
+        deterministic_output=False,
+    )
+
+    assert tp_moe_impl._w4a8_dynamic_materialized_enabled(
+        num_tokens=1,
+        routed_rows=8,
+        **common,
+    )
+    assert not tp_moe_impl._w4a8_dynamic_materialized_enabled(
+        num_tokens=2,
+        routed_rows=16,
+        **common,
+    )
+    assert not tp_moe_impl._w4a8_dynamic_materialized_enabled(
+        num_tokens=1,
+        routed_rows=8,
+        **(common | {"w4a8_repacked": False}),
+    )
+    assert not tp_moe_impl._w4a8_dynamic_materialized_enabled(
+        num_tokens=1,
+        routed_rows=40,
+        **common,
+    )
 
 
 def test_source_native_w4a16_and_nvfp4_share_one_allocation() -> None:

@@ -43,7 +43,7 @@ The current kernel families map onto those axes as follows:
 | Family | Route layout | Availability | Scheduler | Weight memory |
 |---|---|---|---|---|
 | direct micro W4A4 / W4A8-on-NVFP4 | direct top-k | inline | direct | source-native |
-| unified dynamic W4A4/W4A8 | append-only expert rows | precomputed, or experimental streaming | atomic queue, persistent grid, or ready queue | MMA views; native W4A8 uses N256/K128 QMMA repack |
+| unified dynamic W4A4/W4A8 | append-only expert rows; direct top-k at tiny M | precomputed, or experimental streaming | atomic queue, persistent grid, fixed arithmetic domain, or ready queue | MMA views; native W4A8 uses N256/K128 QMMA repack |
 | W4A16 tensor-core | sorted/padded; direct at small M | precomputed; inline at small M | persistent grid | MMA-packed |
 
 ## Why queue versus grid exists
@@ -115,6 +115,14 @@ Its dense specialization combines:
 - a materialized E4M3 intermediate with transposed scale planes;
 - flattened grid-stride full-K FC2 work;
 - register-resident work metadata and compile-time-specialized control flow.
+
+At M=1, the same prepared-layout kernel traces a smaller fixed-domain regime:
+it quantizes the single input once across the resident grid, derives FC1 work
+directly from `(route, K128 slice)`, materializes the MXFP8 intermediate, and
+assigns FC2 work by `(route, N256 tile)`.  It has no route histogram or task
+queue and retains the same N256/K128 prepared weights and public API.  On the
+DSV4F TP2 shape this reduced cold-L2 CUDA-graph time from 95.7 to 88.1 us while
+preserving a 0.999936 cosine match to the reference.
 
 The standalone staged pipeline was removed after the unified kernel won every
 tested common DSV4 point on GPU 9 with `benchmark_moe.py`, CUDA graph replay,

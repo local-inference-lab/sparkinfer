@@ -64,6 +64,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
     ):
@@ -78,6 +79,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
+            direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
         )

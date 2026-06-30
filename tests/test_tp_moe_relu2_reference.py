@@ -156,10 +156,11 @@ def _run_activation_case(
     return output, reference
 
 
-def _run_single_token_multi_expert_micro_case(
+def _run_single_token_multi_expert_case(
     *,
     activation: str,
     topk_ids_dtype: torch.dtype,
+    micro_dynamic_cutover: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = require_sm120()
     torch.manual_seed(7)
@@ -213,7 +214,7 @@ def _run_single_token_multi_expert_micro_case(
     previous_cutover = dict(tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE)
     try:
         clear_tp_moe_caches()
-        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE["nvfp4"] = 128
+        tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE["nvfp4"] = micro_dynamic_cutover
 
         output = run_tp_moe_fp4(
             a=x,
@@ -277,16 +278,41 @@ def test_relu2_matches_reference_across_backends(
 def test_single_token_multi_expert_micro_matches_int32_with_int64_topk_ids(
     activation: str,
 ) -> None:
-    output_i64, reference = _run_single_token_multi_expert_micro_case(
+    output_i64, reference = _run_single_token_multi_expert_case(
         activation=activation,
         topk_ids_dtype=torch.int64,
+        micro_dynamic_cutover=128,
     )
-    output_i32, _ = _run_single_token_multi_expert_micro_case(
+    output_i32, _ = _run_single_token_multi_expert_case(
         activation=activation,
         topk_ids_dtype=torch.int32,
+        micro_dynamic_cutover=128,
     )
     pair_metrics = compare_to_reference(output_i64, output_i32)
     assert pair_metrics.cos > 0.9999, f"{activation} int64 vs int32: {pair_metrics}"
 
     metrics = compare_to_reference(output_i64, reference)
     assert metrics.cos > 0.9999, f"{activation}: {metrics}"
+
+
+@pytest.mark.parametrize("m", [1, 2, 4])
+def test_silu_tiny_dynamic_direct_matches_reference(m: int) -> None:
+    output, reference = _run_activation_case(
+        activation="silu",
+        m=m,
+        micro_dynamic_cutover=0,
+        fast_math=False,
+    )
+    metrics = compare_to_reference(output, reference)
+    assert metrics.max_abs == 0.0, f"m={m}: {metrics}"
+    assert metrics.rmse == 0.0, f"m={m}: {metrics}"
+
+
+def test_silu_single_token_multi_expert_dynamic_direct_matches_reference() -> None:
+    output, reference = _run_single_token_multi_expert_case(
+        activation="silu",
+        topk_ids_dtype=torch.int32,
+        micro_dynamic_cutover=0,
+    )
+    metrics = compare_to_reference(output, reference)
+    assert metrics.cos > 0.9999, f"silu/direct: {metrics}"

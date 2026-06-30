@@ -1435,10 +1435,120 @@ def _w4a8_dynamic_dense_candidate(
     )
 
 
+def _w4a8_dynamic_decode_candidate(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    n: int,
+    deterministic_output: bool,
+) -> bool:
+    """Whether prepared W4A8 should use its shared-input decode regime."""
+
+    return bool(
+        _normalize_quant_mode(quant_mode) == "w4a8_mx"
+        and activation == "silu"
+        and 0 < routed_rows <= _W4A8_DECODE_MAX_ROUTED_ROWS
+        and _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=num_experts,
+            activation=activation,
+        )
+        == (16, 128)
+        and _dynamic_work_source() != "ready_queue"
+        and not deterministic_output
+    )
+
+
+def _w4a8_dynamic_direct_candidate(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    n: int,
+    deterministic_output: bool,
+) -> bool:
+    """Whether tiny prepared W4A8 can bypass grouped route compaction."""
+
+    return bool(
+        routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        and _w4a8_dynamic_decode_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=num_experts,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+    )
+
+
+def _nvfp4_dynamic_direct_candidate(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    n: int,
+    deterministic_output: bool,
+) -> bool:
+    """Whether tiny A4 execution can bypass grouped route compaction."""
+
+    return bool(
+        _normalize_quant_mode(quant_mode) == "nvfp4"
+        and activation == "silu"
+        and 0 < routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        and _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=num_experts,
+            activation=activation,
+        )
+        == (16, 128)
+        and _dynamic_work_source() != "ready_queue"
+        and not deterministic_output
+    )
+
+
+def _dynamic_direct_routing_candidate(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    n: int,
+    deterministic_output: bool,
+) -> bool:
+    return bool(
+        _w4a8_dynamic_direct_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=num_experts,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+        or _nvfp4_dynamic_direct_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=num_experts,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+    )
+
+
 def _w4a8_dynamic_materialized_enabled(
     *,
     quant_mode: str,
     activation: str,
+    num_tokens: int,
     routed_rows: int,
     num_experts: int,
     k: int,
@@ -1449,7 +1559,7 @@ def _w4a8_dynamic_materialized_enabled(
 ) -> bool:
     """Resolve the complete unified-W4A8 specialization as one decision."""
 
-    candidate = _w4a8_dynamic_dense_candidate(
+    dense_candidate = _w4a8_dynamic_dense_candidate(
         quant_mode=quant_mode,
         activation=activation,
         routed_rows=routed_rows,
@@ -1458,6 +1568,20 @@ def _w4a8_dynamic_materialized_enabled(
         n=n,
         deterministic_output=deterministic_output,
     )
+    m1_candidate = bool(
+        int(num_tokens) == 1
+        and k % 256 == 0
+        and n % 128 == 0
+        and _w4a8_dynamic_direct_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=num_experts,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+    )
+    candidate = dense_candidate or m1_candidate
     return bool(
         candidate
         and w4a8_repacked
@@ -1476,6 +1600,10 @@ _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
 # Micro keeps the m tokens' activations resident in registers; 8 is the budget
 # ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
 _MICRO_MAX_TOKENS = 8
+# Prepared MXFP4 decode keeps the shared-input producer through M=8, while
+# pair-direct routing wins through M=4 for the common top-k=8 regime.
+_W4A8_DECODE_MAX_ROUTED_ROWS = 64
+_DIRECT_ROUTING_MAX_ROUTED_ROWS = 32
 _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_DOWN_SCALE_CACHE: bool | None = None
@@ -2079,16 +2207,6 @@ def _build_tp_moe_fp4_binding_from_views(
     raise ValueError(f"unsupported TP MoE binding implementation {plan.implementation!r}")
 
 
-def _reset_volatile_launch_state(workspace: TPMoEWorkspace) -> None:
-    if not workspace.volatile_launch_state:
-        return
-    # Shared execution-lane arenas overlay MoE scratch with attention/indexer
-    # scratch. The resident-grid barrier scalars are launch state, so refresh
-    # them after any previous phase may have overwritten them.
-    workspace.barrier_count.zero_()
-    workspace.barrier_epoch.zero_()
-
-
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -2363,10 +2481,36 @@ def _plan_core_workspace(
             tile_m=dynamic_tile_m,
             tile_n=dynamic_tile_n,
         )
+        if _dynamic_direct_routing_candidate(
+            quant_mode=quant_mode,
+            activation=activation_spec.activation,
+            routed_rows=routed_rows,
+            num_experts=state_E,
+            n=n,
+            deterministic_output=False,
+        ):
+            direct_groups = max(
+                1,
+                (
+                    (n + dynamic_tile_n - 1) // dynamic_tile_n
+                    + _DYNAMIC_SLICE_CHUNK
+                    - 1
+                )
+                // _DYNAMIC_SLICE_CHUNK,
+            )
+            dynamic_tiles = max(dynamic_tiles, routed_rows)
+            dynamic_max_tasks = max(
+                dynamic_max_tasks, routed_rows * direct_groups
+            )
     else:
         dynamic_tiles = dynamic_physical_tiles
         dynamic_max_tasks = dynamic_task_capacity
     dynamic_rows_padded = dynamic_tiles * dynamic_tile_m
+    # NVFP4 scale addressing uses 128-row hardware SF atoms even when the
+    # compute tile is M16/M32/M64.  The final partial atom therefore needs
+    # physical storage through its full 128-row extent.  W4A8 uses a plain
+    # row-major scale plane, for which the extra tail is harmless.
+    dynamic_scale_rows = align_up(dynamic_rows_padded, 128)
     packed_input_cols = k if _is_w4a8_quant_mode(quant_mode) else k // 2
     packed_input_shape = (1, dynamic_rows_padded, packed_input_cols)
     packed_input_dtype = torch.uint8
@@ -2415,7 +2559,7 @@ def _plan_core_workspace(
             ),
             _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
             _TensorAllocSpec(
-                "packed_input_scale", (dynamic_rows_padded, cols_pad_k), torch.uint8
+                "packed_input_scale", (dynamic_scale_rows, cols_pad_k), torch.uint8
             ),
             _TensorAllocSpec(
                 "expert_write_rows", (state_E,), torch.int32, init="zeros"
@@ -4220,7 +4364,7 @@ def _resolve_workspace_layout(
         # Native W4A8 serving prepares its weights in-place into the dynamic
         # kernel's N256/K128 representation.  Use one workspace family for all
         # W4A8-MX sizes so compacted checkpoints never require a second
-        # source-native copy merely to enter the tiny direct-micro band.
+        # source-native copy merely to enter the tiny-decode band.
         if normalized_quant_mode == "w4a8_mx":
             tile_m, _ = _select_dynamic_tile_mn(
                 routed_rows,
@@ -4371,13 +4515,30 @@ def plan_tp_moe_execution(
             num_experts=state_E,
             activation=activation,
         )
-        dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry(
+        dynamic_physical_tiles, gate_tile_cnt, dynamic_task_capacity = _dynamic_task_geometry(
             state_E,
             n,
             routed_rows,
             tile_m=dynamic_tile_m,
             tile_n=dynamic_tile_n,
         )
+        if _dynamic_direct_routing_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=state_E,
+            n=n,
+            deterministic_output=False,
+        ):
+            direct_groups = max(
+                1,
+                (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1)
+                // _DYNAMIC_SLICE_CHUNK,
+            )
+            dynamic_physical_tiles = max(dynamic_physical_tiles, routed_rows)
+            dynamic_task_capacity = max(
+                dynamic_task_capacity, routed_rows * direct_groups
+            )
         max_tokens_per_launch = _dynamic_token_chunk_limit(
             weight_E,
             k,
@@ -6030,8 +6191,12 @@ def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
     sm_count = get_num_sm(torch.device("cuda"))
     mac_limit = min(get_max_active_clusters(1), sm_count)
     override_name = f"B12X_{impl.upper()}_MAX_ACTIVE_CLUSTERS"
-    if impl == "dynamic":
-        mac_override = _first_env(override_name, "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS")
+    if impl.startswith("dynamic"):
+        mac_override = _first_env(
+            override_name,
+            "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
+            "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
+        )
     else:
         mac_override = _first_env(override_name)
     if mac is None:
@@ -6696,6 +6861,7 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     w4a8_repacked: bool = False,
+    direct_routing: bool = False,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -6734,6 +6900,7 @@ def _get_dynamic_kernel(
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation_spec.activation,
+        num_tokens=m,
         routed_rows=m * num_topk,
         num_experts=E,
         k=k,
@@ -6776,6 +6943,7 @@ def _get_dynamic_kernel(
         bool(deterministic_output),
         work_source,
         bool(w4a8_repacked),
+        bool(direct_routing),
         materialize_intermediate,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -6813,6 +6981,7 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_limit"] = swiglu_limit
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
+    kernel_kwargs["direct_routing"] = bool(direct_routing)
     if is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
@@ -7123,7 +7292,30 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
-    effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
+    decode_regime = bool(
+        w4a8_repacked
+        and _w4a8_dynamic_decode_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=E,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+    )
+    direct_routing = bool(
+        (quant_mode != "w4a8_mx" or w4a8_repacked)
+        and _dynamic_direct_routing_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=E,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
+    )
+    mac_backend = "dynamic_w4a8_decode" if decode_regime else "dynamic"
+    effective_mac = _get_impl_mac(mac_backend, routed_rows=routed_rows)
     multicta_enabled = _dynamic_multicta_enabled()
     selected_tile_m = _select_dynamic_tile_mn(
         m * num_topk,
@@ -7135,6 +7327,7 @@ def _launch_dynamic_flat(
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation,
+        num_tokens=m,
         routed_rows=routed_rows,
         num_experts=E,
         k=k,
@@ -7167,6 +7360,17 @@ def _launch_dynamic_flat(
             effective_mac * 2,
             get_num_sm(torch.device("cuda")) * 2,
         )
+    if direct_routing:
+        # One physical M tile per routed pair and one task per N128 slice.
+        # Materialized M=1 has a second, wider route x N256 phase; size the
+        # resident grid for whichever fixed phase exposes more parallel work.
+        direct_task_count = routed_rows * max(1, (n + 127) // 128)
+        if materialize_intermediate and m == 1:
+            direct_task_count = max(
+                direct_task_count,
+                routed_rows * max(1, (k + 255) // 256),
+            )
+        effective_mac = min(effective_mac, direct_task_count)
     # Do not enlarge this grid beyond the measured resident count: the fused
     # kernel has a resident-grid barrier, so over-launching would deadlock.
     compiled, mac = _get_dynamic_kernel(
@@ -7182,6 +7386,7 @@ def _launch_dynamic_flat(
         activation=activation,
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
+        direct_routing=direct_routing,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -8219,15 +8424,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         input_scales_static=effective_input_scales_static,
     )
 
-    # Re-zero the resident-grid read-before-write barrier scalars in-place when
-    # the workspace was eager-bound (volatile_launch_state=True): the vLLM bind
-    # maps caller-owned scratch as views WITHOUT initializing it (do_init=False),
-    # so without this the FP4 compact/dynamic launch reads stale barrier state
-    # from the shared arena -> partially corrupted MoE output. No-op when the
-    # workspace owns/initialized its own scratch. Mirrors the nemotron/W4A16
-    # launch paths, which already call this.
-    _reset_volatile_launch_state(s)
-
     # CUDA graph capture may run on a non-default stream, so the launch stream
     # must be fetched per-call rather than cached per-device.
     stream = current_cuda_stream()
@@ -8314,6 +8510,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             n=n,
             deterministic_output=deterministic_output,
         )
+        decode_w4a8_candidate = _w4a8_dynamic_decode_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=weight_E,
+            n=n,
+            deterministic_output=deterministic_output,
+        )
         dynamic_w4a8_prepared = (
             _w4a8_prepared_dict(prepared_payload)
             if prepared_payload is not None and quant_mode == "w4a8_mx"
@@ -8354,7 +8558,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     dynamic_w4a8_prepared is not None
                     and _env_flag(
                         _DYNAMIC_W4A8_SHARE_INPUT_ENV,
-                        default=dense_w4a8_candidate,
+                        default=(
+                            dense_w4a8_candidate or decode_w4a8_candidate
+                        ),
                     )
                 )
             ),

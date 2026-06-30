@@ -2,8 +2,8 @@
 
 Gates the e8m0_k32 serving prepare: checkpoint-native per-K/32 E8M0 grids
 ([E, rows, K//32] bytes) feed the w4a8_mx kernels directly — no vec16 scale
-stack, no residual grids. Tiny-decode uses the direct micro specialization with
-logical E8M0 scale-grid loads.
+stack, no residual grids. Tiny decode uses compile-time direct regimes inside
+the unified dynamic kernel and consumes only its prepared weight layout.
 """
 
 from __future__ import annotations
