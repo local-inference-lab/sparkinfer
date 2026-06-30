@@ -83,8 +83,12 @@ def _sglang_wo_a_input_quant_reference(source_tgd: torch.Tensor) -> MXFP8Rows:
     scale_u8 = (torch.ceil(torch.log2(quant_scale)).clamp(-127, 127) + 127).to(
         torch.uint8
     )
+    # MXFP8 stores only the UE8M0 power-of-two scale, so values must be
+    # quantized with that representable scale rather than the pre-rounded
+    # max/FP8_MAX value.
+    quant_scale_e8m0 = torch.exp2(scale_u8.to(torch.float32) - 127.0)
     values_tgd = (
-        (blocked / quant_scale[..., None])
+        (blocked / quant_scale_e8m0[..., None])
         .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         .to(torch.float8_e4m3fn)
         .reshape(tokens, groups, group_width)
@@ -125,9 +129,7 @@ def test_pack_mxfp8_scales_round_trips_grouped_rows() -> None:
         num_groups=groups,
     )
     round_trip = (
-        packed.permute(5, 2, 1, 0, 4, 3)
-        .contiguous()
-        .reshape(groups, 128, sf_k)
+        packed.permute(5, 2, 1, 0, 4, 3).contiguous().reshape(groups, 128, sf_k)
     )
 
     torch.testing.assert_close(
@@ -150,8 +152,7 @@ def test_pack_fp8_block_scaled_weight_expands_grouped_scales() -> None:
         torch.randn((groups * m, k), device="cuda", dtype=torch.bfloat16) / 3
     ).to(torch.float8_e4m3fn)
     block_scale_u8 = (
-        torch.arange(groups * m_tiles * k_tiles, device="cuda", dtype=torch.int32)
-        % 8
+        torch.arange(groups * m_tiles * k_tiles, device="cuda", dtype=torch.int32) % 8
         + 124
     ).to(torch.uint8)
     block_scale = block_scale_u8.view(torch.float8_e8m0fnu).reshape(
@@ -185,9 +186,13 @@ def test_pack_fp8_block_scaled_weight_expands_grouped_scales() -> None:
     deq = dequantize_mxfp8_rows_torch(packed.values, packed.scale_rows)
     expected_values = raw_weight.view(groups, m, k).permute(1, 2, 0)
     expected = (
-        expected_values.float().reshape(m, k // 32, 32, groups).permute(3, 0, 1, 2)
-        * expected_scale_rows_u8.view(torch.float8_e8m0fnu).float()[..., None]
-    ).permute(1, 2, 3, 0).reshape(m, k, groups)
+        (
+            expected_values.float().reshape(m, k // 32, 32, groups).permute(3, 0, 1, 2)
+            * expected_scale_rows_u8.view(torch.float8_e8m0fnu).float()[..., None]
+        )
+        .permute(1, 2, 3, 0)
+        .reshape(m, k, groups)
+    )
     torch.testing.assert_close(deq, expected, rtol=0, atol=0)
 
 
@@ -202,8 +207,7 @@ def test_pack_fp8_block_scaled_weight_accepts_float_scales() -> None:
         torch.randn((groups * m, k), device="cuda", dtype=torch.bfloat16) / 8
     ).to(torch.float8_e4m3fn)
     scale_u8 = (
-        torch.arange(groups * m_tiles * k_tiles, device="cuda", dtype=torch.int32)
-        % 4
+        torch.arange(groups * m_tiles * k_tiles, device="cuda", dtype=torch.int32) % 4
         + 125
     ).to(torch.uint8)
     scale_e8m0 = scale_u8.view(torch.float8_e8m0fnu).reshape(
@@ -245,7 +249,9 @@ def test_quantize_mxfp8_rows_dequantizes_on_gpu() -> None:
     require_sm120()
     torch.manual_seed(20260522)
 
-    source = (torch.randn((3, 128, 2), device="cuda", dtype=torch.bfloat16) / 4).contiguous()
+    source = (
+        torch.randn((3, 128, 2), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
     q = quantize_mxfp8_rows_torch(source)
     deq = dequantize_mxfp8_rows_torch(q.values, q.scale_rows)
 
@@ -262,9 +268,10 @@ def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
     require_sm120()
     torch.manual_seed(31000)
 
-    tokens, groups, group_width, rank = 3, 4, 128, 64
+    tokens, groups, group_width, rank = 3, 4, 512, 64
     source_tgd = (
-        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
     ).contiguous()
     actual_a = quantize_wo_a_input_mxfp8(source_tgd)
     expected_a = _sglang_wo_a_input_quant_reference(source_tgd)
@@ -325,13 +332,13 @@ def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
     )
 
 
-def test_wo_a_inv_rope_input_quant_uses_sglang_128_column_groups() -> None:
+def test_wo_a_inv_rope_input_quant_uses_mxfp8_32_column_groups() -> None:
     require_sm120()
     torch.manual_seed(31005)
 
     tokens = 3
     groups = 2
-    heads_per_group = 2
+    heads_per_group = 4
     head_dim = 128
     nope_dim = 96
     rope_dim = 32
@@ -389,7 +396,10 @@ def test_wo_a_dense_gemm_mxfp8_matches_quantized_gpu_reference() -> None:
     torch.manual_seed(31001)
 
     tokens, groups, group_width, rank = 2, 2, 128, 64
-    x_tgd = (torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4)
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
     wo_a_grd = (
         torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
@@ -415,7 +425,10 @@ def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -
     torch.manual_seed(31002)
 
     tokens, groups, group_width, rank, hidden = 2, 2, 128, 64, 128
-    x_tgd = (torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4)
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
     wo_a_grd = (
         torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
@@ -441,12 +454,60 @@ def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -
     _assert_close_bf16(actual[:, :, 0], expected)
 
 
+def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() -> None:
+    """TP8 collapses DSV4's eight output groups to one local WO group."""
+
+    require_sm120()
+    torch.manual_seed(31005)
+
+    tokens, groups, group_width, rank, hidden = 3, 1, 512, 128, 128
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
+    wo_a_grd = (
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / group_width**0.5
+    )
+    wo_b_hgr = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
+
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
+    binding = _make_wo_projection_binding(x_tgd, weights, expected_m=tokens)
+    actual = wo_projection_mxfp8(binding=binding)
+    torch.cuda.synchronize()
+
+    x_q = quantize_wo_a_input_mxfp8(x_tgd)
+    x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
+    wo_a_deq = dequantize_mxfp8_rows_torch(
+        weights.wo_a.values,
+        weights.wo_a.scale_rows,
+    )
+    tmp = (x_deq @ wo_a_deq.T).to(torch.bfloat16).unsqueeze(-1)
+    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    tmp_deq = dequantize_mxfp8_rows_torch(tmp_q.values, tmp_q.scale_rows)
+    wo_b_deq = dequantize_mxfp8_rows_torch(
+        weights.wo_b.values,
+        weights.wo_b.scale_rows,
+    )
+    expected = tmp_deq @ wo_b_deq.T
+
+    assert weights.wo_a.values.ndim == 2
+    assert x_q.values.ndim == 2
+    _assert_close_bf16(actual, expected)
+
+
 def test_two_gemm_wo_projection_replays_under_graph() -> None:
     require_sm120()
     torch.manual_seed(31003)
 
     tokens, groups, group_width, rank, hidden = 1, 2, 128, 64, 128
-    x_tgd = (torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4)
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
     wo_a_grd = (
         torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
@@ -487,9 +548,10 @@ def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
     torch.manual_seed(31004)
 
     tokens, groups, group_width, rank, hidden = 32, 2, 128, 64, 2048
-    x_tgd = torch.randn(
-        (tokens, groups, group_width), device="cuda", dtype=torch.bfloat16
-    ) / 4
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
     wo_a_grd = (
         torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
@@ -528,9 +590,13 @@ def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
     torch.manual_seed(31004)
 
     tokens, groups, group_width, rank, hidden = 1, 2, 128, 128, 128
-    x_tgd = (torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4)
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
     wo_a_weight = (
-        torch.randn((groups * rank, group_width), device="cuda", dtype=torch.bfloat16) / 8
+        torch.randn((groups * rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / 8
     ).to(torch.float8_e4m3fn)
     wo_b_weight = (
         torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16) / 8

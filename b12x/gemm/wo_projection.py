@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -23,6 +24,14 @@ MXFP8_SCALE_VEC_SIZE = 32
 MXFP8_SCALE_ROW_TILE = 128
 MXFP8_SCALE_K_TILE = 4
 WO_A_INPUT_QUANT_GROUP_SIZE = MXFP8_SCALE_VEC_SIZE
+_WO_QUANT_CHUNKS_PER_PROGRAM = int(
+    os.environ.get("B12X_WO_QUANT_CHUNKS_PER_PROGRAM", "16")
+)
+if _WO_QUANT_CHUNKS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32):
+    raise ValueError(
+        "B12X_WO_QUANT_CHUNKS_PER_PROGRAM must be one of 1, 2, 4, 8, 16, or 32, got "
+        f"{_WO_QUANT_CHUNKS_PER_PROGRAM}"
+    )
 _ALPHA_ONE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
@@ -377,12 +386,30 @@ def _as_grouped_mkl(source: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
         m, k, groups = source.shape
         grouped = source.permute(2, 0, 1).contiguous()
         return grouped, m, k, groups
-    raise ValueError(f"source must have shape [M,K] or [M,K,L], got {tuple(source.shape)}")
+    raise ValueError(
+        f"source must have shape [M,K] or [M,K,L], got {tuple(source.shape)}"
+    )
 
 
 def _check_mxfp8_k(k: int) -> None:
     if k <= 0 or k % 128 != 0:
-        raise ValueError(f"MXFP8 dense_gemm K must be a positive multiple of 128, got {k}")
+        raise ValueError(
+            f"MXFP8 dense_gemm K must be a positive multiple of 128, got {k}"
+        )
+
+
+def _wo_quant_chunks_per_program(k: int) -> int:
+    chunks = k // MXFP8_SCALE_VEC_SIZE
+    # tl.arange requires a power-of-two extent. K is only required to be a
+    # multiple of 128, so first round down before finding a divisor (for
+    # example, K=384 has 12 scale chunks and must use four per program).
+    chunks_per_program = min(
+        _WO_QUANT_CHUNKS_PER_PROGRAM,
+        1 << (chunks.bit_length() - 1),
+    )
+    while chunks % chunks_per_program:
+        chunks_per_program //= 2
+    return chunks_per_program
 
 
 def _cached_alpha_one(device: torch.device | str) -> torch.Tensor:
@@ -418,14 +445,13 @@ def _quantize_grouped_tgd_to_tdg_kernel(
     scale_mma_s3,
     scale_mma_s4,
     scale_mma_s5,
-    SCALE_CHUNKS: tl.constexpr,
-    BLOCK: tl.constexpr,
+    CHUNKS_PER_PROGRAM: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
     group = tl.program_id(1)
-    chunk = tl.program_id(2)
-    offs = tl.arange(0, BLOCK)
-    d = chunk * BLOCK + offs
+    chunk_block = tl.program_id(2)
+    chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
+    d = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
 
     src = tl.load(
         source
@@ -433,7 +459,7 @@ def _quantize_grouped_tgd_to_tdg_kernel(
         + group * source_stride_g
         + d * source_stride_d,
     ).to(tl.float32)
-    max_abs = tl.max(tl.abs(src), axis=0)
+    max_abs = tl.max(tl.abs(src), axis=1)
     quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
     scale = tl.exp2(scale_exp)
@@ -444,7 +470,7 @@ def _quantize_grouped_tgd_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / scale).to(tl.float8e4nv),
+        (src / scale[:, None]).to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
@@ -498,22 +524,21 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     HALF_ROPE_DIM: tl.constexpr,
-    SCALE_CHUNKS: tl.constexpr,
-    BLOCK: tl.constexpr,
+    CHUNKS_PER_PROGRAM: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
     group = tl.program_id(1)
-    chunk = tl.program_id(2)
-    offs = tl.arange(0, BLOCK)
-    d = chunk * BLOCK + offs
+    chunk_block = tl.program_id(2)
+    chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
+    d = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
 
     head_in_group = d // HEAD_DIM
     head_d = d - head_in_group * HEAD_DIM
     head = group * heads_per_group + head_in_group
 
-    src = tl.load(
-        o + token * o_stride_t + head * o_stride_h + head_d * o_stride_d
-    ).to(tl.float32)
+    src = tl.load(o + token * o_stride_t + head * o_stride_h + head_d * o_stride_d).to(
+        tl.float32
+    )
 
     is_rope = head_d >= NOPE_DIM
     rope_local = head_d - NOPE_DIM
@@ -534,7 +559,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     rotated = tl.where((rope_local & 1) == 0, x_add, x_sub)
     src = tl.where(is_rope, rotated, src)
 
-    max_abs = tl.max(tl.abs(src), axis=0)
+    max_abs = tl.max(tl.abs(src), axis=1)
     quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
     scale = tl.exp2(scale_exp)
@@ -545,7 +570,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / scale).to(tl.float8e4nv),
+        (src / scale[:, None]).to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
@@ -589,29 +614,26 @@ def _quantize_group_major_trg_to_tk_kernel(
     scale_mma_s3,
     scale_mma_s4,
     scale_mma_s5,
-    BLOCK: tl.constexpr,
+    CHUNKS_PER_PROGRAM: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
-    chunk = tl.program_id(1)
-    offs = tl.arange(0, BLOCK)
-    cols = chunk * BLOCK + offs
+    chunk_block = tl.program_id(1)
+    chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
+    cols = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
     g = cols // rank
     r = cols - g * rank
 
     src = tl.load(
-        source
-        + token * source_stride_t
-        + r * source_stride_r
-        + g * source_stride_g,
+        source + token * source_stride_t + r * source_stride_r + g * source_stride_g,
     ).to(tl.float32)
-    max_abs = tl.max(tl.abs(src), axis=0)
+    max_abs = tl.max(tl.abs(src), axis=1)
     safe = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(safe)), -127.0), 127.0)
     scale = tl.exp2(scale_exp)
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     width = rank * groups
-    tl.store(values + token * width + cols, (src / scale).to(tl.float8e4nv))
+    tl.store(values + token * width + cols, (src / scale[:, None]).to(tl.float8e4nv))
 
     sf_cols = width // 32
     tl.store(scale_rows + token * sf_cols + chunk, scale_u8)
@@ -761,7 +783,9 @@ def _scale_to_e8m0_u8(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.uint8:
         return scale
     if not scale.is_floating_point():
-        raise ValueError(f"scale must be e8m0, uint8, or floating-point, got {scale.dtype}")
+        raise ValueError(
+            f"scale must be e8m0, uint8, or floating-point, got {scale.dtype}"
+        )
     safe = torch.where(
         scale > 0,
         scale.to(torch.float32),
@@ -969,9 +993,7 @@ def _requantize_block_fp8_to_ue8m0(
         )
 
     # Reconstruct the recovered weight: w_fp8 * (block scale broadcast to elems).
-    s_elem = (
-        s_g.repeat_interleave(gk, dim=1).repeat_interleave(gk, dim=2)[:, :m, :k]
-    )
+    s_elem = s_g.repeat_interleave(gk, dim=1).repeat_interleave(gk, dim=2)[:, :m, :k]
     w_rec = w_g.to(torch.float32) * s_elem
 
     # Pad to whole 128x128 blocks, take per-block amax, ceil-UE8M0 cast.
@@ -1038,7 +1060,9 @@ def pack_fp8_block_scaled_weight_mxfp8(
 
     if num_groups == 1:
         if weight.shape != (m, k):
-            raise ValueError(f"weight must have shape {(m, k)}, got {tuple(weight.shape)}")
+            raise ValueError(
+                f"weight must have shape {(m, k)}, got {tuple(weight.shape)}"
+            )
         values = weight.contiguous()
     else:
         if weight.shape == (num_groups * m, k):
@@ -1117,12 +1141,18 @@ def _check_mxfp8_rows_storage(
     if out.values.dtype != torch.float8_e4m3fn:
         raise ValueError(f"out.values must be float8_e4m3fn, got {out.values.dtype}")
     if out.scale_rows.dtype != torch.float8_e8m0fnu:
-        raise ValueError(f"out.scale_rows must be float8_e8m0fnu, got {out.scale_rows.dtype}")
+        raise ValueError(
+            f"out.scale_rows must be float8_e8m0fnu, got {out.scale_rows.dtype}"
+        )
     if out.scale_mma.dtype != torch.float8_e8m0fnu:
-        raise ValueError(f"out.scale_mma must be float8_e8m0fnu, got {out.scale_mma.dtype}")
+        raise ValueError(
+            f"out.scale_mma must be float8_e8m0fnu, got {out.scale_mma.dtype}"
+        )
     if num_groups == 1:
         if out.values.shape != (m, k):
-            raise ValueError(f"out.values must have shape {(m, k)}, got {tuple(out.values.shape)}")
+            raise ValueError(
+                f"out.values must have shape {(m, k)}, got {tuple(out.values.shape)}"
+            )
     else:
         if out.values.shape != (m, k, num_groups):
             raise ValueError(
@@ -1172,8 +1202,14 @@ def quantize_wo_a_input_mxfp8(
         )
     else:
         _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
+    values_stride_g = out.values.stride(2) if out.values.ndim == 3 else 0
+    chunks_per_program = _wo_quant_chunks_per_program(group_width)
     _quantize_grouped_tgd_to_tdg_kernel[
-        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
+        (
+            tokens,
+            groups,
+            group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program,
+        )
     ](
         source_tgd,
         out.values,
@@ -1187,15 +1223,15 @@ def quantize_wo_a_input_mxfp8(
         source_tgd.stride(2),
         out.values.stride(0),
         out.values.stride(1),
-        out.values.stride(2),
+        values_stride_g,
         out.scale_mma.stride(0),
         out.scale_mma.stride(1),
         out.scale_mma.stride(2),
         out.scale_mma.stride(3),
         out.scale_mma.stride(4),
         out.scale_mma.stride(5),
-        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
-        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
+        CHUNKS_PER_PROGRAM=chunks_per_program,
+        num_warps=4,
     )
     return out
 
@@ -1216,8 +1252,14 @@ def _run_wo_a_quant_kernel(
     rope_dim: int,
 ) -> None:
     out_scale_mma_u8 = out_scale_mma.view(torch.uint8)
+    values_stride_g = out_values.stride(2) if out_values.ndim == 3 else 0
+    chunks_per_program = _wo_quant_chunks_per_program(group_width)
     _quantize_attention_inv_rope_to_tdg_kernel[
-        (tokens, groups, group_width // WO_A_INPUT_QUANT_GROUP_SIZE)
+        (
+            tokens,
+            groups,
+            group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program,
+        )
     ](
         o,
         positions,
@@ -1235,7 +1277,7 @@ def _run_wo_a_quant_kernel(
         cos_sin_cache.stride(0),
         out_values.stride(0),
         out_values.stride(1),
-        out_values.stride(2),
+        values_stride_g,
         out_scale_mma.stride(0),
         out_scale_mma.stride(1),
         out_scale_mma.stride(2),
@@ -1245,8 +1287,8 @@ def _run_wo_a_quant_kernel(
         HEAD_DIM=head_dim,
         NOPE_DIM=nope_dim,
         HALF_ROPE_DIM=rope_dim // 2,
-        SCALE_CHUNKS=WO_A_INPUT_QUANT_GROUP_SIZE // MXFP8_SCALE_VEC_SIZE,
-        BLOCK=WO_A_INPUT_QUANT_GROUP_SIZE,
+        CHUNKS_PER_PROGRAM=chunks_per_program,
+        num_warps=4,
     )
 
 
@@ -1274,8 +1316,12 @@ def _quantize_wo_a_input_inv_rope_mxfp8_alloc_op(
         tokens, group_width, num_groups=groups, device=o.device
     )
     out = mxfp8_rows_from_bases(
-        values_base, scale_rows_base, scale_physical_base,
-        tokens, group_width, num_groups=groups,
+        values_base,
+        scale_rows_base,
+        scale_physical_base,
+        tokens,
+        group_width,
+        num_groups=groups,
     )
     _run_wo_a_quant_kernel(
         o,
@@ -1383,13 +1429,15 @@ def quantize_wo_a_input_inv_rope_mxfp8(
     rope_dim: int = 64,
     out: MXFP8Rows | None = None,
 ) -> MXFP8Rows:
-    """Inverse-RoPE attention output and quantize with 128-column WO-A scales."""
+    """Inverse-RoPE attention output and quantize into per-32-column MXFP8 rows."""
 
     _check_gpu_tensor("o", o)
     _check_gpu_tensor("positions", positions)
     _check_gpu_tensor("cos_sin_cache", cos_sin_cache)
     if o.ndim != 3:
-        raise ValueError(f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}")
+        raise ValueError(
+            f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}"
+        )
     tokens, heads, head_dim = o.shape
     if head_dim != nope_dim + rope_dim:
         raise ValueError(
@@ -1431,8 +1479,12 @@ def quantize_wo_a_input_inv_rope_mxfp8(
             )
         )
         return mxfp8_rows_from_bases(
-            values_base, scale_rows_base, scale_physical_base,
-            tokens, group_width, num_groups=groups,
+            values_base,
+            scale_rows_base,
+            scale_physical_base,
+            tokens,
+            group_width,
+            num_groups=groups,
         )
 
     _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
@@ -1464,7 +1516,13 @@ def _run_wo_b_quant_kernel(
     groups: int,
     width: int,
 ) -> None:
-    _quantize_group_major_trg_to_tk_kernel[(tokens, width // MXFP8_SCALE_VEC_SIZE)](
+    chunks_per_program = _wo_quant_chunks_per_program(width)
+    _quantize_group_major_trg_to_tk_kernel[
+        (
+            tokens,
+            width // MXFP8_SCALE_VEC_SIZE // chunks_per_program,
+        )
+    ](
         source_trg,
         out_values,
         out_scale_rows.view(torch.uint8),
@@ -1481,7 +1539,8 @@ def _run_wo_b_quant_kernel(
         out_scale_mma.stride(3),
         out_scale_mma.stride(4),
         out_scale_mma.stride(5),
-        BLOCK=MXFP8_SCALE_VEC_SIZE,
+        CHUNKS_PER_PROGRAM=chunks_per_program,
+        num_warps=4,
     )
 
 
@@ -1525,9 +1584,7 @@ def _quantize_wo_b_input_mxfp8_alloc_fake(
     groups: int,
     width: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return empty_mxfp8_rows_bases(
-        tokens, width, num_groups=1, device=source_trg.device
-    )
+    return empty_mxfp8_rows_bases(tokens, width, num_groups=1, device=source_trg.device)
 
 
 @torch.library.custom_op(
@@ -1597,7 +1654,12 @@ def quantize_wo_b_input_mxfp8(
             )
         )
         return mxfp8_rows_from_bases(
-            values_base, scale_rows_base, scale_physical_base, tokens, width, num_groups=1
+            values_base,
+            scale_rows_base,
+            scale_physical_base,
+            tokens,
+            width,
+            num_groups=1,
         )
 
     _check_mxfp8_rows_storage(out, m=tokens, k=width, num_groups=1)
@@ -1651,7 +1713,9 @@ def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
     return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
 
 
-def dequantize_mxfp8_rows_torch(values: torch.Tensor, scale_rows: torch.Tensor) -> torch.Tensor:
+def dequantize_mxfp8_rows_torch(
+    values: torch.Tensor, scale_rows: torch.Tensor
+) -> torch.Tensor:
     """Dequantize compact row-wise MXFP8 values on GPU for tests/oracles."""
 
     grouped, m, k, num_groups = _as_grouped_mkl(values)
@@ -1665,8 +1729,7 @@ def dequantize_mxfp8_rows_torch(values: torch.Tensor, scale_rows: torch.Tensor) 
         )
     scale = scale_rows.to(torch.float32)
     out_grouped = (
-        grouped.to(torch.float32)
-        .reshape(num_groups, m, sf_k, MXFP8_SCALE_VEC_SIZE)
+        grouped.to(torch.float32).reshape(num_groups, m, sf_k, MXFP8_SCALE_VEC_SIZE)
         * scale[..., None]
     ).reshape(num_groups, m, k)
     out = out_grouped.permute(1, 2, 0).contiguous()
@@ -1704,7 +1767,13 @@ def quantize_wo_projection_weights_mxfp8_torch(
     _check_mxfp8_k(group_width)
     _check_mxfp8_k(groups * rank)
 
-    wo_a = quantize_mxfp8_rows_torch(wo_a_grd.permute(1, 2, 0).contiguous())
+    wo_a_source = wo_a_grd.permute(1, 2, 0).contiguous()
+    # MXFP8Rows intentionally stores singleton-L values as compact [M,K].
+    # Preserve that convention for the benchmark/test setup helper so TP8
+    # (o_groups=8 -> one local output group) matches checkpoint packing.
+    if groups == 1:
+        wo_a_source = wo_a_source[:, :, 0]
+    wo_a = quantize_mxfp8_rows_torch(wo_a_source)
     wo_b = quantize_mxfp8_rows_torch(wo_b_hgr)
     return WOProjectionMXFP8Weights(
         wo_a=wo_a,
@@ -1814,7 +1883,9 @@ def _validate_wo_projection_inv_rope_inputs(
     if heads_per_group <= 0 or nope_dim <= 0 or rope_dim <= 0:
         raise ValueError("heads_per_group, nope_dim, and rope_dim must be positive")
     if o.ndim != 3:
-        raise ValueError(f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}")
+        raise ValueError(
+            f"o must have shape [tokens, heads, head_dim], got {tuple(o.shape)}"
+        )
     tokens, heads, head_dim = o.shape
     if head_dim != nope_dim + rope_dim:
         raise ValueError(
@@ -1989,7 +2060,9 @@ def _build_wo_projection_inv_rope_binding_from_views(
     )
 
 
-def plan_wo_projection_scratch(caps: WOProjectionScratchCaps) -> WOProjectionScratchPlan:
+def plan_wo_projection_scratch(
+    caps: WOProjectionScratchCaps,
+) -> WOProjectionScratchPlan:
     layout = _layout_wo_projection(
         offset_bytes=0,
         tokens=caps.max_tokens,
@@ -2023,11 +2096,16 @@ def wo_a_dense_gemm_mxfp8(
     """Run WO-A as grouped MXFP8 dense GEMM.
 
     Inputs are `x.values [tokens, group_width, groups]` and
-    `wo_a.values [rank, group_width, groups]`; output is `[tokens, rank, groups]`.
+    `wo_a.values [rank, group_width, groups]`; singleton groups use compact
+    `[tokens, group_width]` / `[rank, group_width]` storage. Output is
+    `[tokens, rank, groups]`.
     """
 
-    if x_tdg.values.ndim != 3 or wo_a_rdg.values.ndim != 3:
-        raise ValueError("WO-A operands must have shape [M,K,groups] and [N,K,groups]")
+    if x_tdg.values.ndim not in (2, 3) or wo_a_rdg.values.ndim != x_tdg.values.ndim:
+        raise ValueError(
+            "WO-A operands must both have shape [M,K] for one group or "
+            "[M,K,groups] for multiple groups"
+        )
     if x_tdg.values.shape[1:] != wo_a_rdg.values.shape[1:]:
         raise ValueError(
             f"WO-A K/groups mismatch: x={tuple(x_tdg.values.shape)} "
@@ -2045,9 +2123,14 @@ def wo_a_dense_gemm_mxfp8(
         and wo_a_rdg.values.shape[0] <= 1536
         else None
     )
+    x_values = x_tdg.values
+    wo_a_values = wo_a_rdg.values
+    if x_values.ndim == 2:
+        x_values = x_values.unsqueeze(-1)
+        wo_a_values = wo_a_values.unsqueeze(-1)
     return dense_gemm(
-        (x_tdg.values, x_tdg.scale_mma),
-        (wo_a_rdg.values, wo_a_rdg.scale_mma),
+        (x_values, x_tdg.scale_mma),
+        (wo_a_values, wo_a_rdg.scale_mma),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
@@ -2161,7 +2244,9 @@ def wo_projection_mxfp8(
         tmp_q = None
         output = None
     if source_tgd is None or weights is None:
-        raise TypeError("wo_projection_mxfp8 requires source_tgd and weights or binding")
+        raise TypeError(
+            "wo_projection_mxfp8 requires source_tgd and weights or binding"
+        )
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     # WO auto-defaults the regime hint to the (capture-fixed) token count so the
     # wo_b up-projection (N=hidden>1536) picks the decode tile (32x128) at small
@@ -2228,8 +2313,12 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     # shapes). Weight views passed in are static-shaped. Returns the contiguous
     # [tokens, hidden, 1] base.
     weights = WOProjectionMXFP8Weights(
-        wo_a=MXFP8Rows(values=wo_a_values, scale_rows=wo_a_scale_rows, scale_mma=wo_a_scale_mma),
-        wo_b=MXFP8Rows(values=wo_b_values, scale_rows=wo_b_scale_rows, scale_mma=wo_b_scale_mma),
+        wo_a=MXFP8Rows(
+            values=wo_a_values, scale_rows=wo_a_scale_rows, scale_mma=wo_a_scale_mma
+        ),
+        wo_b=MXFP8Rows(
+            values=wo_b_values, scale_rows=wo_b_scale_rows, scale_mma=wo_b_scale_mma
+        ),
         groups=groups,
         group_width=group_width,
         rank=rank,
@@ -2336,20 +2425,11 @@ def wo_projection_inv_rope_mxfp8(
         positions = binding.positions
         cos_sin_cache = binding.cos_sin_cache
         weights = binding.weights
-        x_q = binding.x_q
-        tmp = binding.tmp
-        tmp_q = binding.tmp_q
-        output = binding.output
         heads_per_group = binding.heads_per_group
         nope_dim = binding.nope_dim
         rope_dim = binding.rope_dim
         return_3d = binding.return_3d
         expected_m = binding.expected_m
-    else:
-        x_q = None
-        tmp = None
-        tmp_q = None
-        output = None
     if (
         o is None
         or positions is None
@@ -2401,6 +2481,7 @@ def wo_projection_inv_rope_mxfp8(
     if return_3d:
         return output
     return output[:, :, 0]
+
 
 __all__ = [
     "FP8_E4M3_MAX",

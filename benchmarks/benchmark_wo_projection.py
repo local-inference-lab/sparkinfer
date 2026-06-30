@@ -26,12 +26,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
+import b12x.gemm.wo_projection as wo_projection_impl
 from b12x.cute.utils import get_hardware_info
 from b12x.gemm.wo_projection import (
-    WOProjectionMXFP8Weights,
+    WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
-    empty_wo_projection_workspace,
-    quantize_mxfp8_rows_torch,
+    plan_wo_projection_scratch,
+    quantize_wo_a_input_inv_rope_mxfp8,
+    quantize_wo_a_input_mxfp8,
+    quantize_wo_projection_weights_mxfp8_torch,
+    wo_projection_inv_rope_mxfp8,
     wo_projection_mxfp8,
 )
 
@@ -71,7 +75,9 @@ def make_l2_flush_fn(*, bytes_hint: int = 0) -> Callable[[], None]:
     key = (device_idx, flush_bytes)
     buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
     if buffer is None:
-        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
+        buffer = torch.empty(
+            flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}"
+        )
         _L2_FLUSH_BUFFER_CACHE[key] = buffer
 
     def flush(cache_buffer: torch.Tensor = buffer) -> None:
@@ -104,7 +110,7 @@ def bench_events(
         fn()
         ends[i].record()
     torch.cuda.synchronize()
-    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    return [s.elapsed_time(e) for s, e in zip(starts, ends, strict=True)]
 
 
 def fmt_us(times_ms: list[float]) -> str:
@@ -136,10 +142,7 @@ def check_outputs(
     max_abs = diff.max().item()
     rmse = diff.square().mean().sqrt().item()
     cos = cosine_similarity(candidate, reference)
-    print(
-        f"    check vs {label}: max_abs={max_abs:.8f} "
-        f"rmse={rmse:.8f} cos={cos:.10f}"
-    )
+    print(f"    check vs {label}: max_abs={max_abs:.8f} rmse={rmse:.8f} cos={cos:.10f}")
     if not math.isfinite(cos) or cos < COSINE_THRESHOLD:
         raise CorrectnessError(
             f"cosine similarity vs {label} fell below {COSINE_THRESHOLD:.6f}: "
@@ -147,7 +150,9 @@ def check_outputs(
         )
 
 
-def capture_graph_replay(fn: Callable[[], torch.Tensor | None]) -> tuple[Callable[[], None], torch.Tensor | None]:
+def capture_graph_replay(
+    fn: Callable[[], torch.Tensor | None],
+) -> tuple[Callable[[], None], torch.Tensor | None]:
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -171,12 +176,65 @@ def make_case(
     rank: int,
     hidden: int,
     seed: int,
+    inv_rope: bool,
+    context_length: int,
+    nope_dim: int,
+    rope_dim: int,
 ) -> dict[str, torch.Tensor | object]:
     torch.manual_seed(seed)
-    x_tgd = (
-        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
-        / 4
-    ).contiguous()
+    if inv_rope:
+        head_dim = nope_dim + rope_dim
+        if group_width % head_dim:
+            raise ValueError(
+                f"group_width={group_width} must be divisible by head_dim={head_dim}"
+            )
+        if tokens > context_length:
+            raise ValueError(f"tokens={tokens} exceeds context_length={context_length}")
+        heads_per_group = group_width // head_dim
+        o = (
+            torch.randn(
+                (tokens, groups * heads_per_group, head_dim),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 4
+        ).contiguous()
+        positions = torch.arange(
+            context_length - tokens,
+            context_length,
+            device="cuda",
+            dtype=torch.long,
+        )
+        angles = torch.randn(
+            (context_length, rope_dim // 2),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=1)
+        x_tgd = None
+        x_tdg_q = quantize_wo_a_input_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin_cache,
+            groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+    else:
+        heads_per_group = 0
+        o = None
+        positions = None
+        cos_sin_cache = None
+        x_tgd = (
+            torch.randn(
+                (tokens, groups, group_width),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 4
+        ).contiguous()
+        x_tdg_q = quantize_wo_a_input_mxfp8(x_tgd)
     wo_a_grd = (
         torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
@@ -186,38 +244,40 @@ def make_case(
         / (groups * rank) ** 0.5
     ).contiguous()
 
-    x_tdg_q = quantize_mxfp8_rows_torch(x_tgd.permute(0, 2, 1).contiguous())
-    wo_a_rdg_q = quantize_mxfp8_rows_torch(wo_a_grd.permute(1, 2, 0).contiguous())
-    wo_b_hrg_q = quantize_mxfp8_rows_torch(wo_b_hgr)
-    weights = WOProjectionMXFP8Weights(
-        wo_a=wo_a_rdg_q,
-        wo_b=wo_b_hrg_q,
-        groups=groups,
-        group_width=group_width,
-        rank=rank,
-        hidden=hidden,
-    )
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
 
     x_deq_tgd = dequantize_mxfp8_rows_torch(
         x_tdg_q.values,
         x_tdg_q.scale_rows,
-    ).permute(0, 2, 1).to(torch.bfloat16)
+    )
+    if groups == 1:
+        x_deq_tgd = x_deq_tgd.unsqueeze(1)
+    else:
+        x_deq_tgd = x_deq_tgd.permute(0, 2, 1)
+    x_deq_tgd = x_deq_tgd.to(torch.bfloat16)
     wo_a_deq_grd = dequantize_mxfp8_rows_torch(
-        wo_a_rdg_q.values,
-        wo_a_rdg_q.scale_rows,
-    ).permute(2, 0, 1).to(torch.bfloat16)
+        weights.wo_a.values,
+        weights.wo_a.scale_rows,
+    )
+    if groups == 1:
+        wo_a_deq_grd = wo_a_deq_grd.unsqueeze(0)
+    else:
+        wo_a_deq_grd = wo_a_deq_grd.permute(2, 0, 1)
+    wo_a_deq_grd = wo_a_deq_grd.to(torch.bfloat16)
     wo_b_deq_hgr = dequantize_mxfp8_rows_torch(
-        wo_b_hrg_q.values,
-        wo_b_hrg_q.scale_rows,
+        weights.wo_b.values,
+        weights.wo_b.scale_rows,
     ).to(torch.bfloat16)
 
     return {
         "x_tgd": x_tgd,
+        "o": o,
+        "positions": positions,
+        "cos_sin_cache": cos_sin_cache,
+        "heads_per_group": heads_per_group,
         "wo_a_grd": wo_a_grd,
         "wo_b_hgr": wo_b_hgr,
         "x_tdg_q": x_tdg_q,
-        "wo_a_rdg_q": wo_a_rdg_q,
-        "wo_b_hrg_q": wo_b_hrg_q,
         "weights": weights,
         "x_deq_tgd": x_deq_tgd,
         "wo_a_deq_grd": wo_a_deq_grd,
@@ -237,6 +297,10 @@ def bench_one(
     check: bool,
     l2_flush: Callable[[], None],
     seed: int,
+    inv_rope: bool,
+    context_length: int,
+    nope_dim: int,
+    rope_dim: int,
 ) -> dict[str, object]:
     case = make_case(
         tokens=tokens,
@@ -245,31 +309,61 @@ def bench_one(
         rank=rank,
         hidden=hidden,
         seed=seed,
+        inv_rope=inv_rope,
+        context_length=context_length,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
     )
 
     results: dict[str, object] = {}
 
     try:
-        workspace = empty_wo_projection_workspace(
-            tokens,
-            groups=groups,
-            group_width=group_width,
-            rank=rank,
-            hidden=hidden,
-            device="cuda",
+        plan = plan_wo_projection_scratch(
+            WOProjectionScratchCaps(
+                device="cuda",
+                max_tokens=tokens,
+                groups=groups,
+                group_width=group_width,
+                rank=rank,
+                hidden=hidden,
+            )
         )
-
-        def b12x_launch() -> torch.Tensor:
-            return wo_projection_mxfp8(
-                case["x_tgd"],
-                case["weights"],
-                workspace,
+        scratch = tuple(
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in plan.shapes_and_dtypes()
+        )
+        if inv_rope:
+            binding = plan.bind_inv_rope(
+                scratch=scratch,
+                o=case["o"],
+                positions=case["positions"],
+                cos_sin_cache=case["cos_sin_cache"],
+                weights=case["weights"],
+                heads_per_group=case["heads_per_group"],
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
                 return_3d=True,
+                expected_m=tokens,
             )
 
-        b12x_replay, _ = capture_graph_replay(b12x_launch)
+            def b12x_launch() -> torch.Tensor:
+                return wo_projection_inv_rope_mxfp8(binding=binding)
+
+        else:
+            binding = plan.bind(
+                scratch=scratch,
+                source_tgd=case["x_tgd"],
+                weights=case["weights"],
+                return_3d=True,
+                expected_m=tokens,
+            )
+
+            def b12x_launch() -> torch.Tensor:
+                return wo_projection_mxfp8(binding=binding)
+
+        b12x_replay, b12x_graph_out = capture_graph_replay(b12x_launch)
         results["b12x_replay"] = b12x_replay
-        results["b12x_out"] = workspace.output
+        results["b12x_out"] = b12x_graph_out if inv_rope else binding.output
         results["b12x"] = bench_events(
             b12x_replay,
             warmup=warmup,
@@ -310,7 +404,9 @@ def bench_one(
 
     if check:
         if results.get("b12x_replay") is None or results.get("torch_replay") is None:
-            raise BenchmarkAbort("correctness check requires both b12x and torch replays")
+            raise BenchmarkAbort(
+                "correctness check requires both b12x and torch replays"
+            )
         results["b12x_replay"]()
         results["torch_replay"]()
         torch.cuda.synchronize()
@@ -332,6 +428,14 @@ def main() -> None:
     parser.add_argument("--group-width", type=int, default=512)
     parser.add_argument("--rank", type=int, default=1024)
     parser.add_argument("--hidden", type=int, default=4096)
+    parser.add_argument(
+        "--inv-rope",
+        action="store_true",
+        help="Benchmark the opaque inverse-RoPE serving route.",
+    )
+    parser.add_argument("--context-length", type=int, default=16384)
+    parser.add_argument("--nope-dim", type=int, default=448)
+    parser.add_argument("--rope-dim", type=int, default=64)
     parser.add_argument(
         "--l2-flush-bytes",
         type=int,
@@ -360,6 +464,8 @@ def main() -> None:
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
 
     print(f"WO projection: b12x native MXFP8 two-GEMM vs {REFERENCE_LABEL}")
+    route = "inverse-RoPE serving op" if args.inv_rope else "plain WO binding"
+    print(f"Route: {route}")
     print("Timing mode: CUDA graph replay")
     print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     if args.check:
@@ -371,7 +477,19 @@ def main() -> None:
         f"groups={args.groups}, group_width={args.group_width}, "
         f"rank={args.rank}, hidden={args.hidden}"
     )
-    print("b12x note: activation quant/scale packing is included in the graph replay path.")
+    if args.inv_rope:
+        print(
+            f"RoPE: context={args.context_length}, nope_dim={args.nope_dim}, "
+            f"rope_dim={args.rope_dim}"
+        )
+    print(
+        "WO quant tile: "
+        f"{wo_projection_impl._WO_QUANT_CHUNKS_PER_PROGRAM}x32 values/program, "
+        "4 warps"
+    )
+    print(
+        "b12x note: activation quant/scale packing is included in the graph replay path."
+    )
     print(f"warmup={args.warmup}, iters={args.iters}")
     print()
 
@@ -389,9 +507,15 @@ def main() -> None:
                 check=args.check,
                 l2_flush=l2_flush,
                 seed=args.seed + tokens,
+                inv_rope=args.inv_rope,
+                context_length=args.context_length,
+                nope_dim=args.nope_dim,
+                rope_dim=args.rope_dim,
             )
         except BenchmarkAbort as exc:
-            print(f"ERROR: benchmark aborted for tokens={tokens}: {exc}", file=sys.stderr)
+            print(
+                f"ERROR: benchmark aborted for tokens={tokens}: {exc}", file=sys.stderr
+            )
             raise SystemExit(1) from exc
 
         b12x_times = results.get("b12x")
@@ -410,7 +534,9 @@ def main() -> None:
         all_results.append((tokens, b12x_med, torch_med))
 
     print(f"\n{'=' * 75}")
-    print(f"  SUMMARY: b12x / {REFERENCE_LABEL} (CUDA graph replay, lower = b12x faster)")
+    print(
+        f"  SUMMARY: b12x / {REFERENCE_LABEL} (CUDA graph replay, lower = b12x faster)"
+    )
     print(f"{'=' * 75}")
     print(f"  {'tokens':<10}  {'ratio':>10}")
     print("  " + "-" * 24)
