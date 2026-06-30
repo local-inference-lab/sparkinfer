@@ -67,6 +67,15 @@ from .tp_moe import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
 )
+from .ep_moe import (
+    EPExpertMap,
+    EPMoEFP4Binding,
+    EPMoEScratchCaps,
+    EPMoEScratchPlan,
+    b12x_ep_moe_fp4,
+    plan_ep_moe_scratch,
+    prepare_ep_expert_map,
+)
 
 __all__ = [
     "B12XPagedAttentionBinding",
@@ -125,4 +134,11 @@ __all__ = [
     "plan_tp_moe_execution",
     "plan_b12x_fp4_moe_weights",
     "prepare_b12x_fp4_moe_weights",
+    "EPExpertMap",
+    "EPMoEFP4Binding",
+    "EPMoEScratchCaps",
+    "EPMoEScratchPlan",
+    "b12x_ep_moe_fp4",
+    "plan_ep_moe_scratch",
+    "prepare_ep_expert_map",
 ]
