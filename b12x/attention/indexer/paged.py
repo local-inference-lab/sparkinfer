@@ -38,7 +38,6 @@ _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _PAGED_INDEX_TILE_BLOCK_Q = 32
 _PAGED_INDEX_TILE_BLOCK_K = 512
-_PAGED_INDEX_CACHE_ROW_BYTES = PAGED_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
 _PAGED_INDEX_CACHE_DATA_BYTES = PAGED_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
 
 
@@ -80,11 +79,14 @@ def _gather_shared_paged_supertile_kernel(
         other=-1,
     )
     valid_tokens = token_mask & (page_ids >= 0)
+    # Packed multi-group allocations can span more than 4 GiB. Keep address
+    # math 64-bit even though the logical page IDs themselves are int32.
+    page_byte_offsets = page_ids.to(tl.int64) * cache_row_stride_bytes
 
     byte_offsets = tl.arange(0, index_head_dim)
     k_bytes = tl.load(
         index_k_cache
-        + page_ids[:, None] * cache_row_stride_bytes
+        + page_byte_offsets[:, None]
         + slot_offsets[:, None] * index_head_dim
         + byte_offsets[None, :],
         mask=valid_tokens[:, None],
@@ -99,7 +101,7 @@ def _gather_shared_paged_supertile_kernel(
     scale_byte_offsets = tl.arange(0, 4)
     scale_bytes = tl.load(
         index_k_cache
-        + page_ids[:, None] * cache_row_stride_bytes
+        + page_byte_offsets[:, None]
         + cache_data_bytes
         + slot_offsets[:, None] * 4
         + scale_byte_offsets[None, :],
@@ -681,16 +683,6 @@ def index_topk_fp8(
             "paged index supertile top-k scratch page-table capacity is too small: "
             f"need={page_table_width}, have={getattr(scratch, 'max_page_table_width', None)}"
         )
-    if (
-        route == "packed_contiguous"
-        and int(index_k_cache.stride(0)) != int(_PAGED_INDEX_CACHE_ROW_BYTES)
-    ):
-        # DS4 packed KV stores each layer as a strided view into a larger
-        # per-block allocation. The packed-contiguous prefill scorer first gathers
-        # a shared supertile into contiguous scratch; that path is only valid for
-        # physically contiguous page rows. The tiled scorer consumes the runtime
-        # cache stride and keeps the vLLM packed-KV layout intact.
-        route = "paged_tiled"
     use_shared_prefill_scorer = route == "packed_contiguous"
     topk_block_k = (
         int(getattr(binding, "prefill_block_k", 0) or getattr(scratch, "prefill_block_k", 0))

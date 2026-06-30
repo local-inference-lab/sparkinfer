@@ -1,13 +1,15 @@
-"""FlashInfer-shaped SM120 DSV4 MG prefill path.
+"""FlashInfer-shaped SM120 DSV4/GLM MG prefill path.
 
-This is a dedicated DSV4/FP8/main-cache prefill kernel matching FlashInfer's
-multi-head-group launch structure for NUM_HEADS in {32, 64, 128}: one CTA handles
-two HPB=16 head groups and reuses a single NoPE KV gather across both groups.
-The DSV4 RoPE payload is intentionally not bulk-staged into smem; QK-RoPE and
-XV-RoPE read it from global/L2.
+One CTA handles up to two HPB=16 head groups and reuses a single NoPE KV gather
+across them. GLM TP8 uses a half-full head group and packs the accurate PV
+HIGH/LOW residual pair into the lower/upper rows of one m16 MMA. The DSV4 RoPE
+payload is intentionally not bulk-staged into smem; QK-RoPE and XV-RoPE read it
+from global/L2.
 """
 
 from __future__ import annotations
+
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -106,11 +108,13 @@ def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
     if cache.ndim < 2:
         return cache
 
-    # Packed vLLM DS4 cache views are [blocks, page_bytes] with a storage_offset
+    # Packed vLLM cache views retain page subdimensions and a storage_offset
     # into a larger per-block allocation. The MG kernels do raw pointer-offset
-    # indexing, so expose the physical byte span for this layer as a 1-D view
-    # and keep the packed block stride in the explicit stride argument.
-    span = (int(cache.shape[0]) - 1) * int(cache.stride(0)) + int(cache.shape[1])
+    # indexing, so expose this layer's full physical span as a 1-D view and keep
+    # the packed block stride in the explicit stride argument.
+    span = 1
+    for size, stride in zip(cache.shape, cache.stride(), strict=True):
+        span += (int(size) - 1) * int(stride)
     return torch.as_strided(cache, size=(span,), stride=(1,))
 
 
@@ -126,7 +130,11 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * _GLM_IO_STRIDE
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
-    if cache.ndim >= 2:
+    # Contiguous inputs are flattened before launch, so their original rank is
+    # not a physical-layout contract and the standard page stride applies.
+    # Packed vLLM page views are non-contiguous and carry the physical
+    # per-block stride in dimension 0.
+    if not cache.is_contiguous() and cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
             raise ValueError(
@@ -1297,6 +1305,7 @@ class UnifiedPrefillMGKernel:
         row_xor=False,
         head_offset=0,
         valid_hpb=None,
+        pack_hilo_rows=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -1330,6 +1339,7 @@ class UnifiedPrefillMGKernel:
         self.row_xor = bool(row_xor)
         self.head_offset = int(head_offset)
         self.valid_hpb = int(traits.hpb if valid_hpb is None else valid_hpb)
+        self.pack_hilo_rows = bool(pack_hilo_rows)
         # MG head-group count (1 for heads==16, 2 for heads % 32 == 0). Derived
         # from the layout (heads_per_cta // hpb) and threaded as a compile-time
         # const so every group-1 op const_expr-elides for n_hg==1.
@@ -1585,8 +1595,6 @@ class UnifiedPrefillMGKernel:
         q_nope_bf16_g1 = q_nope_bf16_addr + Int32(L.q_nope_bf16_group_bytes)
         reduce_g0 = reduce_addr
         reduce_g1 = reduce_addr + Int32(L.reduce_group_bytes)
-        w_fp8_g0 = w_fp8_addr
-        w_fp8_g1 = w_fp8_addr + Int32(L.w_fp8_group_bytes)
         sm_p_g0 = sm_p_full_addr
         sm_p_g1 = sm_p_full_addr + Int32(L.sm_p_full_group_bytes)
         # GLM calls the per-group decode s6_xv_nope, which expects a CONTIGUOUS
@@ -2236,7 +2244,9 @@ class UnifiedPrefillMGKernel:
                         )
                         w_head_sc_view_all[slot_hs] = Float32(0.0)
                         i_hs += Int32(self.math_threads)
-                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
                     acc0 = s6_xv_nope(
                         w_pre0,
                         acc0,
@@ -2260,6 +2270,7 @@ class UnifiedPrefillMGKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         valid_hpb=self.valid_hpb,
+                        pack_hilo_rows=self.pack_hilo_rows,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         acc1 = s6_xv_nope(
@@ -2601,6 +2612,14 @@ def _sparse_mla_prefill_mg_flat_launch(
             f"heads_per_cta={heads_per_cta} (or active_heads==hpb//2 with "
             f"mg_n_hg==1 for the 8-head shard); got active_heads={active_heads}"
         )
+    pack_hilo_rows = (
+        int(model_type) == int(ModelType.GLM_NSA)
+        and int(scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        and int(mg_n_hg) == 1
+        and valid_hpb == 8
+        and os.environ.get("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
+        not in ("0", "false", "False", "off")
+    )
     # DSV4 dual-cache MG: the union puts tile 0 in the MAIN section, so
     # num_main_tiles MUST be >= 1 (topk==128 => 2). All-extra (num_main_tiles==0)
     # has no extra-prologue arm and is forbidden.
@@ -2630,6 +2649,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         row_xor=bool(row_xor),
         head_offset=head_offset,
         valid_hpb=valid_hpb,
+        pack_hilo_rows=pack_hilo_rows,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     base_args = (
@@ -2664,6 +2684,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
         key_field("valid_hpb", int(valid_hpb)),
+        key_field("pack_hilo_rows", int(pack_hilo_rows)),
         key_field("num_tiles", int(num_tiles)),
         key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),

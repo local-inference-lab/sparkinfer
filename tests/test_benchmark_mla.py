@@ -85,6 +85,44 @@ def test_target_prefill64k_bs1_preset_sets_target_shape() -> None:
     assert args.graph_width == 65536
 
 
+def test_target_glm52_prefill4k_ctx16k_preset_sets_target_shape() -> None:
+    args = benchmark_mla._parse_args(
+        ["--preset", benchmark_mla.TARGET_GLM52_PREFILL4K_CTX16K_PRESET]
+    )
+
+    assert args.modes == "prefill"
+    assert args.batch_sizes == "1"
+    assert args.cache_lens == "16384"
+    assert args.verify_q_lens == "4096"
+    assert args.topk_cap == 2048
+    assert args.graph_width == 16384
+    assert args.use_tiled_topk
+    assert args.prefill_indexer_layout == "paged"
+    assert args.cache_page_stride_bytes == 0
+
+
+def test_target_glm52_preset_preserves_explicit_packed_stride_regression() -> None:
+    args = benchmark_mla._parse_args(
+        [
+            "--preset",
+            benchmark_mla.TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
+            "--cache-page-stride-bytes",
+            "-1",
+        ]
+    )
+
+    assert args.cache_page_stride_bytes == -1
+
+
+def test_glm52_all_layer_cache_bytes_match_layer_page_contract() -> None:
+    cfg = benchmark_mla._load_glm_contract_config(tp_size=8, tp_rank=0)
+
+    assert cfg.index_cache_page_bytes == 8_448
+    assert cfg.mla_cache_page_bytes == 41_984
+    assert cfg.all_layer_cache_block_bytes == 3_933_696
+    assert benchmark_mla._resolve_cache_page_stride_bytes(-1, cfg) == 3_933_696
+
+
 def test_render_case_line_reports_public_step_metrics() -> None:
     report = benchmark_mla.CaseReport(
         case=benchmark_mla.DecodeCase(mode="prefill", batch_size=4, cache_len=32768, topk=2048, q_len=16384),
@@ -101,7 +139,7 @@ def test_render_case_line_reports_public_step_metrics() -> None:
 
     line = benchmark_mla._render_case_line(report)
 
-    assert "glm51-prefill tp8" in line
+    assert "glm52-prefill tp8" in line
     assert "bs= 4" in line
     assert "q=16384" in line
     assert "ctx= 32768" in line
@@ -140,7 +178,7 @@ def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
 
     line = benchmark_mla._render_case_line(report)
 
-    assert "glm51-decode tp8" in line
+    assert "glm52-decode tp8" in line
     assert "ctx=131072" in line
     assert "rowctx= 32768-131072" in line
 
@@ -198,7 +236,7 @@ def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert "glm51-" not in captured.out
+    assert "glm52-" not in captured.out
     assert "Summary" not in captured.out
     assert "synthetic failure" in captured.err
 
@@ -227,7 +265,7 @@ def test_main_prints_buffered_case_lines_and_summary(monkeypatch, capsys) -> Non
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert "glm51-prefill tp8" in captured.out
+    assert "glm52-prefill tp8" in captured.out
     assert "Summary" in captured.out
     assert captured.err == ""
 

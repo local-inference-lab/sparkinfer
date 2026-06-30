@@ -58,6 +58,7 @@ from b12x.cute.fp4 import (
     byte_perm,
     cvt_f32_to_e4m3,
     fabs_f32,
+    f16x2_to_f32x2,
     fmax_f32,
     fmin_f32,
     fp8_e4m3_to_f32,
@@ -150,6 +151,93 @@ def _u32_to_f32(a: Uint32, *, loc=None, ip=None) -> Float32:
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def _cvt_f32x2_to_e4m3x2(
+    v0: Float32,
+    v1: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Convert two f32 values to packed E4M3 with one native conversion."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(v0).ir_value(loc=loc, ip=ip),
+                Float32(v1).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 fp8_pair;
+                cvt.rn.satfinite.e4m3x2.f32 fp8_pair, $2, $1;
+                cvt.u32.u16 $0, fp8_pair;
+            }
+            """,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e4m3x2_to_f16x2(
+    packed: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Convert two packed E4M3 values to packed F16 with one instruction."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 fp8_pair;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 $0, fp8_pair;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_shared_u16(
+    smem_addr: Int32,
+    value: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store the low 16 bits of ``value`` to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.u16 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -784,6 +872,7 @@ def s6_xv_nope(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,
     valid_hpb: cutlass.Constexpr = 16,
+    pack_hilo_rows: cutlass.Constexpr = False,
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -811,6 +900,10 @@ def s6_xv_nope(
     sidesteps this with a bf16 P.V MMA; the residual-split keeps the unified e4m3
     W.V MMA infrastructure (DSV4 shares it at W_PASSES=1, byte-identical). The
     fp32 V scale is folded into BOTH W passes via the w_head_sc normalizer.
+    For an eight-head TP8 shard, ``pack_hilo_rows`` stores HIGH in MMA rows
+    0..7 and LOW in the otherwise-unused rows 8..15. One m16 MMA then produces
+    both components, preserving the residual-split math while replacing the
+    two serial MMAs with one.
     ``nt_per_warp_xv`` (const_expr) tiles each V_CHUNK across N_WARPS*8 columns
     NT times: GLM's 128-dim V_CHUNK needs NT=2 (8 warps x 8 dims = 64 per nt)."""
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -854,7 +947,15 @@ def s6_xv_nope(
         vc = i // Int32(valid_hpb)
         h = i - vc * Int32(valid_hpb)
         slot = vc * Int32(hpb) + h
-        w_head_sc_view[slot] = fmax_f32(w_head_sc_view[slot], Float32(1e-10)) * Float32(1.0 / _FP8_MAX)
+        scale = fmax_f32(w_head_sc_view[slot], Float32(1e-10)) * Float32(
+            1.0 / _FP8_MAX
+        )
+        w_head_sc_view[slot] = scale
+        if cutlass.const_expr(pack_hilo_rows):
+            # The upper eight head slots are unused by a TP8 shard. Cache the
+            # reciprocal there once per (V chunk, head), replacing the same
+            # reciprocal redundantly computed by every candidate lane/warp.
+            w_head_sc_view[slot + Int32(8)] = Float32(1.0) / scale
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
@@ -906,6 +1007,72 @@ def s6_xv_nope(
                 if cutlass.const_expr(hi):
                     acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
                     acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
+        return acc_nope
+
+    if cutlass.const_expr(pack_hilo_rows):
+        # GLM TP8: valid_hpb==8 leaves the upper half of every m16 A tile idle.
+        # Put the residual for head h in row h+8, then add the corresponding
+        # upper output fragment to the lower one. The same per-head scale
+        # applies to both rows because LOW is a residual in normalized-W space.
+        for vc in cutlass.range_constexpr(n_v_chunks):
+            w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+            si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid + Int32(8)]
+            sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+            vsc0 = _vsc(cand_e0, vc)
+            vsc1 = _vsc(cand_e1, vc)
+            wn00 = w_pre[0] * vsc0 * si0
+            wn01 = w_pre[1] * vsc1 * si0
+            vc00 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn00))
+            vc01 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn01))
+            fhi2 = _cvt_f32x2_to_e4m3x2(vc00, vc01)
+            hi00, hi01 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi2))
+            resid00 = vc00 - hi00
+            resid01 = vc01 - hi01
+            resid00 = fmax_f32(
+                Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid00)
+            )
+            resid01 = fmax_f32(
+                Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid01)
+            )
+            flo2 = _cvt_f32x2_to_e4m3x2(resid00, resid01)
+            _st_shared_u16(
+                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0,
+                fhi2,
+            )
+            _st_shared_u16(
+                w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
+                flo2,
+            )
+            cute.arch.barrier(**bar_kw)
+
+            a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+            a_col = (lane >> Int32(4)) * Int32(16)
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                dim = (
+                    Int32(vc) * Int32(v_chunk)
+                    + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                )
+                xv0 = Float32(0.0)
+                xv1 = Float32(0.0)
+                xv2 = Float32(0.0)
+                xv3 = Float32(0.0)
+                for kstep in cutlass.range_constexpr(bi // 32):
+                    ko = Int32(kstep) * Int32(32)
+                    a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                    b0, b1 = _d2_load_b_fp8(
+                        kv_fp8_base_addr,
+                        ko,
+                        dim,
+                        lane,
+                        kv_smem_stride=kv_smem_stride,
+                    )
+                    xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                    )
+                at = vc * nt_per_warp_xv + nt
+                acc_nope[at][0] = acc_nope[at][0] + (xv0 + xv2) * sc0
+                acc_nope[at][1] = acc_nope[at][1] + (xv1 + xv3) * sc0
         return acc_nope
 
     # GLM (ARBITRARY_FP32, P10f): 2-pass W (HIGH + LOW e4m3 residual) -> ~7 mantissa

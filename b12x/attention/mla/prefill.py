@@ -52,7 +52,11 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * _GLM_KV_GMEM_STRIDE
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
-    if cache.ndim >= 2:
+    # Contiguous inputs are flattened before launch, so their original rank is
+    # not a physical-layout contract and the standard page stride applies.
+    # Only packed, non-contiguous vLLM views preserve a real per-block stride in
+    # dimension 0.
+    if not cache.is_contiguous() and cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
             raise ValueError(
@@ -282,7 +286,10 @@ def run_unified_prefill(
     # MG_N_HG HPB head groups, sharing the KV gather), differing only in the math
     # arms (post-MMA fp32 QK scale, raw-V + 2-pass-W XV, no XV-rope) and the
     # 656/528 KV geometry -- all const_expr-selected in the SAME MG kernel. Route
-    # GLM prefill OFF the slow per-head-block decode-reuse path onto MG:
+    # GLM prefill uses MG for every supported shard. The TP8 / eight-local-head
+    # case keeps VALID_HPB=8; its PV path packs HIGH and LOW residual rows into
+    # the two halves of the otherwise half-empty m16 tile:
+    #   8 heads               -> MG_N_HG=1 + VALID_HPB=8
     #   paired 32-head prefix -> MG_N_HG=2
     #   optional 16-head tail -> MG_N_HG=1
     #   optional 8-head tail  -> MG_N_HG=1 + VALID_HPB=8

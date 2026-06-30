@@ -229,6 +229,32 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
     assert contiguous_plan.layout.max_k_rows == 1024
 
 
+def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
+    common = dict(
+        device="cpu",
+        source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+        num_q_heads=32,
+        max_q_rows=4096,
+        max_page_table_width=256,
+        topk=2048,
+        mode="prefill",
+        shared_page_table=True,
+    )
+    automatic = plan_indexer_scratch(B12XIndexerScratchCaps(**common))
+    explicit = plan_indexer_scratch(
+        B12XIndexerScratchCaps(**common, supertile_k=32768)
+    )
+
+    assert automatic.layout.supertile_tokens == 16384
+    assert automatic.layout.gather_k_rows == 16384
+    assert explicit.layout.supertile_tokens == 32768
+    assert explicit.layout.gather_k_rows == 32768
+    assert automatic.layout.nbytes < explicit.layout.nbytes
+
+
 def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
     context_tokens = 256 * 1024
     supertile_context_tokens = 32 * 1024

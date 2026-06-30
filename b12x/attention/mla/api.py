@@ -104,7 +104,7 @@ def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
         return
     min_offset = int(tensor.storage_offset())
     max_offset = int(tensor.storage_offset())
-    for size, stride in zip(tensor.shape, tensor.stride()):
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
         extent = (int(size) - 1) * int(stride)
         if extent >= 0:
             max_offset += extent
@@ -117,6 +117,21 @@ def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
             f"stride={tuple(tensor.stride())} storage_offset={int(tensor.storage_offset())} "
             f"storage_elems={storage_elems}"
         )
+
+
+def _is_supported_packed_kv_cache_view(
+    tensor: torch.Tensor,
+    *,
+    page_size: int,
+) -> bool:
+    if tensor.ndim != 3 or int(tensor.shape[1]) != int(page_size):
+        return False
+    if int(tensor.stride(2)) != 1:
+        return False
+    if int(tensor.stride(1)) != int(tensor.shape[2]):
+        return False
+    page_elems = int(tensor.shape[1]) * int(tensor.shape[2])
+    return int(tensor.stride(0)) >= page_elems
 
 
 def _env_flag(name: str) -> bool:
@@ -466,7 +481,15 @@ def _run_sparse_mla(
     if not q_all.is_contiguous():
         raise ValueError("q_all must be contiguous for sparse MLA")
     if not kv_cache.is_contiguous():
-        raise ValueError("kv_cache must be contiguous for sparse MLA")
+        if not _is_supported_packed_kv_cache_view(
+            kv_cache,
+            page_size=int(workspace.page_size),
+        ):
+            raise ValueError(
+                "kv_cache must be contiguous or a packed page-strided view for sparse MLA; "
+                f"got shape={tuple(kv_cache.shape)} stride={tuple(kv_cache.stride())}"
+            )
+        _validate_tensor_storage_bounds(kv_cache, name="sparse MLA kv_cache")
     if not selected_indices.is_contiguous():
         raise ValueError("selected indices must be contiguous for sparse MLA")
     if not cache_seqlens_int32.is_contiguous():

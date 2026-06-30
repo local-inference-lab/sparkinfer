@@ -1244,9 +1244,9 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
 
 def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
     # Contiguous cache can use the historical flat view. Packed vLLM cache views
-    # are non-contiguous [blocks, page_bytes] tensors whose storage_offset points
-    # at this layer's payload inside a larger packed block. Do not reshape those:
-    # reshape would materialize a contiguous copy and lose the packed layout.
+    # are non-contiguous tensors whose storage_offset points at this layer's
+    # payload inside a larger packed block. Do not reshape those: reshape would
+    # materialize a contiguous copy and lose the packed layout.
     if cache.is_contiguous():
         return cache.reshape(-1)
     if cache.ndim < 2:
@@ -1257,7 +1257,9 @@ def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
     # pointer+offset arithmetic stays raw-address based while preserving the
     # original storage_offset. The explicit stride_kv_block argument still
     # carries the packed block stride; this view only defines the base pointer.
-    span = (int(cache.shape[0]) - 1) * int(cache.stride(0)) + int(cache.shape[1])
+    span = 1
+    for size, stride in zip(cache.shape, cache.stride(), strict=True):
+        span += (int(size) - 1) * int(stride)
     return torch.as_strided(cache, size=(span,), stride=(1,))
 
 
@@ -1273,7 +1275,11 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * _GLM_KV_GMEM_STRIDE
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
-    if cache.ndim >= 2:
+    # Contiguous inputs are flattened before launch, so their original rank is
+    # not a physical-layout contract and the standard page stride applies.
+    # Packed vLLM page views are non-contiguous and carry the physical
+    # per-block stride in dimension 0.
+    if not cache.is_contiguous() and cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
             raise ValueError(

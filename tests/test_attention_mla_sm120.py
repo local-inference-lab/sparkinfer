@@ -66,6 +66,61 @@ _NUM_Q_HEADS = 8
 _SM_SCALE = 1.0 / math.sqrt(_GLM_Q_HEAD_DIM)
 
 
+def test_cache_block_stride_distinguishes_flat_contiguous_and_packed_views() -> None:
+    from b12x.attention.mla import kernel as decode_kernel
+    from b12x.attention.mla import prefill as prefill_dispatch
+    from b12x.attention.mla import prefill_mg
+    from b12x.attention.mla.traits import ModelType
+
+    page_size = 64
+    payload = page_size * _GLM_KV_BYTES_PER_TOKEN
+    # This is the token-major rank-3 shape used by the GLM reference and
+    # benchmark. Its stride(0) is one token, not one physical cache block.
+    contiguous = torch.empty(
+        (2 * page_size, 1, _GLM_KV_BYTES_PER_TOKEN), dtype=torch.uint8
+    )
+    physical_stride = payload + 256
+    packed_storage = torch.empty((2, physical_stride), dtype=torch.uint8)
+    packed_view = packed_storage[:, :payload]
+    packed_rank3 = torch.as_strided(
+        packed_storage,
+        size=(2, page_size, _GLM_KV_BYTES_PER_TOKEN),
+        stride=(physical_stride, _GLM_KV_BYTES_PER_TOKEN, 1),
+    )
+    assert contiguous.is_contiguous()
+    assert not packed_view.is_contiguous()
+    assert not packed_rank3.is_contiguous()
+    assert mla_api._is_supported_packed_kv_cache_view(
+        packed_rank3,
+        page_size=page_size,
+    )
+
+    helpers = (
+        lambda cache: decode_kernel._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            model_type=int(ModelType.GLM_NSA),
+        ),
+        lambda cache: prefill_dispatch._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            model_type=ModelType.GLM_NSA,
+        ),
+        lambda cache: prefill_mg._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            is_glm=True,
+        ),
+    )
+    for resolve in helpers:
+        assert resolve(contiguous) == payload
+        assert resolve(packed_view) == physical_stride
+
+    expected_span = physical_stride + payload
+    assert decode_kernel._cache_base_tensor(packed_rank3).numel() == expected_span
+    assert prefill_mg._cache_base_tensor(packed_rank3).numel() == expected_span
+
+
 def sparse_mla_decode_forward(*, workspace=None, q_all=None, page_table_1=None, cache_seqlens_int32=None, nsa_cache_seqlens_int32=None, **kwargs):
     if workspace is not None:
         binding = workspace.bind_sparse_mla(
@@ -1022,6 +1077,84 @@ def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
     assert cos > 0.999, f"DSV4 prefill heads=8 O cos={cos}"
     assert (got - exp).abs().max().item() < 2e-2
     assert (got_lse - exp_lse).abs().max().item() < 5e-2
+
+
+@torch.inference_mode()
+def test_unified_prefill_glm_tp8_topk2048_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM 5.x TP8 has eight local attention heads and a 2048-token sparse
+    selection.  Exercise that serving shape directly, including the
+    VALID_HPB=8 tail and both contiguous and vLLM packed page-strided caches."""
+    device = require_sm120_sparse_mla()
+    from b12x.attention.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads, topk = 2, 8, 2048
+    case = glm_ref.make_glm_decode_case(
+        num_heads=num_heads,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=topk // _GLM_PAGE,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=False,
+        seed=52_820_488,
+        device=device,
+    )
+
+    contiguous_cache = case["kv_cache"].contiguous()
+    num_blocks = topk // _GLM_PAGE
+    page_bytes = _GLM_PAGE * _GLM_KV_BYTES_PER_TOKEN
+    packed_stride = page_bytes + 4096
+    packed_storage = torch.empty(
+        (num_blocks - 1) * packed_stride + page_bytes,
+        dtype=torch.uint8,
+        device=device,
+    )
+    packed_cache = torch.as_strided(
+        packed_storage,
+        size=(num_blocks, _GLM_PAGE, _GLM_KV_BYTES_PER_TOKEN),
+        stride=(packed_stride, _GLM_KV_BYTES_PER_TOKEN, 1),
+    )
+    packed_cache.copy_(
+        contiguous_cache.view(num_blocks, _GLM_PAGE, _GLM_KV_BYTES_PER_TOKEN)
+    )
+    assert not packed_cache.is_contiguous()
+
+    def run(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        result = run_unified_prefill(
+            q=case["q"].contiguous(),
+            kv_cache=kv_cache,
+            topk_indices=case["topk_indices"].contiguous(),
+            sm_scale=case["sm_scale"],
+            page_block_size=_GLM_PAGE,
+        )
+        torch.cuda.synchronize()
+        return result
+
+    # The TP8 packed-row path is an exact reorganization of the accurate
+    # two-pass PV math: HIGH occupies rows 0..7 and LOW rows 8..15 of one m16
+    # tile. Gate its serving default against the former path before comparing
+    # either result to the independent reference.
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "0")
+    legacy_output, legacy_lse = run(contiguous_cache)
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
+    optimized_output, optimized_lse = run(contiguous_cache)
+    assert torch.equal(optimized_output, legacy_output)
+    assert torch.equal(optimized_lse, legacy_lse)
+
+    expected = case["expected_O"].float()
+    packed_output, packed_lse = run(packed_cache)
+    for output, lse in (
+        (optimized_output, optimized_lse),
+        (packed_output, packed_lse),
+    ):
+        got = output.float()
+        assert torch.isfinite(got).all()
+        assert torch.isfinite(lse).all()
+        assert (output != 0).any()
+        assert _cosine(got, expected) > 0.995
+        assert (got - expected).abs().max().item() < 3e-2
+        assert (lse.float() - case["expected_lse"].float()).abs().max().item() < 5e-2
 
 
 @torch.inference_mode()

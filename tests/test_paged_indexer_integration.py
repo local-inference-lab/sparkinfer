@@ -485,6 +485,7 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
         seqlens=graph_seqlens,
         supertile_k=supertile_k,
         shared_page_table=True,
+        route="packed_contiguous",
     )
     reference_binding = _bind_paged_indexer(
         device=device,

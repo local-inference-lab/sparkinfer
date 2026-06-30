@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode plus eager-prefill chunks."""
+"""Benchmark GLM sparse-MLA/indexer decode and chunked-prefill serving shapes."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
+import triton
+import triton.language as tl
 
 from b12x.attention.mla.legacy.split import (
     run_sparse_mla_split_decode_forward,
@@ -50,10 +52,15 @@ from b12x.attention.indexer.persistent_topk import (
     supports_persistent_topk2048,
 )
 from b12x.attention.indexer import (
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_PAGED,
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
+    index_topk_fp8,
+    plan_indexer_scratch,
+    prepare_paged_indexer_metadata,
     resolve_contiguous_prefill_block_k,
     paged_decode_logits,
     contiguous_logits,
@@ -83,7 +90,16 @@ except Exception:  # pragma: no cover - optional dependency
     _sgl_fast_topk_transform_ragged_fused = None
 
 
-MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
+GLM52_CONTRACT = {
+    "num_hidden_layers": 78,
+    "num_attention_heads": 64,
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "qk_nope_head_dim": 192,
+    "qk_rope_head_dim": 64,
+    "kv_lora_rank": 512,
+}
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 65536, 131072)
 DEFAULT_PREFILL_Q_LENS = (2048, 16384)
@@ -93,6 +109,7 @@ DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
 TARGET_PREFILL64K_BS1_PRESET = "target-prefill64k-bs1"
+TARGET_GLM52_PREFILL4K_CTX16K_PRESET = "target-glm52-prefill4k-ctx16k"
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
@@ -114,8 +131,110 @@ def _align_down(value: int, multiple: int) -> int:
     return (value // multiple) * multiple
 
 
+@triton.jit
+def _remap_logical_topk_to_physical_kernel(
+    logical_indices,
+    real_page_table,
+    physical_indices,
+    numel,
+    page_table_width,
+    page_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < numel
+    logical = tl.load(logical_indices + offsets, mask=valid, other=-1)
+    page_col = logical // page_size
+    valid_logical = valid & (logical >= 0) & (page_col < page_table_width)
+    page_id = tl.load(
+        real_page_table + page_col,
+        mask=valid_logical,
+        other=-1,
+    )
+    physical = page_id * page_size + logical % page_size
+    physical = tl.where(valid_logical & (page_id >= 0), physical, -1)
+    tl.store(physical_indices + offsets, physical, mask=valid)
+
+
+def _remap_logical_topk_to_physical(
+    *,
+    logical_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    physical_indices: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    if physical_indices.shape != logical_indices.shape:
+        raise ValueError("physical and logical top-k buffers must have the same shape")
+    numel = logical_indices.numel()
+    _remap_logical_topk_to_physical_kernel[(triton.cdiv(numel, 256),)](
+        logical_indices,
+        real_page_table,
+        physical_indices,
+        numel,
+        int(real_page_table.shape[1]),
+        page_size=int(page_size),
+        BLOCK=256,
+        num_warps=4,
+    )
+    return physical_indices
+
+
+def _make_vllm_packed_cache_views(
+    *,
+    index_k_cache: torch.Tensor,
+    mla_kv_cache: torch.Tensor,
+    page_size: int,
+    block_stride_bytes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy one index/MLA layer pair into vLLM-style packed block views."""
+    if block_stride_bytes == 0:
+        return index_k_cache, mla_kv_cache
+    if index_k_cache.dtype != torch.uint8 or mla_kv_cache.dtype != torch.uint8:
+        raise ValueError("packed vLLM cache views require uint8 caches")
+    if index_k_cache.ndim != 2 or mla_kv_cache.ndim != 3:
+        raise ValueError("unexpected index/MLA cache ranks for packed vLLM views")
+    num_pages = int(index_k_cache.shape[0])
+    if int(mla_kv_cache.shape[0]) % int(page_size) != 0:
+        raise ValueError("MLA cache token count must be divisible by page_size")
+    if int(mla_kv_cache.shape[0]) // int(page_size) != num_pages:
+        raise ValueError("index and MLA caches must contain the same page count")
+
+    index_page_bytes = int(index_k_cache.shape[1])
+    mla_record_bytes = int(mla_kv_cache.shape[2])
+    mla_page_bytes = int(page_size) * mla_record_bytes
+    occupied_bytes = index_page_bytes + mla_page_bytes
+    if block_stride_bytes < occupied_bytes:
+        raise ValueError(
+            f"packed block stride {block_stride_bytes} is smaller than the "
+            f"index+MLA page bytes {occupied_bytes}"
+        )
+
+    backing_bytes = (num_pages - 1) * block_stride_bytes + occupied_bytes
+    backing = torch.empty(
+        backing_bytes,
+        dtype=torch.uint8,
+        device=index_k_cache.device,
+    )
+    strided_index = torch.as_strided(
+        backing,
+        size=(num_pages, index_page_bytes),
+        stride=(block_stride_bytes, 1),
+    )
+    strided_mla = torch.as_strided(
+        backing[index_page_bytes:],
+        size=(num_pages, int(page_size), mla_record_bytes),
+        stride=(block_stride_bytes, mla_record_bytes, 1),
+    )
+    strided_index.copy_(index_k_cache)
+    strided_mla.copy_(
+        mla_kv_cache.view(num_pages, int(page_size), mla_record_bytes)
+    )
+    return strided_index, strided_mla
+
+
 @dataclass(frozen=True)
 class GLMDecodeContractConfig:
+    num_hidden_layers: int
     num_attention_heads: int
     index_n_heads: int
     index_head_dim: int
@@ -138,6 +257,28 @@ class GLMDecodeContractConfig:
     @property
     def sm_scale(self) -> float:
         return (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
+    @property
+    def index_cache_page_bytes(self) -> int:
+        scale_bytes = (self.index_head_dim // 128) * 4
+        return self.page_size * (self.index_head_dim + scale_bytes)
+
+    @property
+    def mla_cache_page_bytes(self) -> int:
+        scale_bytes = (self.kv_lora_rank // 128) * 4
+        rope_bytes = self.qk_rope_head_dim * 2
+        return self.page_size * (self.kv_lora_rank + scale_bytes + rope_bytes)
+
+    @property
+    def all_layer_cache_block_bytes(self) -> int:
+        # Useful as a cross-layer packed-layout stress case. Normal GLM-5.2
+        # serving does not use this stride: vLLM groups its full-MLA main and
+        # index caches into one UniformTypeKVCacheSpecs group, then allocates
+        # one contiguous tensor per cache layer. Multi-group layouts such as
+        # DeepSeek V4 can instead expose cross-layer block-strided views.
+        return self.num_hidden_layers * (
+            self.index_cache_page_bytes + self.mla_cache_page_bytes
+        )
 
 
 @dataclass(frozen=True)
@@ -192,6 +333,8 @@ class SanityMetrics:
 class CaseReport:
     case: DecodeCase
     graph_width: int = 0
+    cache_page_stride_bytes: int = 0
+    step_samples_us: tuple[float, ...] = ()
     metadata_us: float = 0.0
     replay_us: float = 0.0
     indexer_us: float = 0.0
@@ -226,15 +369,18 @@ class BenchmarkFailure(RuntimeError):
         self.case = case
 
 
-def _require_glm_config() -> pathlib.Path:
-    config_path = MODEL_PATH / "config.json"
-    if not config_path.exists():
-        raise SystemExit(f"GLM-5.1 config not found at {config_path}")
-    return config_path
-
-
-def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContractConfig:
-    config = json.loads(_require_glm_config().read_text())
+def _load_glm_contract_config(
+    *,
+    tp_size: int,
+    tp_rank: int,
+    model_config: pathlib.Path | None = None,
+) -> GLMDecodeContractConfig:
+    if model_config is None:
+        config = GLM52_CONTRACT
+    else:
+        if not model_config.is_file():
+            raise SystemExit(f"model config not found at {model_config}")
+        config = json.loads(model_config.read_text())
     num_attention_heads = int(config["num_attention_heads"])
     if num_attention_heads % tp_size != 0:
         raise SystemExit(
@@ -243,6 +389,7 @@ def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContrac
     if tp_rank < 0 or tp_rank >= tp_size:
         raise SystemExit(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
     return GLMDecodeContractConfig(
+        num_hidden_layers=int(config["num_hidden_layers"]),
         num_attention_heads=num_attention_heads,
         index_n_heads=int(config["index_n_heads"]),
         index_head_dim=int(config["index_head_dim"]),
@@ -255,6 +402,26 @@ def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContrac
     )
 
 
+def _resolve_cache_page_stride_bytes(
+    value: int,
+    cfg: GLMDecodeContractConfig,
+) -> int:
+    value = int(value)
+    if value == -1:
+        return cfg.all_layer_cache_block_bytes
+    if value < 0:
+        raise ValueError(
+            f"cache_page_stride_bytes must be -1, 0, or positive, got {value}"
+        )
+    minimum = cfg.index_cache_page_bytes + cfg.mla_cache_page_bytes
+    if value != 0 and value < minimum:
+        raise ValueError(
+            f"cache_page_stride_bytes={value} is smaller than one index+MLA "
+            f"page pair ({minimum} bytes)"
+        )
+    return value
+
+
 def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
 
@@ -265,16 +432,31 @@ def _format_csv_ints(values: tuple[int, ...]) -> str:
 
 def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.preset == "none":
-        return args
-    if args.preset != TARGET_PREFILL64K_BS1_PRESET:
+        pass
+    elif args.preset == TARGET_PREFILL64K_BS1_PRESET:
+        args.modes = "prefill"
+        args.batch_sizes = "1"
+        args.cache_lens = "65536"
+        args.verify_q_lens = "2048"
+        args.topk_cap = 2048
+        args.graph_width = 65536
+    elif args.preset == TARGET_GLM52_PREFILL4K_CTX16K_PRESET:
+        args.modes = "prefill"
+        args.batch_sizes = "1"
+        args.cache_lens = "16384"
+        args.verify_q_lens = "4096"
+        args.topk_cap = 2048
+        args.graph_width = 16384
+        args.use_tiled_topk = True
+        args.prefill_indexer_layout = "paged"
+        # Current vLLM's one-group UniformTypeKVCacheSpecs branch allocates
+        # every normal GLM main/index cache as its own contiguous tensor.
+        if args.cache_page_stride_bytes is None:
+            args.cache_page_stride_bytes = 0
+    else:
         raise ValueError(f"unknown preset {args.preset!r}")
-
-    args.modes = "prefill"
-    args.batch_sizes = "1"
-    args.cache_lens = "65536"
-    args.verify_q_lens = "2048"
-    args.topk_cap = 2048
-    args.graph_width = 65536
+    if args.cache_page_stride_bytes is None:
+        args.cache_page_stride_bytes = 0
     return args
 
 
@@ -885,6 +1067,7 @@ def _run_decode_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    cache_page_stride_bytes: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
     decode_topk_backend: str,
@@ -918,6 +1101,12 @@ def _run_decode_case(
         device=device,
         pool_locs=pool_locs,
         pool_tokens=pool_tokens,
+    )
+    index_k_cache, kv_cache = _make_vllm_packed_cache_views(
+        index_k_cache=index_k_cache,
+        mla_kv_cache=kv_cache,
+        page_size=cfg.page_size,
+        block_stride_bytes=cache_page_stride_bytes,
     )
     live_candidate_page_table = make_dense_candidate_page_table(
         batch_size=case.batch_size,
@@ -1213,6 +1402,15 @@ def _run_decode_case(
     return CaseReport(
         case=case,
         graph_width=graph_width,
+        cache_page_stride_bytes=cache_page_stride_bytes,
+        step_samples_us=tuple(
+            metadata_us + replay_us
+            for metadata_us, replay_us in zip(
+                step_stats["metadata_us"],
+                step_stats["replay_us"],
+                strict=True,
+            )
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
@@ -1238,14 +1436,19 @@ def _run_prefill_or_verify_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    cache_page_stride_bytes: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
     use_tiled_topk: bool,
+    prefill_indexer_layout: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
     if case.q_len <= 1:
         raise ValueError(f"prefill q_len must be > 1, got {case.q_len}")
+    use_paged_prefill = case.mode == "prefill" and prefill_indexer_layout == "paged"
+    if use_paged_prefill and case.batch_size != 1:
+        raise ValueError("paged prefill indexer benchmark requires batch_size=1")
     graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
     aligned_graph_width = _align_up(graph_width, cfg.page_size)
     pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
@@ -1274,6 +1477,12 @@ def _run_prefill_or_verify_case(
         pool_locs=pool_locs,
         pool_tokens=pool_tokens,
     )
+    index_k_cache, kv_cache = _make_vllm_packed_cache_views(
+        index_k_cache=index_k_cache,
+        mla_kv_cache=kv_cache,
+        page_size=cfg.page_size,
+        block_stride_bytes=cache_page_stride_bytes,
+    )
     base_real_page_table = make_dense_real_page_table(
         batch_size=case.batch_size,
         token_locs=pool_locs,
@@ -1285,10 +1494,15 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     ).repeat_interleave(case.q_len)
-    live_real_page_table = base_real_page_table.index_select(
-        0,
-        query_row_to_batch.to(torch.long),
-    ).contiguous()
+    if use_paged_prefill:
+        # vLLM expands the single request's block table across all query rows;
+        # preserving stride(0)==0 is part of the production b12x contract.
+        live_real_page_table = base_real_page_table[:1].expand(case.total_q, -1)
+    else:
+        live_real_page_table = base_real_page_table.index_select(
+            0,
+            query_row_to_batch.to(torch.long),
+        ).contiguous()
     batch_cache_seqlens = torch.full(
         (case.batch_size,),
         case.cache_len,
@@ -1316,18 +1530,31 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     )
-    graph_real_page_table = torch.full(
-        (case.total_q, aligned_graph_width // cfg.page_size),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
+    if use_paged_prefill:
+        graph_real_page_table_storage = torch.full(
+            (1, aligned_graph_width // cfg.page_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        graph_real_page_table = graph_real_page_table_storage.expand(case.total_q, -1)
+    else:
+        graph_real_page_table_storage = None
+        graph_real_page_table = torch.full(
+            (case.total_q, aligned_graph_width // cfg.page_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
-    use_graph_schedule_metadata = uses_paged_mqa_schedule(
-        q_rows=case.total_q,
-        max_pages=graph_real_page_table.shape[1],
+    use_graph_schedule_metadata = (
+        not use_paged_prefill
+        and uses_paged_mqa_schedule(
+            q_rows=case.total_q,
+            max_pages=graph_real_page_table.shape[1],
+        )
     )
     graph_schedule_metadata = (
         torch.empty(
@@ -1352,9 +1579,19 @@ def _run_prefill_or_verify_case(
     graph_contiguous_lengths = torch.empty_like(live_contiguous_lengths)
 
     def prepare_verify_graph() -> None:
-        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
+        if use_paged_prefill:
+            assert graph_real_page_table_storage is not None
+            graph_real_page_table_storage[0, : live_real_page_table.shape[1]].copy_(
+                live_real_page_table[0]
+            )
+        else:
+            graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(
+                live_real_page_table
+            )
         graph_batch_cache_seqlens.copy_(batch_cache_seqlens)
-        graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
+        graph_expanded_cache_seqlens.copy_(
+            live_contiguous_lengths if use_paged_prefill else expanded_cache_seqlens
+        )
         graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
         if graph_schedule_metadata is not None:
             build_paged_mqa_schedule_metadata(
@@ -1369,17 +1606,25 @@ def _run_prefill_or_verify_case(
     contiguous_k_nope = k_nope[pool_locs.to(torch.long)]
     contiguous_k_rope = k_rope[pool_locs.to(torch.long)]
     extend_kv_cache = pack_mla_kv_cache_reference(contiguous_k_nope, contiguous_k_rope)
-    extend_kv_fp8 = _make_extend_kv_fp8(
-        index_k_cache=index_k_cache,
-        real_page_table=base_real_page_table,
-        seq_lens=batch_cache_seqlens,
-        page_size=cfg.page_size,
+    extend_kv_fp8 = (
+        None
+        if use_paged_prefill
+        else _make_extend_kv_fp8(
+            index_k_cache=index_k_cache,
+            real_page_table=base_real_page_table,
+            seq_lens=batch_cache_seqlens,
+            page_size=cfg.page_size,
+        )
     )
     use_runtime_ragged_topk = (
         device.type == "cuda"
         and case.topk == 2048
         and _sgl_fast_topk_transform_ragged_fused is not None
     )
+    paged_prefill_plan = None
+
+    def map_indexer_topk(topk_indices: torch.Tensor) -> torch.Tensor:
+        return topk_indices
 
     if case.mode == "verify":
         base_candidate_page_table = make_dense_candidate_page_table(
@@ -1451,7 +1696,91 @@ def _run_prefill_or_verify_case(
         mla_k_rope = k_rope
         mla_metadata_mode = "target_verify"
         mla_workspace_mode = "verify"
+    elif use_paged_prefill:
+        paged_prefill_plan = plan_indexer_scratch(
+            B12XIndexerScratchCaps(
+                device=device,
+                source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+                num_q_heads=cfg.index_n_heads,
+                max_q_rows=case.total_q,
+                max_page_table_width=graph_real_page_table.shape[1],
+                topk=case.topk,
+                page_size=cfg.page_size,
+                mode="prefill",
+                shared_page_table=True,
+            )
+        )
+        paged_scratch = [
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype in paged_prefill_plan.shapes_and_dtypes()
+        ]
+        paged_metadata = prepare_paged_indexer_metadata(
+            real_page_table=graph_real_page_table,
+            cache_seqlens_int32=graph_expanded_cache_seqlens,
+            expected_num_q_heads=cfg.index_n_heads,
+            build_schedule=False,
+            shared_page_table=True,
+        )
+        paged_binding = paged_prefill_plan.bind(
+            scratch=paged_scratch,
+            real_page_table=paged_metadata.real_page_table,
+            cache_seqlens_int32=paged_metadata.cache_seqlens_int32,
+            expected_num_q_heads=cfg.index_n_heads,
+            shared_page_table=True,
+        )
+        paged_topk_indices = torch.empty(
+            (case.total_q, case.topk), dtype=torch.int32, device=device
+        )
+        paged_topk_scores = torch.empty(
+            (case.total_q, case.topk), dtype=torch.float32, device=device
+        )
+        paged_physical_topk = torch.empty_like(paged_topk_indices)
+
+        def map_indexer_topk(topk_indices: torch.Tensor) -> torch.Tensor:
+            return _remap_logical_topk_to_physical(
+                logical_indices=topk_indices,
+                real_page_table=graph_real_page_table,
+                physical_indices=paged_physical_topk,
+                page_size=cfg.page_size,
+            )
+
+        def run_indexer():
+            return index_topk_fp8(
+                q_fp8=q_fp8,
+                weights=weights.squeeze(-1),
+                index_k_cache=index_k_cache,
+                binding=paged_binding,
+                topk=case.topk,
+                expected_num_q_heads=cfg.index_n_heads,
+                out_indices=paged_topk_indices,
+                out_scores=paged_topk_scores,
+            )
+
+        clear_indexer_caches()
+        actual_topk = run_indexer()
+        torch.cuda.synchronize()
+        expected_topk = graph_expanded_cache_seqlens[:, None] - case.topk + torch.arange(
+            case.topk, dtype=torch.int32, device=device
+        )
+        actual_topk_sorted = torch.sort(actual_topk, dim=1).values
+        if not torch.equal(actual_topk_sorted, expected_topk):
+            mismatch = int((actual_topk_sorted != expected_topk).sum().item())
+            raise BenchmarkFailure(
+                case,
+                f"paged prefill topk mismatch: {mismatch} differing entries",
+            )
+        if not torch.isfinite(paged_topk_scores).all().item():
+            raise BenchmarkFailure(case, "paged prefill topk scores are non-finite")
+        mla_selected_indices = map_indexer_topk(actual_topk)
+        mla_kv_cache = kv_cache
+        mla_k_nope = k_nope
+        mla_k_rope = k_rope
+        mla_metadata_mode = "extend"
+        mla_workspace_mode = "extend"
+        preinitialize_indexer_logits = False
+        _use_tiled_output = True
     else:
+        assert extend_kv_fp8 is not None
         extend_indexer_metadata = IndexerContiguousMetadata(
             k_start=graph_contiguous_k_start,
             k_end=graph_contiguous_k_start + graph_contiguous_lengths,
@@ -1630,7 +1959,7 @@ def _run_prefill_or_verify_case(
         )
 
     def run_step():
-        topk_indices = run_indexer()
+        topk_indices = map_indexer_topk(run_indexer())
         step_binding = mla_workspace.bind(
             q=q_all,
             selected_indices=topk_indices,
@@ -1684,46 +2013,54 @@ def _run_prefill_or_verify_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
-    clear_indexer_caches()
-    indexer_logits_stats = _capture_and_bench_cuda_graph(
-        run_indexer_logits,
-        warmup=warmup,
-        replays=replays,
-        prepare=prepare_verify_graph,
-        l2_flush=l2_flush,
-    )
-    indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
-
-    if case.mode == "verify":
-        def run_indexer_topk():
-            return _select_paged_topk_from_logits(
-                logits=logits_for_topk,
-                page_table_1=base_candidate_page_table,
-                seqlens=graph_expanded_cache_seqlens,
-                topk=case.topk,
-                cu_seqlens_q=cu_seqlens_q,
-                query_row_to_batch=query_row_to_batch,
-            )
-    elif _use_tiled_output:
-        def run_indexer_topk():
-            return _run_tiled_topk()
+    if use_paged_prefill:
+        # The production paged path is a streaming gather+score+top-k contract;
+        # its stages are intentionally not exposed as standalone benchmark APIs.
+        indexer_logits_us = 0.0
+        indexer_topk_us = 0.0
     else:
-        def run_indexer_topk():
-            return _select_ragged_topk_from_logits(
-                logits=logits_for_topk,
-                k_start=graph_contiguous_k_start,
-                lengths=graph_contiguous_lengths,
-                topk=case.topk,
-            )
+        clear_indexer_caches()
+        indexer_logits_stats = _capture_and_bench_cuda_graph(
+            run_indexer_logits,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_verify_graph,
+            l2_flush=l2_flush,
+        )
+        indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
 
-    indexer_topk_stats = _capture_and_bench_cuda_graph(
-        run_indexer_topk,
-        warmup=warmup,
-        replays=replays,
-        prepare=prepare_verify_graph,
-        l2_flush=l2_flush,
-    )
-    indexer_topk_us = statistics.median(indexer_topk_stats["replay_us"])
+        if case.mode == "verify":
+            def run_indexer_topk():
+                return _select_paged_topk_from_logits(
+                    logits=logits_for_topk,
+                    page_table_1=base_candidate_page_table,
+                    seqlens=graph_expanded_cache_seqlens,
+                    topk=case.topk,
+                    cu_seqlens_q=cu_seqlens_q,
+                    query_row_to_batch=query_row_to_batch,
+                )
+        elif _use_tiled_output:
+            def run_indexer_topk():
+                return _run_tiled_topk()
+        else:
+            def run_indexer_topk():
+                return _select_ragged_topk_from_logits(
+                    logits=logits_for_topk,
+                    k_start=graph_contiguous_k_start,
+                    lengths=graph_contiguous_lengths,
+                    topk=case.topk,
+                )
+
+        indexer_topk_stats = _capture_and_bench_cuda_graph(
+            run_indexer_topk,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_verify_graph,
+            l2_flush=l2_flush,
+        )
+        indexer_topk_us = statistics.median(
+            indexer_topk_stats["replay_us"]
+        )
 
     clear_mla_caches()
     prepare_verify_graph()
@@ -1818,7 +2155,11 @@ def _run_prefill_or_verify_case(
         l2_flush=l2_flush,
     )
     indexer_prefill_block_k = None
-    if case.mode == "prefill":
+    if use_paged_prefill:
+        assert paged_prefill_plan is not None
+        indexer_prefill_block_k = paged_prefill_plan.layout.prefill_block_k
+    elif case.mode == "prefill":
+        assert extend_kv_fp8 is not None
         indexer_prefill_block_k = resolve_contiguous_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
@@ -1828,6 +2169,15 @@ def _run_prefill_or_verify_case(
     return CaseReport(
         case=case,
         graph_width=graph_width,
+        cache_page_stride_bytes=cache_page_stride_bytes,
+        step_samples_us=tuple(
+            metadata_us + replay_us
+            for metadata_us, replay_us in zip(
+                step_stats["metadata_us"],
+                step_stats["replay_us"],
+                strict=True,
+            )
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
@@ -1839,9 +2189,17 @@ def _run_prefill_or_verify_case(
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
-        indexer_logits_fill=True if case.mode == "verify" else not skip_indexer_logits_fill,
+        indexer_logits_fill=(
+            True
+            if case.mode == "verify"
+            else False if use_paged_prefill else not skip_indexer_logits_fill
+        ),
         indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
-        indexer_topk_path="tiled" if _use_tiled_output and case.mode == "prefill" else "scatter",
+        indexer_topk_path=(
+            "paged-streaming"
+            if use_paged_prefill
+            else "tiled" if _use_tiled_output and case.mode == "prefill" else "scatter"
+        ),
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
     )
@@ -1854,7 +2212,15 @@ def collect_case_reports(
 ) -> list[CaseReport]:
     if getattr(args, "nsa_prefill_block_k", None) is not None:
         os.environ[_NSA_PREFILL_BLOCK_K_ENV] = args.nsa_prefill_block_k
-    cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
+    cfg = _load_glm_contract_config(
+        tp_size=args.tp_size,
+        tp_rank=args.tp_rank,
+        model_config=args.model_config,
+    )
+    cache_page_stride_bytes = _resolve_cache_page_stride_bytes(
+        args.cache_page_stride_bytes,
+        cfg,
+    )
     device = require_sm120() if device is None else device
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     cases = _build_decode_cases(
@@ -1879,6 +2245,7 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                cache_page_stride_bytes=cache_page_stride_bytes,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 decode_topk_backend=args.decode_topk_backend,
@@ -1893,9 +2260,11 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                cache_page_stride_bytes=cache_page_stride_bytes,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 use_tiled_topk=args.use_tiled_topk,
+                prefill_indexer_layout=args.prefill_indexer_layout,
             )
         )
         case_seed += 17
@@ -1915,10 +2284,18 @@ def _render_case_line(report: CaseReport) -> str:
         row_ctx_desc = (
             f" rowctx={min(report.case.decode_row_cache_lens):6d}-{report.case.cache_len:6d}"
         )
+    sanity_desc = ""
+    if report.mla_sanity is not None:
+        sanity_desc = (
+            f" mla_max_abs={report.mla_sanity.max_abs:.6g}"
+            f" mla_rmse={report.mla_sanity.rmse:.6g}"
+            f" mla_cos={report.mla_sanity.cos:.7f}"
+        )
     return (
-        f"glm51-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
+        f"glm52-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
         f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d}{row_ctx_desc} "
-        f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
+        f"graphw={report.graph_width:6d} cache_stride={report.cache_page_stride_bytes:d} "
+        f"topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
         f"step={report.total_us:8.2f} us | "
         f"total={report.total_us:8.2f} us | "
@@ -1933,6 +2310,7 @@ def _render_case_line(report: CaseReport) -> str:
         f"idx_bk={idx_bk} "
         f"idx_init={fill_flag} "
         f"idx_topk_path={topk_path}"
+        f"{sanity_desc}"
     )
 
 
@@ -1966,13 +2344,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--preset",
-        choices=("none", TARGET_PREFILL64K_BS1_PRESET),
+        choices=(
+            "none",
+            TARGET_PREFILL64K_BS1_PRESET,
+            TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
+        ),
         default="none",
         help=(
-            "shape preset; target-prefill64k-bs1 maps to "
-            "--modes prefill --batch-sizes 1 --cache-lens 65536 "
-            "--verify-q-lens 2048 --topk-cap 2048 --graph-width 65536"
+            "shape preset; target-glm52-prefill4k-ctx16k maps to a vLLM-oriented "
+            "TP8 4096-token chunk at 16k context with top-k 2048 and tiled top-k"
         ),
+    )
+    parser.add_argument(
+        "--model-config",
+        type=pathlib.Path,
+        default=None,
+        help="optional Hugging Face config.json override; default is the built-in GLM-5.2 contract",
     )
     parser.add_argument(
         "--modes",
@@ -2018,6 +2405,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
+    parser.add_argument(
+        "--print-raw-samples",
+        action="store_true",
+        help="print every end-to-end step sample after each case",
+    )
     parser.add_argument("--seed", type=int, default=70_000)
     parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
     parser.add_argument(
@@ -2055,6 +2447,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="benchmark prefill with tiled indexer output consumed directly by the CuTe topk kernel.",
     )
     parser.add_argument(
+        "--prefill-indexer-layout",
+        choices=("contiguous", "paged"),
+        default="contiguous",
+        help=(
+            "prefill indexer source layout; paged matches vLLM's shared-page-table "
+            "production route"
+        ),
+    )
+    parser.add_argument(
+        "--cache-page-stride-bytes",
+        type=int,
+        default=None,
+        help=(
+            "physical stride between pages of one vLLM cache view; 0 keeps "
+            "the normal per-layer contiguous GLM layout, while -1 derives an "
+            "aggregate all-layer stride for packed-layout regression testing"
+        ),
+    )
+    parser.add_argument(
         "--nsa-prefill-block-k",
         choices=("auto", "256", "512"),
         default=None,
@@ -2084,6 +2495,9 @@ def main(argv: list[str] | None = None) -> int:
 
     for report in reports:
         print(_render_case_line(report))
+        if args.print_raw_samples:
+            raw_us = ",".join(f"{sample:.2f}" for sample in report.step_samples_us)
+            print(f"  step_raw_us=[{raw_us}]")
     for line in _render_summary_lines(reports):
         print(line)
     return 0
