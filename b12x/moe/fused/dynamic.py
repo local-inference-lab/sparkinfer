@@ -104,6 +104,8 @@ from b12x.moe.fused.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
+from b12x.moe.fused.w4a8_phase1 import W4A8MaterializedPhase1Kernel
+from b12x.moe.fused.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 
 
 _SF_VEC_SIZE = 16
@@ -704,17 +706,48 @@ class MoEDynamicKernelBackend:
             and self.materialize_intermediate
             and mma_tiler_mn == (16, 128)
         )
+        self.w4a8_m128_materialized = bool(
+            self.w4a8_repacked
+            and self.materialize_intermediate
+            and mma_tiler_mn == (128, 128)
+        )
+        self.w4a8_m64_materialized = bool(
+            self.w4a8_repacked
+            and self.materialize_intermediate
+            and mma_tiler_mn == (64, 128)
+        )
+        self.w4a8_split_materialized = bool(
+            self.w4a8_m64_materialized or self.w4a8_m128_materialized
+        )
+        # Dense M64/M128 retains this kernel as a routing/input-quantization
+        # front-end. Compact stream-ordered M64xN128 kernels compute FC1/FC2
+        # through the existing caller-owned MXFP8 workspace.  The split
+        # removes both GEMM bodies from the routing kernel's register/shared
+        # union and is graph-safe: every grid is fixed from preplanned launch
+        # capacity and no host value is read between launches.
+        self.external_materialized_fc1 = self.w4a8_split_materialized
+        self.external_materialized_fc2 = self.w4a8_split_materialized
+        materialized_source_tile_m = (
+            mma_tiler_mn[0] if self.w4a8_split_materialized else 128
+        )
+        self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
+            fast_math=self.fast_math,
+            source_tile_m=materialized_source_tile_m,
+        )
+        self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
+            source_tile_m=materialized_source_tile_m,
+        )
         if self.w4a8_repacked and quant_recipe != "w4a8_mx":
             raise ValueError("repacked W4A8 weights are only valid for w4a8_mx")
         if self.materialize_intermediate and not (
             self.w4a8_repacked
             and quant_recipe == "w4a8_mx"
-            and mma_tiler_mn in {(16, 128), (32, 128)}
+            and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
             and work_source != _WORK_SOURCE_READY_QUEUE
         ):
             raise ValueError(
                 "materialized-intermediate execution currently requires the "
-                "repacked W4A8 MX M16/M32 non-streaming specialization"
+                "repacked W4A8 MX M16/M32/M64/M128 non-streaming specialization"
             )
         if self.direct_routing and not (
             (
@@ -786,8 +819,15 @@ class MoEDynamicKernelBackend:
         # matching atom shape so the SF smem layout + V-map are consistent.
         _tm = mma_tiler_mn[0]
         if _tm == 128:
-            self.atom_shape = (2, 2, 1)
-            self.num_mma_warps = 4
+            if self.w4a8_m128_materialized:
+                # Large-prefill A8 divides M128xN128 over a 2x4 warp array.
+                # Phase B runs in a separate compact kernel, while eight FC1
+                # warps retain enough registers to avoid local-memory spills.
+                self.atom_shape = (2, 4, 1)
+                self.num_mma_warps = 8
+            else:
+                self.atom_shape = (2, 2, 1)
+                self.num_mma_warps = 4
         elif _tm == 16:
             # W4A8's raw-MMA path benefits from exposing more independent
             # N fragments without enlarging M (and therefore without padding
@@ -812,19 +852,22 @@ class MoEDynamicKernelBackend:
             self.num_mma_warps = 8
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
-        # Give small-tile W4A8 two producer streams, with buffer epochs split
-        # by parity, so TMA/cp.async issue is not serialized through one warp.
+        # Give W4A8 two producer streams, with buffer epochs split by parity,
+        # so TMA/cp.async issue is not serialized through one warp.  The M128
+        # materialized path is one CTA/SM and needs the second producer to hide
+        # the same global staging latency that a second small-tile CTA covers.
         self.num_dma_warps = (
             2
             if self.is_w4a8
-            and mma_tiler_mn[0] <= 32
             else 1
         )
         self.num_route_warps = self.num_mma_warps + self.num_dma_warps
         self.threads_per_cta = self.num_route_warps * self.num_threads_per_warp
         # Repacked small-W4A8 has exactly two buffers and one producer warp
         # assigned to each parity.  A hardware named-barrier handoff avoids
-        # burning scheduler slots in the old shared-flag polling loops.
+        # burning scheduler slots in the old shared-flag polling loops.  M128
+        # keeps the epoch protocol because all eight MMA warps participate in
+        # each buffer handoff.
         self.w4a8_named_pipeline = (
             self.w4a8_repacked
             and self.is_w4a8
@@ -976,7 +1019,16 @@ class MoEDynamicKernelBackend:
             # larger ab_stage only inflates smem. Capping at 2 cuts the CTA
             # footprint to ~88KB so two blocks co-reside per SM (the barrier-
             # heavy mainloop needs the extra occupancy to hide latency).
-            self.ab_stage = min(self.ab_stage, 2)
+            if self.w4a8_repacked:
+                # The generic fit estimate above includes route caches and a
+                # full standalone sC allocation.  Repacked W4A8 aliases those
+                # lifetimes and replaces the route caches with one placeholder
+                # element below, so that estimate is deliberately too large.
+                # Its physical byte layout always requires and fits the two
+                # stages encoded by ``w4a8_depth``.
+                self.ab_stage = 2
+            else:
+                self.ab_stage = min(self.ab_stage, 2)
             # Staging layout/depth (see the kernel hoist block): python ints
             # must live on self so in-loop const_expr sees them as static.
             # Small tiles: gated FC1 runs FUSED (one k sweep, both gate+up
@@ -1007,10 +1059,14 @@ class MoEDynamicKernelBackend:
             # budget and expose eight-N8-per-warp ILP in the fused kernel.
             self.w4a8_fc2_compute_width = 2 if self.w4a8_fc2_pair else 1
             self.w4a8_fc2_hoist_a = self.w4a8_small
-            if self.w4a8_repacked and not self.w4a8_fused:
+            if (
+                self.w4a8_repacked
+                and not self.w4a8_fused
+                and not self.w4a8_split_materialized
+            ):
                 raise ValueError(
                     "the first repacked W4A8 dynamic specialization requires "
-                    "the small gated kernel"
+                    "the small gated or split materialized kernel"
                 )
         self.epi_stage = 1
         (
@@ -1071,7 +1127,9 @@ class MoEDynamicKernelBackend:
             # Raw W4A8 addresses these scale regions as plain byte arrays.  A
             # full generic 128-row SF atom is unnecessary: sSFA retains only
             # the Mx(K/32) FC2-intermediate scales, while sSFB_up retains the
-            # double-buffered FC1-A scales.  Likewise, routing caches are dead
+            # double-buffered FC1-A scales.  This also gives M128 its required
+            # 2x512-byte scale staging without inflating the intermediate
+            # scale plane.  Likewise, routing caches are dead
             # before compute starts and can temporarily occupy sA itself.
             self.sSFA_storage_elems = (
                 self.tile_shape_mnk[0] * (self.tile_shape_mnk[2] // 32)
@@ -1304,50 +1362,80 @@ class MoEDynamicKernelBackend:
         # load and phase A's warp-wide store.  The former [row, slice] layout
         # made every lane skip ``intermediate_tiles`` words and accounted for
         # the largest remaining uncoalesced global-load site in phase B.
-        if copy_tid < Int32(tile_m):
+        sf_row = copy_tid
+        if sf_row < Int32(tile_m):
             sf_src = (
                 rows_capacity * words_per_row
                 + intermediate_slice * rows_capacity
                 + physical_row_base
-                + copy_tid
+                + sf_row
             )
             cp_async_u32_shared_global(
-                sfa_base + (copy_tid << Int32(2)),
+                sfa_base + (sf_row << Int32(2)),
                 get_ptr_as_int64(intermediate_u32, sf_src),
             )
 
         # Repacked B: [kb=4, chunk=8, lane=32, n8-in-chunk=4] u32.
+        # M128 uses one N128 half per task to keep 64 accumulator registers;
+        # the prepared allocation remains N256-tile-major.
+        packed_output_tile = output_tile
+        packed_half = Int32(0)
+        if cutlass.const_expr(self.w4a8_m128_materialized):
+            packed_output_tile = output_tile >> Int32(1)
+            packed_half = output_tile & Int32(1)
         b_tile = (
-            (expert_idx * output_tiles + output_tile) * intermediate_tiles
+            (expert_idx * output_tiles + packed_output_tile)
+            * intermediate_tiles
             + intermediate_slice
         )
         b_word_base = Int64(b_tile) * Int64(4096)
-        for i in cutlass.range_constexpr(
-            (4096 // 4 + copy_threads - 1) // copy_threads
-        ):
-            transfer = copy_tid + Int32(i * copy_threads)
-            if transfer < Int32(4096 // 4):
-                cp_async4_shared_global(
-                    sb_base + (transfer << Int32(4)),
-                    get_ptr_as_int64(
-                        down_rp, b_word_base + Int64(transfer << Int32(2))
-                    ),
-                )
+        if cutlass.const_expr(self.w4a8_m128_materialized):
+            _w4a8_stage_repacked_b_half(
+                down_rp,
+                sb_base,
+                b_word_base,
+                packed_half,
+                copy_tid,
+                copy_threads,
+            )
+        else:
+            for i in cutlass.range_constexpr(
+                (4096 // 4 + copy_threads - 1) // copy_threads
+            ):
+                transfer = copy_tid + Int32(i * copy_threads)
+                if transfer < Int32(4096 // 4):
+                    cp_async4_shared_global(
+                        sb_base + (transfer << Int32(4)),
+                        get_ptr_as_int64(
+                            down_rp,
+                            b_word_base + Int64(transfer << Int32(2)),
+                        ),
+                    )
 
         # Repacked SFB: [n8=32, col8=8] u32, 1 KiB per tile.
         sfb_word_base = Int64(b_tile) * Int64(256)
-        for i in cutlass.range_constexpr(
-            (256 // 4 + copy_threads - 1) // copy_threads
-        ):
-            transfer = copy_tid + Int32(i * copy_threads)
-            if transfer < Int32(256 // 4):
-                cp_async4_shared_global(
-                    sfb_base + (transfer << Int32(4)),
-                    get_ptr_as_int64(
-                        down_sfb_rp,
-                        sfb_word_base + Int64(transfer << Int32(2)),
-                    ),
-                )
+        if cutlass.const_expr(self.w4a8_m128_materialized):
+            _w4a8_stage_repacked_sfb_half(
+                down_sfb_rp,
+                sfb_base,
+                sfb_word_base,
+                packed_half,
+                copy_tid,
+                copy_threads,
+            )
+        else:
+            for i in cutlass.range_constexpr(
+                (256 // 4 + copy_threads - 1) // copy_threads
+            ):
+                transfer = copy_tid + Int32(i * copy_threads)
+                if transfer < Int32(256 // 4):
+                    cp_async4_shared_global(
+                        sfb_base + (transfer << Int32(4)),
+                        get_ptr_as_int64(
+                            down_sfb_rp,
+                            sfb_word_base + Int64(transfer << Int32(2)),
+                        ),
+                    )
 
     @cute.jit
     def _run_w4a8_materialized_fc2(
@@ -1380,10 +1468,20 @@ class MoEDynamicKernelBackend:
         stage_a_bytes = Int32(self.tile_shape_mnk[0] * (128 + 4))
         a_payload_bytes = Int32(self.tile_shape_mnk[0] * 128)
         copy_threads = self.threads_per_cta
+        m_blocks = (
+            4
+            if self.w4a8_m128_materialized
+            else self.tile_shape_mnk[0] // 16
+        )
+        warp_m_base = Int32(0)
+        warp_n_group = warp_idx
+        if cutlass.const_expr(self.w4a8_m128_materialized):
+            warp_m_base = (warp_idx >> Int32(2)) * Int32(64)
+            warp_n_group = warp_idx & Int32(3)
+        n_fragments = 4 if self.w4a8_m128_materialized else 8
+        chunks_per_k = 4 if self.w4a8_m128_materialized else 8
+        chunks_per_warp = 1 if self.w4a8_m128_materialized else 2
 
-        # Prime K128 slice zero with one CTA-wide cooperative copy.  All six
-        # warps have disjoint tids in this copy group; the two phase-A DMA
-        # warps become ordinary staging warps for the materialized FC2 sweep.
         self._stage_w4a8_materialized_fc2(
             intermediate_u32,
             down_rp,
@@ -1408,8 +1506,9 @@ class MoEDynamicKernelBackend:
             # M/16 blocks x eight N8 fragments per warp.  This flat rmem
             # shape is deliberately the register-friendly representation used
             # throughout the dense W4A8 specialization.
-            m_blocks = self.tile_shape_mnk[0] // 16
-            facc = cute.make_rmem_tensor((m_blocks, 8, 4), cutlass.Float32)
+            facc = cute.make_rmem_tensor(
+                (m_blocks, n_fragments, 4), cutlass.Float32
+            )
             facc.fill(0.0)
             q = lane >> Int32(2)
             c = lane & Int32(3)
@@ -1451,7 +1550,7 @@ class MoEDynamicKernelBackend:
 
                 asc = cute.make_rmem_tensor((m_blocks,), Uint32)
                 for blk in cutlass.range_constexpr(m_blocks):
-                    sf_row = Int32(blk * 16) + q + (
+                    sf_row = warp_m_base + Int32(blk * 16) + q + (
                         (lane & Int32(1)) << Int32(3)
                     )
                     asc[blk] = ld_shared_u32(
@@ -1464,6 +1563,7 @@ class MoEDynamicKernelBackend:
                     for blk in cutlass.range_constexpr(m_blocks):
                         a_lo = (
                             sa_base
+                            + warp_m_base * Int32(128)
                             + Int32(blk * 16 * 128)
                             + (q << Int32(7))
                             + (u_phys << Int32(4))
@@ -1476,12 +1576,16 @@ class MoEDynamicKernelBackend:
                         a_frag[blk, 2] = a2
                         a_frag[blk, 3] = a3
 
-                    for ch in cutlass.range_constexpr(2):
+                    for ch in cutlass.range_constexpr(chunks_per_warp):
                         w0, w1, w2, w3 = ld_shared_v4_u32(
                             sb_base
                             + (
                                 (
-                                    (Int32(kb * 8) + warp_idx * Int32(2) + Int32(ch))
+                                    (
+                                        Int32(kb * chunks_per_k)
+                                        + warp_n_group * Int32(chunks_per_warp)
+                                        + Int32(ch)
+                                    )
                                     * Int32(32)
                                     + lane
                                 )
@@ -1495,7 +1599,10 @@ class MoEDynamicKernelBackend:
                         words[3] = w3
                         for i in cutlass.range_constexpr(4):
                             nt = ch * 4 + i
-                            n8 = warp_idx * Int32(8) + Int32(nt)
+                            n8 = (
+                                warp_n_group * Int32(n_fragments)
+                                + Int32(nt)
+                            )
                             b0, b1 = e2m1x8_to_qmma_e2m1x8(words[i])
                             sfb_word = ld_shared_u32(
                                 sfb_base + ((n8 * Int32(8) + q) << Int32(2))
@@ -1522,8 +1629,6 @@ class MoEDynamicKernelBackend:
                                 facc[blk, nt, 2] = d2
                                 facc[blk, nt, 3] = d3
 
-                # Do not let the next iteration overwrite this parity buffer
-                # until every compute warp has consumed it.
                 cute.arch.sync_threads()
                 intermediate_slice += Int32(1)
 
@@ -1533,15 +1638,19 @@ class MoEDynamicKernelBackend:
                 down_alpha[expert_idx].to(cutlass.Float32)
                 * global_scale[expert_idx].to(cutlass.Float32)
             )
+            output_tile_width = (
+                128 if self.w4a8_m128_materialized else 256
+            )
+            warp_n_width = 32 if self.w4a8_m128_materialized else 64
             col_base = (
-                output_tile * Int32(256)
-                + warp_idx * Int32(64)
+                output_tile * Int32(output_tile_width)
+                + warp_n_group * Int32(warp_n_width)
                 + (c << Int32(1))
             )
-            for nt in cutlass.range_constexpr(8):
+            for nt in cutlass.range_constexpr(n_fragments):
                 col = col_base + Int32(nt * 8)
                 for blk in cutlass.range_constexpr(m_blocks):
-                    row_lo = Int32(blk * 16) + q
+                    row_lo = warp_m_base + Int32(blk * 16) + q
                     row_hi = row_lo + Int32(8)
                     if row_lo < valid_rows:
                         physical_row = physical_row_base + row_lo
@@ -1934,6 +2043,43 @@ class MoEDynamicKernelBackend:
             cluster=[1, 1, 1],
             stream=stream,
         )
+        if cutlass.const_expr(self.external_materialized_fc1):
+            self.materialized_phase1_kernel(
+                packed_a_storage,
+                scale_storage,
+                w13_rp,
+                w13_sfb_rp,
+                intermediate_u32,
+                token_map,
+                task_expert,
+                task_valid_rows,
+                expert_tile_base,
+                alpha,
+                input_global_scale,
+                Int32(a_input.shape[1]) // Int32(128),
+                gate_tile_cnt,
+                Int32(b_w13.shape[0]) // Int32(256),
+                max_active_clusters,
+                stream,
+            )
+        if cutlass.const_expr(self.external_materialized_fc2):
+            self.materialized_phase2_kernel(
+                intermediate_u32,
+                down_rp,
+                down_sfb_rp,
+                scatter_output,
+                token_map,
+                token_weights,
+                task_expert,
+                task_valid_rows,
+                expert_tile_base,
+                down_alpha,
+                global_scale,
+                gate_tile_cnt,
+                Int32(b_down.shape[0]) // Int32(256),
+                max_active_clusters,
+                stream,
+            )
 
     @cute.kernel
     def kernel(
@@ -2128,8 +2274,10 @@ class MoEDynamicKernelBackend:
             cta_layout_vmnk=cta_layout_vmnk,
         )
 
-        if cutlass.const_expr(self.is_w4a8 and self.w4a8_b_tma):
-            w4a8_tma_mbar_ptr = storage.w4a8_tma_mbar.data_ptr()
+        w4a8_tma_mbar_ptr = storage.w4a8_tma_mbar.data_ptr()
+        if cutlass.const_expr(
+            self.is_w4a8 and self.w4a8_b_tma
+        ):
             if Int32(tidx) == Int32(0):
                 for _mb in cutlass.range_constexpr(self.w4a8_depth):
                     cute.arch.mbarrier_init(w4a8_tma_mbar_ptr + _mb, Int32(1))
@@ -2342,6 +2490,22 @@ class MoEDynamicKernelBackend:
         # Phase 2: warp-private route/pack producers into compact physical tiles.
         lane_id = Int32(tidx) & Int32(31)
         num_cta_warps = Int32(self.num_route_warps)
+        input_active_warps = num_cta_warps
+        input_groups_per_cta = num_cta_warps
+        if cutlass.const_expr(
+            self.is_w4a8 and self.share_input_across_experts
+        ):
+            # Shared-input A8 assigns a compile-time group of warps to each
+            # token.  Only complete groups may enter the per-token named
+            # barrier; otherwise a tail warp in any future non-divisible CTA
+            # role layout would wait forever for a partner that was not
+            # launched.
+            input_groups_per_cta = num_cta_warps // Int32(
+                self.input_warps_per_token
+            )
+            input_active_warps = input_groups_per_cta * Int32(
+                self.input_warps_per_token
+            )
         producer_batch_pairs = num_cta_warps * Int32(_PRODUCER_PAIRS_PER_WARP)
         shared_input_gs_value = cutlass.Float32(0.0)
         if cutlass.const_expr(self.share_input_across_experts):
@@ -2367,13 +2531,9 @@ class MoEDynamicKernelBackend:
             if is_cta_leader > Int32(0):
                 claim_count = producer_batch_pairs
                 if cutlass.const_expr(self.share_input_across_experts):
-                    claim_count = num_cta_warps
-                    if cutlass.const_expr(self.is_w4a8):
-                        # A compile-time warp group cooperates on each token,
-                        # partitioning both routes and K/32 blocks.
-                        claim_count = num_cta_warps // Int32(
-                            self.input_warps_per_token
-                        )
+                    # A compile-time warp group cooperates on each token,
+                    # partitioning both routes and K/32 blocks under A8.
+                    claim_count = input_groups_per_cta
                 batch_base = atomic_add_global_i32(
                     get_ptr_as_int64(pair_head, Int32(0)),
                     claim_count,
@@ -2398,7 +2558,10 @@ class MoEDynamicKernelBackend:
                             self.input_warps_per_token
                         )
                     token_idx = batch_base + token_owner_warp
-                    if token_idx < num_tokens:
+                    if (
+                        warp_idx < input_active_warps
+                        and token_idx < num_tokens
+                    ):
                         route_slot_base = token_owner_warp * Int32(32)
                         if lane_id == Int32(0):
                             topk_slot = Int32(0)
@@ -3263,16 +3426,30 @@ class MoEDynamicKernelBackend:
             # consumer loop (loop state must be purely dynamic expressions).
             lane_c = Int32(tidx) & Int32(3)
             lane_g = (Int32(tidx) & Int32(31)) >> Int32(2)
-            # Closed form of the (1,4,1) tiled-MMA C-coordinate map used by
-            # the specialized M16/M32 W4A8 body.  CuTe's N permutation orders
-            # the four warps as N8 bases {0, 16, 8, 24}; spelling that mapping
-            # directly avoids rebuilding identity-tensor coordinates in every
-            # FC1/FC2 K tile.
-            w4a8_n8_thread_base = (
-                ((Int32(tidx) & Int32(32)) >> Int32(1))
-                | ((Int32(tidx) & Int32(64)) >> Int32(3))
-                | lane_g
-            )
+            # Closed form of the tiled-MMA C-coordinate map.  CuTe's N
+            # permutation orders four N coordinates as N8 bases
+            # {0, 16, 8, 24}.  The small (1,4,1) atom takes the N coordinate
+            # from warp bits 0:1. M128's (2,4,1) atom is M-major, so warp bit
+            # 0 selects the interleaved M16 coordinate and bits 1:2 select N.
+            # Keep these rows/columns identical to gate_acc/up_acc; the cold
+            # layout-native epilogue consumes those fragments.
+            if cutlass.const_expr(self.w4a8_m128_materialized):
+                w4a8_n8_thread_base = (
+                    ((Int32(tidx) & Int32(64)) >> Int32(2))
+                    | ((Int32(tidx) & Int32(128)) >> Int32(4))
+                    | lane_g
+                )
+            else:
+                w4a8_n8_thread_base = (
+                    ((Int32(tidx) & Int32(32)) >> Int32(1))
+                    | ((Int32(tidx) & Int32(64)) >> Int32(3))
+                    | lane_g
+                )
+            w4a8_m_warp_offset = Int32(0)
+            w4a8_m_block_stride = Int32(16)
+            if cutlass.const_expr(self.w4a8_m128_materialized):
+                w4a8_m_warp_offset = (warp_idx & Int32(1)) * Int32(16)
+                w4a8_m_block_stride = Int32(32)
             n_k32_per_tile = self.tile_shape_mnk[2] // 32
             a_u32_per_row = cols // Int32(4)
             a_mx_per_row = cols // Int32(32)
@@ -3290,7 +3467,14 @@ class MoEDynamicKernelBackend:
             # region; A bufs in sA past the FC2-intermediate bytes; FC1
             # residual bufs in sC (dead until the epilogue rendezvous); FC2
             # residual bufs alias the (FC1-only) A-buf region.
-            if cutlass.const_expr(self.w4a8_small):
+            if cutlass.const_expr(self.w4a8_repacked):
+                w4a8_sa0 = (
+                    shared_ptr_to_u32(storage.sA.data_ptr())
+                    + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
+                )
+                w4a8_res0 = shared_ptr_to_u32(storage.sC.data_ptr())
+                w4a8_res2 = w4a8_sa0
+            elif cutlass.const_expr(self.w4a8_small):
                 w4a8_sa0 = (
                     shared_ptr_to_u32(storage.sA.data_ptr())
                     + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
@@ -3324,7 +3508,11 @@ class MoEDynamicKernelBackend:
             materialized_tail = _ld_global_acquire_i32(
                 get_ptr_as_int64(task_tail, Int32(0))
             )
-        consumer_live = Int32(1)
+        consumer_live = (
+            Int32(0)
+            if cutlass.const_expr(self.external_materialized_fc1)
+            else Int32(1)
+        )
         while consumer_live > Int32(0):
             if cutlass.const_expr(self.w4a8_m1_materialized):
                 # Fixed M=1 domain: one item per (route, intermediate K128
@@ -3882,7 +4070,9 @@ class MoEDynamicKernelBackend:
                                 # scales. At depth 4 the sSFB_up region is
                                 # entirely free (residual bufs moved to
                                 # sC/sA), so A-scale bufs live there.
-                                if cutlass.const_expr(self.w4a8_small):
+                                if cutlass.const_expr(
+                                    self.w4a8_repacked or self.w4a8_small
+                                ):
                                     asc_buf = w4a8_resb + par * Int32(
                                         self.tile_shape_mnk[0] * 4
                                     )
@@ -3921,7 +4111,11 @@ class MoEDynamicKernelBackend:
                                 asc_words = cute.make_rmem_tensor((fc1_m_tiles,), Uint32)
                                 row_lo_arr = cute.make_rmem_tensor((fc1_m_tiles,), Int32)
                                 for _mt in cutlass.range_constexpr(fc1_m_tiles):
-                                    row_lo = lane_g + Int32(_mt * 16)
+                                    row_lo = (
+                                        w4a8_m_warp_offset
+                                        + lane_g
+                                        + Int32(_mt) * w4a8_m_block_stride
+                                    )
                                     row_lo_arr[_mt] = row_lo
                                     sel = row_lo + ((lane_c & Int32(1)) << Int32(3))
                                     asc_words[_mt] = ld_shared_u32(asc_buf + (sel << Int32(2)))
@@ -3960,28 +4154,29 @@ class MoEDynamicKernelBackend:
                                             )
                                             b_lo[_nt] = blo
                                             b_hi[_nt] = bhi
-                                            packed_word_u = ld_shared_u32(
-                                                b_buf
-                                                + Int32(128 * 64)
-                                                + (
-                                                    (
+                                            if cutlass.const_expr(self.w4a8_fused):
+                                                packed_word_u = ld_shared_u32(
+                                                    b_buf
+                                                    + Int32(128 * 64)
+                                                    + (
                                                         (
-                                                            Int32(_kb * 4)
-                                                            + chunk
+                                                            (
+                                                                Int32(_kb * 4)
+                                                                + chunk
+                                                            )
+                                                            * Int32(32)
+                                                            + Int32(lane_id)
                                                         )
-                                                        * Int32(32)
-                                                        + Int32(lane_id)
+                                                        * Int32(4)
+                                                        + n8_in_chunk
                                                     )
                                                     * Int32(4)
-                                                    + n8_in_chunk
                                                 )
-                                                * Int32(4)
-                                            )
-                                            blo_u, bhi_u = e2m1x8_to_qmma_e2m1x8(
-                                                packed_word_u
-                                            )
-                                            b_lo_u[_nt] = blo_u
-                                            b_hi_u[_nt] = bhi_u
+                                                blo_u, bhi_u = e2m1x8_to_qmma_e2m1x8(
+                                                    packed_word_u
+                                                )
+                                                b_lo_u[_nt] = blo_u
+                                                b_hi_u[_nt] = bhi_u
                                     else:
                                         for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                             if cutlass.const_expr(self.w4a8_b_tma):
@@ -5506,7 +5701,9 @@ class MoEDynamicKernelBackend:
                                     w4a8_asc_dst = (
                                         w4a8_resb
                                         + par * Int32(self.tile_shape_mnk[0] * 4)
-                                    ) if cutlass.const_expr(self.w4a8_small) else (
+                                    ) if cutlass.const_expr(
+                                        self.w4a8_repacked or self.w4a8_small
+                                    ) else (
                                         sfa_base_addr + (par << Int32(9))
                                     )
                                     if cutlass.const_expr(
@@ -5927,7 +6124,9 @@ class MoEDynamicKernelBackend:
                     up_pipeline.producer_tail(up_prod_state)
                 phase2_pipeline.producer_tail(phase2_prod_state)
 
-        if cutlass.const_expr(self.materialize_intermediate):
+        if cutlass.const_expr(
+            self.materialize_intermediate and not self.external_materialized_fc2
+        ):
             # Every phase-A task has now published its MXFP8 activation tile.
             # Phase B is a dense, uniform domain: one full-K task per physical
             # M tile and N256 output tile.  A deterministic grid-stride walk
@@ -5937,14 +6136,20 @@ class MoEDynamicKernelBackend:
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
             phase2_packed_output_tiles = output_tile_cnt // Int32(2)
+            phase2_task_output_tiles = phase2_packed_output_tiles
+            if cutlass.const_expr(self.w4a8_m128_materialized):
+                # M128 deliberately runs one N128 half per task.  The prepared
+                # weights remain N256-tile-major, so the helper receives both
+                # this task coordinate and the packed-tile count.
+                phase2_task_output_tiles = output_tile_cnt
             if cutlass.const_expr(self.w4a8_m1_materialized):
-                phase2_tail = total_pairs * phase2_packed_output_tiles
+                phase2_tail = total_pairs * phase2_task_output_tiles
                 phase2_slot = Int32(bidz)
                 while phase2_slot < phase2_tail:
-                    phase2_m_tile = phase2_slot // phase2_packed_output_tiles
+                    phase2_m_tile = phase2_slot // phase2_task_output_tiles
                     phase2_output_tile = (
                         phase2_slot
-                        - phase2_m_tile * phase2_packed_output_tiles
+                        - phase2_m_tile * phase2_task_output_tiles
                     )
                     phase2_expert = topk_ids[phase2_m_tile].to(Int32)
                     self._run_w4a8_materialized_fc2(
@@ -5974,13 +6179,13 @@ class MoEDynamicKernelBackend:
                     phase2_slot += Int32(gdim_z)
             else:
                 phase2_m_tiles = expert_tile_base[num_experts]
-                phase2_tail = phase2_m_tiles * phase2_packed_output_tiles
+                phase2_tail = phase2_m_tiles * phase2_task_output_tiles
                 phase2_slot = Int32(bidz)
                 while phase2_slot < phase2_tail:
-                    phase2_m_tile = phase2_slot // phase2_packed_output_tiles
+                    phase2_m_tile = phase2_slot // phase2_task_output_tiles
                     phase2_output_tile = (
                         phase2_slot
-                        - phase2_m_tile * phase2_packed_output_tiles
+                        - phase2_m_tile * phase2_task_output_tiles
                     )
                     phase1_meta = phase2_m_tile * materialized_num_groups
                     phase2_expert = task_expert[phase1_meta].to(Int32)

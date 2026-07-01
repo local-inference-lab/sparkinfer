@@ -24,6 +24,30 @@ _N = 1024
 _TOPK = 4
 
 
+@pytest.mark.parametrize(
+    ("routed_rows", "expected_tile_m"),
+    [
+        (16 * _E, 16),
+        (16 * _E + 1, 32),
+        (36 * _E - 1, 32),
+        (36 * _E, 64),
+    ],
+)
+def test_w4a8_mx_dynamic_tile_density_boundaries(
+    monkeypatch, routed_rows: int, expected_tile_m: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        routed_rows,
+        _N,
+        "w4a8_mx",
+        num_experts=_E,
+        activation="silu",
+    ) == (expected_tile_m, 128)
+
+
 def _skip_if_unavailable() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
@@ -258,7 +282,7 @@ def _oracle(m: int, weights: dict, seed: int = 33, *, n: int = _N):
 
 
 def test_w4a8_mx_dense_band_defaults_to_dynamic_and_matches_oracle() -> None:
-    """The dense M32 band runs unified dynamic and matches its oracle."""
+    """The planner-selected dense band runs unified dynamic and matches its oracle."""
     _skip_if_unavailable()
     weights = _weights()
     m = 1024
@@ -267,6 +291,29 @@ def test_w4a8_mx_dense_band_defaults_to_dynamic_and_matches_oracle() -> None:
     out = _run(m, prepared)
     n_out = out.float().norm().item()
     assert n_out > 0.01, f"dynamic output near-zero (norm={n_out})"
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.998, cos
+    n_ref = ref.float().norm().item()
+    assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
+
+
+@pytest.mark.parametrize("tile_m", [64, 128])
+def test_w4a8_mx_materialized_dense_override_matches_oracle(
+    monkeypatch, tile_m: int
+) -> None:
+    """The split dense-prefill specializations remain correct when forced."""
+
+    _skip_if_unavailable()
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
+    weights = _weights()
+    m = 1024
+    ref = _oracle(m, weights)
+    prepared = _prepare(weights)
+    out = _run(m, prepared)
+    n_out = out.float().norm().item()
+    assert n_out > 0.01, f"M{tile_m} dynamic output near-zero (norm={n_out})"
     cos = torch.nn.functional.cosine_similarity(
         out.float().flatten(), ref.float().flatten(), dim=0
     ).item()

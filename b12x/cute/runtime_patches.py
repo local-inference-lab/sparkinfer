@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import inspect
+import linecache
 import os
 from functools import wraps
+from typing import Any
 
 _COMPILE_ONLY_CACHE_WARNING = "Cache is disabled as user wants to compile only."
 _WARNING_PATCHED = False
 _MEMORY_DEBUG_PATCHED = False
+_DIRECT_FRAMEINFO_PATCHED = False
 _MEMORY_DEBUG_SNAPSHOT = {
     "free": None,
     "total": None,
@@ -20,6 +24,7 @@ _MEMORY_DEBUG_SNAPSHOT = {
 def apply_cutlass_runtime_patches() -> None:
     _apply_compile_only_warning_patch()
     _apply_memory_debug_patch()
+    _apply_direct_frameinfo_patch()
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -98,3 +103,77 @@ def _apply_memory_debug_patch() -> None:
     cuda_helpers._memory_debug_log = _empty_memory_debug_log
     cuda_helpers._b12x_memory_debug_patched = True
     _MEMORY_DEBUG_PATCHED = True
+
+
+class _DirectFrameInfoInspectProxy:
+    """Preserve CUTLASS source locations without ``inspect.findsource``.
+
+    CUTLASS asks for frame information once per emitted DSL operation.  The
+    standard ``inspect.getframeinfo(..., context=1)`` implementation first
+    scans backwards from the current line to rediscover the enclosing Python
+    function.  That is quadratic for large monolithic kernels: dynamic W4A8
+    emits roughly 41k operations from a function spanning about 4k lines.
+
+    The code position already identifies the exact source line.  Fetching its
+    context directly from ``linecache`` preserves CUTLASS's filename, line,
+    column, function, and source-text location while avoiding the backwards
+    regular-expression scan.
+    """
+
+    _b12x_direct_frameinfo = True
+
+    def __init__(self, inspect_module: Any) -> None:
+        self._inspect = inspect_module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inspect, name)
+
+    def getframeinfo(self, frame: Any, context: int = 1) -> Any:
+        frame_info = self._inspect.getframeinfo(frame, context=0)
+        if context <= 0:
+            return frame_info
+
+        lines = linecache.getlines(frame_info.filename)
+        if not lines:
+            code_context = None
+            index = None
+        else:
+            start = frame_info.lineno - 1 - context // 2
+            start = max(0, min(start, len(lines) - context))
+            code_context = lines[start : start + context]
+            index = frame_info.lineno - 1 - start
+
+        trace_args = (
+            frame_info.filename,
+            frame_info.lineno,
+            frame_info.function,
+            code_context,
+            index,
+        )
+        if hasattr(frame_info, "positions"):
+            return inspect.Traceback(
+                *trace_args,
+                positions=frame_info.positions,
+            )
+        # Python 3.10 predates PEP 657's ``positions`` field; CUTLASS already
+        # handles that legacy Traceback shape by using lineno and column zero.
+        return inspect.Traceback(*trace_args)
+
+
+def _apply_direct_frameinfo_patch() -> None:
+    global _DIRECT_FRAMEINFO_PATCHED
+    if _DIRECT_FRAMEINFO_PATCHED:
+        return
+
+    try:
+        from cutlass.base_dsl._mlir_helpers import op as op_helpers
+    except Exception:
+        return
+
+    current_inspect = op_helpers.inspect
+    if getattr(current_inspect, "_b12x_direct_frameinfo", False):
+        _DIRECT_FRAMEINFO_PATCHED = True
+        return
+
+    op_helpers.inspect = _DirectFrameInfoInspectProxy(current_inspect)
+    _DIRECT_FRAMEINFO_PATCHED = True

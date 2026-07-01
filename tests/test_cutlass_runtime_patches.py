@@ -13,6 +13,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
+from cutlass.base_dsl._mlir_helpers import op as cutlass_op_helpers
 from cutlass.base_dsl.runtime import cuda as cutlass_cuda_runtime
 from cutlass.cute.nvgpu.warp import mma
 
@@ -47,6 +48,27 @@ def test_other_cutlass_warnings_still_emit() -> None:
 
     assert len(captured) == 1
     assert str(captured[0].message) == "some other warning"
+
+
+def test_cutlass_source_locations_do_not_scan_for_enclosing_function(
+    monkeypatch,
+) -> None:
+    def fail_findsource(*args, **kwargs):
+        raise AssertionError("CUTLASS source locations must not call findsource")
+
+    monkeypatch.setattr(inspect, "findsource", fail_findsource)
+    frame = inspect.currentframe()
+    assert frame is not None
+    frame_info = cutlass_op_helpers.inspect.getframeinfo(frame)
+
+    assert frame_info.filename == __file__
+    assert frame_info.function == (
+        "test_cutlass_source_locations_do_not_scan_for_enclosing_function"
+    )
+    assert frame_info.positions.lineno == frame_info.lineno
+    assert frame_info.positions.col_offset is not None
+    assert frame_info.code_context is not None
+    assert "getframeinfo(frame)" in frame_info.code_context[0]
 
 
 def test_cutlass_memory_debug_helpers_are_stubbed_when_disabled(monkeypatch) -> None:

@@ -1373,9 +1373,14 @@ def _select_dynamic_tile_mn(
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
     if _is_w4a8_quant_mode(quant_mode):
-        # W4A8 currently has specialized M16/M32 compute bodies.  Across the
-        # measured expert counts, their crossover is about 16 routed rows per
-        # expert: below that M16 avoids padding; above it M32 amortizes sync.
+        # W4A8 uses M16/M32 for sparse decode and the split M64 compute path
+        # for dense prefill.  DSV4 TP2 graph-replay probes place M32->M64
+        # between 34.5 and 36 routed rows/expert (M32 wins at 34.5; M64 wins
+        # at 36).  Keep the conservative integer boundary at 36.  M128 remains
+        # an explicit research override: its external compute tasks are also
+        # M64, while its coarser routing domain adds expert-tail waste.
+        if routed_rows >= 36 * num_experts:
+            return (64, _LEVEL_TILE_N)
         if routed_rows > 16 * num_experts:
             return (32, _LEVEL_TILE_N)
         return (16, _LEVEL_TILE_N)
@@ -1429,7 +1434,7 @@ def _w4a8_dynamic_dense_candidate(
             num_experts=num_experts,
             activation=activation,
         )
-        == (32, 128)
+        in {(32, 128), (64, 128), (128, 128)}
         and _dynamic_work_source() != "ready_queue"
         and not deterministic_output
     )
