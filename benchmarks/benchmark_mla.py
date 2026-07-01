@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark GLM sparse-MLA/indexer decode and chunked-prefill serving shapes."""
+"""Benchmark GLM MLA and traced DeepSeek-V4 compressed-MLA serving shapes."""
 
 from __future__ import annotations
 
@@ -97,6 +97,7 @@ DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
 TARGET_PREFILL64K_BS1_PRESET = "target-prefill64k-bs1"
 TARGET_GLM52_PREFILL4K_CTX16K_PRESET = "target-glm52-prefill4k-ctx16k"
+TARGET_DSV4_TRACE_PRESET = "target-dsv4-trace"
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
@@ -471,6 +472,10 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
         # every normal GLM main/index cache as its own contiguous tensor.
         if args.cache_page_stride_bytes is None:
             args.cache_page_stride_bytes = 0
+    elif args.preset == TARGET_DSV4_TRACE_PRESET:
+        # main() delegates this distinct compressed-MLA contract to the native
+        # DSV4 benchmark before any GLM config or tensor setup occurs.
+        pass
     else:
         raise ValueError(f"unknown preset {args.preset!r}")
     if args.cache_page_stride_bytes is None:
@@ -2521,11 +2526,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "none",
             TARGET_PREFILL64K_BS1_PRESET,
             TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
+            TARGET_DSV4_TRACE_PRESET,
         ),
         default="none",
         help=(
             "shape preset; target-glm52-prefill4k-ctx16k maps to a vLLM-oriented "
-            "TP8 4096-token chunk at 16k context with top-k 2048 and tiled top-k"
+            "TP8 4096-token chunk at 16k context with top-k 2048 and tiled top-k; "
+            "target-dsv4-trace runs the TP2 C1/C4/C128 compressed-MLA trace race"
         ),
     )
     parser.add_argument(
@@ -2664,6 +2671,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.preset == TARGET_DSV4_TRACE_PRESET:
+        from benchmarks.benchmark_compressed_mla import main as compressed_mla_main
+
+        forwarded = [
+            "--preset",
+            "vllm-dsv4-trace",
+            "--warmup",
+            str(args.warmup),
+            "--replays",
+            str(args.replays),
+            "--seed",
+            str(args.seed),
+            "--l2-flush-bytes",
+            str(args.l2_flush_bytes),
+        ]
+        if not args.flush_l2:
+            forwarded.append("--no-flush-l2")
+        if args.print_raw_samples:
+            forwarded.append("--print-raw-samples")
+        if args.model_config is not None:
+            forwarded.extend(("--model-config", str(args.model_config)))
+        return compressed_mla_main(forwarded)
+
     device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     flush_desc = (

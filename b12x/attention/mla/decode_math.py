@@ -607,6 +607,70 @@ def s1_qk_nope_block_scaled_glm_h8_swap_ab(
     return qk
 
 
+@cute.jit
+def s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
+    qk,
+    q_fp8_base_addr: Int32,
+    kv_fp8_base_addr: Int32,
+    q_sc_view: cute.Tensor,
+    kv_sc_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_stride: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    scale_bytes_per_token: cutlass.Constexpr,
+):
+    """DSV4 H8 QK with candidates in hardware A and heads in hardware B.
+
+    Four warps cover the 64-candidate window.  Unlike the H16 orientation, both
+    operands are regular ldmatrix tiles; the per-candidate UE8M0 K scale moves to
+    SFA and the per-head Q scale moves to SFB.  Fragment ownership matches the
+    GLM H8 swapped path.
+    """
+    gid = lane >> Int32(2)
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    b_row = lane & Int32(7)
+    b_col = ((lane >> Int32(3)) & Int32(1)) * Int32(16)
+
+    # scale_vec::1X selector ownership follows the physical operand tiles.
+    sfa_cand = warp_first_cand + gid + (lane & Int32(1)) * Int32(8)
+    sfb_head = gid
+
+    for blk in cutlass.range_constexpr(num_scales):
+        sfa = _ld_u8_zext(
+            kv_sc_base_addr,
+            sfa_cand * Int32(scale_bytes_per_token) + Int32(blk),
+        )
+        sfb = _fp32_to_ue8m0_byte(
+            q_sc_view[sfb_head * Int32(num_scales) + Int32(blk)]
+        )
+        for ks in cutlass.range_constexpr(quant_tile // 32):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(32)
+            a_addr = _smem_byte(
+                kv_fp8_base_addr,
+                warp_first_cand * Int32(kv_smem_stride)
+                + a_row * Int32(kv_smem_stride)
+                + ko
+                + a_col,
+            )
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+            b_addr = _smem_byte(
+                q_fp8_base_addr,
+                b_row * Int32(q_nope_stride) + ko + b_col,
+            )
+            b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
+            qk[0], qk[1], qk[2], qk[3] = mxfp8_mma_m16n8k32_f32_e4m3(
+                qk[0], qk[1], qk[2], qk[3],
+                a0, a1, a2, a3, b0, b1, sfa, sfb,
+            )
+    return qk
+
+
 # =============================================================================
 # S2 -- QK-RoPE bf16 m16n8k16 MMA (accumulate into the SAME qk regs)
 # =============================================================================
@@ -979,6 +1043,7 @@ def s4_online_softmax_glm_h8_swap_ab(
     qk,
     p,
     acc_nope,
+    acc_rope,
     global_max,
     global_sum,
     reduce_max_addr: Int32,
@@ -992,6 +1057,7 @@ def s4_online_softmax_glm_h8_swap_ab(
     n_warps: cutlass.Constexpr,
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
+    rope_tiles_per_warp: cutlass.Constexpr = 0,
 ):
     """Online softmax for the swapped 16-candidate x 8-head score tile.
 
@@ -1101,6 +1167,9 @@ def s4_online_softmax_glm_h8_swap_ab(
     for at in cutlass.range_constexpr(n_acc_tiles):
         acc_nope[at][0] = acc_nope[at][0] * row_alpha
         acc_nope[at][1] = acc_nope[at][1] * row_alpha
+    for rt in cutlass.range_constexpr(rope_tiles_per_warp):
+        acc_rope[rt * 4 + 0] = acc_rope[rt * 4 + 0] * row_alpha
+        acc_rope[rt * 4 + 1] = acc_rope[rt * 4 + 1] * row_alpha
 
     global_sum[0] = global_sum[0] * alpha0 + block_sum0 * block_rescale0
     global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_rescale1
@@ -1630,6 +1699,163 @@ def s6_xv_nope_glm_h8_swap_ab(
     return acc_nope
 
 
+@cute.jit
+def s6_xv_nope_dsv4_h8_swap_ab(
+    w_pre,
+    acc_nope,
+    kv_fp8_base_addr: Int32,
+    kv_sc_base_addr: Int32,
+    w_head_sc_view: cute.Tensor,
+    w_fp8_base_addr: Int32,
+    sm_p_full_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    v_chunk: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    w_fp8_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    nt_per_warp_xv: cutlass.Constexpr,
+    scale_bytes_per_token: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+):
+    """DSV4 H8 PV fed directly by the swapped score fragment.
+
+    The lower eight W rows hold the eight query heads.  Four warps each stage
+    sixteen candidate probabilities, then two N tiles per warp cover every
+    64-wide V group.  The same probability stores also populate the BF16 matrix
+    consumed by the RoPE PV path.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    head0 = tid * Int32(2)
+    head1 = head0 + Int32(1)
+    cand0 = warp_id * Int32(16) + gid
+    cand1 = cand0 + Int32(8)
+
+    # Swapped score-fragment ownership -> ordinary [head, candidate] staging.
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(bi) + cand0) * Int32(2), w_pre[0]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(bi) + cand0) * Int32(2), w_pre[1]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(bi) + cand1) * Int32(2), w_pre[2]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(bi) + cand1) * Int32(2), w_pre[3]
+    )
+
+    i = tid_flat
+    while i < Int32(n_v_chunks * hpb):
+        w_head_sc_view[i] = Float32(0.0)
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    def _vsc(cand: Int32, vc: int):
+        return _ue8m0_byte_to_fp32(
+            _ld_u8_zext(
+                kv_sc_base_addr,
+                cand * Int32(scale_bytes_per_token) + Int32(vc),
+            )
+        )
+
+    scale_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        vsc0 = _vsc(cand0, vc)
+        vsc1 = _vsc(cand1, vc)
+        atomic_max_shared_f32(
+            scale_base + (Int32(vc) * Int32(hpb) + head0) * Int32(4),
+            fmax_f32(fabs_f32(w_pre[0] * vsc0), fabs_f32(w_pre[2] * vsc1)),
+        )
+        atomic_max_shared_f32(
+            scale_base + (Int32(vc) * Int32(hpb) + head1) * Int32(4),
+            fmax_f32(fabs_f32(w_pre[1] * vsc0), fabs_f32(w_pre[3] * vsc1)),
+        )
+    cute.arch.barrier(**bar_kw)
+
+    # Lower slots hold the dequant scale; upper slots hold its reciprocal.
+    i = tid_flat
+    while i < Int32(n_v_chunks * 8):
+        vc = i // Int32(8)
+        h = i - vc * Int32(8)
+        slot = vc * Int32(hpb) + h
+        scale = fmax_f32(w_head_sc_view[slot], Float32(1e-10)) * Float32(
+            1.0 / _FP8_MAX
+        )
+        w_head_sc_view[slot] = scale
+        w_head_sc_view[slot + Int32(8)] = Float32(1.0) / scale
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+        si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + head0 + Int32(8)]
+        si1 = w_head_sc_view[Int32(vc) * Int32(hpb) + head1 + Int32(8)]
+        vsc0 = _vsc(cand0, vc)
+        vsc1 = _vsc(cand1, vc)
+
+        f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
+        f01 = _quant_e4m3_byte(w_pre[1] * vsc0 * si1)
+        f10 = _quant_e4m3_byte(w_pre[2] * vsc1 * si0)
+        f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
+        st_shared_u8(
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand0,
+            f00.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand0,
+            f01.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand1,
+            f10.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand1,
+            f11.to(cutlass.Uint8),
+        )
+        cute.arch.barrier(**bar_kw)
+
+        sc_row = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            dim = (
+                Int32(vc) * Int32(v_chunk)
+                + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+            )
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for kstep in cutlass.range_constexpr(bi // 32):
+                ko = Int32(kstep) * Int32(32)
+                a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                b0, b1 = _d2_load_b_fp8(
+                    kv_fp8_base_addr,
+                    ko,
+                    dim,
+                    lane,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                    xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + xv0 * sc_row
+            acc_nope[at][1] = acc_nope[at][1] + xv1 * sc_row
+    return acc_nope
+
+
 # =============================================================================
 # S6b -- XV-RoPE: bf16 m16n8k16 MMA (V_HAS_ROPE gate), V read from sm_kv_rope
 # Port of decode_dsv4 :673-708.
@@ -1679,6 +1905,77 @@ def s6b_xv_rope(
     return acc_rope
 
 
+@cute.jit
+def s6b_xv_rope_h8_swap_ab(
+    acc_rope,
+    sm_p_full_addr: Int32,
+    kv_rope_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr,
+    d_rope: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    tiles_per_warp: cutlass.Constexpr,
+    kv_rope_stride_bytes: cutlass.Constexpr,
+):
+    """H8 RoPE PV: two 8-column N tiles per warp cover D_ROPE=64."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+
+    for nt in cutlass.range_constexpr(tiles_per_warp):
+        col = (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8) + gid
+        r = nt * 4
+        for ks in cutlass.range_constexpr(bi // 16):
+            k_base = Int32(ks) * Int32(16)
+            a_byte = (a_row * Int32(bi) + k_base + a_col) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                sm_p_full_addr + a_byte
+            )
+            ent0 = k_base + tid * Int32(2)
+            v0 = _ld_u16_zext(
+                kv_rope_base_addr,
+                ent0 * Int32(kv_rope_stride_bytes) + col * Int32(2),
+            )
+            v1 = _ld_u16_zext(
+                kv_rope_base_addr,
+                (ent0 + Int32(1)) * Int32(kv_rope_stride_bytes)
+                + col * Int32(2),
+            )
+            v8 = _ld_u16_zext(
+                kv_rope_base_addr,
+                (ent0 + Int32(8)) * Int32(kv_rope_stride_bytes)
+                + col * Int32(2),
+            )
+            v9 = _ld_u16_zext(
+                kv_rope_base_addr,
+                (ent0 + Int32(9)) * Int32(kv_rope_stride_bytes)
+                + col * Int32(2),
+            )
+            b0 = v0 | (v1 << Uint32(16))
+            b1 = v8 | (v9 << Uint32(16))
+            (
+                acc_rope[r + 0],
+                acc_rope[r + 1],
+                acc_rope[r + 2],
+                acc_rope[r + 3],
+            ) = mma_m16n8k16_f32_bf16(
+                acc_rope[r + 0],
+                acc_rope[r + 1],
+                acc_rope[r + 2],
+                acc_rope[r + 3],
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+    return acc_rope
+
+
 # =============================================================================
 # S7 -- epilogue: per-SPLIT NORMALIZED partial writeback in split.py's convention
 # Port of decode_dsv4 :725-783, adapted to the rs-1 base-2 merge (split.py:1138).
@@ -1702,6 +1999,7 @@ def s7_epilogue(
     valid_hpb: cutlass.Constexpr,    # <= HPB
     nt_per_warp_xv: cutlass.Constexpr = 1,  # 1 DSV4 / 2 GLM
     v_has_rope: cutlass.Constexpr = True,   # True DSV4 / False GLM (V == nope only)
+    rope_tiles_per_warp: cutlass.Constexpr = 1,
     epilogue_mode: cutlass.Constexpr = EPILOGUE_PARTIAL_WRITEBACK,
     has_attn_sink: cutlass.Constexpr = False,  # FINAL_BF16 only: fold per-head sink
     attn_sink=None,                  # (heads,) f32 view (FINAL_BF16 + has_attn_sink)
@@ -1778,12 +2076,20 @@ def s7_epilogue(
 
     # RoPE dims (DSV4 only: V_HAS_ROPE). GLM V == nope-only so this is elided.
     if cutlass.const_expr(v_has_rope):
-        rd0 = Int32(d_nope) + warp_id * Int32(8) + tid * Int32(2)
-        out_o[gid, rd0] = (acc_rope[0] * inv_g0).to(_ot)
-        out_o[gid, rd0 + Int32(1)] = (acc_rope[1] * inv_g0).to(_ot)
-        if cutlass.const_expr(valid_hpb > 8):
-            out_o[gid + Int32(8), rd0] = (acc_rope[2] * inv_g1).to(_ot)
-            out_o[gid + Int32(8), rd0 + Int32(1)] = (acc_rope[3] * inv_g1).to(_ot)
+        for nt in cutlass.range_constexpr(rope_tiles_per_warp):
+            r = nt * 4
+            rd0 = (
+                Int32(d_nope)
+                + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                + tid * Int32(2)
+            )
+            out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
+            out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
+            if cutlass.const_expr(valid_hpb > 8):
+                out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
+                out_o[gid + Int32(8), rd0 + Int32(1)] = (
+                    acc_rope[r + 3] * inv_g1
+                ).to(_ot)
 
     # base-2 LSE (warp 0, tid 0 owns one head pair via gid). The PARTIAL_WRITEBACK
     # path is the EXACT prior decode epilogue (byte-identical IR); the FINAL_BF16 +

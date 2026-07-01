@@ -97,6 +97,7 @@ def io_issue_gather(
     scale_format: cutlass.Constexpr = 0,   # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
     packed_glm: cutlass.Constexpr = False,
+    packed_dsv4: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -215,13 +216,20 @@ def io_issue_gather(
 
             if cutlass.const_expr(packed_glm):
                 # Native GLM H8 keeps the source's contiguous 656-byte record
-                # intact in smem.  This replaces the separate 528B + 128B bulk
-                # operations with one transaction while using exactly the same
-                # total double-buffered storage.
+                # intact in smem, replacing separate 528B + 128B bulk copies.
                 cp_async_bulk_g2s_mbar(
                     kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                     data_base_i64,
                     Int32(_GLM_GMEM_STRIDE),
+                    full_mbar_u32,
+                )
+            elif cutlass.const_expr(packed_dsv4):
+                # DSV4 copies its contiguous 448B NoPE + 128B RoPE payload into
+                # a padded row; its grouped footer remains scalar-gathered.
+                cp_async_bulk_g2s_mbar(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                    data_base_i64,
+                    Int32(_DSV4_IO_STRIDE),
                     full_mbar_u32,
                 )
             else:

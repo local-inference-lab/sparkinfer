@@ -483,7 +483,7 @@ def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
 
 
 # ── DSV4 MAIN-CACHE compressed decode (P7): real kernel + split-K + merge ──────
-_DSV4_HEADS = 32          # local q heads (2 head blocks of HPB=16)
+_DSV4_HEADS = 32          # local q heads (4 native head blocks of HPB=8)
 _DSV4_HEAD_DIM = 512
 _DSV4_PAGE = 64           # compressed page_size for the test cache
 _DSV4_SM_SCALE = 1.0 / math.sqrt(_DSV4_HEAD_DIM)
@@ -539,6 +539,18 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     )
     torch.cuda.synchronize()
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
+
+    import b12x.attention.mla.kernel as launch
+
+    plan = launch.LAST_DECODE_PLAN
+    assert plan.get("native_dsv4_h8") is True
+    assert plan.get("heads_per_block") == 8
+    assert plan.get("math_warps") == 4
+    assert plan.get("block_threads") == 160
+    assert plan.get("kv_stage_packed") is True
+    assert plan.get("kv_smem_stride") == 592
+    assert plan.get("qk_candidates_per_warp") == 16
+    assert plan.get("qk_swap_ab") is True
 
     exp = compressed_sparse_mla_reference(
         q, cache, idx, lengths, sm_scale=_DSV4_SM_SCALE, swa_page_size=_DSV4_PAGE

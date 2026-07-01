@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark native compressed sparse MLA layouts."""
+"""Benchmark native DeepSeek-V4 compressed sparse MLA layouts."""
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import gc
 import json
 import math
@@ -16,8 +17,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.attention.mla.compressed_reference import (
+    COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -25,13 +26,16 @@ from b12x.attention.mla.compressed_reference import (
     COMPRESSED_MLA_NOPE_DIM,
     COMPRESSED_MLA_ROPE_DIM,
     COMPRESSED_MLA_SWA_TOKENS,
+    compressed_mla_page_nbytes,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
 from b12x.integration.mla import (
+    B12XCompressedMLAScratchCaps,
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
+    plan_compressed_mla_scratch,
 )
 
 from benchmarks.common import (
@@ -50,6 +54,21 @@ _PREFILL4096_TARGET_US = 2_000.0
 _PAGE_INDEX_ALIGNMENT = 64
 _DEFAULT_NUM_Q_HEADS = 32
 _DEFAULT_INDEX_TOPK = 512
+_DECODE_SPLIT_TILE = 64
+_C128_COMPRESSION_RATIO = 128
+_FLASHINFER_WORKSPACE_BYTES = 128 << 20
+
+DEFAULT_DSV4_HF_REPO_ID = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+VLLM_DSV4_TRACE_PRESET = "vllm-dsv4-trace"
+VLLM_DSV4_TRACE_SWA_PAGE_SIZE = 64
+# The captured vLLM run packs the DSV4 cache groups into one allocation.  Its
+# 22 x 37,440B, 21 x 8,640B, and 20 x 1,728B slots make each physical block
+# 1,039,680B.  The trace allocation contains 7,792 blocks; consequently a
+# 37,440B layer view spans exactly 8,100,184,320B, matching the Cute tensor
+# extent encoded in the captured B12X kernel name.
+VLLM_DSV4_TRACE_CACHE_PAGE_STRIDE_BYTES = 1_039_680
+VLLM_DSV4_TRACE_CACHE_NUM_PAGES = 7_792
+VLLM_DSV4_TRACE_CACHE_VIEW_SPAN_BYTES = 8_100_184_320
 
 
 @dataclass(frozen=True)
@@ -78,6 +97,21 @@ class CaseReport:
     replay_us: float
     p90_replay_us: float
     sanity_algorithm: Sanity | None
+    replay_samples_us: tuple[float, ...] = ()
+    flashinfer_replay_us: float | None = None
+    flashinfer_p90_replay_us: float | None = None
+    flashinfer_replay_samples_us: tuple[float, ...] = ()
+    flashinfer_sanity_algorithm: Sanity | None = None
+    b12x_vs_flashinfer_sanity: Sanity | None = None
+    split_chunks: int | None = None
+
+    @property
+    def ratio_vs_flashinfer(self) -> float | None:
+        """B12X latency divided by FlashInfer latency; lower is faster."""
+
+        if self.flashinfer_replay_us is None or self.flashinfer_replay_us <= 0.0:
+            return None
+        return self.replay_us / self.flashinfer_replay_us
 
 
 @dataclass(frozen=True)
@@ -95,6 +129,22 @@ class DSV4CompressedMLAProfile:
     c4_indexed_width: int
     c128_indexed_width: int
     selected_widths: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CacheViews:
+    b12x: torch.Tensor
+    flashinfer: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TraceWeightedSummary:
+    b12x_total_us: float
+    flashinfer_total_us: float
+    b12x_avg_us: float
+    flashinfer_avg_us: float
+    ratio: float
+    layer_count: int
 
 
 class BenchmarkFailure(RuntimeError):
@@ -115,6 +165,84 @@ def _load_model_config(path: pathlib.Path) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise ValueError(f"model config must be a JSON object: {path}")
     return loaded
+
+
+def _resolve_cached_hf_config(
+    repo_id: str = DEFAULT_DSV4_HF_REPO_ID,
+    *,
+    cache_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Resolve config.json from the local HF cache without downloading it."""
+
+    from huggingface_hub import try_to_load_from_cache
+
+    cached_config = try_to_load_from_cache(
+        repo_id=repo_id,
+        filename="config.json",
+        cache_dir=cache_root,
+        revision="main",
+    )
+    if isinstance(cached_config, str):
+        return pathlib.Path(cached_config)
+    cache_desc = (
+        "the configured Hugging Face cache" if cache_root is None else str(cache_root)
+    )
+    raise SystemExit(
+        f"cached Hugging Face config not found for {repo_id!r} in {cache_desc}; "
+        "populate the cache or pass --model-config /path/to/config.json"
+    )
+
+
+def _resolve_flashinfer_autotune_cache(path: pathlib.Path | None) -> pathlib.Path:
+    """Resolve the newest local SM120 DSV4 sparse-MLA autotune cache."""
+
+    if path is not None:
+        resolved = path.expanduser()
+        if not resolved.is_file():
+            raise SystemExit(f"FlashInfer autotune cache not found at {resolved}")
+        return resolved
+
+    cache_root = pathlib.Path.home() / ".cache" / "vllm" / "flashinfer_autotune_cache"
+    candidates: list[pathlib.Path] = []
+    for candidate in cache_root.glob("*/120f/*/autotune_configs.json"):
+        try:
+            contents = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if (
+            "sparse_mla_sm120_decode_dsv4" in contents
+            and "(1, 32, 512)" in contents
+            and "8192" in contents
+        ):
+            candidates.append(candidate)
+    if not candidates:
+        raise SystemExit(
+            "no SM120 DeepSeek-V4 FlashInfer autotune cache found under "
+            f"{cache_root}; pass --flashinfer-autotune-cache"
+        )
+    return max(candidates, key=lambda candidate: candidate.stat().st_mtime_ns)
+
+
+def _trace_layer_weights(config: dict[str, object]) -> dict[str, int]:
+    """Map the real model layers to the three compressed attention regimes."""
+
+    num_layers = int(config["num_hidden_layers"])
+    ratios = tuple(int(value) for value in config["compress_ratios"])  # type: ignore[index]
+    if len(ratios) < num_layers:
+        raise ValueError(
+            f"compress_ratios has {len(ratios)} entries for {num_layers} model layers"
+        )
+    counts = Counter(ratios[:num_layers])
+    unexpected = sorted(ratio for ratio in counts if ratio not in (0, 4, 128))
+    if unexpected:
+        raise ValueError(
+            f"unsupported DSV4 compression ratios in model layers: {unexpected}"
+        )
+    return {
+        "swa": counts[0],
+        "swa-c4": counts[4],
+        "swa-c128": counts[128],
+    }
 
 
 def _derive_dsv4_compressed_mla_profile(
@@ -145,7 +273,13 @@ def _derive_dsv4_compressed_mla_profile(
 
     c128_width = 0
     if uses_c128 and c128_source_tokens:
-        c128_width = (int(c128_source_tokens) + COMPRESSED_MLA_C128_PAGE_SIZE - 1) // COMPRESSED_MLA_C128_PAGE_SIZE
+        # Selected C128 slots are source-token positions compressed by 128.
+        # The resulting cache then packs two compressed slots per physical
+        # page (256 / 128); dividing source capacity by that page size would
+        # overstate the cache by 64x.
+        c128_width = (
+            int(c128_source_tokens) + _C128_COMPRESSION_RATIO - 1
+        ) // _C128_COMPRESSION_RATIO
         if c128_pool_size is not None:
             c128_width = min(c128_width, int(c128_pool_size))
     c128_indexed_width = _align_up(c128_width) if c128_width else 0
@@ -279,14 +413,24 @@ def _resolve_case_widths(args: argparse.Namespace) -> tuple[int, int]:
     return int(c4_indexed_width), int(c128_indexed_width)
 
 
-def _planned_split_chunks(case: BenchmarkCase) -> int:
+def _planned_split_chunks(
+    case: BenchmarkCase,
+    *,
+    production_decode_cap: bool = False,
+) -> int:
+    max_chunks = None
+    if production_decode_cap:
+        max_chunks = max(1, math.ceil(case.topk / _DECODE_SPLIT_TILE))
     return compressed_mla_split_chunks_for_contract(
         rows=case.rows,
         width=max(1, case.topk),
+        max_chunks=max_chunks,
     )
 
 
-def _make_q(*, rows: int, num_q_heads: int, seed: int, device: torch.device) -> torch.Tensor:
+def _make_q(
+    *, rows: int, num_q_heads: int, seed: int, device: torch.device
+) -> torch.Tensor:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q = torch.randn(
@@ -332,6 +476,98 @@ def _make_compressed_cache(
     )
 
 
+def _make_cache_views(
+    packed_cache: torch.Tensor,
+    *,
+    page_size: int,
+    block_stride_bytes: int,
+    num_pages: int | None = None,
+    backing: torch.Tensor | None = None,
+    byte_offset: int = 0,
+) -> CacheViews:
+    """Expose one packed vLLM cache allocation to B12X and FlashInfer.
+
+    vLLM presents the same storage as ``[pages, page_size, 584]`` to
+    FlashInfer and as ``[pages, padded_page_bytes]`` to B12X. Packed KV cache
+    groups retain the aggregate all-layer byte stride between successive
+    physical pages, which is the important C128 addressing stress in the
+    serving trace.
+    """
+
+    if packed_cache.dtype != torch.uint8 or packed_cache.ndim != 2:
+        raise ValueError("packed compressed cache must be rank-2 uint8")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if block_stride_bytes < 0:
+        raise ValueError(
+            f"block_stride_bytes must be non-negative, got {block_stride_bytes}"
+        )
+
+    active_pages, page_nbytes = (int(value) for value in packed_cache.shape)
+    pages = active_pages if num_pages is None else int(num_pages)
+    if pages <= 0:
+        raise ValueError(f"num_pages must be positive, got {pages}")
+    if active_pages > pages:
+        raise ValueError(
+            f"active cache has {active_pages} pages but pool only has {pages}"
+        )
+    if byte_offset < 0:
+        raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
+    nominal_page_bytes = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+    if page_nbytes < nominal_page_bytes:
+        raise ValueError(
+            f"packed page has {page_nbytes} bytes, smaller than nominal "
+            f"{nominal_page_bytes} bytes"
+        )
+    page_stride = page_nbytes if block_stride_bytes == 0 else int(block_stride_bytes)
+    if page_stride < page_nbytes:
+        raise ValueError(
+            f"block stride {page_stride} is smaller than packed page {page_nbytes}"
+        )
+
+    if (
+        backing is None
+        and byte_offset == 0
+        and pages == active_pages
+        and page_stride == page_nbytes
+    ):
+        b12x_view = packed_cache
+    else:
+        required_nbytes = byte_offset + (pages - 1) * page_stride + page_nbytes
+        if backing is None:
+            backing = torch.empty(
+                required_nbytes,
+                dtype=torch.uint8,
+                device=packed_cache.device,
+            )
+        elif (
+            backing.dtype != torch.uint8
+            or backing.ndim != 1
+            or backing.device != packed_cache.device
+        ):
+            raise ValueError(
+                "cache backing must be a rank-1 uint8 tensor on the cache device"
+            )
+        if int(backing.numel()) < required_nbytes:
+            raise ValueError(
+                f"cache backing has {backing.numel()} bytes, needs {required_nbytes}"
+            )
+        b12x_view = torch.as_strided(
+            backing,
+            size=(pages, page_nbytes),
+            stride=(page_stride, 1),
+            storage_offset=byte_offset,
+        )
+        b12x_view[:active_pages].copy_(packed_cache)
+
+    flashinfer_view = torch.as_strided(
+        b12x_view,
+        size=(pages, int(page_size), COMPRESSED_MLA_BYTES_PER_TOKEN),
+        stride=(page_stride, COMPRESSED_MLA_BYTES_PER_TOKEN, 1),
+    )
+    return CacheViews(b12x=b12x_view, flashinfer=flashinfer_view)
+
+
 def _make_indices(
     *,
     rows: int,
@@ -349,26 +585,50 @@ def _make_indices(
     return ((offsets + cols) % tokens).to(torch.int32)
 
 
-def _make_workspace(
+def _make_binding(
     *,
     case: BenchmarkCase,
     num_q_heads: int,
     device: torch.device,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_contract(
-        mode="decode",
+    q: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    indexed_indices: torch.Tensor | None,
+    indexed_lengths: torch.Tensor | None,
+    swa_page_size: int,
+    production_decode_cap: bool,
+):
+    split_chunks = _planned_split_chunks(
+        case,
+        production_decode_cap=production_decode_cap,
+    )
+    plan = plan_compressed_mla_scratch(
+        B12XCompressedMLAScratchCaps(
         device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
         num_q_heads=num_q_heads,
+            max_q_rows=case.rows,
+            max_width=max(1, case.topk),
         head_dim=COMPRESSED_MLA_HEAD_DIM,
         v_head_dim=COMPRESSED_MLA_HEAD_DIM,
-        topk=max(1, case.topk),
-        max_total_q=case.rows,
         max_batch=case.rows,
-        use_cuda_graph=True,
-        max_chunks_per_row=_planned_split_chunks(case),
+            page_size=swa_page_size,
+            max_chunks_per_row=split_chunks,
+        )
     )
+    scratch = [
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    ]
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+    )
+    binding.scratch.use_cuda_graph = True
+    return binding, split_chunks
 
 
 def _sanity(actual: torch.Tensor, expected: torch.Tensor) -> Sanity:
@@ -378,7 +638,9 @@ def _sanity(actual: torch.Tensor, expected: torch.Tensor) -> Sanity:
     return Sanity(
         max_abs=diff.abs().max().item(),
         rmse=torch.sqrt(torch.mean(diff * diff)).item(),
-        cos=torch.nn.functional.cosine_similarity(flat_actual, flat_expected, dim=0).item(),
+        cos=torch.nn.functional.cosine_similarity(
+            flat_actual, flat_expected, dim=0
+        ).item(),
     )
 
 
@@ -435,31 +697,90 @@ def _benchmark_case(
     l2_flush,
     verify: bool,
     num_q_heads: int,
+    swa_page_size: int,
+    cache_page_stride_bytes: int,
+    cache_num_pages: int,
+    production_decode_cap: bool,
+    use_attn_sink: bool,
+    reference: str,
 ) -> CaseReport:
     clear_mla_caches()
     q = _make_q(rows=case.rows, num_q_heads=num_q_heads, seed=seed, device=device)
+    attn_sink = None
+    if use_attn_sink:
+        attn_sink = torch.linspace(
+            -0.25,
+            0.25,
+            num_q_heads,
+            dtype=torch.float32,
+            device=device,
+        )
 
     swa_tokens = max(case.swa_width, 1)
-    swa_cache = _make_compressed_cache(
+    swa_packed = _make_compressed_cache(
         tokens=swa_tokens,
-        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
+        page_size=swa_page_size,
         seed=seed + 1,
         device=device,
     )
-    swa_indices = _make_indices(rows=case.rows, width=case.swa_width, tokens=swa_tokens, device=device)
-    swa_lengths = torch.full((case.rows,), case.swa_width, dtype=torch.int32, device=device)
+    indexed_packed: torch.Tensor | None = None
+    if case.indexed_width:
+        assert case.indexed_page_size is not None
+        indexed_packed = _make_compressed_cache(
+            tokens=case.indexed_width * max(case.rows, 1),
+            page_size=case.indexed_page_size,
+            seed=seed + 2,
+            device=device,
+        )
 
-    indexed_cache: torch.Tensor | None = None
+    cache_backing: torch.Tensor | None = None
+    indexed_byte_offset = 0
+    if cache_num_pages:
+        if cache_page_stride_bytes <= 0:
+            raise ValueError("cache_num_pages requires a positive packed-cache stride")
+        indexed_byte_offset = compressed_mla_page_nbytes(swa_page_size)
+        largest_payload_end = indexed_byte_offset
+        if case.indexed_page_size is not None:
+            largest_payload_end += compressed_mla_page_nbytes(case.indexed_page_size)
+        if largest_payload_end > cache_page_stride_bytes:
+            raise ValueError(
+                "SWA and indexed cache payloads do not fit in one packed block: "
+                f"need {largest_payload_end}, stride is {cache_page_stride_bytes}"
+            )
+        cache_backing = torch.empty(
+            cache_num_pages * cache_page_stride_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    swa_cache = _make_cache_views(
+        swa_packed,
+        page_size=swa_page_size,
+        block_stride_bytes=cache_page_stride_bytes,
+        num_pages=cache_num_pages or None,
+        backing=cache_backing,
+    )
+    swa_indices = _make_indices(
+        rows=case.rows, width=case.swa_width, tokens=swa_tokens, device=device
+    )
+    swa_lengths = torch.full(
+        (case.rows,), case.swa_width, dtype=torch.int32, device=device
+    )
+
+    indexed_cache: CacheViews | None = None
     indexed_indices: torch.Tensor | None = None
     indexed_lengths: torch.Tensor | None = None
     if case.indexed_width:
         assert case.indexed_page_size is not None
         indexed_tokens = case.indexed_width * max(case.rows, 1)
-        indexed_cache = _make_compressed_cache(
-            tokens=indexed_tokens,
+        assert indexed_packed is not None
+        indexed_cache = _make_cache_views(
+            indexed_packed,
             page_size=case.indexed_page_size,
-            seed=seed + 2,
-            device=device,
+            block_stride_bytes=cache_page_stride_bytes,
+            num_pages=cache_num_pages or None,
+            backing=cache_backing,
+            byte_offset=indexed_byte_offset,
         )
         indexed_indices = _make_indices(
             rows=case.rows,
@@ -467,12 +788,21 @@ def _benchmark_case(
             tokens=indexed_tokens,
             device=device,
         )
-        indexed_lengths = torch.full((case.rows,), case.indexed_width, dtype=torch.int32, device=device)
+        indexed_lengths = torch.full(
+            (case.rows,), case.indexed_width, dtype=torch.int32, device=device
+        )
 
-    workspace = _make_workspace(
+    binding, split_chunks = _make_binding(
         case=case,
         num_q_heads=num_q_heads,
         device=device,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        swa_page_size=swa_page_size,
+        production_decode_cap=production_decode_cap,
     )
 
     output: torch.Tensor | None = None
@@ -480,57 +810,135 @@ def _benchmark_case(
     def run() -> torch.Tensor:
         nonlocal output
         output = compressed_mla_decode_forward(
-            q_all=q,
-            swa_k_cache=swa_cache,
-            swa_indices=swa_indices,
-            swa_topk_lengths=swa_lengths,
-            indexed_k_cache=indexed_cache,
-            indexed_indices=indexed_indices,
-            indexed_topk_lengths=indexed_lengths,
+            binding=binding,
+            swa_k_cache=swa_cache.b12x,
+            swa_page_size=swa_page_size,
+            indexed_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
             indexed_page_size=case.indexed_page_size,
-            workspace=workspace,
+            attn_sink=attn_sink,
             sm_scale=_SM_SCALE,
+            expected_num_q_heads=num_q_heads,
         )
         return output
+
+    expected_algorithm: torch.Tensor | None = None
+    if verify:
+        expected_algorithm = compressed_sparse_mla_reference(
+            q,
+            swa_cache.b12x,
+            swa_indices,
+            swa_lengths,
+            sm_scale=_SM_SCALE,
+            attn_sink=attn_sink,
+            extra_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
+            extra_indices=indexed_indices,
+            extra_topk_lengths=indexed_lengths,
+            swa_page_size=swa_page_size,
+            extra_page_size=case.indexed_page_size,
+        )
 
     graph = capture_cuda_graph(run, warmup=warmup)
     try:
         stats = bench_cuda_graph(graph, replays=replays, l2_flush=l2_flush)
-
         if output is None:
             raise RuntimeError("benchmark graph did not produce an output tensor")
-
-        sanity_algorithm: Sanity | None = None
-        if verify:
-            expected_algorithm = compressed_sparse_mla_reference(
-                q,
-                swa_cache,
-                swa_indices,
-                swa_lengths,
-                sm_scale=_SM_SCALE,
-                extra_k_cache=indexed_cache,
-                extra_indices=indexed_indices,
-                extra_topk_lengths=indexed_lengths,
-                extra_page_size=case.indexed_page_size,
-            )
-            sanity_algorithm = _sanity(output, expected_algorithm)
-            _check_algorithm_sanity(case, sanity_algorithm)
     finally:
         torch.cuda.synchronize(device)
         del graph
-        gc.collect()
-        torch.cuda.empty_cache()
 
     replay_us = stats["replay_us"]
+    sanity_algorithm: Sanity | None = None
+    if expected_algorithm is not None:
+        sanity_algorithm = _sanity(output, expected_algorithm)
+        _check_algorithm_sanity(case, sanity_algorithm)
+    if not bool(torch.isfinite(output.float()).all().item()):
+        raise BenchmarkFailure(f"non-finite B12X output for case={case.name}")
+    if not bool(torch.count_nonzero(output).item()):
+        raise BenchmarkFailure(f"all-zero B12X output for case={case.name}")
+
+    flashinfer_replay_us: list[float] = []
+    flashinfer_sanity: Sanity | None = None
+    b12x_vs_flashinfer: Sanity | None = None
+    if reference == "flashinfer":
+        from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4
+
+        flashinfer_workspace = torch.zeros(
+            _FLASHINFER_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=device,
+        )
+        flashinfer_output = torch.empty_like(q)
+
+        def run_flashinfer() -> torch.Tensor:
+            return trtllm_batch_decode_sparse_mla_dsv4(
+                query=q,
+                swa_kv_cache=swa_cache.flashinfer,
+                workspace_buffer=flashinfer_workspace,
+                sparse_indices=swa_indices,
+                compressed_kv_cache=(
+                    indexed_cache.flashinfer if indexed_cache is not None else None
+                ),
+                out=flashinfer_output,
+                bmm1_scale=_SM_SCALE,
+                bmm2_scale=1.0,
+                sinks=attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lengths,
+                extra_sparse_indices=indexed_indices,
+                extra_sparse_topk_lens=indexed_lengths,
+            )
+
+        flashinfer_graph = capture_cuda_graph(run_flashinfer, warmup=warmup)
+        try:
+            flashinfer_stats = bench_cuda_graph(
+                flashinfer_graph,
+                replays=replays,
+                l2_flush=l2_flush,
+            )
+        finally:
+            torch.cuda.synchronize(device)
+            del flashinfer_graph
+        flashinfer_replay_us = flashinfer_stats["replay_us"]
+        if expected_algorithm is not None:
+            flashinfer_sanity = _sanity(flashinfer_output, expected_algorithm)
+            _check_algorithm_sanity(case, flashinfer_sanity)
+        b12x_vs_flashinfer = _sanity(output, flashinfer_output)
+        _check_algorithm_sanity(case, b12x_vs_flashinfer)
+        if not bool(torch.isfinite(flashinfer_output.float()).all().item()):
+            raise BenchmarkFailure(f"non-finite FlashInfer output for case={case.name}")
+        if not bool(torch.count_nonzero(flashinfer_output).item()):
+            raise BenchmarkFailure(f"all-zero FlashInfer output for case={case.name}")
+
+    gc.collect()
+    torch.cuda.empty_cache()
     return CaseReport(
         case=case,
         replay_us=statistics.median(replay_us),
-        p90_replay_us=statistics.quantiles(replay_us, n=10)[8] if len(replay_us) >= 10 else max(replay_us),
+        p90_replay_us=statistics.quantiles(replay_us, n=10)[8]
+        if len(replay_us) >= 10
+        else max(replay_us),
         sanity_algorithm=sanity_algorithm,
+        replay_samples_us=tuple(replay_us),
+        flashinfer_replay_us=(
+            statistics.median(flashinfer_replay_us) if flashinfer_replay_us else None
+        ),
+        flashinfer_p90_replay_us=(
+            statistics.quantiles(flashinfer_replay_us, n=10)[8]
+            if len(flashinfer_replay_us) >= 10
+            else max(flashinfer_replay_us)
+            if flashinfer_replay_us
+            else None
+        ),
+        flashinfer_replay_samples_us=tuple(flashinfer_replay_us),
+        flashinfer_sanity_algorithm=flashinfer_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer,
+        split_chunks=split_chunks,
     )
 
 
-def collect_case_reports(args: argparse.Namespace, *, device: torch.device | None = None) -> list[CaseReport]:
+def collect_case_reports(
+    args: argparse.Namespace, *, device: torch.device | None = None
+) -> list[CaseReport]:
     if device is None:
         device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
@@ -556,13 +964,23 @@ def collect_case_reports(args: argparse.Namespace, *, device: torch.device | Non
                 l2_flush=l2_flush,
                 verify=not args.skip_verify,
                 num_q_heads=args.num_q_heads,
+                swa_page_size=args.swa_page_size,
+                cache_page_stride_bytes=args.cache_page_stride_bytes,
+                cache_num_pages=args.cache_num_pages,
+                production_decode_cap=args.production_decode_cap,
+                use_attn_sink=args.attn_sink,
+                reference=args.reference,
             )
         )
     return reports
 
 
 def _render_report(report: CaseReport) -> str:
-    indexed_page = report.case.indexed_page_size if report.case.indexed_page_size is not None else 0
+    indexed_page = (
+        report.case.indexed_page_size
+        if report.case.indexed_page_size is not None
+        else 0
+    )
     parts = [
         f"compressed-mla-native case={report.case.name:8s}",
         f"rows={report.case.rows:2d}",
@@ -570,10 +988,18 @@ def _render_report(report: CaseReport) -> str:
         f"indexed={report.case.indexed_width:3d}",
         f"indexed_page={indexed_page:3d}",
         f"topk={report.case.topk:3d}",
-        f"chunks={_planned_split_chunks(report.case):2d}",
+        f"chunks={(report.split_chunks if report.split_chunks is not None else _planned_split_chunks(report.case)):3d}",
         f"replay={report.replay_us:8.2f} us",
         f"p90={report.p90_replay_us:8.2f} us",
     ]
+    if report.flashinfer_replay_us is not None:
+        parts.extend(
+            [
+                f"flashinfer={report.flashinfer_replay_us:8.2f} us",
+                f"fi_p90={report.flashinfer_p90_replay_us:8.2f} us",
+                f"b12x/fi={report.ratio_vs_flashinfer:.4f}x",
+            ]
+        )
     if report.sanity_algorithm is not None:
         parts.append(
             "algorithm="
@@ -581,7 +1007,75 @@ def _render_report(report: CaseReport) -> str:
             f"rmse:{report.sanity_algorithm.rmse:.5f},"
             f"cos:{report.sanity_algorithm.cos:.6f}"
         )
+    if report.flashinfer_sanity_algorithm is not None:
+        parts.append(
+            "fi_algorithm="
+            f"max_abs:{report.flashinfer_sanity_algorithm.max_abs:.4f},"
+            f"rmse:{report.flashinfer_sanity_algorithm.rmse:.5f},"
+            f"cos:{report.flashinfer_sanity_algorithm.cos:.6f}"
+        )
+    if report.b12x_vs_flashinfer_sanity is not None:
+        parts.append(
+            "b12x_vs_fi="
+            f"max_abs:{report.b12x_vs_flashinfer_sanity.max_abs:.4f},"
+            f"rmse:{report.b12x_vs_flashinfer_sanity.rmse:.5f},"
+            f"cos:{report.b12x_vs_flashinfer_sanity.cos:.6f}"
+        )
     return " | ".join(parts)
+
+
+def _compute_trace_weighted_summary(
+    reports: list[CaseReport],
+    layer_weights: dict[str, int],
+) -> TraceWeightedSummary:
+    by_name = {report.case.name: report for report in reports}
+    missing = sorted(
+        name for name, weight in layer_weights.items() if weight and name not in by_name
+    )
+    if missing:
+        raise BenchmarkFailure(f"missing trace cases for weighted summary: {missing}")
+    if any(
+        by_name[name].flashinfer_replay_us is None
+        for name in layer_weights
+        if layer_weights[name]
+    ):
+        raise BenchmarkFailure("weighted trace summary requires FlashInfer timings")
+
+    layer_count = sum(layer_weights.values())
+    b12x_total = sum(
+        layer_weights[name] * by_name[name].replay_us for name in layer_weights
+    )
+    flashinfer_total = sum(
+        layer_weights[name] * float(by_name[name].flashinfer_replay_us)
+        for name in layer_weights
+    )
+    return TraceWeightedSummary(
+        b12x_total_us=b12x_total,
+        flashinfer_total_us=flashinfer_total,
+        b12x_avg_us=b12x_total / layer_count,
+        flashinfer_avg_us=flashinfer_total / layer_count,
+        ratio=b12x_total / flashinfer_total,
+        layer_count=layer_count,
+    )
+
+
+def _render_trace_weighted_summary(
+    summary: TraceWeightedSummary,
+    layer_weights: dict[str, int],
+) -> str:
+    return " | ".join(
+        [
+            "Trace-weighted",
+            f"layers={summary.layer_count}",
+            "weights="
+            + ",".join(f"{name}:{weight}" for name, weight in layer_weights.items()),
+            f"b12x_total={summary.b12x_total_us:.2f} us",
+            f"flashinfer_total={summary.flashinfer_total_us:.2f} us",
+            f"b12x_avg={summary.b12x_avg_us:.2f} us",
+            f"flashinfer_avg={summary.flashinfer_avg_us:.2f} us",
+            f"b12x/fi={summary.ratio:.4f}x",
+        ]
+    )
 
 
 def _render_summary(reports: list[CaseReport], summary: TargetSummary) -> str:
@@ -597,14 +1091,44 @@ def _render_summary(reports: list[CaseReport], summary: TargetSummary) -> str:
     )
 
 
+def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if args.preset == "none":
+        return args
+    if args.preset != VLLM_DSV4_TRACE_PRESET:
+        raise ValueError(f"unknown preset {args.preset!r}")
+
+    args.cases = "model"
+    args.rows = [1]
+    args.num_q_heads = _DEFAULT_NUM_Q_HEADS
+    args.swa_page_size = VLLM_DSV4_TRACE_SWA_PAGE_SIZE
+    args.cache_page_stride_bytes = VLLM_DSV4_TRACE_CACHE_PAGE_STRIDE_BYTES
+    args.cache_num_pages = VLLM_DSV4_TRACE_CACHE_NUM_PAGES
+    args.production_decode_cap = True
+    args.attn_sink = True
+    args.reference = "flashinfer"
+    return args
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preset",
+        choices=("none", VLLM_DSV4_TRACE_PRESET),
+        default="none",
+        help=(
+            "vllm-dsv4-trace reproduces the captured TP2 C1, C4, and C128 "
+            "decode contracts, packed cache stride, sink, split caps, and "
+            "FlashInfer comparison"
+        ),
+    )
     parser.add_argument(
         "--cases",
         default="all",
         help="comma-separated cases: all,model,swa,c4,c128,swa-c4,swa-c128",
     )
-    parser.add_argument("--rows", type=_parse_csv_ints, default=_parse_csv_ints("1,4096"))
+    parser.add_argument(
+        "--rows", type=_parse_csv_ints, default=_parse_csv_ints("1,4096")
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--seed", type=int, default=91_000)
@@ -667,7 +1191,58 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_NUM_Q_HEADS,
         help="local query-head count to benchmark; default is the synthetic 32-head profile",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--swa-page-size",
+        type=int,
+        default=COMPRESSED_MLA_DSV4_PAGE_SIZE,
+        help="physical SWA page size; vLLM's DeepSeek-V4 cache uses 64",
+    )
+    parser.add_argument(
+        "--cache-page-stride-bytes",
+        type=int,
+        default=0,
+        help=(
+            "physical byte stride between pages in a packed vLLM cache view; "
+            "0 uses contiguous per-layer pages"
+        ),
+    )
+    parser.add_argument(
+        "--cache-num-pages",
+        type=int,
+        default=0,
+        help=(
+            "physical pages in the packed cache pool; 0 allocates only pages "
+            "addressed by the synthetic case"
+        ),
+    )
+    parser.add_argument(
+        "--production-decode-cap",
+        action="store_true",
+        help="cap split scratch at ceil(total_width/64), matching the vLLM backend",
+    )
+    parser.add_argument(
+        "--attn-sink",
+        action="store_true",
+        help="include the per-head FP32 attention sink used by the traced model",
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("none", "flashinfer"),
+        default="none",
+        help="optional graph-captured FlashInfer DSV4 sparse-MLA race",
+    )
+    parser.add_argument(
+        "--flashinfer-autotune-cache",
+        type=pathlib.Path,
+        default=None,
+        help="FlashInfer autotune_configs.json; defaults to the newest local matching SM120 cache",
+    )
+    parser.add_argument(
+        "--print-raw-samples",
+        action="store_true",
+        help="print every B12X and FlashInfer CUDA-graph replay sample",
+    )
+    return _apply_benchmark_preset(parser.parse_args(argv))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -684,6 +1259,39 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--c128-indexed-width must be positive")
     if args.num_q_heads <= 0:
         raise SystemExit("--num-q-heads must be positive")
+    if args.swa_page_size <= 0:
+        raise SystemExit("--swa-page-size must be positive")
+    if args.cache_page_stride_bytes < 0:
+        raise SystemExit("--cache-page-stride-bytes must be non-negative")
+    if args.cache_num_pages < 0:
+        raise SystemExit("--cache-num-pages must be non-negative")
+
+    if args.preset == VLLM_DSV4_TRACE_PRESET:
+        if args.model_config is None:
+            args.model_config = _resolve_cached_hf_config()
+        trace_config = _load_model_config(args.model_config)
+        args.full_token_capacity = int(trace_config["max_position_embeddings"])
+        layer_weights = _trace_layer_weights(trace_config)
+    else:
+        trace_config = None
+        layer_weights = None
+
+    flashinfer_autotune_cache: pathlib.Path | None = None
+    if args.reference == "flashinfer":
+        flashinfer_autotune_cache = _resolve_flashinfer_autotune_cache(
+            args.flashinfer_autotune_cache
+        )
+        from flashinfer import __version__ as flashinfer_version
+        from flashinfer.autotuner import AutoTuner
+
+        if not AutoTuner.get().load_configs(str(flashinfer_autotune_cache)):
+            raise SystemExit(
+                f"FlashInfer rejected autotune cache {flashinfer_autotune_cache}"
+            )
+        print(
+            "FlashInfer reference: "
+            f"version={flashinfer_version} autotune_cache={flashinfer_autotune_cache}"
+        )
     try:
         _resolve_case_widths(args)
     except (OSError, ValueError) as exc:
@@ -696,10 +1304,41 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
-    flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per replay)" if args.flush_l2 else "off"
+    flush_desc = (
+        f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per replay)"
+        if args.flush_l2
+        else "off"
+    )
     print(f"L2 flush: {flush_desc}")
+    if trace_config is not None:
+        print(
+            "DSV4 trace contract: "
+            f"config={args.model_config} rows=1 local_heads={args.num_q_heads} "
+            f"swa_page={args.swa_page_size} "
+            f"cache_page_stride={args.cache_page_stride_bytes} "
+            f"cache_num_pages={args.cache_num_pages} "
+            f"cache_allocation={args.cache_num_pages * args.cache_page_stride_bytes} "
+            f"max_positions={trace_config['max_position_embeddings']}"
+        )
     for report in reports:
         print(_render_report(report))
+        if args.print_raw_samples:
+            print(
+                f"raw case={report.case.name} backend=b12x us="
+                + ",".join(f"{sample:.3f}" for sample in report.replay_samples_us)
+            )
+            if report.flashinfer_replay_samples_us:
+                print(
+                    f"raw case={report.case.name} backend=flashinfer us="
+                    + ",".join(
+                        f"{sample:.3f}"
+                        for sample in report.flashinfer_replay_samples_us
+                    )
+                )
+    if layer_weights is not None:
+        weighted = _compute_trace_weighted_summary(reports, layer_weights)
+        print(_render_trace_weighted_summary(weighted, layer_weights))
+        return 0
     try:
         summary = _compute_target_summary(reports)
     except BenchmarkFailure as exc:

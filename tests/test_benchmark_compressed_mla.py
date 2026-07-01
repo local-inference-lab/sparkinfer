@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from benchmarks import benchmark_compressed_mla
 
@@ -135,6 +136,68 @@ def test_model_config_derives_live_dsv4_selected_widths() -> None:
     assert profile.selected_widths == (128, 640, 2_816)
 
 
+def test_model_config_derives_c128_width_from_compression_ratio() -> None:
+    profile = benchmark_compressed_mla._derive_dsv4_compressed_mla_profile(
+        {
+            "sliding_window": 128,
+            "index_topk": 512,
+            "max_position_embeddings": 1_048_576,
+            "compress_ratios": [0, 4, 128],
+        }
+    )
+
+    assert profile.c128_indexed_width == 8_192
+    assert profile.selected_widths == (128, 640, 8_320)
+
+
+def test_trace_preset_uses_full_packed_vllm_pool_geometry() -> None:
+    args = benchmark_compressed_mla._parse_args(
+        ["--preset", benchmark_compressed_mla.VLLM_DSV4_TRACE_PRESET]
+    )
+
+    assert args.cache_page_stride_bytes == 1_039_680
+    assert args.cache_num_pages == 7_792
+    span = (
+        (args.cache_num_pages - 1) * args.cache_page_stride_bytes
+        + benchmark_compressed_mla.compressed_mla_page_nbytes(args.swa_page_size)
+    )
+    assert span == benchmark_compressed_mla.VLLM_DSV4_TRACE_CACHE_VIEW_SPAN_BYTES
+
+
+def test_cache_views_can_share_a_larger_strided_pool() -> None:
+    page_size = 2
+    page_nbytes = benchmark_compressed_mla.compressed_mla_page_nbytes(page_size)
+    packed = torch.full((2, page_nbytes), 7, dtype=torch.uint8)
+    backing = torch.zeros(4 * 4096, dtype=torch.uint8)
+
+    views = benchmark_compressed_mla._make_cache_views(
+        packed,
+        page_size=page_size,
+        block_stride_bytes=4096,
+        num_pages=4,
+        backing=backing,
+        byte_offset=576,
+    )
+
+    assert views.b12x.shape == (4, page_nbytes)
+    assert views.b12x.stride() == (4096, 1)
+    assert views.b12x.storage_offset() == 576
+    assert views.flashinfer.shape == (4, page_size, 584)
+    assert views.flashinfer.stride() == (4096, 584, 1)
+    assert torch.equal(views.b12x[:2], packed)
+
+
+def test_trace_layer_weights_cover_all_target_layers() -> None:
+    weights = benchmark_compressed_mla._trace_layer_weights(
+        {
+            "num_hidden_layers": 6,
+            "compress_ratios": [0, 0, 4, 128, 4, 128, 0],
+        }
+    )
+
+    assert weights == {"swa": 2, "swa-c4": 2, "swa-c128": 2}
+
+
 def test_parse_model_cases_uses_runtime_variants() -> None:
     cases = benchmark_compressed_mla._parse_cases(
         "model",
@@ -221,7 +284,9 @@ def test_main_prints_target_ratios(monkeypatch, capsys) -> None:
     assert "replay_geo" not in captured.out
 
 
-def test_main_prints_partial_case_reports_without_target_summary(monkeypatch, capsys) -> None:
+def test_main_prints_partial_case_reports_without_target_summary(
+    monkeypatch, capsys
+) -> None:
     reports = [
         benchmark_compressed_mla.CaseReport(
             case=_case(1),
