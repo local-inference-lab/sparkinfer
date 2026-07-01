@@ -42,8 +42,14 @@ def compressed_mla_decode_forward(
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     backend: str | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run compressed sparse MLA decode directly from compressed KV pages."""
+    """Run compressed sparse MLA decode directly from compressed KV pages.
+
+    ``out``, when given, is the final O destination: the kernel/merge writes it
+    directly (no workspace-to-caller copy). Must be a contiguous BF16
+    [rows, heads, 512] tensor on q's device; anything else raises.
+    """
 
     if lse_scale not in ("base2", "natural"):
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
@@ -166,6 +172,9 @@ def compressed_mla_decode_forward(
         width=swa_indices_2d.shape[1] + (indexed_indices_2d.shape[1] if has_indexed else 0),
     )
 
+    if out is not None:
+        _validate_compressed_mla_out(out, q3=q3)
+
     if scratch.mode in ("extend", "verify", "draft_extend"):
         return _run_sm120_compressed_prefill(
             q3=q3,
@@ -182,6 +191,7 @@ def compressed_mla_decode_forward(
             attn_sink=attn_sink,
             return_lse=return_lse,
             lse_scale=lse_scale,
+            out=out,
         )
 
     from .kernel import run_unified_decode
@@ -201,7 +211,25 @@ def compressed_mla_decode_forward(
         attn_sink=attn_sink,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        out=out,
     )
+
+
+def _validate_compressed_mla_out(out: torch.Tensor, *, q3: torch.Tensor) -> None:
+    rows, heads, _ = q3.shape
+    expected = (int(rows), int(heads), COMPRESSED_MLA_HEAD_DIM)
+    if tuple(out.shape) != expected:
+        raise ValueError(
+            f"compressed MLA out must have shape {expected}, got {tuple(out.shape)}"
+        )
+    if out.dtype != torch.bfloat16:
+        raise TypeError(f"compressed MLA out must be bfloat16, got {out.dtype}")
+    if out.device != q3.device:
+        raise ValueError(
+            f"compressed MLA out device {out.device} does not match q device {q3.device}"
+        )
+    if not out.is_contiguous():
+        raise ValueError("compressed MLA out must be contiguous")
 
 
 def _run_sm120_compressed_prefill(
@@ -220,6 +248,7 @@ def _run_sm120_compressed_prefill(
     attn_sink: torch.Tensor | None,
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
     active SM120 single-pass prefill.
@@ -234,11 +263,14 @@ def _run_sm120_compressed_prefill(
     from .kernel import run_unified_prefill
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
-    output = _get_mla_output_view(
-        workspace=workspace,
-        q_all=q3,
-        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
-    )
+    if out is not None:
+        output = out
+    else:
+        output = _get_mla_output_view(
+            workspace=workspace,
+            q_all=q3,
+            v_head_dim=COMPRESSED_MLA_HEAD_DIM,
+        )
 
     extra_kwargs: dict = {}
     if indexed_k_cache is not None:

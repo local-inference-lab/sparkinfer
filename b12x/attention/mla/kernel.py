@@ -2046,6 +2046,7 @@ def run_unified_decode(
     return_lse: bool = False,
     lse_scale: str = "base2",
     forced_num_splits: int | None = None,
+    out: torch.Tensor | None = None,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2330,7 +2331,25 @@ def run_unified_decode(
         extra_kv_flat = _cache_base_tensor(swa_k_cache)  # alias (never read when has_extra=False)
         extra_indices_t = swa_indices            # alias (never read)
 
-    output = workspace.output_buffer[:rows, :heads, :d_v]
+    if out is not None:
+        if tuple(out.shape) != (rows, heads, d_v):
+            raise ValueError(
+                f"SM120 sparse MLA decode out must have shape "
+                f"{(rows, heads, d_v)}, got {tuple(out.shape)}"
+            )
+        if out.dtype != torch.bfloat16:
+            raise TypeError(
+                f"SM120 sparse MLA decode out must be bfloat16, got {out.dtype}"
+            )
+        if out.device != q_all.device:
+            raise ValueError(
+                "SM120 sparse MLA decode out must be on the same device as q_all"
+            )
+        if not out.is_contiguous():
+            raise ValueError("SM120 sparse MLA decode out must be contiguous")
+        output = out
+    else:
+        output = workspace.output_buffer[:rows, :heads, :d_v]
 
     kv_flat = _cache_base_tensor(swa_k_cache)
     swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices

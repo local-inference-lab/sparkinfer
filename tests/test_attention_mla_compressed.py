@@ -959,3 +959,123 @@ def test_compressed_mla_rejects_live_mapped_page_table() -> None:
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
+
+
+@torch.inference_mode()
+def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows = 8
+    q = _make_q(rows=rows, seed=311, device=device)
+    swa_cache = _make_cache(
+        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=312, device=device
+    )
+    attn_sink = torch.linspace(
+        -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
+    )
+
+    def _make_swa(width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+        lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+        for row in range(rows):
+            length = min(width, row + 1)
+            indices[row, :length] = torch.arange(
+                row, row - length, -1, dtype=torch.int32, device=device
+            )
+            lengths[row] = length
+        return indices, lengths
+
+    # The MG prefill kernel requires the FP8 topk widths (512/1024/2048);
+    # decode has no such floor.
+    for mode, width in (("decode", 8), ("extend", 512)):
+        swa_indices, swa_lengths = _make_swa(width)
+        binding = _make_compressed_binding(
+            device=device,
+            rows=rows,
+            topk=width,
+            max_kv_rows=rows * width,
+            q=q,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+        )
+        binding.scratch.mode = mode
+        baseline = compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        ).clone()
+
+        # NaN canary: every output position must be written by the kernel.
+        out = torch.full(
+            (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        returned = compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=out,
+        )
+        assert returned.data_ptr() == out.data_ptr(), mode
+        assert not torch.isnan(out.float()).any(), mode
+        # The extend kernel has a small run-to-run wobble on partially-valid
+        # tiles, so compare with a tolerance rather than bitwise.
+        torch.testing.assert_close(
+            out.float(), baseline.float(), atol=0.05, rtol=0.0, msg=mode
+        )
+
+    swa_indices, swa_lengths = _make_swa(512)
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=512,
+        max_kv_rows=rows * 512,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+    binding.scratch.mode = "extend"
+    bad_shape = torch.empty(
+        (rows + 1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    with pytest.raises(ValueError, match="out must have shape"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_shape,
+        )
+    bad_dtype = torch.empty(
+        (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+        dtype=torch.float16,
+        device=device,
+    )
+    with pytest.raises(TypeError, match="out must be bfloat16"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_dtype,
+        )
+    non_contiguous = torch.empty(
+        (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM * 2),
+        dtype=torch.bfloat16,
+        device=device,
+    )[..., ::2]
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=non_contiguous,
+        )
