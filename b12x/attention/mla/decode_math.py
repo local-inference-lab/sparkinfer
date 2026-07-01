@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -62,6 +62,8 @@ from b12x.cute.fp4 import (
     fmax_f32,
     fmin_f32,
     fp8_e4m3_to_f32,
+    get_ptr_as_int64,
+    ld_shared_v4_u32,
     ld_shared_f32,
     ld_shared_u32,
     ldmatrix_m8n8x2_b16,
@@ -70,10 +72,12 @@ from b12x.cute.fp4 import (
     mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
     pow2_ceil_ue8m0,
+    rcp_approx_ftz,
     shared_ptr_to_u32,
     st_shared_bf16_from_f32,
     st_shared_f32,
     st_shared_u8,
+    st_global_v4_u32,
 )
 
 
@@ -292,6 +296,7 @@ def s0_quantize_q_to_smem(
     num_scales: cutlass.Constexpr,   # 7
     hpb: cutlass.Constexpr,          # 16
     q_nope_stride: cutlass.Constexpr,  # 464
+    q_rope_stride: cutlass.Constexpr,  # D_ROPE plus optional bank-layout pad
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,   # named-barrier slot for the math-only sync
 ):
@@ -313,7 +318,7 @@ def s0_quantize_q_to_smem(
     while i < Int32(hpb * d_rope):
         h = i // Int32(d_rope)
         d = i - h * Int32(d_rope)
-        s_byte = h * Int32(d_rope * 2) + d * Int32(2)
+        s_byte = (h * Int32(q_rope_stride) + d) * Int32(2)
         val = Float32(0.0)
         if h < valid_hpb:
             val = Float32(q_token[head_base + h, Int32(d_nope) + d])
@@ -882,13 +887,22 @@ def _ld_u32(base_addr: Int32, byte_off: Int32) -> Uint32:
 def _ld_u16_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
     """Load one u16 (bf16) from smem (base+byte_off), zero-extended to u32.
 
-    ``byte_off`` is 2-byte aligned (bf16 element). Reads the containing 4-byte
-    word and selects the low/high half. Used for the per-lane K-rope/V-rope
-    scalar reads packed into the m16n8k16 bf16 MMA b0/b1 operands."""
-    word = byte_off & ~Int32(3)
-    sh = (byte_off & Int32(2)) * Int32(8)  # 0 or 16
-    val = ld_shared_u32(base_addr + word)
-    return (val >> sh.to(Uint32)) & Uint32(0xFFFF)
+    ``byte_off`` is always 2-byte aligned (bf16 or packed FP8-pair element).
+    Use the native halfword shared-memory instruction rather than loading the
+    containing word and dynamically selecting its low/high half.  The latter
+    costs address masking plus SHF/LOP3 on every BF16-QK K step.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [(base_addr + byte_off).ir_value()],
+            "ld.shared.u16 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 @cute.jit
@@ -901,6 +915,27 @@ def _ue8m0_byte_to_fp32(byte: Uint32) -> Float32:
         llvm.inline_asm(
             T.f32(),
             [Uint32(byte & Uint32(0xFF)).ir_value()],
+            "{ .reg .b32 b; shl.b32 b, $1, 23; mov.b32 $0, b; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _ue8m0_zext_byte_to_fp32(byte: Uint32) -> Float32:
+    """Expand an already zero-extended UE8M0 byte to its FP32 power of two.
+
+    Native ``ld.shared.u8`` and the ``prmt(..., 0, 0x777x)`` scale-cache form
+    both guarantee that the upper 24 bits are zero, so masking again only adds
+    an instruction and diverges from the native prefill PTX.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(byte).ir_value()],
             "{ .reg .b32 b; shl.b32 b, $1, 23; mov.b32 $0, b; }",
             "=f,r",
             has_side_effects=False,
@@ -2004,6 +2039,12 @@ def s7_epilogue(
     has_attn_sink: cutlass.Constexpr = False,  # FINAL_BF16 only: fold per-head sink
     attn_sink=None,                  # (heads,) f32 view (FINAL_BF16 + has_attn_sink)
     head_base: Int32 = None,         # first head index of this CTA (sink indexing)
+    fast_rcp: cutlass.Constexpr = False,
+    staging_base_addr: Int32 = None,
+    d_v: cutlass.Constexpr = 0,
+    num_threads: cutlass.Constexpr = 0,
+    barrier_id: cutlass.Constexpr = 0,
+    coalesced_output: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -2041,21 +2082,33 @@ def s7_epilogue(
         denom0 = global_sum[0] + _exp2_approx_ftz_f32(s0 - global_max[0])
         inv_g0 = Float32(0.0)
         if denom0 > Float32(0.0):
-            inv_g0 = Float32(1.0) / denom0
+            if cutlass.const_expr(fast_rcp):
+                inv_g0 = rcp_approx_ftz(denom0)
+            else:
+                inv_g0 = Float32(1.0) / denom0
         inv_g1 = Float32(0.0)
         if cutlass.const_expr(valid_hpb > 8):
             s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
             denom1 = global_sum[1] + _exp2_approx_ftz_f32(s1 - global_max[1])
             if denom1 > Float32(0.0):
-                inv_g1 = Float32(1.0) / denom1
+                if cutlass.const_expr(fast_rcp):
+                    inv_g1 = rcp_approx_ftz(denom1)
+                else:
+                    inv_g1 = Float32(1.0) / denom1
     else:
         # PARTIAL_WRITEBACK or FINAL_BF16-without-sink: il = 1/l (0 if empty).
         inv_g0 = Float32(0.0)
         inv_g1 = Float32(0.0)
         if global_sum[0] > Float32(0.0):
-            inv_g0 = Float32(1.0) / global_sum[0]
+            if cutlass.const_expr(fast_rcp):
+                inv_g0 = rcp_approx_ftz(global_sum[0])
+            else:
+                inv_g0 = Float32(1.0) / global_sum[0]
         if global_sum[1] > Float32(0.0):
-            inv_g1 = Float32(1.0) / global_sum[1]
+            if cutlass.const_expr(fast_rcp):
+                inv_g1 = rcp_approx_ftz(global_sum[1])
+            else:
+                inv_g1 = Float32(1.0) / global_sum[1]
 
     # NoPE dims: d0 = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 + tid*2 (per N-tile).
     # Cast to the output element type (bf16 for the split.py mid_out partials AND
@@ -2068,11 +2121,34 @@ def s7_epilogue(
             d0 = (Int32(vc) * Int32(v_chunk)
                   + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
                   + tid * Int32(2))
-            out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
-            out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
-            if cutlass.const_expr(valid_hpb > 8):
-                out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
-                out_o[gid + Int32(8), d0 + Int32(1)] = (acc_nope[at][3] * inv_g1).to(_ot)
+            if cutlass.const_expr(coalesced_output):
+                st_shared_bf16_from_f32(
+                    staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                    acc_nope[at][0] * inv_g0,
+                )
+                st_shared_bf16_from_f32(
+                    staging_base_addr + (gid * Int32(d_v) + d0 + Int32(1)) * Int32(2),
+                    acc_nope[at][1] * inv_g0,
+                )
+                if cutlass.const_expr(valid_hpb > 8):
+                    st_shared_bf16_from_f32(
+                        staging_base_addr
+                        + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                        acc_nope[at][2] * inv_g1,
+                    )
+                    st_shared_bf16_from_f32(
+                        staging_base_addr
+                        + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1)) * Int32(2),
+                        acc_nope[at][3] * inv_g1,
+                    )
+            else:
+                out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
+                out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
+                if cutlass.const_expr(valid_hpb > 8):
+                    out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
+                    out_o[gid + Int32(8), d0 + Int32(1)] = (
+                        acc_nope[at][3] * inv_g1
+                    ).to(_ot)
 
     # RoPE dims (DSV4 only: V_HAS_ROPE). GLM V == nope-only so this is elided.
     if cutlass.const_expr(v_has_rope):
@@ -2083,13 +2159,54 @@ def s7_epilogue(
                 + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
                 + tid * Int32(2)
             )
-            out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
-            out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
-            if cutlass.const_expr(valid_hpb > 8):
-                out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
-                out_o[gid + Int32(8), rd0 + Int32(1)] = (
-                    acc_rope[r + 3] * inv_g1
-                ).to(_ot)
+            if cutlass.const_expr(coalesced_output):
+                st_shared_bf16_from_f32(
+                    staging_base_addr + (gid * Int32(d_v) + rd0) * Int32(2),
+                    acc_rope[r + 0] * inv_g0,
+                )
+                st_shared_bf16_from_f32(
+                    staging_base_addr + (gid * Int32(d_v) + rd0 + Int32(1)) * Int32(2),
+                    acc_rope[r + 1] * inv_g0,
+                )
+                if cutlass.const_expr(valid_hpb > 8):
+                    st_shared_bf16_from_f32(
+                        staging_base_addr
+                        + ((gid + Int32(8)) * Int32(d_v) + rd0) * Int32(2),
+                        acc_rope[r + 2] * inv_g1,
+                    )
+                    st_shared_bf16_from_f32(
+                        staging_base_addr
+                        + ((gid + Int32(8)) * Int32(d_v) + rd0 + Int32(1))
+                        * Int32(2),
+                        acc_rope[r + 3] * inv_g1,
+                    )
+            else:
+                out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
+                out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
+                if cutlass.const_expr(valid_hpb > 8):
+                    out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
+                    out_o[gid + Int32(8), rd0 + Int32(1)] = (
+                        acc_rope[r + 3] * inv_g1
+                    ).to(_ot)
+
+    if cutlass.const_expr(coalesced_output):
+        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
+        stores_per_head = d_v // 8
+        store_idx = warp_id * Int32(32) + lane
+        while store_idx < Int32(valid_hpb * stores_per_head):
+            h = store_idx // Int32(stores_per_head)
+            d8 = (store_idx - h * Int32(stores_per_head)) * Int32(8)
+            v0, v1, v2, v3 = ld_shared_v4_u32(
+                staging_base_addr + (h * Int32(d_v) + d8) * Int32(2)
+            )
+            st_global_v4_u32(
+                get_ptr_as_int64(out_o, h.to(Int64) * Int64(d_v) + d8.to(Int64)),
+                v0,
+                v1,
+                v2,
+                v3,
+            )
+            store_idx += Int32(num_threads)
 
     # base-2 LSE (warp 0, tid 0 owns one head pair via gid). The PARTIAL_WRITEBACK
     # path is the EXACT prior decode epilogue (byte-identical IR); the FINAL_BF16 +
@@ -2128,6 +2245,17 @@ def _quant_e4m3_byte(v: Float32) -> Uint32:
     """Clamp to [FP8_MIN, FP8_MAX] then cvt.rn.satfinite.e4m3 -> low byte."""
     vc = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
     return cvt_f32_to_e4m3(vc) & Uint32(0xFF)
+
+
+@cute.jit
+def _quant_e4m3_bounded_byte(v: Float32) -> Uint32:
+    """Quantize an already-bounded value with saturating E4M3 conversion.
+
+    This is for paths whose scale construction proves ``abs(v) <= FP8_MAX``.
+    The saturating conversion handles any rounding overshoot without a redundant
+    min/max pair at every call site.
+    """
+    return cvt_f32_to_e4m3(v) & Uint32(0xFF)
 
 
 @cute.jit

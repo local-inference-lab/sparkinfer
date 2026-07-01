@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Uint32
+from cutlass import Int32, Int64, Uint32, Uint64
 
 from b12x.cute.fp4 import (
-    cp_async_bulk_g2s_mbar,
+    cp_async_bulk_g2s_mbar_l2hint,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
@@ -41,13 +41,13 @@ def io_issue_gather_dsv4_nope(
     topk_indices: cute.Tensor,
     kv_fp8_dst_addr: Int32,
     kv_sc_dst_addr: Int32,
-    token_idx_view: cute.Tensor,
     full_mbar_ptr,
     g_start: Int32,
     g_end: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
     io_lane: Int32,
+    cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
@@ -71,7 +71,6 @@ def io_issue_gather_dsv4_nope(
             idx_raw = Int32(-1)
             if cand_pos < g_end:
                 idx_raw = Int32(topk_indices[cand_pos])
-            token_idx_view[entry] = idx_raw
 
             f0 = Uint32(0)
             f1 = Uint32(0)
@@ -109,11 +108,12 @@ def io_issue_gather_dsv4_nope(
             block_idx = idx // page_block_size
             local_idx = idx - block_idx * page_block_size
             data_base_off = Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
-            cp_async_bulk_g2s_mbar(
+            cp_async_bulk_g2s_mbar_l2hint(
                 kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                 get_ptr_as_int64(kv_cache_u8, data_base_off),
                 _nope,
                 full_mbar_u32,
+                cache_policy,
             )
         eo += Int32(io_threads)
 
@@ -123,13 +123,13 @@ def io_issue_gather_glm_mg(
     kv_cache_u8: cute.Tensor,
     topk_indices: cute.Tensor,
     kv_fp8_dst_addr: Int32,
-    token_idx_view: cute.Tensor,
     full_mbar_ptr,
     g_start: Int32,
     g_end: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
     io_lane: Int32,
+    cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,   # 528 (512 nope + 16 inline fp32 scales)
@@ -146,20 +146,6 @@ def io_issue_gather_glm_mg(
     MG convention): the leader arrives + expect_tx over the BI 528B bulks."""
     _ios = Int64(_GLM_IO_STRIDE)
     _nope = Int32(_GLM_NOPE_SCALE_BYTES)
-
-    # --- (1) per-entry validity index staging (no footer for GLM). ---
-    eo = Int32(0)
-    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
-        entry = eo + io_lane
-        if entry < Int32(bi):
-            cand_pos = g_start + entry
-            idx_raw = Int32(-1)
-            if cand_pos < g_end:
-                idx_raw = Int32(topk_indices[cand_pos])
-            token_idx_view[entry] = idx_raw
-        eo += Int32(io_threads)
-
-    cute.arch.fence_acq_rel_cta()
 
     if io_lane == Int32(0):
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi * _GLM_NOPE_SCALE_BYTES))
@@ -180,10 +166,11 @@ def io_issue_gather_glm_mg(
             local_idx = idx - block_idx * page_block_size
             data_base_off = Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
             # NoPE + inline fp32 scales (528B) -> kv_fp8 row.
-            cp_async_bulk_g2s_mbar(
+            cp_async_bulk_g2s_mbar_l2hint(
                 kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                 get_ptr_as_int64(kv_cache_u8, data_base_off),
                 _nope,
                 full_mbar_u32,
+                cache_policy,
             )
         eo += Int32(io_threads)

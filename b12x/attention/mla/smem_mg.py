@@ -20,7 +20,6 @@ from .traits import ComputeMode, UnifiedMLATraits
 _MG_N_HG = 2
 _KV_BUF_COUNT = 2
 _W_FP8_BUF_COUNT = 2
-_TOKEN_IDX_BUF_COUNT = _KV_BUF_COUNT
 _MATH_WARPS = 8
 _W_FP8_PAD = 16
 _MBAR_BYTES = _KV_BUF_COUNT * 8
@@ -95,10 +94,6 @@ class SmemLayoutMG:
     w_fp8_stride: int
     w_fp8_bufs: int
 
-    token_idx_off: int
-    token_idx_buf_bytes: int
-    token_idx_bufs: int
-
     sm_p_full_off: int
     sm_p_full_group_bytes: int
     sm_p_full_bytes: int
@@ -132,18 +127,16 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
     heads_per_cta = mg_n_hg * hpb
 
     bf16_qk = traits.compute_mode == ComputeMode.BF16
-    # GLM (ARBITRARY_FP32) FP8 path registerizes Q-rope (aliased onto W_FP8) and
-    # reads KV-rope from global/L2 (NO kv_rope staging) -- EXACTLY like the DSV4 MG
-    # design -- so the 528-stride GLM KV (vs DSV4's 464) + the per-group FP8 Q fit
-    # under the carveout for mg_n_hg==2. The Q-rope alias path is shared with the
-    # BF16-QK path below.
+    # BF16-QK and GLM FP8 use Q-rope scratch aliased onto W_FP8. BF16 reloads
+    # that small scratch cooperatively between tiles instead of keeping the
+    # ldmatrix fragments live (and spilled) across the full kernel.
     alias_qrope = bf16_qk or is_glm
-    # BF16-QK: K is dequantized inline at MMA time, so the FP8 KV NoPE staging
-    # only needs the 448-byte payload (the FP8 path's +16 alignment tail is pure
-    # padding, never read). Drop it to claw back 64*16 B/buf, which (together with
-    # the registerized Q-rope aliased onto W_FP8) lets the 2x-larger BF16 Q-NoPE
-    # smem fit under the 99 KB SM120 carveout. FP8 keeps the validated 464 stride.
-    kv_smem_stride = (d_nope if bf16_qk else traits.kv_smem_stride)
+    # Keep the model-native padded KV row in both compute modes.  DSV4's 464-B
+    # stride (448-B payload + 16-B pad) is part of the shared-memory bank layout,
+    # not merely copy padding; FlashInfer retains it for BF16 QK as well.  The
+    # XV-RoPE weights alias W_FP8 below, so the padded double buffer still fits
+    # the SM120 carveout.
+    kv_smem_stride = traits.kv_smem_stride
 
     off = 0
 
@@ -156,10 +149,7 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
         q_nope_bf16_group_bytes = hpb * q_nope_bf16_stride * 2
         q_nope_bf16_bytes = mg_n_hg * q_nope_bf16_group_bytes
         off = q_nope_bf16_off + q_nope_bf16_bytes
-        # Q-rope is read into registers ONCE (preload) before the main loop, so
-        # its smem scratch can ALIAS the W_FP8 region (W_FP8 is only written in
-        # S6/XV, strictly after the S0 Q-rope preload). Assigned after W_FP8 off
-        # is known, below.
+        # Assigned after W_FP8 is laid out below.
         q_fp8_off = 0
         q_fp8_group_bytes = 0
         q_fp8_bytes = 0
@@ -173,8 +163,11 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
         q_nope_bf16_group_bytes = 0
         q_nope_bf16_bytes = 0
 
-        q_rope_stride = d_rope
-        q_rope_group_bytes = hpb * d_rope * 2
+        # GLM consumes the aliased Q-RoPE tile through ldmatrix.x4.  A 64-bf16
+        # row aliases every row onto one bank group; the 8-element pad rotates
+        # rows by one 16-B bank group.  DSV4 FP8 keeps its established layout.
+        q_rope_stride = d_rope + (8 if is_glm else 0)
+        q_rope_group_bytes = hpb * q_rope_stride * 2
         q_rope_bytes = mg_n_hg * q_rope_group_bytes
         if alias_qrope:
             # GLM FP8: Q-rope is preloaded to registers once (S0) then its smem
@@ -247,25 +240,28 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
         # S0 (written by the cooperative load, immediately read to registers).
         # Shared by the BF16-QK (DSV4) and FP8 GLM paths.
         q_rope_off = w_fp8_off
-        q_rope_stride = d_rope
-        q_rope_group_bytes = hpb * d_rope * 2
+        q_rope_stride = d_rope + 8
+        q_rope_group_bytes = hpb * q_rope_stride * 2
         q_rope_bytes = mg_n_hg * q_rope_group_bytes
         assert q_rope_bytes <= w_fp8_parity_bytes * w_fp8_bufs, (
             "Q-rope scratch does not fit in the aliased W_FP8 region"
         )
 
-    off = _align_up(off, 16)
-    token_idx_off = off
-    token_idx_buf_bytes = bi * 4
-    token_idx_bufs = _TOKEN_IDX_BUF_COUNT
-    off = token_idx_off + token_idx_buf_bytes * token_idx_bufs
-
-    off = _align_up(off, 128)
-    sm_p_full_off = off
-    sm_p_full_stride = bi
-    sm_p_full_group_bytes = hpb * bi * 2
+    # XV-RoPE runs after XV-NoPE has consumed W_FP8.  Reuse that dead region for
+    # the BF16 softmax-weight tile exactly as the native MG kernel does instead
+    # of reserving a separate 4-KiB sm_p_full allocation.
+    sm_p_full_off = w_fp8_off
+    # A BI=64 bf16 row is exactly 128 B, so all sixteen rows presented to an
+    # ldmatrix.x4 start in the same shared-memory bank group.  Add one 16-B
+    # bank-group step per row: successive rows then cover all eight groups
+    # before repeating, while the two padded head-group tiles still fit in the
+    # dead double-buffered W_FP8 allocation (2 * 16 * 72 * 2 = 4608 B <= 5120 B).
+    sm_p_full_stride = bi + 8
+    sm_p_full_group_bytes = hpb * sm_p_full_stride * 2
     sm_p_full_bytes = mg_n_hg * sm_p_full_group_bytes
-    off = sm_p_full_off + sm_p_full_bytes
+    assert sm_p_full_bytes <= w_fp8_parity_bytes * w_fp8_bufs, (
+        "XV-RoPE weight tile does not fit in the aliased W_FP8 region"
+    )
 
     total_bytes = _align_up(off, 128)
 
@@ -315,9 +311,6 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
         w_fp8_parity_bytes=w_fp8_parity_bytes,
         w_fp8_stride=w_fp8_stride,
         w_fp8_bufs=w_fp8_bufs,
-        token_idx_off=token_idx_off,
-        token_idx_buf_bytes=token_idx_buf_bytes,
-        token_idx_bufs=token_idx_bufs,
         sm_p_full_off=sm_p_full_off,
         sm_p_full_group_bytes=sm_p_full_group_bytes,
         sm_p_full_bytes=sm_p_full_bytes,
@@ -334,7 +327,7 @@ def get_prefill_mg_shared_storage_cls(traits: UnifiedMLATraits, mg_n_hg: int = _
 
     is_glm = not traits.has_extra_cache
 
-    # Tail (kv_fp8 .. sm_p_full) is identical across DSV4 compute modes. DSV4
+    # Tail (kv_fp8 .. w_fp8) is identical across DSV4 compute modes. DSV4
     # stages a separate UE8M0 footer ``kv_sc`` (rope from global/L2). GLM has NO
     # footer (the 4 inline fp32 scales travel in the kv_fp8 528B row) and also
     # reads rope from global/L2, so it allocates NEITHER kv_sc nor kv_rope. Each
@@ -368,17 +361,6 @@ def get_prefill_mg_shared_storage_cls(traits: UnifiedMLATraits, mg_n_hg: int = _
         ],
         "w_fp8": cute.struct.MemRange[
             cutlass.Uint8, int(layout.w_fp8_parity_bytes * layout.w_fp8_bufs)
-        ],
-        "token_idx": cute.struct.Align[
-            cute.struct.MemRange[
-                cutlass.Int32,
-                int(layout.token_idx_buf_bytes * layout.token_idx_bufs // 4),
-            ],
-            16,
-        ],
-        "sm_p_full": cute.struct.Align[
-            cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
-            128,
         ],
     }
 
@@ -432,9 +414,9 @@ def _run_module_asserts() -> None:
     bf16 = make_unified_traits(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
     bl = make_smem_layout_mg(bf16)
     assert bl.bf16_qk
-    assert bl.kv_smem_stride == 448  # FP8 NoPE payload only; +16 tail dropped.
+    assert bl.kv_smem_stride == 464
     assert bl.q_nope_bf16_stride == 448 + 8
-    assert bl.q_rope_off == bl.w_fp8_off  # Q-rope scratch aliases W_FP8.
+    assert bl.q_rope_off == bl.w_fp8_off
     assert bl.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
         f"BF16 MG prefill smem {bl.total_bytes}B exceeds SM120 carveout "
         f"{SM120_SMEM_CARVEOUT_BYTES}B"
@@ -463,7 +445,7 @@ def _run_module_asserts() -> None:
     assert bf16_1.mg_n_hg == 1 and bf16_1.bf16_qk
     assert bf16_1.q_nope_bf16_group_bytes == bl.q_nope_bf16_group_bytes
     assert bf16_1.q_nope_bf16_bytes == bl.q_nope_bf16_bytes // 2
-    assert bf16_1.q_rope_off == bf16_1.w_fp8_off  # alias still holds for 1 group.
+    assert bf16_1.q_rope_off == bf16_1.w_fp8_off
     assert bf16_1.total_bytes < SM120_SMEM_CARVEOUT_BYTES
 
     # GLM (ARBITRARY_FP32, no extra cache): kv_smem_stride 528 (512 nope + 16

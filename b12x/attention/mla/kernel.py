@@ -671,6 +671,7 @@ class UnifiedDecodeKernel:
                 quant_tile=t.quant_tile, num_scales=t.num_scales,
                 hpb=(8 if self.native_h8 else t.hpb),
                 q_nope_stride=t.q_nope_stride,
+                q_rope_stride=L.q_rope_stride,
                 num_threads=self.math_threads, barrier_id=2,
             )
 
@@ -1330,6 +1331,7 @@ class UnifiedDecodeKernel:
                 quant_tile=t.quant_tile, num_scales=t.num_scales,
                 hpb=(8 if self.native_h8 else t.hpb),
                 q_nope_stride=t.q_nope_stride,
+                q_rope_stride=L.q_rope_stride,
                 num_threads=self.math_threads, barrier_id=2,
             )
 

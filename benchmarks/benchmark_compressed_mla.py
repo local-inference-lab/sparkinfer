@@ -616,6 +616,26 @@ def _make_indices(
     return ((offsets + cols) % tokens).to(torch.int32)
 
 
+def _indexed_cache_tokens(
+    case: BenchmarkCase,
+    *,
+    shared_indexed_cache: bool,
+) -> int:
+    """Size the indexed cache for independent rows or one shared prefill pool."""
+
+    if not case.indexed_width:
+        return 0
+    if shared_indexed_cache:
+        return case.indexed_width
+    return case.indexed_width * max(case.rows, 1)
+
+
+def _benchmark_workspace_mode(*, shared_indexed_cache: bool) -> str:
+    """Select the serving workspace contract represented by the benchmark."""
+
+    return "extend" if shared_indexed_cache else "decode"
+
+
 def _make_binding(
     *,
     case: BenchmarkCase,
@@ -628,6 +648,7 @@ def _make_binding(
     indexed_lengths: torch.Tensor | None,
     swa_page_size: int,
     production_decode_cap: bool,
+    mode: str,
 ):
     split_chunks = _planned_split_chunks(
         case,
@@ -658,6 +679,7 @@ def _make_binding(
         indexed_indices=indexed_indices,
         indexed_lengths=indexed_lengths,
     )
+    binding.scratch.mode = mode
     binding.scratch.use_cuda_graph = True
     return binding, split_chunks
 
@@ -735,6 +757,7 @@ def _benchmark_case(
     use_attn_sink: bool,
     reference: str,
     context_length: int | None,
+    shared_indexed_cache: bool,
 ) -> CaseReport:
     clear_mla_caches()
     q = _make_q(rows=case.rows, num_q_heads=num_q_heads, seed=seed, device=device)
@@ -758,8 +781,12 @@ def _benchmark_case(
     indexed_packed: torch.Tensor | None = None
     if case.indexed_width:
         assert case.indexed_page_size is not None
+        indexed_tokens = _indexed_cache_tokens(
+            case,
+            shared_indexed_cache=shared_indexed_cache,
+        )
         indexed_packed = _make_compressed_cache(
-            tokens=case.indexed_width * max(case.rows, 1),
+            tokens=indexed_tokens,
             page_size=case.indexed_page_size,
             seed=seed + 2,
             device=device,
@@ -807,7 +834,10 @@ def _benchmark_case(
     indexed_lengths: torch.Tensor | None = None
     if case.indexed_width:
         assert case.indexed_page_size is not None
-        indexed_tokens = case.indexed_width * max(case.rows, 1)
+        indexed_tokens = _indexed_cache_tokens(
+            case,
+            shared_indexed_cache=shared_indexed_cache,
+        )
         assert indexed_packed is not None
         indexed_cache = _make_cache_views(
             indexed_packed,
@@ -838,6 +868,9 @@ def _benchmark_case(
         indexed_lengths=indexed_lengths,
         swa_page_size=swa_page_size,
         production_decode_cap=production_decode_cap,
+        mode=_benchmark_workspace_mode(
+            shared_indexed_cache=shared_indexed_cache,
+        ),
     )
 
     output: torch.Tensor | None = None
@@ -1008,6 +1041,7 @@ def collect_case_reports(
                 use_attn_sink=args.attn_sink,
                 reference=args.reference,
                 context_length=args.context_length,
+                shared_indexed_cache=args.shared_indexed_cache,
             )
         )
     return reports
@@ -1196,6 +1230,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "replay-time source-token context length; keeps captured widths at "
             "capacity while setting SWA/C4/C128 valid lengths as vLLM does"
+        ),
+    )
+    parser.add_argument(
+        "--shared-indexed-cache",
+        action="store_true",
+        help=(
+            "share one indexed cache pool across all query rows, matching "
+            "single-sequence chunked prefill and select the extend workspace "
+            "contract instead of modeling each row as an independent decode "
+            "sequence"
         ),
     )
     parser.add_argument(

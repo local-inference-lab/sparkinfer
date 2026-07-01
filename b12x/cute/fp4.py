@@ -28,7 +28,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
-from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -440,6 +440,29 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_b16(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Load one 16-bit global-memory payload into a 32-bit register.
+
+    PTX permits a bit-typed load into a wider bit register.  This is the form
+    emitted by FlashInfer for the DSV4 RoPE gather and avoids rounding the
+    address down to a word followed by a runtime halfword select.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b16 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
     """Prefetch a global memory line into L2."""
     llvm.inline_asm(
@@ -701,6 +724,69 @@ def ldmatrix_m8n8x4_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32,
 
 
 @dsl_user_op
+def ld_shared_u16_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint16:
+    """Load a shared halfword at a compile-time byte displacement.
+
+    Keeping the result as i16 lets NVVM select a PTX ``%rs`` operand and
+    avoids a redundant ``cvt.u16.u32`` before packed FP8 decode. Embedding the
+    displacement also avoids materializing one address register per unrolled
+    K step.
+    """
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.u16 $0, {address};",
+            "=h,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_shared_u8_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Load one shared byte at a compile-time displacement, zero-extended.
+
+    This is the native ``ld.shared.u8`` form used for UE8M0 scale tables.  A
+    common row base plus an immediate displacement keeps the unrolled scale
+    cache free of word-alignment, shift, and mask instructions.
+    """
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.u8 $0, {address};",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ldmatrix_m8n8x2_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
     """Issue `ldmatrix.sync.aligned.m8n8.x2.shared.b16` from a shared-memory byte address."""
     result = llvm.inline_asm(
@@ -944,6 +1030,56 @@ def cp_async_bulk_g2s_mbar(
 
 
 @dsl_user_op
+def create_l2_evict_first_policy(*, loc=None, ip=None) -> Uint64:
+    """Create an L2 evict-first policy for one-pass streaming cache rows."""
+    return Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cp_async_bulk_g2s_mbar_l2hint(
+    smem_dst_u32: Int32,
+    gmem_src_i64: Int64,
+    nbytes: Int32,
+    mbar_u32: Int32,
+    cache_policy: Uint64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Bulk global-to-shared copy with an explicit L2 cache policy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_dst_u32).ir_value(loc=loc, ip=ip),
+            Int64(gmem_src_i64).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_u32).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [$0], [$1], $2, [$3], $4;",
+        "r,l,r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
     """Store 8 bits to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(
@@ -957,6 +1093,53 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def quantize_scaled_store_shared_v2_e4m3(
+    smem_addr: Int32,
+    scaled_value0: Float32,
+    scaled_value1: Float32,
+    inv_scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Scale, quantize, and vector-store two contiguous E4M3 bytes.
+
+    ``scaled_value*`` already include the per-candidate V scale used by the
+    preceding atomic-max pass. Keeping that multiplication in ordinary SSA
+    lets LLVM retain/reuse the products across the barrier, as FlashInfer does.
+    The E4M3 results never widen through ``Uint32`` and are written with the
+    same half-register ``st.shared.v2.b8`` form.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(scaled_value0).ir_value(loc=loc, ip=ip),
+            Float32(scaled_value1).ir_value(loc=loc, ip=ip),
+            Float32(inv_scale).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 q0, q1;
+            .reg .f32 zero, tmp;
+            mov.f32 zero, 0f00000000;
+            mul.f32 tmp, $1, $3;
+            cvt.rn.satfinite.e4m3x2.f32 q0, zero, tmp;
+            mul.f32 tmp, $2, $3;
+            cvt.rn.satfinite.e4m3x2.f32 q1, zero, tmp;
+            st.shared.v2.b8 [$0], {q0, q1};
+        }
+        """,
+        "r,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1207,38 +1390,55 @@ def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
-def atomic_max_shared_f32(smem_addr: Int32, val: Float32, *, loc=None, ip=None) -> Float32:
-    """Shared-memory (CTA-scope) atomic max of a NON-NEGATIVE fp32 `val` into the
-    slot at 32-bit shared address `smem_addr`. Returns the resulting max.
+def atomic_max_shared_f32(smem_addr: Int32, val: Float32, *, loc=None, ip=None):
+    """No-return shared atomic max for a NON-NEGATIVE fp32 ``val``.
 
     Relies on the IEEE-754 ordering of non-negative floats matching the signed
     int ordering of their bit patterns, so the smem max can be done with a
-    single s32 atomic. Used by the running-max reduction of the sparse-MLA
-    softmax stage.
+    single s32 reduction. All callers consume the reduced shared slot after a
+    barrier; none needs the old or resulting value in the issuing lane.
     """
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [
-                Int32(smem_addr).ir_value(loc=loc, ip=ip),
-                Float32(val).ir_value(loc=loc, ip=ip),
-            ],
-            """
-            {
-                .reg .s32 vi, oldi, maxi;
-                mov.b32 vi, $2;
-                atom.shared.max.s32 oldi, [$1], vi;
-                max.s32 maxi, oldi, vi;
-                mov.b32 $0, maxi;
-            }
-            """,
-            "=f,r,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{.reg .s32 vi; mov.b32 vi, $1; red.shared.max.s32 [$0], vi;}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_max_shared_f32_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    val: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """No-return nonnegative FP32 shared max at a constant displacement."""
+    offset = int(byte_offset)
+    address = f"[$0+{offset}]" if offset else "[$0]"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{.reg .s32 vi; mov.b32 vi, $1; red.shared.max.s32 {address}, vi;}}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1376,6 +1576,32 @@ def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def ld_shared_f32_offset(
+    addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Load shared FP32 using a compile-time displacement."""
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.f32 $0, {address};",
+            "=f,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_shared_v4_f32(
     addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32, Float32, Float32]:
@@ -1427,6 +1653,34 @@ def st_shared_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
             Float32(val).ir_value(loc=loc, ip=ip),
         ],
         "st.shared.f32 [$0], $1;",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_f32_offset(
+    addr: Int32,
+    byte_offset: int,
+    val: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store shared FP32 using a compile-time displacement."""
+    offset = int(byte_offset)
+    address = f"[$0+{offset}]" if offset else "[$0]"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        f"st.shared.f32 {address}, $1;",
         "r,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -3505,7 +3759,7 @@ def cvt_w4a16_packed_e4m3_scale_to_f32(
 
 @dsl_user_op
 def dequant_kv_e4m3_pair_to_bf16x2(
-    p0: Uint32, p1: Uint32, scale_f: Float32, *, loc=None, ip=None
+    p0: Uint16, p1: Uint16, scale_f: Float32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
     """FP8 -> BF16 K dequant for the BF16-QK m16n8k16 B operand.
 
@@ -3520,20 +3774,17 @@ def dequant_kv_e4m3_pair_to_bf16x2(
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(i32, i32)>"),
         [
-            Uint32(p0).ir_value(loc=loc, ip=ip),
-            Uint32(p1).ir_value(loc=loc, ip=ip),
+            Uint16(p0).ir_value(loc=loc, ip=ip),
+            Uint16(p1).ir_value(loc=loc, ip=ip),
             Float32(scale_f).ir_value(loc=loc, ip=ip),
         ],
         """
         {
-            .reg .b16 pp0, pp1;
             .reg .b32 h2_0, h2_1;
             .reg .b16 l0, h0, l1, h1;
             .reg .f32 fk0, fk1, fk2, fk3;
-            cvt.u16.u32 pp0, $2;
-            cvt.u16.u32 pp1, $3;
-            cvt.rn.f16x2.e4m3x2 h2_0, pp0;
-            cvt.rn.f16x2.e4m3x2 h2_1, pp1;
+            cvt.rn.f16x2.e4m3x2 h2_0, $2;
+            cvt.rn.f16x2.e4m3x2 h2_1, $3;
             mov.b32 {l0, h0}, h2_0;
             mov.b32 {l1, h1}, h2_1;
             cvt.f32.f16 fk0, l0;
@@ -3548,7 +3799,7 @@ def dequant_kv_e4m3_pair_to_bf16x2(
             cvt.rn.bf16x2.f32 $1, fk3, fk2;
         }
         """,
-        "=r,=r,r,r,f",
+        "=r,=r,h,h,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

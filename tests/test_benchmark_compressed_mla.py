@@ -141,6 +141,34 @@ def test_parse_args_accepts_runtime_context_length() -> None:
     assert args.context_length == 16_384
 
 
+def test_shared_indexed_cache_uses_one_production_prefill_pool() -> None:
+    case = benchmark_compressed_mla.BenchmarkCase(
+        name="swa-c128",
+        rows=4096,
+        swa_width=128,
+        indexed_width=8192,
+        indexed_page_size=2,
+    )
+
+    assert benchmark_compressed_mla._indexed_cache_tokens(
+        case,
+        shared_indexed_cache=True,
+    ) == 8192
+    assert benchmark_compressed_mla._indexed_cache_tokens(
+        case,
+        shared_indexed_cache=False,
+    ) == 4096 * 8192
+
+    args = benchmark_compressed_mla._parse_args(["--shared-indexed-cache"])
+    assert args.shared_indexed_cache
+    assert benchmark_compressed_mla._benchmark_workspace_mode(
+        shared_indexed_cache=True
+    ) == "extend"
+    assert benchmark_compressed_mla._benchmark_workspace_mode(
+        shared_indexed_cache=False
+    ) == "decode"
+
+
 def test_model_config_derives_live_dsv4_selected_widths() -> None:
     profile = benchmark_compressed_mla._derive_dsv4_compressed_mla_profile(
         {
