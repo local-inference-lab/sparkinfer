@@ -176,6 +176,13 @@ class SmemLayout:
     sm_p_full_bytes: int
     sm_p_full_stride: int  # BI (bf16 elems per head row)
 
+    # --- second-group w_head_sc for the native H16 two-group decode. ---
+    # The base w_head_sc row packs scale [0,8) + reciprocal [8,16) for ONE
+    # 8-head group, so the H16 kernel's second group gets its own region.
+    # Appended at the TAIL so every pre-existing offset stays byte-identical.
+    w_head_sc2_off: int
+    w_head_sc2_bytes: int
+
     total_bytes: int
 
 
@@ -287,6 +294,19 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     sm_p_full_bytes = hpb * bi * 2
     off = sm_p_full_off + sm_p_full_bytes
 
+    # --- native H16 group-1 w_head_sc (tail region; base offsets unchanged).
+    #     DSV4-only: GLM has no two-group H16 mode and sits near the carveout.
+    #     The extra 8*BI bf16 rows keep group 1's S6b ldmatrix.x4 A-loads (which
+    #     always touch 16 sm_p rows from the group base at +8 rows) inside the
+    #     allocation; those rows are read-garbage/compute-discarded, exactly
+    #     like the H8 kernel's rows 8-15. ---
+    off = _align_up(off, 16)
+    w_head_sc2_off = off
+    w_head_sc2_bytes = (
+        n_v_chunks * hpb * 4 + 8 * bi * 2 if traits.has_extra_cache else 0
+    )
+    off = w_head_sc2_off + w_head_sc2_bytes
+
     total_bytes = _align_up(off, 128)
 
     return SmemLayout(
@@ -328,6 +348,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
         sm_p_full_off=sm_p_full_off,
         sm_p_full_bytes=sm_p_full_bytes,
         sm_p_full_stride=sm_p_full_stride,
+        w_head_sc2_off=w_head_sc2_off,
+        w_head_sc2_bytes=w_head_sc2_bytes,
         total_bytes=total_bytes,
     )
 
@@ -407,6 +429,14 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "sm_p_full": cute.struct.Align[
             cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
             128,
+        ],
+        # native H16 group-1 w_head_sc (tail region; 16B-aligned). 1-word stub
+        # for GLM (never read; the DSV4-only gate keeps it out of that trace).
+        "w_head_sc2": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Float32, max(1, int(layout.w_head_sc2_bytes // 4))
+            ],
+            16,
         ],
     }
     return cute.struct(SharedStorage)

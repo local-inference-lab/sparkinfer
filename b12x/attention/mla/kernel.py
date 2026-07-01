@@ -117,6 +117,12 @@ _MLA_SM120_NUM_SPLITS_ENV = "B12X_MLA_SM120_NUM_SPLITS"
 # and performance A/B diagnostics without changing serving code.
 _MLA_SM120_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
 
+# Native DSV4 H16 two-group decode (two 8-head H8 groups sharing one KV
+# pipeline per CTA): halves h_blocks (CTA count + KV gather traffic) and runs
+# 8 math warps (2/scheduler) so the two groups' serial chunk chains interleave.
+# Opt-in while being validated: unset/0 -> off; 1/true/on/yes -> on.
+_MLA_SM120_DSV4_H16_NATIVE_ENV = "B12X_MLA_SM120_DSV4_H16_NATIVE"
+
 # FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
 # (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
 # gap looks small but require more than this many integer waves are rejected.
@@ -146,6 +152,42 @@ def _env_num_splits_override() -> int:
 def _env_glm_h8_native_enabled() -> bool:
     raw = os.environ.get(_MLA_SM120_GLM_H8_NATIVE_ENV)
     return raw is None or raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_dsv4_h16_native_mode() -> bool | None:
+    """Tri-state H16 override: None = auto policy, False = never, True = always."""
+    raw = os.environ.get(_MLA_SM120_DSV4_H16_NATIVE_ENV)
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+    if text in {"1", "true", "on", "yes"}:
+        return True
+    if text in {"0", "false", "off", "no"}:
+        return False
+    return None
+
+
+# Auto H8/H16 policy constants (measured on RTX PRO 6000 Blackwell, 188 SMs).
+# H16 wins when the shape is KV-gather-bound (many chunks -> halving h_blocks
+# halves gather traffic) or when the H8 grid would exceed ~1.4 waves of
+# 1-CTA/SM blocks; the H8 CTA keeps a ~4us-lower fixed latency, so it wins the
+# small-rows sub-wave regime.
+_DSV4_H16_MIN_BW_CHUNKS = 24
+_DSV4_H16_MIN_BW_ROWS = 2
+_DSV4_H16_H8_CTA_LIMIT = 256
+
+
+def _dsv4_h16_auto(
+    *,
+    rows: int,
+    heads: int,
+    num_chunks: int,
+    h8_num_splits: int,
+) -> bool:
+    if num_chunks >= _DSV4_H16_MIN_BW_CHUNKS and rows >= _DSV4_H16_MIN_BW_ROWS:
+        return True
+    h8_ctas = rows * (heads // 8) * max(1, int(h8_num_splits))
+    return h8_ctas > _DSV4_H16_H8_CTA_LIMIT
 
 
 def _wave_balanced_num_splits(
@@ -292,7 +334,7 @@ class UnifiedDecodeKernel:
                  has_extra=False,
                  pbs_extra=1, valid_hpb=None, head_block_offset=0,
                  per_token_len=False, native_glm_h8=False,
-                 native_dsv4_h8=False):
+                 native_dsv4_h8=False, native_dsv4_h16=False):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -329,8 +371,11 @@ class UnifiedDecodeKernel:
         self.per_token_len = bool(per_token_len)
         self.native_glm_h8 = bool(native_glm_h8)
         self.native_dsv4_h8 = bool(native_dsv4_h8)
+        # Native H16: two independent 8-head H8 groups (4 math warps each)
+        # sharing the CTA's packed KV stage. Grid keeps HPB=16 head blocks.
+        self.native_dsv4_h16 = bool(native_dsv4_h16)
         self.native_h8 = self.native_glm_h8 or self.native_dsv4_h8
-        if self.native_dsv4_h8:
+        if self.native_dsv4_h8 or self.native_dsv4_h16:
             packed_span = (
                 int(layout.kv_bufs) * int(traits.bi) * _DSV4_PACKED_SMEM_STRIDE
                 + int(layout.kv_bufs) * int(layout.kv_sc_buf_bytes)
@@ -1172,12 +1217,12 @@ class UnifiedDecodeKernel:
         staged_kv_stride = t.kv_smem_stride
         if cutlass.const_expr(self.native_glm_h8):
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
-        if cutlass.const_expr(self.native_dsv4_h8):
+        if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
         kv_fp8_buf = Int32(t.bi * staged_kv_stride)
         kv_rope_buf = Int32(L.kv_rope_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
-        if cutlass.const_expr(self.native_dsv4_h8):
+        if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             kv_rope_addr = kv_fp8_addr + Int32(_DSV4_PACKED_ROPE_OFFSET)
             kv_rope_buf = kv_fp8_buf
             kv_sc_addr = kv_fp8_addr + Int32(2) * kv_fp8_buf
@@ -1237,6 +1282,20 @@ class UnifiedDecodeKernel:
         if cutlass.const_expr(self.native_h8):
             warp_first_cand = warp_id * Int32(16)
 
+        # Native H16 two-group mapping: math warps 0-3 are group 0 (heads
+        # [head_base, head_base+8)), warps 4-7 group 1 (+8). Each group runs
+        # the H8 math on its own staging half; the KV stage/mbarriers/token
+        # buffer are shared. group/warp_sel/tid_sel collapse to the identity
+        # for every other specialization (const_expr elided).
+        group = Int32(0)
+        warp_sel = warp_id
+        tid_sel = tid
+        if cutlass.const_expr(self.native_dsv4_h16):
+            group = warp_id >> Int32(2)
+            warp_sel = warp_id & Int32(3)
+            tid_sel = tid - group * Int32(128)
+            warp_first_cand = warp_sel * Int32(16)
+
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
         # ════════════════════════════════════════════════════════════════════
@@ -1264,7 +1323,7 @@ class UnifiedDecodeKernel:
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
                     scale_format=t.scale_format,
                     packed_glm=self.native_glm_h8,
-                    packed_dsv4=self.native_dsv4_h8,
+                    packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -1331,20 +1390,70 @@ class UnifiedDecodeKernel:
         else:
             # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
+
+            # ── Native H16 per-group staging bases. Identity aliases when the
+            #    two-group mode is off (const_expr; zero IR change). Each group
+            #    strides its cooperative loops by nt_stage=128 threads while
+            #    every named barrier spans the full bt_stage=256-thread math
+            #    domain (barrier_threads override), so the groups share one
+            #    barrier schedule but touch disjoint staging halves. ──
+            q_fp8_stage = q_fp8_addr
+            q_rope_stage = q_rope_addr
+            q_sc_stage_view = q_sc_view
+            amax_stage_view = amax_view
+            reduce_max_stage = reduce_max_addr
+            reduce_sum_stage = reduce_sum_addr
+            w_fp8_stage = w_fp8_addr
+            sm_p_stage = sm_p_full_addr
+            w_head_sc_stage_view = w_head_sc_view
+            head_base_stage = head_base
+            nt_stage = 128 if self.native_dsv4_h16 else self.math_threads
+            bt_stage = self.math_threads if self.native_dsv4_h16 else 0
+            if cutlass.const_expr(self.native_dsv4_h16):
+                head_base_stage = head_base + group * Int32(8)
+                q_fp8_stage = q_fp8_addr + group * Int32(8 * t.q_nope_stride)
+                q_rope_stage = q_rope_addr + group * Int32(
+                    8 * L.q_rope_stride * 2
+                )
+                q_sc_stage_view = cute.make_tensor(
+                    q_sc_view.iterator + group * Int32(8 * t.num_scales),
+                    cute.make_layout(int(8 * t.num_scales)),
+                )
+                amax_stage_view = cute.make_tensor(
+                    amax_view.iterator + group * Int32(64),
+                    cute.make_layout(64),
+                )
+                reduce_max_stage = reduce_max_addr + group * Int32(4 * t.hpb * 4)
+                reduce_sum_stage = reduce_sum_addr + group * Int32(4 * t.hpb * 4)
+                w_fp8_stage = w_fp8_addr + group * Int32(8 * (t.bi + 16))
+                sm_p_stage = sm_p_full_addr + group * Int32(8 * t.bi * 2)
+                # Group 1 gets the dedicated tail region (w_head_sc packs
+                # scale+reciprocal across its full 16-wide row, so the groups
+                # cannot split one row).
+                w_head_sc_stage_view = cute.make_tensor(
+                    w_head_sc_view.iterator
+                    + group * Int32((L.w_head_sc2_off - L.w_head_sc_off) // 4),
+                    cute.make_layout(int(L.w_head_sc_bytes // 4)),
+                )
+
             s0_quantize_q_to_smem(
-                q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
-                head_base, Int32(self.valid_hpb), tid,
+                q_token, q_fp8_stage, q_sc_stage_view, q_rope_stage,
+                amax_stage_view,
+                head_base_stage,
+                Int32(8 if self.native_dsv4_h16 else self.valid_hpb),
+                tid_sel,
                 d_nope=t.d_nope, d_rope=t.d_rope,
                 d_qk=t.d_nope + t.d_rope,
                 quant_tile=t.quant_tile, num_scales=t.num_scales,
-                hpb=(8 if self.native_h8 else t.hpb),
+                hpb=(8 if (self.native_h8 or self.native_dsv4_h16) else t.hpb),
                 q_nope_stride=t.q_nope_stride,
                 q_rope_stride=L.q_rope_stride,
-                num_threads=self.math_threads, barrier_id=2,
+                num_threads=nt_stage, barrier_id=2,
+                barrier_threads=bt_stage,
             )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
-            rope_acc_elems = 8 if self.native_dsv4_h8 else 4
+            rope_acc_elems = 8 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 4
             accr_frag = cute.make_rmem_tensor(rope_acc_elems, Float32)
             gmax_frag = cute.make_rmem_tensor(2, Float32)
             gsum_frag = cute.make_rmem_tensor(2, Float32)
@@ -1396,10 +1505,10 @@ class UnifiedDecodeKernel:
                 # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                if cutlass.const_expr(self.native_h8):
+                if cutlass.const_expr(self.native_h8 or self.native_dsv4_h16):
                     if cutlass.const_expr(self.native_glm_h8):
                         qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
-                            qk, q_fp8_addr, kv_fp8_b, q_sc_view,
+                            qk, q_fp8_stage, kv_fp8_b, q_sc_stage_view,
                             warp_first_cand, lane,
                             num_scales=t.num_scales, quant_tile=t.quant_tile,
                             q_nope_stride=t.q_nope_stride,
@@ -1409,7 +1518,7 @@ class UnifiedDecodeKernel:
                         h8_rope_stride = staged_kv_stride
                     else:
                         qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
-                            qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                            qk, q_fp8_stage, kv_fp8_b, q_sc_stage_view, kv_sc_b,
                             warp_first_cand, lane,
                             num_scales=t.num_scales, quant_tile=t.quant_tile,
                             q_nope_stride=t.q_nope_stride,
@@ -1419,7 +1528,7 @@ class UnifiedDecodeKernel:
                         h8_rope_addr = kv_rope_b
                         h8_rope_stride = staged_kv_stride
                     qk = s2_qk_rope_bf16_glm_h8_swap_ab(
-                        qk, q_rope_addr, h8_rope_addr,
+                        qk, q_rope_stage, h8_rope_addr,
                         warp_first_cand, lane,
                         d_rope=t.d_rope,
                         kv_rope_stride_bytes=h8_rope_stride,
@@ -1442,10 +1551,16 @@ class UnifiedDecodeKernel:
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                     p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
                         qk, p, acc_nope, acc_rope, global_max, global_sum,
-                        reduce_max_addr, reduce_sum_addr, warp_id, lane, tid,
+                        reduce_max_stage, reduce_sum_stage, warp_sel, lane,
+                        tid_sel,
                         n_acc_tiles=n_acc_tiles, hpb=t.hpb, n_warps=4,
-                        num_threads=self.math_threads, barrier_id=3,
-                        rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 0),
+                        num_threads=nt_stage, barrier_id=3,
+                        rope_tiles_per_warp=(
+                            2
+                            if (self.native_dsv4_h8 or self.native_dsv4_h16)
+                            else 0
+                        ),
+                        barrier_threads=bt_stage,
                     )
                     w_pre = [
                         p[0] * wr0, p[1] * wr1,
@@ -1465,15 +1580,16 @@ class UnifiedDecodeKernel:
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
                             w_pre, acc_nope, kv_fp8_b, kv_sc_b,
-                            w_head_sc_view, w_fp8_addr, sm_p_full_addr,
-                            warp_id, lane, tid,
+                            w_head_sc_stage_view, w_fp8_stage, sm_p_stage,
+                            warp_sel, lane, tid_sel,
                             n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
                             hpb=t.hpb, bi=t.bi,
                             kv_smem_stride=staged_kv_stride,
                             w_fp8_stride=t.bi + 16, n_warps=4,
                             nt_per_warp_xv=t.nt_per_warp_xv,
                             scale_bytes_per_token=8,
-                            num_threads=self.math_threads, barrier_id=3,
+                            num_threads=nt_stage, barrier_id=3,
+                            barrier_threads=bt_stage,
                         )
                 else:
                     qk = s1_qk_nope_block_scaled(
@@ -1551,9 +1667,11 @@ class UnifiedDecodeKernel:
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
                 if cutlass.const_expr(t.v_has_rope):
-                    if cutlass.const_expr(self.native_dsv4_h8):
+                    if cutlass.const_expr(
+                        self.native_dsv4_h8 or self.native_dsv4_h16
+                    ):
                         acc_rope = s6b_xv_rope_h8_swap_ab(
-                            acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
+                            acc_rope, sm_p_stage, kv_rope_b, warp_sel, lane,
                             bi=t.bi, d_rope=t.d_rope, n_warps=4,
                             tiles_per_warp=2,
                             kv_rope_stride_bytes=staged_kv_stride,
@@ -1594,7 +1712,7 @@ class UnifiedDecodeKernel:
             fin_acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
-            if cutlass.const_expr(self.native_h8):
+            if cutlass.const_expr(self.native_h8 or self.native_dsv4_h16):
                 gid = lane >> Int32(2)
                 pair_lane = gid >> Int32(1)
                 row_gmax0 = cute.arch.shuffle_sync(gmax_frag[0], pair_lane)
@@ -1612,7 +1730,7 @@ class UnifiedDecodeKernel:
             out_o = cute.make_tensor(
                 mid_out.iterator
                 + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
-                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + head_base_stage.to(Int64) * Int64(self.mid_out_stride_head)
                 + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
                 cute.make_layout(
                     (t.hpb, t.d_v),
@@ -1623,19 +1741,21 @@ class UnifiedDecodeKernel:
             out_lse = cute.make_tensor(
                 mid_lse.iterator
                 + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
-                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + head_base_stage.to(Int64) * Int64(self.mid_lse_stride_head)
                 + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
                 cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
             )
             s7_epilogue(
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
-                warp_id, lane,
+                warp_sel, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
                 d_rope=t.d_rope,
-                n_warps=(4 if self.native_h8 else 8),
-                valid_hpb=self.valid_hpb,
+                n_warps=(4 if (self.native_h8 or self.native_dsv4_h16) else 8),
+                valid_hpb=(8 if self.native_dsv4_h16 else self.valid_hpb),
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
-                rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 1),
+                rope_tiles_per_warp=(
+                    2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
+                ),
             )
 
 
@@ -1750,6 +1870,16 @@ def _sparse_mla_decode_grid_flat_launch(
         int(model_type) == int(ModelType.DSV4)
         and int(valid_hpb) == 8
     )
+    native_dsv4_h16 = bool(
+        int(model_type) == int(ModelType.DSV4)
+        and int(valid_hpb) == 16
+        and int(head_block_offset) == 0
+        and (int(topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
+        + (int(extra_topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
+        <= _DSV4_H8_MAX_CHUNKS
+        and bool(per_token_len)
+        and _env_dsv4_h16_native_mode() is not False
+    )
     native_h8 = native_glm_h8 or native_dsv4_h8
     traits = make_unified_traits(
         int(model_type),
@@ -1764,6 +1894,13 @@ def _sparse_mla_decode_grid_flat_launch(
             nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
             math_threads=128,
             block_threads=160,
+        )
+    elif native_dsv4_h16:
+        # Two H8 groups of four warps each keep the H8 per-warp tile shape:
+        # 16 swapped QK candidates + doubled PV N-tiles, 256 math threads.
+        traits = replace(
+            traits,
+            nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
         )
     layout = make_smem_layout(traits)
     hpb = int(traits.hpb)
@@ -1840,6 +1977,7 @@ def _sparse_mla_decode_grid_flat_launch(
         per_token_len=bool(per_token_len),
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
+        native_dsv4_h16=native_dsv4_h16,
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -1860,6 +1998,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("per_token_len", int(per_token_len)),
         key_field("native_glm_h8", int(native_glm_h8)),
         key_field("native_dsv4_h8", int(native_dsv4_h8)),
+        key_field("native_dsv4_h16", int(native_dsv4_h16)),
         tensor_key(
             "q_all",
             q_all,
@@ -2160,17 +2299,49 @@ def run_unified_decode(
     # The swapped H8 DSV4 kernel is validated across the traced C1/C4/C128
     # regimes, including C128's three chunks per split. This is a shape-only
     # policy decision, so capture and replay use the same kernel and workspace.
+    max_chunks = int(workspace.max_chunks_per_row)
+    # SM count read early: both the H8/H16 policy and the split plan need it.
+    sm_count = None
+    if q_all.is_cuda:
+        sm_count = int(
+            torch.cuda.get_device_properties(q_all.device).multi_processor_count
+        )
+
+    h16_allowed = bool(
+        int(model_type) == int(ModelType.DSV4)
+        and heads % 16 == 0
+        and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
+    )
+    h16_mode = _env_dsv4_h16_native_mode()
+    if h16_allowed and h16_mode is None:
+        # AUTO policy: pre-plan the H8 grid, then choose by regime (see
+        # _dsv4_h16_auto): gather-bound many-chunk shapes and >1.4-wave H8
+        # grids go H16; the sub-wave latency regime keeps H8.
+        _nc8, _ns8, _ = plan_unified_decode_splits(
+            topk=topk,
+            max_chunks=max_chunks,
+            forced_num_splits=forced_num_splits,
+            num_tokens=rows,
+            h_blocks=heads // 8,
+            sm_count=sm_count,
+            extra_topk=extra_topk,
+        )
+        native_dsv4_h16 = _dsv4_h16_auto(
+            rows=rows, heads=heads, num_chunks=_nc8, h8_num_splits=_ns8
+        )
+    else:
+        native_dsv4_h16 = bool(h16_allowed and h16_mode)
     native_dsv4_h8 = bool(
         int(model_type) == int(ModelType.DSV4)
         and heads % 8 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
+        and not native_dsv4_h16
     )
     if native_dsv4_h8:
         hpb = 8
         h_blocks_full = heads // hpb
         rem_heads = heads % hpb
         h_blocks = h_blocks_full + (1 if rem_heads else 0)
-    max_chunks = int(workspace.max_chunks_per_row)
 
     # ── P10b PER-TOKEN topk_length threading ──────────────────────────────────
     # Decide whether to route to the per-token kernel (section_len read per CTA
@@ -2233,13 +2404,6 @@ def run_unified_decode(
             extra_len_t = torch.full(
                 (rows,), extra_topk, dtype=torch.int32, device=q_all.device
             )
-    # SM count read at RUNTIME (RTX PRO 6000 Blackwell sm_120 et al.) -- feeds the
-    # FlashInfer-ported wave-balance tail-gap search. None if no CUDA device.
-    sm_count = None
-    if q_all.is_cuda:
-        sm_count = int(
-            torch.cuda.get_device_properties(q_all.device).multi_processor_count
-        )
     num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
         topk=topk,
         max_chunks=max_chunks,
@@ -2263,22 +2427,23 @@ def run_unified_decode(
         model_type=str(model_type),
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
+        native_dsv4_h16=native_dsv4_h16,
         heads_per_block=(8 if native_h8 else 16),
         math_warps=(4 if native_h8 else 8),
         block_threads=(160 if native_h8 else int(traits.block_threads)),
         io_warps=1,
-        kv_stage_packed=native_h8,
+        kv_stage_packed=native_h8 or native_dsv4_h16,
         kv_smem_stride=(
             _GLM_KV_GMEM_STRIDE
             if native_glm_h8
             else (
                 _DSV4_PACKED_SMEM_STRIDE
-                if native_dsv4_h8
+                if (native_dsv4_h8 or native_dsv4_h16)
                 else int(traits.kv_smem_stride)
             )
         ),
-        qk_candidates_per_warp=(16 if native_h8 else 8),
-        qk_swap_ab=native_h8,
+        qk_candidates_per_warp=(16 if (native_h8 or native_dsv4_h16) else 8),
+        qk_swap_ab=native_h8 or native_dsv4_h16,
         topk=int(topk),
         extra_topk=int(extra_topk),
         has_extra=bool(has_extra),

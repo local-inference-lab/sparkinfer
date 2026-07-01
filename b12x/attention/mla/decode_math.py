@@ -299,6 +299,7 @@ def s0_quantize_q_to_smem(
     q_rope_stride: cutlass.Constexpr,  # D_ROPE plus optional bank-layout pad
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,   # named-barrier slot for the math-only sync
+    barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
 ):
     """S0: cooperative BF16->E4M3 Q quant with per-tile pow2 UE8M0 scale.
 
@@ -310,8 +311,16 @@ def s0_quantize_q_to_smem(
       5. quantize q_nope * (1/q_sc) -> E4M3 into q_fp8 (zero-fill invalid heads)
     The caller fences (named barrier) AFTER this returns so S1 reads a coherent
     Q stage. The internal barriers separate the 5 phases.
+
+    ``barrier_threads`` widens the named barrier beyond ``num_threads`` for the
+    native-H16 two-group decode (each 128-thread group strides its own staging
+    with ``num_threads`` while both groups share one 256-wide barrier domain).
+    0 keeps the historical num_threads-wide barrier (byte-identical).
     """
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    bar_kw = dict(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
 
     # --- Step 1: copy Q-rope bf16 -> smem; zero-fill invalid heads. ---
     i = tid
@@ -1093,6 +1102,7 @@ def s4_online_softmax_glm_h8_swap_ab(
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     rope_tiles_per_warp: cutlass.Constexpr = 0,
+    barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
 ):
     """Online softmax for the swapped 16-candidate x 8-head score tile.
 
@@ -1101,7 +1111,10 @@ def s4_online_softmax_glm_h8_swap_ab(
     so the cross-chunk alpha is shuffled from the lane owning that head pair
     before rescaling the accumulator rows.
     """
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    bar_kw = dict(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     head0 = tid * Int32(2)
@@ -1758,6 +1771,7 @@ def s6_xv_nope_dsv4_h8_swap_ab(
     scale_bytes_per_token: cutlass.Constexpr,
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
 ):
     """DSV4 H8 PV fed directly by the swapped score fragment.
 
@@ -1766,7 +1780,10 @@ def s6_xv_nope_dsv4_h8_swap_ab(
     64-wide V group.  The same probability stores also populate the BF16 matrix
     consumed by the RoPE PV path.
     """
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    bar_kw = dict(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     head0 = tid * Int32(2)
