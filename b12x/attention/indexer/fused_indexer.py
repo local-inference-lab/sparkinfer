@@ -97,11 +97,9 @@ _MAX_CHUNK_ELEMENTS = 8192
 KV_LAYOUT_CONTIGUOUS_MLA = 0
 KV_LAYOUT_PAGED = 1
 
-# Routing is by ROW COUNT, not context width. Under CUDA-graph capture the gate
-# is fixed at capture time, and `width` there is the workspace page-table CAPACITY
-# (constant), not the live seqlen (which varies per step via the seqlens tensor) —
-# so a width gate can't adapt to live context and is the wrong axis. The batch row
-# count IS fixed at capture, so it's the correct gate.
+# The general route is by row count. GLM's measured boundary also uses small
+# capture-static width-capacity buckets below; neither policy reads live seqlen,
+# so vLLM graph replay cannot change the selected backend.
 #
 # Measured HBM-bound (L2-flushed, graph min_us, sm120, heads=64) fused-vs-supertile
 # vs the PRODUCTION chunked supertile (supertile_k=32768, num_chunks=ceil(seq/32k)).
@@ -117,6 +115,8 @@ KV_LAYOUT_PAGED = 1
 # CTA/row). FUSED_MIN_WIDTH retained only for capacity sizing.
 FUSED_MAX_ROWS = 6           # decode-batch crossover: fused wins rows <= this (HBM-bound)
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
+_GLM32_FUSED_MAX_ROWS_SHORT = 1
+_GLM32_FUSED_MAX_ROWS_32K = 5
 
 
 @cute.jit
@@ -300,6 +300,44 @@ _LAST_CTA_MERGE_MAX = 49152
 # too small for coop's grid barriers to ever pay off -- see run_fused_paged_indexer).
 _FORCE_LAST_CTA = 1 << 30
 
+# The fused cooperative merge uses persistent_topk's 772-word state layout.
+# Histograms occupy [0, 768); the fused path uses the two otherwise-generic
+# scalar slots as its candidate-total and end-of-launch cleanup counters.
+_FUSED_STATE_TOTAL = 3 * _RADIX
+_FUSED_STATE_CLEANUP = _FUSED_STATE_TOTAL + 1
+
+
+@cute.jit
+def _load_q_bytes_g2s_v4(
+    q_bytes: cute.Tensor,
+    q_idx: Int32,
+    q_row_stride_bytes: Int64,
+    real_q_bytes: cutlass.Constexpr[int],
+    padded_q_bytes: cutlass.Constexpr[int],
+    q_smem_base_addr: Int32,
+    tx: Int32,
+    n_threads: Int32,
+):
+    """Vectorized 16-byte query staging for the common contiguous-head layout."""
+    linear_vec = tx
+    total_vecs = Int32(int(padded_q_bytes) // 16)
+    real_vecs = Int32(int(real_q_bytes) // 16)
+    row_base = Int64(q_idx) * q_row_stride_bytes
+    while linear_vec < total_vecs:
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        if linear_vec < real_vecs:
+            q_addr = get_ptr_as_int64(
+                q_bytes, row_base + Int64(linear_vec) * Int64(16)
+            )
+            v0, v1, v2, v3 = ld_global_v4_u32(q_addr)
+        st_shared_v4_u32(
+            q_smem_base_addr + linear_vec * Int32(16), v0, v1, v2, v3
+        )
+        linear_vec += n_threads
+
 
 def _fused_indexer_state_nbytes(launch: _FusedLaunchConfig) -> int:
     return launch.num_groups * _STATE_WORDS_PER_GROUP * 4
@@ -378,21 +416,25 @@ def resolve_fused_indexer_path(
     topk: int,
     num_rows: int,
     width: int,
+    num_heads: int | None = None,
 ) -> bool:
     """Route to the fused kernel only for small decode batches (rows <= N).
 
-    Routing is by ROW COUNT (fixed at graph-capture), NOT context width: under
-    graph capture `width` is the workspace capacity, not the live seqlen, so it
-    can't distinguish a short live step from a long one. The fused kernel's scorer
-    already beats supertile's, but its parallelism is ctas_per_group = num_sms //
-    rows, which collapses as rows grow — so it only wins the smallest decode
-    batches. Measured at 32k/topk=2048/heads=64 (graph min_us): rows 2/4/8 win
-    (0.91/0.91/0.97x), rows 16/24/32 lose (1.06/1.15/1.23x, growing). Larger
-    batches and all prefill (m=q-rows; fused's m=heads is ~7x slower at T=4096)
-    stay on supertile. width is intentionally ignored for routing.
+    Row count, head count, top-k, and width here are all capture-time workspace
+    metadata; live seqlen is deliberately absent, so the selected route is stable
+    across vLLM CUDA-graph replays. The general small-decode gate remains six
+    rows. GLM's 32-head/top-k-2048 shape has measured capacity buckets after the
+    vectorized-Q and merge-crossover tuning: below 16k only B1 wins; from 16k
+    through 32k fused wins/ties through B5 and B6 loses. Above 32k this targeted
+    retune leaves the separately benchmarked general six-row policy unchanged.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
+    if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
+        if int(width) < 16384:
+            return int(num_rows) <= _GLM32_FUSED_MAX_ROWS_SHORT
+        if int(width) <= 32768:
+            return int(num_rows) <= _GLM32_FUSED_MAX_ROWS_32K
     return int(num_rows) <= FUSED_MAX_ROWS
 
 
@@ -894,12 +936,18 @@ class SparseNSAFusedIndexerKernel:
         ctas_per_group: int = 1,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
         k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+        max_seq_capacity: int = 1 << 30,
+        vectorized_q_load: bool = False,
+        q_row_stride_bytes: int = 0,
     ):
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
         self.ctas_per_group = max(1, int(ctas_per_group))
         self.merge_threshold = int(merge_threshold)
+        self.max_seq_capacity = max(0, int(max_seq_capacity))
+        self.vectorized_q_load = bool(vectorized_q_load)
+        self.q_row_stride_bytes = int(q_row_stride_bytes)
         # dim-0 byte stride of k_quant_bytes for the PAGED wide load. Defaults to
         # the contiguous 8192 (64*128); the packed paged cache interleaves per-page
         # scales so its real page stride is 8448 -- run_fused_paged_indexer passes
@@ -940,6 +988,9 @@ class SparseNSAFusedIndexerKernel:
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
+        self.coop_merge_possible = (
+            self.merge_in_kernel and self.max_seq_capacity > self.merge_threshold
+        )
         self.pack_cap = self.ctas_per_group * int(self.topk)
         # Both cross-CTA merge arms are compiled and chosen at runtime per group by
         # seq_len vs merge_threshold (see the merge dispatch). Both index the
@@ -1042,6 +1093,7 @@ class SparseNSAFusedIndexerKernel:
             )
         )
         s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
+        q_smem_base_addr = shared_ptr_to_u32(storage.q_bytes.data_ptr())
         k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
         k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
         s_k_page_stage = storage.k_page.get_tensor(
@@ -1103,17 +1155,29 @@ class SparseNSAFusedIndexerKernel:
         # Stage q + weights with all 1024 threads (paid once per CTA; the
         # 128-thread version was 64 sequential byte rounds, costly at short K
         # where per-CTA work is small and CTAs are many).
-        q_linear = tx
-        total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
-        while q_linear < total_q_bytes:
-            head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
-            col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
-            s_q[head_idx, col_idx] = (
-                q_bytes[q_idx, head_idx, col_idx]
-                if head_idx < num_heads
-                else cutlass.Uint8(0)
+        if cutlass.const_expr(self.vectorized_q_load):
+            _load_q_bytes_g2s_v4(
+                q_bytes,
+                q_idx,
+                Int64(self.q_row_stride_bytes),
+                self.num_heads_static * _INDEX_HEAD_DIM,
+                self.padded_q_heads * _INDEX_HEAD_DIM,
+                q_smem_base_addr,
+                tx,
+                Int32(_RADIX_THREADS),
             )
-            q_linear += Int32(_RADIX_THREADS)
+        else:
+            q_linear = tx
+            total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
+            while q_linear < total_q_bytes:
+                head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
+                col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
+                s_q[head_idx, col_idx] = (
+                    q_bytes[q_idx, head_idx, col_idx]
+                    if head_idx < num_heads
+                    else cutlass.Uint8(0)
+                )
+                q_linear += Int32(_RADIX_THREADS)
         w_linear = tx
         while w_linear < Int32(self.padded_q_heads):
             s_w[w_linear] = (
@@ -1312,14 +1376,24 @@ class SparseNSAFusedIndexerKernel:
             ordered_pivot = Uint32(0)
             bucket_u32 = Uint32(0)
             c = Int32(0)
-            if seq_len > Int32(self.merge_threshold):
+            coop_possible = Int32(1 if self.coop_merge_possible else 0)
+            if (seq_len > Int32(self.merge_threshold)) & (
+                coop_possible != Int32(0)
+            ):
                 # group total candidate count (for the degenerate total <= topk path)
                 if tx == Int32(0):
                     atomic_add_global_i32(
-                        _global_state_ptr(merge_state, group_id, Int32(768)), carry_count
+                        _global_state_ptr(
+                            merge_state, group_id, Int32(_FUSED_STATE_TOTAL)
+                        ),
+                        carry_count,
                     )
                 barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                total = Int32(merge_state[_state_offset(group_id, Int32(768))])
+                total = Int32(
+                    merge_state[
+                        _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
+                    ]
+                )
                 if total <= topk_static:
                     # every candidate survives: pack contiguously (atomic base) + pad -1
                     if tx == Int32(0):
@@ -1470,6 +1544,34 @@ class SparseNSAFusedIndexerKernel:
                                 out_values[group_id, pos] = Float32(s_c0_values[i])
                                 out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
+
+                # Self-reset the cooperative state without a second grid
+                # barrier.  Each CTA publishes departure only after its final
+                # output/state use; the last departing CTA can therefore reset
+                # every cross-launch scalar safely.  This also permits graph
+                # replays to switch between cooperative and serial merge as the
+                # live seqlen changes, without a captured memset on every replay.
+                cute.arch.sync_threads()
+                if tx == Int32(0):
+                    cleanup_ptr = _global_state_ptr(
+                        merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)
+                    )
+                    s_relay[0] = atomic_add_global_i32(cleanup_ptr, Int32(1))
+                cute.arch.sync_threads()
+                if Int32(s_relay[0]) == (ctas_pg - Int32(1)):
+                    if tx == Int32(0):
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_FUSED_STATE_CLEANUP))
+                        ] = Int32(0)
             else:
                 # ---- in-kernel cross-CTA merge (relay) ----
                 # Each CTA atomically packs its carry_count REAL candidates into the
@@ -1545,6 +1647,9 @@ def _build_fused_indexer_kernel(
     ctas_per_group: int,
     merge_threshold: int = _LAST_CTA_MERGE_MAX,
     k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+    max_seq_capacity: int = 1 << 30,
+    vectorized_q_load: bool = False,
+    q_row_stride_bytes: int = 0,
 ):
     return SparseNSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
@@ -1554,6 +1659,9 @@ def _build_fused_indexer_kernel(
         ctas_per_group=ctas_per_group,
         merge_threshold=merge_threshold,
         k_quant_page_stride=k_quant_page_stride,
+        max_seq_capacity=max_seq_capacity,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
     )
 
 
@@ -1673,6 +1781,7 @@ def run_fused_paged_indexer(
     pack_values: torch.Tensor | None = None,
     pack_indices: torch.Tensor | None = None,
     merge_state: torch.Tensor | None = None,
+    merge_state_preinitialized: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
@@ -1680,8 +1789,10 @@ def run_fused_paged_indexer(
     pack_values/pack_indices/merge_state: optional caller-owned (workspace) scratch for
     serving. Size them with fused_indexer_scratch_capacity(max_rows, topk, num_sms) ONCE
     (fixed capacity, never grows -- the merge scratch is seq-independent). When omitted,
-    scratch is allocated per call (benchmarks/tests). merge_state is zeroed here each
-    call (cheap, graph-capturable); the kernel also self-resets its per-group counters.
+    scratch is allocated per call (benchmarks/tests). A caller-owned merge_state must
+    either be zero-initialized once and pass merge_state_preinitialized=True, or it is
+    zeroed here for backwards compatibility. Both merge arms self-reset every scalar
+    they carry across launches, so a preinitialized state needs no replay-time memset.
 
     merge_threshold drives the per-group runtime cross-CTA merge auto-switch: a row
     whose live seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
@@ -1709,6 +1820,13 @@ def run_fused_paged_indexer(
         # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
         # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
         crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (int(topk) - 512))
+        # The original fit was dominated by the 64-head kernel. After vectorized
+        # query staging, GLM's 32-head/top-k-2048 path still favors the serial
+        # last-CTA reducer through 16k for B2-B5; cooperative merge only wins
+        # beyond that point. This floor is runtime-seqlen dispatch inside a
+        # capture-static kernel variant, and both arms self-reset for replay.
+        if int(num_heads) == 32 and int(topk) == 2048:
+            crossover = max(crossover, 16384)
         cap = ctas_per_group * int(topk)
         merge_threshold = crossover if cap > crossover else _FORCE_LAST_CTA
 
@@ -1723,9 +1841,8 @@ def run_fused_paged_indexer(
         else out_values
     )
     if pack_values is not None and pack_indices is not None and merge_state is not None:
-        # Workspace-owned fixed-capacity scratch. Slice to this launch's need and zero the
-        # state (the per-group counters; cheap and graph-capturable). Capacity is validated
-        # against fused_indexer_scratch_capacity by the workspace at allocation time.
+        # Workspace-owned fixed-capacity scratch. Capacity is validated against
+        # fused_indexer_scratch_capacity by the workspace at allocation time.
         pack_need = rows * ctas_per_group * int(topk)
         state_need = rows * _COOP_STATE_WORDS
         if pack_values.numel() < pack_need or pack_indices.numel() < pack_need:
@@ -1742,18 +1859,31 @@ def run_fused_paged_indexer(
         pack_v = pack_values[:pack_need]
         pack_i = pack_indices[:pack_need]
         state = merge_state[:state_need]
-        state.zero_()
+        if not bool(merge_state_preinitialized):
+            state.zero_()
     else:
         pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
     # Real dim-0 byte stride of the K-quant tensor: the packed paged cache interleaves
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
     k_quant_page_stride = int(k_quant_bytes.stride(0))
+    vectorized_q_load = (
+        int(q_bytes.data_ptr()) % 16 == 0
+        and int(q_bytes.stride(2)) == 1
+        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
+        and int(q_bytes.stride(0)) % 16 == 0
+    )
+    q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
     kernel = _build_fused_indexer_kernel(
         KV_LAYOUT_PAGED, int(num_heads), int(topk), False, ctas_per_group,
         merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
+        max_seq_capacity=max_pages * _PAGE_SIZE,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
     )
-    dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for paged
+    # k_start/k_end are constexpr-dead in the PAGED kernel. Reuse the existing
+    # int32 row metadata instead of capturing a pointless zero-fill kernel.
+    unused_k_bounds = seqlens
     args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8, assumed_align=4),
         _to_kernel_tensor(weights, cutlass.Float32, assumed_align=4),
@@ -1761,8 +1891,8 @@ def run_fused_paged_indexer(
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(dummy, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(dummy, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(unused_k_bounds, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(unused_k_bounds, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(out_i, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(out_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_v, cutlass.Float32, assumed_align=4),
@@ -1772,13 +1902,15 @@ def run_fused_paged_indexer(
     )
     key_tensors = [
         ("q", q_bytes), ("w", weights), ("kq", k_quant_bytes), ("ks", k_scales),
-        ("pt", real_page_table), ("sl", seqlens), ("kstart", dummy), ("kend", dummy),
+        ("pt", real_page_table), ("sl", seqlens),
+        ("kstart", unused_k_bounds), ("kend", unused_k_bounds),
         ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
     ]
     _launch_fused(
         kernel, args, key_tensors,
         (KV_LAYOUT_PAGED, int(num_heads), int(topk), int(ctas_per_group),
-         int(merge_threshold), k_quant_page_stride),
+         int(merge_threshold), k_quant_page_stride, max_pages * _PAGE_SIZE,
+         bool(vectorized_q_load), q_row_stride_bytes),
     )
     return out_i, out_v
 

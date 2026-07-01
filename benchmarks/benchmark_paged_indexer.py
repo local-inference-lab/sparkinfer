@@ -318,17 +318,31 @@ def main() -> None:
     cache_tokens = max_pages_needed * 64
     analytic_scores = None
     if args.check:
-        if str(args.mode) != "supertile-topk":
-            raise ValueError("--check currently validates --mode supertile-topk")
+        if str(args.mode) not in ("supertile-topk", "fused-topk"):
+            raise ValueError(
+                "--check validates --mode supertile-topk or fused-topk"
+            )
+        if page_stride != 0 and page_stride < page_table_width:
+            raise ValueError(
+                "--check with distinct page tables requires page_stride >= "
+                "page_table_width"
+            )
         q_source = torch.zeros((rows, num_heads, 128), dtype=torch.float32, device=device)
         q_source[..., 0] = 1.0
         q_fp8 = q_source.to(torch.float8_e4m3fn)
         weights = torch.full(
             (rows, num_heads), 1.0 / num_heads, dtype=torch.float32, device=device
         )
-        analytic_scores = torch.linspace(
-            0.25, 1.0, cache_tokens, dtype=torch.float32, device=device
+        # Repeat a request-local monotonic ramp for each disjoint physical page
+        # span. Kernel outputs are logical token indices, so every row must have
+        # the same logical score oracle even when its physical pages are offset.
+        analytic_span = cache_tokens if page_stride == 0 else page_stride * 64
+        analytic_base = torch.linspace(
+            0.25, 1.0, analytic_span, dtype=torch.float32, device=device
         )
+        analytic_scores = analytic_base.repeat(
+            (cache_tokens + analytic_span - 1) // analytic_span
+        )[:cache_tokens]
         k_source = torch.zeros((cache_tokens, 128), dtype=torch.float32, device=device)
         k_source[:, 0] = analytic_scores
     else:
@@ -452,6 +466,40 @@ def main() -> None:
 
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
     out_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
+    fused_cache = None
+    if bench_mode == "fused-topk":
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        planned_ctas = int(
+            fused_ctas
+            or max(1, min(page_table_width, num_sms // max(rows, 1)))
+        )
+        try:
+            fused_cache = binding.scratch.get_fused_indexer_scratch(topk=topk)
+            pack_need = rows * planned_ctas * topk
+            if min(fused_cache[0].numel(), fused_cache[1].numel()) < pack_need:
+                fused_cache = None
+        except RuntimeError:
+            fused_cache = None
+        if fused_cache is None:
+            # The benchmark can force the primitive outside the production row
+            # routing gate. Keep that comparison graph-realistic with one fixed,
+            # preinitialized workspace rather than per-replay allocations.
+            from b12x.attention.indexer.fused_indexer import (
+                fused_indexer_scratch_capacity,
+            )
+
+            scratch_ctas = max(num_sms, rows * planned_ctas)
+            pack_elems, state_words = fused_indexer_scratch_capacity(
+                rows,
+                topk,
+                scratch_ctas,
+            )
+            fused_cache = (
+                torch.empty(pack_elems, dtype=torch.float32, device=device),
+                torch.empty(pack_elems, dtype=torch.int32, device=device),
+                torch.zeros(state_words, dtype=torch.int32, device=device),
+            )
 
     clear_indexer_caches()
 
@@ -474,22 +522,28 @@ def main() -> None:
             from b12x.attention.indexer.kernel import _split_index_k_cache_runtime_views
             from b12x.attention.indexer.fused_indexer import run_fused_paged_indexer
 
+            assert fused_cache is not None
             quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
-            fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
             return run_fused_paged_indexer(
                 q_bytes=q_fp8.view(torch.uint8),
                 weights=weights,
                 k_quant_bytes=quant,
                 k_scales=scales,
-                real_page_table=page_table,
-                seqlens=seqlens,
+                real_page_table=metadata.real_page_table,
+                seqlens=metadata.cache_seqlens_int32,
                 num_heads=num_heads,
                 topk=topk,
+                out_indices=out_indices,
+                out_values=out_scores,
                 ctas_per_group=fused_ctas,
                 merge_threshold=(
                     None if args.fused_merge_threshold < 0
                     else int(args.fused_merge_threshold)
                 ),
+                pack_values=fused_cache[0],
+                pack_indices=fused_cache[1],
+                merge_state=fused_cache[2],
+                merge_state_preinitialized=True,
             )[0]
         return index_topk_fp8(
             q_fp8=q_fp8,

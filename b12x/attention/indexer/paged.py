@@ -668,6 +668,9 @@ def index_topk_fp8(
             pack_values=cache[0],
             pack_indices=cache[1],
             merge_state=cache[2],
+            merge_state_preinitialized=bool(
+                getattr(scratch, "fused_indexer_merge_state_preinitialized", False)
+            ),
         )
         return idx
 

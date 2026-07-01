@@ -382,6 +382,7 @@ class B12XIndexerPagedScratch:
     fused_indexer_pack_values: torch.Tensor | None = None
     fused_indexer_pack_indices: torch.Tensor | None = None
     fused_indexer_merge_state: torch.Tensor | None = None
+    fused_indexer_merge_state_preinitialized: bool = False
     msa_page_scores: torch.Tensor | None = None
     msa_block_scores: torch.Tensor | None = None
     msa_q2k_indices: torch.Tensor | None = None
@@ -754,6 +755,7 @@ def _resolve_indexer_paged_route(
                         topk=int(caps.topk),
                         num_rows=int(caps.max_q_rows),
                         width=int(width),
+                        num_heads=int(caps.num_q_heads),
                     )
                     and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
                 ):
@@ -789,6 +791,7 @@ def _resolve_indexer_paged_route(
                 topk=int(caps.topk),
                 num_rows=int(caps.max_q_rows),
                 width=int(width),
+                num_heads=int(caps.num_q_heads),
             )
             and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
         ):
@@ -1279,6 +1282,10 @@ def _materialize_indexer_paged_scratch(
             shape=(int(layout.fused_state_words),),
             dtype=torch.int32,
         )
+        # One-time initialization at workspace bind/materialization.  Both fused
+        # merge strategies restore their cross-launch counters before returning,
+        # so serving graph replays do not need to capture a state memset.
+        fused_merge_state.zero_()
     else:
         fused_pack_values = None
         fused_pack_indices = None
@@ -1397,6 +1404,7 @@ def _materialize_indexer_paged_scratch(
         fused_indexer_pack_values=fused_pack_values,
         fused_indexer_pack_indices=fused_pack_indices,
         fused_indexer_merge_state=fused_merge_state,
+        fused_indexer_merge_state_preinitialized=fused_merge_state is not None,
         msa_page_scores=msa_page_scores,
         msa_block_scores=msa_block_scores,
         msa_q2k_indices=msa_q2k_indices,
