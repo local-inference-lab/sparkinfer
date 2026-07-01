@@ -3237,6 +3237,9 @@ class PagedForwardKernel:
             grid=grid,
             block=[32, self.traits.num_warps_q, self.launch_warps_kv],
             smem=SharedStorage.size_in_bytes(),
+            # Trait selection already budgets shared memory for exactly one
+            # or two resident CTAs.  Carry the same contract into ptxas.
+            min_blocks_per_mp=self.traits.num_ctas_per_sm,
             stream=stream,
         )
 
@@ -6035,6 +6038,8 @@ class PagedFp8DecodeRawForwardKernel:
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 1, 4],
             smem=SharedStorage.size_in_bytes(),
+            # 67,584 B including barriers/alignment on SM120: one CTA/SM.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -6670,6 +6675,8 @@ class PagedBf16ExtendRawForwardKernel:
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 4, 1],
             smem=SharedStorage.size_in_bytes(),
+            # 99,328 B including barriers/alignment on SM120: one CTA/SM.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -7395,6 +7402,9 @@ class PagedFp8ExtendRawForwardKernel:
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, self.num_warps_q, 1],
             smem=SharedStorage.size_in_bytes(),
+            # Q48 consumes 58,368 B and is one-CTA; Q32 consumes 50,176 B
+            # and deliberately fits two CTAs in the 102,400-B SM budget.
+            min_blocks_per_mp=1 if self.use_q48_long_form else 2,
             stream=stream,
         )
 

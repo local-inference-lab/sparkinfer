@@ -797,6 +797,10 @@ class W4A16GemmKernel:
             self.cta_m_blocks,
             self.uses_m_block_8,
             self.shared_words,
+            # Launch bounds are part of the compiled kernel.  Keep binaries
+            # planned for different residency targets out of the same cache
+            # entry even when their arithmetic geometry otherwise matches.
+            self.blocks_per_sm,
         )
 
     @cute.jit
@@ -947,6 +951,7 @@ class W4A16GemmKernel:
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
             stream=stream,
         )
 
@@ -3656,6 +3661,7 @@ class W4A16FusedMoeKernel:
             self.cta_threads,
             self.sms,
             self.shared_words,
+            self.blocks_per_sm,
         )
 
     @cute.jit
@@ -3742,6 +3748,7 @@ class W4A16FusedMoeKernel:
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
             stream=stream,
         )
 

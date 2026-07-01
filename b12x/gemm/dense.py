@@ -619,6 +619,9 @@ class DenseGemmKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # Stage selection is explicitly computed for occupancy=1 and the
+            # warp-specialized body redistributes registers with setmaxnreg.
+            min_blocks_per_mp=self.occupancy,
             stream=stream,
         )
         return

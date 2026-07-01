@@ -1048,6 +1048,10 @@ class SparseNSAFusedIndexerKernel:
             grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
             block=[_RADIX_THREADS, 1, 1],
             smem=SharedStorage.size_in_bytes(),
+            # The 1024-thread radix CTA is architecturally limited to one
+            # resident block on SM120 (1536 threads/SM).  The cooperative
+            # planner also caps the default launch to one machine-wide wave.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 

@@ -2659,6 +2659,10 @@ class MoEMicroKernelBackend:
             grid=(grid_x, Int32(1), Int32(1)),
             block=(_BLOCK_DIM, 1, 1),
             smem=0,
+            # configure() caps this cooperative, grid-barrier launch at one
+            # CTA wave.  A one-block launch bound gives the 512-thread body the
+            # matching register budget while preserving graph-stable geometry.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 

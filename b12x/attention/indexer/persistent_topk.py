@@ -322,6 +322,9 @@ class SparseNSAPersistentTopK2048Kernel:
         ).launch(
             grid=(num_groups * ctas_per_group, 1, 1),
             block=[_THREADS_PER_CTA, 1, 1],
+            # 1024 threads make this a one-resident-CTA kernel on SM120; expose
+            # that fact to ptxas instead of targeting unattainable occupancy.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 

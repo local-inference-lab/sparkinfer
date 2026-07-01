@@ -385,6 +385,11 @@ class UnifiedDecodeKernel:
         ).launch(
             grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
+            # The unified DSV4/GLM decode layouts consume 93--101 KiB of
+            # shared memory, so only one CTA can reside on an SM120 SM.  Make
+            # that existing resource contract visible to ptxas so it need not
+            # target artificial multi-CTA register occupancy.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -420,6 +425,7 @@ class UnifiedDecodeKernel:
         ).launch(
             grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -450,6 +456,7 @@ class UnifiedDecodeKernel:
         ).launch(
             grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -484,6 +491,7 @@ class UnifiedDecodeKernel:
         ).launch(
             grid=(num_tokens, self.h_blocks, self.num_splits),
             block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
