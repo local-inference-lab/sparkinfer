@@ -20,6 +20,11 @@ from typing import Any
 _B12X_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
+_SPEC_MEMO: OrderedDict[tuple[object, ...], Any] = OrderedDict()
+_SPEC_MEMO_LOCK = RLock()
+_SPEC_MEMO_MAX = 8192
+_SPEC_MEMO_HITS = 0
+_SPEC_MEMO_MISSES = 0
 _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
@@ -97,6 +102,57 @@ class TensorKey:
         )
 
 
+def _spec_memo_enabled() -> bool:
+    raw = os.environ.get("B12X_CUTE_COMPILE_SPEC_MEMO", "1")
+    return raw.lower() not in {"0", "false", "no", ""}
+
+
+def _spec_memo_key(
+    kind: str,
+    kernel_id: str,
+    version: int,
+    payload: object,
+    extra: object = None,
+) -> tuple[object, ...] | None:
+    # repr() of a JSON-POD payload is content-deterministic and preserves
+    # type distinctions (True vs 1, tuple vs list), so it is a safe memo key.
+    # Non-POD payloads never get stored (see _spec_memo_put callers), which
+    # keeps id-based reprs out of the cache.
+    if not _spec_memo_enabled():
+        return None
+    try:
+        memo_key = (kind, str(kernel_id), int(version), repr(payload), extra)
+        hash(memo_key)
+    except Exception:
+        return None
+    return memo_key
+
+
+def _spec_memo_get(memo_key: tuple[object, ...] | None) -> Any | None:
+    global _SPEC_MEMO_HITS
+    global _SPEC_MEMO_MISSES
+    if memo_key is None:
+        return None
+    with _SPEC_MEMO_LOCK:
+        spec = _SPEC_MEMO.get(memo_key)
+        if spec is None:
+            _SPEC_MEMO_MISSES += 1
+            return None
+        _SPEC_MEMO_HITS += 1
+        _SPEC_MEMO.move_to_end(memo_key)
+        return spec
+
+
+def _spec_memo_put(memo_key: tuple[object, ...] | None, spec: Any) -> None:
+    if memo_key is None:
+        return
+    with _SPEC_MEMO_LOCK:
+        _SPEC_MEMO[memo_key] = spec
+        _SPEC_MEMO.move_to_end(memo_key)
+        while len(_SPEC_MEMO) > _SPEC_MEMO_MAX:
+            _SPEC_MEMO.popitem(last=False)
+
+
 @dataclass(frozen=True)
 class KeyField:
     name: str
@@ -130,8 +186,12 @@ class KernelCompileSpec:
         version: int,
         *facts: object,
     ) -> "KernelCompileSpec":
+        memo_key = _spec_memo_key("facts", kernel_id, version, facts)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         json_key = _compile_spec_json(kernel_id, version, facts)
-        return KernelCompileSpec(
+        spec = KernelCompileSpec(
             kernel_id=str(kernel_id),
             version=int(version),
             fields=(),
@@ -139,6 +199,10 @@ class KernelCompileSpec:
             hash_key=_hash_json_key(json_key),
             legacy=False,
         )
+        # _compile_spec_json raises for non-POD facts, so only POD-validated
+        # specs reach the memo.
+        _spec_memo_put(memo_key, spec)
+        return spec
 
     @staticmethod
     def from_fields(
@@ -146,13 +210,19 @@ class KernelCompileSpec:
         version: int,
         *fields: KeyField | tuple[str, object],
     ) -> "KernelCompileSpec":
+        memo_key = _spec_memo_key("fields", kernel_id, version, fields)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         coerced_fields = tuple(_coerce_key_field(field) for field in fields)
         if all(_is_json_pod(field.value) for field in coerced_fields):
-            return KernelCompileSpec.from_facts(
+            spec = KernelCompileSpec.from_facts(
                 kernel_id,
                 version,
                 *((field.name, field.value) for field in coerced_fields),
             )
+            _spec_memo_put(memo_key, spec)
+            return spec
         return KernelCompileSpec(
             kernel_id=kernel_id,
             version=int(version),
@@ -186,13 +256,19 @@ class KernelCompileSpec:
                 f"compile spec labels length {len(labels)} does not match "
                 f"key length {len(key)}"
             )
+        memo_key = _spec_memo_key("key", kernel_id, version, key, extra=labels)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         if _is_json_pod(key):
             facts = (
                 tuple((str(labels[idx]), value) for idx, value in enumerate(key))
                 if labels is not None
                 else key
             )
-            return KernelCompileSpec.from_facts(kernel_id, version, *facts)
+            spec = KernelCompileSpec.from_facts(kernel_id, version, *facts)
+            _spec_memo_put(memo_key, spec)
+            return spec
         return KernelCompileSpec(
             kernel_id=kernel_id,
             version=int(version),
@@ -1754,6 +1830,8 @@ def clear_compile_cache() -> None:
     global _MEMORY_CACHE_MISSES
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
+    global _SPEC_MEMO_HITS
+    global _SPEC_MEMO_MISSES
     _compile_environment_key.cache_clear()
     _static_compile_cache_context.cache_clear()
     with _MEMORY_CACHE_LOCK:
@@ -1762,11 +1840,15 @@ def clear_compile_cache() -> None:
         _MEMORY_CACHE_MISSES = 0
         _DISK_CACHE_HITS = 0
         _COMPILE_MISSES = 0
+    with _SPEC_MEMO_LOCK:
+        _SPEC_MEMO.clear()
+        _SPEC_MEMO_HITS = 0
+        _SPEC_MEMO_MISSES = 0
 
 
 def compile_cache_info() -> dict[str, int | bool]:
     with _MEMORY_CACHE_LOCK:
-        return {
+        info: dict[str, int | bool] = {
             "memory_cache_enabled": _cute_compile_memory_cache_enabled(),
             "memory_cache_size": len(_MEMORY_CACHE),
             "memory_cache_max_size": _cute_compile_memory_cache_size(),
@@ -1776,6 +1858,12 @@ def compile_cache_info() -> dict[str, int | bool]:
             "disk_cache_hits": _DISK_CACHE_HITS,
             "compile_misses": _COMPILE_MISSES,
         }
+    with _SPEC_MEMO_LOCK:
+        info["spec_memo_enabled"] = _spec_memo_enabled()
+        info["spec_memo_size"] = len(_SPEC_MEMO)
+        info["spec_memo_hits"] = _SPEC_MEMO_HITS
+        info["spec_memo_misses"] = _SPEC_MEMO_MISSES
+    return info
 
 
 def compile(
