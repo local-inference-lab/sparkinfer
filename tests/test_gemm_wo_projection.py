@@ -9,6 +9,9 @@ from b12x.gemm.wo_projection import (
     WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
     empty_dense_gemm_mnl_view,
+    empty_mxfp8_rows_bases,
+    empty_mxfp8_rows_for_dense_gemm,
+    mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
     pack_mxfp8_scales_for_dense_gemm,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,
@@ -20,6 +23,7 @@ from b12x.gemm.wo_projection import (
     quantize_wo_projection_weights_mxfp8_torch,
     wo_a_dense_gemm_mxfp8,
     wo_b_dense_gemm_mxfp8,
+    wo_projection_inv_rope_mxfp8,
     wo_projection_mxfp8,
 )
 
@@ -391,6 +395,128 @@ def test_wo_a_inv_rope_input_quant_uses_mxfp8_32_column_groups() -> None:
     )
 
 
+def test_wo_b_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
+    require_sm120()
+    torch.manual_seed(31006)
+
+    tokens, rank, groups, hidden = 1, 1024, 4, 128
+    width = rank * groups
+    source = (
+        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+    quantized = []
+    bases = []
+    for poison in (0, 254):
+        values, scale_rows, scale_physical = empty_mxfp8_rows_bases(
+            tokens,
+            width,
+            num_groups=1,
+            device="cuda",
+            initialize_scales=False,
+        )
+        values.view(torch.uint8).fill_(poison)
+        scale_rows.fill_(poison)
+        scale_physical.fill_(poison)
+        out = mxfp8_rows_from_bases(
+            values,
+            scale_rows,
+            scale_physical,
+            tokens,
+            width,
+            num_groups=1,
+        )
+        quantize_wo_b_input_mxfp8(source, out=out)
+        quantized.append(out)
+        bases.append((values, scale_rows, scale_physical))
+
+    weight = empty_mxfp8_rows_for_dense_gemm(hidden, width, device="cuda")
+    weight.values.fill_(1)
+    actual_0 = wo_b_dense_gemm_mxfp8(quantized[0], weight, expected_m=1).clone()
+    actual_1 = wo_b_dense_gemm_mxfp8(quantized[1], weight, expected_m=1).clone()
+    torch.cuda.synchronize()
+
+    # Both quantizers overwrite every logical value and row scale. Most of the
+    # physical scale tile is M padding at tokens=1 and intentionally remains
+    # poisoned; the dense kernel must not let it affect the logical output row.
+    assert torch.equal(bases[0][0].view(torch.uint8), bases[1][0].view(torch.uint8))
+    assert torch.equal(bases[0][1], bases[1][1])
+    assert bool((bases[0][2] != bases[1][2]).any().item())
+    assert bool(torch.isfinite(actual_0).all().item())
+    assert bool((actual_0 != 0).any().item())
+    torch.testing.assert_close(actual_0, actual_1, rtol=0, atol=0)
+
+
+def test_wo_a_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
+    require_sm120()
+    torch.manual_seed(31008)
+
+    tokens, groups, heads_per_group = 1, 2, 4
+    nope_dim, rope_dim = 96, 32
+    head_dim = nope_dim + rope_dim
+    group_width = heads_per_group * head_dim
+    rank = 64
+    o = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 4
+    ).contiguous()
+    positions = torch.zeros((tokens,), device="cuda", dtype=torch.long)
+    cos_sin_cache = torch.zeros((1, rope_dim), device="cuda", dtype=torch.float32)
+    cos_sin_cache[:, : rope_dim // 2] = 1
+    quantized = []
+    bases = []
+    for poison in (0, 254):
+        values, scale_rows, scale_physical = empty_mxfp8_rows_bases(
+            tokens,
+            group_width,
+            num_groups=groups,
+            device="cuda",
+            initialize_scales=False,
+        )
+        values.view(torch.uint8).fill_(poison)
+        scale_rows.fill_(poison)
+        scale_physical.fill_(poison)
+        out = mxfp8_rows_from_bases(
+            values,
+            scale_rows,
+            scale_physical,
+            tokens,
+            group_width,
+            num_groups=groups,
+        )
+        quantize_wo_a_input_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin_cache,
+            groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            out=out,
+        )
+        quantized.append(out)
+        bases.append((values, scale_rows, scale_physical))
+
+    weight = empty_mxfp8_rows_for_dense_gemm(
+        rank, group_width, num_groups=groups, device="cuda"
+    )
+    weight.values.fill_(1)
+    actual_0 = wo_a_dense_gemm_mxfp8(quantized[0], weight, expected_m=1).clone()
+    actual_1 = wo_a_dense_gemm_mxfp8(quantized[1], weight, expected_m=1).clone()
+    torch.cuda.synchronize()
+
+    assert torch.equal(bases[0][0].view(torch.uint8), bases[1][0].view(torch.uint8))
+    assert torch.equal(bases[0][1], bases[1][1])
+    assert bool((bases[0][2] != bases[1][2]).any().item())
+    assert bool(torch.isfinite(actual_0).all().item())
+    assert bool((actual_0 != 0).any().item())
+    torch.testing.assert_close(actual_0, actual_1, rtol=0, atol=0)
+
+
 def test_wo_a_dense_gemm_mxfp8_matches_quantized_gpu_reference() -> None:
     require_sm120()
     torch.manual_seed(31001)
@@ -536,6 +662,80 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
+
+
+def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding() -> None:
+    require_sm120()
+    torch.manual_seed(31007)
+
+    tokens = 1
+    groups = 2
+    heads_per_group = 4
+    nope_dim = 96
+    rope_dim = 32
+    head_dim = nope_dim + rope_dim
+    group_width = heads_per_group * head_dim
+    rank, hidden = 64, 128
+    o = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 4
+    ).contiguous()
+    positions = torch.zeros((tokens,), device="cuda", dtype=torch.long)
+    cos_sin_cache = torch.zeros((4, rope_dim), device="cuda", dtype=torch.float32)
+    cos_sin_cache[:, : rope_dim // 2] = 1
+    wo_a = (
+        torch.randn(
+            (groups, rank, group_width), device="cuda", dtype=torch.bfloat16
+        )
+        / group_width**0.5
+    )
+    wo_b = (
+        torch.randn(
+            (hidden, groups * rank), device="cuda", dtype=torch.bfloat16
+        )
+        / (groups * rank) ** 0.5
+    )
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
+
+    def run_once() -> torch.Tensor:
+        return wo_projection_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin_cache,
+            weights,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            expected_m=1,
+        )
+
+    # Warm all compilation/allocation before capture, then retain the graph-owned
+    # output and verify replay observes changed inputs without allocating or
+    # depending on stale scale padding.
+    run_once()
+    run_once()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_once()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    o.copy_(torch.randn_like(o) / 4)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()
+    expected = run_once().clone()
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(replayed).all().item())
+    assert bool((replayed != 0).any().item())
+    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
 
 
 def test_wo_projection_expected_m_hint_is_byte_identical() -> None:

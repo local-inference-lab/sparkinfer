@@ -679,6 +679,7 @@ def empty_mxfp8_rows_bases(
     *,
     num_groups: int,
     device: torch.device | str,
+    initialize_scales: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Allocate the three CONTIGUOUS base buffers behind an MXFP8Rows.
 
@@ -689,6 +690,11 @@ def empty_mxfp8_rows_bases(
     view as a downstream graph input, which trips torch's AOT
     `merge_view_inputs` synthetic-base path under dynamic shapes. Returning bases
     keeps op outputs contiguous; the views are rebuilt in normal traced code.
+
+    ``initialize_scales=False`` is for an immediately following quantization
+    kernel that overwrites every logical row scale and every physical scale
+    entry consumed by dense GEMM. Physical M-padding remains unspecified; dense
+    GEMM must not observe it for logical output rows.
     """
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
@@ -700,20 +706,30 @@ def empty_mxfp8_rows_bases(
         values_base = torch.empty(
             (num_groups, m, k), device=device, dtype=torch.float8_e4m3fn
         )
-    scale_rows_base = torch.full(
-        (num_groups, m, k // MXFP8_SCALE_VEC_SIZE),
-        127,
-        dtype=torch.uint8,
-        device=device,
-    )
+    scale_shape = (num_groups, m, k // MXFP8_SCALE_VEC_SIZE)
+    if initialize_scales:
+        scale_rows_base = torch.full(
+            scale_shape,
+            127,
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        scale_rows_base = torch.empty(scale_shape, dtype=torch.uint8, device=device)
     m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
     k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
-    scale_physical_base = torch.full(
-        (num_groups, m_tiles, k_tiles, 32, 4, 4),
-        127,
-        dtype=torch.uint8,
-        device=device,
-    )
+    physical_shape = (num_groups, m_tiles, k_tiles, 32, 4, 4)
+    if initialize_scales:
+        scale_physical_base = torch.full(
+            physical_shape,
+            127,
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        scale_physical_base = torch.empty(
+            physical_shape, dtype=torch.uint8, device=device
+        )
     return values_base, scale_rows_base, scale_physical_base
 
 
@@ -1307,13 +1323,18 @@ def _quantize_wo_a_input_inv_rope_mxfp8_alloc_op(
     head_dim: int,
     nope_dim: int,
     rope_dim: int,
+    initialize_scales: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Functional (allocate + return) quantizer. The MXFP8 output views (notably
     # the permuted scale_mma) are materialized and written INSIDE this opaque op,
     # so torch.compile never sees a mutation of an as_strided/permute view (which
     # it bans). Used whenever the caller does not pass a pre-owned `out`.
     values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
-        tokens, group_width, num_groups=groups, device=o.device
+        tokens,
+        group_width,
+        num_groups=groups,
+        device=o.device,
+        initialize_scales=initialize_scales,
     )
     out = mxfp8_rows_from_bases(
         values_base,
@@ -1354,9 +1375,14 @@ def _quantize_wo_a_input_inv_rope_mxfp8_alloc_fake(
     head_dim: int,
     nope_dim: int,
     rope_dim: int,
+    initialize_scales: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return empty_mxfp8_rows_bases(
-        tokens, group_width, num_groups=groups, device=o.device
+        tokens,
+        group_width,
+        num_groups=groups,
+        device=o.device,
+        initialize_scales=initialize_scales,
     )
 
 
@@ -1428,6 +1454,7 @@ def quantize_wo_a_input_inv_rope_mxfp8(
     nope_dim: int = 448,
     rope_dim: int = 64,
     out: MXFP8Rows | None = None,
+    _initialize_scales: bool = True,
 ) -> MXFP8Rows:
     """Inverse-RoPE attention output and quantize into per-32-column MXFP8 rows."""
 
@@ -1476,6 +1503,7 @@ def quantize_wo_a_input_inv_rope_mxfp8(
                 head_dim,
                 nope_dim,
                 rope_dim,
+                _initialize_scales,
             )
         )
         return mxfp8_rows_from_bases(
@@ -1554,11 +1582,16 @@ def _quantize_wo_b_input_mxfp8_alloc_op(
     rank: int,
     groups: int,
     width: int,
+    initialize_scales: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Functional (allocate + return) quantizer; materializes + writes the MXFP8
     # output views INSIDE the op, returns the contiguous bases (see WO-A _alloc).
     values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
-        tokens, width, num_groups=1, device=source_trg.device
+        tokens,
+        width,
+        num_groups=1,
+        device=source_trg.device,
+        initialize_scales=initialize_scales,
     )
     out = mxfp8_rows_from_bases(
         values_base, scale_rows_base, scale_physical_base, tokens, width, num_groups=1
@@ -1583,8 +1616,15 @@ def _quantize_wo_b_input_mxfp8_alloc_fake(
     rank: int,
     groups: int,
     width: int,
+    initialize_scales: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return empty_mxfp8_rows_bases(tokens, width, num_groups=1, device=source_trg.device)
+    return empty_mxfp8_rows_bases(
+        tokens,
+        width,
+        num_groups=1,
+        device=source_trg.device,
+        initialize_scales=initialize_scales,
+    )
 
 
 @torch.library.custom_op(
@@ -1632,6 +1672,7 @@ def quantize_wo_b_input_mxfp8(
     source_trg: torch.Tensor,
     *,
     out: MXFP8Rows | None = None,
+    _initialize_scales: bool = True,
 ) -> MXFP8Rows:
     """Quantize WO-A intermediate `[tokens, rank, groups]` into group-major `[tokens, groups * rank]`."""
 
@@ -1651,6 +1692,7 @@ def quantize_wo_b_input_mxfp8(
                 rank,
                 groups,
                 width,
+                _initialize_scales,
             )
         )
         return mxfp8_rows_from_bases(
@@ -2325,6 +2367,10 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         hidden=hidden,
     )
     alpha_one = _cached_alpha_one(o.device)
+    # Both quantizers overwrite every logical scale before either GEMM reads it.
+    # Leave physical M-padding unspecified to avoid four graph-replayed uint8
+    # unity-fill launches; poisoned-padding tests pin that it cannot affect a
+    # logical output row. Standalone quantizers retain initialized padding.
     x_q = quantize_wo_a_input_inv_rope_mxfp8(
         o,
         positions,
@@ -2333,6 +2379,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         heads_per_group=heads_per_group,
         nope_dim=nope_dim,
         rope_dim=rope_dim,
+        _initialize_scales=False,
     )
     tmp = wo_a_dense_gemm_mxfp8(
         x_q,
@@ -2341,7 +2388,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         expected_m=expected_m,
         stream=stream_int,
     )
-    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    tmp_q = quantize_wo_b_input_mxfp8(tmp, _initialize_scales=False)
     return wo_b_dense_gemm_mxfp8(
         tmp_q,
         weights.wo_b,
