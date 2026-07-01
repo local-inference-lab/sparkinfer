@@ -49,6 +49,7 @@ class SparseMLASplitDecodeMergeBinding:
     tmp_lse: torch.Tensor
     num_chunks_ptr: torch.Tensor
     output: torch.Tensor
+    num_chunks: int | None = None
     attn_sink: torch.Tensor | None = None
     scratch: object | None = None
 
@@ -62,6 +63,7 @@ def build_sparse_mla_split_decode_merge_binding(
     tmp_lse: torch.Tensor,
     num_chunks_ptr: torch.Tensor,
     output: torch.Tensor,
+    num_chunks: int | None = None,
     attn_sink: torch.Tensor | None = None,
     scratch: object | None = None,
 ) -> SparseMLASplitDecodeMergeBinding:
@@ -70,6 +72,7 @@ def build_sparse_mla_split_decode_merge_binding(
         tmp_lse=tmp_lse,
         num_chunks_ptr=num_chunks_ptr,
         output=output,
+        num_chunks=num_chunks,
         attn_sink=attn_sink,
         scratch=scratch,
     )
@@ -207,6 +210,9 @@ def _split_lse_head_view(
 class SparseMLASplitDecodeMergeKernel:
     """Reduce normalized chunk partials into the final decode output."""
 
+    def __init__(self, static_num_chunks: int | None = None):
+        self.static_num_chunks = static_num_chunks
+
     @cute.jit
     def __call__(
         self,
@@ -251,7 +257,10 @@ class SparseMLASplitDecodeMergeKernel:
         merged_m = Float32(-Float32.inf)
         merged_d = Float32(1.0)
         chunk_idx = Int32(0)
-        num_chunks = Int32(num_chunks_ptr[Int32(0)])
+        if cutlass.const_expr(self.static_num_chunks is None):
+            num_chunks = Int32(num_chunks_ptr[Int32(0)])
+        else:
+            num_chunks = Int32(self.static_num_chunks)
         if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
             num_chunks = Int32(_SPLIT_MAX_CHUNKS)
 
@@ -324,6 +333,9 @@ class SparseMLASplitDecodeMergeKernel:
 class SparseMLASplitDecodeSinkMergeKernel:
     """Reduce chunk partials and fold a zero-value attention sink into softmax."""
 
+    def __init__(self, static_num_chunks: int | None = None):
+        self.static_num_chunks = static_num_chunks
+
     @cute.jit
     def __call__(
         self,
@@ -371,7 +383,10 @@ class SparseMLASplitDecodeSinkMergeKernel:
         merged_m = Float32(-Float32.inf)
         merged_d = Float32(1.0)
         chunk_idx = Int32(0)
-        num_chunks = Int32(num_chunks_ptr[Int32(0)])
+        if cutlass.const_expr(self.static_num_chunks is None):
+            num_chunks = Int32(num_chunks_ptr[Int32(0)])
+        else:
+            num_chunks = Int32(self.static_num_chunks)
         if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
             num_chunks = Int32(_SPLIT_MAX_CHUNKS)
 
@@ -446,14 +461,18 @@ class SparseMLASplitDecodeSinkMergeKernel:
             ).to(output.element_type)
 
 
-@lru_cache(maxsize=1)
-def _build_sparse_mla_split_merge_kernel() -> SparseMLASplitDecodeMergeKernel:
-    return SparseMLASplitDecodeMergeKernel()
+@lru_cache(maxsize=None)
+def _build_sparse_mla_split_merge_kernel(
+    static_num_chunks: int | None = None,
+) -> SparseMLASplitDecodeMergeKernel:
+    return SparseMLASplitDecodeMergeKernel(static_num_chunks)
 
 
-@lru_cache(maxsize=1)
-def _build_sparse_mla_split_sink_merge_kernel() -> SparseMLASplitDecodeSinkMergeKernel:
-    return SparseMLASplitDecodeSinkMergeKernel()
+@lru_cache(maxsize=None)
+def _build_sparse_mla_split_sink_merge_kernel(
+    static_num_chunks: int | None = None,
+) -> SparseMLASplitDecodeSinkMergeKernel:
+    return SparseMLASplitDecodeSinkMergeKernel(static_num_chunks)
 
 
 def clear_sparse_mla_merge_kernel_cache() -> None:
@@ -470,10 +489,14 @@ def _sparse_mla_split_decode_merge_flat_launch(
     contract_tmp_output: torch.Tensor,
     contract_tmp_lse: torch.Tensor,
     contract_output: torch.Tensor,
+    static_num_chunks: int,
     has_attn_sink: bool,
 ) -> None:
+    static_num_chunks_or_none = (
+        int(static_num_chunks) if int(static_num_chunks) > 0 else None
+    )
     if not has_attn_sink:
-        merge_kernel = _build_sparse_mla_split_merge_kernel()
+        merge_kernel = _build_sparse_mla_split_merge_kernel(static_num_chunks_or_none)
         merge_args = (
             _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
             _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
@@ -502,10 +525,11 @@ def _sparse_mla_split_decode_merge_flat_launch(
             ),
             str(tmp_output.dtype),
             str(output.dtype),
+            static_num_chunks_or_none,
         )
         merge_spec = KernelCompileSpec.from_key(
             "attention.mla.merge",
-            3,
+            4,
             merge_cache_key,
             labels=(
                 "tmp_output",
@@ -514,6 +538,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
                 "output",
                 "tmp_output_dtype",
                 "output_dtype",
+                "static_num_chunks",
             ),
         )
         b12x_launch(
@@ -524,7 +549,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
         )
         return
 
-    merge_kernel = _build_sparse_mla_split_sink_merge_kernel()
+    merge_kernel = _build_sparse_mla_split_sink_merge_kernel(static_num_chunks_or_none)
     merge_args = (
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
@@ -556,10 +581,11 @@ def _sparse_mla_split_decode_merge_flat_launch(
         str(tmp_output.dtype),
         str(output.dtype),
         "attn_sink",
+        static_num_chunks_or_none,
     )
     merge_spec = KernelCompileSpec.from_key(
         "attention.mla.sink_merge",
-        3,
+        4,
         merge_cache_key,
         labels=(
             "tmp_output",
@@ -570,6 +596,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
             "tmp_output_dtype",
             "output_dtype",
             "kind",
+            "static_num_chunks",
         ),
     )
     b12x_launch(
@@ -593,6 +620,7 @@ def _sparse_mla_split_decode_merge_op(
     contract_tmp_output: torch.Tensor,
     contract_tmp_lse: torch.Tensor,
     contract_output: torch.Tensor,
+    static_num_chunks: int,
     has_attn_sink: bool,
 ) -> None:
     _sparse_mla_split_decode_merge_flat_launch(
@@ -604,6 +632,7 @@ def _sparse_mla_split_decode_merge_op(
         contract_tmp_output,
         contract_tmp_lse,
         contract_output,
+        static_num_chunks,
         has_attn_sink,
     )
 
@@ -618,6 +647,7 @@ def _sparse_mla_split_decode_merge_fake(
     contract_tmp_output: torch.Tensor,
     contract_tmp_lse: torch.Tensor,
     contract_output: torch.Tensor,
+    static_num_chunks: int,
     has_attn_sink: bool,
 ) -> None:
     return None
@@ -628,6 +658,7 @@ def run_sparse_mla_split_decode_merge(
     tmp_output: torch.Tensor | None = None,
     tmp_lse: torch.Tensor | None = None,
     num_chunks_ptr: torch.Tensor | None = None,
+    num_chunks: int | None = None,
     output: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
     workspace: object | None = None,
@@ -640,6 +671,7 @@ def run_sparse_mla_split_decode_merge(
                 ("tmp_output", tmp_output),
                 ("tmp_lse", tmp_lse),
                 ("num_chunks_ptr", num_chunks_ptr),
+                ("num_chunks", num_chunks),
                 ("output", output),
                 ("attn_sink", attn_sink),
                 ("workspace", workspace),
@@ -651,6 +683,7 @@ def run_sparse_mla_split_decode_merge(
         tmp_output = binding.tmp_output
         tmp_lse = binding.tmp_lse
         num_chunks_ptr = binding.num_chunks_ptr
+        num_chunks = binding.num_chunks
         output = binding.output
         attn_sink = binding.attn_sink
         workspace = binding.scratch
@@ -717,6 +750,15 @@ def run_sparse_mla_split_decode_merge(
         name="num_chunks_ptr",
         device=output.device,
     )
+    if num_chunks is not None:
+        num_chunks = int(num_chunks)
+        if num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+        if num_chunks > min(int(tmp_output.shape[2]), _SPLIT_MAX_CHUNKS):
+            raise ValueError(
+                "num_chunks exceeds merge scratch capacity: "
+                f"{num_chunks} > min({int(tmp_output.shape[2])}, {_SPLIT_MAX_CHUNKS})"
+            )
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     _co = getattr(workspace, "_contract_output", None)
@@ -746,6 +788,7 @@ def run_sparse_mla_split_decode_merge(
         _cto if _cto is not None else tmp_output,
         _ctl if _ctl is not None else tmp_lse,
         _co if _co is not None else output,
+        int(num_chunks or 0),
         bool(has_attn_sink),
     )
 

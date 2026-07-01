@@ -956,6 +956,8 @@ class SparseNSAFusedIndexerKernel:
         if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
+        if self.paged_output and self.kv_layout != KV_LAYOUT_PAGED:
+            raise ValueError("physical-slot output requires the paged K/V layout")
         if self.topk not in _SUPPORTED_TOPK:
             raise ValueError(f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}")
         self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
@@ -1279,7 +1281,13 @@ class SparseNSAFusedIndexerKernel:
                                 s_c0_values[carry_count + slot_idx] = Float32(
                                     logit * s_scale[slot_idx]
                                 )
-                                s_c0_gindex[carry_count + slot_idx] = abs_start + page_base + slot_idx
+                                output_idx = abs_start + page_base + slot_idx
+                                if cutlass.const_expr(
+                                    self.kv_layout == KV_LAYOUT_PAGED
+                                    and self.paged_output
+                                ):
+                                    output_idx = page_id * Int32(_PAGE_SIZE) + slot_idx
+                                s_c0_gindex[carry_count + slot_idx] = output_idx
                     # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
                     # barrier — the next page's load barrier (or the trim's leading
                     # sync, or the pre-output sync) orders this reduce before any
@@ -1782,6 +1790,7 @@ def run_fused_paged_indexer(
     pack_indices: torch.Tensor | None = None,
     merge_state: torch.Tensor | None = None,
     merge_state_preinitialized: bool = False,
+    output_physical_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
@@ -1875,7 +1884,11 @@ def run_fused_paged_indexer(
     )
     q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
     kernel = _build_fused_indexer_kernel(
-        KV_LAYOUT_PAGED, int(num_heads), int(topk), False, ctas_per_group,
+        KV_LAYOUT_PAGED,
+        int(num_heads),
+        int(topk),
+        bool(output_physical_slots),
+        ctas_per_group,
         merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
         max_seq_capacity=max_pages * _PAGE_SIZE,
         vectorized_q_load=vectorized_q_load,
@@ -1908,7 +1921,7 @@ def run_fused_paged_indexer(
     ]
     _launch_fused(
         kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED, int(num_heads), int(topk), int(ctas_per_group),
+        (KV_LAYOUT_PAGED, int(num_heads), int(topk), bool(output_physical_slots), int(ctas_per_group),
          int(merge_threshold), k_quant_page_stride, max_pages * _PAGE_SIZE,
          bool(vectorized_q_load), q_row_stride_bytes),
     )

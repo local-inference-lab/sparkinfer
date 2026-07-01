@@ -34,21 +34,19 @@ if triton is not None and tl is not None:
     @triton.jit
     def _split_decode_final_lse_kernel(
         tmp_lse_ptr,
-        num_chunks_ptr,
         out_lse_ptr,
         tmp_lse_stride_b: tl.constexpr,
         tmp_lse_stride_h: tl.constexpr,
         tmp_lse_stride_c: tl.constexpr,
         out_lse_stride_b: tl.constexpr,
         out_lse_stride_h: tl.constexpr,
-        max_chunks: tl.constexpr,
+        chunk_count: tl.constexpr,
         block_c: tl.constexpr,
         natural_scale: tl.constexpr,
     ):
         row = tl.program_id(0)
         head = tl.program_id(1)
         offs = tl.arange(0, block_c)
-        chunk_count = tl.minimum(tl.load(num_chunks_ptr), max_chunks)
         valid = offs < chunk_count
         vals = tl.load(
             tmp_lse_ptr
@@ -744,12 +742,9 @@ def _final_lse_from_split_workspace(
         and chunk_lse.device.type == "cuda"
         and final_lse.device == chunk_lse.device
     ):
-        if workspace.num_chunks_ptr is None:
-            raise RuntimeError("workspace is missing split MLA chunk-count buffer")
         block_c = triton.next_power_of_2(chunk_count)
         _split_decode_final_lse_kernel[(q_rows, num_heads)](
             chunk_lse,
-            workspace.num_chunks_ptr,
             final_lse,
             chunk_lse.stride(0),
             chunk_lse.stride(1),

@@ -3,9 +3,8 @@
 Eager PLAN -> BIND -> KERNEL, never a workspace/arena. bind() maps the
 caller-owned scratch tensor into per-spec kernel-argument VIEWS and returns a
 plain B12XSparseMLAScratch views container (mirroring B12XCompressedMLAScratch).
-It never constructs a B12XAttentionWorkspace / arena and never allocates or
-init-writes (only guarded in-place fill_ on the split-control scalar views). The
-unified SM120 sparse-MLA decode/extend kernels duck-type the workspace
+It never constructs a B12XAttentionWorkspace / arena, allocates, or init-writes.
+The unified SM120 sparse-MLA decode/extend kernels duck-type the workspace
 (tmp_output/tmp_lse/output_buffer/final_lse/num_chunks_ptr/kv_chunk_size_ptr/
 set_split_chunk_config/...), so the views container is a drop-in -- no kernel
 signature change.
@@ -35,12 +34,6 @@ from b12x.integration.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-
-# Candidate window for the unified SM120 split-K decode (matches
-# SM120 sparse MLA _CAND_WINDOW / the vLLM _DECODE_SPLIT_TILE). The merge reduction
-# count (num_chunks) is the per-row split count; kv_chunk_size is informational
-# for the unified merge but is seeded for parity with the legacy contract.
-_SPARSE_MLA_DECODE_KV_CHUNK = 64
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -450,17 +443,6 @@ def _materialize_sparse_mla_scratch(
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
     )
-    if layout.split:
-        # Seed a stable, batch-independent split count so the merge reduction
-        # count is well-defined before the kernel runs. The container is fresh
-        # each eager bind, so this in-place fill is captured into every CUDA graph
-        # (no stale-pointer hazard). run_unified_decode pins the same width-derived
-        # num_splits via forced_num_splits, so its own set_split_chunk_config is a
-        # no-op on top of this seed.
-        scratch.set_split_chunk_config(
-            kv_chunk_size=_SPARSE_MLA_DECODE_KV_CHUNK,
-            num_chunks=max_chunks_per_row,
-        )
     return scratch
 
 

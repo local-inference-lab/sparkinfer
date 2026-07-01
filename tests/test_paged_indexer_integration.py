@@ -102,6 +102,19 @@ def _paged_index_logits(
     )
 
 
+def _logical_to_physical(
+    logical: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    page_size: int = 64,
+) -> torch.Tensor:
+    safe_logical = logical.clamp_min(0)
+    page_cols = torch.div(safe_logical, page_size, rounding_mode="floor").long()
+    page_ids = torch.gather(page_table, 1, page_cols)
+    physical = page_ids * page_size + torch.remainder(safe_logical, page_size)
+    return torch.where(logical >= 0, physical, torch.full_like(physical, -1))
+
+
 def _bind_paged_indexer(
     *,
     device: torch.device,
@@ -116,6 +129,7 @@ def _bind_paged_indexer(
     schedule_metadata: torch.Tensor | None = None,
     shared_page_table: bool = False,
     route: str = "paged_tiled",
+    output_physical_slots: bool = False,
 ):
     plan = plan_indexer_paged_scratch(
         B12XIndexerPagedScratchCaps(
@@ -144,6 +158,7 @@ def _bind_paged_indexer(
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=num_heads,
         shared_page_table=shared_page_table,
+        output_physical_slots=output_physical_slots,
     )
 
 
@@ -421,6 +436,93 @@ def test_index_topk_fp8_graph_matches_reference(
         torch.gather(logits1, 1, actual.to(torch.int64)),
         rtol=0,
         atol=1e-2,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu").manual_seed(91_009)
+    rows, num_heads, width_blocks, topk = 4, 32, 32, 512
+    seqlens = torch.tensor(
+        [0, 1472, 1536, 1600], dtype=torch.int32, device=device
+    )
+    shared_storage = torch.full(
+        (1, width_blocks), -1, dtype=torch.int32, device=device
+    )
+    shared_storage[0, :25] = torch.arange(
+        5, 30, dtype=torch.int32, device=device
+    ).flip(0)
+    page_table = shared_storage.expand(rows, width_blocks)
+    assert page_table.stride(0) == 0
+
+    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
+    weights = torch.randn(
+        (rows, num_heads), generator=gen, dtype=torch.float32
+    ).to(device)
+    index_k_cache = pack_paged_index_k_cache_reference(
+        torch.randn((64 * 64, 128), generator=gen, dtype=torch.float32).to(device)
+        / 3
+    )
+    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        supertile_k=512,
+        shared_page_table=True,
+        route="paged_tiled",
+        output_physical_slots=True,
+    )
+
+    clear_indexer_caches()
+    index_topk_fp8(
+        q_fp8=q_fp8,
+        weights=weights.unsqueeze(-1),
+        index_k_cache=index_k_cache,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        binding=binding,
+        out_indices=actual,
+        supertile_k=512,
+    )
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        index_topk_fp8(
+            q_fp8=q_fp8,
+            weights=weights.unsqueeze(-1),
+            index_k_cache=index_k_cache,
+            topk=topk,
+            expected_num_q_heads=num_heads,
+            binding=binding,
+            out_indices=actual,
+            supertile_k=512,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    logical = _expected_paged_index_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        topk=topk,
+    )
+    expected = _logical_to_physical(logical, page_table)
+    expected[0].fill_(-1)
+    assert torch.equal(
+        torch.sort(actual, dim=1).values,
+        torch.sort(expected, dim=1).values,
     )
 
 

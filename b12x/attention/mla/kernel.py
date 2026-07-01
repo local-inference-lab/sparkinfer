@@ -2372,9 +2372,6 @@ def run_unified_decode(
         run_sparse_mla_split_decode_merge,
     )
 
-    if int(workspace.num_chunks_value or -1) != num_splits:
-        workspace.set_split_chunk_config(kv_chunk_size=_CAND_WINDOW, num_chunks=num_splits)
-
     # When attn_sink is supplied, the merge SELECTS the sink-folding merge kernel
     # (merge.py SparseMLASplitDecodeSinkMergeKernel) which applies the FlashMLA V4
     # fold output *= sigmoid(lse_e - sink) directly into O (exactly upstream's
@@ -2385,6 +2382,7 @@ def run_unified_decode(
         tmp_lse=mid_lse,
         num_chunks_ptr=workspace.num_chunks_ptr,
         output=output,
+        num_chunks=num_splits,
         attn_sink=attn_sink,
         scratch=workspace,
     )

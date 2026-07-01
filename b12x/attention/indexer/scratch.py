@@ -403,6 +403,7 @@ class B12XIndexerPagedScratch:
         schedule_metadata: torch.Tensor | None = None,
         expected_num_q_heads: int | None = None,
         shared_page_table: bool | None = None,
+        output_physical_slots: bool = False,
     ) -> "B12XIndexerPagedBinding":
         if shared_page_table is None:
             shared_page_table = bool(self.shared_page_table)
@@ -414,6 +415,7 @@ class B12XIndexerPagedScratch:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+            output_physical_slots=output_physical_slots,
         )
 
     def bind_msa(
@@ -636,6 +638,7 @@ class B12XIndexerPagedBinding:
     schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
     shared_page_table: bool = False
+    output_physical_slots: bool = False
     route: str = INDEXER_PAGED_ROUTE_TILED
     supertile_k: int | None = None
     prefill_block_k: int | None = None
@@ -1664,6 +1667,7 @@ def build_indexer_paged_binding(
     schedule_metadata: torch.Tensor | None = None,
     expected_num_q_heads: int | None = None,
     shared_page_table: bool = False,
+    output_physical_slots: bool = False,
 ) -> B12XIndexerPagedBinding:
     if scratch is None:
         raise TypeError("build_indexer_paged_binding requires scratch")
@@ -1743,6 +1747,7 @@ def build_indexer_paged_binding(
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
         shared_page_table=bool(shared_page_table),
+        output_physical_slots=bool(output_physical_slots),
         route=str(getattr(scratch, "route", INDEXER_PAGED_ROUTE_TILED)),
         supertile_k=int(getattr(scratch, "paged_tile_logits_k_rows", 0)) or None,
         prefill_block_k=getattr(scratch, "prefill_block_k", None),
@@ -2018,6 +2023,7 @@ class B12XIndexerPagedScratchPlan:
         schedule_metadata: torch.Tensor | None = None,
         expected_num_q_heads: int | None = None,
         shared_page_table: bool | None = None,
+        output_physical_slots: bool = False,
     ) -> B12XIndexerPagedBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -2039,6 +2045,7 @@ class B12XIndexerPagedScratchPlan:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+            output_physical_slots=output_physical_slots,
         )
 
     def bind_msa(

@@ -1910,6 +1910,7 @@ def _run_prefill_or_verify_case(
             cache_seqlens_int32=paged_metadata.cache_seqlens_int32,
             expected_num_q_heads=cfg.index_n_heads,
             shared_page_table=True,
+            output_physical_slots=True,
         )
         paged_topk_indices = torch.empty(
             (case.total_q, case.topk), dtype=torch.int32, device=device
@@ -1917,15 +1918,6 @@ def _run_prefill_or_verify_case(
         paged_topk_scores = torch.empty(
             (case.total_q, case.topk), dtype=torch.float32, device=device
         )
-        paged_physical_topk = torch.empty_like(paged_topk_indices)
-
-        def map_indexer_topk(topk_indices: torch.Tensor) -> torch.Tensor:
-            return _remap_logical_topk_to_physical(
-                logical_indices=topk_indices,
-                real_page_table=graph_real_page_table,
-                physical_indices=paged_physical_topk,
-                page_size=cfg.page_size,
-            )
 
         def run_indexer():
             return index_topk_fp8(
@@ -1942,19 +1934,28 @@ def _run_prefill_or_verify_case(
         clear_indexer_caches()
         actual_topk = run_indexer()
         torch.cuda.synchronize()
-        expected_topk = graph_expanded_cache_seqlens[:, None] - case.topk + torch.arange(
+        expected_logical_topk = graph_expanded_cache_seqlens[:, None] - case.topk + torch.arange(
             case.topk, dtype=torch.int32, device=device
         )
+        expected_topk = _remap_logical_topk_to_physical(
+            logical_indices=expected_logical_topk,
+            real_page_table=graph_real_page_table,
+            physical_indices=torch.empty_like(expected_logical_topk),
+            page_size=cfg.page_size,
+        )
         actual_topk_sorted = torch.sort(actual_topk, dim=1).values
-        if not torch.equal(actual_topk_sorted, expected_topk):
-            mismatch = int((actual_topk_sorted != expected_topk).sum().item())
+        expected_topk_sorted = torch.sort(expected_topk, dim=1).values
+        if not torch.equal(actual_topk_sorted, expected_topk_sorted):
+            mismatch = int(
+                (actual_topk_sorted != expected_topk_sorted).sum().item()
+            )
             raise BenchmarkFailure(
                 case,
                 f"paged prefill topk mismatch: {mismatch} differing entries",
             )
         if not torch.isfinite(paged_topk_scores).all().item():
             raise BenchmarkFailure(case, "paged prefill topk scores are non-finite")
-        mla_selected_indices = map_indexer_topk(actual_topk)
+        mla_selected_indices = actual_topk
         mla_kv_cache = kv_cache
         mla_k_nope = k_nope
         mla_k_rope = k_rope

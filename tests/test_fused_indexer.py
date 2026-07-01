@@ -114,6 +114,44 @@ def test_fused_indexer_paged_matches_reference(topk, rows, seqlen, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_paged_emits_native_physical_slots():
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 2, 16, 512, 1024
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=71, device=device
+    )
+    page_table = torch.flip(page_table, dims=(1,)).contiguous()
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        output_physical_slots=True,
+    )
+    torch.cuda.synchronize(device)
+    gold_vals, gold_idx_sets = _golden_topk(
+        q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk
+    )
+    assert torch.allclose(
+        torch.sort(val, dim=1, descending=True).values,
+        gold_vals,
+        atol=1e-2,
+        rtol=0,
+    )
+    for row in range(rows):
+        logical = torch.tensor(
+            sorted(gold_idx_sets[row]), dtype=torch.int64, device=device
+        )
+        page_ids = page_table[row, torch.div(logical, _PS, rounding_mode="floor")]
+        physical = page_ids * _PS + torch.remainder(logical, _PS)
+        assert set(idx[row].tolist()) == set(physical.tolist())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("seqlen", [4101, 8255, 5377])
 def test_fused_indexer_paged_partial_last_page(seqlen):
     # seqlen % 64 != 0 -> the last page is partial (valid_slots < 64). Exercises

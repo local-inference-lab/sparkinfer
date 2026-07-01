@@ -575,7 +575,9 @@ def index_topk_fp8(
     tiled-logits supertile and folds the shared `run_tiled_topk` selector.
     Returns top-k indices per query row. When ``out_scores`` is provided, it is
     filled with the float32 top-k scores corresponding position-for-position to
-    the returned indices.
+    the returned indices. A binding with ``output_physical_slots=True`` makes the
+    producer emit flat physical cache slots directly; no post-selection remap is
+    performed or supported by this entrypoint.
     """
 
     metadata, scratch, binding_active_width = _resolve_binding_metadata(
@@ -642,6 +644,7 @@ def index_topk_fp8(
     page_table_width = int(metadata.real_page_table.shape[1])
 
     route = str(getattr(binding, "route", getattr(scratch, "route", "paged_tiled")))
+    output_physical_slots = bool(getattr(binding, "output_physical_slots", False))
     # Fused score+top-k route: single launch, no logits blob. Route selection is
     # owned by the scratch plan; launch only carries it out.
     from b12x.attention.indexer.fused_indexer import (
@@ -671,6 +674,7 @@ def index_topk_fp8(
             merge_state_preinitialized=bool(
                 getattr(scratch, "fused_indexer_merge_state_preinitialized", False)
             ),
+            output_physical_slots=output_physical_slots,
         )
         return idx
 
@@ -864,6 +868,10 @@ def index_topk_fp8(
             carry_values=carry_values,
             carry_indices=carry_indices,
             is_first=is_first,
+            output_page_table=(
+                metadata.real_page_table if is_last and output_physical_slots else None
+            ),
+            output_page_size=page_size,
         )
 
     return final_raw_indices

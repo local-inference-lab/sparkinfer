@@ -63,32 +63,70 @@ def _validate_analytic_topk(
     seqlens: torch.Tensor,
     topk: int,
     analytic_scores: torch.Tensor,
+    real_page_table: torch.Tensor,
+    output_physical_slots: bool,
 ) -> float:
     """Validate every target-shape row against a cheap analytic top-k oracle."""
-    min_seq_len = int(seqlens.min().item())
-    if topk > min_seq_len:
-        raise ValueError(
-            "analytic check requires topk <= every sequence length, got "
-            f"{topk} > min_seqlen={min_seq_len}"
+    max_abs = 0.0
+    for row in range(indices.shape[0]):
+        seq_len = int(seqlens[row].item())
+        valid_count = min(int(topk), seq_len)
+        row_indices = indices[row]
+        valid_mask = row_indices >= 0
+        if int(valid_mask.sum().item()) != valid_count:
+            raise AssertionError(
+                "analytic top-k valid-count mismatch: "
+                f"row={row} actual={int(valid_mask.sum().item())} "
+                f"expected={valid_count}"
+            )
+        if not bool((row_indices[~valid_mask] == -1).all().item()):
+            raise AssertionError(f"analytic top-k invalid tail is not -1 for row={row}")
+
+        expected_logical = seq_len - valid_count + torch.arange(
+            valid_count,
+            dtype=torch.int32,
+            device=indices.device,
         )
-    if not torch.isfinite(scores).all().item():
-        raise AssertionError("top-k scores contain non-finite values")
-    expected = seqlens[:, None] - topk + torch.arange(
-        topk,
-        dtype=torch.int32,
-        device=indices.device,
-    )
-    actual_sorted = torch.sort(indices, dim=1).values
-    if not torch.equal(actual_sorted, expected):
-        mismatched = int((actual_sorted != expected).sum().item())
-        raise AssertionError(
-            f"analytic top-k index oracle mismatch: {mismatched} entries differ"
+        expected_page_cols = torch.div(
+            expected_logical, 64, rounding_mode="floor"
         )
-    expected_scores = analytic_scores.index_select(
-        0, indices.reshape(-1).to(torch.int64)
-    ).view_as(scores)
-    max_abs = float((scores - expected_scores).abs().max().item())
-    torch.testing.assert_close(scores, expected_scores, rtol=2e-3, atol=2e-3)
+        expected_page_offsets = torch.remainder(expected_logical, 64)
+        expected_page_ids = real_page_table[row].index_select(
+            0, expected_page_cols.to(torch.int64)
+        )
+        expected_physical = expected_page_ids * 64 + expected_page_offsets
+        expected_indices = (
+            expected_physical if output_physical_slots else expected_logical
+        )
+        actual_valid_indices = row_indices[valid_mask]
+        if not torch.equal(
+            torch.sort(actual_valid_indices).values,
+            torch.sort(expected_indices).values,
+        ):
+            raise AssertionError(f"analytic top-k index oracle mismatch for row={row}")
+
+        actual_valid_scores = scores[row][valid_mask]
+        if not bool(torch.isfinite(actual_valid_scores).all().item()):
+            raise AssertionError(f"top-k valid scores are non-finite for row={row}")
+        if output_physical_slots:
+            score_indices = actual_valid_indices
+        else:
+            actual_page_cols = torch.div(
+                actual_valid_indices, 64, rounding_mode="floor"
+            )
+            actual_page_offsets = torch.remainder(actual_valid_indices, 64)
+            actual_page_ids = real_page_table[row].index_select(
+                0, actual_page_cols.to(torch.int64)
+            )
+            score_indices = actual_page_ids * 64 + actual_page_offsets
+        expected_scores = analytic_scores.index_select(
+            0, score_indices.to(torch.int64)
+        )
+        row_max_abs = float((actual_valid_scores - expected_scores).abs().max().item())
+        max_abs = max(max_abs, row_max_abs)
+        torch.testing.assert_close(
+            actual_valid_scores, expected_scores, rtol=2e-3, atol=2e-3
+        )
     return max_abs
 
 
@@ -222,6 +260,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cache-num-pages",
+        type=int,
+        default=0,
+        help=(
+            "physical cache allocation in pages; 0 allocates the full page-table "
+            "capacity. A smaller value can model a large graph-static block table "
+            "with only the live pages physically allocated"
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=("supertile-logits", "supertile-topk", "fused-topk"),
         default="supertile-topk",
@@ -233,6 +281,15 @@ def main() -> None:
         help="force the paged prefill route; auto uses production policy",
     )
     parser.add_argument("--topk", type=int, default=512)
+    parser.add_argument(
+        "--output-index-space",
+        choices=("logical", "physical"),
+        default="logical",
+        help=(
+            "index space emitted by top-k; physical exercises the closed-system "
+            "indexer-to-MLA contract without a post-selection adapter"
+        ),
+    )
     parser.add_argument(
         "--fused-ctas",
         type=int,
@@ -315,7 +372,19 @@ def main() -> None:
         max_pages_needed = page_table_width
     else:
         max_pages_needed = (rows - 1) * page_stride + page_table_width
-    cache_tokens = max_pages_needed * 64
+    active_pages_per_row = min((seq_len + 63) // 64, page_table_width)
+    min_cache_pages = (
+        active_pages_per_row
+        if page_stride == 0
+        else (rows - 1) * page_stride + active_pages_per_row
+    )
+    cache_num_pages = int(args.cache_num_pages) or max_pages_needed
+    if cache_num_pages < min_cache_pages:
+        raise ValueError(
+            "cache_num_pages is too small for the live page table: "
+            f"need at least {min_cache_pages}, got {cache_num_pages}"
+        )
+    cache_tokens = cache_num_pages * 64
     analytic_scores = None
     if args.check:
         if str(args.mode) not in ("supertile-topk", "fused-topk"):
@@ -363,9 +432,9 @@ def main() -> None:
     # b12x. The apparent [64, 132] shape is an allocation contract, not an
     # interleaved per-token byte layout.
     if cache_page_stride_bytes == logical_cache_page_bytes:
-        vllm_kv_cache = packed_index_k_cache.view(max_pages_needed, 64, 132)
+        vllm_kv_cache = packed_index_k_cache.view(cache_num_pages, 64, 132)
         index_k_cache = vllm_kv_cache.as_strided(
-            (max_pages_needed, logical_cache_page_bytes),
+            (cache_num_pages, logical_cache_page_bytes),
             (int(vllm_kv_cache.stride(0)), 1),
         )
     else:
@@ -373,13 +442,13 @@ def main() -> None:
         # per-block allocation. Consecutive logical pages for that layer are
         # then separated by the aggregate bytes for every cache slot.
         backing_bytes = (
-            (max_pages_needed - 1) * cache_page_stride_bytes
+            (cache_num_pages - 1) * cache_page_stride_bytes
             + logical_cache_page_bytes
         )
         packed_backing = torch.empty(backing_bytes, dtype=torch.uint8, device=device)
         index_k_cache = torch.as_strided(
             packed_backing,
-            size=(max_pages_needed, logical_cache_page_bytes),
+            size=(cache_num_pages, logical_cache_page_bytes),
             stride=(cache_page_stride_bytes, 1),
         )
         index_k_cache.copy_(packed_index_k_cache)
@@ -393,6 +462,7 @@ def main() -> None:
     bench_mode = str(args.mode)
     requested_route = str(args.route).replace("-", "_")
     topk = int(args.topk)
+    output_physical_slots = str(args.output_index_space) == "physical"
     requested_supertile_k = int(args.supertile_k)
     shared_page_table = page_stride == 0
     max_seq_len = min(seq_len, page_table_width * 64)
@@ -462,6 +532,7 @@ def main() -> None:
         schedule_metadata=metadata.schedule_metadata,
         expected_num_q_heads=num_heads,
         shared_page_table=shared_page_table,
+        output_physical_slots=output_physical_slots,
     )
 
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
@@ -544,6 +615,7 @@ def main() -> None:
                 pack_indices=fused_cache[1],
                 merge_state=fused_cache[2],
                 merge_state_preinitialized=True,
+                output_physical_slots=output_physical_slots,
             )[0]
         return index_topk_fp8(
             q_fp8=q_fp8,
@@ -569,6 +641,8 @@ def main() -> None:
             seqlens=seqlens,
             topk=topk,
             analytic_scores=analytic_scores,
+            real_page_table=metadata.real_page_table,
+            output_physical_slots=output_physical_slots,
         )
     l2_flush = _make_l2_flush(not args.no_l2_flush)
     if args.eager:
@@ -602,8 +676,10 @@ def main() -> None:
         f"page_table_width={page_table_width} seq_len={seq_len} "
         f"seqlen_range={int(seqlens.min().item())}-{int(seqlens.max().item())} "
         f"page_stride={page_stride} cache_page_stride_bytes={cache_page_stride_bytes} "
-        f"cache_span_mib={((max_pages_needed - 1) * cache_page_stride_bytes + logical_cache_page_bytes) / (1024 * 1024):.2f} "
+        f"cache_num_pages={cache_num_pages} "
+        f"cache_span_mib={((cache_num_pages - 1) * cache_page_stride_bytes + logical_cache_page_bytes) / (1024 * 1024):.2f} "
         f"topk={topk} supertile_k={supertile_k} "
+        f"output_index_space={args.output_index_space} "
         f"requested_supertile_k={requested_supertile_k} "
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
         f"scratch_mib={plan.layout.nbytes / (1024 * 1024):.2f} "
