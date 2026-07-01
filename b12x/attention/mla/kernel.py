@@ -19,6 +19,8 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
 from cutlass import Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute.ops import LOG2_E
@@ -83,6 +85,24 @@ _DSV4_PACKED_ROPE_OFFSET = 448
 # plus 128 indexed chunks.  Keep this shape-only so graph capture and replay
 # select identical launch geometry without inspecting runtime tensor values.
 _DSV4_H8_MAX_CHUNKS = 130
+
+
+@dsl_user_op
+def _exit_thread(
+    *,
+    loc=None,
+    ip=None,
+):
+    """Terminate a thread after a CTA-uniform empty-split decision."""
+    llvm.inline_asm(
+        None,
+        [],
+        "exit;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 # Optional decode num_splits override (P9b AutoTuner sweep hook). ``<= 0`` (or an
@@ -495,6 +515,35 @@ class UnifiedDecodeKernel:
             head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(8 if self.native_h8 else t.hpb)
 
+        # The launch grid is capacity-based and therefore fixed across CUDA-graph
+        # replay.  Compact this split to the chunks that are valid for the current
+        # row, and retire a wholly empty CTA before it allocates/initializes the KV
+        # pipeline.  The merge treats LSE=-inf as a neutral partial and does not
+        # read the corresponding (potentially stale) mid_out row.
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
+        split_last_chunk = split_first_chunk + cps
+        main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
+            _CAND_WINDOW
+        )
+        if main_valid_chunks < Int32(0):
+            main_valid_chunks = Int32(0)
+        max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+        if main_valid_chunks > max_main_chunks:
+            main_valid_chunks = max_main_chunks
+        main_chunk_end = split_last_chunk
+        if main_chunk_end > main_valid_chunks:
+            main_chunk_end = main_valid_chunks
+        active_chunks = main_chunk_end - split_first_chunk
+        if active_chunks < Int32(0):
+            active_chunks = Int32(0)
+        if active_chunks == Int32(0):
+            if tid < Int32(self.valid_hpb):
+                mid_lse[token_idx, head_base + tid, split_idx] = Float32(
+                    -Float32.inf
+                )
+            _exit_thread()
+
         smem = cutlass_utils.SmemAllocator()
         SharedStorage = get_unified_shared_storage_cls(t)
         st = smem.allocate(SharedStorage)
@@ -551,10 +600,6 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
-        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
-
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         topk_row = cute.make_tensor(
             swa_indices.iterator
@@ -580,7 +625,7 @@ class UnifiedDecodeKernel:
             io_lane = lane
             prod_phase = Int32(1)
             prod_idx = Int32(0)
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+            for lc in cutlass.range(active_chunks, unroll=1):
                 ci = split_first_chunk + Int32(lc)
                 buf = Int32(lc) & Int32(1)
                 g_start = ci * Int32(_CAND_WINDOW)
@@ -646,7 +691,7 @@ class UnifiedDecodeKernel:
             cons_phase = Int32(0)
             cons_idx = Int32(0)
 
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
+            for lc in cutlass.range(active_chunks, unroll=1):
                 ci = split_first_chunk + Int32(lc)
                 split_cand_start = ci * Int32(_CAND_WINDOW)
                 buf = Int32(lc) & Int32(1)
@@ -1015,6 +1060,78 @@ class UnifiedDecodeKernel:
             head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(8 if self.native_h8 else t.hpb)
 
+        # Load and clamp replay-time lengths before touching the shared KV
+        # pipeline. Capacity planning, launch geometry, and workspace addresses
+        # remain fixed across CUDA-graph capture and replay.
+        if cutlass.const_expr(per_token_len):
+            topk_total = Int32(self.topk)
+            section_len = Int32(topk_length[token_idx])
+            if section_len < Int32(0):
+                section_len = Int32(0)
+            if section_len > topk_total:
+                section_len = topk_total
+            if cutlass.const_expr(has_extra):
+                extra_total = Int32(self.extra_topk)
+                extra_section_len = Int32(extra_topk_length[token_idx])
+                if extra_section_len < Int32(0):
+                    extra_section_len = Int32(0)
+                if extra_section_len > extra_total:
+                    extra_section_len = extra_total
+
+        # Compact this split's intersection with the independently valid main
+        # and extra chunk prefixes. This also handles a short-main gap before the
+        # fixed extra-section boundary. Producer and consumer use the same compact
+        # order, so their mbarrier phases remain matched.
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
+        split_last_chunk = split_first_chunk + cps
+
+        main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
+            _CAND_WINDOW
+        )
+        if main_valid_chunks < Int32(0):
+            main_valid_chunks = Int32(0)
+        max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+        if main_valid_chunks > max_main_chunks:
+            main_valid_chunks = max_main_chunks
+        main_chunk_end = split_last_chunk
+        if main_chunk_end > main_valid_chunks:
+            main_chunk_end = main_valid_chunks
+        main_chunk_count = main_chunk_end - split_first_chunk
+        if main_chunk_count < Int32(0):
+            main_chunk_count = Int32(0)
+
+        extra_first_chunk = split_first_chunk
+        extra_chunk_count = Int32(0)
+        if cutlass.const_expr(has_extra):
+            extra_valid_chunks = (
+                extra_section_len + Int32(_CAND_WINDOW - 1)
+            ) // Int32(_CAND_WINDOW)
+            if extra_valid_chunks < Int32(0):
+                extra_valid_chunks = Int32(0)
+            max_extra_chunks = Int32(
+                (self.extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+            )
+            if extra_valid_chunks > max_extra_chunks:
+                extra_valid_chunks = max_extra_chunks
+            if extra_first_chunk < num_main_chunks:
+                extra_first_chunk = num_main_chunks
+            extra_chunk_end = split_last_chunk
+            extra_valid_end = num_main_chunks + extra_valid_chunks
+            if extra_chunk_end > extra_valid_end:
+                extra_chunk_end = extra_valid_end
+            extra_chunk_count = extra_chunk_end - extra_first_chunk
+            if extra_chunk_count < Int32(0):
+                extra_chunk_count = Int32(0)
+
+        active_chunks = main_chunk_count + extra_chunk_count
+        if active_chunks == Int32(0):
+            if tid < Int32(self.valid_hpb):
+                mid_lse[token_idx, head_base + tid, split_idx] = Float32(
+                    -Float32.inf
+                )
+            _exit_thread()
+
         smem = cutlass_utils.SmemAllocator()
         SharedStorage = get_unified_shared_storage_cls(t)
         st = smem.allocate(SharedStorage)
@@ -1067,31 +1184,6 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
-        # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
-
-        # P10b PER-TOKEN section length: this CTA's section_len = clamp(
-        # topk_length[token_idx], 0, topk). Elided (per_token_len=False) on the
-        # uniform / byte-identical path -> the scalar section_len passed in is used
-        # unchanged. The main/extra chunk geometry (num_main_chunks, chunks_per_split)
-        # stays UNIFORM over the MAX topk; this per-token clamp is what masks the
-        # over-allocated chunks (their candidates fall past section_len -> S3 -inf).
-        if cutlass.const_expr(per_token_len):
-            topk_total = Int32(self.topk)
-            section_len = Int32(topk_length[token_idx])
-            if section_len < Int32(0):
-                section_len = Int32(0)
-            if section_len > topk_total:
-                section_len = topk_total
-            if cutlass.const_expr(has_extra):
-                extra_total = Int32(self.extra_topk)
-                extra_section_len = Int32(extra_topk_length[token_idx])
-                if extra_section_len < Int32(0):
-                    extra_section_len = Int32(0)
-                if extra_section_len > extra_total:
-                    extra_section_len = extra_total
-
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
         # self.topk == 0 means there are NO main chunks (num_main_chunks
@@ -1143,8 +1235,12 @@ class UnifiedDecodeKernel:
             io_lane = lane
             prod_phase = Int32(1)
             prod_idx = Int32(0)
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
-                ci = split_first_chunk + Int32(lc)
+            for lc in cutlass.range(active_chunks, unroll=1):
+                active_idx = Int32(lc)
+                ci = split_first_chunk + active_idx
+                if cutlass.const_expr(has_extra):
+                    if active_idx >= main_chunk_count:
+                        ci = extra_first_chunk + active_idx - main_chunk_count
                 buf = Int32(lc) & Int32(1)
 
                 cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
@@ -1254,8 +1350,12 @@ class UnifiedDecodeKernel:
             cons_phase = Int32(0)
             cons_idx = Int32(0)
 
-            for lc in cutlass.range(self.chunks_per_split, unroll=1):
-                ci = split_first_chunk + Int32(lc)
+            for lc in cutlass.range(active_chunks, unroll=1):
+                active_idx = Int32(lc)
+                ci = split_first_chunk + active_idx
+                if cutlass.const_expr(has_extra):
+                    if active_idx >= main_chunk_count:
+                        ci = extra_first_chunk + active_idx - main_chunk_count
                 split_cand_start = ci * Int32(_CAND_WINDOW)
                 buf = Int32(lc) & Int32(1)
 
@@ -2195,12 +2295,6 @@ def run_unified_decode(
     # partial O dim is d_v (512) for both models.
     mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
     mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
-    has_empty_split_slots = (num_splits - 1) * chunks_per_split >= num_chunks
-    if has_empty_split_slots:
-        # Seed empty-split LSE = -inf so the merge skips splits with no chunks
-        # (and so partially-written rows are well-defined). The kernel overwrites
-        # every (token, head, split) it actually runs.
-        mid_lse.fill_(float("-inf"))
 
     stride_kv_block = _cache_block_stride_bytes(
         swa_k_cache,

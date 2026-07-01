@@ -509,6 +509,34 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     assert max_abs <= 0.10
     assert cos.item() >= 0.9995
 
+    # Replay the same captured graph with shorter live sections. The launch grid,
+    # workspace, and tensor addresses stay fixed; one of the two capacity-planned
+    # chunks is now wholly empty and must contribute a neutral LSE without running
+    # its gather/MMA pipeline.
+    swa_lengths.fill_(1)
+    indexed_lengths.zero_()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected_short = compressed_sparse_mla_reference(
+        q,
+        swa_cache_bytes,
+        swa_indices,
+        swa_lengths,
+        extra_k_cache=indexed_cache_bytes,
+        extra_indices=indexed_indices,
+        extra_topk_lengths=indexed_lengths,
+        extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs_short = (captured_out.float() - expected_short.float()).abs().max().item()
+    cos_short = torch.nn.functional.cosine_similarity(
+        captured_out.float().reshape(-1), expected_short.float().reshape(-1), dim=0
+    )
+    assert max_abs_short <= 0.10
+    assert cos_short.item() >= 0.9995
+
 
 @torch.inference_mode()
 def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:

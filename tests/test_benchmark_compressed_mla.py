@@ -118,6 +118,29 @@ def test_parse_args_accepts_non_flash_local_q_heads() -> None:
     assert args.num_q_heads == 16
 
 
+def test_runtime_valid_widths_preserve_capture_capacity() -> None:
+    cases = benchmark_compressed_mla._parse_cases(
+        "model",
+        [1],
+        c4_indexed_width=512,
+        c128_indexed_width=8192,
+    )
+
+    assert [
+        benchmark_compressed_mla._runtime_valid_widths(
+            case, context_length=16_384
+        )
+        for case in cases
+    ] == [(128, 0), (128, 512), (128, 128)]
+    assert [case.topk for case in cases] == [128, 640, 8320]
+
+
+def test_parse_args_accepts_runtime_context_length() -> None:
+    args = benchmark_compressed_mla._parse_args(["--context-length", "16384"])
+
+    assert args.context_length == 16_384
+
+
 def test_model_config_derives_live_dsv4_selected_widths() -> None:
     profile = benchmark_compressed_mla._derive_dsv4_compressed_mla_profile(
         {

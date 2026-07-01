@@ -104,6 +104,8 @@ class CaseReport:
     flashinfer_sanity_algorithm: Sanity | None = None
     b12x_vs_flashinfer_sanity: Sanity | None = None
     split_chunks: int | None = None
+    swa_valid: int | None = None
+    indexed_valid: int | None = None
 
     @property
     def ratio_vs_flashinfer(self) -> float | None:
@@ -413,6 +415,35 @@ def _resolve_case_widths(args: argparse.Namespace) -> tuple[int, int]:
     return int(c4_indexed_width), int(c128_indexed_width)
 
 
+def _runtime_valid_widths(
+    case: BenchmarkCase,
+    *,
+    context_length: int | None,
+) -> tuple[int, int]:
+    """Return replay-time SWA/indexed lengths for a captured-capacity case."""
+
+    if context_length is None:
+        return case.swa_width, case.indexed_width
+    if context_length <= 0:
+        raise ValueError(f"context_length must be positive, got {context_length}")
+
+    swa_valid = min(case.swa_width, context_length)
+    indexed_valid = 0
+    if case.indexed_width:
+        if case.indexed_page_size is None:
+            raise ValueError("indexed_width requires indexed_page_size")
+        if COMPRESSED_MLA_DSV4_PAGE_SIZE % case.indexed_page_size:
+            raise ValueError(
+                "indexed page size must divide the DSV4 page size: "
+                f"{case.indexed_page_size} vs {COMPRESSED_MLA_DSV4_PAGE_SIZE}"
+            )
+        compression_ratio = (
+            COMPRESSED_MLA_DSV4_PAGE_SIZE // case.indexed_page_size
+        )
+        indexed_valid = min(case.indexed_width, context_length // compression_ratio)
+    return swa_valid, indexed_valid
+
+
 def _planned_split_chunks(
     case: BenchmarkCase,
     *,
@@ -703,6 +734,7 @@ def _benchmark_case(
     production_decode_cap: bool,
     use_attn_sink: bool,
     reference: str,
+    context_length: int | None,
 ) -> CaseReport:
     clear_mla_caches()
     q = _make_q(rows=case.rows, num_q_heads=num_q_heads, seed=seed, device=device)
@@ -763,8 +795,11 @@ def _benchmark_case(
     swa_indices = _make_indices(
         rows=case.rows, width=case.swa_width, tokens=swa_tokens, device=device
     )
+    swa_valid, indexed_valid = _runtime_valid_widths(
+        case, context_length=context_length
+    )
     swa_lengths = torch.full(
-        (case.rows,), case.swa_width, dtype=torch.int32, device=device
+        (case.rows,), swa_valid, dtype=torch.int32, device=device
     )
 
     indexed_cache: CacheViews | None = None
@@ -789,7 +824,7 @@ def _benchmark_case(
             device=device,
         )
         indexed_lengths = torch.full(
-            (case.rows,), case.indexed_width, dtype=torch.int32, device=device
+            (case.rows,), indexed_valid, dtype=torch.int32, device=device
         )
 
     binding, split_chunks = _make_binding(
@@ -933,6 +968,8 @@ def _benchmark_case(
         flashinfer_sanity_algorithm=flashinfer_sanity,
         b12x_vs_flashinfer_sanity=b12x_vs_flashinfer,
         split_chunks=split_chunks,
+        swa_valid=swa_valid,
+        indexed_valid=indexed_valid,
     )
 
 
@@ -970,6 +1007,7 @@ def collect_case_reports(
                 production_decode_cap=args.production_decode_cap,
                 use_attn_sink=args.attn_sink,
                 reference=args.reference,
+                context_length=args.context_length,
             )
         )
     return reports
@@ -988,6 +1026,7 @@ def _render_report(report: CaseReport) -> str:
         f"indexed={report.case.indexed_width:3d}",
         f"indexed_page={indexed_page:3d}",
         f"topk={report.case.topk:3d}",
+        f"valid={int(report.swa_valid or 0):3d}+{int(report.indexed_valid or 0):4d}",
         f"chunks={(report.split_chunks if report.split_chunks is not None else _planned_split_chunks(report.case)):3d}",
         f"replay={report.replay_us:8.2f} us",
         f"p90={report.p90_replay_us:8.2f} us",
@@ -1151,6 +1190,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help=(
+            "replay-time source-token context length; keeps captured widths at "
+            "capacity while setting SWA/C4/C128 valid lengths as vLLM does"
+        ),
+    )
+    parser.add_argument(
         "--c128-pool-size",
         type=int,
         default=None,
@@ -1251,6 +1299,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--warmup and --replays must be positive")
     if args.full_token_capacity is not None and args.full_token_capacity <= 0:
         raise SystemExit("--full-token-capacity must be positive")
+    if args.context_length is not None and args.context_length <= 0:
+        raise SystemExit("--context-length must be positive")
     if args.c128_pool_size is not None and args.c128_pool_size <= 0:
         raise SystemExit("--c128-pool-size must be positive")
     if args.c4_indexed_width is not None and args.c4_indexed_width <= 0:
@@ -1318,7 +1368,8 @@ def main(argv: list[str] | None = None) -> int:
             f"cache_page_stride={args.cache_page_stride_bytes} "
             f"cache_num_pages={args.cache_num_pages} "
             f"cache_allocation={args.cache_num_pages * args.cache_page_stride_bytes} "
-            f"max_positions={trace_config['max_position_embeddings']}"
+            f"max_positions={trace_config['max_position_embeddings']} "
+            f"context_length={args.context_length or 'capacity'}"
         )
     for report in reports:
         print(_render_report(report))
