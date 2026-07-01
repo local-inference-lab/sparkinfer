@@ -114,11 +114,45 @@ _PREFILL_TF32_TMA_STAGES = int(
 _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
 )
-_PREFILL_TF32_TMA_CHUNK_M_WARPS = int(
+# At hidden=4096, large-M projection is fastest when one CTA owns all 24 mix
+# columns: the A tile is loaded once instead of once per 8-column N tile.  Keep
+# the previous geometry for hidden=7168, where the longer K loop benefits from
+# the additional M-warp reuse and the wide-N geometry regresses.
+_PREFILL_TF32_TMA_CHUNK_4096_M_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "1")
+)
+_PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
 )
-_PREFILL_TF32_TMA_CHUNK_TILE_M = int(
+_PREFILL_TF32_TMA_CHUNK_4096_N_WARPS = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "3"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_4096_TILE_M = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "16")
+)
+_PREFILL_TF32_TMA_CHUNK_OTHER_TILE_M = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
+)
+_PREFILL_TF32_TMA_CHUNK_4096_TILE_N = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_OTHER_TILE_N = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
+    )
 )
 _PREFILL_FINALIZE_THREADS = int(
     os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
@@ -1815,24 +1849,28 @@ class MHCPrefillTf32ProjectTmaKernel:
         split_k: int | None = None,
         chunk_geometry: bool = False,
     ):
-        self.num_m_warps = (
-            _PREFILL_TF32_TMA_CHUNK_M_WARPS
-            if chunk_geometry
-            else _PREFILL_TF32_TMA_M_WARPS
-        )
-        self.num_n_warps = _PREFILL_TF32_TMA_N_WARPS
+        self.hidden_size = int(hidden_size)
+        use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
+        if use_4096_chunk_geometry:
+            self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS
+            self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_4096_N_WARPS
+            self.tile_m = _PREFILL_TF32_TMA_CHUNK_4096_TILE_M
+            self.tile_n = _PREFILL_TF32_TMA_CHUNK_4096_TILE_N
+        elif chunk_geometry:
+            self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS
+            self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS
+            self.tile_m = _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_M
+            self.tile_n = _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_N
+        else:
+            self.num_m_warps = _PREFILL_TF32_TMA_M_WARPS
+            self.num_n_warps = _PREFILL_TF32_TMA_N_WARPS
+            self.tile_m = _PREFILL_TF32_TMA_TILE_M
+            self.tile_n = _PREFILL_TF32_TMA_TILE_N
         self.num_compute_warps = self.num_m_warps * self.num_n_warps
         self.producer_warp = self.num_compute_warps
         self.num_threads = (self.num_compute_warps + 1) * 32
-        self.tile_m = (
-            _PREFILL_TF32_TMA_CHUNK_TILE_M
-            if chunk_geometry
-            else _PREFILL_TF32_TMA_TILE_M
-        )
-        self.tile_n = _PREFILL_TF32_TMA_TILE_N
         self.tile_k = _PREFILL_TF32_TMA_TILE_K
         self.num_stages = _PREFILL_TF32_TMA_STAGES
-        self.hidden_size = int(hidden_size)
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
             _split_k_for_hidden(self.hidden_size)

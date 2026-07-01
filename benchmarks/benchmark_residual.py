@@ -354,6 +354,18 @@ def main() -> None:
         )
         != "0"
     )
+    prefill_policy_m = args.expected_m or args.tokens
+    prefill_tf32_min_tokens = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_MIN_TOKENS",
+            os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
+        )
+    )
+    prefill_tf32_selected = (
+        args.fuse_rmsnorm
+        and prefill_policy_m >= prefill_tf32_min_tokens
+        and prefill_tf32_enabled
+    )
     prefill_bf16_enabled = os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
     prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
     prefill_gram_threads = int(
@@ -405,12 +417,44 @@ def main() -> None:
         args.tokens >= prefill_tf32_tma_chunk_min_tokens
     )
     if prefill_tf32_tma_chunk_geometry:
-        prefill_tf32_tma_m_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
-        )
-        prefill_tf32_tma_m = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
-        )
+        if args.hidden_size == 4096:
+            prefill_tf32_tma_m_warps = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "1")
+            )
+            prefill_tf32_tma_n_warps = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "3"),
+                )
+            )
+            prefill_tf32_tma_m = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "16")
+            )
+            prefill_tf32_tma_n = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
+                )
+            )
+        else:
+            prefill_tf32_tma_m_warps = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
+            )
+            prefill_tf32_tma_n_warps = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+                )
+            )
+            prefill_tf32_tma_m = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
+            )
+            prefill_tf32_tma_n = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
+                )
+            )
 
     device = require_sm120()
     if args.compare_vllm:
@@ -597,7 +641,9 @@ def main() -> None:
         f"mode={mode} tokens={args.tokens} expected_m={args.expected_m} "
         f"hidden={args.hidden_size} "
         f"split_k={args.split_k} block_k={args.block_k} block_h={args.block_h} "
+        f"fused_rmsnorm={args.fuse_rmsnorm} "
         f"prefill_tf32_mma={prefill_tf32_enabled} "
+        f"prefill_tf32_selected={prefill_tf32_selected} "
         f"prefill_tf32_tma=m{prefill_tf32_tma_m}n{prefill_tf32_tma_n}"
         f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
         f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
