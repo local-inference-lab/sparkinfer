@@ -517,6 +517,96 @@ def s1_qk_nope_block_scaled(
     return qk
 
 
+@cute.jit
+def s1_qk_nope_block_scaled_glm_h8_swap_ab(
+    qk,
+    q_fp8_base_addr: Int32,
+    kv_fp8_base_addr: Int32,
+    q_sc_view: cute.Tensor,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_stride: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+):
+    """GLM TP8 QK-NoPE with the logical operands swapped.
+
+    Hardware A is a 16-candidate K tile and hardware B is Q transposed into the
+    eight-column role.  The m16n8 output is therefore fully occupied instead of
+    padding the eight query heads to sixteen rows.  Four warps cover BI=64.
+
+    Fragment ownership is::
+
+        qk[0] = score[cand=base+gid,   head=2*tid]
+        qk[1] = score[cand=base+gid,   head=2*tid+1]
+        qk[2] = score[cand=base+gid+8, head=2*tid]
+        qk[3] = score[cand=base+gid+8, head=2*tid+1]
+
+    GLM's arbitrary K scale remains a candidate-wise FP32 post-MMA multiply.
+    Q's pow2 scale moves from SFA to SFB, matching its new hardware-B role.
+    """
+    gid = lane >> Int32(2)
+
+    # A: sixteen candidate rows from K.
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    # B: eight query-head rows.  scale_vec::1X SFB consumes q_sc[gid].
+    b_row = lane & Int32(7)
+    b_col = ((lane >> Int32(3)) & Int32(1)) * Int32(16)
+    sfb_head = gid
+
+    cand0 = warp_first_cand + gid
+    cand1 = cand0 + Int32(8)
+    glm_scale_base = Int32(num_scales) * Int32(quant_tile)
+
+    for blk in cutlass.range_constexpr(num_scales):
+        sfa = Uint32(0x7F)  # raw GLM K; arbitrary scale is applied below
+        sfb = _fp32_to_ue8m0_byte(
+            q_sc_view[sfb_head * Int32(num_scales) + Int32(blk)]
+        )
+        acc0 = Float32(0.0)
+        acc1 = Float32(0.0)
+        acc2 = Float32(0.0)
+        acc3 = Float32(0.0)
+        for ks in cutlass.range_constexpr(quant_tile // 32):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(32)
+            a_addr = _smem_byte(
+                kv_fp8_base_addr,
+                warp_first_cand * Int32(kv_smem_stride)
+                + a_row * Int32(kv_smem_stride)
+                + ko
+                + a_col,
+            )
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+            b_addr = _smem_byte(
+                q_fp8_base_addr,
+                b_row * Int32(q_nope_stride) + ko + b_col,
+            )
+            b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
+            acc0, acc1, acc2, acc3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                acc0, acc1, acc2, acc3,
+                a0, a1, a2, a3,
+                b0, b1,
+                sfa, sfb,
+            )
+
+        ks0 = _u32_to_f32(ld_shared_u32(
+            kv_fp8_base_addr + cand0 * Int32(kv_smem_stride)
+            + glm_scale_base + Int32(blk) * Int32(4)
+        ))
+        ks1 = _u32_to_f32(ld_shared_u32(
+            kv_fp8_base_addr + cand1 * Int32(kv_smem_stride)
+            + glm_scale_base + Int32(blk) * Int32(4)
+        ))
+        qk[0] = qk[0] + acc0 * ks0
+        qk[1] = qk[1] + acc1 * ks0
+        qk[2] = qk[2] + acc2 * ks1
+        qk[3] = qk[3] + acc3 * ks1
+    return qk
+
+
 # =============================================================================
 # S2 -- QK-RoPE bf16 m16n8k16 MMA (accumulate into the SAME qk regs)
 # =============================================================================
@@ -564,6 +654,49 @@ def s2_qk_rope_bf16(
         if cutlass.const_expr(hi):
             qk[2] = d2
             qk[3] = d3
+    return qk
+
+
+@cute.jit
+def s2_qk_rope_bf16_glm_h8_swap_ab(
+    qk,
+    q_rope_base_addr: Int32,
+    kv_rope_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    d_rope: cutlass.Constexpr,
+    kv_rope_stride_bytes: cutlass.Constexpr,
+):
+    """GLM TP8 RoPE dot product in the same swapped fragment layout as S1."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    q_head = gid
+
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        a_byte = (
+            (warp_first_cand + a_row) * Int32(kv_rope_stride_bytes)
+            + (ko + a_col) * Int32(2)
+        )
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+            _smem_byte(kv_rope_base_addr, a_byte)
+        )
+        row_byte = q_head * Int32(d_rope * 2) + ko * Int32(2)
+        b0 = _ld_u32(
+            q_rope_base_addr, row_byte + tid * Int32(2) * Int32(2)
+        )
+        b1 = _ld_u32(
+            q_rope_base_addr,
+            row_byte + (tid * Int32(2) + Int32(8)) * Int32(2),
+        )
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3],
+            a0, a1, a2, a3,
+            b0, b1,
+        )
     return qk
 
 
@@ -616,6 +749,43 @@ def s3_mask_and_scale(
     qk[1] = qk[1] * sm_scale_log2
     qk[2] = qk[2] * sm_scale_log2
     qk[3] = qk[3] * sm_scale_log2
+    return qk
+
+
+@cute.jit
+def s3_mask_and_scale_glm_h8_swap_ab(
+    qk,
+    sTokenIdx: cute.Tensor,
+    warp_first_cand: Int32,
+    split_cand_start: Int32,
+    split_cand_end: Int32,
+    section_len: Int32,
+    sm_scale_log2: Float32,
+    lane: Int32,
+):
+    """Mask the two candidate rows owned by a swapped GLM TP8 fragment."""
+    gid = lane >> Int32(2)
+    c0 = warp_first_cand + gid
+    c1 = c0 + Int32(8)
+    abs_c0 = c0 + split_cand_start
+    abs_c1 = c1 + split_cand_start
+
+    idx0 = Int32(-1)
+    if abs_c0 < section_len:
+        idx0 = Int32(sTokenIdx[c0])
+    idx1 = Int32(-1)
+    if abs_c1 < section_len:
+        idx1 = Int32(sTokenIdx[c1])
+
+    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+        qk[0] = Float32(_QK_MASK)
+        qk[1] = Float32(_QK_MASK)
+    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+        qk[2] = Float32(_QK_MASK)
+        qk[3] = Float32(_QK_MASK)
+
+    for i in cutlass.range_constexpr(4):
+        qk[i] = qk[i] * sm_scale_log2
     return qk
 
 
@@ -801,6 +971,141 @@ def s4_online_softmax(
     global_max[0] = new_gmax0
     global_max[1] = new_gmax1
 
+    return p, warp_rescale0, warp_rescale1
+
+
+@cute.jit
+def s4_online_softmax_glm_h8_swap_ab(
+    qk,
+    p,
+    acc_nope,
+    global_max,
+    global_sum,
+    reduce_max_addr: Int32,
+    reduce_sum_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    n_acc_tiles: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+):
+    """Online softmax for the swapped 16-candidate x 8-head score tile.
+
+    ``global_{max,sum}[0:2]`` track the head pair ``(2*tid, 2*tid+1)``.
+    PV accumulators instead use the ordinary output-row ownership (head=gid),
+    so the cross-chunk alpha is shuffled from the lane owning that head pair
+    before rescaling the accumulator rows.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    head0 = tid * Int32(2)
+    head1 = head0 + Int32(1)
+    _NI = Float32(-1e29)
+
+    local_max0 = fmax_f32(qk[0], qk[2])
+    local_max1 = fmax_f32(qk[1], qk[3])
+    for off in (4, 8, 16):
+        local_max0 = fmax_f32(
+            local_max0, cute.arch.shuffle_sync_bfly(local_max0, offset=off)
+        )
+        local_max1 = fmax_f32(
+            local_max1, cute.arch.shuffle_sync_bfly(local_max1, offset=off)
+        )
+
+    p[0] = _exp2_approx_ftz_f32(qk[0] - local_max0)
+    p[1] = _exp2_approx_ftz_f32(qk[1] - local_max1)
+    p[2] = _exp2_approx_ftz_f32(qk[2] - local_max0)
+    p[3] = _exp2_approx_ftz_f32(qk[3] - local_max1)
+    local_sum0 = p[0] + p[2]
+    local_sum1 = p[1] + p[3]
+    for off in (4, 8, 16):
+        local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(
+            local_sum0, offset=off
+        )
+        local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(
+            local_sum1, offset=off
+        )
+
+    # Lanes 0..3 (gid==0) own the four head pairs for this warp.
+    if gid == Int32(0):
+        st_shared_f32(
+            reduce_max_addr + (warp_id * Int32(hpb) + head0) * Int32(4),
+            local_max0,
+        )
+        st_shared_f32(
+            reduce_max_addr + (warp_id * Int32(hpb) + head1) * Int32(4),
+            local_max1,
+        )
+        st_shared_f32(
+            reduce_sum_addr + (warp_id * Int32(hpb) + head0) * Int32(4),
+            local_sum0,
+        )
+        st_shared_f32(
+            reduce_sum_addr + (warp_id * Int32(hpb) + head1) * Int32(4),
+            local_sum1,
+        )
+    cute.arch.barrier(**bar_kw)
+
+    if tid_flat < Int32(8):
+        h = tid_flat
+        bmax = Float32(-1e30)
+        for w in cutlass.range_constexpr(n_warps):
+            wm = ld_shared_f32(
+                reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4)
+            )
+            bmax = fmax_f32(bmax, wm)
+        bsum = Float32(0.0)
+        for w in cutlass.range_constexpr(n_warps):
+            wm = ld_shared_f32(
+                reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4)
+            )
+            ws = ld_shared_f32(
+                reduce_sum_addr + (Int32(w) * Int32(hpb) + h) * Int32(4)
+            )
+            bsum = bsum + ws * _exp2_approx_ftz_f32(wm - bmax)
+        st_shared_f32(reduce_max_addr + h * Int32(4), bmax)
+        st_shared_f32(reduce_sum_addr + h * Int32(4), bsum)
+    cute.arch.barrier(**bar_kw)
+
+    block_max0 = ld_shared_f32(reduce_max_addr + head0 * Int32(4))
+    block_max1 = ld_shared_f32(reduce_max_addr + head1 * Int32(4))
+    block_sum0 = ld_shared_f32(reduce_sum_addr + head0 * Int32(4))
+    block_sum1 = ld_shared_f32(reduce_sum_addr + head1 * Int32(4))
+
+    new_gmax0 = fmax_f32(global_max[0], block_max0)
+    new_gmax1 = fmax_f32(global_max[1], block_max1)
+    alpha0 = Float32(0.0)
+    alpha1 = Float32(0.0)
+    if global_max[0] > _NI:
+        alpha0 = _exp2_approx_ftz_f32(global_max[0] - new_gmax0)
+    if global_max[1] > _NI:
+        alpha1 = _exp2_approx_ftz_f32(global_max[1] - new_gmax1)
+
+    block_rescale0 = _exp2_approx_ftz_f32(block_max0 - new_gmax0)
+    block_rescale1 = _exp2_approx_ftz_f32(block_max1 - new_gmax1)
+    warp_rescale0 = _exp2_approx_ftz_f32(local_max0 - new_gmax0)
+    warp_rescale1 = _exp2_approx_ftz_f32(local_max1 - new_gmax1)
+
+    # Source lanes 0..3 carry alpha for pairs (0,1), (2,3), (4,5), (6,7).
+    pair_lane = gid >> Int32(1)
+    row_alpha0 = cute.arch.shuffle_sync(alpha0, pair_lane)
+    row_alpha1 = cute.arch.shuffle_sync(alpha1, pair_lane)
+    row_alpha = row_alpha0
+    if (gid & Int32(1)) != Int32(0):
+        row_alpha = row_alpha1
+    for at in cutlass.range_constexpr(n_acc_tiles):
+        acc_nope[at][0] = acc_nope[at][0] * row_alpha
+        acc_nope[at][1] = acc_nope[at][1] * row_alpha
+
+    global_sum[0] = global_sum[0] * alpha0 + block_sum0 * block_rescale0
+    global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_rescale1
+    global_max[0] = new_gmax0
+    global_max[1] = new_gmax1
     return p, warp_rescale0, warp_rescale1
 
 
@@ -1148,6 +1453,180 @@ def s6_xv_nope(
             if cutlass.const_expr(hi):
                 acc_nope[at][2] = acc_nope[at][2] + xv[nt][2] * sc1
                 acc_nope[at][3] = acc_nope[at][3] + xv[nt][3] * sc1
+    return acc_nope
+
+
+@cute.jit
+def s6_xv_nope_glm_h8_swap_ab(
+    w_pre,
+    acc_nope,
+    kv_fp8_base_addr: Int32,
+    w_head_sc_view: cute.Tensor,
+    w_fp8_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    v_chunk: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    w_fp8_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    nt_per_warp_xv: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+):
+    """GLM TP8 packed HIGH/LOW PV fed directly by swapped-score fragments.
+
+    Four warps each own sixteen candidates.  HIGH for each of the eight heads
+    occupies W rows 0..7 and the e4m3 residual occupies rows 8..15, so one
+    m16n8k32 MMA accumulates both precision passes.  The ordinary MMA output-row
+    mapping is retained for the epilogue (lane gid owns head gid).
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    head0 = tid * Int32(2)
+    head1 = head0 + Int32(1)
+    cand0 = warp_id * Int32(16) + gid
+    cand1 = cand0 + Int32(8)
+    glm_scale_base = Int32(n_v_chunks) * Int32(v_chunk)
+
+    def _vsc(cand: Int32, vc: int):
+        return _u32_to_f32(ld_shared_u32(
+            kv_fp8_base_addr + cand * Int32(kv_smem_stride)
+            + glm_scale_base + Int32(vc) * Int32(4)
+        ))
+
+    # Clear both the lower scale slots and the upper reciprocal scratch slots.
+    i = tid_flat
+    while i < Int32(n_v_chunks * hpb):
+        w_head_sc_view[i] = Float32(0.0)
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        vsc0 = _vsc(cand0, vc)
+        vsc1 = _vsc(cand1, vc)
+        m0 = fmax_f32(
+            fabs_f32(w_pre[0] * vsc0), fabs_f32(w_pre[2] * vsc1)
+        )
+        m1 = fmax_f32(
+            fabs_f32(w_pre[1] * vsc0), fabs_f32(w_pre[3] * vsc1)
+        )
+        scale_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+        atomic_max_shared_f32(
+            scale_base + (Int32(vc) * Int32(hpb) + head0) * Int32(4), m0
+        )
+        atomic_max_shared_f32(
+            scale_base + (Int32(vc) * Int32(hpb) + head1) * Int32(4), m1
+        )
+    cute.arch.barrier(**bar_kw)
+
+    i = tid_flat
+    while i < Int32(n_v_chunks * 8):
+        vc = i // Int32(8)
+        h = i - vc * Int32(8)
+        slot = vc * Int32(hpb) + h
+        scale = fmax_f32(w_head_sc_view[slot], Float32(1e-10)) * Float32(
+            1.0 / _FP8_MAX
+        )
+        w_head_sc_view[slot] = scale
+        w_head_sc_view[slot + Int32(8)] = Float32(1.0) / scale
+        i += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+        si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + head0 + Int32(8)]
+        si1 = w_head_sc_view[Int32(vc) * Int32(hpb) + head1 + Int32(8)]
+        vsc0 = _vsc(cand0, vc)
+        vsc1 = _vsc(cand1, vc)
+
+        wn00 = w_pre[0] * vsc0 * si0
+        wn01 = w_pre[1] * vsc0 * si1
+        wn10 = w_pre[2] * vsc1 * si0
+        wn11 = w_pre[3] * vsc1 * si1
+
+        f00 = _quant_e4m3_byte(wn00)
+        f01 = _quant_e4m3_byte(wn01)
+        f10 = _quant_e4m3_byte(wn10)
+        f11 = _quant_e4m3_byte(wn11)
+        r00 = _quant_e4m3_residual_byte(wn00)
+        r01 = _quant_e4m3_residual_byte(wn01)
+        r10 = _quant_e4m3_residual_byte(wn10)
+        r11 = _quant_e4m3_residual_byte(wn11)
+
+        st_shared_u8(
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand0,
+            f00.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand0,
+            f01.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand1,
+            f10.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand1,
+            f11.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + cand0,
+            r00.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + cand0,
+            r01.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + cand1,
+            r10.to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + cand1,
+            r11.to(cutlass.Uint8),
+        )
+        cute.arch.barrier(**bar_kw)
+
+        # The PV MMA's output rows use the ordinary m16 fragment mapping:
+        # this lane owns row/head ``gid`` irrespective of the score fragment's
+        # ``2*tid`` head pair used above to populate W.
+        sc_row = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            dim = (
+                Int32(vc) * Int32(v_chunk)
+                + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+            )
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for kstep in cutlass.range_constexpr(bi // 32):
+                ko = Int32(kstep) * Int32(32)
+                a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
+                b0, b1 = _d2_load_b_fp8(
+                    kv_fp8_base_addr,
+                    ko,
+                    dim,
+                    lane,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                    xv0, xv1, xv2, xv3,
+                    a0, a1, a2, a3,
+                    b0, b1,
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + (xv0 + xv2) * sc_row
+            acc_nope[at][1] = acc_nope[at][1] + (xv1 + xv3) * sc_row
     return acc_nope
 
 

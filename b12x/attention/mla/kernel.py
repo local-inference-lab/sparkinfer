@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -35,11 +36,16 @@ from b12x.cute.fp4 import shared_ptr_to_u32
 from .decode_math import (
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
+    s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
+    s2_qk_rope_bf16_glm_h8_swap_ab,
     s3_mask_and_scale,
+    s3_mask_and_scale_glm_h8_swap_ab,
     s4_online_softmax,
+    s4_online_softmax_glm_h8_swap_ab,
     s5_fill_sm_p_full,
     s6_xv_nope,
+    s6_xv_nope_glm_h8_swap_ab,
     s6b_xv_rope,
     s7_epilogue,
 )
@@ -74,6 +80,11 @@ _GLM_KV_GMEM_STRIDE = 656
 # at import) so a sweep / AutoTuner can flip it between launches.
 _MLA_SM120_NUM_SPLITS_ENV = "B12X_MLA_SM120_NUM_SPLITS"
 
+# Exact GLM TP8 decode specialization: four math warps, swapped QK A/B, and
+# packed HIGH/LOW PV.  Default-on; the per-call escape hatch exists for numeric
+# and performance A/B diagnostics without changing serving code.
+_MLA_SM120_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
+
 # FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
 # (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
 # gap looks small but require more than this many integer waves are rejected.
@@ -98,6 +109,11 @@ def _env_num_splits_override() -> int:
     except (TypeError, ValueError):
         return 0
     return v if v > 0 else 0
+
+
+def _env_glm_h8_native_enabled() -> bool:
+    raw = os.environ.get(_MLA_SM120_GLM_H8_NATIVE_ENV)
+    return raw is None or raw.strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _wave_balanced_num_splits(
@@ -226,12 +242,13 @@ def plan_unified_decode_splits(
 
 
 class UnifiedDecodeKernel:
-    """288-thread warp-specialized DSV4 decode with split-K partial writeback.
+    """Warp-specialized sparse-MLA decode with split-K partial writeback.
 
     Grid = (num_tokens, H_BLOCKS, num_splits). Each CTA owns one query token, one
-    HPB=16-head block, and one chunk-range slice (split). 8 math warps consume
-    the double-buffered KV gathered by the 9th IO warp (cp.async.bulk + mbarrier,
-    io.py); the math runs S0-S6b over the split's chunks then S7 writes this
+    HPB=16-head block, and one chunk-range slice (split). The generic path uses
+    8 math warps plus one IO warp; native GLM H8 uses 4 math warps plus one IO
+    warp. Math consumes the double-buffered KV gathered with cp.async.bulk and
+    mbarriers (io.py), then runs S0-S6b over the split's chunks and S7 writes this
     split's NORMALIZED partial O + base-2 LSE into mid_out / mid_lse in the exact
     split.py merge convention. The hot-op MMA PTX (14 block-scaled + 14 plain
     e4m3 + 8 bf16) is identical to the single-CTA P6 kernel: the split slicing
@@ -244,7 +261,7 @@ class UnifiedDecodeKernel:
                  mid_out_stride, mid_lse_stride,
                  has_extra=False,
                  pbs_extra=1, valid_hpb=None, head_block_offset=0,
-                 per_token_len=False):
+                 per_token_len=False, native_glm_h8=False):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -279,6 +296,7 @@ class UnifiedDecodeKernel:
         # launcher routes here ONLY for a genuinely-mixed-length multi-token batch
         # (a uniform batch collapses to the scalar path -> PTX byte-identical).
         self.per_token_len = bool(per_token_len)
+        self.native_glm_h8 = bool(native_glm_h8)
         # VALID_HPB (small-TP / non-multiple-of-16 head shards). Upstream
         # VALID_HPB=min(NUM_HEADS,HPB) (decode_dsv4_kernel.cuh:152): the kernel
         # computes a FULL HPB=16 tile with zero-Q padding then gates output/LSE
@@ -477,10 +495,16 @@ class UnifiedDecodeKernel:
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
 
-        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        # Math warps are consumers; the final warp is the IO producer.
         is_io = warp_id >= Int32(self.math_threads // 32)
 
-        kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
+        # Native GLM H8 preserves each cache record's packed 656-byte layout in
+        # smem. This aliases the existing adjacent kv_fp8/kv_sc/kv_rope storage;
+        # it changes neither the allocation size nor the graph-time workspace.
+        staged_kv_stride = (
+            _GLM_KV_GMEM_STRIDE if self.native_glm_h8 else t.kv_smem_stride
+        )
+        kv_fp8_buf = Int32(t.bi * staged_kv_stride)
         kv_rope_buf = Int32(L.kv_rope_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
         tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
@@ -493,7 +517,7 @@ class UnifiedDecodeKernel:
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
-        cute.arch.barrier()  # full-CTA (288) structural fence.
+        cute.arch.barrier()  # Full-CTA structural fence.
 
         # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
         cps = Int32(self.chunks_per_split)
@@ -514,6 +538,8 @@ class UnifiedDecodeKernel:
             ),
         )
         warp_first_cand = warp_id * Int32(8)
+        if cutlass.const_expr(self.native_glm_h8):
+            warp_first_cand = warp_id * Int32(16)
 
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
@@ -545,9 +571,11 @@ class UnifiedDecodeKernel:
                     mbar_base + buf,  # full[buf]
                     g_start, g_end,
                     Int32(self.page_block_size), stride_kv_block, io_lane,
-                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                    bi=t.bi, kv_smem_stride=staged_kv_stride,
+                    rope_smem_stride=t.d_rope,
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
                     scale_format=t.scale_format,
+                    packed_glm=self.native_glm_h8,
                 )
                 prod_idx += Int32(1)
                 if prod_idx == Int32(n_buf):
@@ -560,9 +588,12 @@ class UnifiedDecodeKernel:
             s0_quantize_q_to_smem(
                 q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
                 head_base, Int32(self.valid_hpb), tid,
-                d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
-                quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
-                q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
+                d_nope=t.d_nope, d_rope=t.d_rope,
+                d_qk=t.d_nope + t.d_rope,
+                quant_tile=t.quant_tile, num_scales=t.num_scales,
+                hpb=(8 if self.native_glm_h8 else t.hpb),
+                q_nope_stride=t.q_nope_stride,
+                num_threads=self.math_threads, barrier_id=2,
             )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
@@ -573,8 +604,10 @@ class UnifiedDecodeKernel:
                 accn_frag[k] = Float32(0.0)
             for k in cutlass.range_constexpr(4):
                 accr_frag[k] = Float32(0.0)
-            gmax_frag[0] = Float32(-1e30); gmax_frag[1] = Float32(-1e30)
-            gsum_frag[0] = Float32(0.0); gsum_frag[1] = Float32(0.0)
+            gmax_frag[0] = Float32(-1e30)
+            gmax_frag[1] = Float32(-1e30)
+            gsum_frag[0] = Float32(0.0)
+            gsum_frag[1] = Float32(0.0)
 
             cons_phase = Int32(0)
             cons_idx = Int32(0)
@@ -611,53 +644,102 @@ class UnifiedDecodeKernel:
                 # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                qk = s1_qk_nope_block_scaled(
-                    qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
-                    warp_first_cand, lane,
-                    num_scales=t.num_scales, quant_tile=t.quant_tile,
-                    q_nope_stride=t.q_nope_stride, kv_smem_stride=t.kv_smem_stride,
-                    scale_bytes_per_token=8, scale_format=t.scale_format,
-                )
-                qk = s2_qk_rope_bf16(
-                    qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
-                )
-
                 split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
                 if split_cand_end > section_len:
                     split_cand_end = section_len
-                qk = s3_mask_and_scale(
-                    qk, tok_buf_view, warp_first_cand,
-                    split_cand_start, split_cand_end, section_len,
-                    sm_scale_log2, lane,
-                )
-
-                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                p, wr0, wr1 = s4_online_softmax(
-                    qk, p, acc_nope, acc_rope, global_max, global_sum,
-                    reduce_max_addr, reduce_sum_addr, False,
-                    warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
-                    num_threads=self.math_threads, barrier_id=3,
-                    n_acc_tiles=n_acc_tiles,
-                )
-                w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
-
-                s5_fill_sm_p_full(
-                    w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
-                    bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
-                    num_threads=self.math_threads, barrier_id=3,
-                )
-                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-
-                acc_nope = s6_xv_nope(
-                    w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view, w_fp8_addr,
-                    warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb, bi=t.bi,
-                    kv_smem_stride=t.kv_smem_stride, w_fp8_stride=t.bi + 16, n_warps=8,
-                    scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
-                    scale_format=t.scale_format,
-                    num_threads=self.math_threads, barrier_id=3,
-                )
+                if cutlass.const_expr(self.native_glm_h8):
+                    qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                        qk, q_fp8_addr, kv_fp8_b, q_sc_view,
+                        warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_stride=t.q_nope_stride,
+                        kv_smem_stride=staged_kv_stride,
+                    )
+                    qk = s2_qk_rope_bf16_glm_h8_swap_ab(
+                        qk, q_rope_addr,
+                        kv_fp8_b + Int32(t.kv_smem_stride),
+                        warp_first_cand, lane,
+                        d_rope=t.d_rope,
+                        kv_rope_stride_bytes=staged_kv_stride,
+                    )
+                    qk = s3_mask_and_scale_glm_h8_swap_ab(
+                        qk, tok_buf_view, warp_first_cand,
+                        split_cand_start, split_cand_end, section_len,
+                        sm_scale_log2, lane,
+                    )
+                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                        qk, p, acc_nope, global_max, global_sum,
+                        reduce_max_addr, reduce_sum_addr, warp_id, lane, tid,
+                        n_acc_tiles=n_acc_tiles, hpb=t.hpb, n_warps=4,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                    w_pre = [
+                        p[0] * wr0, p[1] * wr1,
+                        p[2] * wr0, p[3] * wr1,
+                    ]
+                    acc_nope = s6_xv_nope_glm_h8_swap_ab(
+                        w_pre, acc_nope, kv_fp8_b, w_head_sc_view, w_fp8_addr,
+                        warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
+                        hpb=t.hpb, bi=t.bi,
+                        kv_smem_stride=staged_kv_stride,
+                        w_fp8_stride=t.bi + 16, n_warps=4,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                else:
+                    qk = s1_qk_nope_block_scaled(
+                        qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                        warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_stride=t.q_nope_stride,
+                        kv_smem_stride=t.kv_smem_stride,
+                        scale_bytes_per_token=8, scale_format=t.scale_format,
+                    )
+                    qk = s2_qk_rope_bf16(
+                        qk, q_rope_addr, kv_rope_b, warp_first_cand, lane,
+                        d_rope=t.d_rope,
+                    )
+                    qk = s3_mask_and_scale(
+                        qk, tok_buf_view, warp_first_cand,
+                        split_cand_start, split_cand_end, section_len,
+                        sm_scale_log2, lane,
+                    )
+                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    p, wr0, wr1 = s4_online_softmax(
+                        qk, p, acc_nope, acc_rope, global_max, global_sum,
+                        reduce_max_addr, reduce_sum_addr, False,
+                        warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8,
+                        valid_hpb=self.valid_hpb,
+                        num_threads=self.math_threads, barrier_id=3,
+                        n_acc_tiles=n_acc_tiles,
+                    )
+                    w_pre = [
+                        p[0] * wr0, p[1] * wr0,
+                        p[2] * wr1, p[3] * wr1,
+                    ]
+                    s5_fill_sm_p_full(
+                        w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
+                        bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
+                    acc_nope = s6_xv_nope(
+                        w_pre, acc_nope, kv_fp8_b, kv_sc_b,
+                        w_head_sc_view, w_fp8_addr, warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
+                        hpb=t.hpb, bi=t.bi,
+                        kv_smem_stride=t.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16, n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        scale_format=t.scale_format,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
                 if cutlass.const_expr(t.v_has_rope):
@@ -671,10 +753,14 @@ class UnifiedDecodeKernel:
                     accn_frag[at * 4 + 1] = acc_nope[at][1]
                     accn_frag[at * 4 + 2] = acc_nope[at][2]
                     accn_frag[at * 4 + 3] = acc_nope[at][3]
-                accr_frag[0] = acc_rope[0]; accr_frag[1] = acc_rope[1]
-                accr_frag[2] = acc_rope[2]; accr_frag[3] = acc_rope[3]
-                gmax_frag[0] = global_max[0]; gmax_frag[1] = global_max[1]
-                gsum_frag[0] = global_sum[0]; gsum_frag[1] = global_sum[1]
+                accr_frag[0] = acc_rope[0]
+                accr_frag[1] = acc_rope[1]
+                accr_frag[2] = acc_rope[2]
+                accr_frag[3] = acc_rope[3]
+                gmax_frag[0] = global_max[0]
+                gmax_frag[1] = global_max[1]
+                gsum_frag[0] = global_sum[0]
+                gsum_frag[1] = global_sum[1]
 
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                 if tid == Int32(0):
@@ -694,6 +780,18 @@ class UnifiedDecodeKernel:
             fin_acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
+            if cutlass.const_expr(self.native_glm_h8):
+                gid = lane >> Int32(2)
+                pair_lane = gid >> Int32(1)
+                row_gmax0 = cute.arch.shuffle_sync(gmax_frag[0], pair_lane)
+                row_gmax1 = cute.arch.shuffle_sync(gmax_frag[1], pair_lane)
+                row_gsum0 = cute.arch.shuffle_sync(gsum_frag[0], pair_lane)
+                row_gsum1 = cute.arch.shuffle_sync(gsum_frag[1], pair_lane)
+                fin_gmax[0] = row_gmax0
+                fin_gsum[0] = row_gsum0
+                if (gid & Int32(1)) != Int32(0):
+                    fin_gmax[0] = row_gmax1
+                    fin_gsum[0] = row_gsum1
 
             # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
             # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
@@ -719,7 +817,9 @@ class UnifiedDecodeKernel:
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
                 warp_id, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
-                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
+                d_rope=t.d_rope,
+                n_warps=(4 if self.native_glm_h8 else 8),
+                valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
             )
 
@@ -870,10 +970,16 @@ class UnifiedDecodeKernel:
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
 
-        # ── 288 threads = 8 math warps (CONSUMER, warps 0-7) + 1 IO warp (warp 8). ──
+        # Math warps are consumers; the final warp is the IO producer.
         is_io = warp_id >= Int32(self.math_threads // 32)
 
-        kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
+        # Native GLM H8 preserves each cache record's packed 656-byte layout in
+        # smem. This aliases the existing adjacent kv_fp8/kv_sc/kv_rope storage;
+        # it changes neither the allocation size nor the graph-time workspace.
+        staged_kv_stride = (
+            _GLM_KV_GMEM_STRIDE if self.native_glm_h8 else t.kv_smem_stride
+        )
+        kv_fp8_buf = Int32(t.bi * staged_kv_stride)
         kv_rope_buf = Int32(L.kv_rope_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
         tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
@@ -886,7 +992,7 @@ class UnifiedDecodeKernel:
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
-        cute.arch.barrier()  # full-CTA (288) structural fence.
+        cute.arch.barrier()  # Full-CTA structural fence.
 
         # Per-split chunk range [split_first_chunk, split_last_chunk) over BI windows.
         cps = Int32(self.chunks_per_split)
@@ -954,6 +1060,8 @@ class UnifiedDecodeKernel:
             ),
         )
         warp_first_cand = warp_id * Int32(8)
+        if cutlass.const_expr(self.native_glm_h8):
+            warp_first_cand = warp_id * Int32(16)
 
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
@@ -973,9 +1081,11 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.token_idx_buf_bytes // 4)),
                 )
                 io_kw = dict(
-                    bi=t.bi, kv_smem_stride=t.kv_smem_stride, rope_smem_stride=t.d_rope,
+                    bi=t.bi, kv_smem_stride=staged_kv_stride,
+                    rope_smem_stride=t.d_rope,
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
                     scale_format=t.scale_format,
+                    packed_glm=self.native_glm_h8,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -1045,9 +1155,12 @@ class UnifiedDecodeKernel:
             s0_quantize_q_to_smem(
                 q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
                 head_base, Int32(self.valid_hpb), tid,
-                d_nope=t.d_nope, d_rope=t.d_rope, d_qk=t.d_nope + t.d_rope,
-                quant_tile=t.quant_tile, num_scales=t.num_scales, hpb=t.hpb,
-                q_nope_stride=t.q_nope_stride, num_threads=self.math_threads, barrier_id=2,
+                d_nope=t.d_nope, d_rope=t.d_rope,
+                d_qk=t.d_nope + t.d_rope,
+                quant_tile=t.quant_tile, num_scales=t.num_scales,
+                hpb=(8 if self.native_glm_h8 else t.hpb),
+                q_nope_stride=t.q_nope_stride,
+                num_threads=self.math_threads, barrier_id=2,
             )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
@@ -1058,8 +1171,10 @@ class UnifiedDecodeKernel:
                 accn_frag[k] = Float32(0.0)
             for k in cutlass.range_constexpr(4):
                 accr_frag[k] = Float32(0.0)
-            gmax_frag[0] = Float32(-1e30); gmax_frag[1] = Float32(-1e30)
-            gsum_frag[0] = Float32(0.0); gsum_frag[1] = Float32(0.0)
+            gmax_frag[0] = Float32(-1e30)
+            gmax_frag[1] = Float32(-1e30)
+            gsum_frag[0] = Float32(0.0)
+            gsum_frag[1] = Float32(0.0)
 
             cons_phase = Int32(0)
             cons_idx = Int32(0)
@@ -1096,74 +1211,123 @@ class UnifiedDecodeKernel:
                 # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                qk = s1_qk_nope_block_scaled(
-                    qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
-                    warp_first_cand, lane,
-                    num_scales=t.num_scales, quant_tile=t.quant_tile,
-                    q_nope_stride=t.q_nope_stride, kv_smem_stride=t.kv_smem_stride,
-                    scale_bytes_per_token=8, scale_format=t.scale_format,
-                )
-                qk = s2_qk_rope_bf16(
-                    qk, q_rope_addr, kv_rope_b, warp_first_cand, lane, d_rope=t.d_rope,
-                )
-
-                # Per-chunk section dispatch for the S3 mask: compare the
-                # candidate's offset WITHIN ITS SECTION against that section's
-                # length. has_extra=False uses the EXACT pre-P7c expressions
-                # (split_cand_start, section_len) verbatim -> byte-identical PTX.
-                # An extra chunk (ci >= num_main_chunks) re-bases the offset and
-                # swaps in the extra section length; the MATH (S0-S6b) above reads
-                # only the buffered smem, so it is section-agnostic.
-                if cutlass.const_expr(has_extra):
-                    sc_start = split_cand_start
-                    sec_len = section_len
-                    if ci >= num_main_chunks:
-                        sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
-                        sec_len = extra_section_len
-                    sc_end = sc_start + Int32(_CAND_WINDOW)
-                    if sc_end > sec_len:
-                        sc_end = sec_len
-                    qk = s3_mask_and_scale(
-                        qk, tok_buf_view, warp_first_cand,
-                        sc_start, sc_end, sec_len, sm_scale_log2, lane,
+                if cutlass.const_expr(self.native_glm_h8):
+                    qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                        qk, q_fp8_addr, kv_fp8_b, q_sc_view,
+                        warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_stride=t.q_nope_stride,
+                        kv_smem_stride=staged_kv_stride,
                     )
-                else:
+                    qk = s2_qk_rope_bf16_glm_h8_swap_ab(
+                        qk, q_rope_addr,
+                        kv_fp8_b + Int32(t.kv_smem_stride),
+                        warp_first_cand, lane,
+                        d_rope=t.d_rope,
+                        kv_rope_stride_bytes=staged_kv_stride,
+                    )
                     split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
                     if split_cand_end > section_len:
                         split_cand_end = section_len
-                    qk = s3_mask_and_scale(
+                    qk = s3_mask_and_scale_glm_h8_swap_ab(
                         qk, tok_buf_view, warp_first_cand,
                         split_cand_start, split_cand_end, section_len,
                         sm_scale_log2, lane,
                     )
+                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                        qk, p, acc_nope, global_max, global_sum,
+                        reduce_max_addr, reduce_sum_addr, warp_id, lane, tid,
+                        n_acc_tiles=n_acc_tiles, hpb=t.hpb, n_warps=4,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                    w_pre = [
+                        p[0] * wr0, p[1] * wr1,
+                        p[2] * wr0, p[3] * wr1,
+                    ]
+                    acc_nope = s6_xv_nope_glm_h8_swap_ab(
+                        w_pre, acc_nope, kv_fp8_b, w_head_sc_view, w_fp8_addr,
+                        warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
+                        hpb=t.hpb, bi=t.bi,
+                        kv_smem_stride=staged_kv_stride,
+                        w_fp8_stride=t.bi + 16, n_warps=4,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                else:
+                    qk = s1_qk_nope_block_scaled(
+                        qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                        warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_stride=t.q_nope_stride,
+                        kv_smem_stride=t.kv_smem_stride,
+                        scale_bytes_per_token=8, scale_format=t.scale_format,
+                    )
+                    qk = s2_qk_rope_bf16(
+                        qk, q_rope_addr, kv_rope_b, warp_first_cand, lane,
+                        d_rope=t.d_rope,
+                    )
 
-                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                p, wr0, wr1 = s4_online_softmax(
-                    qk, p, acc_nope, acc_rope, global_max, global_sum,
-                    reduce_max_addr, reduce_sum_addr, False,
-                    warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8, valid_hpb=self.valid_hpb,
-                    num_threads=self.math_threads, barrier_id=3,
-                    n_acc_tiles=n_acc_tiles,
-                )
-                w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
+                    # Per-chunk section dispatch for the S3 mask: compare the
+                    # candidate's offset within its main/extra section.
+                    if cutlass.const_expr(has_extra):
+                        sc_start = split_cand_start
+                        sec_len = section_len
+                        if ci >= num_main_chunks:
+                            sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                            sec_len = extra_section_len
+                        sc_end = sc_start + Int32(_CAND_WINDOW)
+                        if sc_end > sec_len:
+                            sc_end = sec_len
+                        qk = s3_mask_and_scale(
+                            qk, tok_buf_view, warp_first_cand,
+                            sc_start, sc_end, sec_len, sm_scale_log2, lane,
+                        )
+                    else:
+                        split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                        if split_cand_end > section_len:
+                            split_cand_end = section_len
+                        qk = s3_mask_and_scale(
+                            qk, tok_buf_view, warp_first_cand,
+                            split_cand_start, split_cand_end, section_len,
+                            sm_scale_log2, lane,
+                        )
 
-                s5_fill_sm_p_full(
-                    w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
-                    bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
-                    num_threads=self.math_threads, barrier_id=3,
-                )
-                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-
-                acc_nope = s6_xv_nope(
-                    w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view, w_fp8_addr,
-                    warp_id, lane, tid,
-                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb, bi=t.bi,
-                    kv_smem_stride=t.kv_smem_stride, w_fp8_stride=t.bi + 16, n_warps=8,
-                    scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
-                    scale_format=t.scale_format,
-                    num_threads=self.math_threads, barrier_id=3,
-                )
+                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    p, wr0, wr1 = s4_online_softmax(
+                        qk, p, acc_nope, acc_rope, global_max, global_sum,
+                        reduce_max_addr, reduce_sum_addr, False,
+                        warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, hpb=t.hpb, n_warps=8,
+                        valid_hpb=self.valid_hpb,
+                        num_threads=self.math_threads, barrier_id=3,
+                        n_acc_tiles=n_acc_tiles,
+                    )
+                    w_pre = [
+                        p[0] * wr0, p[1] * wr0,
+                        p[2] * wr1, p[3] * wr1,
+                    ]
+                    s5_fill_sm_p_full(
+                        w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
+                        bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
+                    acc_nope = s6_xv_nope(
+                        w_pre, acc_nope, kv_fp8_b, kv_sc_b,
+                        w_head_sc_view, w_fp8_addr, warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
+                        hpb=t.hpb, bi=t.bi,
+                        kv_smem_stride=t.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16, n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        scale_format=t.scale_format,
+                        num_threads=self.math_threads, barrier_id=3,
+                    )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
                 if cutlass.const_expr(t.v_has_rope):
@@ -1177,10 +1341,14 @@ class UnifiedDecodeKernel:
                     accn_frag[at * 4 + 1] = acc_nope[at][1]
                     accn_frag[at * 4 + 2] = acc_nope[at][2]
                     accn_frag[at * 4 + 3] = acc_nope[at][3]
-                accr_frag[0] = acc_rope[0]; accr_frag[1] = acc_rope[1]
-                accr_frag[2] = acc_rope[2]; accr_frag[3] = acc_rope[3]
-                gmax_frag[0] = global_max[0]; gmax_frag[1] = global_max[1]
-                gsum_frag[0] = global_sum[0]; gsum_frag[1] = global_sum[1]
+                accr_frag[0] = acc_rope[0]
+                accr_frag[1] = acc_rope[1]
+                accr_frag[2] = acc_rope[2]
+                accr_frag[3] = acc_rope[3]
+                gmax_frag[0] = global_max[0]
+                gmax_frag[1] = global_max[1]
+                gsum_frag[0] = global_sum[0]
+                gsum_frag[1] = global_sum[1]
 
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                 if tid == Int32(0):
@@ -1200,6 +1368,18 @@ class UnifiedDecodeKernel:
             fin_acc_rope = [accr_frag[0], accr_frag[1], accr_frag[2], accr_frag[3]]
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
+            if cutlass.const_expr(self.native_glm_h8):
+                gid = lane >> Int32(2)
+                pair_lane = gid >> Int32(1)
+                row_gmax0 = cute.arch.shuffle_sync(gmax_frag[0], pair_lane)
+                row_gmax1 = cute.arch.shuffle_sync(gmax_frag[1], pair_lane)
+                row_gsum0 = cute.arch.shuffle_sync(gsum_frag[0], pair_lane)
+                row_gsum1 = cute.arch.shuffle_sync(gsum_frag[1], pair_lane)
+                fin_gmax[0] = row_gmax0
+                fin_gsum[0] = row_gsum0
+                if (gid & Int32(1)) != Int32(0):
+                    fin_gmax[0] = row_gmax1
+                    fin_gsum[0] = row_gsum1
 
             # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
             # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
@@ -1225,7 +1405,9 @@ class UnifiedDecodeKernel:
                 fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum, out_o, out_lse,
                 warp_id, lane,
                 n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, d_nope=t.d_nope,
-                d_rope=t.d_rope, n_warps=8, valid_hpb=self.valid_hpb,
+                d_rope=t.d_rope,
+                n_warps=(4 if self.native_glm_h8 else 8),
+                valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv, v_has_rope=t.v_has_rope,
             )
 
@@ -1325,15 +1507,33 @@ def _sparse_mla_decode_grid_flat_launch(
     has_extra: bool,
     per_token_len: bool,
 ) -> None:
+    q_head_dim = int(q_all.shape[-1])
+    rows = int(q_all.shape[0])
+    heads = int(q_all.shape[1])
+    native_glm_h8 = bool(
+        int(model_type) == int(ModelType.GLM_NSA)
+        and heads == 8
+        and int(valid_hpb) == 8
+        and int(grid_h_blocks) == 1
+        and int(head_block_offset) == 0
+        and not bool(has_extra)
+        and _env_glm_h8_native_enabled()
+    )
     traits = make_unified_traits(
         int(model_type),
         int(compute_mode),
         int(scale_format),
     )
+    if native_glm_h8:
+        # Four warps cover 4*16 candidates in swapped QK.  PV keeps the same
+        # total 128 output columns per V group via four N-tiles per warp.
+        traits = replace(
+            traits,
+            nt_per_warp_xv=4,
+            math_threads=128,
+            block_threads=160,
+        )
     layout = make_smem_layout(traits)
-    q_head_dim = int(q_all.shape[-1])
-    rows = int(q_all.shape[0])
-    heads = int(q_all.shape[1])
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1406,6 +1606,7 @@ def _sparse_mla_decode_grid_flat_launch(
         valid_hpb=int(valid_hpb),
         head_block_offset=int(head_block_offset),
         per_token_len=bool(per_token_len),
+        native_glm_h8=native_glm_h8,
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -1424,6 +1625,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("pbs_extra", int(pbs_extra)),
         key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         key_field("per_token_len", int(per_token_len)),
+        key_field("native_glm_h8", int(native_glm_h8)),
         tensor_key(
             "q_all",
             q_all,
@@ -1480,7 +1682,7 @@ def _sparse_mla_decode_grid_flat_launch(
             )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.sm120.decode",
-        6,
+        8,
         *spec_fields,
     )
     if per_token_len:
@@ -1800,9 +2002,27 @@ def run_unified_decode(
     )
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
+    native_glm_h8 = bool(
+        int(model_type) == int(ModelType.GLM_NSA)
+        and int(heads) == 8
+        and not has_extra
+        and _env_glm_h8_native_enabled()
+    )
     LAST_DECODE_PLAN.clear()
     LAST_DECODE_PLAN.update(
         model_type=str(model_type),
+        native_glm_h8=native_glm_h8,
+        math_warps=(4 if native_glm_h8 else 8),
+        block_threads=(160 if native_glm_h8 else int(traits.block_threads)),
+        io_warps=1,
+        kv_stage_packed=native_glm_h8,
+        kv_smem_stride=(
+            _GLM_KV_GMEM_STRIDE
+            if native_glm_h8
+            else int(traits.kv_smem_stride)
+        ),
+        qk_candidates_per_warp=(16 if native_glm_h8 else 8),
+        qk_swap_ab=native_glm_h8,
         topk=int(topk),
         extra_topk=int(extra_topk),
         has_extra=bool(has_extra),

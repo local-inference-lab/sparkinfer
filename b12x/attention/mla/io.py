@@ -1,11 +1,11 @@
-"""DSV4 sparse-MLA decode IO-warp PRODUCER (P6 warp-specialized pipeline).
+"""Sparse-MLA decode IO-warp PRODUCER (P6 warp-specialized pipeline).
 
-The unified SM120 decode CTA runs 288 threads = 8 MATH warps (warps 0-7, 256
-threads, the CONSUMER) + 1 IO warp (warp 8, 32 threads, the PRODUCER). This
-module is the producer body: per chunk it waits on the ``empty`` mbarrier for
-the target KV buffer, gathers the BI=64 candidate rows from the paged FP8 KV
-cache into the double-buffered smem KV regions via ``cp.async.bulk``, gathers
-the UE8M0 footer scales (scalar, fenced), and signals ``full`` via
+The generic SM120 decode CTA uses 8 math warps plus one IO warp; native GLM H8
+uses 4 math warps plus one IO warp. This module is the producer body: per chunk
+it waits on the ``empty`` mbarrier for the target KV buffer, gathers the BI=64
+candidate rows from the paged FP8 KV cache into the double-buffered smem KV
+regions via ``cp.async.bulk``, gathers DSV4 UE8M0 footer scales when present,
+and signals ``full`` via
 ``mbarrier_arrive_and_expect_tx`` so the bulk completion drives the transaction
 count to zero.
 
@@ -96,6 +96,7 @@ def io_issue_gather(
     bulk_tx_bytes: cutlass.Constexpr,      # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
     scale_format: cutlass.Constexpr = 0,   # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
+    packed_glm: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -115,9 +116,9 @@ def io_issue_gather(
       2. CTA-scope fence so those footer/index stores are visible before the
          leader's expect_tx (mbarrier.try_wait.parity has NO implicit fence).
       3. IO leader (io_lane 0) arrive + expect_tx(BULK_TX_BYTES) on full[buf].
-      4. cp.async.bulk NoPE (448B) + RoPE (128B) per entry; bulk completion
-         decrements the full[buf] tx. 32 IO threads -> 2 unrolled passes cover
-         BI=64 entries -> 4 cp.async.bulk in the static PTX.
+      4. cp.async.bulk each entry; DSV4 issues separate NoPE (448B) and RoPE
+         (128B) copies, while packed GLM H8 issues one contiguous 656B copy.
+         Bulk completion decrements the full[buf] transaction count.
 
     DUAL-CACHE (DSV4 only; FlashInfer ``issue_gather`` :243-306): this function
     gathers ONE chunk from ONE section. The dual-cache section dispatch lives in
@@ -212,18 +213,30 @@ def io_issue_gather(
             )
             data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
 
-            # NoPE (DSV4 448B e4m3 / GLM 528B e4m3+inline-fp32) -> kv_fp8 row.
-            cp_async_bulk_g2s_mbar(
-                kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
-                data_base_i64,
-                _NOPE,
-                full_mbar_u32,
-            )
-            # RoPE: 128B -> kv_rope[entry*D_ROPE bf16] (byte stride = D_ROPE*2).
-            cp_async_bulk_g2s_mbar(
-                kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
-                data_base_i64 + _ROPE_SRC,
-                _ROPE,
-                full_mbar_u32,
-            )
+            if cutlass.const_expr(packed_glm):
+                # Native GLM H8 keeps the source's contiguous 656-byte record
+                # intact in smem.  This replaces the separate 528B + 128B bulk
+                # operations with one transaction while using exactly the same
+                # total double-buffered storage.
+                cp_async_bulk_g2s_mbar(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                    data_base_i64,
+                    Int32(_GLM_GMEM_STRIDE),
+                    full_mbar_u32,
+                )
+            else:
+                # NoPE (DSV4 448B e4m3 / GLM 528B e4m3+inline-fp32) -> kv_fp8 row.
+                cp_async_bulk_g2s_mbar(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                    data_base_i64,
+                    _NOPE,
+                    full_mbar_u32,
+                )
+                # RoPE: 128B -> kv_rope[entry*D_ROPE bf16] (byte stride = D_ROPE*2).
+                cp_async_bulk_g2s_mbar(
+                    kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+                    data_base_i64 + _ROPE_SRC,
+                    _ROPE,
+                    full_mbar_u32,
+                )
         eo += Int32(io_threads)

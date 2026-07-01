@@ -86,16 +86,7 @@ except Exception:  # pragma: no cover - optional dependency
     _sgl_fast_topk_transform_ragged_fused = None
 
 
-GLM52_CONTRACT = {
-    "num_hidden_layers": 78,
-    "num_attention_heads": 64,
-    "index_n_heads": 32,
-    "index_head_dim": 128,
-    "index_topk": 2048,
-    "qk_nope_head_dim": 192,
-    "qk_rope_head_dim": 64,
-    "kv_lora_rank": 512,
-}
+DEFAULT_GLM52_HF_REPO_ID = "lukealonso/GLM-5.2-NVFP4"
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 65536, 131072)
 DEFAULT_PREFILL_Q_LENS = (2048, 16384)
@@ -373,6 +364,29 @@ class BenchmarkFailure(RuntimeError):
         self.case = case
 
 
+def _resolve_cached_hf_config(
+    repo_id: str = DEFAULT_GLM52_HF_REPO_ID,
+    *,
+    cache_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    from huggingface_hub import try_to_load_from_cache
+
+    cached_config = try_to_load_from_cache(
+        repo_id=repo_id,
+        filename="config.json",
+        cache_dir=cache_root,
+        revision="main",
+    )
+    if isinstance(cached_config, str):
+        return pathlib.Path(cached_config)
+
+    cache_desc = "the configured Hugging Face cache" if cache_root is None else str(cache_root)
+    raise SystemExit(
+        f"cached Hugging Face config not found for {repo_id!r} in {cache_desc}; "
+        "populate the cache or pass --model-config /path/to/config.json"
+    )
+
+
 def _load_glm_contract_config(
     *,
     tp_size: int,
@@ -380,11 +394,11 @@ def _load_glm_contract_config(
     model_config: pathlib.Path | None = None,
 ) -> GLMDecodeContractConfig:
     if model_config is None:
-        config = GLM52_CONTRACT
-    else:
-        if not model_config.is_file():
-            raise SystemExit(f"model config not found at {model_config}")
-        config = json.loads(model_config.read_text())
+        model_config = _resolve_cached_hf_config()
+    model_config = model_config.expanduser()
+    if not model_config.is_file():
+        raise SystemExit(f"model config not found at {model_config}")
+    config = json.loads(model_config.read_text())
     num_attention_heads = int(config["num_attention_heads"])
     if num_attention_heads % tp_size != 0:
         raise SystemExit(
@@ -2518,7 +2532,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model-config",
         type=pathlib.Path,
         default=None,
-        help="optional Hugging Face config.json override; default is the built-in GLM-5.2 contract",
+        help=(
+            "Hugging Face config.json override; by default resolve "
+            f"{DEFAULT_GLM52_HF_REPO_ID} from the local Hugging Face cache"
+        ),
     )
     parser.add_argument(
         "--reference",

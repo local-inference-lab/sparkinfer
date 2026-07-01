@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
 from benchmarks import benchmark_mla
+
+
+_GLM52_TEST_CONFIG = {
+    "num_hidden_layers": 78,
+    "num_attention_heads": 64,
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "qk_nope_head_dim": 192,
+    "qk_rope_head_dim": 64,
+    "kv_lora_rank": 512,
+}
+
+
+def _write_glm52_config(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_GLM52_TEST_CONFIG))
 
 
 def test_build_decode_cases_covers_requested_matrix_and_topk_cap() -> None:
@@ -131,7 +150,32 @@ def test_target_glm52_preset_preserves_explicit_packed_stride_regression() -> No
     assert args.cache_page_stride_bytes == -1
 
 
-def test_glm52_all_layer_cache_bytes_match_layer_page_contract() -> None:
+def test_resolve_cached_hf_config_follows_main_ref(tmp_path) -> None:
+    repo_cache = tmp_path / "models--lukealonso--GLM-5.2-NVFP4"
+    revision = "test-revision"
+    config_path = repo_cache / "snapshots" / revision / "config.json"
+    _write_glm52_config(config_path)
+    main_ref = repo_cache / "refs" / "main"
+    main_ref.parent.mkdir(parents=True)
+    main_ref.write_text(revision)
+
+    resolved = benchmark_mla._resolve_cached_hf_config(cache_root=tmp_path)
+
+    assert resolved == config_path
+
+
+def test_glm52_all_layer_cache_bytes_match_cached_config(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_glm52_config(config_path)
+    monkeypatch.setattr(
+        benchmark_mla,
+        "_resolve_cached_hf_config",
+        lambda: config_path,
+    )
+
     cfg = benchmark_mla._load_glm_contract_config(tp_size=8, tp_rank=0)
 
     assert cfg.index_cache_page_bytes == 8_448

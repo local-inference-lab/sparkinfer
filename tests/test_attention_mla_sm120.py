@@ -1229,14 +1229,21 @@ def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
     return plan, storage
 
 
-def _run_unified_glm(device, *, topk, forced_num_splits, seed):
-    """Build a glm_ref GLM decode case (num_heads=128), run the REAL launcher over
-    the GLM 656B cache + sparse scratch, return (got_O, exp_O, eff_splits)."""
+def _run_unified_glm(
+    device,
+    *,
+    topk,
+    forced_num_splits,
+    seed,
+    num_heads=_GLM_NUM_HEADS,
+    use_length_tensor=True,
+):
+    """Build a glm_ref GLM decode case and run the real unified launcher."""
     from b12x.attention.mla.kernel import run_unified_decode
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=_GLM_NUM_HEADS, topk=topk, num_blocks=nblk,
+        num_heads=num_heads, topk=topk, num_blocks=nblk,
         page_block_size=_GLM_PAGE, invalidate_half=True, seed=seed, device=device,
     )
     q = case["q"].contiguous()                    # [1, 128, 576] bf16
@@ -1249,7 +1256,7 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
     n_chunks = (topk + 64 - 1) // 64
     max_chunks = max(8, forced_num_splits)
     plan, storage = _make_glm_sparse_scratch(
-        device, topk=topk, max_chunks=max_chunks, num_heads=_GLM_NUM_HEADS, s_kv=s_kv,
+        device, topk=topk, max_chunks=max_chunks, num_heads=num_heads, s_kv=s_kv,
     )
     cache_seqlens = torch.full((1,), s_kv, dtype=torch.int32, device=device)
     nsa_seqlens = torch.full((1,), topk, dtype=torch.int32, device=device)
@@ -1262,7 +1269,7 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
         q_all=q,
         swa_k_cache=kv_cache,
         swa_indices=idx,
-        swa_topk_lengths=nsa_seqlens,
+        swa_topk_lengths=(nsa_seqlens if use_length_tensor else None),
         workspace=binding.scratch,
         sm_scale=sm_scale,
         swa_page_size=_GLM_PAGE,
@@ -1270,6 +1277,78 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
     )
     torch.cuda.synchronize()
     return out[0].float(), exp_O, min(forced_num_splits, n_chunks)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("forced_num_splits", [1, 4])
+def test_unified_decode_glm_tp8_native_swap_ab_matches_reference(
+    forced_num_splits,
+) -> None:
+    """GLM TP8 uses the native four-warp swapped-QK decode specialization."""
+    device = require_sm120_sparse_mla()
+    import b12x.attention.mla.kernel as launch
+
+    got_O, exp_O, _ = _run_unified_glm(
+        device,
+        topk=256,
+        forced_num_splits=forced_num_splits,
+        seed=52_008 + forced_num_splits,
+        num_heads=8,
+    )
+    plan = launch.LAST_DECODE_PLAN
+    assert plan.get("native_glm_h8") is True
+    assert plan.get("qk_swap_ab") is True
+    assert plan.get("math_warps") == 4
+    assert plan.get("block_threads") == 160
+    assert plan.get("io_warps") == 1
+    assert plan.get("kv_stage_packed") is True
+    assert plan.get("kv_smem_stride") == 656
+    assert plan.get("qk_candidates_per_warp") == 16
+    assert torch.isfinite(got_O).all()
+    assert (got_O != 0).any()
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"GLM TP8 splits={forced_num_splits} O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_tp8_native_matches_padded_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native TP8 path preserves the former padded decode numerics."""
+    device = require_sm120_sparse_mla()
+    kwargs = dict(
+        topk=256,
+        forced_num_splits=4,
+        seed=52_016,
+        num_heads=8,
+    )
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "0")
+    padded, _, _ = _run_unified_glm(device, **kwargs)
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "1")
+    native, _, _ = _run_unified_glm(device, **kwargs)
+    assert _cosine(native, padded) > 0.999999
+    assert (native - padded).abs().max().item() < 1e-3
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None:
+    """The uniform scalar-length entry uses the same native TP8 math path."""
+    device = require_sm120_sparse_mla()
+    import b12x.attention.mla.kernel as launch
+
+    got_O, exp_O, _ = _run_unified_glm(
+        device,
+        topk=128,
+        forced_num_splits=1,
+        seed=52_128,
+        num_heads=8,
+        use_length_tensor=False,
+    )
+    assert launch.LAST_DECODE_PLAN.get("native_glm_h8") is True
+    assert launch.LAST_DECODE_PLAN.get("per_token_len") is False
+    assert _cosine(got_O, exp_O) > 0.999
+    assert (got_O - exp_O).abs().max().item() < 3e-2
 
 
 @torch.inference_mode()
