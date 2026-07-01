@@ -1023,11 +1023,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
         )
         assert returned.data_ptr() == out.data_ptr(), mode
         assert not torch.isnan(out.float()).any(), mode
-        # The extend kernel has a small run-to-run wobble on partially-valid
-        # tiles, so compare with a tolerance rather than bitwise.
-        torch.testing.assert_close(
-            out.float(), baseline.float(), atol=0.05, rtol=0.0, msg=mode
-        )
+        assert torch.equal(out, baseline), mode
 
     swa_indices, swa_lengths = _make_swa(512)
     binding = _make_compressed_binding(
@@ -1079,3 +1075,57 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
             sm_scale=_SM_SCALE,
             out=non_contiguous,
         )
+
+
+@torch.inference_mode()
+def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
+    """Guards the s4_finalize_row_sum_mg2 scratch-reuse barrier: the epilogue's
+    persistent-max reads must complete before the row-sum reduction overwrites
+    the scratch. Without it, outputs wobble run-to-run (worst for short
+    topk_lengths) and depend on unrelated memory traffic."""
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows, width = 8, 512
+    q = _make_q(rows=rows, seed=411, device=device)
+    swa_cache = _make_cache(
+        tokens=64, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=412, device=device
+    )
+    swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+    for row in range(rows):
+        length = min(width, row + 1)
+        swa_indices[row, :length] = (
+            torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
+            % 64
+        )
+        swa_lengths[row] = length
+    attn_sink = torch.linspace(
+        -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
+    )
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=width,
+        max_kv_rows=rows * width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+    binding.scratch.mode = "extend"
+
+    def call() -> torch.Tensor:
+        return compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        ).clone()
+
+    base = call()
+    # Dirty L2/DRAM between runs; a stale/racing read would surface as a
+    # run-to-run difference.
+    garbage = torch.empty(64 * 1024 * 1024, dtype=torch.float32, device=device)
+    for _ in range(10):
+        garbage.uniform_(-1e30, 1e30)
+        assert torch.equal(call(), base)

@@ -1408,6 +1408,11 @@ def s4_finalize_row_sum_mg2(
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
+    # The sum scratch still holds the persistent max that the caller's
+    # final_gmax reads consume; every warp must finish those reads before the
+    # stores below reuse the region (racecheck-confirmed hazard otherwise).
+    cute.arch.barrier(**bar_kw)
+
     if tid == Int32(0):
         st_shared_f32(reduce0_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs0[0])
         if cutlass.const_expr(hi0):
