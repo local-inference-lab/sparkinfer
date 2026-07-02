@@ -98,20 +98,33 @@ def pack_index_k_cache_reference(
     )
 
     data_bytes = page_size * _INDEX_HEAD_DIM
-    for token_idx in range(num_tokens):
-        page_idx = token_idx // page_size
-        slot_idx = token_idx % page_size
-        row = k_matrix[token_idx]
-        scale = row.abs().amax() / _FP8_E4M3_MAX
-        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-        quant = (row / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        cache[page_idx, slot_idx * _INDEX_HEAD_DIM : (slot_idx + 1) * _INDEX_HEAD_DIM] = (
-            quant.view(torch.uint8)
-        )
-        scale_offset = data_bytes + slot_idx * _SCALE_BYTES
-        cache[page_idx, scale_offset : scale_offset + _SCALE_BYTES] = (
-            scale.reshape(1).view(torch.uint8)
-        )
+    scales = k_matrix.abs().amax(dim=1) / _FP8_E4M3_MAX
+    scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    quant = (
+        (k_matrix / scales.unsqueeze(1))
+        .clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    # The packed page is planar: all 64 quantized 128-byte rows followed by
+    # all 64 FP32 scales.  Populate those two planes in bulk; the previous
+    # per-token Python loop launched several tiny CUDA operations per row and
+    # made production-capacity benchmark setup take minutes.
+    padded_tokens = num_pages * page_size
+    quant_padded = torch.zeros(
+        (padded_tokens, _INDEX_HEAD_DIM), dtype=torch.uint8, device=k_matrix.device
+    )
+    scale_padded = torch.zeros(
+        (padded_tokens,), dtype=torch.float32, device=k_matrix.device
+    )
+    quant_padded[:num_tokens].copy_(quant.view(torch.uint8))
+    scale_padded[:num_tokens].copy_(scales)
+    cache[:, :data_bytes].view(
+        num_pages, page_size, _INDEX_HEAD_DIM
+    ).copy_(quant_padded.view(num_pages, page_size, _INDEX_HEAD_DIM))
+    cache[:, data_bytes:].view(torch.float32).copy_(
+        scale_padded.view(num_pages, page_size)
+    )
     return cache.contiguous()
 
 

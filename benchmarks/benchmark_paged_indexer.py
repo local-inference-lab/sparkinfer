@@ -71,66 +71,75 @@ def _validate_analytic_topk(
     output_physical_slots: bool,
 ) -> float:
     """Validate every target-shape row against a cheap analytic top-k oracle."""
-    max_abs = 0.0
-    for row in range(indices.shape[0]):
-        seq_len = int(seqlens[row].item())
-        valid_count = min(int(topk), seq_len)
-        row_indices = indices[row]
-        valid_mask = row_indices >= 0
-        if int(valid_mask.sum().item()) != valid_count:
-            raise AssertionError(
-                "analytic top-k valid-count mismatch: "
-                f"row={row} actual={int(valid_mask.sum().item())} "
-                f"expected={valid_count}"
-            )
-        if not bool((row_indices[~valid_mask] == -1).all().item()):
-            raise AssertionError(f"analytic top-k invalid tail is not -1 for row={row}")
+    columns = torch.arange(topk, dtype=torch.int32, device=indices.device)
+    valid_counts = torch.minimum(seqlens, torch.full_like(seqlens, int(topk)))
+    valid_mask = indices >= 0
+    actual_counts = valid_mask.sum(dim=1)
+    bad_counts = actual_counts != valid_counts
+    if bool(bad_counts.any().item()):
+        row = int(torch.nonzero(bad_counts, as_tuple=False)[0, 0].item())
+        raise AssertionError(
+            "analytic top-k valid-count mismatch: "
+            f"row={row} actual={int(actual_counts[row].item())} "
+            f"expected={int(valid_counts[row].item())}"
+        )
+    if bool((indices[~valid_mask] != -1).any().item()):
+        raise AssertionError("analytic top-k invalid entries must be -1")
 
-        expected_logical = seq_len - valid_count + torch.arange(
-            valid_count,
-            dtype=torch.int32,
-            device=indices.device,
+    expected_valid = columns.unsqueeze(0) < valid_counts.unsqueeze(1)
+    expected_logical = (
+        seqlens.unsqueeze(1) - valid_counts.unsqueeze(1) + columns.unsqueeze(0)
+    )
+    expected_page_cols = torch.div(expected_logical, 64, rounding_mode="floor")
+    expected_page_offsets = torch.remainder(expected_logical, 64)
+    expected_page_ids = torch.gather(
+        real_page_table,
+        1,
+        expected_page_cols.clamp_(min=0).to(torch.int64),
+    )
+    expected_physical = expected_page_ids * 64 + expected_page_offsets
+    expected_indices = expected_physical if output_physical_slots else expected_logical
+    expected_indices = torch.where(
+        expected_valid, expected_indices, torch.full_like(expected_indices, -1)
+    )
+    actual_sorted = torch.sort(indices, dim=1).values
+    expected_sorted = torch.sort(expected_indices, dim=1).values
+    bad_rows = (actual_sorted != expected_sorted).any(dim=1)
+    if bool(bad_rows.any().item()):
+        row = int(torch.nonzero(bad_rows, as_tuple=False)[0, 0].item())
+        actual_valid_indices = indices[row][valid_mask[row]]
+        expected_valid_indices = expected_indices[row][expected_valid[row]]
+        actual_set = set(actual_valid_indices.tolist())
+        expected_set = set(expected_valid_indices.tolist())
+        missing = sorted(expected_set - actual_set)[:8]
+        extra = sorted(actual_set - expected_set)[:8]
+        raise AssertionError(
+            "analytic top-k index oracle mismatch: "
+            f"row={row} missing={missing} extra={extra} "
+            f"actual_unique={len(actual_set)} expected_unique={len(expected_set)}"
         )
-        expected_page_cols = torch.div(
-            expected_logical, 64, rounding_mode="floor"
-        )
-        expected_page_offsets = torch.remainder(expected_logical, 64)
-        expected_page_ids = real_page_table[row].index_select(
-            0, expected_page_cols.to(torch.int64)
-        )
-        expected_physical = expected_page_ids * 64 + expected_page_offsets
-        expected_indices = (
-            expected_physical if output_physical_slots else expected_logical
-        )
-        actual_valid_indices = row_indices[valid_mask]
-        if not torch.equal(
-            torch.sort(actual_valid_indices).values,
-            torch.sort(expected_indices).values,
-        ):
-            raise AssertionError(f"analytic top-k index oracle mismatch for row={row}")
 
-        actual_valid_scores = scores[row][valid_mask]
-        if not bool(torch.isfinite(actual_valid_scores).all().item()):
-            raise AssertionError(f"top-k valid scores are non-finite for row={row}")
-        if output_physical_slots:
-            score_indices = actual_valid_indices
-        else:
-            actual_page_cols = torch.div(
-                actual_valid_indices, 64, rounding_mode="floor"
-            )
-            actual_page_offsets = torch.remainder(actual_valid_indices, 64)
-            actual_page_ids = real_page_table[row].index_select(
-                0, actual_page_cols.to(torch.int64)
-            )
-            score_indices = actual_page_ids * 64 + actual_page_offsets
-        expected_scores = analytic_scores.index_select(
-            0, score_indices.to(torch.int64)
+    safe_indices = indices.clamp(min=0)
+    if output_physical_slots:
+        score_indices = safe_indices
+    else:
+        actual_page_cols = torch.div(safe_indices, 64, rounding_mode="floor")
+        actual_page_offsets = torch.remainder(safe_indices, 64)
+        actual_page_ids = torch.gather(
+            real_page_table, 1, actual_page_cols.to(torch.int64)
         )
-        row_max_abs = float((actual_valid_scores - expected_scores).abs().max().item())
-        max_abs = max(max_abs, row_max_abs)
-        torch.testing.assert_close(
-            actual_valid_scores, expected_scores, rtol=2e-3, atol=2e-3
-        )
+        score_indices = actual_page_ids * 64 + actual_page_offsets
+    expected_scores = analytic_scores[score_indices.to(torch.int64)]
+    actual_valid_scores = scores[valid_mask]
+    expected_valid_scores = expected_scores[valid_mask]
+    if not bool(torch.isfinite(actual_valid_scores).all().item()):
+        raise AssertionError("top-k valid scores are non-finite")
+    max_abs = float(
+        (actual_valid_scores - expected_valid_scores).abs().max().item()
+    )
+    torch.testing.assert_close(
+        actual_valid_scores, expected_valid_scores, rtol=2e-3, atol=2e-3
+    )
     return max_abs
 
 
@@ -425,14 +434,39 @@ def main() -> None:
         # span. Kernel outputs are logical token indices, so every row must have
         # the same logical score oracle even when its physical pages are offset.
         analytic_span = cache_tokens if page_stride == 0 else page_stride * 64
-        analytic_base = torch.linspace(
-            0.25, 1.0, analytic_span, dtype=torch.float32, device=device
-        )
+        # Give the entire causal tail that can enter any row's top-k a strict,
+        # unit-spaced ordering, while leaving older tokens tied safely below it.
+        # A globally linear 266K ramp either exceeds FP16_MAX or packs too many
+        # candidates into one high-byte radix bin; this bounded tail remains an
+        # exact index oracle without violating the selector's refinement capacity.
+        tail_span = rows + int(args.topk) + 1024
+        tail_start = max(int(seq_len) - tail_span, 0)
+        analytic_base = 1.0 + (
+            torch.arange(analytic_span, dtype=torch.float32, device=device)
+            - float(tail_start)
+        ).clamp_(min=0.0)
         analytic_scores = analytic_base.repeat(
             (cache_tokens + analytic_span - 1) // analytic_span
         )[:cache_tokens]
-        k_source = torch.zeros((cache_tokens, 128), dtype=torch.float32, device=device)
-        k_source[:, 0] = analytic_scores
+        # Construct the planar FP8+scale cache directly.  Every K row has one
+        # positive component: quantized value 448 in column zero and scale
+        # analytic_score/448.  This is exactly what the reference packer would
+        # produce, without materializing an O(cache_tokens * 128) FP32 tensor.
+        packed_index_k_cache = torch.zeros(
+            (cache_num_pages, logical_cache_page_bytes),
+            dtype=torch.uint8,
+            device=device,
+        )
+        quant_plane = packed_index_k_cache[:, : 64 * 128].view(
+            cache_num_pages, 64, 128
+        )
+        fp8_max_byte = int(
+            torch.tensor(448.0, dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+        )
+        quant_plane[..., 0].fill_(fp8_max_byte)
+        packed_index_k_cache[:, 64 * 128 :].view(torch.float32).copy_(
+            (analytic_scores / 448.0).view(cache_num_pages, 64)
+        )
     else:
         q_fp8 = (
             torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device)
@@ -445,7 +479,7 @@ def main() -> None:
             torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(device)
             / 3
         )
-    packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
+        packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
     # Match vLLM's rank-3 allocation, whose page bytes are planar
     # [64*128 quant][64*4 scales], then reproduce its zero-copy flattening for
     # b12x. The apparent [64, 132] shape is an allocation contract, not an

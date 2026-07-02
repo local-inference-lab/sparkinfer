@@ -49,6 +49,25 @@ def test_fused_indexer_route_uses_capture_static_glm_buckets(
     )
 
 
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_fused_indexer_route_covers_c4_decode_buckets(rows):
+    assert resolve_fused_indexer_path(
+        topk=512,
+        num_rows=rows,
+        width=4160 * 64,
+        num_heads=64,
+    )
+
+
+def test_fused_indexer_route_stops_after_c4_decode_buckets():
+    assert not resolve_fused_indexer_path(
+        topk=512,
+        num_rows=65,
+        width=4160 * 64,
+        num_heads=64,
+    )
+
+
 def _build_case(rows, heads, seqlen, topk, *, seed, device):
     g = torch.Generator(device="cpu").manual_seed(seed)
     pr = (seqlen + _PS - 1) // _PS

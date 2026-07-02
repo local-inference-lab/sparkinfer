@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 import b12x.attention.indexer.api as indexer_impl
@@ -227,6 +228,42 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
     assert paged_plan.layout.route in {"paged_tiled", "paged_fused"}
     assert contiguous_plan.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS
     assert contiguous_plan.layout.max_k_rows == 1024
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_indexer_common_plan_selects_fused_for_c4_decode_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=64,
+            max_q_rows=rows,
+            max_page_table_width=4160,
+            topk=512,
+            mode="decode",
+        )
+    )
+
+    assert plan.layout.route == "paged_fused"
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
+def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=64,
+            max_q_rows=rows,
+            max_page_table_width=4160,
+            topk=512,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+
+    assert plan.layout.route == "packed_contiguous"
+    assert plan.layout.prefill_block_k == 512
 
 
 def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(

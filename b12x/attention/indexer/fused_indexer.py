@@ -86,6 +86,7 @@ from b12x.cute.fp4 import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     ld_shared_v4_u32,
+    st_shared_u8,
     st_shared_v4_u32,
     threadfence,
 )
@@ -101,23 +102,14 @@ _MAX_CHUNK_ELEMENTS = 8192
 KV_LAYOUT_CONTIGUOUS_MLA = 0
 KV_LAYOUT_PAGED = 1
 
-# The general route is by row count. GLM's measured boundary also uses small
-# capture-static width-capacity buckets below; neither policy reads live seqlen,
-# so vLLM graph replay cannot change the selected backend.
-#
-# Measured HBM-bound (L2-flushed, graph min_us, sm120, heads=64) fused-vs-supertile
-# vs the PRODUCTION chunked supertile (supertile_k=32768, num_chunks=ceil(seq/32k)).
-# Earlier L2-hot single-pass numbers were misleading -- with L2 flushed and supertile
-# chunked realistically, fused wins/ties rows<=6 and the win EXPLODES with context
-# because chunked supertile re-scores per 32k chunk while fused streams once:
-#   rows=1: 256k 0.50x, 128k 0.59x, 64k 0.73x, 32k tie
-#   rows=6: 256k 0.87x, 128k 0.89x, 64k 0.94x, 32k ~tie (topk512 +2us, topk2048 -4us)
-#   rows=8: supertile wins (fused's per-row scoring is HBM-bandwidth-starved at
-#           ctas_per_group=num_sms/rows~=23). So 6 is the cut.
-# Small decode batches with long context are exactly fused's niche; supertile owns
-# larger batches AND prefill (m=q-rows, where fused's m=heads degenerates to 1
-# CTA/row). FUSED_MIN_WIDTH retained only for capacity sizing.
-FUSED_MAX_ROWS = 6           # decode-batch crossover: fused wins rows <= this (HBM-bound)
+# Route metadata is capture-static; live seqlen is deliberately not a policy input,
+# so vLLM graph replay cannot switch backends.  The generic and GLM policies retain
+# their measured small-row limits.  C4's heads=64/topk=512 shape is materially
+# different: production-path, L2-flushed SM120 measurements at 4K, 8K, 16K, and
+# 266K capacity show fused winning for every newly routed B8-B64 serving bucket.
+# Prefill remains packed-contiguous and never reaches this decode-only resolver.
+FUSED_MAX_ROWS = 6
+_C4_FUSED_MAX_ROWS = 64
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
 _GLM32_FUSED_MAX_ROWS_SHORT = 1
 _GLM32_FUSED_MAX_ROWS_32K = 5
@@ -427,13 +419,16 @@ def resolve_fused_indexer_path(
     Row count, head count, top-k, and width here are all capture-time workspace
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
-    rows. GLM's 32-head/top-k-2048 shape has measured capacity buckets after the
-    vectorized-Q and merge-crossover tuning: below 16k only B1 wins; from 16k
-    through 32k fused wins/ties through B5 and B6 loses. Above 32k this targeted
-    retune leaves the separately benchmarked general six-row policy unchanged.
+    rows. C4's 64-head/top-k-512 shape uses fused through B64. GLM's
+    32-head/top-k-2048 shape has measured capacity buckets after the vectorized-Q
+    and merge-crossover tuning: below 16k only B1 wins; from 16k through 32k fused
+    wins/ties through B5 and B6 loses. Above 32k this targeted retune leaves the
+    separately benchmarked general six-row policy unchanged.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
+    if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
+        return int(num_rows) <= _C4_FUSED_MAX_ROWS
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
         if int(width) < 16384:
             return int(num_rows) <= _GLM32_FUSED_MAX_ROWS_SHORT
@@ -944,6 +939,7 @@ class SparseNSAFusedIndexerKernel:
         ctas_per_group: int = 1,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
         k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+        k_scales_row_stride: int = _PAGE_SIZE,
         max_seq_capacity: int = 1 << 30,
         vectorized_q_load: bool = False,
         q_row_stride_bytes: int = 0,
@@ -962,8 +958,10 @@ class SparseNSAFusedIndexerKernel:
         # k_quant_bytes.stride(0) so the load reads the correct page.
         self.k_quant_page_stride = int(k_quant_page_stride)
         # dim-0 ELEMENT stride of the (pages, 64) f32 scales view: the packed
-        # cache interleaves per-page scales, so it equals page_stride/4.
-        self.k_scales_row_stride = int(k_quant_page_stride) // 4
+        # cache interleaves per-page scales, while standalone scale tensors are
+        # normally contiguous.  Keep this independent from the quant-page byte
+        # stride so both layouts obey their actual tensor contracts.
+        self.k_scales_row_stride = int(k_scales_row_stride)
         if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
@@ -1175,16 +1173,45 @@ class SparseNSAFusedIndexerKernel:
         # Q staged straight into the ldmatrix-permuted per-head-tile layout so
         # the score core consumes raw fragments on BOTH operands (no byte
         # packs, no 16b->8b fragment swizzles).
-        _stage_q_permuted(
-            q_bytes,
-            q_idx,
-            num_heads,
-            q_smem_base_addr,
-            tx,
-            Int64(self.q_row_stride_bytes),
-            padded_q_heads=self.padded_q_heads,
-            stage_threads=_RADIX_THREADS,
-        )
+        if cutlass.const_expr(self.vectorized_q_load):
+            _stage_q_permuted(
+                q_bytes,
+                q_idx,
+                num_heads,
+                q_smem_base_addr,
+                tx,
+                Int64(self.q_row_stride_bytes),
+                padded_q_heads=self.padded_q_heads,
+                stage_threads=_RADIX_THREADS,
+            )
+        else:
+            # Preserve arbitrary tensor head/row strides.  Each thread moves
+            # individual bytes directly into the same XOR-permuted granules as
+            # the vectorized loader; this is the correctness fallback for views
+            # whose 128-byte head rows are not 16-byte vector-load compatible.
+            q_linear = tx
+            total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
+            while q_linear < total_q_bytes:
+                head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
+                col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
+                vec_idx = col_idx // Int32(16)
+                byte_idx = col_idx - vec_idx * Int32(16)
+                tile_idx = head_idx // Int32(_PAGED_Q_HEAD_TILE)
+                row_in_tile = head_idx - tile_idx * Int32(_PAGED_Q_HEAD_TILE)
+                tile_base = q_smem_base_addr + tile_idx * Int32(
+                    _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
+                )
+                dst_addr = _smem_addr_from_b128_offset(
+                    tile_base,
+                    _permuted_offset_128b(
+                        row_in_tile, vec_idx, Int32(_INDEX_HEAD_DIM // 16)
+                    ),
+                ) + byte_idx
+                q_byte = cutlass.Uint8(0)
+                if head_idx < num_heads:
+                    q_byte = q_bytes[q_idx, head_idx, col_idx]
+                st_shared_u8(dst_addr, q_byte)
+                q_linear += Int32(_RADIX_THREADS)
         w_linear = tx
         while w_linear < Int32(self.padded_q_heads):
             s_w[w_linear] = (
@@ -1718,6 +1745,7 @@ def _build_fused_indexer_kernel(
     ctas_per_group: int,
     merge_threshold: int = _LAST_CTA_MERGE_MAX,
     k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+    k_scales_row_stride: int = _PAGE_SIZE,
     max_seq_capacity: int = 1 << 30,
     vectorized_q_load: bool = False,
     q_row_stride_bytes: int = 0,
@@ -1730,6 +1758,7 @@ def _build_fused_indexer_kernel(
         ctas_per_group=ctas_per_group,
         merge_threshold=merge_threshold,
         k_quant_page_stride=k_quant_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
         max_seq_capacity=max_seq_capacity,
         vectorized_q_load=vectorized_q_load,
         q_row_stride_bytes=q_row_stride_bytes,
@@ -1939,6 +1968,7 @@ def run_fused_paged_indexer(
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
     k_quant_page_stride = int(k_quant_bytes.stride(0))
+    k_scales_row_stride = int(k_scales.stride(0))
     vectorized_q_load = (
         int(q_bytes.data_ptr()) % 16 == 0
         and int(q_bytes.stride(2)) == 1
@@ -1952,7 +1982,9 @@ def run_fused_paged_indexer(
         int(topk),
         bool(output_physical_slots),
         ctas_per_group,
-        merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
+        merge_threshold=int(merge_threshold),
+        k_quant_page_stride=k_quant_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
         max_seq_capacity=max_pages * _PAGE_SIZE,
         vectorized_q_load=vectorized_q_load,
         q_row_stride_bytes=q_row_stride_bytes,
@@ -1986,6 +2018,7 @@ def run_fused_paged_indexer(
         kernel, args, key_tensors,
         (KV_LAYOUT_PAGED, int(num_heads), int(topk), bool(output_physical_slots), int(ctas_per_group),
          int(merge_threshold), k_quant_page_stride, max_pages * _PAGE_SIZE,
+         k_scales_row_stride,
          bool(vectorized_q_load), q_row_stride_bytes),
     )
     return out_i, out_v
@@ -2018,7 +2051,22 @@ def run_fused_indexer_mla(
         else out_values
     )
     pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, 1, dev)
-    kernel = _build_fused_indexer_kernel(KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), False, 1)
+    vectorized_q_load = (
+        int(q_bytes.data_ptr()) % 16 == 0
+        and int(q_bytes.stride(2)) == 1
+        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
+        and int(q_bytes.stride(0)) % 16 == 0
+    )
+    q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
+    kernel = _build_fused_indexer_kernel(
+        KV_LAYOUT_CONTIGUOUS_MLA,
+        int(num_heads),
+        int(topk),
+        False,
+        1,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
+    )
     # page table / seqlens unused for FLAT; pass minimal dummies.
     dummy_pt = torch.zeros((rows, 1), dtype=torch.int32, device=dev)
     dummy_sl = torch.zeros((rows,), dtype=torch.int32, device=dev)
@@ -2044,6 +2092,16 @@ def run_fused_indexer_mla(
         ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
     ]
     _launch_fused(
-        kernel, args, key_tensors, (KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), 1)
+        kernel,
+        args,
+        key_tensors,
+        (
+            KV_LAYOUT_CONTIGUOUS_MLA,
+            int(num_heads),
+            int(topk),
+            1,
+            bool(vectorized_q_load),
+            q_row_stride_bytes,
+        ),
     )
     return out_i, out_v
