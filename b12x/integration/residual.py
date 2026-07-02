@@ -956,6 +956,7 @@ def _b12x_mhc_post_pre_impl(
             run_mhc_post_pre_prefill_block_m_partial,
             run_mhc_post_pre_prefill_gram,
             run_mhc_post_pre_prefill_partial,
+            mhc_prefill_tf32_project_splits,
             run_mhc_prefill_bf16_project,
             run_mhc_prefill_tf32_project,
         )
@@ -1087,6 +1088,14 @@ def _b12x_mhc_post_pre_impl(
                 or use_prefill_bf16_mma
                 or use_prefill_block_m
                 or use_prefill_compact
+            ),
+            compact_projection_splits=(
+                mhc_prefill_tf32_project_splits(
+                    tokens=tokens,
+                    hidden_size=hidden_size,
+                )
+                if use_prefill_tf32_mma
+                else 1
             ),
         )
         return residual_out, post_out, comb_out, y_out

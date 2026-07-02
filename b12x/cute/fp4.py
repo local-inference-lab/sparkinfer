@@ -2780,6 +2780,24 @@ def bf16_mma_m16n8k16_f32(
 
 
 @dsl_user_op
+def f32_to_raw_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Return the raw IEEE-754 bits of one float32 value."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def f32_to_tf32_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
     """Round one float32 value to TF32 format and return its 32-bit operand bits."""
     return Uint32(

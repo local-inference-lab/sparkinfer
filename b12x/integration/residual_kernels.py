@@ -28,7 +28,7 @@ from b12x.cute.compiler import (
 from b12x.cute.fp4 import (
     bf16_mma_m16n8k16_f32,
     bfloat2_to_float2_scaled,
-    f32_to_tf32_bits,
+    f32_to_raw_bits,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ldmatrix_m8n8x4_b16,
@@ -114,12 +114,15 @@ _PREFILL_TF32_TMA_STAGES = int(
 _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
 )
-# At hidden=4096, large-M projection is fastest when one CTA owns all 24 mix
-# columns: the A tile is loaded once instead of once per 8-column N tile.  Keep
-# the previous geometry for hidden=7168, where the longer K loop benefits from
-# the additional M-warp reuse and the wide-N geometry regresses.
+_PREFILL_TF32_TMA_LONG_MIN_TOKENS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
+)
+# At hidden=4096, one CTA owns all 24 mix columns so A is loaded once instead
+# of once per 8-column N tile. M192/K64 gives the best 4096-token balance of B
+# reuse and SM coverage; K splitting supplies enough CTAs for all SMs.
+# Keep the previous geometry for hidden=7168, where wide-N regresses.
 _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "1")
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
 )
 _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
@@ -127,7 +130,7 @@ _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS = int(
 _PREFILL_TF32_TMA_CHUNK_4096_N_WARPS = int(
     os.getenv(
         "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-        os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "3"),
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
     )
 )
 _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS = int(
@@ -137,7 +140,7 @@ _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS = int(
     )
 )
 _PREFILL_TF32_TMA_CHUNK_4096_TILE_M = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "16")
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
 )
 _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_M = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
@@ -153,6 +156,44 @@ _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_N = int(
         "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
         os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
     )
+)
+_PREFILL_TF32_TMA_CHUNK_4096_TILE_K = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_4096_STAGES = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
+        os.getenv("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
+    )
+)
+_PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8")
+)
+# At 8192+ tokens, four K splits give the same 256-CTA launch while doubling
+# useful work per CTA relative to the 4096-token specialization.
+_PREFILL_TF32_TMA_LONG_4096_M_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
+)
+_PREFILL_TF32_TMA_LONG_4096_N_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
+)
+_PREFILL_TF32_TMA_LONG_4096_TILE_M = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
+)
+_PREFILL_TF32_TMA_LONG_4096_TILE_N = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
+)
+_PREFILL_TF32_TMA_LONG_4096_TILE_K = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
+)
+_PREFILL_TF32_TMA_LONG_4096_STAGES = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
+)
+_PREFILL_TF32_TMA_LONG_4096_K_SPLITS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
 )
 _PREFILL_FINALIZE_THREADS = int(
     os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
@@ -1848,29 +1889,46 @@ class MHCPrefillTf32ProjectTmaKernel:
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
         chunk_geometry: bool = False,
+        long_geometry: bool = False,
     ):
         self.hidden_size = int(hidden_size)
         use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
-        if use_4096_chunk_geometry:
+        use_4096_long_geometry = long_geometry and self.hidden_size == _HIDDEN
+        if use_4096_long_geometry:
+            self.num_m_warps = _PREFILL_TF32_TMA_LONG_4096_M_WARPS
+            self.num_n_warps = _PREFILL_TF32_TMA_LONG_4096_N_WARPS
+            self.tile_m = _PREFILL_TF32_TMA_LONG_4096_TILE_M
+            self.tile_n = _PREFILL_TF32_TMA_LONG_4096_TILE_N
+            self.tile_k = _PREFILL_TF32_TMA_LONG_4096_TILE_K
+            self.num_stages = _PREFILL_TF32_TMA_LONG_4096_STAGES
+            self.k_splits = _PREFILL_TF32_TMA_LONG_4096_K_SPLITS
+        elif use_4096_chunk_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_4096_N_WARPS
             self.tile_m = _PREFILL_TF32_TMA_CHUNK_4096_TILE_M
             self.tile_n = _PREFILL_TF32_TMA_CHUNK_4096_TILE_N
+            self.tile_k = _PREFILL_TF32_TMA_CHUNK_4096_TILE_K
+            self.num_stages = _PREFILL_TF32_TMA_CHUNK_4096_STAGES
+            self.k_splits = _PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS
         elif chunk_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS
             self.tile_m = _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_M
             self.tile_n = _PREFILL_TF32_TMA_CHUNK_OTHER_TILE_N
+            self.tile_k = _PREFILL_TF32_TMA_TILE_K
+            self.num_stages = _PREFILL_TF32_TMA_STAGES
+            self.k_splits = 1
         else:
             self.num_m_warps = _PREFILL_TF32_TMA_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_N_WARPS
             self.tile_m = _PREFILL_TF32_TMA_TILE_M
             self.tile_n = _PREFILL_TF32_TMA_TILE_N
+            self.tile_k = _PREFILL_TF32_TMA_TILE_K
+            self.num_stages = _PREFILL_TF32_TMA_STAGES
+            self.k_splits = 1
         self.num_compute_warps = self.num_m_warps * self.num_n_warps
         self.producer_warp = self.num_compute_warps
         self.num_threads = (self.num_compute_warps + 1) * 32
-        self.tile_k = _PREFILL_TF32_TMA_TILE_K
-        self.num_stages = _PREFILL_TF32_TMA_STAGES
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
             _split_k_for_hidden(self.hidden_size)
@@ -1901,11 +1959,24 @@ class MHCPrefillTf32ProjectTmaKernel:
                 f"num_compute_warps*16={m_per_mma_group}"
             )
         self.k_tiles = self.total_k // self.tile_k
+        if self.k_splits <= 0 or self.k_tiles % self.k_splits != 0:
+            raise ValueError(
+                f"TF32 TMA k_splits={self.k_splits} must be positive and divide "
+                f"k_tiles={self.k_tiles}"
+            )
+        if self.k_splits >= self.split_k:
+            raise ValueError(
+                f"TF32 TMA k_splits={self.k_splits} must be less than "
+                f"partials split_k={self.split_k}"
+            )
+        self.k_tiles_per_split = self.k_tiles // self.k_splits
         self.n_tiles = (_MIXES + self.tile_n - 1) // self.tile_n
         self.n_mma_tiles = self.tile_n // 8
         self.n_mma_tiles_per_warp = self.n_mma_tiles // self.num_n_warps
 
-    def _get_smem_layouts(self) -> tuple[cute.ComposedLayout, cute.Layout]:
+    def _get_smem_layouts(
+        self,
+    ) -> tuple[cute.ComposedLayout, cute.ComposedLayout]:
         a_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(
                 LayoutEnum.ROW_MAJOR,
@@ -1914,25 +1985,30 @@ class MHCPrefillTf32ProjectTmaKernel:
             ),
             cutlass.BFloat16,
         )
+        b_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR,
+                cutlass.Float32,
+                self.tile_k,
+            ),
+            cutlass.Float32,
+        )
         sA_layout = cute.tile_to_shape(
             a_layout_atom,
             (self.tile_m, self.tile_k, self.num_stages),
             order=(0, 1, 2),
         )
-        sB_layout = cute.make_layout(
+        sB_layout = cute.tile_to_shape(
+            b_layout_atom,
             (self.tile_n, self.tile_k, self.num_stages),
-            stride=(
-                self.tile_k,
-                1,
-                self.tile_n * self.tile_k,
-            ),
+            order=(0, 1, 2),
         )
         return sA_layout, sB_layout
 
     def _get_shared_storage_cls(
         self,
         sA_layout: cute.ComposedLayout,
-        sB_layout: cute.Layout,
+        sB_layout: cute.ComposedLayout,
     ):
         class SharedStorage:
             pass
@@ -2001,7 +2077,7 @@ class MHCPrefillTf32ProjectTmaKernel:
             SharedStorage,
             num_tokens,
         ).launch(
-            grid=(grid_m, self.n_tiles, 1),
+            grid=(grid_m, self.n_tiles, self.k_splits),
             block=[self.num_threads, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -2017,22 +2093,25 @@ class MHCPrefillTf32ProjectTmaKernel:
         tma_atom_A: cute.CopyAtom,
         tma_atom_B: cute.CopyAtom,
         sA_layout: cute.ComposedLayout,
-        sB_layout: cute.Layout,
+        sB_layout: cute.ComposedLayout,
         SharedStorage: cutlass.Constexpr,
         num_tokens: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        m_tile, n_tile, _ = cute.arch.block_idx()
+        m_tile, n_tile, k_split = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        partial_row = k_split + Int32(1)
+        if k_split == Int32(0):
+            partial_row = Int32(0)
 
-        if warp_idx == 0:
+        if tidx == 0:
             cpasync.prefetch_descriptor(tma_atom_A)
             cpasync.prefetch_descriptor(tma_atom_B)
 
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
-        sB = storage.sB.get_tensor(sB_layout)
+        sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
 
         tma_copy_bytes = (
             self.tile_m * self.tile_k * cutlass.BFloat16.width // 8
@@ -2049,7 +2128,6 @@ class MHCPrefillTf32ProjectTmaKernel:
             barrier_storage=storage.mbar_ptr.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
-        cute.arch.sync_threads()
 
         gA = cute.local_tile(
             out_flat,
@@ -2098,28 +2176,28 @@ class MHCPrefillTf32ProjectTmaKernel:
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
             )
-            for _k_tile in range(0, self.k_tiles, 1, unroll=1):
+            for _k_tile in range(0, self.k_tiles_per_split, 1, unroll=1):
                 load_pipeline.consumer_wait(consumer_state)
                 for kk in cutlass.range_constexpr(self.tile_k // 8):
                     k0 = Int32(kk * 8)
                     a_k0 = k0 + lane_in_group
                     a_k1 = a_k0 + Int32(4)
 
-                    a0_f = Float32(0.0)
-                    a1_f = Float32(0.0)
-                    a2_f = Float32(0.0)
-                    a3_f = Float32(0.0)
-                    if token0 < num_tokens:
-                        a0_f = Float32(sA[row0, a_k0, consumer_state.index])
-                        a2_f = Float32(sA[row0, a_k1, consumer_state.index])
-                    if token1 < num_tokens:
-                        a1_f = Float32(sA[row1, a_k0, consumer_state.index])
-                        a3_f = Float32(sA[row1, a_k1, consumer_state.index])
+                    # TMA zero-fills out-of-bounds rows, so all compute lanes
+                    # can load shared memory without a per-MMA token branch.
+                    a0_f = Float32(sA[row0, a_k0, consumer_state.index])
+                    a1_f = Float32(sA[row1, a_k0, consumer_state.index])
+                    a2_f = Float32(sA[row0, a_k1, consumer_state.index])
+                    a3_f = Float32(sA[row1, a_k1, consumer_state.index])
 
-                    a0_tf32 = f32_to_tf32_bits(a0_f)
-                    a1_tf32 = f32_to_tf32_bits(a1_f)
-                    a2_tf32 = f32_to_tf32_bits(a2_f)
-                    a3_tf32 = f32_to_tf32_bits(a3_f)
+                    # These values originate from BF16, so their promoted FP32
+                    # representation is already exact in TF32.  A raw bitcast
+                    # avoids four redundant cvt.rna.tf32.f32 instructions per
+                    # MMA step without changing the operand value.
+                    a0_tf32 = f32_to_raw_bits(a0_f)
+                    a1_tf32 = f32_to_raw_bits(a1_f)
+                    a2_tf32 = f32_to_raw_bits(a2_f)
+                    a3_tf32 = f32_to_raw_bits(a3_f)
                     for warp_mma_n in cutlass.range_constexpr(
                         self.n_mma_tiles_per_warp
                     ):
@@ -2128,19 +2206,13 @@ class MHCPrefillTf32ProjectTmaKernel:
                             + warp_n
                         )
                         b_mix_local = Int32(mma_n * 8) + lane_group
-                        b_mix = (
-                            n_tile * Int32(self.tile_n)
-                            + b_mix_local
+                        # TMA likewise zero-fills a partial final N tile.
+                        b0_f = Float32(
+                            sB[b_mix_local, a_k0, consumer_state.index]
                         )
-                        b0_f = Float32(0.0)
-                        b1_f = Float32(0.0)
-                        if b_mix < Int32(_MIXES):
-                            b0_f = Float32(
-                                sB[b_mix_local, a_k0, consumer_state.index]
-                            )
-                            b1_f = Float32(
-                                sB[b_mix_local, a_k1, consumer_state.index]
-                            )
+                        b1_f = Float32(
+                            sB[b_mix_local, a_k1, consumer_state.index]
+                        )
 
                         d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
                             acc[warp_mma_n, 0],
@@ -2151,8 +2223,8 @@ class MHCPrefillTf32ProjectTmaKernel:
                             a1_tf32,
                             a2_tf32,
                             a3_tf32,
-                            f32_to_tf32_bits(b0_f),
-                            f32_to_tf32_bits(b1_f),
+                            f32_to_raw_bits(b0_f),
+                            f32_to_raw_bits(b1_f),
                         )
                         acc[warp_mma_n, 0] = d0
                         acc[warp_mma_n, 1] = d1
@@ -2173,20 +2245,20 @@ class MHCPrefillTf32ProjectTmaKernel:
                 mix1 = mix0 + Int32(1)
                 if token0 < num_tokens:
                     if mix0 < Int32(_MIXES):
-                        partials[token0, Int32(0), mix0 + Int32(1)] = acc[
+                        partials[token0, partial_row, mix0 + Int32(1)] = acc[
                             warp_mma_n, 0
                         ]
                     if mix1 < Int32(_MIXES):
-                        partials[token0, Int32(0), mix1 + Int32(1)] = acc[
+                        partials[token0, partial_row, mix1 + Int32(1)] = acc[
                             warp_mma_n, 1
                         ]
                 if token1 < num_tokens:
                     if mix0 < Int32(_MIXES):
-                        partials[token1, Int32(0), mix0 + Int32(1)] = acc[
+                        partials[token1, partial_row, mix0 + Int32(1)] = acc[
                             warp_mma_n, 2
                         ]
                     if mix1 < Int32(_MIXES):
-                        partials[token1, Int32(0), mix1 + Int32(1)] = acc[
+                        partials[token1, partial_row, mix1 + Int32(1)] = acc[
                             warp_mma_n, 3
                         ]
 
@@ -2195,9 +2267,12 @@ class MHCPrefillTf32ProjectTmaKernel:
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
             )
-            for _k_tile in range(0, self.k_tiles, 1, unroll=1):
+            for _k_tile in range(0, self.k_tiles_per_split, 1, unroll=1):
                 load_pipeline.producer_acquire(producer_state)
-                k_tile = producer_state.count
+                k_tile = (
+                    k_split * Int32(self.k_tiles_per_split)
+                    + producer_state.count
+                )
                 cute.copy(
                     tma_atom_A,
                     tAgA[(None, m_tile, k_tile)],
@@ -2383,6 +2458,7 @@ class MHCFinalizeGramKernel:
         norm_eps: float,
         fuse_norm: bool = True,
         compact_partials: bool = False,
+        compact_projection_splits: int = 1,
     ):
         self.hidden_size = int(hidden_size)
         self.num_threads = (
@@ -2413,6 +2489,17 @@ class MHCFinalizeGramKernel:
         # (no Gram reduction, no RMSNorm). The partial then skips the Gram.
         self.fuse_norm = bool(fuse_norm)
         self.compact_partials = bool(compact_partials)
+        self.compact_projection_splits = int(compact_projection_splits)
+        if self.compact_projection_splits <= 0:
+            raise ValueError("compact_projection_splits must be positive")
+        if not self.compact_partials and self.compact_projection_splits != 1:
+            raise ValueError(
+                "compact_projection_splits requires compact_partials=True"
+            )
+        if self.compact_projection_splits >= self.split_k:
+            raise ValueError(
+                "compact_projection_splits must be less than partials split_k"
+            )
         self.tiles_per_cta = self.hidden_tiles if self.compact_partials else 1
         if self.compact_partials and self.hidden_size % (2 * self.num_threads) != 0:
             raise ValueError(
@@ -2482,6 +2569,17 @@ class MHCFinalizeGramKernel:
             if tidx == Int32(0):
                 for column in cutlass.range_constexpr(_PARTIALS):
                     sums[column] = Float32(partials[token, Int32(0), column])
+                    if column > 0:
+                        for projection_split in cutlass.range_constexpr(
+                            1, self.compact_projection_splits
+                        ):
+                            sums[column] += Float32(
+                                partials[
+                                    token,
+                                    Int32(projection_split + 1),
+                                    column,
+                                ]
+                            )
                 if const_expr(self.fuse_norm):
                     for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                         gram[gp] = Float32(partials[token, Int32(1), gp])
@@ -3003,11 +3101,13 @@ def _prefill_tf32_project_kernel(
     hidden_size: int,
     split_k: int,
     chunk_geometry: bool = False,
+    long_geometry: bool = False,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
         chunk_geometry=chunk_geometry,
+        long_geometry=long_geometry,
     )
 
 
@@ -3021,6 +3121,7 @@ def _finalize_gram_kernel(
     norm_eps: float,
     fuse_norm: bool,
     compact_partials: bool = False,
+    compact_projection_splits: int = 1,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=hidden_size,
@@ -3031,6 +3132,7 @@ def _finalize_gram_kernel(
         norm_eps=norm_eps,
         fuse_norm=fuse_norm,
         compact_partials=compact_partials,
+        compact_projection_splits=compact_projection_splits,
     )
 
 
@@ -4007,10 +4109,15 @@ def _run_mhc_prefill_tf32_project_launch(
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
     chunk_geometry = tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+    long_geometry = (
+        hidden_size == _HIDDEN
+        and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+    )
     kernel = _prefill_tf32_project_kernel(
         hidden_size,
         split_k,
         chunk_geometry,
+        long_geometry,
     )
     args = (
         _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
@@ -4055,6 +4162,8 @@ def _run_mhc_prefill_tf32_project_launch(
         ("split_k", split_k),
         ("chunk_geometry", chunk_geometry),
         ("chunk_min_tokens", _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS),
+        ("long_geometry", long_geometry),
+        ("long_min_tokens", _PREFILL_TF32_TMA_LONG_MIN_TOKENS),
         ("tile_m", kernel.tile_m),
         ("tile_n", kernel.tile_n),
         ("tile_k", kernel.tile_k),
@@ -4063,15 +4172,34 @@ def _run_mhc_prefill_tf32_project_launch(
         ("num_n_warps", kernel.num_n_warps),
         ("num_compute_warps", kernel.num_compute_warps),
         ("threads", kernel.num_threads),
-        ("operand_layout", "tma_a_bf16_b_f32_tf32_m16n8k8_v3"),
+        ("k_splits", kernel.k_splits),
+        (
+            "operand_layout",
+            "tma_swizzled_branchless_a_bf16_b_f32_rawtf32_m16n8k8_v7",
+        ),
         cache_key,
     )
     b12x_launch(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 5, compile_key),
         compile_args=args,
         runtime_args=args,
     )
+
+
+def mhc_prefill_tf32_project_splits(*, tokens: int, hidden_size: int) -> int:
+    """Return the projection split count selected by the TF32 prefill kernel."""
+    chunk_geometry = int(tokens) >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+    long_geometry = (
+        int(hidden_size) == _HIDDEN
+        and int(tokens) >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+    )
+    return _prefill_tf32_project_kernel(
+        int(hidden_size),
+        _split_k_for_hidden(int(hidden_size)),
+        chunk_geometry,
+        long_geometry,
+    ).k_splits
 
 
 @torch.library.custom_op(
@@ -4509,6 +4637,7 @@ def _run_mhc_finalize_gram_launch(
     norm_eps: float,
     fuse_norm: bool,
     compact_partials: bool = False,
+    compact_projection_splits: int = 1,
 ) -> None:
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
@@ -4516,6 +4645,7 @@ def _run_mhc_finalize_gram_launch(
     norm_eps = float(norm_eps)
     fuse_norm = bool(fuse_norm)
     compact_partials = bool(compact_partials)
+    compact_projection_splits = int(compact_projection_splits)
     norm_weight_tensor = _norm_weight_kernel_tensor(
         norm_weight if fuse_norm else None,
         y,
@@ -4579,6 +4709,7 @@ def _run_mhc_finalize_gram_launch(
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
         ("compact_partials", compact_partials),
+        ("compact_projection_splits", compact_projection_splits),
         ("norm_eps", norm_eps if fuse_norm else 0.0),
         rms_eps,
         hc_eps,
@@ -4664,6 +4795,7 @@ def _run_mhc_finalize_gram_launch(
             norm_eps,
             fuse_norm,
             compact_partials,
+            compact_projection_splits,
         ),
         compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
@@ -4690,6 +4822,7 @@ def _mhc_finalize_gram_launch_op(
     norm_eps: float,
     fuse_norm: bool,
     compact_partials: bool,
+    compact_projection_splits: int,
 ) -> None:
     _run_mhc_finalize_gram_launch(
         residual=residual,
@@ -4706,6 +4839,7 @@ def _mhc_finalize_gram_launch_op(
         norm_eps=norm_eps,
         fuse_norm=fuse_norm,
         compact_partials=compact_partials,
+        compact_projection_splits=compact_projection_splits,
     )
 
 
@@ -4725,6 +4859,7 @@ def _mhc_finalize_gram_launch_fake(
     norm_eps: float,
     fuse_norm: bool,
     compact_partials: bool,
+    compact_projection_splits: int,
 ) -> None:
     return None
 
@@ -4744,6 +4879,7 @@ def run_mhc_finalize_gram(
     norm_weight: torch.Tensor | None,
     norm_eps: float,
     compact_partials: bool = False,
+    compact_projection_splits: int = 1,
 ) -> None:
     # When norm_weight is None the kernel ignores it (fuse_norm=False), but it
     # still needs a valid tensor arg. Do NOT alias `y` here: `y` is a mutated arg
@@ -4769,6 +4905,7 @@ def run_mhc_finalize_gram(
         float(norm_eps),
         norm_weight is not None,
         bool(compact_partials),
+        int(compact_projection_splits),
     )
 
 
