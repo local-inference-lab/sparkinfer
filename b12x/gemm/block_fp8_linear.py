@@ -43,6 +43,7 @@ _B12X_TIMING_THRESHOLD_MS = float(
 _SCRATCH_ALIGN_BYTES = 1024
 
 
+
 @dataclass(frozen=True)
 class BlockFP8LinearWeight:
     weight: MXFP8Rows
@@ -664,6 +665,9 @@ def _block_fp8_linear_mxfp8_fused_op(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
+        # Weight scales come from 128x128 blocks expanded to per-32 rows, so
+        # the four SFB bytes per 128-wide k tile are identical by construction.
+        sfb_k_replicated=True,
         stream=stream_int,
     )[:, :, 0]
 
@@ -792,6 +796,7 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
         expected_m=expected_m,
+        sfb_k_replicated=True,
         stream=stream,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
