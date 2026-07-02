@@ -165,6 +165,7 @@ def _quantize_dense_tk_to_tk_kernel(
     scale_rows,
     scale_mma,
     tokens,
+    num_groups_k,
     source_stride_t,
     source_stride_k,
     values_stride_t,
@@ -178,47 +179,72 @@ def _quantize_dense_tk_to_tk_kernel(
     scale_mma_s3,
     scale_mma_s4,
     scale_mma_s5,
-    BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    GROUPS: tl.constexpr,
+    VEC: tl.constexpr,
 ) -> None:
-    token = tl.program_id(0)
-    chunk = tl.program_id(1)
-    offs = tl.arange(0, BLOCK)
-    k = chunk * BLOCK + offs
+    # Tiled MXFP8 row quantizer: each program covers BLOCK_M tokens x GROUPS
+    # 32-wide scale groups so loads/stores are coalesced across the K dim.
+    # BLOCK_M must divide 32 (or be a multiple of it) so that the swizzled
+    # scale_mma row32/row4/tile_m coordinates stay vectorizable per tile.
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
 
-    src = tl.load(source + token * source_stride_t + k * source_stride_k).to(tl.float32)
-    max_abs = tl.max(tl.abs(src), axis=0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_g = pid_g * GROUPS + tl.arange(0, GROUPS)
+    offs_e = tl.arange(0, VEC)
+    mask_m = offs_m < tokens
+    mask_g = offs_g < num_groups_k
+
+    k = offs_g[:, None] * VEC + offs_e[None, :]
+    mask = mask_m[:, None, None] & mask_g[None, :, None]
+    src = tl.load(
+        source
+        + offs_m[:, None, None] * source_stride_t
+        + k[None, :, :] * source_stride_k,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    max_abs = tl.max(tl.abs(src), axis=2)
     safe = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(safe)), -127.0), 127.0)
     scale = tl.exp2(scale_exp)
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     tl.store(
-        values + token * values_stride_t + k * values_stride_k,
-        (src / scale).to(tl.float8e4nv),
+        values
+        + offs_m[:, None, None] * values_stride_t
+        + k[None, :, :] * values_stride_k,
+        (src / scale[:, :, None]).to(tl.float8e4nv),
+        mask=mask,
     )
 
+    mask2 = mask_m[:, None] & mask_g[None, :]
     tl.store(
         scale_rows
         + scale_rows_stride_l * 0
-        + token * scale_rows_stride_t
-        + chunk * scale_rows_stride_k,
+        + offs_m[:, None] * scale_rows_stride_t
+        + offs_g[None, :] * scale_rows_stride_k,
         scale_u8,
+        mask=mask2,
     )
 
-    row32 = token % 32
-    row4 = (token // 32) % 4
-    tile_m = token // 128
-    k4 = chunk % 4
-    tile_k = chunk // 4
+    row32 = offs_m % 32
+    row4 = (offs_m // 32) % 4
+    tile_m = offs_m // 128
+    k4 = offs_g % 4
+    tile_k = offs_g // 4
     tl.store(
         scale_mma
-        + row32 * scale_mma_s0
-        + row4 * scale_mma_s1
-        + tile_m * scale_mma_s2
-        + k4 * scale_mma_s3
-        + tile_k * scale_mma_s4
+        + row32[:, None] * scale_mma_s0
+        + row4[:, None] * scale_mma_s1
+        + tile_m[:, None] * scale_mma_s2
+        + k4[None, :] * scale_mma_s3
+        + tile_k[None, :] * scale_mma_s4
         + scale_mma_s5 * 0,
         scale_u8,
+        mask=mask2,
     )
 
 
@@ -504,12 +530,20 @@ def _run_block_fp8_quant_kernel(
     tokens: int,
     in_features: int,
 ) -> None:
-    _quantize_dense_tk_to_tk_kernel[(tokens, in_features // MXFP8_SCALE_VEC_SIZE)](
+    num_groups_k = in_features // MXFP8_SCALE_VEC_SIZE
+    block_m = 32
+    groups = 16
+    grid = (
+        (tokens + block_m - 1) // block_m,
+        (num_groups_k + groups - 1) // groups,
+    )
+    _quantize_dense_tk_to_tk_kernel[grid](
         source_tk,
         out_values,
         out_scale_rows.view(torch.uint8),
         out_scale_mma.view(torch.uint8),
         tokens,
+        num_groups_k,
         source_tk.stride(0),
         source_tk.stride(1),
         out_values.stride(0),
@@ -523,7 +557,9 @@ def _run_block_fp8_quant_kernel(
         out_scale_mma.stride(3),
         out_scale_mma.stride(4),
         out_scale_mma.stride(5),
-        BLOCK=MXFP8_SCALE_VEC_SIZE,
+        BLOCK_M=block_m,
+        GROUPS=groups,
+        VEC=MXFP8_SCALE_VEC_SIZE,
     )
 
 
