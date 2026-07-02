@@ -103,16 +103,16 @@ KV_LAYOUT_CONTIGUOUS_MLA = 0
 KV_LAYOUT_PAGED = 1
 
 # Route metadata is capture-static; live seqlen is deliberately not a policy input,
-# so vLLM graph replay cannot switch backends.  The generic and GLM policies retain
-# their measured small-row limits.  C4's heads=64/topk=512 shape is materially
-# different: production-path, L2-flushed SM120 measurements at 4K, 8K, 16K, and
-# 266K capacity show fused winning for every newly routed B8-B64 serving bucket.
+# so vLLM graph replay cannot switch backends.  The generic policy retains its
+# measured small-row limit.  C4's heads=64/topk=512 and GLM's heads=32/topk=2048
+# shapes are materially different: production-shape, L2-flushed SM120 measurements
+# show fused winning for every B1-B64 decode bucket.  GLM was measured at 8K, 16K,
+# 32K, and 131K capacity; C4 at 4K, 8K, 16K, and 266K capacity.
 # Prefill remains packed-contiguous and never reaches this decode-only resolver.
 FUSED_MAX_ROWS = 6
 _C4_FUSED_MAX_ROWS = 64
+_GLM32_FUSED_MAX_ROWS = 64
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
-_GLM32_FUSED_MAX_ROWS_SHORT = 1
-_GLM32_FUSED_MAX_ROWS_32K = 5
 
 
 @cute.jit
@@ -419,21 +419,16 @@ def resolve_fused_indexer_path(
     Row count, head count, top-k, and width here are all capture-time workspace
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
-    rows. C4's 64-head/top-k-512 shape uses fused through B64. GLM's
-    32-head/top-k-2048 shape has measured capacity buckets after the vectorized-Q
-    and merge-crossover tuning: below 16k only B1 wins; from 16k through 32k fused
-    wins/ties through B5 and B6 loses. Above 32k this targeted retune leaves the
-    separately benchmarked general six-row policy unchanged.
+    rows. C4's 64-head/top-k-512 and GLM's 32-head/top-k-2048 shapes use fused
+    through B64, based on capture-static serving-shape measurements. Prefill is
+    selected before this decode-only resolver and remains packed-contiguous.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
     if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
         return int(num_rows) <= _C4_FUSED_MAX_ROWS
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
-        if int(width) < 16384:
-            return int(num_rows) <= _GLM32_FUSED_MAX_ROWS_SHORT
-        if int(width) <= 32768:
-            return int(num_rows) <= _GLM32_FUSED_MAX_ROWS_32K
+        return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
     return int(num_rows) <= FUSED_MAX_ROWS
 
 

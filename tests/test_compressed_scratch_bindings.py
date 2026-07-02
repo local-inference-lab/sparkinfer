@@ -247,6 +247,23 @@ def test_indexer_common_plan_selects_fused_for_c4_decode_buckets(rows) -> None:
     assert plan.layout.route == "paged_fused"
 
 
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_indexer_common_plan_selects_fused_for_glm_decode_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=32,
+            max_q_rows=rows,
+            max_page_table_width=256,
+            topk=2048,
+            mode="decode",
+        )
+    )
+
+    assert plan.layout.route == "paged_fused"
+
+
 @pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
 def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
     plan = plan_indexer_scratch(
@@ -257,6 +274,25 @@ def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
             max_q_rows=rows,
             max_page_table_width=4160,
             topk=512,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+
+    assert plan.layout.route == "packed_contiguous"
+    assert plan.layout.prefill_block_k == 512
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
+def test_indexer_common_plan_selects_bk512_for_glm_prefill_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=32,
+            max_q_rows=rows,
+            max_page_table_width=256,
+            topk=2048,
             mode="prefill",
             shared_page_table=True,
         )

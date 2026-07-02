@@ -22,30 +22,32 @@ from b12x.attention.indexer.fused_indexer import (
 _PS = 64  # compressed-index page size
 
 
-@pytest.mark.parametrize(
-    "heads,width,rows,expected",
-    [
-        (32, 8192, 1, True),
-        (32, 8192, 2, False),
-        (32, 16384, 5, True),
-        (32, 16384, 6, False),
-        (32, 32768, 5, True),
-        (32, 32768, 6, False),
-        (32, 65536, 6, True),
-        (64, 16384, 6, True),
-    ],
-)
-def test_fused_indexer_route_uses_capture_static_glm_buckets(
-    heads, width, rows, expected
-):
-    assert (
-        resolve_fused_indexer_path(
-            topk=2048,
-            num_rows=rows,
-            width=width,
-            num_heads=heads,
-        )
-        is expected
+@pytest.mark.parametrize("width", [8192, 16384, 32768, 131072])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_fused_indexer_route_covers_glm_decode_buckets(width, rows):
+    assert resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=rows,
+        width=width,
+        num_heads=32,
+    )
+
+
+def test_fused_indexer_route_stops_after_glm_decode_buckets():
+    assert not resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=65,
+        width=16384,
+        num_heads=32,
+    )
+
+
+def test_fused_indexer_route_keeps_generic_head_count_limit():
+    assert not resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=8,
+        width=16384,
+        num_heads=64,
     )
 
 
