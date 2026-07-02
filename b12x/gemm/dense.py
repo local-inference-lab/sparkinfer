@@ -293,6 +293,7 @@ class DenseGemmKernel:
         use_m1_non_tma_sfa: bool = False,
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
+        sfb_k_reuse: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -322,11 +323,17 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
+        # SFB bytes are k-replicated within a 128-wide k tile (128x128 block
+        # weight scales expanded to per-32): load one byte per stage and feed
+        # every k block from it.
+        self.sfb_k_reuse = sfb_k_reuse
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.atom_shape = (2, 2, 1)
+        elif os.getenv("B12X_DENSE_ATOM_24", "0") == "1":
+            self.atom_shape = (2, 4, 1)
         else:
             self.atom_shape = (4, 2, 1)
 
@@ -1302,16 +1309,26 @@ class DenseGemmKernel:
                 tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                 tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
 
+                # Whole-stage SF copy: scale bytes for all k blocks of the
+                # acquired stage load in one bulk copy (per-k_block SF reloads
+                # dominated the LDS/issue budget at prefill M).
                 cute.copy(
                     smem_tiled_copy_SFA,
-                    tCsSFA_p_filtered[None, None, 0],
-                    tCrSFA_copy_view_filtered[None, None, 0],
+                    tCsSFA_p_filtered,
+                    tCrSFA_copy_view_filtered,
                 )
-                cute.copy(
-                    smem_tiled_copy_SFB,
-                    tCsSFB_p_filtered[None, None, 0],
-                    tCrSFB_copy_view_filtered[None, None, 0],
-                )
+                if cutlass.const_expr(self.sfb_k_reuse):
+                    cute.copy(
+                        smem_tiled_copy_SFB,
+                        tCsSFB_p_filtered[None, None, 0],
+                        tCrSFB_copy_view_filtered[None, None, 0],
+                    )
+                else:
+                    cute.copy(
+                        smem_tiled_copy_SFB,
+                        tCsSFB_p_filtered,
+                        tCrSFB_copy_view_filtered,
+                    )
 
                 for k_tile in range(0, k_tile_iter_cnt - 1, 1, unroll=2):
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1351,10 +1368,16 @@ class DenseGemmKernel:
                                     WarpField.SFA,
                                     tCrSFA_tile[None, _mt, k_block_idx].iterator,
                                 )
-                                mma_atom.set(
-                                    WarpField.SFB,
-                                    tCrSFB_tile[None, _nt, k_block_idx].iterator,
-                                )
+                                if cutlass.const_expr(self.sfb_k_reuse):
+                                    mma_atom.set(
+                                        WarpField.SFB,
+                                        tCrSFB_tile[None, _nt, 0].iterator,
+                                    )
+                                else:
+                                    mma_atom.set(
+                                        WarpField.SFB,
+                                        tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                    )
                                 cute.gemm(
                                     mma_atom,
                                     accumulators[None, _mt, _nt],
@@ -1373,20 +1396,31 @@ class DenseGemmKernel:
                             tCrB_copy_view[None, None, k_block_next],
                         )
 
-                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
-                        cute.copy(
-                            smem_tiled_copy_SFA,
-                            tCsSFA_p_filtered[None, None, k_block_next],
-                            tCrSFA_copy_view_filtered[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, k_block_next],
-                            tCrSFB_copy_view_filtered[None, None, k_block_next],
-                        )
+                        if k_block_idx == num_k_blocks - 1:
+                            # New stage acquired above: bulk-load its whole SF
+                            # tile once. The current tile's k_block MMAs have
+                            # all consumed their SF registers by this point.
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered,
+                                tCrSFA_copy_view_filtered,
+                            )
+                            if cutlass.const_expr(self.sfb_k_reuse):
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, 0],
+                                    tCrSFB_copy_view_filtered[None, None, 0],
+                                )
+                            else:
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered,
+                                    tCrSFB_copy_view_filtered,
+                                )
 
                 # Hoist out last k_tile
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1409,20 +1443,8 @@ class DenseGemmKernel:
                             tCsB_p[None, None, k_block_next],
                             tCrB_copy_view[None, None, k_block_next],
                         )
-                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
-                        cute.copy(
-                            smem_tiled_copy_SFA,
-                            tCsSFA_p_filtered[None, None, k_block_next],
-                            tCrSFA_copy_view_filtered[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, k_block_next],
-                            tCrSFB_copy_view_filtered[None, None, k_block_next],
-                        )
+                        # SF registers for the whole stage were bulk-loaded at
+                        # stage acquisition; nothing to reload per k block.
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
@@ -1430,10 +1452,16 @@ class DenseGemmKernel:
                                 WarpField.SFA,
                                 tCrSFA_tile[None, _mt, k_block_idx].iterator,
                             )
-                            mma_atom.set(
-                                WarpField.SFB,
-                                tCrSFB_tile[None, _nt, k_block_idx].iterator,
-                            )
+                            if cutlass.const_expr(self.sfb_k_reuse):
+                                mma_atom.set(
+                                    WarpField.SFB,
+                                    tCrSFB_tile[None, _nt, 0].iterator,
+                                )
+                            else:
+                                mma_atom.set(
+                                    WarpField.SFB,
+                                    tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                )
                             cute.gemm(
                                 mma_atom,
                                 accumulators[None, _mt, _nt],
@@ -2397,6 +2425,7 @@ class _DenseGemmLaunch:
         sm_version: str,
         load_path: str,
         swap_ab: bool,
+        sfb_k_reuse: bool,
     ):
         self._n = n
         self._k = k
@@ -2417,6 +2446,7 @@ class _DenseGemmLaunch:
         self._policy = policy
         self._load_path = load_path
         self._swap_ab = swap_ab
+        self._sfb_k_reuse = sfb_k_reuse
 
         if not DenseGemmKernel.can_implement(
             ab_dtype,
@@ -2504,6 +2534,7 @@ class _DenseGemmLaunch:
             use_m1_non_tma_sfa=False,
             load_path=self._load_path,
             swap_ab=self._swap_ab,
+            sfb_k_reuse=self._sfb_k_reuse,
         )(
             a_tensor,
             b_tensor,
@@ -2539,6 +2570,7 @@ def _get_compiled_dense_gemm(
     sm_version: str,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -2608,6 +2640,7 @@ def _get_compiled_dense_gemm(
         sm_version=sm_version,
         load_path=load_path,
         swap_ab=swap_ab,
+        sfb_k_reuse=sfb_k_reuse,
     )
     compile_key = (
         n,
@@ -2711,6 +2744,7 @@ def _dense_gemm_launch_flat(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
     stream_int: Optional[int],
 ) -> None:
     policy = _DenseGemmPolicy(
@@ -2742,6 +2776,7 @@ def _dense_gemm_launch_flat(
         sm_version="sm_120",
         load_path=load_path,
         swap_ab=swap_ab,
+        sfb_k_reuse=sfb_k_reuse,
     )
     compiled(
         a_tensor_gpu=a_tensor_gpu,
@@ -2788,6 +2823,7 @@ def _dense_gemm_launch_op(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
     stream_int: Optional[int],
 ) -> None:
     _dense_gemm_launch_flat(
@@ -2820,6 +2856,7 @@ def _dense_gemm_launch_op(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        sfb_k_reuse,
         stream_int,
     )
 
@@ -2855,6 +2892,7 @@ def _dense_gemm_launch_fake(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
     stream_int: Optional[int],
 ) -> None:
     return None
@@ -2938,6 +2976,7 @@ def _dense_gemm_launch_functional_op(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
     stream_int: Optional[int],
 ) -> torch.Tensor:
     m = int(a_tensor_gpu.shape[0])
@@ -2992,6 +3031,7 @@ def _dense_gemm_launch_functional_op(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        sfb_k_reuse,
         stream_int,
     )
     if split_k_output and not split_k_atomic_bf16:
@@ -3030,6 +3070,7 @@ def _dense_gemm_launch_functional_fake(
     split_k_atomic_bf16: bool,
     load_path: str,
     swap_ab: bool,
+    sfb_k_reuse: bool,
     stream_int: Optional[int],
 ) -> torch.Tensor:
     del (
@@ -3058,6 +3099,7 @@ def _dense_gemm_launch_functional_fake(
         split_k_atomic_bf16,
         load_path,
         swap_ab,
+        sfb_k_reuse,
         stream_int,
     )
     return _empty_dense_gemm_output(
@@ -3223,6 +3265,7 @@ def dense_gemm(
     expected_m: Optional[int] = None,
     load_path: Optional[Literal["tma", "cpasync"]] = None,
     swap_ab: Optional[bool] = None,
+    sfb_k_replicated: bool = False,
     stream: object = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
@@ -3273,6 +3316,9 @@ def dense_gemm(
             swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
+    # k-reuse relies on SFB being the 128x128-block weight operand; with
+    # swap_ab the smem B slot holds activations, so force it off there.
+    sfb_k_reuse = bool(sfb_k_replicated) and not swap_ab and is_mxfp8
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
     policy = _dense_gemm_policy_for(
@@ -3346,6 +3392,7 @@ def dense_gemm(
             policy.split_k_atomic_bf16,
             load_path,
             swap_ab,
+            sfb_k_reuse,
             stream_int,
         )
     split_storage = None
@@ -3415,6 +3462,7 @@ def dense_gemm(
         policy.split_k_atomic_bf16,
         load_path,
         swap_ab,
+        sfb_k_reuse,
         stream_int,
     )
     result = out
