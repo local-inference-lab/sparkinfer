@@ -1,4 +1,7 @@
-"""MoETinyRpKernelBackend — rp-native tiny-decode (M<=4) W4A8-MX MoE for SM120.
+"""MoETinyDecodeKernelBackend — tiny-decode (M<=4) W4A8-MX MoE for SM120.
+
+Reads the N256/K128 in-place-REPACKED weight storage (the "rp" layout produced
+by _logical_weight_to_w4a8_rp_inplace) directly.
 
 Consumes the N256/K128 in-place-repacked FP4 weights and e8m0 sfb grids
 directly (inverse mappings verified in tests/test_w4a8_rp_inverse_mapping.py),
@@ -49,7 +52,7 @@ _FC1_KT_PER_TASK = 4
 _FC2_KT_PER_TASK = 2
 
 
-class MoETinyRpKernelBackend:
+class MoETinyDecodeKernelBackend:
     """Tiny-M (decode) W4A8-MX kernel reading the repacked weight layout."""
 
     def __init__(
@@ -60,9 +63,9 @@ class MoETinyRpKernelBackend:
         compile_time_phase: int = 1,
     ):
         if activation != "silu":
-            raise ValueError(f"tiny_rp supports silu only, got {activation!r}")
+            raise ValueError(f"tiny_decode supports silu only, got {activation!r}")
         if int(compile_time_phase) not in (1, 2):
-            raise ValueError(f"unsupported tiny_rp phase {compile_time_phase!r}")
+            raise ValueError(f"unsupported tiny_decode phase {compile_time_phase!r}")
         self.compile_time_phase = int(compile_time_phase)
         self.activation = activation
         self.w13_layout = w13_layout
@@ -82,14 +85,14 @@ class MoETinyRpKernelBackend:
     ) -> None:
         del device
         if k % 256 != 0 or n % 256 != 0:
-            raise ValueError("tiny_rp requires k % 256 == 0 and n % 256 == 0")
+            raise ValueError("tiny_decode requires k % 256 == 0 and n % 256 == 0")
         if m < 1 or m > 4:
-            raise ValueError("tiny_rp supports 1 <= m <= 4")
+            raise ValueError("tiny_decode supports 1 <= m <= 4")
         rt = m * num_topk
         kt13 = k // 128
         kt2 = n // 128
         if kt13 % _FC1_KT_PER_TASK != 0 or kt2 % _FC2_KT_PER_TASK != 0:
-            raise ValueError("tiny_rp k-tile counts not divisible by task sizes")
+            raise ValueError("tiny_decode k-tile counts not divisible by task sizes")
         cfg = dict(
             m=m,
             k=k,
