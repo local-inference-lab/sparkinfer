@@ -323,7 +323,7 @@ class MoEMicroKernelBackend:
         w13_layout: str = "w13",
     ):
         activation = normalize_moe_activation(activation)
-        if int(compile_time_phase) not in {0, 1}:
+        if int(compile_time_phase) not in {0, 1, 2}:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
         if scale_format not in {"e4m3_k16", "e8m0_k32"}:
             raise ValueError(f"unsupported micro scale_format {scale_format!r}")
@@ -371,6 +371,8 @@ class MoEMicroKernelBackend:
         self._cfg = None
         self.m_const = 0
         self.m1_fc2_onepass = False
+        self.m1_fc2_rows_per_cta = _K_PER_CTA * 2
+        self.launch_block_dim = _BLOCK_DIM
         self.grid_x = 0
 
     @property
@@ -396,6 +398,8 @@ class MoEMicroKernelBackend:
             self._cfg,
             self.m_const,
             self.m1_fc2_onepass,
+            self.m1_fc2_rows_per_cta,
+            self.launch_block_dim,
         )
 
     @cute.jit
@@ -622,9 +626,14 @@ class MoEMicroKernelBackend:
         if self.a8_mx_mode:
             # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
             # (the default policy picks i_chunk=16 at m<=2).
-            a8_chunks = max(1, min(num_fc1_chunks, n // 32))
+            # The standalone FC1 phase only writes the contiguous FP32
+            # intermediate; it never forms the FC2 per-32 activation scale.
+            # It can therefore use the native 16-row tile, which doubles the
+            # decode work grid without changing quantization semantics.
+            a8_chunk_rows = 16 if self.compile_time_phase == 1 else 32
+            a8_chunks = max(1, min(num_fc1_chunks, n // a8_chunk_rows))
             while a8_chunks > 1 and (
-                n % a8_chunks != 0 or (n // a8_chunks) % 32 != 0
+                n % a8_chunks != 0 or (n // a8_chunks) % a8_chunk_rows != 0
             ):
                 a8_chunks -= 1
             num_fc1_chunks = a8_chunks
@@ -632,15 +641,24 @@ class MoEMicroKernelBackend:
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
         w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
+        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
+        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
         if m == 1:
-            fc2_tasks = cfg.k_dim // (_K_PER_CTA * 2)
+            fc2_tasks = cfg.k_dim // m1_fc2_rows
         elif w4a16_rowpair_fc2:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
         else:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
         if max_active_ctas is None:
             max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
-        if m == 1:
+        if self.compile_time_phase == 1:
+            # A standalone FC1 phase has no cooperative-grid requirement.
+            grid_x = max(1, fc1_tasks)
+        elif self.compile_time_phase == 2:
+            # Likewise FC2 can expose every output-row task directly once
+            # FC1 has completed in a prior launch.
+            grid_x = max(1, fc2_tasks)
+        elif m == 1:
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif m == 2:
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
@@ -650,13 +668,15 @@ class MoEMicroKernelBackend:
             grid_x = max(1, min(int(max_active_ctas), fc1_tasks, fc2_tasks))
         m1_fc2_onepass = bool(m == 1 and grid_x >= fc2_tasks)
 
-        if self.a8_mx_mode and cfg.i_chunk % 32 != 0:
+        if self.a8_mx_mode and self.compile_time_phase != 1 and cfg.i_chunk % 32 != 0:
             # The per-32 block scale reads the partner 16-block; the FC2
             # intermediate chunk must hold whole 32-blocks.
             raise ValueError("a8_mx micro mode requires i_chunk % 32 == 0")
         self._cfg = cfg
         self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
+        self.m1_fc2_rows_per_cta = m1_fc2_rows
+        self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
 
     @cute.jit
@@ -696,7 +716,7 @@ class MoEMicroKernelBackend:
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
-        k_chunk_off = fc2_task * Int32(_K_PER_CTA * 2)
+        k_chunk_off = fc2_task * Int32(self.m1_fc2_rows_per_cta)
         k_row0 = k_chunk_off + warp_id * Int32(2)
         k_row1 = k_row0 + Int32(1)
 
@@ -793,7 +813,7 @@ class MoEMicroKernelBackend:
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
-        k_chunk_off = fc2_task * Int32(_K_PER_CTA * 2)
+        k_chunk_off = fc2_task * Int32(self.m1_fc2_rows_per_cta)
         k_row0 = k_chunk_off + warp_id * Int32(2)
         k_row1 = k_row0 + Int32(1)
 
@@ -1329,6 +1349,13 @@ class MoEMicroKernelBackend:
         bidx_x, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         gdim_x, _, _ = cute.arch.grid_dim()
+        if cutlass.const_expr(self.compile_time_phase == 2):
+            self._run_fc2(
+                Int32(bidx_x), Int32(gdim_x), tidx // Int32(32), tidx % Int32(32),
+                m_val, w2_weights, w2_scales, w2_alphas, intermediate,
+                topk_ids, topk_weights, scatter_output,
+            )
+            return
         is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
         m1_epoch0 = Int32(0)
         if cutlass.const_expr(self.m_const == 1):
@@ -2543,14 +2570,36 @@ class MoEMicroKernelBackend:
         else:
             self._resident_grid_barrier(barrier_count, barrier_epoch, Int32(gdim_x), is_cta_leader)
 
-        # ===================================================================
-        # PHASE 2: FC2 output
-        # ===================================================================
+        self._run_fc2(
+            bidx_x, gdim_x, warp_id, lane, m_val, w2_weights, w2_scales,
+            w2_alphas, intermediate, topk_ids, topk_weights, scatter_output,
+        )
+
+    @cute.jit
+    def _run_fc2(
+        self,
+        bidx_x: Int32,
+        gdim_x: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        m_val: Int32,
+        w2_weights: cute.Tensor,
+        w2_scales: cute.Tensor,
+        w2_alphas: cute.Tensor,
+        intermediate: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+    ):
+        # FC2 is intentionally factored out so native NVFP4 decode can run it
+        # in a second, non-cooperative launch after FC1 has materialized the
+        # exact same intermediate representation.
+        cfg = self._cfg
         w2_base_addr = w2_weights.iterator.toint()
         w2s_base_addr = w2_scales.iterator.toint()
         # ---- m==1 FC2 rowpair ----
         if cutlass.const_expr(self.m_const == 1):
-            fc2_chunks_m1 = Int32(cfg.k_dim // (_K_PER_CTA * 2))
+            fc2_chunks_m1 = Int32(cfg.k_dim // self.m1_fc2_rows_per_cta)
             if cutlass.const_expr(self.m1_fc2_onepass):
                 fc2_task = Int32(bidx_x)
                 if fc2_task < fc2_chunks_m1:
@@ -2657,11 +2706,11 @@ class MoEMicroKernelBackend:
             barrier_count, barrier_epoch, m_val,
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
-            block=(_BLOCK_DIM, 1, 1),
+            block=(self.launch_block_dim, 1, 1),
             smem=0,
-            # configure() caps this cooperative, grid-barrier launch at one
-            # CTA wave.  A one-block launch bound gives the 512-thread body the
-            # matching register budget while preserving graph-stable geometry.
+            # The fused and FC1-only bodies are 512-thread cooperative CTAs;
+            # the FC2-only m=1 specialization is a 256-thread independent CTA.
+            # One block per SM preserves each variant's register budget.
             min_blocks_per_mp=1,
             stream=stream,
         )

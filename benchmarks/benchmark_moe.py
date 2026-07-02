@@ -16,7 +16,7 @@ import os
 import pathlib
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -1769,6 +1769,119 @@ def _requantize_flashinfer_mxfp4_stack(
     return quantized.contiguous(), quantized_scales.contiguous()
 
 
+def force_convert_nvfp4_weights_to_mxfp4(
+    weights: ExpertWeights,
+    params: ScaleContractParams,
+    *,
+    activation: str,
+) -> ExpertWeights:
+    """Re-quantize a ModelOpt NVFP4 MoE source to native MXFP4 E8M0/K32.
+
+    This is intentionally an offline preparation step, before the b12x weight
+    planner runs.  Each expert is reconstructed with the checkpoint's complete
+    input/weight scale contract and then quantized onto a fresh K/32 power-of-
+    two scale grid.  The result is a real ``fp4_e8m0_k32`` source for the
+    native W4A8-MX QMMA path, not a runtime adapter over ModelOpt storage.
+    """
+    if weights.source_format != "modelopt_nvfp4":
+        raise ValueError(
+            "--force-mxfp4 requires ModelOpt NVFP4 source weights, got "
+            f"{weights.source_format!r}"
+        )
+    spec = weights.spec
+    if spec.hidden_size % 32 or spec.I_tp % 32:
+        raise ValueError(
+            "--force-mxfp4 requires K and I_tp divisible by 32, got "
+            f"K={spec.hidden_size}, I_tp={spec.I_tp}"
+        )
+
+    from benchmarks.benchmark_ds4_moe import quantize_mxfp4_batched
+
+    def requantize_stack(
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        rows: int,
+        cols: int,
+        global_scales: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        converted = torch.empty_like(packed, dtype=torch.uint8)
+        converted_scales = torch.empty(
+            spec.num_experts,
+            rows,
+            cols // 32,
+            dtype=torch.uint8,
+            device=packed.device,
+        )
+        for expert_id in range(spec.num_experts):
+            logical = _dequant_nvfp4_expert(
+                packed[expert_id],
+                scales[expert_id],
+                rows=rows,
+                cols=cols,
+                global_scale=global_scales[expert_id],
+            )
+            quantized, quantized_scales = quantize_mxfp4_batched(logical.unsqueeze(0))
+            converted[expert_id].copy_(quantized[0])
+            converted_scales[expert_id].copy_(quantized_scales[0])
+        return converted.contiguous(), converted_scales.contiguous()
+
+    # The ModelOpt runtime applies input-scale reciprocal x weight-global-scale
+    # as its FC alpha.  Fold that complete factor into the offline logical
+    # weights, leaving the MXFP4 source with unit alphas.
+    fc1_scales = (params.g1_alphas * params.a1_gscale).to(torch.float32)
+    fc2_scales = (params.g2_alphas * params.a2_gscale).to(torch.float32)
+    print("  Forcing ModelOpt NVFP4 -> MXFP4 E8M0/K32...", end="", flush=True)
+    w13_weight, w13_mx = requantize_stack(
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        rows=moe_activation_w1_rows(activation, spec.I_tp),
+        cols=spec.hidden_size,
+        global_scales=fc1_scales,
+    )
+    w2_weight, w2_mx = requantize_stack(
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        rows=spec.hidden_size,
+        cols=spec.I_tp,
+        global_scales=fc2_scales,
+    )
+    torch.cuda.synchronize()
+    print(" done.")
+
+    ones = torch.ones(spec.num_experts, dtype=torch.float32, device=w13_weight.device)
+    one = torch.ones((), dtype=torch.float32, device=w13_weight.device)
+    return replace(
+        weights,
+        w13_permuted=w13_weight.permute(1, 2, 0),
+        w13_scale=w13_mx,
+        down_permuted=w2_weight.permute(1, 2, 0),
+        down_scale=w2_mx,
+        w13_weight=w13_weight,
+        w13_blockscale_swizzled=w13_mx,
+        w2_weight=w2_weight,
+        w2_blockscale_swizzled=w2_mx,
+        w13_input_scale=one,
+        w2_input_scale=one,
+        w13_input_scale_quant=one,
+        w2_input_scale_quant=one,
+        w13_input_scale_per_expert=ones,
+        w2_input_scale_per_expert=ones,
+        w13_input_scale_quant_per_expert=ones,
+        w2_input_scale_quant_per_expert=ones,
+        g1_alphas=ones,
+        g2_alphas=ones,
+        g1_alphas_per_expert=ones,
+        g2_alphas_per_expert=ones,
+        source_format="fp4_e8m0_k32",
+        oracle_w13_weight=None,
+        oracle_w13_scale=None,
+        oracle_w2_weight=None,
+        oracle_w2_scale=None,
+        oracle_flashinfer_weights=None,
+    )
+
+
 def prepare_flashinfer_mxfp4_weights(
     weights: ExpertWeights,
     params: ScaleContractParams,
@@ -2707,6 +2820,14 @@ def bench_e2e() -> None:
             "omitted, the model profile default is used."
         ),
     )
+    parser.add_argument(
+        "--force-mxfp4",
+        action="store_true",
+        help=(
+            "Offline-requantize ModelOpt NVFP4 checkpoint weights to native "
+            "MXFP4 E8M0/K32 before preparing --quant-mode w4a8_mx."
+        ),
+    )
     parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
     parser.add_argument("--graph-num-layers", type=int, default=4)
     parser.add_argument("--graph-layer-start", type=int, default=0)
@@ -2859,6 +2980,8 @@ def bench_e2e() -> None:
         raise ValueError(
             "--reference flashinfer-mxfp8 requires --graph-mode single-op"
         )
+    if args.force_mxfp4 and args.quant_mode != "w4a8_mx":
+        raise ValueError("--force-mxfp4 requires --quant-mode w4a8_mx")
     if args.flashinfer_tune_max_num_tokens <= 0:
         raise ValueError("--flashinfer-tune-max-num-tokens must be positive")
     if (
@@ -2953,6 +3076,13 @@ def bench_e2e() -> None:
         checkpoint_family=model_profile.checkpoint_family,
         keep_flashinfer_oracle_copy=keep_flashinfer_oracle_copy,
     )
+    if args.force_mxfp4:
+        source_params = get_quant_mode_params(weights, args.scale_contract, "w4a8_nvfp4")
+        weights = force_convert_nvfp4_weights_to_mxfp4(
+            weights,
+            source_params,
+            activation=args.activation,
+        )
     print(f"Source format: {weights.source_format}")
     params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
     weight_plan = plan_b12x_benchmark_weights(

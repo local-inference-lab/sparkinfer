@@ -4,13 +4,14 @@ Reads the N256/K128 in-place-REPACKED weight storage (the "rp" layout produced
 by _logical_weight_to_w4a8_rp_inplace) directly.
 
 Consumes the N256/K128 in-place-repacked FP4 weights and e8m0 sfb grids
-directly (inverse mappings verified in tests/test_w4a8_rp_inverse_mapping.py),
-with BF16 activations (no input quantization) and f32 accumulation. Two plain
-(non-cooperative) launches: FC1 dots gate+up rows into an fp32 intermediate,
-FC2 applies SiLU inline and folds router-weighted partials into the bf16
-output via scatter-add. The wrapper zeroes the intermediate and output first;
-there are no grid barriers and no CTA co-residency assumptions, so the
-kernels are safe on busy serving streams.
+directly (inverse mappings verified in tests/test_w4a8_rp_inverse_mapping.py).
+Both the BF16 input and FC1 activation are quantized/dequantized in-register
+as MXFP8 E4M3 with one UE8M0 scale per 32 values, matching the W4A8 contract.
+Two plain (non-cooperative) launches: FC1 dots gate+up rows into an fp32
+intermediate, FC2 applies SiLU and the second MXFP8 round-trip inline, then
+applies router weights after FC2. The wrapper zeroes the intermediate and
+output first; there are no grid barriers and no CTA co-residency assumptions,
+so the kernels are safe on busy serving streams.
 
 Thread mapping (256 threads/CTA), the core of the rp coalescing story: one rp
 (nt, kt) tile is 4096 contiguous int32 words whose flat index decomposes as
@@ -37,11 +38,14 @@ from b12x.cute.utils import current_cuda_stream, make_ptr
 from b12x.cute.fp4 import (
     cvt_bf16x2_to_f16x2,
     cvt_e8m0x4_to_f32x4,
+    fmax_f32,
     fp4_dot4_sum_f32acc,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
     pack_f32x2_to_f16x2,
+    mx_scale_from_amax32,
+    quant_dequant_e4m3_2,
     red_add_global_f32,
     scatter_add_bf16x2,
     warp_reduce,
@@ -166,10 +170,59 @@ class MoETinyDecodeKernelBackend:
             acc[v] += accv
         return acc[0], acc[1], acc[2], acc[3]
 
+    @cute.jit
+    def _mxfp8_roundtrip_8(
+        self,
+        v0: Float32, v1: Float32, v2: Float32, v3: Float32,
+        v4: Float32, v5: Float32, v6: Float32, v7: Float32,
+    ):
+        """Round-trip this lane's 8 values through its CTA group's K32 scale.
+
+        Four adjacent ``cgrp`` lanes own one logical K32 block.  The width-4
+        warp reduction therefore produces precisely the UE8M0 scale used by
+        the W4A8 MXFP8 reference, without a shared-memory staging buffer.
+        """
+        peak = fmax_f32(v0, -v0)
+        peak = fmax_f32(peak, fmax_f32(v1, -v1))
+        peak = fmax_f32(peak, fmax_f32(v2, -v2))
+        peak = fmax_f32(peak, fmax_f32(v3, -v3))
+        peak = fmax_f32(peak, fmax_f32(v4, -v4))
+        peak = fmax_f32(peak, fmax_f32(v5, -v5))
+        peak = fmax_f32(peak, fmax_f32(v6, -v6))
+        peak = fmax_f32(peak, fmax_f32(v7, -v7))
+        peak = warp_reduce(peak, fmax_f32, width=4)
+        scale, inv_scale = mx_scale_from_amax32(peak)
+        q0, q1 = quant_dequant_e4m3_2(v0, v1, inv_scale, scale)
+        q2, q3 = quant_dequant_e4m3_2(v2, v3, inv_scale, scale)
+        q4, q5 = quant_dequant_e4m3_2(v4, v5, inv_scale, scale)
+        q6, q7 = quant_dequant_e4m3_2(v6, v7, inv_scale, scale)
+        return (
+            pack_f32x2_to_f16x2(q0, q1),
+            pack_f32x2_to_f16x2(q2, q3),
+            pack_f32x2_to_f16x2(q4, q5),
+            pack_f32x2_to_f16x2(q6, q7),
+        )
+
+    @cute.jit
+    def _load_mxfp8_input_8(
+        self,
+        qinput: cute.Tensor,
+        word_idx: Int32,
+    ):
+        """Load eight pre-quantized/dequantized f16 values as four pairs."""
+        return (
+            qinput[word_idx + Int32(0)],
+            qinput[word_idx + Int32(1)],
+            qinput[word_idx + Int32(2)],
+            qinput[word_idx + Int32(3)],
+        )
+
     @cute.kernel
     def kernel(
         self,
         a_input: cute.Tensor,       # bf16 [m*k]
+        qinput: cute.Tensor,        # f16x2 words [m*k/2]
+        qinter: cute.Tensor,        # f16x2 words [rt*n/2]
         w13: cute.Tensor,           # u8 rp bytes, expert-major
         sfb13: cute.Tensor,         # u8 sfb bytes, expert-major
         inter: cute.Tensor,         # f32 [rt * 2n] (pre-zeroed for phase 1)
@@ -186,7 +239,6 @@ class MoETinyDecodeKernelBackend:
         r8 = (tidx // Int32(4)) % Int32(8)
         cgrp = tidx % Int32(4)
 
-        x_base = get_ptr_as_int64(a_input, Int32(0))
         w13_base = get_ptr_as_int64(w13, Int32(0))
         sfb13_base = get_ptr_as_int64(sfb13, Int32(0))
         inter_base = get_ptr_as_int64(inter, Int32(0))
@@ -205,7 +257,6 @@ class MoETinyDecodeKernelBackend:
             tok = rt_idx // Int32(c["num_topk"])
             we_base = w13_base + eid * Int64(c["w13_words"] * 4)
             se_base = sfb13_base + eid * Int64(c["sfb13_bytes"])
-            xt_base = x_base + Int64(tok) * Int64(c["k"] * 2)
             srow_base = se_base + Int64(r8 * Int32(4) + n8c * Int32(128))
 
             acc0 = Float32(0.0)
@@ -219,18 +270,11 @@ class MoETinyDecodeKernelBackend:
                 srow = srow_base + Int64(col_tile) * Int64(1024)
                 xs = []
                 for k32 in cutlass.range_constexpr(4):
-                    ax = xt_base + (
-                        Int64(kt * Int32(128) + cgrp * Int32(8)) + Int64(k32 * 32)
-                    ) * Int64(2)
-                    bq = ld_global_nc_v4_u32(ax)
-                    xs.append(
-                        (
-                            cvt_bf16x2_to_f16x2(bq[0]),
-                            cvt_bf16x2_to_f16x2(bq[1]),
-                            cvt_bf16x2_to_f16x2(bq[2]),
-                            cvt_bf16x2_to_f16x2(bq[3]),
-                        )
-                    )
+                    x_idx = tok * Int32(c["k"]) + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                    xs.append(self._load_mxfp8_input_8(
+                        qinput,
+                        (x_idx >> Int32(1)),
+                    ))
                 d0, d1, d2, d3 = self._row_block_dot(
                     tile_word, srow, n8c, r8, cgrp,
                     xs[0][0], xs[0][1], xs[0][2], xs[0][3],
@@ -269,7 +313,7 @@ class MoETinyDecodeKernelBackend:
             we_base = w2_base + eid * Int64(c["w2_words"] * 4)
             se_base = sfb2_base + eid * Int64(c["sfb2_bytes"])
             srow_base = se_base + Int64(r8 * Int32(4) + n8c * Int32(128))
-            ibase = rt_idx * Int32(c["two_n"])
+            ibase = rt_idx * Int32(c["n"])
 
             acc0 = Float32(0.0)
             acc1 = Float32(0.0)
@@ -283,22 +327,7 @@ class MoETinyDecodeKernelBackend:
                 xs = []
                 for k32 in cutlass.range_constexpr(4):
                     ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
-                    quads = []
-                    for jp in cutlass.range_constexpr(4):
-                        g0 = Float32(inter[ich + Int32(2 * jp)])
-                        g1 = Float32(inter[ich + Int32(2 * jp + 1)])
-                        u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
-                        u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
-                        s0 = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                        )
-                        s1 = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                        )
-                        a0 = s0 * g0 * u0 * rw
-                        a1 = s1 * g1 * u1 * rw
-                        quads.append(pack_f32x2_to_f16x2(a0, a1))
-                    xs.append((quads[0], quads[1], quads[2], quads[3]))
+                    xs.append(self._load_mxfp8_input_8(qinter, ich >> Int32(1)))
                 d0, d1, d2, d3 = self._row_block_dot(
                     tile_word, srow, n8c, r8, cgrp,
                     xs[0][0], xs[0][1], xs[0][2], xs[0][3],
@@ -314,6 +343,10 @@ class MoETinyDecodeKernelBackend:
             acc1 = warp_reduce(acc1, lambda a, b: a + b, width=4)
             acc2 = warp_reduce(acc2, lambda a, b: a + b, width=4)
             acc3 = warp_reduce(acc3, lambda a, b: a + b, width=4)
+            acc0 = acc0 * rw
+            acc1 = acc1 * rw
+            acc2 = acc2 * rw
+            acc3 = acc3 * rw
             # pair consecutive output rows: partner lane differs in r8 bit0 (lane^4)
             o0 = cute.arch.shuffle_sync_bfly(acc0, offset=4)
             o1 = cute.arch.shuffle_sync_bfly(acc1, offset=4)
@@ -334,6 +367,8 @@ class MoETinyDecodeKernelBackend:
     def __call__(
         self,
         x_ptr: cute.Pointer,
+        qinput_ptr: cute.Pointer,
+        qinter_ptr: cute.Pointer,
         w13_ptr: cute.Pointer,
         sfb13_ptr: cute.Pointer,
         inter_ptr: cute.Pointer,
@@ -346,6 +381,12 @@ class MoETinyDecodeKernelBackend:
     ):
         c = self._c
         a_input = cute.make_tensor(x_ptr, cute.make_layout(Int32(c["m"] * c["k"])))
+        qinput = cute.make_tensor(
+            qinput_ptr, cute.make_layout(Int32(c["m"] * (c["k"] // 2)))
+        )
+        qinter = cute.make_tensor(
+            qinter_ptr, cute.make_layout(Int32(c["rt"] * (c["n"] // 2)))
+        )
         w13 = cute.make_tensor(
             w13_ptr, cute.make_layout(Int64(c["weight_E"] * c["w13_words"] * 4))
         )
@@ -366,7 +407,7 @@ class MoETinyDecodeKernelBackend:
         out = cute.make_tensor(out_ptr, cute.make_layout(Int32(c["m"] * c["k"])))
 
         self.kernel(
-            a_input, w13, sfb13, inter, w2, sfb2, topk_ids, topk_weights, out,
+            a_input, qinput, qinter, w13, sfb13, inter, w2, sfb2, topk_ids, topk_weights, out,
         ).launch(
             grid=(Int32(self.grid_x), Int32(1), Int32(1)),
             block=(_BLOCK_THREADS, 1, 1),
@@ -378,8 +419,12 @@ class MoETinyDecodeKernelBackend:
     def launch(
         compiled_fc1,
         compiled_fc2,
+        compiled_input_quant,
+        compiled_intermediate_quant,
         *,
         x: torch.Tensor,
+        qinput: torch.Tensor,
+        qinter: torch.Tensor,
         w13_rp: torch.Tensor,
         sfb13: torch.Tensor,
         inter_fp32: torch.Tensor,
@@ -394,11 +439,14 @@ class MoETinyDecodeKernelBackend:
                 dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
             )
 
+        MoETinyDecodeInputQuantizer.launch(compiled_input_quant, x=x, out=qinput)
         inter_fp32.zero_()
         out.zero_()
         stream = current_cuda_stream()
         args = (
             ptr(cutlass.BFloat16, x),
+            ptr(cutlass.Uint32, qinput, 4),
+            ptr(cutlass.Uint32, qinter, 4),
             ptr(cutlass.Uint8, w13_rp.view(torch.uint8)),
             ptr(cutlass.Uint8, sfb13.view(torch.uint8)),
             ptr(cutlass.Float32, inter_fp32),
@@ -410,4 +458,172 @@ class MoETinyDecodeKernelBackend:
             stream,
         )
         compiled_fc1(*args)
+        MoETinyDecodeIntermediateQuantizer.launch(
+            compiled_intermediate_quant, inter=inter_fp32, out=qinter
+        )
         compiled_fc2(*args)
+
+
+class MoETinyDecodeInputQuantizer:
+    """K32 MXFP8 round-trip prepass for the tiny FC1 schedule.
+
+    It writes the f16x2 values consumed by the scalar FP4 dot directly.  This
+    is deliberately not a general MXFP8 packing kernel: avoiding a payload
+    decode in every FC1 CTA is the point of the tiny-decode specialization.
+    """
+
+    def __init__(self, m: int, k: int):
+        if m < 1 or k <= 0 or k % 256 != 0:
+            raise ValueError("tiny input quantizer requires 1<=m and k % 256 == 0")
+        self.m = int(m)
+        self.k = int(k)
+        self.tiles_per_row = self.k // 256
+        # One CTA has eight warps; each warp quantizes eight K32 blocks.
+        self.grid_x = self.m * ((self.tiles_per_row + 7) // 8)
+
+    @property
+    def __cache_key__(self):
+        return (self.m, self.k, self.tiles_per_row, self.grid_x)
+
+    @cute.kernel
+    def kernel(self, x: cute.Tensor, out_u32: cute.Tensor):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp = tidx // Int32(32)
+        lane = tidx % Int32(32)
+        subgroup = lane // Int32(4)
+        lane8 = lane % Int32(4)
+        task = bidx * Int32(8) + warp
+        row = task // Int32(self.tiles_per_row)
+        tile = task - row * Int32(self.tiles_per_row)
+        group = tile * Int32(8) + subgroup
+        valid = Int32(1) if row < Int32(self.m) else Int32(0)
+
+        value_idx = row * Int32(self.k) + group * Int32(32) + lane8 * Int32(8)
+        v0 = Float32(x[value_idx + Int32(0)]) if valid > Int32(0) else Float32(0.0)
+        v1 = Float32(x[value_idx + Int32(1)]) if valid > Int32(0) else Float32(0.0)
+        v2 = Float32(x[value_idx + Int32(2)]) if valid > Int32(0) else Float32(0.0)
+        v3 = Float32(x[value_idx + Int32(3)]) if valid > Int32(0) else Float32(0.0)
+        v4 = Float32(x[value_idx + Int32(4)]) if valid > Int32(0) else Float32(0.0)
+        v5 = Float32(x[value_idx + Int32(5)]) if valid > Int32(0) else Float32(0.0)
+        v6 = Float32(x[value_idx + Int32(6)]) if valid > Int32(0) else Float32(0.0)
+        v7 = Float32(x[value_idx + Int32(7)]) if valid > Int32(0) else Float32(0.0)
+
+        peak = fmax_f32(v0, -v0)
+        peak = fmax_f32(peak, fmax_f32(v1, -v1))
+        peak = fmax_f32(peak, fmax_f32(v2, -v2))
+        peak = fmax_f32(peak, fmax_f32(v3, -v3))
+        peak = fmax_f32(peak, fmax_f32(v4, -v4))
+        peak = fmax_f32(peak, fmax_f32(v5, -v5))
+        peak = fmax_f32(peak, fmax_f32(v6, -v6))
+        peak = fmax_f32(peak, fmax_f32(v7, -v7))
+        peak = warp_reduce(peak, fmax_f32, width=4)
+        scale, inv_scale = mx_scale_from_amax32(peak)
+        q0, q1 = quant_dequant_e4m3_2(v0, v1, inv_scale, scale)
+        q2, q3 = quant_dequant_e4m3_2(v2, v3, inv_scale, scale)
+        q4, q5 = quant_dequant_e4m3_2(v4, v5, inv_scale, scale)
+        q6, q7 = quant_dequant_e4m3_2(v6, v7, inv_scale, scale)
+        out_idx = row * Int32(self.k // 2) + group * Int32(16) + lane8 * Int32(4)
+        if valid > Int32(0):
+            out_u32[out_idx + Int32(0)] = pack_f32x2_to_f16x2(q0, q1)
+            out_u32[out_idx + Int32(1)] = pack_f32x2_to_f16x2(q2, q3)
+            out_u32[out_idx + Int32(2)] = pack_f32x2_to_f16x2(q4, q5)
+            out_u32[out_idx + Int32(3)] = pack_f32x2_to_f16x2(q6, q7)
+
+    @cute.jit
+    def __call__(self, x_ptr: cute.Pointer, out_ptr: cute.Pointer, stream):
+        x = cute.make_tensor(x_ptr, cute.make_layout(Int32(self.m * self.k)))
+        out_u32 = cute.make_tensor(
+            out_ptr, cute.make_layout(Int32(self.m * (self.k // 2)))
+        )
+        self.kernel(x, out_u32).launch(
+            grid=(Int32(self.grid_x), Int32(1), Int32(1)),
+            block=(_BLOCK_THREADS, 1, 1),
+            smem=0,
+            stream=stream,
+        )
+
+    @staticmethod
+    def launch(compiled, *, x: torch.Tensor, out: torch.Tensor) -> None:
+        compiled(
+            make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            current_cuda_stream(),
+        )
+
+
+class MoETinyDecodeIntermediateQuantizer:
+    """Route-local SiLU and MXFP8 K32 round-trip for tiny FC2.
+
+    FC2 has many N tiles for one route but they all consume the same 256-wide
+    activated intermediate.  Quantizing that intermediate once avoids doing
+    the nonlinear operation and K32 reduction in every output CTA.
+    """
+
+    def __init__(self, rt: int, n: int):
+        if rt < 1 or n <= 0 or n % 256 != 0:
+            raise ValueError("tiny intermediate quantizer requires rt>=1 and n % 256 == 0")
+        self.rt = int(rt)
+        self.n = int(n)
+        self.tiles_per_route = self.n // 256
+
+    @property
+    def __cache_key__(self):
+        return (self.rt, self.n, self.tiles_per_route)
+
+    @cute.kernel
+    def kernel(self, inter: cute.Tensor, out_u32: cute.Tensor):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        route = bidx // Int32(self.tiles_per_route)
+        tile = bidx - route * Int32(self.tiles_per_route)
+        subgroup = tidx // Int32(4)
+        lane8 = tidx % Int32(4)
+        group = tile * Int32(8) + subgroup
+        base = route * Int32(2 * self.n) + group * Int32(32) + lane8 * Int32(8)
+
+        vals = []
+        for i in cutlass.range_constexpr(8):
+            g = Float32(inter[base + Int32(i)])
+            u = Float32(inter[base + Int32(self.n) + Int32(i)])
+            sigmoid = Float32(1.0) / (
+                Float32(1.0) + cute.math.exp(-g, fastmath=False)
+            )
+            vals.append(sigmoid * g * u)
+        peak = fmax_f32(vals[0], -vals[0])
+        for i in cutlass.range_constexpr(1, 8):
+            peak = fmax_f32(peak, fmax_f32(vals[i], -vals[i]))
+        peak = warp_reduce(peak, fmax_f32, width=4)
+        scale, inv_scale = mx_scale_from_amax32(peak)
+        q0, q1 = quant_dequant_e4m3_2(vals[0], vals[1], inv_scale, scale)
+        q2, q3 = quant_dequant_e4m3_2(vals[2], vals[3], inv_scale, scale)
+        q4, q5 = quant_dequant_e4m3_2(vals[4], vals[5], inv_scale, scale)
+        q6, q7 = quant_dequant_e4m3_2(vals[6], vals[7], inv_scale, scale)
+        out_idx = route * Int32(self.n // 2) + group * Int32(16) + lane8 * Int32(4)
+        out_u32[out_idx + Int32(0)] = pack_f32x2_to_f16x2(q0, q1)
+        out_u32[out_idx + Int32(1)] = pack_f32x2_to_f16x2(q2, q3)
+        out_u32[out_idx + Int32(2)] = pack_f32x2_to_f16x2(q4, q5)
+        out_u32[out_idx + Int32(3)] = pack_f32x2_to_f16x2(q6, q7)
+
+    @cute.jit
+    def __call__(self, inter_ptr: cute.Pointer, out_ptr: cute.Pointer, stream):
+        inter = cute.make_tensor(
+            inter_ptr, cute.make_layout(Int32(self.rt * 2 * self.n))
+        )
+        out_u32 = cute.make_tensor(
+            out_ptr, cute.make_layout(Int32(self.rt * (self.n // 2)))
+        )
+        self.kernel(inter, out_u32).launch(
+            grid=(Int32(self.rt * self.tiles_per_route), Int32(1), Int32(1)),
+            block=(32, 1, 1),
+            smem=0,
+            stream=stream,
+        )
+
+    @staticmethod
+    def launch(compiled, *, inter: torch.Tensor, out: torch.Tensor) -> None:
+        compiled(
+            make_ptr(cutlass.Float32, inter.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            current_cuda_stream(),
+        )
