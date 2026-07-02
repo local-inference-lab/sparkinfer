@@ -231,7 +231,10 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
-def test_indexer_common_plan_selects_fused_for_c4_decode_buckets(rows) -> None:
+def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
+    # C4 decode is owned by the streamed tiled route + two-level fold; the
+    # fused kernel is retired from this shape (kept for MSA/contiguous and as
+    # an explicit opt-in).
     plan = plan_indexer_scratch(
         B12XIndexerScratchCaps(
             device="cpu",
@@ -244,11 +247,11 @@ def test_indexer_common_plan_selects_fused_for_c4_decode_buckets(rows) -> None:
         )
     )
 
-    assert plan.layout.route == "paged_fused"
+    assert plan.layout.route == "paged_tiled"
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
-def test_indexer_common_plan_selects_fused_for_glm_decode_buckets(rows) -> None:
+def test_indexer_common_plan_selects_measured_glm_decode_routes(rows) -> None:
     plan = plan_indexer_scratch(
         B12XIndexerScratchCaps(
             device="cpu",
@@ -261,7 +264,10 @@ def test_indexer_common_plan_selects_fused_for_glm_decode_buckets(rows) -> None:
         )
     )
 
-    assert plan.layout.route == "paged_fused"
+    # GLM keeps fused through rows 16; rows >= 32 measured faster on the
+    # streamed tiled route at every capacity bucket.
+    expected = "paged_fused" if rows <= 16 else "paged_tiled"
+    assert plan.layout.route == expected
 
 
 @pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])

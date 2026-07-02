@@ -19,12 +19,20 @@ from b12x.attention.indexer.api import (
 )
 from b12x.attention.indexer.contiguous_kernel import run_contiguous_logits_kernel
 from b12x.attention.indexer.kernel import (
+    _env_indexer_stream_scorer_enabled,
     _split_index_k_cache_runtime_views,
     run_paged_supertile_logits_kernel,
 )
 from b12x.attention.indexer.tiled_topk import (
+    run_row_topk,
     run_tiled_topk,
 )
+
+# Two-level fold: target slice width for level-1 pseudo-row parallelism and the
+# cap that keeps the candidate buffers capacity-independent (~topk*8B*cap per
+# row) at very long contexts.
+_TWO_LEVEL_SLICE_TOKENS = 16384
+_TWO_LEVEL_MAX_SLICES = 32
 from b12x.attention.indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
@@ -732,10 +740,44 @@ def index_topk_fp8(
         raise ValueError("paged indexer top-k buffers must be contiguous")
     # Streaming-fold carry double-buffer (2, M, topk): chunk j reads the running top-k
     # written by chunk j-1 and writes the next half; the final chunk writes the user
+    # Two-level cross-chunk fold: each chunk's slices are top-k'd by parallel
+    # pseudo-row CTAs straight into a shared candidate buffer (bounded by the
+    # slice cap, NOT the context capacity); one linear pass folds them after
+    # the last chunk. The per-chunk tile-logits scratch stays at the supertile
+    # ceiling. Physical-slot output keeps the legacy carry chain (the fold
+    # gather emits logical indices).
+    width_tokens = page_table_width * page_size
+    two_level_slices: list[tuple[int, int]] = []
+    total_slices = 0
+    fold_values = None
+    fold_indices = None
+    fold_lengths = None
+    if not output_physical_slots and width_tokens >= 2 * _TWO_LEVEL_SLICE_TOKENS:
+        slice_tokens = _TWO_LEVEL_SLICE_TOKENS
+        min_slice = -(-width_tokens // _TWO_LEVEL_MAX_SLICES)
+        if min_slice > slice_tokens:
+            slice_tokens = -(-min_slice // page_size) * page_size
+        base = 0
+        for c in range(num_chunks):
+            c_pages = min((c + 1) * supertile_pages, page_table_width) - c * supertile_pages
+            c_tokens = c_pages * page_size
+            splits_c = max(1, -(-c_tokens // slice_tokens))
+            two_level_slices.append((splits_c, base))
+            base += splits_c
+        total_slices = base
+        fold_values = torch.empty(
+            (q_rows * total_slices, topk), dtype=torch.float32, device=q_fp8.device
+        )
+        fold_indices = torch.empty(
+            (q_rows * total_slices, topk), dtype=torch.int32, device=q_fp8.device
+        )
+        fold_lengths = torch.full(
+            (q_rows,), total_slices * topk, dtype=torch.int32, device=q_fp8.device
+        )
     # output. Only needed when there is more than one supertile chunk.
     carry_buf_values = None
     carry_buf_indices = None
-    if num_chunks > 1:
+    if num_chunks > 1 and not two_level_slices:
         carry_buf_values, carry_buf_indices = scratch.get_indexer_contiguous_candidate_buffers()
         if carry_buf_values.shape[0] < 2 or carry_buf_indices.shape[0] < 2:
             raise RuntimeError(
@@ -783,7 +825,13 @@ def index_topk_fp8(
         chunk_pages = page_end - page_begin
         chunk_width_tokens = chunk_pages * page_size
         chunk_start_token = page_begin * page_size
-        if uses_paged_mqa_schedule(q_rows=q_rows, max_pages=chunk_pages):
+        if (
+            not _env_indexer_stream_scorer_enabled()
+            and uses_paged_mqa_schedule(q_rows=q_rows, max_pages=chunk_pages)
+        ):
+            # The streamed scorer schedules its own persistent grid over the
+            # whole supertile; only the legacy tiled scorer needs the
+            # unscheduled-tile contract.
             raise RuntimeError(
                 "paged supertile top-k requires an unscheduled paged scorer tile; "
                 f"reduce {_PAGED_INDEX_SUPERTILE_K_ENV} below "
@@ -851,28 +899,61 @@ def index_topk_fp8(
             carry_indices = None
             out_values = final_values
             out_indices = final_raw_indices
-        run_tiled_topk(
-            tile_logits=tile_logits,
-            k_start=None,
-            lengths=topk_lengths,
-            topk=topk,
-            block_q=_PAGED_INDEX_TILE_BLOCK_Q,
-            block_k=topk_block_k,
-            output_values=out_values,
-            output_indices=out_indices,
-            num_k_tiles=supertile_k_tiles,
-            input_index_offset=chunk_start_token,
-            input_extent=chunk_width_tokens,
-            output_index_offset=chunk_start_token,
-            zero_row_start=True,
-            carry_values=carry_values,
-            carry_indices=carry_indices,
-            is_first=is_first,
-            output_page_table=(
-                metadata.real_page_table if is_last and output_physical_slots else None
-            ),
-            output_page_size=page_size,
-        )
+        if two_level_slices:
+            chunk_splits, chunk_slice_base = two_level_slices[chunk_idx]
+            split_extent = -(-chunk_width_tokens // chunk_splits)
+            split_extent = -(-split_extent // topk_block_k) * topk_block_k
+            run_tiled_topk(
+                tile_logits=tile_logits,
+                k_start=None,
+                lengths=topk_lengths,
+                topk=topk,
+                block_q=_PAGED_INDEX_TILE_BLOCK_Q,
+                block_k=topk_block_k,
+                output_values=fold_values,
+                output_indices=fold_indices,
+                num_k_tiles=supertile_k_tiles,
+                input_index_offset=chunk_start_token,
+                input_extent=split_extent,
+                output_index_offset=chunk_start_token,
+                zero_row_start=True,
+                is_first=True,
+                extent_splits=chunk_splits,
+                output_row_stride=total_slices,
+                output_row_base=chunk_slice_base,
+            )
+            if is_last:
+                run_row_topk(
+                    row_logits=fold_values.view(q_rows, total_slices * topk),
+                    lengths=fold_lengths,
+                    topk=topk,
+                    output_values=final_values,
+                    output_indices=final_raw_indices,
+                    output_gather_table=fold_indices.view(q_rows, total_slices * topk),
+                )
+        else:
+            run_tiled_topk(
+                tile_logits=tile_logits,
+                k_start=None,
+                lengths=topk_lengths,
+                topk=topk,
+                block_q=_PAGED_INDEX_TILE_BLOCK_Q,
+                block_k=topk_block_k,
+                output_values=out_values,
+                output_indices=out_indices,
+                num_k_tiles=supertile_k_tiles,
+                input_index_offset=chunk_start_token,
+                input_extent=chunk_width_tokens,
+                output_index_offset=chunk_start_token,
+                zero_row_start=True,
+                carry_values=carry_values,
+                carry_indices=carry_indices,
+                is_first=is_first,
+                output_page_table=(
+                    metadata.real_page_table if is_last and output_physical_slots else None
+                ),
+                output_page_size=page_size,
+            )
 
     return final_raw_indices
 

@@ -52,7 +52,7 @@ def test_large_fused_carry_is_paged_dsv4_specific(kv_layout, num_heads, topk):
 
 
 @pytest.mark.parametrize("width", [8192, 16384, 32768, 131072])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
 def test_fused_indexer_route_covers_glm_decode_buckets(width, rows):
     assert resolve_fused_indexer_path(
         topk=2048,
@@ -62,10 +62,13 @@ def test_fused_indexer_route_covers_glm_decode_buckets(width, rows):
     )
 
 
-def test_fused_indexer_route_stops_after_glm_decode_buckets():
+@pytest.mark.parametrize("rows", [32, 64])
+def test_fused_indexer_route_stops_after_glm_decode_buckets(rows):
+    # Rows >= 32 belong to the streamed tiled route: measured wins at every
+    # capacity bucket (e.g. r64@131K 1043us tiled vs 1541us fused).
     assert not resolve_fused_indexer_path(
         topk=2048,
-        num_rows=65,
+        num_rows=rows,
         width=16384,
         num_heads=32,
     )
@@ -81,8 +84,10 @@ def test_fused_indexer_route_keeps_generic_head_count_limit():
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
-def test_fused_indexer_route_covers_c4_decode_buckets(rows):
-    assert resolve_fused_indexer_path(
+def test_fused_indexer_route_retired_for_c4_decode_buckets(rows):
+    # C4 decode is owned by the streamed tiled route + two-level fold; fused
+    # remains only for MSA/contiguous and explicit opt-in.
+    assert not resolve_fused_indexer_path(
         topk=512,
         num_rows=rows,
         width=4160 * 64,

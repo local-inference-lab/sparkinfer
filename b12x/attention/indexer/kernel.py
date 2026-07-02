@@ -2808,7 +2808,7 @@ _INDEXER_STREAM_SCORER_ENV = "B12X_INDEXER_STREAM_SCORER"
 def _env_indexer_stream_scorer_enabled() -> bool:
     raw = os.environ.get(_INDEXER_STREAM_SCORER_ENV)
     if raw is None:
-        return False
+        return True
     return raw.strip().lower() in {"1", "true", "on", "yes"}
 
 

@@ -279,17 +279,19 @@ def _store_output_index(
     output_pos: Int32,
     logical_idx: Int32,
     page_table_stride: Int32,
+    output_stride: Int32,
     paged_output: cutlass.Constexpr[bool],
 ):
     out_val = logical_idx
     if cutlass.const_expr(paged_output):
         out_val = Int32(page_table[row_idx * page_table_stride + logical_idx])
-    output[row_idx * Int32(_TOPK) + output_pos] = out_val
+    output[row_idx * output_stride + output_pos] = out_val
 
 
 class SparseNSAPersistentTopK2048Kernel:
-    def __init__(self, *, paged_output: bool):
+    def __init__(self, *, paged_output: bool, topk: int = _TOPK):
         self.paged_output = bool(paged_output)
+        self.topk_static = int(topk)
 
     @cute.jit
     def __call__(
@@ -443,7 +445,7 @@ class SparseNSAPersistentTopK2048Kernel:
             if row_idx < num_rows:
                 seq_len = Int32(lengths[row_idx])
                 row_base = row_idx * stride
-                row_out_base = row_idx * Int32(_TOPK)
+                row_out_base = row_idx * Int32(self.topk_static)
 
                 chunk_start = Int32(0)
                 chunk_end = Int32(0)
@@ -472,10 +474,10 @@ class SparseNSAPersistentTopK2048Kernel:
                 local_pos = Int32(0)
                 pos = Int32(0)
 
-                if seq_len <= Int32(_TOPK):
+                if seq_len <= Int32(self.topk_static):
                     if cta_in_group == Int32(0):
                         i = tx
-                        while i < Int32(_TOPK):
+                        while i < Int32(self.topk_static):
                             if i < seq_len:
                                 _store_output_index(
                                     output,
@@ -484,13 +486,14 @@ class SparseNSAPersistentTopK2048Kernel:
                                     i,
                                     i,
                                     page_table_stride,
+                                    Int32(self.topk_static),
                                     self.paged_output,
                                 )
                             else:
                                 output[row_out_base + i] = Int32(-1)
                             i = i + Int32(_THREADS_PER_CTA)
 
-                if seq_len > Int32(_TOPK):
+                if seq_len > Int32(self.topk_static):
                     chunk_start = cta_in_group * chunk_size
                     chunk_end = chunk_start + chunk_size
                     if chunk_end > seq_len:
@@ -508,7 +511,7 @@ class SparseNSAPersistentTopK2048Kernel:
 
                     if tx == Int32(0):
                         s_scalars[0] = Uint32(0)
-                        s_scalars[1] = Uint32(_TOPK)
+                        s_scalars[1] = Uint32(self.topk_static)
                     cute.arch.sync_threads()
 
                     barrier_phase = _group_barrier(
@@ -652,6 +655,7 @@ class SparseNSAPersistentTopK2048Kernel:
                                 pos,
                                 chunk_start + i,
                                 page_table_stride,
+                                Int32(self.topk_static),
                                 self.paged_output,
                             )
                         i = i + Int32(_THREADS_PER_CTA)
@@ -668,7 +672,7 @@ class SparseNSAPersistentTopK2048Kernel:
                                 _global_state_ptr(state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
                                 Int32(1),
                             )
-                            if pos < Int32(_TOPK):
+                            if pos < Int32(self.topk_static):
                                 _store_output_index(
                                     output,
                                     page_table,
@@ -676,6 +680,7 @@ class SparseNSAPersistentTopK2048Kernel:
                                     pos,
                                     chunk_start + i,
                                     page_table_stride,
+                                    Int32(self.topk_static),
                                     self.paged_output,
                                 )
                         i = i + Int32(_THREADS_PER_CTA)
@@ -684,8 +689,8 @@ class SparseNSAPersistentTopK2048Kernel:
 
 
 @lru_cache(maxsize=16)
-def _build_persistent_topk_kernel(*, paged_output: bool):
-    return SparseNSAPersistentTopK2048Kernel(paged_output=paged_output)
+def _build_persistent_topk_kernel(*, paged_output: bool, topk: int = _TOPK):
+    return SparseNSAPersistentTopK2048Kernel(paged_output=paged_output, topk=topk)
 
 
 def clear_persistent_topk2048_kernel_cache() -> None:
@@ -699,7 +704,7 @@ def supports_persistent_topk2048(
     topk: int = _TOPK,
     page_table_1: torch.Tensor | None = None,
 ) -> bool:
-    if topk != _TOPK:
+    if int(topk) not in (512, 1024, 2048):
         return False
     if not logits.is_cuda or logits.dtype != torch.float32 or logits.ndim != 2:
         return False
@@ -727,14 +732,15 @@ def _fallback_topk2048(
     *,
     page_table_1: torch.Tensor | None,
     output_indices: torch.Tensor | None,
+    topk: int = _TOPK,
 ) -> torch.Tensor:
     rows, cols = logits.shape
     if output_indices is None:
-        output = torch.full((rows, _TOPK), -1, dtype=torch.int32, device=logits.device)
+        output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     else:
-        if output_indices.shape != (rows, _TOPK) or output_indices.dtype != torch.int32:
+        if output_indices.shape != (rows, topk) or output_indices.dtype != torch.int32:
             raise ValueError(
-                f"output_indices must have shape {(rows, _TOPK)} and dtype int32, "
+                f"output_indices must have shape {(rows, topk)} and dtype int32, "
                 f"got {tuple(output_indices.shape)} {output_indices.dtype}"
             )
         if output_indices.device != logits.device:
@@ -743,7 +749,7 @@ def _fallback_topk2048(
             raise ValueError("output_indices must be contiguous")
         output = output_indices
         output.fill_(-1)
-    gather_k = min(_TOPK, cols)
+    gather_k = min(topk, cols)
     if gather_k == 0:
         return output
     mask = torch.arange(cols, device=logits.device).unsqueeze(0) >= lengths.reshape(-1, 1)
@@ -769,6 +775,7 @@ def run_persistent_topk2048(
     output_indices: torch.Tensor | None = None,
     scratch: torch.Tensor | None = None,
     max_seq_len: int | None = None,
+    topk: int = _TOPK,
     binding: B12XPersistentTopK2048Binding | None = None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -801,12 +808,15 @@ def run_persistent_topk2048(
         lengths = lengths.reshape(-1)
     if max_seq_len is None:
         max_seq_len = int(logits.shape[1])
-    if not supports_persistent_topk2048(logits, lengths, page_table_1=page_table_1):
+    if not supports_persistent_topk2048(
+        logits, lengths, topk=topk, page_table_1=page_table_1
+    ):
         return _fallback_topk2048(
             logits,
             lengths,
             page_table_1=page_table_1,
             output_indices=output_indices,
+            topk=topk,
         )
     if int(max_seq_len) <= _RADIX_THRESHOLD:
         return _fallback_topk2048(
@@ -814,6 +824,7 @@ def run_persistent_topk2048(
             lengths,
             page_table_1=page_table_1,
             output_indices=output_indices,
+            topk=topk,
         )
 
     rows, stride = logits.shape
@@ -824,13 +835,14 @@ def run_persistent_topk2048(
             lengths,
             page_table_1=page_table_1,
             output_indices=output_indices,
+            topk=topk,
         )
 
     if output_indices is None:
-        output_indices = torch.empty((rows, _TOPK), dtype=torch.int32, device=logits.device)
-    elif output_indices.shape != (rows, _TOPK) or output_indices.dtype != torch.int32:
+        output_indices = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+    elif output_indices.shape != (rows, topk) or output_indices.dtype != torch.int32:
         raise ValueError(
-            f"output_indices must have shape {(rows, _TOPK)} and dtype int32, "
+            f"output_indices must have shape {(rows, topk)} and dtype int32, "
             f"got {tuple(output_indices.shape)} {output_indices.dtype}"
         )
     elif output_indices.device != logits.device:
@@ -856,12 +868,12 @@ def run_persistent_topk2048(
     paged_output = page_table_1 is not None
     if page_table_1 is None:
         page_table = output_indices
-        page_table_stride = _TOPK
+        page_table_stride = int(topk)
     else:
         page_table = page_table_1
         page_table_stride = int(page_table_1.shape[1])
 
-    kernel = _build_persistent_topk_kernel(paged_output=paged_output)
+    kernel = _build_persistent_topk_kernel(paged_output=paged_output, topk=int(topk))
     args = (
         _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
@@ -884,6 +896,7 @@ def run_persistent_topk2048(
         _tensor_meta_key(state, dynamic_dims=(0,)),
         (
             "persistent_topk2048_v1",
+            int(topk),
             launch.chunk_size,
             launch.ctas_per_group,
             launch.num_groups,

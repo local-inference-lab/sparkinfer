@@ -111,7 +111,11 @@ KV_LAYOUT_PAGED = 1
 # Prefill remains packed-contiguous and never reaches this decode-only resolver.
 FUSED_MAX_ROWS = 6
 _C4_FUSED_MAX_ROWS = 64
-_GLM32_FUSED_MAX_ROWS = 64
+# GLM re-measured after the two-level tiled fold landed: fused keeps rows 1-16
+# (wins/ties at 8K, dominant at 32K-131K, e.g. r1@131K 41us vs 90us tiled) but
+# loses rows 32-64 everywhere (r64@131K 1541us vs 1043us tiled, r64@8K 100 vs
+# 78) -- the 2-CTAs-per-group merge and one-resident-CTA occupancy starve it.
+_GLM32_FUSED_MAX_ROWS = 16
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
 
 
@@ -419,14 +423,21 @@ def resolve_fused_indexer_path(
     Row count, head count, top-k, and width here are all capture-time workspace
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
-    rows. C4's 64-head/top-k-512 and GLM's 32-head/top-k-2048 shapes use fused
-    through B64, based on capture-static serving-shape measurements. Prefill is
-    selected before this decode-only resolver and remains packed-contiguous.
+    rows. C4's 64-head/top-k-512 shape is owned by the streamed tiled route
+    (see the branch below); GLM's 32-head/top-k-2048 shape uses fused through
+    B16 and the streamed tiled route beyond, based on capture-static
+    serving-shape measurements. Prefill is selected before this decode-only
+    resolver and remains packed-contiguous.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
     if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
-        return int(num_rows) <= _C4_FUSED_MAX_ROWS
+        # C4 (DSV4, heads=64/topk=512): the streamed tiled route + two-level
+        # fold retired fused here -- it wins or ties at rows <= 8 across the
+        # measured range and at rows 64 everywhere, leaving fused ahead only
+        # at rows 16 long-K (not enough to keep two production kernels).
+        # GLM's shape below keeps its own measured policy until re-swept.
+        return False
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
         return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
     return int(num_rows) <= FUSED_MAX_ROWS
@@ -514,7 +525,10 @@ class FusedIndexerConfig:
 # capacity, so do not create capacity-dependent variants that are unreachable
 # in production.  Other contracts retain the smaller footprint, notably GLM's
 # top-k-2048 specialization, which cannot fit the larger carry.
-_BATCH_SLACK = 512
+# 448 (not 512): the deferred-reduce pipeline's third K stage + partials/scales
+# rings cost ~10KB of SMEM; topk-2048 (GLM) needs 64 fewer carry entries to fit
+# the 101376B SM120 carveout. One trim per ~7 pages instead of 8.
+_BATCH_SLACK = 448
 _DSV4_BATCH_SLACK = 2816
 
 
