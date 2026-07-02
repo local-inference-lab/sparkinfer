@@ -1297,6 +1297,54 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None):
+    """No-return global fp32 add reduction (relaxed device scope)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cvt_bf16x2_to_f16x2(packed: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert a u32 holding two bf16 (lo, hi) into an f16x2 u32 (lo, hi)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 blo, bhi, hlo, hhi;
+                .reg .f32 flo, fhi;
+                mov.b32 {blo, bhi}, $1;
+                cvt.f32.bf16 flo, blo;
+                cvt.f32.bf16 fhi, bhi;
+                cvt.rn.f16.f32 hlo, flo;
+                cvt.rn.f16.f32 hhi, fhi;
+                mov.b32 $0, {hlo, hhi};
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
     """No-return global atomic add of a packed bf16x2 value (2 contiguous bf16).
 

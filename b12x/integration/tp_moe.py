@@ -2413,6 +2413,10 @@ def _plan_core_workspace(
         packed_input_shape = (state_E, max_rows, k // 2)
         packed_input_dtype = torch.uint8
         micro_intermediate_elements = state_E * n
+        if _tiny_rp_enabled() and quant_mode == "w4a8_mx":
+            micro_intermediate_elements = max(
+                micro_intermediate_elements, max_rows * 2 * n
+            )
         if direct_micro_candidate:
             fc2_n_chunks = (n // 2 + 127) // 128
             micro_intermediate_elements = max(
@@ -3794,6 +3798,20 @@ def _get_weight_views(
     """
     global _LAST_WEIGHTS
     quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w4a8_mx" and w1_fp4.dim() != 3:
+        # In-place N256/K128-repacked storage (tiny_rp band): view flat as the
+        # source-native 3-D shape for pointer plumbing. The prep rotation
+        # already normalized the half order -- never flip rp storage in place.
+        e_dim = w1_fp4.shape[0]
+        w1_fp4 = w1_fp4.view(torch.uint8).reshape(
+            e_dim, activation_spec.w1_rows(n), k // 2
+        )
+        w2_fp4 = w2_fp4.view(torch.uint8).reshape(e_dim, k, n // 2)
+        w1_blockscale = w1_blockscale.view(torch.uint8).reshape(
+            e_dim, activation_spec.w1_rows(n), k // 32
+        )
+        w2_blockscale = w2_blockscale.view(torch.uint8).reshape(e_dim, k, n // 32)
+        w13_layout = "w13"
     w13_layout = _normalize_w13_layout_for_activation(
         activation_spec.activation,
         w13_layout,
@@ -4371,6 +4389,10 @@ def _resolve_workspace_layout(
         # W4A8-MX sizes so compacted checkpoints never require a second
         # source-native copy merely to enter the tiny-decode band.
         if normalized_quant_mode == "w4a8_mx":
+            if _tiny_rp_enabled() and _tiny_rp_supports(
+                num_tokens=num_tokens, k=k, n=n, activation=activation
+            ):
+                return "micro", max(1, routed_rows), max(1, routed_rows)
             tile_m, _ = _select_dynamic_tile_mn(
                 routed_rows,
                 n,
@@ -7909,6 +7931,183 @@ def _launch_compact_micro_flat(
     )
 
 
+def _tiny_rp_enabled() -> bool:
+    return os.environ.get("B12X_W4A8_TINY_RP", "0") == "1"
+
+
+def _tiny_rp_supports(*, num_tokens: int, k: int, n: int, activation: str) -> bool:
+    return (
+        num_tokens == 1
+        and activation == "silu"
+        and k % 256 == 0
+        and n % 256 == 0
+        and (k // 128) % 4 == 0
+        and (n // 128) % 2 == 0
+    )
+
+
+_TINY_RP_KERNEL_CACHE: dict = {}
+
+
+def _get_tiny_rp_kernel(
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    *,
+    device: torch.device | None = None,
+):
+    from b12x.moe.fused.tiny_rp import MoETinyRpKernelBackend
+
+    compiled_phases = []
+    for phase in (1, 2):
+        kernel = MoETinyRpKernelBackend(compile_time_phase=phase)
+        kernel.configure(m, k, n, num_topk, weight_E, device=device)
+        cache_key = ("tiny_rp",) + kernel.__cache_key__
+        cached = _TINY_RP_KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            compiled_phases.append(cached)
+            continue
+
+        def dummy(dt):
+            return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+        raise_if_kernel_resolution_frozen(
+            "cute.compile", target=kernel, cache_key=cache_key
+        )
+        compiled = b12x_compile(
+            kernel,
+            dummy(cutlass.BFloat16),
+            dummy(cutlass.Uint8),
+            dummy(cutlass.Uint8),
+            dummy(cutlass.Float32),
+            dummy(cutlass.Uint8),
+            dummy(cutlass.Uint8),
+            dummy(cutlass.Int32),
+            dummy(cutlass.Float32),
+            dummy(cutlass.BFloat16),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "integration.tp_moe.tiny_rp",
+                1,
+                cache_key,
+            ),
+        )
+        _TINY_RP_KERNEL_CACHE[cache_key] = compiled
+        compiled_phases.append(compiled)
+    return compiled_phases[0], compiled_phases[1]
+
+
+def _launch_tiny_rp_flat(
+    *,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+) -> None:
+    from b12x.moe.fused.tiny_rp import MoETinyRpKernelBackend
+
+    del barrier_count, barrier_epoch
+    compiled_fc1, compiled_fc2 = _get_tiny_rp_kernel(
+        weight_E, m, k, n, num_topk, device=a.device
+    )
+    rt = m * num_topk
+    inter = micro_intermediate.view(torch.float32).reshape(-1)[: rt * 2 * n]
+    MoETinyRpKernelBackend.launch(
+        compiled_fc1,
+        compiled_fc2,
+        x=a.reshape(-1),
+        w13_rp=w1_storage,
+        sfb13=w1_scale_storage,
+        inter_fp32=inter,
+        w2_rp=w2_storage,
+        sfb2=w2_scale_storage,
+        topk_ids=launch_ids,
+        topk_weights=flat_weights,
+        out=scatter_output.reshape(-1),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::tp_moe_tiny_rp_launch",
+    mutates_args="unknown",
+)
+def _tp_moe_tiny_rp_launch_op(
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    volatile_launch_state: bool,
+) -> None:
+    del volatile_launch_state
+    _launch_tiny_rp_flat(
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        micro_intermediate=micro_intermediate,
+        w1_storage=w1_storage,
+        w1_scale_storage=w1_scale_storage,
+        w2_storage=w2_storage,
+        w2_scale_storage=w2_scale_storage,
+        a=a,
+        launch_ids=launch_ids,
+        flat_weights=flat_weights,
+        scatter_output=scatter_output,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+    )
+
+
+@_tp_moe_tiny_rp_launch_op.register_fake
+def _tp_moe_tiny_rp_launch_fake(
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    micro_intermediate: torch.Tensor,
+    w1_storage: torch.Tensor,
+    w1_scale_storage: torch.Tensor,
+    w2_storage: torch.Tensor,
+    w2_scale_storage: torch.Tensor,
+    a: torch.Tensor,
+    launch_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    volatile_launch_state: bool,
+) -> None:
+    return None
+
+
 @torch.library.custom_op(
     "b12x::tp_moe_compact_micro_launch",
     mutates_args="unknown",
@@ -8042,6 +8241,35 @@ def _launch_micro(
 ) -> None:
     del stream, unit_scale_contract
     quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w4a8_mx":
+        # The w4a8_mx tiny band reaches the compact family only via the
+        # tiny_rp resolve gate; its weights are N256/K128-repacked, which
+        # direct-micro cannot read.
+        if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
+            launch_ids = flat_ids
+        else:
+            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+            launch_ids.copy_(flat_ids.to(torch.int32))
+        torch.ops.b12x.tp_moe_tiny_rp_launch(
+            workspace.barrier_count,
+            workspace.barrier_epoch,
+            workspace.micro_intermediate,
+            weights.w1_storage,
+            weights.w1_scale_storage,
+            weights.w2_storage,
+            weights.w2_scale_storage,
+            a,
+            launch_ids,
+            flat_weights,
+            scatter_output,
+            weight_E,
+            m,
+            k,
+            n,
+            num_topk,
+            workspace.volatile_launch_state,
+        )
+        return
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
     del routed_rows, topk_ids_dtype
