@@ -2,8 +2,10 @@
 scales onto exact UE8M0, achieving DeepGEMM-parity weight error -- and leaves
 the already-UE8M0 (e8m0) path byte-for-byte unchanged.
 
-Run: CUDA_VISIBLE_DEVICES=0 trafficcontrol -- \
-       ~/projects/b12x/.venv/bin/python benchmarks/probe_weight_requant_integration.py
+Run with the assigned GPU:
+  python benchmarks/probe_weight_requant_integration.py
+
+GPU serialization, when enabled, is managed outside this command.
 """
 
 import torch

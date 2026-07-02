@@ -7,9 +7,10 @@ BF16 inputs, at both gran_k=32 and gran_k=128, and reports:
   - reconstruction error of each quant vs the original BF16 (accuracy)
   - which gran_k b12x actually implements
 
-Run under trafficcontrol, e.g.:
-  CUDA_VISIBLE_DEVICES=0 trafficcontrol -- \
-    ~/projects/b12x/.venv/bin/python benchmarks/probe_quant_parity_deepgemm.py
+Run with the assigned GPU:
+  python benchmarks/probe_quant_parity_deepgemm.py
+
+GPU serialization, when enabled, is managed outside this command.
 """
 
 import torch

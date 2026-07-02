@@ -12,8 +12,10 @@ test cannot exercise:
   (3) GRAN_K on OUTLIER-channel data: where 32 vs 128 actually matters --
       reconstruction + GEMM-vs-fp32-oracle for b12x(32) vs DeepGEMM(128).
 
-Run: CUDA_VISIBLE_DEVICES=0 trafficcontrol -- \
-       ~/projects/b12x/.venv/bin/python benchmarks/probe_quant_parity_adversarial.py
+Run with the assigned GPU:
+  python benchmarks/probe_quant_parity_adversarial.py
+
+GPU serialization, when enabled, is managed outside this command.
 """
 
 import torch

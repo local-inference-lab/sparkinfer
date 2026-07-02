@@ -5,9 +5,11 @@ their native FP8 block-scaled path (b12x: per-32 ue8m0; DeepGEMM: per_token/
 per_block gran_k=128 ue8m0). We time only the GEMM (operands pre-quantized
 outside the captured region).
 
-Run: CUDA_VISIBLE_DEVICES=0 trafficcontrol --timeout 600 -- \
-       ~/projects/vllm-other/.venv/bin/python \
-       benchmarks/benchmark_dense_fp8_vs_deepgemm.py
+Run with the assigned GPU and an environment that provides b12x and DeepGEMM:
+  python benchmarks/benchmark_dense_fp8_vs_deepgemm.py
+
+GPU serialization, when enabled, is managed outside this command. Do not wrap
+the benchmark in traffic-control tooling yourself.
 """
 
 import statistics

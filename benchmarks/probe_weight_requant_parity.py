@@ -16,8 +16,10 @@ UE8M0 block-scaled MMA you must reconcile this with power-of-two scales.
 Ground truth = the original bf16 weight (and the checkpoint intent C = w_fp8*s_fp32).
 If B is much closer than A, b12x is dropping the re-quantization step.
 
-Run: CUDA_VISIBLE_DEVICES=0 trafficcontrol -- \
-       ~/projects/b12x/.venv/bin/python benchmarks/probe_weight_requant_parity.py
+Run with the assigned GPU:
+  python benchmarks/probe_weight_requant_parity.py
+
+GPU serialization, when enabled, is managed outside this command.
 """
 
 import torch
