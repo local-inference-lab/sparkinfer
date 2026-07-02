@@ -31,6 +31,7 @@ from b12x.cute.utils import get_hardware_info
 from b12x.gemm.wo_projection import (
     WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
+    pack_wo_projection_fp8_block_scaled_weights_mxfp8,
     plan_wo_projection_scratch,
     quantize_wo_a_input_inv_rope_mxfp8,
     quantize_wo_a_input_mxfp8,
@@ -41,6 +42,7 @@ from b12x.gemm.wo_projection import (
 
 
 REFERENCE_LABEL = "PyTorch graph BF16 einsum+matmul"
+DEEPGEMM_LABEL = "deepgemm"
 COSINE_THRESHOLD = 0.995
 _L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 _AUTO_L2_FLUSH_MULTIPLIER = 2
@@ -168,6 +170,106 @@ def capture_graph_replay(
     return replay, graph_output
 
 
+def _block_fp8_checkpoint(
+    weight_bf16: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16 `[N,K]` weight to checkpoint-style FP8 with exact
+    power-of-two 128x128 block scales, so b12x and DeepGEMM consume identical
+    FP8 bytes."""
+
+    n, k = map(int, weight_bf16.shape)
+    if n % 128 or k % 128:
+        raise ValueError(f"block-scaled checkpoint needs 128-divisible dims, got {n}x{k}")
+    blocked = weight_bf16.reshape(n // 128, 128, k // 128, 128)
+    amax = blocked.abs().amax(dim=(1, 3), keepdim=True).float()
+    scale = torch.pow(2.0, torch.ceil(torch.log2((amax / 448.0).clamp(min=1e-12))))
+    w_fp8 = (blocked.float() / scale).to(torch.float8_e4m3fn).reshape(n, k)
+    return w_fp8, scale[:, 0, :, 0].contiguous()
+
+
+def build_deepgemm_launch(
+    case: dict[str, torch.Tensor | object],
+    *,
+    tokens: int,
+    groups: int,
+    rank: int,
+    hidden: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> Callable[[], torch.Tensor]:
+    """Build the serving DeepGEMM WO chain (vLLM deep_gemm_fp8_o_proj):
+    fused inverse-RoPE FP8 quant -> fp8_einsum (WO-A) -> QuantFP8 ->
+    fp8_gemm_nt (WO-B), from the same FP8 checkpoint tensors as b12x."""
+
+    import vllm.envs as envs
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
+    from vllm.utils.deep_gemm import fp8_einsum, fp8_gemm_nt, is_deep_gemm_e8m0_used
+
+    use_e8m0 = is_deep_gemm_e8m0_used()
+    recipe, tma_aligned = compute_fp8_einsum_recipe()
+    wa_dg, wa_dg_scale = deepgemm_post_process_fp8_weight_block(
+        wq=case["ckpt_wo_a_fp8"].clone(),
+        ws=case["ckpt_wo_a_scale"].clone(),
+        quant_block_shape=(128, 128),
+        use_e8m0=use_e8m0,
+        is_bmm=True,
+        bmm_batch_size=groups,
+    )
+    wb_dg, wb_dg_scale = deepgemm_post_process_fp8_weight_block(
+        wq=case["ckpt_wo_b_fp8"].clone(),
+        ws=case["ckpt_wo_b_scale"].clone(),
+        quant_block_shape=(128, 128),
+        use_e8m0=use_e8m0,
+    )
+    with set_current_vllm_config(VllmConfig()):
+        quant_fp8 = QuantFP8(
+            static=False,
+            group_shape=GroupShape(1, 128),
+            use_ue8m0=use_e8m0,
+            tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
+            column_major_scales=True,
+        )
+    o = case["o"]
+    positions = case["positions"]
+    cos_sin_cache = case["cos_sin_cache"]
+    heads_per_group = int(case["heads_per_group"])
+
+    def launch() -> torch.Tensor:
+        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            tma_aligned_scales=tma_aligned,
+        )
+        z = torch.empty((tokens, groups, rank), device=o.device, dtype=torch.bfloat16)
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (wa_dg, wa_dg_scale),
+            z,
+            recipe=recipe,
+        )
+        q, s = quant_fp8(z.flatten(1))
+        out = torch.empty((tokens, hidden), device=o.device, dtype=torch.bfloat16)
+        fp8_gemm_nt((q, s), (wb_dg, wb_dg_scale), out, is_deep_gemm_e8m0_used=use_e8m0)
+        return out
+
+    return launch
+
+
 def make_case(
     *,
     tokens: int,
@@ -180,6 +282,7 @@ def make_case(
     context_length: int,
     nope_dim: int,
     rope_dim: int,
+    block_scaled_weights: bool = False,
 ) -> dict[str, torch.Tensor | object]:
     torch.manual_seed(seed)
     if inv_rope:
@@ -244,7 +347,26 @@ def make_case(
         / (groups * rank) ** 0.5
     ).contiguous()
 
-    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
+    ckpt_wo_a_fp8 = ckpt_wo_a_scale = ckpt_wo_b_fp8 = ckpt_wo_b_scale = None
+    if block_scaled_weights:
+        # Serving checkpoints carry FP8 weights with 128x128 block scales;
+        # both b12x and DeepGEMM pack from the same FP8 bytes.
+        ckpt_wo_a_fp8, ckpt_wo_a_scale = _block_fp8_checkpoint(
+            wo_a_grd.reshape(groups * rank, group_width)
+        )
+        ckpt_wo_b_fp8, ckpt_wo_b_scale = _block_fp8_checkpoint(wo_b_hgr)
+        weights = pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+            ckpt_wo_a_fp8,
+            ckpt_wo_a_scale,
+            ckpt_wo_b_fp8,
+            ckpt_wo_b_scale,
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+        )
+    else:
+        weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
 
     x_deq_tgd = dequantize_mxfp8_rows_torch(
         x_tdg_q.values,
@@ -282,6 +404,10 @@ def make_case(
         "x_deq_tgd": x_deq_tgd,
         "wo_a_deq_grd": wo_a_deq_grd,
         "wo_b_deq_hgr": wo_b_deq_hgr,
+        "ckpt_wo_a_fp8": ckpt_wo_a_fp8,
+        "ckpt_wo_a_scale": ckpt_wo_a_scale,
+        "ckpt_wo_b_fp8": ckpt_wo_b_fp8,
+        "ckpt_wo_b_scale": ckpt_wo_b_scale,
     }
 
 
@@ -301,6 +427,7 @@ def bench_one(
     context_length: int,
     nope_dim: int,
     rope_dim: int,
+    compare_deepgemm: bool = False,
 ) -> dict[str, object]:
     case = make_case(
         tokens=tokens,
@@ -313,6 +440,7 @@ def bench_one(
         context_length=context_length,
         nope_dim=nope_dim,
         rope_dim=rope_dim,
+        block_scaled_weights=compare_deepgemm,
     )
 
     results: dict[str, object] = {}
@@ -402,6 +530,30 @@ def bench_one(
         results[REFERENCE_LABEL] = None
         print(f"      {REFERENCE_LABEL} FAILED: {exc}")
 
+    if compare_deepgemm:
+        try:
+            dg_launch = build_deepgemm_launch(
+                case,
+                tokens=tokens,
+                groups=groups,
+                rank=rank,
+                hidden=hidden,
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
+            )
+            dg_replay, dg_graph_out = capture_graph_replay(dg_launch)
+            results["deepgemm_replay"] = dg_replay
+            results["deepgemm_out"] = dg_graph_out
+            results[DEEPGEMM_LABEL] = bench_events(
+                dg_replay,
+                warmup=warmup,
+                iters=iters,
+                l2_flush=l2_flush,
+            )
+        except Exception as exc:
+            results[DEEPGEMM_LABEL] = None
+            print(f"      deepgemm WO chain FAILED: {exc}")
+
     if check:
         if results.get("b12x_replay") is None or results.get("torch_replay") is None:
             raise BenchmarkAbort(
@@ -415,6 +567,14 @@ def bench_one(
             results["torch_out"],
             label=REFERENCE_LABEL,
         )
+        if compare_deepgemm and results.get("deepgemm_replay") is not None:
+            results["deepgemm_replay"]()
+            torch.cuda.synchronize()
+            check_outputs(
+                results["deepgemm_out"],
+                results["torch_out"],
+                label=f"{REFERENCE_LABEL} (deepgemm route)",
+            )
 
     return results
 
@@ -432,6 +592,16 @@ def main() -> None:
         "--inv-rope",
         action="store_true",
         help="Benchmark the opaque inverse-RoPE serving route.",
+    )
+    parser.add_argument(
+        "--compare-deepgemm",
+        action="store_true",
+        help=(
+            "Also run the serving DeepGEMM WO chain (vLLM deep_gemm_fp8_o_proj: "
+            "fused inv-RoPE FP8 quant + fp8_einsum + QuantFP8 + fp8_gemm_nt) from "
+            "the same FP8 block-scaled checkpoint weights. Implies --inv-rope and "
+            "requires a vLLM+deep_gemm environment."
+        ),
     )
     parser.add_argument("--context-length", type=int, default=16384)
     parser.add_argument("--nope-dim", type=int, default=448)
@@ -457,6 +627,8 @@ def main() -> None:
         help="Disable correctness checks before timing.",
     )
     args = parser.parse_args()
+    if args.compare_deepgemm:
+        args.inv_rope = True
 
     require_sm120()
     torch.empty(1, device="cuda")
@@ -466,6 +638,11 @@ def main() -> None:
     print(f"WO projection: b12x native MXFP8 two-GEMM vs {REFERENCE_LABEL}")
     route = "inverse-RoPE serving op" if args.inv_rope else "plain WO binding"
     print(f"Route: {route}")
+    if args.compare_deepgemm:
+        print(
+            "DeepGEMM comparison: serving deep_gemm_fp8_o_proj chain, both "
+            "routes packed from the same FP8 128x128 block-scaled checkpoint"
+        )
     print("Timing mode: CUDA graph replay")
     print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     if args.check:
@@ -511,6 +688,7 @@ def main() -> None:
                 context_length=args.context_length,
                 nope_dim=args.nope_dim,
                 rope_dim=args.rope_dim,
+                compare_deepgemm=args.compare_deepgemm,
             )
         except BenchmarkAbort as exc:
             print(
@@ -520,42 +698,52 @@ def main() -> None:
 
         b12x_times = results.get("b12x")
         torch_times = results.get(REFERENCE_LABEL)
+        dg_times = results.get(DEEPGEMM_LABEL)
         b12x_med = statistics.median(b12x_times) * 1000.0 if b12x_times else None
         torch_med = statistics.median(torch_times) * 1000.0 if torch_times else None
+        dg_med = statistics.median(dg_times) * 1000.0 if dg_times else None
 
         parts = [f"  tokens={tokens:<4}"]
         if b12x_times is not None:
             parts.append(f"b12x={fmt_us(b12x_times)}")
+        if dg_times is not None:
+            parts.append(f"deepgemm={fmt_us(dg_times)}")
         if torch_times is not None:
             parts.append(f"torch={fmt_us(torch_times)}")
+        if b12x_med is not None and dg_med is not None:
+            parts.append(f"b12x/dg={b12x_med / dg_med:.2f}x")
         if b12x_med is not None and torch_med is not None:
             parts.append(f"b12x/torch={b12x_med / torch_med:.2f}x")
         print("  ".join(parts) + "  (graph replay)")
-        all_results.append((tokens, b12x_med, torch_med))
+        all_results.append((tokens, b12x_med, torch_med, dg_med))
 
-    print(f"\n{'=' * 75}")
-    print(
-        f"  SUMMARY: b12x / {REFERENCE_LABEL} (CUDA graph replay, lower = b12x faster)"
-    )
-    print(f"{'=' * 75}")
-    print(f"  {'tokens':<10}  {'ratio':>10}")
-    print("  " + "-" * 24)
+    def print_summary(label: str, pairs: list[tuple[int, float | None, float | None]]) -> None:
+        print(f"\n{'=' * 75}")
+        print(f"  SUMMARY: b12x / {label} (CUDA graph replay, lower = b12x faster)")
+        print(f"{'=' * 75}")
+        print(f"  {'tokens':<10}  {'ratio':>10}")
+        print("  " + "-" * 24)
+        ratios = []
+        for tokens, b12x_med, other_med in pairs:
+            if b12x_med is not None and other_med is not None:
+                ratio = b12x_med / other_med
+                ratios.append(ratio)
+                print(f"  {tokens:<10}  {ratio:>9.2f}x")
+            else:
+                print(f"  {tokens:<10}  {'n/a':>10}")
+        if ratios:
+            geo = 1.0
+            for ratio in ratios:
+                geo *= ratio
+            geo **= 1.0 / len(ratios)
+            print(f"\n  geo mean: {geo:.2f}x")
 
-    ratios = []
-    for tokens, b12x_med, torch_med in all_results:
-        if b12x_med is not None and torch_med is not None:
-            ratio = b12x_med / torch_med
-            ratios.append(ratio)
-            print(f"  {tokens:<10}  {ratio:>9.2f}x")
-        else:
-            print(f"  {tokens:<10}  {'n/a':>10}")
-
-    if ratios:
-        geo = 1.0
-        for ratio in ratios:
-            geo *= ratio
-        geo **= 1.0 / len(ratios)
-        print(f"\n  geo mean: {geo:.2f}x")
+    if args.compare_deepgemm:
+        print_summary(
+            f"{DEEPGEMM_LABEL} serving WO chain",
+            [(t, b, d) for t, b, _, d in all_results],
+        )
+    print_summary(REFERENCE_LABEL, [(t, b, r) for t, b, r, _ in all_results])
 
 
 if __name__ == "__main__":

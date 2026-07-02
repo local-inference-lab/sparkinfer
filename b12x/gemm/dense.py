@@ -66,18 +66,22 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfb,
 )
 from b12x.cute.fp4 import (
+    FLOAT8_E4M3_MAX,
     bfloat2_to_float2_scaled,
+    cvt_f32x4_to_e4m3x4,
     elem_pointer,
     fabs_f32,
     fmax_f32,
     get_ptr_as_int64,
     ld_global_b16,
     ld_global_v4_u32,
+    pow2_ceil_ue8m0,
     quantize_block_fp8_mx,
     scatter_add_bf16,
     scatter_add_bf16x2,
     shared_ptr_to_u32,
     st_shared_u16,
+    ue8m0_to_output_scale,
 )
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
@@ -328,6 +332,14 @@ class DenseGemmKernel:
         swap_ab: bool = False,
         sfb_k_reuse: bool = False,
         fused_quant_a: bool = False,
+        fused_quant_a_inner_span: int = 0,
+        fused_quant_a_row_stride: int = 0,
+        fused_quant_a_l_stride: int = 0,
+        fused_quant_a_inv_rope: bool = False,
+        fused_quant_a_head_dim: int = 0,
+        fused_quant_a_nope_dim: int = 0,
+        fused_quant_a_rope_dim: int = 0,
+        fused_quant_a_wide: bool = False,
         atom_shape_24: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
@@ -365,6 +377,29 @@ class DenseGemmKernel:
         # every k block from it.
         self.sfb_k_reuse = sfb_k_reuse
         self.fused_quant_a = fused_quant_a
+        # When >0, the BF16 A source is stored L-blocked along K (physical
+        # [K/span, M, span], e.g. the WO tmp group-major view over [groups, M,
+        # rank]): flat k = outer * span + inner reads element
+        # outer * (M * span) + row * span + inner. 0 keeps contiguous [M, K].
+        self.fused_quant_a_inner_span = fused_quant_a_inner_span
+        # Grouped (L>1) BF16 A source, e.g. WO-A reading attention output
+        # [M, groups, group_width] flat rows: element offset is
+        # row * row_stride + l * l_stride + k (both strides in elements;
+        # row_stride 0 keeps the contiguous shape[1] row pitch).
+        self.fused_quant_a_row_stride = fused_quant_a_row_stride
+        self.fused_quant_a_l_stride = fused_quant_a_l_stride
+        # Inverse-RoPE applied in the quantizing A load: the trailing rope_dim
+        # of every head_dim block is de-rotated with cos/sin at positions[row]
+        # before MXFP8 quantization (head_dim/nope_dim aligned to 32-value
+        # scale blocks; adjacent-pair rotation stays inside one load).
+        self.fused_quant_a_inv_rope = fused_quant_a_inv_rope
+        self.fused_quant_a_head_dim = fused_quant_a_head_dim
+        self.fused_quant_a_nope_dim = fused_quant_a_nope_dim
+        self.fused_quant_a_rope_dim = fused_quant_a_rope_dim
+        # M=1 layout: 4 lanes per 32-value scale block (16 active lanes per
+        # 128-wide k tile) instead of one, cutting the DMA-warp quantization
+        # latency that serializes deep-K small-N pipelines.
+        self.fused_quant_a_wide = fused_quant_a_wide
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
@@ -504,6 +539,8 @@ class DenseGemmKernel:
         self,
         a: cute.Tensor,
         quant_a_source: cute.Tensor,
+        quant_a_positions: cute.Tensor,
+        quant_a_cos_sin: cute.Tensor,
         b: cute.Tensor,
         sfa: cute.Tensor,
         sfb: cute.Tensor,
@@ -655,6 +692,8 @@ class DenseGemmKernel:
             tma_tensor_a,
             a,
             quant_a_source,
+            quant_a_positions,
+            quant_a_cos_sin,
             tma_atom_b,
             tma_tensor_b,
             b,
@@ -836,6 +875,8 @@ class DenseGemmKernel:
         mA_mkl: cute.Tensor,
         directA_mkl: cute.Tensor,
         quantA_mkl: cute.Tensor,
+        quantA_positions: cute.Tensor,
+        quantA_cos_sin: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         directB_nkl: cute.Tensor,
@@ -2113,6 +2154,186 @@ class DenseGemmKernel:
                             Int32(directC_mnl.shape[1]),
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
+                    elif cutlass.const_expr(
+                        self.fused_quant_a and self.fused_quant_a_wide
+                    ):
+                        # M=1 wide layout: 4 lanes cooperate on each 32-value
+                        # scale block (16B load per lane, butterfly max), so a
+                        # k-tile quantizes with 16 lanes instead of 4 and stops
+                        # throttling deep-K producer pipelines. Lanes 16..31
+                        # mirror blocks 0..3 (clamped index, stores predicated
+                        # off) so the warp stays converged at the shuffles.
+                        lane = Int32(tidx % self.num_threads_per_warp)
+                        scale_group_raw = lane // Int32(4)
+                        scale_group = scale_group_raw % Int32(4)
+                        lane4 = lane % Int32(4)
+                        row_global = tile_coord_mnl[0] * Int32(
+                            self.tile_shape_mnk[0]
+                        )
+                        # Uniform across the warp: at M=1 there is a single
+                        # m tile, so this only guards the degenerate case.
+                        if row_global < Int32(quantA_mkl.shape[0]):
+                            values = cute.make_rmem_tensor((8,), cutlass.Float32)
+                            k_local0 = scale_group * Int32(32)
+                            k_global0 = (
+                                k_tile_global * Int32(self.tile_shape_mnk[2])
+                                + k_local0
+                            )
+                            if cutlass.const_expr(
+                                self.fused_quant_a_inner_span > 0
+                            ):
+                                span = Int32(self.fused_quant_a_inner_span)
+                                outer = k_global0 // span
+                                linear_offset = (
+                                    outer * (Int32(quantA_mkl.shape[0]) * span)
+                                    + row_global * span
+                                    + (k_global0 - outer * span)
+                                )
+                            else:
+                                if cutlass.const_expr(
+                                    self.fused_quant_a_row_stride > 0
+                                ):
+                                    linear_offset = (
+                                        row_global
+                                        * Int32(self.fused_quant_a_row_stride)
+                                        + k_global0
+                                    )
+                                else:
+                                    linear_offset = row_global * Int32(
+                                        quantA_mkl.shape[1]
+                                    ) + k_global0
+                                if cutlass.const_expr(
+                                    self.fused_quant_a_l_stride > 0
+                                ):
+                                    linear_offset = (
+                                        linear_offset
+                                        + tile_coord_mnl[2]
+                                        * Int32(self.fused_quant_a_l_stride)
+                                    )
+                            elem0 = lane4 * Int32(8)
+                            source_base = get_ptr_as_int64(
+                                quantA_mkl, linear_offset + elem0
+                            )
+                            max_abs = cutlass.Float32(0.0)
+                            w0, w1, w2, w3 = ld_global_v4_u32(source_base)
+                            v0, v1 = bfloat2_to_float2_scaled(
+                                w0, cutlass.Float32(1.0)
+                            )
+                            v2, v3 = bfloat2_to_float2_scaled(
+                                w1, cutlass.Float32(1.0)
+                            )
+                            v4, v5 = bfloat2_to_float2_scaled(
+                                w2, cutlass.Float32(1.0)
+                            )
+                            v6, v7 = bfloat2_to_float2_scaled(
+                                w3, cutlass.Float32(1.0)
+                            )
+                            values[0] = v0
+                            values[1] = v1
+                            values[2] = v2
+                            values[3] = v3
+                            values[4] = v4
+                            values[5] = v5
+                            values[6] = v6
+                            values[7] = v7
+                            if cutlass.const_expr(self.fused_quant_a_inv_rope):
+                                head_d0 = k_global0 % Int32(
+                                    self.fused_quant_a_head_dim
+                                )
+                                if head_d0 >= Int32(self.fused_quant_a_nope_dim):
+                                    pos = Int32(quantA_positions[row_global])
+                                    half_rope = Int32(
+                                        self.fused_quant_a_rope_dim // 2
+                                    )
+                                    cs_base = pos * Int32(
+                                        self.fused_quant_a_rope_dim
+                                    )
+                                    rl_half0 = (
+                                        head_d0
+                                        - Int32(self.fused_quant_a_nope_dim)
+                                        + elem0
+                                    ) // Int32(2)
+                                    for pair in cutlass.range_constexpr(4):
+                                        cs_idx = (
+                                            cs_base + rl_half0 + Int32(pair)
+                                        )
+                                        cos_v = cutlass.Float32(
+                                            quantA_cos_sin[cs_idx]
+                                        )
+                                        sin_v = cutlass.Float32(
+                                            quantA_cos_sin[cs_idx + half_rope]
+                                        )
+                                        v_even = values[pair * 2]
+                                        v_odd = values[pair * 2 + 1]
+                                        values[pair * 2] = (
+                                            v_even * cos_v + v_odd * sin_v
+                                        )
+                                        values[pair * 2 + 1] = (
+                                            v_odd * cos_v - v_even * sin_v
+                                        )
+                            for elem in cutlass.range_constexpr(8):
+                                max_abs = fmax_f32(
+                                    max_abs, fabs_f32(values[elem])
+                                )
+                            for shift in cutlass.range_constexpr(2):
+                                max_abs = fmax_f32(
+                                    max_abs,
+                                    cute.arch.shuffle_sync_bfly(
+                                        max_abs, offset=1 << shift
+                                    ),
+                                )
+                            _, scale_byte = pow2_ceil_ue8m0(
+                                max_abs
+                                * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
+                            )
+                            if max_abs == cutlass.Float32(0.0):
+                                scale_byte = cutlass.Uint32(127)
+                            inv_scale = ue8m0_to_output_scale(scale_byte)
+                            payload0 = cvt_f32x4_to_e4m3x4(
+                                values[0] * inv_scale,
+                                values[1] * inv_scale,
+                                values[2] * inv_scale,
+                                values[3] * inv_scale,
+                            )
+                            payload1 = cvt_f32x4_to_e4m3x4(
+                                values[4] * inv_scale,
+                                values[5] * inv_scale,
+                                values[6] * inv_scale,
+                                values[7] * inv_scale,
+                            )
+                            if scale_group_raw < Int32(4):
+                                for byte in cutlass.range_constexpr(4):
+                                    raw0 = cutlass.Uint8(
+                                        payload0 >> cutlass.Uint32(byte * 8)
+                                    )
+                                    raw1 = cutlass.Uint8(
+                                        payload1 >> cutlass.Uint32(byte * 8)
+                                    )
+                                    sA[
+                                        (
+                                            Int32(0),
+                                            k_local0 + elem0 + Int32(byte),
+                                            mainloop_producer_state.index,
+                                        )
+                                    ] = raw0.bitcast(cutlass.Float8E4M3FN)
+                                    sA[
+                                        (
+                                            Int32(0),
+                                            k_local0 + elem0 + Int32(4 + byte),
+                                            mainloop_producer_state.index,
+                                        )
+                                    ] = raw1.bitcast(cutlass.Float8E4M3FN)
+                                if lane4 == Int32(0):
+                                    sSFA[
+                                        (
+                                            Int32(0),
+                                            k_local0,
+                                            mainloop_producer_state.index,
+                                        )
+                                    ] = cutlass.Uint8(scale_byte).bitcast(
+                                        cutlass.Float8E8M0FNU
+                                    )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     elif cutlass.const_expr(self.fused_quant_a):
                         lane = Int32(tidx % self.num_threads_per_warp)
                         row_local = lane // Int32(4)
@@ -2128,9 +2349,37 @@ class DenseGemmKernel:
                                 k_tile_global * Int32(self.tile_shape_mnk[2])
                                 + k_local0
                             )
-                            linear_offset = row_global * Int32(
-                                quantA_mkl.shape[1]
-                            ) + k_global0
+                            if cutlass.const_expr(
+                                self.fused_quant_a_inner_span > 0
+                            ):
+                                # L-blocked source: each 32-value scale block
+                                # lies within one span (span % 32 == 0).
+                                span = Int32(self.fused_quant_a_inner_span)
+                                outer = k_global0 // span
+                                linear_offset = (
+                                    outer * (Int32(quantA_mkl.shape[0]) * span)
+                                    + row_global * span
+                                    + (k_global0 - outer * span)
+                                )
+                            else:
+                                if cutlass.const_expr(
+                                    self.fused_quant_a_row_stride > 0
+                                ):
+                                    linear_offset = (
+                                        row_global
+                                        * Int32(self.fused_quant_a_row_stride)
+                                        + k_global0
+                                    )
+                                else:
+                                    linear_offset = row_global * Int32(
+                                        quantA_mkl.shape[1]
+                                    ) + k_global0
+                                if cutlass.const_expr(
+                                    self.fused_quant_a_l_stride > 0
+                                ):
+                                    linear_offset = linear_offset + tile_coord_mnl[
+                                        2
+                                    ] * Int32(self.fused_quant_a_l_stride)
                             source_base = get_ptr_as_int64(
                                 quantA_mkl, linear_offset
                             )
@@ -2167,6 +2416,54 @@ class DenseGemmKernel:
                                 max_abs = fmax_f32(max_abs, fabs_f32(v5))
                                 max_abs = fmax_f32(max_abs, fabs_f32(v6))
                                 max_abs = fmax_f32(max_abs, fabs_f32(v7))
+                            if cutlass.const_expr(self.fused_quant_a_inv_rope):
+                                # nope_dim % 32 == 0, so a scale block is
+                                # entirely nope (left as loaded) or entirely
+                                # rope: de-rotate adjacent pairs with cos/sin
+                                # at positions[row] and recompute the block
+                                # max over the rotated values.
+                                head_d0 = k_global0 % Int32(
+                                    self.fused_quant_a_head_dim
+                                )
+                                if head_d0 >= Int32(self.fused_quant_a_nope_dim):
+                                    pos = Int32(quantA_positions[row_global])
+                                    half_rope = Int32(
+                                        self.fused_quant_a_rope_dim // 2
+                                    )
+                                    cs_base = pos * Int32(
+                                        self.fused_quant_a_rope_dim
+                                    )
+                                    rl_half0 = (
+                                        head_d0
+                                        - Int32(self.fused_quant_a_nope_dim)
+                                    ) // Int32(2)
+                                    max_abs = cutlass.Float32(0.0)
+                                    for pair in cutlass.range_constexpr(16):
+                                        cs_idx = (
+                                            cs_base + rl_half0 + Int32(pair)
+                                        )
+                                        cos_v = cutlass.Float32(
+                                            quantA_cos_sin[cs_idx]
+                                        )
+                                        sin_v = cutlass.Float32(
+                                            quantA_cos_sin[cs_idx + half_rope]
+                                        )
+                                        v_even = values[pair * 2]
+                                        v_odd = values[pair * 2 + 1]
+                                        values[pair * 2] = (
+                                            v_even * cos_v + v_odd * sin_v
+                                        )
+                                        values[pair * 2 + 1] = (
+                                            v_odd * cos_v - v_even * sin_v
+                                        )
+                                        max_abs = fmax_f32(
+                                            max_abs,
+                                            fabs_f32(values[pair * 2]),
+                                        )
+                                        max_abs = fmax_f32(
+                                            max_abs,
+                                            fabs_f32(values[pair * 2 + 1]),
+                                        )
                             payload, scale_byte = quantize_block_fp8_mx(
                                 values, max_abs
                             )
@@ -2829,6 +3126,8 @@ class _DenseGemmLaunch:
         )(
             a_tensor,
             a_tensor,
+            alpha_tensor,
+            alpha_tensor,
             b_tensor,
             sfa_tensor,
             sfb_tensor,
@@ -2842,11 +3141,27 @@ class _DenseGemmLaunch:
 class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
     """Small-M MXFP8 launch that quantizes BF16 A into each CTA's stages."""
 
+    def __init__(
+        self,
+        *args,
+        fused_quant_a_inner_span: int = 0,
+        fused_quant_a_wide: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._fused_quant_a_inner_span = int(fused_quant_a_inner_span)
+        self._fused_quant_a_wide = bool(fused_quant_a_wide)
+
     def compile_key(self) -> tuple[object, ...]:
         # Keep the fused entry point separate even if every ordinary launch
         # specialization matches. Deriving the rest from the parent key avoids
         # silently omitting a future codegen field here.
-        return ("fused_quant_a", *super().compile_key())
+        return (
+            "fused_quant_a",
+            self._fused_quant_a_inner_span,
+            self._fused_quant_a_wide,
+            *super().compile_key(),
+        )
 
     @cute.jit
     def __call__(
@@ -2875,7 +3190,9 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
         )
         c_tensor = cute.make_tensor(
             c_ptr,
-            layout=cute.make_ordered_layout((m, self._n, 1), order=(1, 0, 2)),
+            layout=cute.make_ordered_layout(
+                (m, self._n, self._c_l), order=(1, 0, 2)
+            ),
         )
         alpha_tensor = cute.make_tensor(
             alpha_ptr,
@@ -2904,10 +3221,14 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             swap_ab=False,
             sfb_k_reuse=self._sfb_k_reuse,
             fused_quant_a=True,
+            fused_quant_a_inner_span=self._fused_quant_a_inner_span,
+            fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
         )(
             a_tensor,
             a_source,
+            alpha_tensor,
+            alpha_tensor,
             b_tensor,
             sfa_tensor,
             sfb_tensor,
@@ -2927,12 +3248,15 @@ def _get_compiled_dense_gemm_fused_quant_a(
     mma_tiler_mn: Tuple[int, int],
     sm_count: int,
     sfb_k_reuse: bool,
+    a_inner_span: int = 0,
+    kernel_c_l: int = 1,
+    a_wide: bool = False,
 ) -> Callable:
     launch = _DenseGemmFusedQuantALaunch(
         n=n,
         k=k,
         l=1,
-        c_l=1,
+        c_l=kernel_c_l,
         a_major="k",
         b_major="k",
         c_major="n",
@@ -2951,6 +3275,8 @@ def _get_compiled_dense_gemm_fused_quant_a(
         load_path="tma",
         swap_ab=False,
         sfb_k_reuse=sfb_k_reuse,
+        fused_quant_a_inner_span=a_inner_span,
+        fused_quant_a_wide=a_wide,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -2998,6 +3324,404 @@ def _get_compiled_dense_gemm_fused_quant_a(
         return out
 
     return tensor_api
+
+
+class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
+    """Grouped small-M MXFP8 launch quantizing a strided (optionally
+    inverse-RoPE) BF16 A source into each CTA's stages (WO-A)."""
+
+    def __init__(
+        self,
+        *args,
+        fused_quant_a_row_stride: int,
+        fused_quant_a_l_stride: int,
+        fused_quant_a_inv_rope: bool,
+        fused_quant_a_head_dim: int,
+        fused_quant_a_nope_dim: int,
+        fused_quant_a_rope_dim: int,
+        fused_quant_a_wide: bool,
+        positions_dtype: Type[cutlass.Numeric],
+        cos_sin_dtype: Type[cutlass.Numeric],
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._fused_quant_a_row_stride = int(fused_quant_a_row_stride)
+        self._fused_quant_a_l_stride = int(fused_quant_a_l_stride)
+        self._fused_quant_a_inv_rope = bool(fused_quant_a_inv_rope)
+        self._fused_quant_a_head_dim = int(fused_quant_a_head_dim)
+        self._fused_quant_a_nope_dim = int(fused_quant_a_nope_dim)
+        self._fused_quant_a_rope_dim = int(fused_quant_a_rope_dim)
+        self._fused_quant_a_wide = bool(fused_quant_a_wide)
+        self._positions_dtype = positions_dtype
+        self._cos_sin_dtype = cos_sin_dtype
+
+    def compile_key(self) -> tuple[object, ...]:
+        return (
+            "fused_quant_a_grouped",
+            self._fused_quant_a_row_stride,
+            self._fused_quant_a_l_stride,
+            self._fused_quant_a_inv_rope,
+            self._fused_quant_a_head_dim,
+            self._fused_quant_a_nope_dim,
+            self._fused_quant_a_rope_dim,
+            self._fused_quant_a_wide,
+            self._positions_dtype,
+            self._cos_sin_dtype,
+            *super().compile_key(),
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a_placeholder_ptr: cute.Pointer,
+        a_source_ptr: cute.Pointer,
+        positions_ptr: cute.Pointer,
+        cos_sin_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        sfa_placeholder_ptr: cute.Pointer,
+        sfb_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
+        m: cutlass.Int32,
+        cos_sin_len: cutlass.Int32,
+        current_stream: cuda.CUstream,
+    ):
+        a_tensor = cute.make_tensor(
+            a_placeholder_ptr,
+            layout=cute.make_ordered_layout((m, self._k, 1), order=(1, 0, 2)),
+        )
+        a_source = cute.make_tensor(
+            a_source_ptr,
+            layout=cute.make_ordered_layout((m, self._k, 1), order=(1, 0, 2)),
+        )
+        positions_tensor = cute.make_tensor(
+            positions_ptr, layout=cute.make_layout((m,))
+        )
+        cos_sin_tensor = cute.make_tensor(
+            cos_sin_ptr, layout=cute.make_layout((cos_sin_len,))
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                (self._n, self._k, self._l), order=(1, 0, 2)
+            ),
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_ordered_layout(
+                (m, self._n, self._c_l), order=(1, 0, 2)
+            ),
+        )
+        alpha_tensor = cute.make_tensor(
+            alpha_ptr,
+            layout=cute.make_ordered_layout((1,), order=(0,)),
+        )
+        sfa_tensor = cute.make_tensor(
+            sfa_placeholder_ptr, layout=cute.make_layout((1,))
+        )
+        sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
+        policy = self._policy
+        DenseGemmKernel(
+            sf_vec_size=self._sf_vec_size,
+            mma_tiler_mn=self._mma_tiler_mn,
+            cluster_shape_mn=self._cluster_shape_mn,
+            mma_k=self._mma_k,
+            tile_k=self._tile_k,
+            single_work_tile_per_cta=policy.single_work_tile_per_cta,
+            direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
+            split_k_slices=policy.split_k_slices,
+            split_k_atomic_bf16=policy.split_k_atomic_bf16,
+            large_m_unroll=False,
+            use_m1_non_tma_a=False,
+            use_m1_non_tma_c=policy.use_m1_non_tma,
+            use_m1_non_tma_sfa=False,
+            load_path="tma",
+            swap_ab=False,
+            sfb_k_reuse=self._sfb_k_reuse,
+            fused_quant_a=True,
+            fused_quant_a_row_stride=self._fused_quant_a_row_stride,
+            fused_quant_a_l_stride=self._fused_quant_a_l_stride,
+            fused_quant_a_inv_rope=self._fused_quant_a_inv_rope,
+            fused_quant_a_head_dim=self._fused_quant_a_head_dim,
+            fused_quant_a_nope_dim=self._fused_quant_a_nope_dim,
+            fused_quant_a_rope_dim=self._fused_quant_a_rope_dim,
+            fused_quant_a_wide=self._fused_quant_a_wide,
+            atom_shape_24=self._atom_shape_24,
+        )(
+            a_tensor,
+            a_source,
+            positions_tensor,
+            cos_sin_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            alpha_tensor,
+            self._max_active_clusters,
+            current_stream,
+        )
+
+
+def _cutlass_positions_dtype(dtype: torch.dtype) -> Type[cutlass.Numeric]:
+    if dtype == torch.int64:
+        return cutlass.Int64
+    if dtype == torch.int32:
+        return cutlass.Int32
+    raise ValueError(f"fused inv-RoPE positions must be int32/int64, got {dtype}")
+
+
+def _cutlass_cos_sin_dtype(dtype: torch.dtype) -> Type[cutlass.Numeric]:
+    if dtype == torch.bfloat16:
+        return cutlass.BFloat16
+    if dtype == torch.float32:
+        return cutlass.Float32
+    raise ValueError(f"fused inv-RoPE cos/sin cache must be bf16/fp32, got {dtype}")
+
+
+@functools.cache
+def _get_compiled_dense_gemm_fused_quant_a_grouped(
+    n: int,
+    k: int,
+    l: int,
+    policy: _DenseGemmPolicy,
+    mma_tiler_mn: Tuple[int, int],
+    sm_count: int,
+    sfb_k_reuse: bool,
+    a_row_stride: int,
+    a_l_stride: int,
+    inv_rope: bool,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    a_wide: bool,
+    positions_dtype: Type[cutlass.Numeric],
+    cos_sin_dtype: Type[cutlass.Numeric],
+) -> Callable:
+    launch = _DenseGemmFusedQuantAGroupedLaunch(
+        n=n,
+        k=k,
+        l=l,
+        c_l=l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float8E8M0FNU,
+        c_dtype=cutlass.BFloat16,
+        alpha_dtype=cutlass.Float32,
+        sf_vec_size=32,
+        mma_k=32,
+        tile_k=128,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        policy=policy,
+        sm_count=sm_count,
+        sm_version="sm_120",
+        load_path="tma",
+        swap_ab=False,
+        sfb_k_reuse=sfb_k_reuse,
+        fused_quant_a_row_stride=a_row_stride,
+        fused_quant_a_l_stride=a_l_stride,
+        fused_quant_a_inv_rope=inv_rope,
+        fused_quant_a_head_dim=head_dim,
+        fused_quant_a_nope_dim=nope_dim,
+        fused_quant_a_rope_dim=rope_dim,
+        fused_quant_a_wide=a_wide,
+        positions_dtype=positions_dtype,
+        cos_sin_dtype=cos_sin_dtype,
+    )
+    compile_key = launch.compile_key()
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=launch,
+        cache_key=compile_key,
+    )
+    placeholders = [16] * 9
+    compiled = b12x_compile(
+        launch,
+        make_ptr(cutlass.Float8E4M3FN, placeholders[0], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, placeholders[1], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(positions_dtype, placeholders[2], cute.AddressSpace.gmem, assumed_align=8),
+        make_ptr(cos_sin_dtype, placeholders[3], cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Float8E4M3FN, placeholders[4], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float8E8M0FNU, placeholders[5], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float8E8M0FNU, placeholders[6], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, placeholders[7], cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float32, placeholders[8], cute.AddressSpace.gmem, assumed_align=16),
+        1,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "gemm.dense_fused_quant_a_grouped", 2, compile_key
+        ),
+    )
+
+    def tensor_api(
+        source: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+        out: torch.Tensor,
+        alpha: torch.Tensor,
+        stream_int: Optional[int],
+    ) -> torch.Tensor:
+        source_ptr = source.data_ptr()
+        compiled(
+            make_ptr(cutlass.Float8E4M3FN, source_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.BFloat16, source_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(positions_dtype, positions.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
+            make_ptr(cos_sin_dtype, cos_sin.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+            make_ptr(cutlass.Float8E4M3FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float8E8M0FNU, source_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float8E8M0FNU, sfb.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            int(source.shape[0]),
+            int(cos_sin.numel()),
+            cuda_stream_from_int_or_current(stream_int),
+        )
+        return out
+
+    return tensor_api
+
+
+def dense_gemm_fused_quant_a_grouped(
+    source: torch.Tensor,
+    b: torch.Tensor,
+    sfb: torch.Tensor,
+    *,
+    groups: int,
+    out: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    head_dim: int = 0,
+    nope_dim: int = 0,
+    rope_dim: int = 0,
+    expected_m: Optional[int] = None,
+    sfb_k_replicated: bool = False,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Small-M grouped BF16-A -> MXFP8 GEMM quantizing A in each CTA (WO-A).
+
+    `source` is `[M, groups, K]` BF16 with contiguous trailing dims (rows may
+    be strided); logical GEMM operands are per-group `[M, K] x [N, K]`. When
+    `positions`/`cos_sin_cache` are given, the trailing `rope_dim` of every
+    `head_dim` block is inverse-RoPE-rotated before quantization.
+    """
+
+    if source.dtype != torch.bfloat16 or source.ndim != 3:
+        raise ValueError("fused grouped MXFP8 quantization requires BF16 [M, groups, K]")
+    m = int(source.shape[0])
+    k = int(source.shape[2])
+    if int(source.shape[1]) != groups:
+        raise ValueError(
+            f"source groups {int(source.shape[1])} != weight groups {groups}"
+        )
+    if source.stride(2) != 1 or source.stride(1) != k:
+        raise ValueError(
+            f"fused grouped MXFP8 A needs contiguous [groups, K] rows, got strides {source.stride()}"
+        )
+    row_stride = int(source.stride(0))
+    if m < 1 or m > 8 or k % 128 != 0 or row_stride % 8 != 0:
+        raise ValueError(
+            f"fused grouped MXFP8 quantization requires 1<=M<=8, K%128=0, row stride%8=0; "
+            f"got M={m}, K={k}, row_stride={row_stride}"
+        )
+    if b.ndim != 3 or int(b.shape[1]) != k or int(b.shape[2]) != groups:
+        raise ValueError(f"B must have shape [N,{k},{groups}], got {tuple(b.shape)}")
+    n = int(b.shape[0])
+    inv_rope = positions is not None or cos_sin_cache is not None
+    if inv_rope:
+        if positions is None or cos_sin_cache is None:
+            raise ValueError("inverse-RoPE needs both positions and cos_sin_cache")
+        if positions.shape != (m,):
+            raise ValueError(f"positions must have shape {(m,)}, got {tuple(positions.shape)}")
+        if not positions.is_contiguous() or not cos_sin_cache.is_contiguous():
+            raise ValueError("positions and cos_sin_cache must be contiguous")
+        if cos_sin_cache.ndim != 2 or int(cos_sin_cache.shape[1]) != rope_dim:
+            raise ValueError(
+                f"cos_sin_cache must have shape [max_pos, {rope_dim}], got {tuple(cos_sin_cache.shape)}"
+            )
+        if (
+            head_dim <= 0
+            or nope_dim + rope_dim != head_dim
+            or head_dim % 32
+            or nope_dim % 32
+            or rope_dim % 32
+            or k % head_dim
+        ):
+            raise ValueError(
+                "fused inverse-RoPE requires 32-aligned head_dim = nope_dim + rope_dim "
+                f"dividing K, got head={head_dim}, nope={nope_dim}, rope={rope_dim}, K={k}"
+            )
+        positions_dtype = _cutlass_positions_dtype(positions.dtype)
+        cos_sin_dtype = _cutlass_cos_sin_dtype(cos_sin_cache.dtype)
+    else:
+        head_dim = nope_dim = rope_dim = 0
+        positions = source
+        cos_sin_cache = source
+        positions_dtype = cutlass.Int64
+        cos_sin_dtype = cutlass.BFloat16
+    sm_count = get_num_sm(source.device)
+    if mma_tiler_mn is None:
+        plan = _select_default_dense_gemm_plan(
+            m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
+        )
+        if plan.swap_ab or plan.load_path != "tma":
+            raise ValueError("fused grouped MXFP8 quantization requires the unswapped TMA plan")
+        mma_tiler_mn = plan.mma_tiler_mn
+    policy = _dense_gemm_policy_for(
+        m=m,
+        n=n,
+        k=k,
+        l=groups,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=sm_count,
+        expected_m=expected_m,
+    )
+    if policy.split_k_slices != 1:
+        raise ValueError("fused grouped MXFP8 quantization does not support split-K")
+    if out is None:
+        out = _empty_dense_gemm_output(
+            m, n, groups, dtype=torch.bfloat16, device=source.device
+        )
+    if out.shape != (m, n, groups) or out.dtype != torch.bfloat16:
+        raise ValueError(
+            f"out must be BF16 with shape {(m, n, groups)}, got {out.dtype} {tuple(out.shape)}"
+        )
+    compiled = _get_compiled_dense_gemm_fused_quant_a_grouped(
+        n,
+        k,
+        groups,
+        policy,
+        mma_tiler_mn,
+        sm_count,
+        bool(sfb_k_replicated),
+        row_stride,
+        k,
+        bool(inv_rope),
+        int(head_dim),
+        int(nope_dim),
+        int(rope_dim),
+        m == 1,
+        positions_dtype,
+        cos_sin_dtype,
+    )
+    return compiled(
+        source,
+        positions,
+        cos_sin_cache,
+        b,
+        sfb,
+        out,
+        _cached_alpha_one(source.device),
+        cuda_stream_to_int(stream),
+    )
 
 
 @functools.cache
@@ -3737,24 +4461,58 @@ def dense_gemm_fused_quant_a(
     out: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
     sfb_k_replicated: bool = False,
+    a_inner_span: int = 0,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Small-M BF16-A -> MXFP8 GEMM with activation quantization in each CTA."""
+    """Small-M BF16-A -> MXFP8 GEMM with activation quantization in each CTA.
 
-    if source.dtype != torch.bfloat16 or source.ndim != 2 or not source.is_contiguous():
-        raise ValueError("fused MXFP8 activation quantization requires contiguous BF16 [M,K]")
-    m, k = map(int, source.shape)
+    a_inner_span > 0 reads A from an L-blocked source instead of contiguous
+    rows: `source` is the `[M, span, K/span]` dense-GEMM mnl view over physical
+    `[K/span, M, span]` storage (the WO tmp group-major layout). Follows the
+    dense_gemm split-K policy (FP32 partials + fused reduce) instead of forcing
+    a single un-split kernel, which loses ~2x at M=1 for N,K >= 4096.
+    """
+
+    a_inner_span = int(a_inner_span)
+    if source.dtype != torch.bfloat16:
+        raise ValueError("fused MXFP8 activation quantization requires BF16 A")
+    if a_inner_span == 0:
+        if source.ndim != 2 or not source.is_contiguous():
+            raise ValueError(
+                "fused MXFP8 activation quantization requires contiguous BF16 [M,K]"
+            )
+        m, k = map(int, source.shape)
+    else:
+        if a_inner_span % 32 != 0:
+            raise ValueError(
+                f"fused MXFP8 a_inner_span must be a multiple of 32, got {a_inner_span}"
+            )
+        if source.ndim != 3 or int(source.shape[1]) != a_inner_span:
+            raise ValueError(
+                "L-blocked fused MXFP8 A requires an [M, span, K/span] view, "
+                f"got {tuple(source.shape)} for span={a_inner_span}"
+            )
+        m = int(source.shape[0])
+        k = a_inner_span * int(source.shape[2])
+        if source.stride() != (a_inner_span, 1, m * a_inner_span):
+            raise ValueError(
+                "L-blocked fused MXFP8 A must be a dense-GEMM mnl view over "
+                f"physical [K/span, M, span] storage, got strides {source.stride()}"
+            )
     if m < 1 or m > 8 or k % 128 != 0:
         raise ValueError(f"fused MXFP8 activation quantization requires 1<=M<=8 and K%128=0, got M={m}, K={k}")
     if b.ndim != 3 or int(b.shape[1]) != k or int(b.shape[2]) != 1:
         raise ValueError(f"B must have shape [N,{k},1], got {tuple(b.shape)}")
     n = int(b.shape[0])
     sm_count = get_num_sm(source.device)
-    plan = _select_default_dense_gemm_plan(
-        m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
-    )
-    if plan.swap_ab or plan.load_path != "tma":
-        raise ValueError("fused MXFP8 activation quantization requires the unswapped TMA plan")
+    if mma_tiler_mn is None:
+        plan = _select_default_dense_gemm_plan(
+            m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
+        )
+        if plan.swap_ab or plan.load_path != "tma":
+            raise ValueError("fused MXFP8 activation quantization requires the unswapped TMA plan")
+        mma_tiler_mn = plan.mma_tiler_mn
     policy = _dense_gemm_policy_for(
         m=m,
         n=n,
@@ -3762,41 +4520,58 @@ def dense_gemm_fused_quant_a(
         l=1,
         ab_dtype=cutlass.Float8E4M3FN,
         c_dtype=cutlass.BFloat16,
-        mma_tiler_mn=plan.mma_tiler_mn,
+        mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         sm_count=sm_count,
         expected_m=expected_m,
     )
-    if policy.split_k_slices != 1:
-        policy = _DenseGemmPolicy(
-            single_work_tile_per_cta=policy.single_work_tile_per_cta,
-            direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
-            use_m1_non_tma=policy.use_m1_non_tma,
-            split_k_slices=1,
-            split_k_atomic_bf16=False,
-            large_m_unroll=False,
-        )
+    split_k_slices = policy.split_k_slices
+    split_k_output = split_k_slices > 1
+    split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
     if out is None:
         out = torch.empty((m, n, 1), dtype=torch.bfloat16, device=source.device)
     if out.shape != (m, n, 1) or out.dtype != torch.bfloat16:
         raise ValueError(f"out must be BF16 with shape {(m, n, 1)}, got {out.dtype} {tuple(out.shape)}")
+    split_storage = None
+    if split_k_atomic_bf16:
+        out.zero_()
+        kernel_c_l = 1
+        kernel_c_dtype = cutlass.BFloat16
+        c_tensor_gpu = out
+    elif split_k_output:
+        split_storage = torch.empty(
+            (split_k_slices, m, n), dtype=torch.float32, device=source.device
+        )
+        kernel_c_l = split_k_slices
+        kernel_c_dtype = cutlass.Float32
+        c_tensor_gpu = split_storage
+    else:
+        kernel_c_l = 1
+        kernel_c_dtype = cutlass.BFloat16
+        c_tensor_gpu = out
     compiled = _get_compiled_dense_gemm_fused_quant_a(
         n,
         k,
-        cutlass.BFloat16,
+        kernel_c_dtype,
         policy,
-        plan.mma_tiler_mn,
+        mma_tiler_mn,
         sm_count,
         bool(sfb_k_replicated),
+        a_inner_span,
+        kernel_c_l,
+        m == 1,
     )
-    return compiled(
+    compiled(
         source,
         b,
         sfb,
-        out,
+        c_tensor_gpu,
         _cached_alpha_one(source.device),
         cuda_stream_to_int(stream),
     )
+    if split_storage is not None:
+        _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
+    return out
 
 
 def dense_gemm(

@@ -126,7 +126,10 @@ def test_fused_quant_compile_key_is_distinct_and_exhaustive():
     fused = _bk64_launch(launch_type=_DenseGemmFusedQuantALaunch)
 
     assert fused.compile_key()[0] == "fused_quant_a"
-    assert fused.compile_key()[1:] == ordinary.compile_key()
+    # Indexes 1-2 are the fused-only A inner-span and wide-M1 layout fields.
+    assert fused.compile_key()[1] == 0
+    assert fused.compile_key()[2] is False
+    assert fused.compile_key()[3:] == ordinary.compile_key()
 
 
 def test_expected_m_short_k_large_n_uses_production_bk64_plan():

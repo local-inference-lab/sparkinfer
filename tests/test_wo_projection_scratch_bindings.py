@@ -126,13 +126,10 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
         calls["tmp_out"] = out
         return out
 
-    def fake_quantize_b(tmp, *, out):
+    def fake_wo_b_fused(tmp, wo_b, *, out, expected_m=None, **kwargs):
+        # Small-M bindings route WO-B through the fused-quant GEMM; the bound
+        # tmp_q scratch is intentionally unused there.
         calls["tmp"] = tmp
-        calls["tmp_q_out"] = out
-        return out
-
-    def fake_wo_b(tmp_q, wo_b, *, out, expected_m=None, **kwargs):
-        calls["tmp_q"] = tmp_q
         calls["wo_b"] = wo_b
         calls["output_out"] = out
         out.zero_()
@@ -140,15 +137,16 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
 
     monkeypatch.setattr(wo_impl, "quantize_wo_a_input_mxfp8", fake_quantize_a)
     monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
-    monkeypatch.setattr(wo_impl, "quantize_wo_b_input_mxfp8", fake_quantize_b)
-    monkeypatch.setattr(wo_impl, "wo_b_dense_gemm_mxfp8", fake_wo_b)
+    monkeypatch.setattr(
+        wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b_fused
+    )
 
     out = wo_impl.wo_projection_mxfp8(binding=binding)
 
     assert calls["source_tgd"] is source
     assert calls["x_q_out"] is binding.x_q
     assert calls["tmp_out"] is binding.tmp
-    assert calls["tmp_q_out"] is binding.tmp_q
+    assert calls["tmp"] is binding.tmp
     assert calls["output_out"] is binding.output
     assert out.shape == (3, 256)
 
@@ -194,6 +192,7 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         nope_dim,
         rope_dim,
         expected_m,
+        sfb_k_replicated,
         stream_int,
     ):
         calls["o"] = o_arg
@@ -213,6 +212,7 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         calls["nope_dim"] = nope_dim
         calls["rope_dim"] = rope_dim
         calls["expected_m"] = expected_m
+        calls["sfb_k_replicated"] = sfb_k_replicated
         calls["stream_int"] = stream_int
         return torch.empty((o_arg.shape[0], hidden, 1), dtype=o_arg.dtype)
 
@@ -243,6 +243,7 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     assert calls["nope_dim"] == 96
     assert calls["rope_dim"] == 32
     assert calls["expected_m"] == 3
+    assert calls["sfb_k_replicated"] == weights.sfb_k_replicated
     assert calls["stream_int"] == 123
     assert out.shape == (3, 256, 1)
 

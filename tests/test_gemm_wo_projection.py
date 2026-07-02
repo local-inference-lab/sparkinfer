@@ -838,3 +838,403 @@ def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
 
     assert bool(torch.isfinite(binding.output).all().item())
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
+
+
+def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
+    require_sm120()
+    torch.manual_seed(31007)
+
+    tokens, groups, group_width, rank, hidden = 5, 2, 256, 128, 256
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
+    wo_a_weight = (
+        torch.randn((groups * rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / 8
+    ).to(torch.float8_e4m3fn)
+    wo_b_weight = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16) / 8
+    ).to(torch.float8_e4m3fn)
+    # Distinct per-128-block UE8M0 scales so k reuse would diverge if the
+    # replication assumption were wrong.
+    wo_a_scale = torch.randint(
+        120,
+        134,
+        (groups * (rank // 128), group_width // 128),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e8m0fnu)
+    wo_b_scale = torch.randint(
+        120,
+        134,
+        (hidden // 128, groups * rank // 128),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e8m0fnu)
+
+    weights = pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+        wo_a_weight,
+        wo_a_scale,
+        wo_b_weight,
+        wo_b_scale,
+        groups=groups,
+        group_width=group_width,
+        rank=rank,
+        hidden=hidden,
+    )
+    assert weights.sfb_k_replicated
+
+    x_tdg = quantize_wo_a_input_mxfp8(x_tgd)
+    tmp_base = wo_a_dense_gemm_mxfp8(x_tdg, weights.wo_a)
+    tmp_reuse = wo_a_dense_gemm_mxfp8(x_tdg, weights.wo_a, sfb_k_replicated=True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tmp_reuse, tmp_base, rtol=0, atol=0)
+
+    tmp_q = quantize_wo_b_input_mxfp8(tmp_base)
+    out_base = wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b)
+    out_reuse = wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b, sfb_k_replicated=True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_reuse, out_base, rtol=0, atol=0)
+
+
+def _wo_b_fused_vs_unfused(
+    tokens: int, rank: int, groups: int, hidden: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from b12x.gemm.wo_projection import wo_b_dense_gemm_fused_quant_mxfp8
+
+    tmp = empty_dense_gemm_mnl_view(
+        tokens, rank, groups, device="cuda", dtype=torch.bfloat16
+    )
+    tmp.copy_(
+        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16) / 4
+    )
+    wo_b_bf16 = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
+    wo_b = quantize_mxfp8_rows_torch(wo_b_bf16)
+
+    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    unfused = wo_b_dense_gemm_mxfp8(tmp_q, wo_b, expected_m=tokens)
+    fused = wo_b_dense_gemm_fused_quant_mxfp8(tmp, wo_b, expected_m=tokens)
+    torch.cuda.synchronize()
+    return fused, unfused
+
+
+def test_wo_b_fused_quant_matches_unfused_small_shapes() -> None:
+    require_sm120()
+    torch.manual_seed(31008)
+
+    for tokens in (1, 3, 8):
+        fused, unfused = _wo_b_fused_vs_unfused(
+            tokens, rank=128, groups=2, hidden=256
+        )
+        torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+    # Singleton group takes the contiguous-source path.
+    fused, unfused = _wo_b_fused_vs_unfused(2, rank=256, groups=1, hidden=256)
+    torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
+    require_sm120()
+    torch.manual_seed(31009)
+
+    # DS4-Flash TP2 WO-B: N=4096, K=4096 -> the decode policy picks 2-way
+    # split-K; the fused path must produce byte-identical output through the
+    # FP32-partials reduce.
+    for tokens in (1, 4):
+        fused, unfused = _wo_b_fused_vs_unfused(
+            tokens, rank=1024, groups=4, hidden=4096
+        )
+        torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
+    require_sm120()
+    torch.manual_seed(31010)
+    from b12x.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
+
+    for tokens, groups, group_width, rank in (
+        (1, 2, 256, 128),
+        (3, 2, 256, 128),
+        (8, 1, 512, 128),
+    ):
+        x_tgd = (
+            torch.randn(
+                (tokens, groups, group_width), device="cuda", dtype=torch.bfloat16
+            )
+            / 4
+        )
+        wo_a_grd = (
+            torch.randn(
+                (groups, rank, group_width), device="cuda", dtype=torch.bfloat16
+            )
+            / group_width**0.5
+        )
+        wo_a_source = wo_a_grd.permute(1, 2, 0).contiguous()
+        if groups == 1:
+            wo_a_source = wo_a_source[:, :, 0]
+        wo_a = quantize_mxfp8_rows_torch(wo_a_source)
+
+        x_q = quantize_wo_a_input_mxfp8(x_tgd)
+        unfused = wo_a_dense_gemm_mxfp8(x_q, wo_a, expected_m=tokens)
+        fused = wo_a_dense_gemm_fused_quant_mxfp8(x_tgd, wo_a, expected_m=tokens)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
+    require_sm120()
+    torch.manual_seed(31011)
+    from b12x.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
+
+    tokens, groups, heads_per_group = 3, 2, 4
+    head_dim, nope_dim, rope_dim = 128, 96, 32
+    group_width = heads_per_group * head_dim
+    rank = 128
+    o = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 8
+    ).contiguous()
+    positions = torch.arange(7, 7 + tokens, device="cuda", dtype=torch.int64)
+    max_pos = 64
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
+            / rope_dim
+        )
+    )
+    t = torch.arange(max_pos, device="cuda", dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    wo_a_grd = (
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / group_width**0.5
+    )
+    wo_a = quantize_mxfp8_rows_torch(wo_a_grd.permute(1, 2, 0).contiguous())
+    source_tgd = o.reshape(tokens, groups, group_width)
+
+    for cos_sin_dtype in (torch.float32, torch.bfloat16):
+        cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(cos_sin_dtype)
+        x_q = quantize_wo_a_input_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin,
+            groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+        unfused = wo_a_dense_gemm_mxfp8(x_q, wo_a, expected_m=tokens)
+        fused = wo_a_dense_gemm_fused_quant_mxfp8(
+            source_tgd,
+            wo_a,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            head_dim=head_dim,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            expected_m=tokens,
+        )
+        torch.cuda.synchronize()
+        # The fused de-rotation reproduces the Triton quantizer's FP32 math
+        # bit-for-bit (also verified at the DS4-Flash TP2 serving shape).
+        torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
+    require_sm120()
+    torch.manual_seed(31012)
+
+    # DS4-Flash TP2 serving shape at decode M: the fused route must replay
+    # under graph capture and stay finite/consistent between eager and replay.
+    tokens, groups, heads_per_group = 1, 4, 8
+    head_dim, nope_dim, rope_dim = 512, 448, 64
+    group_width = heads_per_group * head_dim
+    rank, hidden = 1024, 4096
+    o = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 8
+    ).contiguous()
+    positions = torch.randint(0, 4096, (tokens,), device="cuda", dtype=torch.int64)
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
+            / rope_dim
+        )
+    )
+    t = torch.arange(4096, device="cuda", dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+    wo_a_grd = (
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / group_width**0.5
+    )
+    wo_b_hgr = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
+
+    def run():
+        return wo_projection_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin,
+            weights,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+
+    eager = run().clone()
+    torch.cuda.synchronize()
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_wo_quant_cute_paths_match_triton_bit_exact() -> None:
+    require_sm120()
+    torch.manual_seed(31013)
+
+    tokens, groups, heads_per_group = 130, 2, 4
+    head_dim, nope_dim, rope_dim = 128, 96, 32
+    group_width = heads_per_group * head_dim
+    rank = 256
+
+    def _assert_rows_equal(actual: MXFP8Rows, expected: MXFP8Rows) -> None:
+        torch.testing.assert_close(
+            actual.values.view(torch.uint8),
+            expected.values.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual.scale_rows.view(torch.uint8),
+            expected.scale_rows.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual.scale_mma.view(torch.uint8),
+            expected.scale_mma.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+    # Plain grouped: the (unrouted) CuTe grouped kernel vs the Triton path.
+    from b12x.gemm.wo_quant_cute import quantize_wo_grouped_rows_cute
+
+    src_contig = (
+        torch.randn(
+            (tokens, groups, group_width), device="cuda", dtype=torch.bfloat16
+        )
+        / 4
+    ).contiguous()
+    cute_out = empty_mxfp8_rows_for_dense_gemm(
+        tokens, group_width, num_groups=groups, device="cuda"
+    )
+    quantize_wo_grouped_rows_cute(
+        src_contig.reshape(tokens, groups * group_width),
+        cute_out.values,
+        cute_out.scale_rows.view(torch.uint8),
+        cute_out.scale_mma.view(torch.uint8),
+        m=tokens,
+        groups=groups,
+        group_width=group_width,
+    )
+    _assert_rows_equal(cute_out, quantize_wo_a_input_mxfp8(src_contig))
+
+    # Inverse-RoPE: real rotation, the (unrouted) CuTe kernel vs Triton.
+    o_contig = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 8
+    ).contiguous()
+    positions = torch.randint(0, 512, (tokens,), device="cuda", dtype=torch.int64)
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
+            / rope_dim
+        )
+    )
+    freqs = torch.outer(
+        torch.arange(512, device="cuda", dtype=torch.float32), inv_freq
+    )
+    for cos_sin_dtype in (torch.float32, torch.bfloat16):
+        cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(cos_sin_dtype)
+        cute_rope = empty_mxfp8_rows_for_dense_gemm(
+            tokens, group_width, num_groups=groups, device="cuda"
+        )
+        quantize_wo_grouped_rows_cute(
+            o_contig.reshape(tokens, groups * group_width),
+            cute_rope.values,
+            cute_rope.scale_rows.view(torch.uint8),
+            cute_rope.scale_mma.view(torch.uint8),
+            m=tokens,
+            groups=groups,
+            group_width=group_width,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            head_dim=head_dim,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+        _assert_rows_equal(
+            cute_rope,
+            quantize_wo_a_input_inv_rope_mxfp8(
+                o_contig,
+                positions,
+                cos_sin,
+                groups=groups,
+                heads_per_group=heads_per_group,
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
+            ),
+        )
+
+    # Group-major: the (unrouted) CuTe regather kernel vs the Triton path.
+    from b12x.gemm.wo_quant_cute import quantize_wo_group_major_rows_cute
+
+    tmp_canon = empty_dense_gemm_mnl_view(
+        tokens, rank, groups, device="cuda", dtype=torch.bfloat16
+    )
+    tmp_canon.copy_(
+        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16) / 4
+    )
+    cute_gm = empty_mxfp8_rows_for_dense_gemm(
+        tokens, rank * groups, num_groups=1, device="cuda"
+    )
+    quantize_wo_group_major_rows_cute(
+        tmp_canon,
+        cute_gm.values,
+        cute_gm.scale_rows.view(torch.uint8),
+        cute_gm.scale_mma.view(torch.uint8),
+        m=tokens,
+        groups=groups,
+        rank=rank,
+    )
+    _assert_rows_equal(cute_gm, quantize_wo_b_input_mxfp8(tmp_canon))
