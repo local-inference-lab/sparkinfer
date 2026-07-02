@@ -322,3 +322,29 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
             assert out.shape == (tokens, out_features)
     finally:
         unfreeze_kernel_resolution()
+
+
+def test_block_fp8_linear_expected_m_short_k_large_n_matches_reference() -> None:
+    """Exercise the production expected_m route through 128x128x64."""
+    require_sm120()
+    torch.manual_seed(20260702)
+
+    tokens, in_features, out_features = 16, 1024, 16384
+    expected_m = 4096
+    x = (
+        torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    actual = block_fp8_linear_mxfp8(x, packed, expected_m=expected_m)
+    expected = _reference_from_quantized_operands(x, weight, scale)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=0,
+        atol=1 / 128,
+    )

@@ -9,11 +9,9 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import torch
-import triton
-import triton.language as tl
 
 from b12x.cute.utils import cuda_stream_to_int
-from b12x.gemm.dense import dense_gemm
+from b12x.gemm.dense import dense_gemm, dense_gemm_fused_quant_a
 from b12x.gemm.wo_projection import (
     MXFP8Rows,
     MXFP8_SCALE_K_TILE,
@@ -28,6 +26,7 @@ from b12x.gemm.wo_projection import (
     pack_fp8_block_scaled_weight_mxfp8,
 )
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.gemm.mxfp8_quant_cute import quantize_mxfp8_rows_cute
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
@@ -157,96 +156,6 @@ class _BlockFP8LinearScratchLayout:
     x_scale_rows_offset_bytes: int
     x_scale_mma_offset_bytes: int
     x_scale_mma_physical_shape: tuple[int, int, int, int, int, int]
-
-
-@triton.jit
-def _quantize_dense_tk_to_tk_kernel(
-    source,
-    values,
-    scale_rows,
-    scale_mma,
-    tokens,
-    num_groups_k,
-    source_stride_t,
-    source_stride_k,
-    values_stride_t,
-    values_stride_k,
-    scale_rows_stride_l,
-    scale_rows_stride_t,
-    scale_rows_stride_k,
-    scale_mma_s0,
-    scale_mma_s1,
-    scale_mma_s2,
-    scale_mma_s3,
-    scale_mma_s4,
-    scale_mma_s5,
-    BLOCK_M: tl.constexpr,
-    GROUPS: tl.constexpr,
-    VEC: tl.constexpr,
-) -> None:
-    # Tiled MXFP8 row quantizer: each program covers BLOCK_M tokens x GROUPS
-    # 32-wide scale groups so loads/stores are coalesced across the K dim.
-    # BLOCK_M must divide 32 (or be a multiple of it) so that the swizzled
-    # scale_mma row32/row4/tile_m coordinates stay vectorizable per tile.
-    pid_m = tl.program_id(0)
-    pid_g = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_g = pid_g * GROUPS + tl.arange(0, GROUPS)
-    offs_e = tl.arange(0, VEC)
-    mask_m = offs_m < tokens
-    mask_g = offs_g < num_groups_k
-
-    k = offs_g[:, None] * VEC + offs_e[None, :]
-    mask = mask_m[:, None, None] & mask_g[None, :, None]
-    src = tl.load(
-        source
-        + offs_m[:, None, None] * source_stride_t
-        + k[None, :, :] * source_stride_k,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    max_abs = tl.max(tl.abs(src), axis=2)
-    safe = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
-    scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(safe)), -127.0), 127.0)
-    scale = tl.exp2(scale_exp)
-    scale_u8 = (scale_exp + 127.0).to(tl.uint8)
-
-    tl.store(
-        values
-        + offs_m[:, None, None] * values_stride_t
-        + k[None, :, :] * values_stride_k,
-        (src / scale[:, :, None]).to(tl.float8e4nv),
-        mask=mask,
-    )
-
-    mask2 = mask_m[:, None] & mask_g[None, :]
-    tl.store(
-        scale_rows
-        + scale_rows_stride_l * 0
-        + offs_m[:, None] * scale_rows_stride_t
-        + offs_g[None, :] * scale_rows_stride_k,
-        scale_u8,
-        mask=mask2,
-    )
-
-    row32 = offs_m % 32
-    row4 = (offs_m // 32) % 4
-    tile_m = offs_m // 128
-    k4 = offs_g % 4
-    tile_k = offs_g // 4
-    tl.store(
-        scale_mma
-        + row32[:, None] * scale_mma_s0
-        + row4[:, None] * scale_mma_s1
-        + tile_m[:, None] * scale_mma_s2
-        + k4[None, :] * scale_mma_s3
-        + tile_k[None, :] * scale_mma_s4
-        + scale_mma_s5 * 0,
-        scale_u8,
-        mask=mask2,
-    )
 
 
 def _check_block_size(block_size: Sequence[int]) -> tuple[int, int]:
@@ -531,36 +440,12 @@ def _run_block_fp8_quant_kernel(
     tokens: int,
     in_features: int,
 ) -> None:
-    num_groups_k = in_features // MXFP8_SCALE_VEC_SIZE
-    block_m = 32
-    groups = 16
-    grid = (
-        (tokens + block_m - 1) // block_m,
-        (num_groups_k + groups - 1) // groups,
-    )
-    _quantize_dense_tk_to_tk_kernel[grid](
+    del tokens, in_features
+    quantize_mxfp8_rows_cute(
         source_tk,
         out_values,
-        out_scale_rows.view(torch.uint8),
-        out_scale_mma.view(torch.uint8),
-        tokens,
-        num_groups_k,
-        source_tk.stride(0),
-        source_tk.stride(1),
-        out_values.stride(0),
-        out_values.stride(1),
-        out_scale_rows.stride(0),
-        out_scale_rows.stride(1),
-        out_scale_rows.stride(2),
-        out_scale_mma.stride(0),
-        out_scale_mma.stride(1),
-        out_scale_mma.stride(2),
-        out_scale_mma.stride(3),
-        out_scale_mma.stride(4),
-        out_scale_mma.stride(5),
-        BLOCK_M=block_m,
-        GROUPS=groups,
-        VEC=MXFP8_SCALE_VEC_SIZE,
+        out_scale_rows,
+        out_scale_mma,
     )
 
 
@@ -573,9 +458,9 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
     tokens: int,
     in_features: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Functional (allocate + return) quantizer: the raw Triton kernel writes the
+    # Functional (allocate + return) quantizer: the raw CuTe kernel writes the
     # MXFP8 output views INSIDE this opaque op, so torch.compile never sees a
-    # triton_kernel_wrapper_mutation on 3 caller-visible views. Returns the
+    # low-level mutation on 3 caller-visible views. Returns the
     # CONTIGUOUS bases (not the views) so no symbolic-shaped view output reaches a
     # downstream subgraph (which trips AOT merge_view_inputs). Used on the no-`out`
     # (compile) path.
@@ -656,6 +541,15 @@ def _block_fp8_linear_mxfp8_fused_op(
     # shapes). The weight views passed in are static-shaped, so they don't hit
     # that path. Returns a contiguous [tokens, out_features] base.
     tokens = int(source_2d.shape[0])
+    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+        return dense_gemm_fused_quant_a(
+            source_2d,
+            weight_values.reshape(out_features, in_features, 1),
+            weight_scale_mma,
+            expected_m=None if expected_m == 0 else expected_m,
+            sfb_k_replicated=True,
+            stream=stream_int,
+        )[:, :, 0]
     x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
     return dense_gemm(
         (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
@@ -664,7 +558,7 @@ def _block_fp8_linear_mxfp8_fused_op(
         sf_dtype="float8_e8m0fnu",
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
-        expected_m=expected_m,
+        expected_m=None if expected_m == 0 else expected_m,
         # Weight scales come from 128x128 blocks expanded to per-32 rows, so
         # the four SFB bytes per 128-wide k tile are identical by construction.
         sfb_k_replicated=True,
@@ -758,7 +652,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.scale_mma,
             packed_weight.in_features,
             packed_weight.out_features,
-            int(expected_m) if expected_m is not None else tokens,
+            int(expected_m) if expected_m is not None else 0,
             stream_int,
         )
         if bias is not None:
@@ -778,6 +672,23 @@ def block_fp8_linear_mxfp8(
     assert x_q_storage is not None
     assert output_storage is not None
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
+    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+        output = dense_gemm_fused_quant_a(
+            source_2d,
+            packed_weight.weight.values.reshape(
+                packed_weight.out_features,
+                packed_weight.in_features,
+                1,
+            ),
+            packed_weight.weight.scale_mma,
+            out=output_storage,
+            expected_m=expected_m,
+            sfb_k_replicated=True,
+            stream=stream,
+        )[:, :, 0]
+        if bias is not None:
+            output += bias
+        return output.view(*source.shape[:-1], packed_weight.out_features)
     x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(

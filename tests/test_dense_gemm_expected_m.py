@@ -7,15 +7,68 @@ kernel per (N,K,expected_m) be reused for all live M under frozen resolution.
 """
 from __future__ import annotations
 
-from b12x.gemm.dense import _select_default_mma_tiler_mn
+import cutlass
+import pytest
+
+import b12x.gemm.dense as dense_module
+from b12x.gemm.dense import (
+    _DenseGemmFusedQuantALaunch,
+    _DenseGemmLaunch,
+    _DenseGemmPolicy,
+    _dense_gemm_policy_for,
+    _select_default_mma_tiler_mn,
+    _select_mxfp8_tile_k,
+    _validate_mxfp8_bk64_plan,
+)
 
 SM = 188  # RTX PRO 6000 Blackwell
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
 
 
-def _tile(m, *, expected_m=None, n=WIDE_N):
+def _tile(m, *, expected_m=None, n=WIDE_N, k=None):
     return _select_default_mma_tiler_mn(
-        m, n, SM, is_mxfp8=True, expected_m=expected_m
+        m, n, SM, is_mxfp8=True, expected_m=expected_m, k=k
+    )
+
+
+def _bk64_launch(
+    *,
+    launch_type=_DenseGemmLaunch,
+    policy: _DenseGemmPolicy | None = None,
+    sfb_k_reuse: bool = True,
+) -> _DenseGemmLaunch:
+    if policy is None:
+        policy = _DenseGemmPolicy(
+            single_work_tile_per_cta=False,
+            direct_one_m_tile_scheduler=False,
+            use_m1_non_tma=False,
+            split_k_slices=1,
+            split_k_atomic_bf16=False,
+            large_m_unroll=True,
+        )
+    return launch_type(
+        n=16384,
+        k=1024,
+        l=1,
+        c_l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float8E8M0FNU,
+        c_dtype=cutlass.BFloat16,
+        alpha_dtype=cutlass.Float32,
+        sf_vec_size=32,
+        mma_k=32,
+        tile_k=64,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        policy=policy,
+        sm_count=SM,
+        sm_version="sm_120",
+        load_path="tma",
+        swap_ab=False,
+        sfb_k_reuse=sfb_k_reuse,
     )
 
 
@@ -47,6 +100,151 @@ def test_expected_m_is_independent_of_live_m():
     for em, want in ((64, (32, 128)), (1, (16, 64)), (2048, (64, 128))):
         tiles = {_tile(live_m, expected_m=em) for live_m in (1, 16, 128, 512, 4096)}
         assert tiles == {want}, (em, tiles)
+
+
+def test_dense_compile_key_separates_replicated_sfb_reuse():
+    generic_scales = _bk64_launch(sfb_k_reuse=False)
+    replicated_scales = _bk64_launch()
+
+    assert generic_scales.compile_key() != replicated_scales.compile_key()
+    assert generic_scales.compile_key()[:-1] == replicated_scales.compile_key()[:-1]
+
+
+def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
+    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", False)
+    atom_42 = _bk64_launch()
+    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", True)
+    atom_24 = _bk64_launch()
+
+    assert atom_42.compile_key() != atom_24.compile_key()
+    assert atom_42.compile_key()[-2] is False
+    assert atom_24.compile_key()[-2] is True
+
+
+def test_fused_quant_compile_key_is_distinct_and_exhaustive():
+    ordinary = _bk64_launch()
+    fused = _bk64_launch(launch_type=_DenseGemmFusedQuantALaunch)
+
+    assert fused.compile_key()[0] == "fused_quant_a"
+    assert fused.compile_key()[1:] == ordinary.compile_key()
+
+
+def test_expected_m_short_k_large_n_uses_production_bk64_plan():
+    # DSV4 TP2 q_b production supplies expected_m, so pin every compile-time
+    # choice that must match the optimized production-hinted benchmark.
+    for em in (2048, 4096, 8192):
+        for live_m in (1, 64, 4096):
+            assert _tile(
+                live_m,
+                expected_m=em,
+                n=16384,
+                k=1024,
+            ) == (128, 128)
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em) == 64
+        policy = _dense_gemm_policy_for(
+            m=64,
+            n=16384,
+            k=1024,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            sm_count=SM,
+            expected_m=em,
+        )
+        assert policy.large_m_unroll == (em >= 8192)
+
+
+def test_short_k_1024_and_2048_hints_have_stable_distinct_keys():
+    def specialization(live_m: int, expected_m: int | None):
+        tile = _tile(live_m, expected_m=expected_m, n=16384, k=1024)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, expected_m)
+        policy = _dense_gemm_policy_for(
+            m=live_m,
+            n=16384,
+            k=1024,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=tile,
+            cluster_shape_mn=(1, 1),
+            sm_count=SM,
+            expected_m=expected_m,
+        )
+        return tile, tile_k, policy
+
+    # Persistent live shapes share one specialization for a fixed hint.
+    hint_1024 = {specialization(m, 1024) for m in (16, 1024, 2048, 8192)}
+    hint_2048 = {specialization(m, 2048) for m in (16, 1024, 2048, 8192)}
+    assert len(hint_1024) == 1
+    assert len(hint_2048) == 1
+    assert next(iter(hint_1024))[:2] == ((64, 128), 128)
+    assert next(iter(hint_2048))[:2] == ((128, 128), 64)
+    assert hint_1024 != hint_2048
+
+
+def test_short_k_no_hint_does_not_cross_bk64_cache_boundary():
+    # The no-hint API promises one prefill kernel across live M. BK64 is only
+    # selected by an explicit regime hint, so crossing live M=2048 cannot cause
+    # a new tile, tile-K, or policy key under frozen resolution.
+    specializations = set()
+    for live_m in (16, 1024, 2048, 4096, 8192):
+        tile = _tile(live_m, expected_m=None, n=16384, k=1024)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, None)
+        policy = _dense_gemm_policy_for(
+            m=live_m,
+            n=16384,
+            k=1024,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=tile,
+            cluster_shape_mn=(1, 1),
+            sm_count=SM,
+            expected_m=None,
+        )
+        specializations.add((tile, tile_k, policy))
+    assert specializations == {
+        (
+            (64, 128),
+            128,
+            _DenseGemmPolicy(False, False, False, 1, False, True),
+        )
+    }
+
+
+def test_bk64_rejects_unvalidated_short_row_and_swapped_tiles():
+    _validate_mxfp8_bk64_plan(64, (128, 128), False)
+    _validate_mxfp8_bk64_plan(64, (128, 64), False)
+    _validate_mxfp8_bk64_plan(128, (64, 128), False)
+    with pytest.raises(ValueError, match="requires an unswapped 128-row tile"):
+        _validate_mxfp8_bk64_plan(64, (64, 128), False)
+    with pytest.raises(ValueError, match="requires an unswapped 128-row tile"):
+        _validate_mxfp8_bk64_plan(64, (128, 64), True)
+
+
+def test_no_hint_persistent_policy_keeps_unroll_m_independent():
+    # Public expected_m=None warms one persistent-policy kernel and reuses it
+    # across live prefill sizes. In particular, crossing M=4096 must not change
+    # the compile key solely to toggle mainloop unrolling.
+    policies = {
+        _dense_gemm_policy_for(
+            m=live_m,
+            n=1536,
+            k=128,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=(64, 64),
+            cluster_shape_mn=(1, 1),
+            sm_count=SM,
+            expected_m=None,
+        )
+        for live_m in (16, 512, 1824, 4096, 8192)
+    }
+    assert len(policies) == 1
+    assert next(iter(policies)).large_m_unroll
 
 
 def test_no_hint_preserves_graft_a_default():

@@ -465,8 +465,10 @@ def sm120_make_smem_layout_sfa(
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
     blk_mn = 128
-    blk_sf = 4
-    blk_elems = blk_mn * blk_sf
+    blk_sf = min(4, tile_shape_mnk[2] // sf_vec_size)
+    # The global scale atom always has four K groups.  A BK64 stage consumes
+    # two groups but keeps the same row pitch inside shared memory.
+    blk_elems = blk_mn * 4
     mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
 
     mn_basic_block_shape = (32, 4)
@@ -546,8 +548,9 @@ def sm120_make_smem_layout_sfb(
     """
 
     blk_mn = 128
-    blk_sf = 4
-    blk_elems = blk_mn * blk_sf
+    blk_sf = min(4, tile_shape_mnk[2] // sf_vec_size)
+    # Keep the four-group atom pitch when a BK64 stage exposes two groups.
+    blk_elems = blk_mn * 4
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 

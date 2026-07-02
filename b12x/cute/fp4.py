@@ -1097,6 +1097,25 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_shared_u16(smem_addr: Int32, value: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits of a register to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.u16 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def quantize_scaled_store_shared_v2_e4m3(
     smem_addr: Int32,
     scaled_value0: Float32,

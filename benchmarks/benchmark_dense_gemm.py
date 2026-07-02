@@ -435,6 +435,10 @@ def bench_one_fp8(
                 c_dtype="bfloat16",
                 sf_vec_size=32,
                 out=b12x_out,
+                # Match the production scaled-mm route: the graph shape is the
+                # regime hint, so 1024 stays on BK128 while 2048+ may select the
+                # separately keyed BK64 specialization.
+                expected_m=M,
             )
 
         b12x_replay = capture_graph_replay(b12x_launch)
