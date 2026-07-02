@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import pathlib
 import statistics
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
@@ -315,6 +319,21 @@ def main() -> None:
         type=int,
         default=0,
         help="benchmark-only override for paged scorer persistent CTAs",
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("none", "vllm"),
+        default="none",
+        help=(
+            "race the production SM120 DSV4 C4 indexer stack (the 'lucifer' "
+            "serving configuration): DeepGEMM sm120 fp8 MQA logits plus "
+            "vLLM's CUDA top-k, on the same cache bytes, page table, and "
+            "seqlens. Decode shapes (--page-stride > 0) race "
+            "fp8_fp4_paged_mqa_logits + torch.ops._C.persistent_topk; the "
+            "shared-page-table prefill shape races fp8_fp4_mqa_logits + "
+            "ops.top_k_per_row_prefill. Requires DeepGEMM >= nv_dev "
+            "(sm120_fp8_mqa_logits) and --output-index-space logical"
+        ),
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
@@ -629,6 +648,117 @@ def main() -> None:
             supertile_k=supertile_k,
         )
 
+    run_reference = None
+    ref_indices = None
+    if str(args.reference) == "vllm":
+        if output_physical_slots:
+            raise ValueError(
+                "--reference vllm compares logical top-k indices; drop "
+                "--output-index-space physical"
+            )
+        # The production stack, imported from the installed packages -- the
+        # same kernels the DSV4 serving build launches on SM120 for the C4
+        # indexer (FP8 cache): DeepGEMM's sm120 MQA logits + vLLM's CUDA
+        # top-k. Requires the nv_dev DeepGEMM line (PyPI 2.6.1 asserts on
+        # SM120 for the attention entry points).
+        import deep_gemm
+        import vllm  # noqa: F401  (registers torch.ops._C.persistent_topk)
+        from vllm import _custom_ops as vllm_ops
+
+        ref_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+        if not shared_page_table:
+            # vLLM decode contract: one page-table row per request, 2D
+            # (batch, next_n=1) context lens, FP8 Q (batch, next_n, heads,
+            # head_dim) with no q_scale, the indexer cache as raw uint8
+            # [num_blocks, 64, 1, 132] pages (planar [64*128 quant][64*4
+            # fp32-scale] bytes), and clean_logits=False (the top-k masks by
+            # context length).
+            num_sms = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
+            ref_context_lens = seqlens.view(rows, 1).contiguous()
+            ref_q = q_fp8.view(rows, 1, num_heads, 128)
+            ref_kv_cache = torch.as_strided(
+                index_k_cache,
+                size=(cache_num_pages, 64, 1, 132),
+                stride=(int(index_k_cache.stride(0)), 132, 132, 1),
+            )
+            ref_block_table = metadata.real_page_table.contiguous()
+            ref_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                ref_context_lens, 64, num_sms
+            )
+            # RADIX_TOPK_WORKSPACE_SIZE in vLLM's sparse_attn_indexer.
+            ref_topk_workspace = torch.zeros(
+                1024 * 1024, dtype=torch.uint8, device=device
+            )
+
+            def run_reference() -> torch.Tensor:
+                logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                    (ref_q, None),
+                    ref_kv_cache,
+                    weights,
+                    ref_context_lens,
+                    ref_block_table,
+                    ref_schedule,
+                    max_seq_len,
+                    clean_logits=False,
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    ref_context_lens,
+                    ref_indices,
+                    ref_topk_workspace,
+                    topk,
+                    max_seq_len,
+                )
+                return ref_indices
+
+        else:
+            # vLLM prefill contract: contiguous FP8 K + per-token scale
+            # (production gathers them from the paged cache with
+            # cp_gather_indexer_k_quant_cache_kernel), per-row causal
+            # [cu_seqlen_ks, cu_seqlen_ke) ranges, then topKPerRowPrefill.
+            # Unpack the SAME cache bytes the b12x kernel reads.
+            active_pages = min((max_seq_len + 63) // 64, page_table_width)
+            page_ids = metadata.real_page_table[0, :active_pages].to(torch.int64)
+            pages_u8 = index_k_cache[page_ids]  # (P, 8448) planar page bytes
+            ref_k_quant = (
+                pages_u8[:, : 64 * 128]
+                .reshape(active_pages * 64, 128)
+                .view(torch.float8_e4m3fn)
+                .contiguous()
+            )
+            ref_k_scale = (
+                pages_u8[:, 64 * 128 :]
+                .reshape(active_pages, 64, 4)
+                .view(torch.float32)
+                .reshape(active_pages * 64)
+                .contiguous()
+            )
+            ref_cu_ks = torch.zeros(rows, dtype=torch.int32, device=device)
+            ref_cu_ke = seqlens.contiguous()
+
+            def run_reference() -> torch.Tensor:
+                logits = deep_gemm.fp8_fp4_mqa_logits(
+                    (q_fp8, None),
+                    (ref_k_quant, ref_k_scale),
+                    weights,
+                    ref_cu_ks,
+                    ref_cu_ke,
+                    clean_logits=False,
+                )
+                vllm_ops.top_k_per_row_prefill(
+                    logits,
+                    ref_cu_ks,
+                    ref_cu_ke,
+                    ref_indices,
+                    rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk,
+                )
+                return ref_indices
+
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
@@ -661,6 +791,43 @@ def main() -> None:
         )
         timing_mode = "graph"
 
+    ref_summary = ""
+    if run_reference is not None:
+        assert ref_indices is not None
+        run_reference()
+        torch.cuda.synchronize()
+        # Sanity: same top-k sets modulo fp32 score ties at the boundary.
+        overlap_min = 1.0
+        for row in range(rows):
+            valid = min(topk, int(seqlens[row].item()))
+            b12x_set = set(out_indices[row][out_indices[row] >= 0].tolist())
+            ref_row = ref_indices[row][:valid]
+            ref_set = set(ref_row[ref_row >= 0].tolist())
+            denom = max(1, len(ref_set))
+            overlap_min = min(overlap_min, len(b12x_set & ref_set) / denom)
+        if overlap_min < 0.98:
+            raise AssertionError(
+                f"b12x/vllm top-k sets diverge: min row overlap {overlap_min:.4f}"
+            )
+        if args.eager:
+            ref_samples_us = _event_time_us(
+                run_reference, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
+            )
+        else:
+            ref_samples_us = _graph_time_us(
+                run_reference,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
+        ref_median_us = statistics.median(ref_samples_us)
+        ref_kind = "paged+persistent_topk" if not shared_page_table else "contig+topk_per_row"
+        ref_summary = (
+            f" ref=deepgemm_sm120({ref_kind}) ref_median_us={ref_median_us:.2f} "
+            f"b12x/ref={statistics.median(samples_us) / ref_median_us:.4f}x "
+            f"topk_overlap_min={overlap_min:.4f}"
+        )
+
     median_us = statistics.median(samples_us)
     min_us = min(samples_us)
     oracle_state = (
@@ -684,7 +851,8 @@ def main() -> None:
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
         f"scratch_mib={plan.layout.nbytes / (1024 * 1024):.2f} "
         f"output_shape={tuple(out.shape)} correctness={oracle_state} "
-        f"median_us={median_us:.2f} min_us={min_us:.2f} raw_us=[{raw_us}]"
+        f"median_us={median_us:.2f} min_us={min_us:.2f}"
+        f"{ref_summary} raw_us=[{raw_us}]"
     )
 
 

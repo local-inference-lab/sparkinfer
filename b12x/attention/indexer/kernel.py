@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -23,14 +24,21 @@ from b12x.cute.compiler import (
 )
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
+    cp_async4_shared_global,
+    cp_async_u32_shared_global,
     frag_layout_swizzle_16b_to_8b,
+    get_ptr_as_int64,
+    ld_global_v4_u32,
     ld_shared_v4_u32,
+    ldmatrix_m8n8x2_b16,
+    ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
+from cutlass import Int64
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -2682,7 +2690,37 @@ def _run_paged_tiled_logits_kernel_common(
         device_index=device_index,
         q_rows=rows,
     )
-    if supertile:
+    if supertile and _env_indexer_stream_scorer_enabled():
+        stream_ctas = _resolve_stream_scorer_ctas(
+            device_index=device_index,
+            q_rows=rows,
+        )
+        kernel = _build_sparse_nsa_paged_stream_supertile_kernel(
+            stream_ctas,
+            q_fp8.shape[1],
+            int(tile_block_q),
+            int(tile_block_k),
+            int(k_quant_bytes.stride(0)),
+            int(k_scales.stride(0)),
+        )
+        args = (
+            *common_args,
+            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            Int32(source_page_offset),
+            Int32(width_tokens),
+            _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+            current_cuda_stream(),
+        )
+        cache_key = (
+            "stream_supertile",
+            stream_ctas,
+            int(tile_block_q),
+            int(tile_block_k),
+            int(k_quant_bytes.stride(0)),
+            int(k_scales.stride(0)),
+            *common_cache_key,
+        )
+    elif supertile:
         kernel = _build_sparse_nsa_paged_supertile_kernel(
             persistent_ctas,
             q_fp8.shape[1],
@@ -2740,3 +2778,720 @@ def _run_paged_tiled_logits_kernel_common(
     logits_view._b12x_block_q = int(tile_block_q)
     logits_view._b12x_block_k = int(tile_block_k)
     return logits_view
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Streamed paged scorer (v2): persistent right-sized grid + multi-stage
+# cp.async K ring loaded straight into the ldmatrix-permuted layout.
+#
+# Replaces, for the production tiled route, the historical per-row 4xSM grid
+# whose single-stage TMA pipeline (issue -> wait -> compute per 8.4KB page)
+# and SMEM->SMEM repack left DRAM at ~15% of SOL while saturating L1TEX. The
+# ring keeps _STREAM_KV_STAGES-1 page fetches in flight (DeepGEMM
+# sm120_fp8_paged_mqa_logits idiom) and the 32-warp CTA covers a full
+# 64-token page in ONE MMA pass (the fused kernel's proven score shape), so
+# the steady state is wait_group -> MMA -> reduce with three barriers per
+# page instead of ~24.
+# ═════════════════════════════════════════════════════════════════════════════
+_STREAM_WARPS_PER_CTA = 16
+_STREAM_THREADS_PER_CTA = _WARP_THREADS * _STREAM_WARPS_PER_CTA
+_STREAM_KV_STAGES = 8
+# Four warps cooperate on one 64-token page (16 tokens per warp, DeepGEMM's
+# A=KV geometry); a 512-thread CTA therefore consumes four pages per
+# iteration, each quad ping-ponging two ring stages independently.
+_STREAM_WARPS_PER_PAGE = 4
+_STREAM_PAGES_PER_ITER = _STREAM_WARPS_PER_CTA // _STREAM_WARPS_PER_PAGE
+_STREAM_TOKENS_PER_WARP = _PAGE_SIZE // _STREAM_WARPS_PER_PAGE
+_INDEXER_STREAM_SCORER_ENV = "B12X_INDEXER_STREAM_SCORER"
+
+
+def _env_indexer_stream_scorer_enabled() -> bool:
+    raw = os.environ.get(_INDEXER_STREAM_SCORER_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _resolve_stream_scorer_ctas(*, device_index: int, q_rows: int) -> int:
+    """One wave of 1024-thread CTAs (1 CTA/SM) split evenly across rows."""
+    num_sms = int(
+        torch.cuda.get_device_properties(device_index).multi_processor_count
+    )
+    rows = max(1, int(q_rows))
+    return max(1, (num_sms + rows - 1) // rows)
+
+
+@lru_cache(maxsize=None)
+def _paged_stream_indexer_shared_storage_cls(
+    padded_q_heads: int,
+    tokens_per_work: int,
+    num_q_head_tiles: int,
+):
+    class SharedStorage:
+        pass
+
+    SharedStorage.__annotations__ = {
+        "q_bytes": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(padded_q_heads) * _INDEX_HEAD_DIM],
+            16,
+        ],
+        "weights": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, int(padded_q_heads)],
+            16,
+        ],
+        # _STREAM_KV_STAGES ldmatrix-permuted K pages (cp.async ring).
+        "k_perm_ring": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Uint8, _STREAM_KV_STAGES * _PAGE_SIZE * _INDEX_HEAD_DIM
+            ],
+            1024,
+        ],
+        "scales_ring": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _STREAM_KV_STAGES * _PAGE_SIZE],
+            16,
+        ],
+    }
+    return cute.struct(SharedStorage)
+
+
+@cute.jit
+def _stage_q_permuted(
+    q_bytes: cute.Tensor,      # (rows, heads, 128) uint8
+    q_idx: Int32,
+    num_heads: Int32,
+    q_perm_base_addr: Int32,
+    tx: Int32,
+    q_row_stride_bytes: Int64,
+    *,
+    padded_q_heads: cutlass.Constexpr,
+    stage_threads: cutlass.Constexpr = _STREAM_THREADS_PER_CTA,
+):
+    """Stage Q into per-head-tile XOR-permuted 16B granules (ldmatrix layout).
+
+    Head-tile t occupies a 2KB block (16 head rows x 8 vec16), swizzled with
+    the same `_permuted_offset_128b` pattern as the K pages, so the score core
+    can ldmatrix.x4 the Q operand instead of gathering 64 bytes per fragment.
+    Heads past num_heads stage zeros (same padding contract as the linear
+    staging).
+    """
+    linear = tx
+    total = Int32(int(padded_q_heads) * (_INDEX_HEAD_DIM // 16))
+    while linear < total:
+        head_idx = linear // Int32(_INDEX_HEAD_DIM // 16)
+        vec_idx = linear - head_idx * Int32(_INDEX_HEAD_DIM // 16)
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        if head_idx < num_heads:
+            v0, v1, v2, v3 = ld_global_v4_u32(
+                get_ptr_as_int64(
+                    q_bytes,
+                    Int64(q_idx) * q_row_stride_bytes
+                    + Int64(head_idx) * Int64(_INDEX_HEAD_DIM)
+                    + Int64(vec_idx) * Int64(16),
+                )
+            )
+        tile_idx = head_idx // Int32(_PAGED_Q_HEAD_TILE)
+        row_in_tile = head_idx - tile_idx * Int32(_PAGED_Q_HEAD_TILE)
+        tile_base = q_perm_base_addr + tile_idx * Int32(
+            _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
+        )
+        dst_addr = _smem_addr_from_b128_offset(
+            tile_base,
+            _permuted_offset_128b(
+                row_in_tile, vec_idx, Int32(_INDEX_HEAD_DIM // 16)
+            ),
+        )
+        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(stage_threads)
+
+
+@cute.jit
+def _compute_mxfp8_tile_partials_qldm(
+    q_perm_base_addr: Int32,
+    s_w: cute.Tensor,
+    num_heads: Int32,
+    k_perm_base_addr: Int32,
+    token_base: Int32,
+    head_tile_base: Int32,
+    head_tile_slot: Int32,
+    lane: Int32,
+    s_partial_logits: cute.Tensor,
+    partial_row_base: Int32,
+    partial_col: Int32,
+    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.NSA_RELU_SUM,
+):
+    """Score core with BOTH operands ldmatrix-loaded from permuted smem.
+
+    Byte-identical math to `_compute_mxfp8_tile_partials`: the manual
+    `_pack_q_mxfp8_reg` byte gather (64 single-byte smem loads + shifts per
+    warp per page) is replaced by one ldmatrix.x4 + the standard 16b->8b
+    fragment swizzle per 32-dim step, which reproduces exactly the
+    {2t, 2t+1, 2t+8, 2t+9} per-lane byte pattern the MMA expects.
+    """
+    group_id = lane // Int32(4)
+    thread_id_in_group = lane % Int32(4)
+    q0_acc = Float32(0.0)
+    q1_acc = Float32(0.0)
+    q2_acc = Float32(0.0)
+    q3_acc = Float32(0.0)
+    q_tile_base = q_perm_base_addr + head_tile_slot * Int32(
+        _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
+    )
+    q_row = lane & Int32(15)
+    q_half = lane >> Int32(4)
+    k_offset = _permuted_offset_128b(
+        token_base + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
+        (lane % Int32(16)) // Int32(8),
+        Int32(_INDEX_HEAD_DIM // 16),
+    )
+    for mma_pair in cutlass.range_constexpr(_INDEX_HEAD_DIM // 32):
+        q_vec = Int32(2 * mma_pair) + q_half
+        q_addr = _smem_addr_from_b128_offset(
+            q_tile_base,
+            _permuted_offset_128b(q_row, q_vec, Int32(_INDEX_HEAD_DIM // 16)),
+        )
+        # RAW b16 ldmatrix order on BOTH operands: the fp8 MMA's K reduction is
+        # permutation-invariant as long as A and B agree, so the historical
+        # 16b->8b fragment swizzles (2 shuffles + 2 byte-perms each, x6 per
+        # pair) are unnecessary. DeepGEMM's sm120 fp8_mma uses the same raw
+        # convention.
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_addr)
+        # One x4 yields both K halves for this warp's 8 tokens as matrices
+        # 0 and 1 (lanes 0-7 / 8-15 address token rows 0-7 at halves 0/1);
+        # the historical left+right pair issued TWO x4 loads and kept one
+        # matrix from each.
+        b0_k0, b0_k1, _bk2, _bk3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(k_perm_base_addr, k_offset)
+        )
+        k_offset_cur = _advance_offset_by_row_128b(
+            k_offset,
+            Int32(16),
+            Int32(_INDEX_HEAD_DIM // 16),
+        )
+        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+            q0_acc,
+            q1_acc,
+            q2_acc,
+            q3_acc,
+            a0,
+            a1,
+            a2,
+            a3,
+            b0_k0,
+            b0_k1,
+            Uint32(0x7F7F7F7F),
+            Uint32(0x7F7F7F7F),
+        )
+        q0_acc = d0
+        q1_acc = d1
+        q2_acc = d2
+        q3_acc = d3
+        k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
+            16 * (_INDEX_HEAD_DIM // 16)
+        )
+
+    head0 = head_tile_base + group_id
+    head1 = head0 + Int32(8)
+    w0 = Float32(0.0)
+    w1 = Float32(0.0)
+    if head0 < num_heads:
+        w0 = Float32(s_w[head0])
+    if head1 < num_heads:
+        w1 = Float32(s_w[head1])
+    col0 = thread_id_in_group * Int32(2)
+    col1 = col0 + Int32(1)
+    if cutlass.const_expr(score_mode == IndexerScoreMode.MSA_BILINEAR):
+        partial0 = Float32(q0_acc * w0)
+        partial0 = Float32(partial0 + q2_acc * w1)
+        partial1 = Float32(q1_acc * w0)
+        partial1 = Float32(partial1 + q3_acc * w1)
+    else:
+        partial0 = Float32(attention_ops.fmax(q0_acc, Float32(0.0)) * w0)
+        partial0 = Float32(partial0 + attention_ops.fmax(q2_acc, Float32(0.0)) * w1)
+        partial1 = Float32(attention_ops.fmax(q1_acc, Float32(0.0)) * w0)
+        partial1 = Float32(partial1 + attention_ops.fmax(q3_acc, Float32(0.0)) * w1)
+    partial0 = _reduce_column_pair_sum(partial0)
+    partial1 = _reduce_column_pair_sum(partial1)
+    if group_id == Int32(0):
+        s_partial_logits[partial_row_base + col0, partial_col] = partial0
+        s_partial_logits[partial_row_base + col1, partial_col] = partial1
+
+
+@cute.jit
+def _stream_issue_k_page_cp_async(
+    k_quant_bytes: cute.Tensor,   # (pages, 64, 128) uint8 view of the packed cache
+    k_scales: cute.Tensor,        # (pages, 64) float32 view of the packed cache
+    page_id: Int32,
+    k_ring_base_addr: Int32,
+    scales_ring_base_addr: Int32,
+    stage: Int32,
+    tx: Int32,
+    *,
+    k_quant_page_stride: cutlass.Constexpr,   # dim-0 BYTE stride (8448 packed)
+    k_scales_row_stride: cutlass.Constexpr,   # dim-0 ELEMENT stride (2112 packed)
+    issue_threads: cutlass.Constexpr = _STREAM_THREADS_PER_CTA,
+):
+    """Async global->shared page fetch straight into the permuted layout.
+
+    16B `cp.async.cg` granules use the same XOR-swizzled destination as the
+    fused kernel's synchronous `_load_permute_k_page_g2s`, so the MMA-side
+    addressing is unchanged; the copy is simply asynchronous and ring-staged.
+    The caller commits the group.
+    """
+    stage_k_base = k_ring_base_addr + stage * Int32(_PAGE_SIZE * _INDEX_HEAD_DIM)
+    page_elem_base = Int64(page_id) * Int64(k_quant_page_stride)
+    linear = tx
+    total = Int32(_PAGE_SIZE * (_INDEX_HEAD_DIM // 16))
+    while linear < total:
+        row = linear // Int32(_INDEX_HEAD_DIM // 16)
+        vec_idx = linear - row * Int32(_INDEX_HEAD_DIM // 16)
+        g_addr = get_ptr_as_int64(
+            k_quant_bytes,
+            page_elem_base
+            + Int64(row) * Int64(_INDEX_HEAD_DIM)
+            + Int64(vec_idx) * Int64(16),
+        )
+        dst_addr = _smem_addr_from_b128_offset(
+            stage_k_base,
+            _permuted_offset_128b(row, vec_idx, Int32(_INDEX_HEAD_DIM // 16)),
+        )
+        cp_async4_shared_global(dst_addr, g_addr)
+        linear += Int32(issue_threads)
+    if tx < Int32(_PAGE_SIZE):
+        s_addr = (
+            scales_ring_base_addr
+            + (stage * Int32(_PAGE_SIZE) + tx) * Int32(4)
+        )
+        g_addr = get_ptr_as_int64(
+            k_scales,
+            Int64(page_id) * Int64(k_scales_row_stride) + Int64(tx),
+        )
+        cp_async_u32_shared_global(s_addr, g_addr)
+
+
+class SparseNSAPagedStreamLogitsKernel:
+    """Persistent streamed paged scorer (tiled-output supertile contract)."""
+
+    def __init__(
+        self,
+        persistent_ctas: int,
+        num_heads_static: int,
+        *,
+        tile_block_q: int = _PAGED_TILED_BLOCK_Q,
+        tile_block_k: int = _PAGED_TILED_BLOCK_K,
+        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        k_quant_page_stride: int,
+        k_scales_row_stride: int,
+    ):
+        self.persistent_ctas = int(persistent_ctas)
+        self.num_heads_static = int(num_heads_static)
+        self.tile_block_q = int(tile_block_q)
+        self.tile_block_k = int(tile_block_k)
+        self.score_mode = int(score_mode)
+        self.k_quant_page_stride = int(k_quant_page_stride)
+        self.k_scales_row_stride = int(k_scales_row_stride)
+        if self.tile_block_k != _PAGED_TILED_BLOCK_K:
+            raise ValueError(
+                f"stream paged logits require block_k={_PAGED_TILED_BLOCK_K}, "
+                f"got {self.tile_block_k}"
+            )
+        self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
+        if self.num_q_head_tiles not in (1, 2, 4):
+            raise ValueError(
+                "stream paged logits kernel only supports 1/2/4 head tiles, "
+                f"got {self.num_q_head_tiles}"
+            )
+        self.padded_q_heads = self.num_q_head_tiles * _PAGED_Q_HEAD_TILE
+        # DeepGEMM A=KV geometry: a warp owns 16 tokens and loops every 8-head
+        # B tile in registers, so a warp quad covers one 64-token page and the
+        # CTA consumes _STREAM_PAGES_PER_ITER pages per iteration.
+        self.tokens_per_work = _PAGE_SIZE
+        self.num_b_head_tiles = (self.num_heads_static + 7) // 8
+
+    def _get_shared_storage_cls(self):
+        return _paged_stream_indexer_shared_storage_cls(
+            self.padded_q_heads,
+            self.tokens_per_work,
+            self.num_q_head_tiles,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,      # unused (ABI parity, kept)
+        use_scalar_k_load: cute.Tensor,    # unused (single cp.async path)
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        active_width: cute.Tensor,
+        source_page_offset: Int32,
+        output_width_tokens: Int32,
+        logits_out: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        SharedStorage = self._get_shared_storage_cls()
+        self.kernel(
+            q_bytes,
+            weights,
+            k_quant_bytes,
+            k_scales,
+            real_page_table,
+            seqlens_per_query,
+            active_width,
+            source_page_offset,
+            output_width_tokens,
+            logits_out,
+        ).launch(
+            grid=(q_bytes.shape[0], self.persistent_ctas, 1),
+            block=[_STREAM_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        active_width: cute.Tensor,
+        source_page_offset: Int32,
+        output_width_tokens: Int32,
+        logits_out: cute.Tensor,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        q_idx, cta_idx, _ = cute.arch.block_idx()
+        lane = tx % Int32(_WARP_THREADS)
+        warp_idx = tx // Int32(_WARP_THREADS)
+
+        smem = cutlass.utils.SmemAllocator()
+        SharedStorage = self._get_shared_storage_cls()
+
+        # ── live width / seqlen clamps (identical to the historical scorer) ──
+        source_width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
+        source_offset_pages = source_page_offset
+        if source_offset_pages < Int32(0):
+            source_offset_pages = Int32(0)
+        source_offset_tokens = source_offset_pages * Int32(_PAGE_SIZE)
+        remaining_width_tokens = source_width_tokens - source_offset_tokens
+        if remaining_width_tokens < Int32(0):
+            remaining_width_tokens = Int32(0)
+
+        width_tokens = output_width_tokens
+        if width_tokens <= Int32(0):
+            width_tokens = remaining_width_tokens
+        valid_width_tokens = width_tokens
+        if valid_width_tokens > remaining_width_tokens:
+            valid_width_tokens = remaining_width_tokens
+
+        live_width = Int32(active_width[Int32(0)])
+        if live_width > source_width_tokens:
+            live_width = source_width_tokens
+        live_width = live_width - source_offset_tokens
+        if live_width < Int32(0):
+            live_width = Int32(0)
+        if live_width > valid_width_tokens:
+            live_width = valid_width_tokens
+
+        seq_len = Int32(seqlens_per_query[q_idx]) - source_offset_tokens
+        if seq_len < Int32(0):
+            seq_len = Int32(0)
+        if seq_len > live_width:
+            seq_len = live_width
+        total_work = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
+
+        storage = smem.allocate(SharedStorage)
+        s_w = storage.weights.get_tensor(
+            cute.make_layout((self.padded_q_heads,), stride=(1,))
+        )
+        k_ring_base_addr = shared_ptr_to_u32(storage.k_perm_ring.data_ptr())
+        scales_ring_base_addr = shared_ptr_to_u32(storage.scales_ring.data_ptr())
+        q_perm_base_addr = shared_ptr_to_u32(storage.q_bytes.data_ptr())
+        s_scales_ring = storage.scales_ring.get_tensor(
+            cute.make_layout((_STREAM_KV_STAGES * _PAGE_SIZE,), stride=(1,))
+        )
+
+        if cta_idx < total_work:
+            num_heads = Int32(self.num_heads_static)
+            _stage_q_permuted(
+                q_bytes,
+                q_idx,
+                num_heads,
+                q_perm_base_addr,
+                tx,
+                Int64(q_bytes.shape[1]) * Int64(_INDEX_HEAD_DIM),
+                padded_q_heads=self.padded_q_heads,
+            )
+            w_linear = tx
+            while w_linear < Int32(self.padded_q_heads):
+                s_w[w_linear] = (
+                    Float32(weights[q_idx, w_linear])
+                    if w_linear < num_heads
+                    else Float32(0.0)
+                )
+                w_linear += Int32(_STREAM_THREADS_PER_CTA)
+
+            # ── v3 geometry: warp quad per page, warp per 16 tokens ──
+            quad = warp_idx // Int32(_STREAM_WARPS_PER_PAGE)
+            warp_in_quad = warp_idx % Int32(_STREAM_WARPS_PER_PAGE)
+            tx_in_quad = tx % Int32(
+                _WARP_THREADS * _STREAM_WARPS_PER_PAGE
+            )
+            token_base_w = warp_in_quad * Int32(_STREAM_TOKENS_PER_WARP)
+            g = lane // Int32(4)
+            t = lane % Int32(4)
+
+            ctas_stride = Int32(self.persistent_ctas)
+            # This CTA's page count and iteration count (uniform across CTA).
+            n_pages_cta = (
+                total_work - Int32(cta_idx) + ctas_stride - Int32(1)
+            ) // ctas_stride
+            n_iters = (
+                n_pages_cta + Int32(_STREAM_PAGES_PER_ITER - 1)
+            ) // Int32(_STREAM_PAGES_PER_ITER)
+
+            # Q staging must be visible before B-fragment loads.
+            cute.arch.sync_threads()
+
+            # ── prologue: each quad prefetches its first page (stage=quad) ──
+            j0 = quad
+            if j0 < n_pages_cta:
+                work0 = Int32(cta_idx) + j0 * ctas_stride
+                src_col0 = source_offset_pages + work0
+                if (work0 * Int32(_PAGE_SIZE) < seq_len) & (
+                    src_col0 < Int32(real_page_table.shape[1])
+                ):
+                    page_id0 = Int32(real_page_table[q_idx, src_col0])
+                    if page_id0 >= Int32(0):
+                        _stream_issue_k_page_cp_async(
+                            k_quant_bytes,
+                            k_scales,
+                            page_id0,
+                            k_ring_base_addr,
+                            scales_ring_base_addr,
+                            quad,
+                            tx_in_quad,
+                            k_quant_page_stride=self.k_quant_page_stride,
+                            k_scales_row_stride=self.k_scales_row_stride,
+                            issue_threads=_WARP_THREADS * _STREAM_WARPS_PER_PAGE,
+                        )
+            cute.arch.cp_async_commit_group()
+
+            it = Int32(0)
+            while it < n_iters:
+                j = it * Int32(_STREAM_PAGES_PER_ITER) + quad
+                # ping-pong stage for this quad: quad or quad + PAGES_PER_ITER
+                stage = quad + (it % Int32(2)) * Int32(_STREAM_PAGES_PER_ITER)
+                next_stage = quad + ((it + Int32(1)) % Int32(2)) * Int32(
+                    _STREAM_PAGES_PER_ITER
+                )
+
+                # Issue the quad's NEXT page into the other stage, then wait
+                # for the current one (1 group lookahead per quad).
+                j_next = j + Int32(_STREAM_PAGES_PER_ITER)
+                if j_next < n_pages_cta:
+                    work_n = Int32(cta_idx) + j_next * ctas_stride
+                    src_col_n = source_offset_pages + work_n
+                    if (work_n * Int32(_PAGE_SIZE) < seq_len) & (
+                        src_col_n < Int32(real_page_table.shape[1])
+                    ):
+                        page_id_n = Int32(real_page_table[q_idx, src_col_n])
+                        if page_id_n >= Int32(0):
+                            _stream_issue_k_page_cp_async(
+                                k_quant_bytes,
+                                k_scales,
+                                page_id_n,
+                                k_ring_base_addr,
+                                scales_ring_base_addr,
+                                next_stage,
+                                tx_in_quad,
+                                k_quant_page_stride=self.k_quant_page_stride,
+                                k_scales_row_stride=self.k_scales_row_stride,
+                                issue_threads=_WARP_THREADS
+                                * _STREAM_WARPS_PER_PAGE,
+                            )
+                cute.arch.cp_async_commit_group()
+                # Current page landed (own-thread groups: <=1 pending).
+                cute.arch.cp_async_wait_group(1)
+                cute.arch.sync_threads()
+
+                consume = Int32(0)
+                work = Int32(cta_idx) + j * ctas_stride
+                page_base = work * Int32(_PAGE_SIZE)
+                if j < n_pages_cta:
+                    src_col = source_offset_pages + work
+                    if (page_base < seq_len) & (
+                        src_col < Int32(real_page_table.shape[1])
+                    ):
+                        if Int32(real_page_table[q_idx, src_col]) >= Int32(0):
+                            consume = Int32(1)
+                if consume != Int32(0):
+                    valid_slots = seq_len - page_base
+                    if valid_slots > Int32(_PAGE_SIZE):
+                        valid_slots = Int32(_PAGE_SIZE)
+                    stage_k_base = k_ring_base_addr + stage * Int32(
+                        _PAGE_SIZE * _INDEX_HEAD_DIM
+                    )
+
+                    # Hoist the warp's A (K-token) fragments: 16 tokens x 128
+                    # dims as 4 k-step x4 fragments, reused across all B head
+                    # tiles.
+                    a_row = token_base_w + (lane & Int32(15))
+                    a_half = lane >> Int32(4)
+                    ak = cute.make_rmem_tensor(16, Uint32)
+                    for kk in cutlass.range_constexpr(4):
+                        a_addr = _smem_addr_from_b128_offset(
+                            stage_k_base,
+                            _permuted_offset_128b(
+                                a_row,
+                                Int32(2 * kk) + a_half,
+                                Int32(_INDEX_HEAD_DIM // 16),
+                            ),
+                        )
+                        aa0, aa1, aa2, aa3 = ldmatrix_m8n8x4_b16(a_addr)
+                        ak[kk * 4 + 0] = aa0
+                        ak[kk * 4 + 1] = aa1
+                        ak[kk * 4 + 2] = aa2
+                        ak[kk * 4 + 3] = aa3
+
+                    partial0 = Float32(0.0)
+                    partial1 = Float32(0.0)
+                    b_row = lane & Int32(7)
+                    b_half = (lane >> Int32(3)) & Int32(1)
+                    for nt in cutlass.range_constexpr(2 * self.num_q_head_tiles):
+                        if cutlass.const_expr(True):
+                            d0 = Float32(0.0)
+                            d1 = Float32(0.0)
+                            d2 = Float32(0.0)
+                            d3 = Float32(0.0)
+                            tile16 = nt // 2
+                            row_in_tile = Int32((nt % 2) * 8) + b_row
+                            q_tile_base = q_perm_base_addr + Int32(
+                                tile16 * _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
+                            )
+                            for kk in cutlass.range_constexpr(4):
+                                b_addr = _smem_addr_from_b128_offset(
+                                    q_tile_base,
+                                    _permuted_offset_128b(
+                                        row_in_tile,
+                                        Int32(2 * kk) + b_half,
+                                        Int32(_INDEX_HEAD_DIM // 16),
+                                    ),
+                                )
+                                b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
+                                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                    d0,
+                                    d1,
+                                    d2,
+                                    d3,
+                                    ak[kk * 4 + 0],
+                                    ak[kk * 4 + 1],
+                                    ak[kk * 4 + 2],
+                                    ak[kk * 4 + 3],
+                                    b0,
+                                    b1,
+                                    Uint32(0x7F7F7F7F),
+                                    Uint32(0x7F7F7F7F),
+                                )
+                            h0 = Int32(nt * 8) + t * Int32(2)
+                            h1 = h0 + Int32(1)
+                            w0 = Float32(0.0)
+                            w1 = Float32(0.0)
+                            if h0 < num_heads:
+                                w0 = Float32(s_w[h0])
+                            if h1 < num_heads:
+                                w1 = Float32(s_w[h1])
+                            if cutlass.const_expr(
+                                self.score_mode == IndexerScoreMode.MSA_BILINEAR
+                            ):
+                                partial0 = Float32(partial0 + d0 * w0 + d1 * w1)
+                                partial1 = Float32(partial1 + d2 * w0 + d3 * w1)
+                            else:
+                                partial0 = Float32(
+                                    partial0
+                                    + attention_ops.fmax(d0, Float32(0.0)) * w0
+                                    + attention_ops.fmax(d1, Float32(0.0)) * w1
+                                )
+                                partial1 = Float32(
+                                    partial1
+                                    + attention_ops.fmax(d2, Float32(0.0)) * w0
+                                    + attention_ops.fmax(d3, Float32(0.0)) * w1
+                                )
+
+                    # Quad-lane (t) reduction: sum head-column pairs.
+                    for off in cutlass.range_constexpr(2):
+                        partial0 = partial0 + cute.arch.shuffle_sync_bfly(
+                            partial0, offset=1 << off
+                        )
+                        partial1 = partial1 + cute.arch.shuffle_sync_bfly(
+                            partial1, offset=1 << off
+                        )
+
+                    if t == Int32(0):
+                        tile_block_q = Int32(self.tile_block_q)
+                        tile_block_k = Int32(self.tile_block_k)
+                        tile_size = Int32(self.tile_block_q * self.tile_block_k)
+                        num_k_tiles = (
+                            width_tokens + tile_block_k - Int32(1)
+                        ) // tile_block_k
+                        q_tile_idx = q_idx // tile_block_q
+                        q_local = q_idx - q_tile_idx * tile_block_q
+                        k_tile_idx = page_base // tile_block_k
+                        row_flat_base = (
+                            q_tile_idx * num_k_tiles * tile_size
+                            + k_tile_idx * tile_size
+                            + q_local * tile_block_k
+                            + page_base
+                            - k_tile_idx * tile_block_k
+                        )
+                        slot0 = token_base_w + g
+                        if slot0 < valid_slots:
+                            logits_out[row_flat_base + slot0] = Float32(
+                                partial0
+                                * s_scales_ring[
+                                    stage * Int32(_PAGE_SIZE) + slot0
+                                ]
+                            )
+                        slot1 = slot0 + Int32(8)
+                        if slot1 < valid_slots:
+                            logits_out[row_flat_base + slot1] = Float32(
+                                partial1
+                                * s_scales_ring[
+                                    stage * Int32(_PAGE_SIZE) + slot1
+                                ]
+                            )
+                # Ring safety: all quad threads finished reading this stage
+                # before the NEXT iteration's issue targets it again (the
+                # next issue writes next_stage of it+1 == stage of it).
+                cute.arch.sync_threads()
+                it += Int32(1)
+
+
+@lru_cache(maxsize=None)
+def _build_sparse_nsa_paged_stream_supertile_kernel(
+    persistent_ctas: int,
+    num_heads_static: int,
+    tile_block_q: int,
+    tile_block_k: int,
+    k_quant_page_stride: int,
+    k_scales_row_stride: int,
+    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+) -> SparseNSAPagedStreamLogitsKernel:
+    return SparseNSAPagedStreamLogitsKernel(
+        persistent_ctas,
+        num_heads_static,
+        tile_block_q=tile_block_q,
+        tile_block_k=tile_block_k,
+        score_mode=score_mode,
+        k_quant_page_stride=k_quant_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
+    )
+

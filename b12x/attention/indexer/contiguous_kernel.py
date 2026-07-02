@@ -29,6 +29,7 @@ from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
     ld_shared_v4_u32,
+    ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -847,27 +848,36 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
+        # RAW fragment order on BOTH operands: each Q fragment register is one
+        # aligned u32 read (bytes {4t..4t+3} of the k-half), so the byte
+        # gather + shift chain and the K-side 16b->8b swizzles both vanish.
         group_id = lane // Int32(4)
         thread_id_in_group = lane % Int32(4)
-        col_base = Int32(mma_pair * 32) + thread_id_in_group * Int32(2)
+        u32_lo = Int32(mma_pair * 8) + thread_id_in_group
+        u32_hi = u32_lo + Int32(4)
         for mma_q in cutlass.range_constexpr(num_mma_q):
             row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
             abs_row_0 = q_tile_base + row_base_q + group_id
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_global(
-                q_u32, head_idx, abs_row_0, col_base, valid_q_rows
+            abs_row_8 = abs_row_0 + Int32(8)
+            q_regs[mma_q, 0] = (
+                Uint32(q_u32[abs_row_0, head_idx, u32_lo])
+                if abs_row_0 < valid_q_rows
+                else Uint32(0)
             )
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_global(
-                q_u32, head_idx, abs_row_0 + Int32(8), col_base, valid_q_rows
+            q_regs[mma_q, 1] = (
+                Uint32(q_u32[abs_row_8, head_idx, u32_lo])
+                if abs_row_8 < valid_q_rows
+                else Uint32(0)
             )
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_global(
-                q_u32, head_idx, abs_row_0, col_base + Int32(16), valid_q_rows
+            q_regs[mma_q, 2] = (
+                Uint32(q_u32[abs_row_0, head_idx, u32_hi])
+                if abs_row_0 < valid_q_rows
+                else Uint32(0)
             )
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_global(
-                q_u32,
-                head_idx,
-                abs_row_0 + Int32(8),
-                col_base + Int32(16),
-                valid_q_rows,
+            q_regs[mma_q, 3] = (
+                Uint32(q_u32[abs_row_8, head_idx, u32_hi])
+                if abs_row_8 < valid_q_rows
+                else Uint32(0)
             )
 
         k_offset_cur = k_offset
@@ -878,10 +888,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
                 _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
             )
-            b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
-            b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
-            b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
-            b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
             k_offset_cur = _advance_offset_by_row_128b(
                 k_offset_cur, Int32(16), upcast_stride_k
             )
@@ -1391,30 +1397,30 @@ def _prefill_qk_mma_from_smem_q(
         (lane % Int32(16)) // Int32(8),
         upcast_stride_k,
     )
+    q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
     for mma_pair in cutlass.range_constexpr(num_mma_d_qk // 2):
         q_regs = cute.make_rmem_tensor(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
-        group_id = lane // Int32(4)
-        thread_id_in_group = lane % Int32(4)
-        col_base = Int32(mma_pair * 32) + thread_id_in_group * Int32(2)
+        # RAW fragment order on BOTH operands (see the paged stream scorer):
+        # Q comes straight off ldmatrix.x4 over the permuted Q stage (one
+        # instruction per 16-row tile instead of four 16B-load+extract packs),
+        # and the K halves skip the 16b->8b fragment swizzles entirely.
+        q_row_in_tile = lane & Int32(15)
+        q_half = lane >> Int32(4)
         for mma_q in cutlass.range_constexpr(num_mma_q):
             row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
-            row_local_0 = row_base_q + group_id
-            row_local_8 = row_local_0 + Int32(8)
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_smem_ptr(
-                q_smem_base, row_local_0, col_base
-            )
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_smem_ptr(
-                q_smem_base, row_local_8, col_base
-            )
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_smem_ptr(
-                q_smem_base, row_local_0, col_base + Int32(16)
-            )
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_smem_ptr(
-                q_smem_base, row_local_8, col_base + Int32(16)
-            )
+            q_addr = q_smem_base + _permuted_offset_128b(
+                row_base_q + q_row_in_tile,
+                Int32(2 * mma_pair) + q_half,
+                q_rs,
+            ) * Int32(16)
+            qa0, qa1, qa2, qa3 = ldmatrix_m8n8x4_b16(q_addr)
+            q_regs[mma_q, 0] = qa0
+            q_regs[mma_q, 1] = qa1
+            q_regs[mma_q, 2] = qa2
+            q_regs[mma_q, 3] = qa3
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -1424,10 +1430,6 @@ def _prefill_qk_mma_from_smem_q(
             b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
                 _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
             )
-            b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
-            b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
-            b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
-            b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
             k_offset_cur = _advance_offset_by_row_128b(
                 k_offset_cur, Int32(16), upcast_stride_k
             )

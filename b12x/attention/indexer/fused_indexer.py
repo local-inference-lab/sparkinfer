@@ -62,7 +62,9 @@ from b12x.attention.indexer.tiled_topk import (
     _smem_st,
     _smem_xadd,
 )
+from b12x.cute.fp4 import ld_shared_f32
 from b12x.attention.indexer.kernel import (
+    _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
     _PAGE_SIZE,
     _PAGED_Q_HEAD_TILE,
@@ -71,6 +73,8 @@ from b12x.attention.indexer.kernel import (
     _PAGED_WARPS_PER_CTA,
     _WARP_THREADS,
     _compute_mxfp8_tile_partials,
+    _compute_mxfp8_tile_partials_qldm,
+    _stage_q_permuted,
     _load_index_k_page_scalar,
     _num_q_head_tiles,
     _permuted_offset_128b,
@@ -548,6 +552,10 @@ def _fused_indexer_shared_storage_cls(
         "k_page": _u8_page(),
         "k_page_perm": _u8_page(),
         "scales": _f32(_PAGE_SIZE),
+        # Second per-page scale slot: the paged branch ping-pongs K between
+        # k_page_perm (stage 0) and k_page (stage 1, otherwise unused there),
+        # so the scale staging needs a matching second buffer.
+        "scales2": _f32(_PAGE_SIZE),
         "partial_logits": _f32(int(tokens_per_work) * int(num_q_head_tiles)),
         # --- radix scratch (mirror tiled_topk SharedStorage) ---
         "hist0": _i32(384),
@@ -953,6 +961,9 @@ class SparseNSAFusedIndexerKernel:
         # scales so its real page stride is 8448 -- run_fused_paged_indexer passes
         # k_quant_bytes.stride(0) so the load reads the correct page.
         self.k_quant_page_stride = int(k_quant_page_stride)
+        # dim-0 ELEMENT stride of the (pages, 64) f32 scales view: the packed
+        # cache interleaves per-page scales, so it equals page_stride/4.
+        self.k_scales_row_stride = int(k_quant_page_stride) // 4
         if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
@@ -1161,29 +1172,19 @@ class SparseNSAFusedIndexerKernel:
         # Stage q + weights with all 1024 threads (paid once per CTA; the
         # 128-thread version was 64 sequential byte rounds, costly at short K
         # where per-CTA work is small and CTAs are many).
-        if cutlass.const_expr(self.vectorized_q_load):
-            _load_q_bytes_g2s_v4(
-                q_bytes,
-                q_idx,
-                Int64(self.q_row_stride_bytes),
-                self.num_heads_static * _INDEX_HEAD_DIM,
-                self.padded_q_heads * _INDEX_HEAD_DIM,
-                q_smem_base_addr,
-                tx,
-                Int32(_RADIX_THREADS),
-            )
-        else:
-            q_linear = tx
-            total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
-            while q_linear < total_q_bytes:
-                head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
-                col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
-                s_q[head_idx, col_idx] = (
-                    q_bytes[q_idx, head_idx, col_idx]
-                    if head_idx < num_heads
-                    else cutlass.Uint8(0)
-                )
-                q_linear += Int32(_RADIX_THREADS)
+        # Q staged straight into the ldmatrix-permuted per-head-tile layout so
+        # the score core consumes raw fragments on BOTH operands (no byte
+        # packs, no 16b->8b fragment swizzles).
+        _stage_q_permuted(
+            q_bytes,
+            q_idx,
+            num_heads,
+            q_smem_base_addr,
+            tx,
+            Int64(self.q_row_stride_bytes),
+            padded_q_heads=self.padded_q_heads,
+            stage_threads=_RADIX_THREADS,
+        )
         w_linear = tx
         while w_linear < Int32(self.padded_q_heads):
             s_w[w_linear] = (
@@ -1196,6 +1197,31 @@ class SparseNSAFusedIndexerKernel:
         token_group = warp_idx // Int32(self.num_q_head_tiles)
 
         carry_count = Int32(0)
+        # Paged-branch cp.async ping-pong: K alternates between k_page_perm
+        # (stage 0) and k_page (stage 1 -- unused as linear staging on the
+        # paged path); scales alternate scales/scales2. One page of lookahead.
+        scales_base_addr = shared_ptr_to_u32(storage.scales.data_ptr())
+        scales2_base_addr = shared_ptr_to_u32(storage.scales2.data_ptr())
+        pipe_stage = Int32(0)
+        if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+            if page_start < page_end:
+                pid0 = Int32(-1)
+                if page_start < Int32(real_page_table.shape[1]):
+                    pid0 = Int32(real_page_table[q_idx, page_start])
+                if pid0 >= Int32(0):
+                    _stream_issue_k_page_cp_async(
+                        k_quant_bytes,
+                        k_scales,
+                        pid0,
+                        k_page_perm_base_addr,
+                        scales_base_addr,
+                        Int32(0),
+                        tx,
+                        k_quant_page_stride=int(self.k_quant_page_stride),
+                        k_scales_row_stride=int(self.k_scales_row_stride),
+                        issue_threads=_RADIX_THREADS,
+                    )
+            cute.arch.cp_async_commit_group()
         page_col = page_start
         while page_col < page_end:
             page_base = page_col * Int32(_PAGE_SIZE)
@@ -1215,19 +1241,46 @@ class SparseNSAFusedIndexerKernel:
                 if valid_slots > Int32(0):
                     do_page = Int32(1)
 
+            cur_k_base = k_page_perm_base_addr
+            cur_scale_base = scales_base_addr
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+                # Issue NEXT page into the other stage, then wait for the
+                # current one (committed by the previous iteration/prologue).
+                nxt = page_col + Int32(1)
+                if nxt < page_end:
+                    pid_n = Int32(-1)
+                    if nxt < Int32(real_page_table.shape[1]):
+                        pid_n = Int32(real_page_table[q_idx, nxt])
+                    if (pid_n >= Int32(0)) & (
+                        nxt * Int32(_PAGE_SIZE) < seq_len
+                    ):
+                        nk = k_page_base_addr
+                        nsc = scales2_base_addr
+                        if pipe_stage != Int32(0):
+                            nk = k_page_perm_base_addr
+                            nsc = scales_base_addr
+                        _stream_issue_k_page_cp_async(
+                            k_quant_bytes,
+                            k_scales,
+                            pid_n,
+                            nk,
+                            nsc,
+                            Int32(0),
+                            tx,
+                            k_quant_page_stride=int(self.k_quant_page_stride),
+                            k_scales_row_stride=int(self.k_scales_row_stride),
+                            issue_threads=_RADIX_THREADS,
+                        )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(1)
+                cute.arch.sync_threads()
+                if pipe_stage != Int32(0):
+                    cur_k_base = k_page_base_addr
+                    cur_scale_base = scales2_base_addr
             if do_page != Int32(0):
                 n_new = valid_slots
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                    # Fused g2s load + permute (no linear staging, no repack pass).
-                    _load_permute_k_page_g2s(
-                        k_quant_bytes, page_id, Int64(self.k_quant_page_stride),
-                        k_page_perm_base_addr, tx, Int32(_RADIX_THREADS),
-                    )
-                    scale_idx = tx
-                    while scale_idx < Int32(_PAGE_SIZE):
-                        s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
-                        scale_idx += Int32(_RADIX_THREADS)
-                    cute.arch.sync_threads()
+                    pass
                 else:
                     # CONTIGUOUS_MLA: masked wide scalar load into linear staging, then repack.
                     _load_flat_k_tile_wide(
@@ -1259,13 +1312,14 @@ class SparseNSAFusedIndexerKernel:
                     if tx < score_threads:
                         if token_base < valid_slots:
                             head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
-                            _compute_mxfp8_tile_partials(
-                                s_q,
+                            _compute_mxfp8_tile_partials_qldm(
+                                q_smem_base_addr,
                                 s_w,
                                 num_heads,
-                                k_page_perm_base_addr,
+                                cur_k_base,
                                 token_base,
                                 head_tile_base,
+                                head_tile_slot,
                                 lane,
                                 s_partial_logits,
                                 token_group * Int32(_PAGED_TOKENS_PER_GROUP),
@@ -1283,7 +1337,10 @@ class SparseNSAFusedIndexerKernel:
                                     logit = Float32(logit + s_partial_logits[partial_row, h_i])
                                     h_i += Int32(1)
                                 s_c0_values[carry_count + slot_idx] = Float32(
-                                    logit * s_scale[slot_idx]
+                                    logit
+                                    * ld_shared_f32(
+                                        cur_scale_base + slot_idx * Int32(4)
+                                    )
                                 )
                                 output_idx = abs_start + page_base + slot_idx
                                 if cutlass.const_expr(
@@ -1312,6 +1369,8 @@ class SparseNSAFusedIndexerKernel:
             need_trim = (carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)) | (
                 is_last & (carry_count > topk_static)
             )
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+                pipe_stage = pipe_stage ^ Int32(1)
             if need_trim:
                 cute.arch.sync_threads()
                 _fused_radix_select(
