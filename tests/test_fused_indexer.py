@@ -12,7 +12,12 @@ import pytest
 import torch
 
 from b12x.attention.indexer.fused_indexer import (
+    KV_LAYOUT_CONTIGUOUS_MLA,
+    KV_LAYOUT_PAGED,
+    _BATCH_SLACK,
     _COOP_STATE_WORDS,
+    _DSV4_BATCH_SLACK,
+    _resolve_fused_batch_slack,
     fused_indexer_scratch_capacity,
     resolve_fused_indexer_path,
     run_fused_paged_indexer,
@@ -20,6 +25,30 @@ from b12x.attention.indexer.fused_indexer import (
 )
 
 _PS = 64  # compressed-index page size
+
+
+def test_paged_dsv4_always_uses_large_fused_carry():
+    assert _resolve_fused_batch_slack(
+        kv_layout=KV_LAYOUT_PAGED,
+        num_heads=64,
+        topk=512,
+    ) == _DSV4_BATCH_SLACK
+
+
+@pytest.mark.parametrize(
+    "kv_layout,num_heads,topk",
+    [
+        (KV_LAYOUT_CONTIGUOUS_MLA, 64, 512),
+        (KV_LAYOUT_PAGED, 32, 2048),
+        (KV_LAYOUT_PAGED, 16, 512),
+    ],
+)
+def test_large_fused_carry_is_paged_dsv4_specific(kv_layout, num_heads, topk):
+    assert _resolve_fused_batch_slack(
+        kv_layout=kv_layout,
+        num_heads=num_heads,
+        topk=topk,
+    ) == _BATCH_SLACK
 
 
 @pytest.mark.parametrize("width", [8192, 16384, 32768, 131072])

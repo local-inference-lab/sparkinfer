@@ -506,7 +506,33 @@ class FusedIndexerConfig:
 # only to "trim" carry back to topk when it would overflow -> one radix per
 # ~slack/page pages instead of one per page (the dominant cost). Slack is a
 # perf/SMEM knob.
+# The fused scorer is synchronization/instruction limited rather than HBM
+# limited on SM120 (the 64-head DSV4 B32/128K production launch reaches only
+# ~45% DRAM throughput).  Spend the otherwise-idle one-block-per-SM shared-memory
+# headroom on a larger DSV4 carry, batching fifty-two 64-token pages between
+# exact radix trims.  DSV4 serving graphs always have a large static context
+# capacity, so do not create capacity-dependent variants that are unreachable
+# in production.  Other contracts retain the smaller footprint, notably GLM's
+# top-k-2048 specialization, which cannot fit the larger carry.
 _BATCH_SLACK = 512
+_DSV4_BATCH_SLACK = 3328
+
+
+def _resolve_fused_batch_slack(
+    *,
+    kv_layout: int,
+    num_heads: int,
+    topk: int,
+) -> int:
+    """Select the capture-static carry batching size for one fused variant."""
+
+    if (
+        int(kv_layout) == KV_LAYOUT_PAGED
+        and int(num_heads) == 64
+        and int(topk) == 512
+    ):
+        return _DSV4_BATCH_SLACK
+    return _BATCH_SLACK
 
 
 @lru_cache(maxsize=64)
@@ -984,8 +1010,16 @@ class SparseNSAFusedIndexerKernel:
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
         self.score_warps = self.token_groups * self.num_q_head_tiles
         self.score_threads = self.score_warps * _WARP_THREADS
-        # Over-sized accumulator: scored tokens append until topk+slack, then trim.
-        self.carry_cap = int(self.topk) + _BATCH_SLACK
+        # Over-sized accumulator: scored tokens append until topk+slack, then
+        # trim.  Keep the large measured slack specific to the paged DSV4
+        # contract so top-k-2048 and contiguous contracts retain their existing
+        # shared-memory residency.
+        batch_slack = _resolve_fused_batch_slack(
+            kv_layout=self.kv_layout,
+            num_heads=self.num_heads_static,
+            topk=self.topk,
+        )
+        self.carry_cap = int(self.topk) + int(batch_slack)
         # The trim radix runs over <= carry_cap elements, so its threshold-bin
         # candidate set is bounded by carry_cap -> size cand0/cand1 to that.
         self.cands = self.carry_cap
