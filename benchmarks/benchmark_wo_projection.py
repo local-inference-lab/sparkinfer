@@ -665,6 +665,11 @@ def main() -> None:
         "4 warps"
     )
     print(
+        "b12x WO PDL: "
+        f"{'on' if wo_projection_impl._WO_PDL else 'off'} "
+        "(set B12X_WO_PDL=1 to enable)"
+    )
+    print(
         "b12x note: activation quant/scale packing is included in the graph replay path."
     )
     print(f"warmup={args.warmup}, iters={args.iters}")

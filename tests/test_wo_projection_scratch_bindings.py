@@ -151,6 +151,52 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
     assert out.shape == (3, 256)
 
 
+def test_wo_projection_pdl_preclears_atomic_output_before_chain(monkeypatch) -> None:
+    monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wo_impl, "_WO_PDL", True)
+    plan = _plan()
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    source = torch.empty((3, 2, 128), dtype=torch.bfloat16)
+    binding = plan.bind(scratch=scratch, source_tgd=source, weights=_weights())
+    binding.output.fill_(float("nan"))
+    calls: list[str] = []
+
+    def fake_quantize_a(source_tgd, *, out):
+        assert not torch.count_nonzero(binding.output)
+        calls.append("quantize_a")
+        return out
+
+    def fake_wo_a(x_q, wo_a, *, out, expected_m=None, **kwargs):
+        calls.append("wo_a")
+        return out
+
+    def fake_wo_b_fused(
+        tmp,
+        wo_b,
+        *,
+        out,
+        expected_m=None,
+        _atomic_output_precleared=False,
+        **kwargs,
+    ):
+        assert _atomic_output_precleared is True
+        assert not torch.count_nonzero(out)
+        calls.append("wo_b")
+        return out
+
+    monkeypatch.setattr(wo_impl, "quantize_wo_a_input_mxfp8", fake_quantize_a)
+    monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
+    monkeypatch.setattr(
+        wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b_fused
+    )
+
+    out = wo_impl.wo_projection_mxfp8(binding=binding)
+
+    assert calls == ["quantize_a", "wo_a", "wo_b"]
+    assert out.data_ptr() == binding.output.data_ptr()
+
+
 def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
     plan = _plan()

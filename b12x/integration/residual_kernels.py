@@ -50,6 +50,7 @@ _SUPPORTED_HIDDEN_SIZES = (_HIDDEN, 7168)
 _MIXES = 24
 _PARTIALS = 1 + _MIXES
 _PARTIALS_PER_CTA = 2
+_MHC_PDL = os.getenv("B12X_MHC_PDL", "0") != "0"
 # Partials handled per post_pre-partial CTA. mix_groups = ceil(25/this), so the
 # partial-kernel grid is (32 source tiles x mix_groups). 4 (-> 7 groups, 224
 # CTAs) maximizes fn-read parallelism without excess grid-scheduling overhead.
@@ -776,6 +777,10 @@ class MHCPostPrePartialKernel:
                                 gtotal += Float32(gram_sums[gp, src_warp])
                                 src_warp += Int32(1)
                             partials[token, Int32(self.gram_row0) + hidden_tile, gp] = gtotal
+
+        if const_expr(_MHC_PDL):
+            cute.arch.sync_threads()
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 class MHCPostPrePrefillPartialKernel:
@@ -1532,6 +1537,10 @@ class MHCPostPrePrefillGramKernel:
                     total_sq += gtotal
             partials[token, Int32(0), Int32(0)] = total_sq
 
+        if const_expr(_MHC_PDL):
+            cute.arch.sync_threads()
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 @cute.jit
 def _mhc_warp_mma_gemm(
@@ -2082,6 +2091,7 @@ class MHCPrefillTf32ProjectTmaKernel:
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -2100,6 +2110,10 @@ class MHCPrefillTf32ProjectTmaKernel:
         tidx, _, _ = cute.arch.thread_idx()
         m_tile, n_tile, k_split = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
+
         partial_row = k_split + Int32(1)
         if k_split == Int32(0):
             partial_row = Int32(0)
@@ -2288,6 +2302,10 @@ class MHCPrefillTf32ProjectTmaKernel:
                 load_pipeline.producer_commit(producer_state)
                 producer_state.advance()
             load_pipeline.producer_tail(producer_state)
+
+        if const_expr(_MHC_PDL):
+            cute.arch.sync_threads()
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 class MHCPrefillBf16ProjectKernel:
@@ -2537,6 +2555,7 @@ class MHCFinalizeGramKernel:
             grid=(self.hidden_tiles // self.tiles_per_cta, num_tokens, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -2554,6 +2573,10 @@ class MHCFinalizeGramKernel:
         tile_group, token, _ = cute.arch.block_idx()
         tile_group = Int32(tile_group)
         tidx = Int32(cute.arch.thread_idx()[0])
+
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
+
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(_finalize_storage_cls(self.num_threads, False))
         s_pre = storage.pre.get_tensor(cute.make_layout((_MHC_MULT,), stride=(1,)))
@@ -3248,6 +3271,7 @@ def _run_mhc_post_pre_partial_launch(
         compile_key = (
             ("partials_per_cta", partials_per_cta),
             ("compute_gram", compute_gram),
+            ("pdl", _MHC_PDL),
             cache_key,
         )
     else:
@@ -3261,6 +3285,7 @@ def _run_mhc_post_pre_partial_launch(
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("partials_per_cta", partials_per_cta),
             ("compute_gram", compute_gram),
+            ("pdl", _MHC_PDL),
             cache_key,
         )
     b12x_launch(
@@ -3272,7 +3297,7 @@ def _run_mhc_post_pre_partial_launch(
             False,
             partials_per_cta,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -3843,11 +3868,12 @@ def _run_mhc_post_pre_prefill_gram_launch(
         ("hidden_size", hidden_size),
         ("split_k", split_k),
         ("threads", _PREFILL_GRAM_THREADS),
+        ("pdl", _MHC_PDL),
         cache_key,
     )
     b12x_launch(
         _post_pre_prefill_gram_kernel(hidden_size, split_k),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -4173,6 +4199,7 @@ def _run_mhc_prefill_tf32_project_launch(
         ("num_compute_warps", kernel.num_compute_warps),
         ("threads", kernel.num_threads),
         ("k_splits", kernel.k_splits),
+        ("pdl", _MHC_PDL),
         (
             "operand_layout",
             "tma_swizzled_branchless_a_bf16_b_f32_rawtf32_m16n8k8_v7",
@@ -4181,7 +4208,7 @@ def _run_mhc_prefill_tf32_project_launch(
     )
     b12x_launch(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 5, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 6, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -4710,6 +4737,7 @@ def _run_mhc_finalize_gram_launch(
         ("fuse_norm", fuse_norm),
         ("compact_partials", compact_partials),
         ("compact_projection_splits", compact_projection_splits),
+        ("pdl", _MHC_PDL),
         ("norm_eps", norm_eps if fuse_norm else 0.0),
         rms_eps,
         hc_eps,
@@ -4797,7 +4825,7 @@ def _run_mhc_finalize_gram_launch(
             compact_partials,
             compact_projection_splits,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )

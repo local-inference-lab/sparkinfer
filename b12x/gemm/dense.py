@@ -86,6 +86,12 @@ from b12x.cute.fp4 import (
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
+_B12X_WO_PDL = os.environ.get("B12X_WO_PDL", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
     "VLLM_B12X_TIMING", "0"
 ) == "1"
@@ -95,7 +101,7 @@ _B12X_TIMING_THRESHOLD_MS = float(
         os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
     )
 )
-_B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "0") == "1"
+_B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "1") == "1"
 _B12X_DENSE_ATOM_24 = os.getenv("B12X_DENSE_ATOM_24", "0") == "1"
 _DENSE_LOAD_PATHS = ("tma", "cpasync")
 
@@ -320,7 +326,7 @@ class DenseGemmKernel:
         tile_k: Optional[int] = None,
         single_work_tile_per_cta: bool = False,
         use_prefetch: bool = False,
-        enable_pdl: bool = True,
+        enable_pdl: bool = False,
         direct_one_m_tile_scheduler: bool = False,
         split_k_slices: int = 1,
         split_k_atomic_bf16: bool = False,
@@ -722,6 +728,7 @@ class DenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
         return
 
@@ -901,6 +908,13 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
+        if cutlass.const_expr(self.enable_pdl):
+            # Match CUDA PDL's full device contract. The launch attribute lets
+            # this grid overlap its predecessor; launch_dependents releases the
+            # next grid, while wait preserves RAW ordering for A/SFA/source.
+            cute.arch.griddepcontrol_launch_dependents()
+            cute.arch.griddepcontrol_wait()
+
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
 
@@ -2538,6 +2552,27 @@ class DenseGemmKernel:
                         sf_k_half = k_tile_global - sf_k_tile * Int32(2)
                         sfa_tile = tile_coord_mnl[0]
                         sfb_tile = tile_coord_mnl[1] // Int32(self.sfb_tiles_per_block)
+                        # directSFA/directSFB retain the physical packed-scale
+                        # storage order [L, MN-tile, K128-tile, 32, 4, 4].
+                        # The original BK64 address arithmetic covered only
+                        # L=1; without these strides every later grouped GEMM
+                        # batch silently consumed batch 0's scales.
+                        sfa_l_stride = (
+                            Int32(tile_sched_params.problem_shape_ntile_mnl[0])
+                            * sf_k_tiles
+                            * Int32(512)
+                        )
+                        problem_n_tiles = Int32(
+                            tile_sched_params.problem_shape_ntile_mnl[1]
+                        )
+                        sfb_scale_n_tiles = (
+                            problem_n_tiles
+                            + Int32(self.sfb_tiles_per_block - 1)
+                        ) // Int32(self.sfb_tiles_per_block)
+                        sfb_l_stride = (
+                            sfb_scale_n_tiles * sf_k_tiles * Int32(512)
+                        )
+                        l_coord = tile_coord_mnl[2]
                         for sf_iter in cutlass.range_constexpr(4):
                             mn_local = lane + Int32(
                                 sf_iter * self.num_threads_per_warp
@@ -2550,11 +2585,13 @@ class DenseGemmKernel:
                                 + sf_k_half * Int32(2)
                             )
                             sfa_offset = (
-                                (sfa_tile * sf_k_tiles + sf_k_tile) * Int32(512)
+                                l_coord * sfa_l_stride
+                                + (sfa_tile * sf_k_tiles + sf_k_tile) * Int32(512)
                                 + atom_offset
                             )
                             sfb_offset = (
-                                (sfb_tile * sf_k_tiles + sf_k_tile) * Int32(512)
+                                l_coord * sfb_l_stride
+                                + (sfb_tile * sf_k_tiles + sf_k_tile) * Int32(512)
                                 + atom_offset
                             )
                             sfa_pair = ld_global_b16(
@@ -3004,6 +3041,9 @@ class _DenseGemmLaunch:
         # the persistent object cache distinguish it.
         self._atom_shape_24 = _B12X_DENSE_ATOM_24
         self._sfb_k_reuse = sfb_k_reuse
+        # Import-time experimental switch, captured in the persistent compile
+        # key so PDL and non-PDL cubins can never alias.
+        self._enable_pdl = _B12X_WO_PDL
 
         if not DenseGemmKernel.can_implement(
             ab_dtype,
@@ -3060,6 +3100,7 @@ class _DenseGemmLaunch:
             self._swap_ab,
             self._atom_shape_24,
             self._sfb_k_reuse,
+            self._enable_pdl,
         )
 
     @cute.jit
@@ -3123,6 +3164,7 @@ class _DenseGemmLaunch:
             swap_ab=self._swap_ab,
             sfb_k_reuse=self._sfb_k_reuse,
             atom_shape_24=self._atom_shape_24,
+            enable_pdl=self._enable_pdl,
         )(
             a_tensor,
             a_tensor,
@@ -3224,6 +3266,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             fused_quant_a_inner_span=self._fused_quant_a_inner_span,
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
+            enable_pdl=self._enable_pdl,
         )(
             a_tensor,
             a_source,
@@ -3447,6 +3490,7 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_rope_dim=self._fused_quant_a_rope_dim,
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
+            enable_pdl=self._enable_pdl,
         )(
             a_tensor,
             a_source,
@@ -4288,6 +4332,19 @@ def _select_default_mma_tiler_mn(
     k: Optional[int] = None,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
+    # The serving WO-B prefill GEMM is [M,4096] x [4096,4096]. DeepGEMM's
+    # specialized O-projection dispatch switches it from BM64/BK128 to
+    # BM128/BK64 at M>=2048, and the same exact-shape switch wins in b12x.
+    # WO-A is deliberately excluded: its four grouped [M,512]x[1024,512]
+    # GEMMs remain faster with BM64/BK128 on this kernel.
+    if (
+        is_mxfp8
+        and expected_m is not None
+        and expected_m >= 2048
+        and k is not None
+        and (n, k) == (4096, 4096)
+    ):
+        return (128, 128)
     if is_mxfp8 and n > 1536:
         # DeepGEMM-style regime hint. When a caller declares expected_m, pick the
         # per-regime optimal tile and key the compile on it: ONE kernel per
@@ -4407,14 +4464,15 @@ def _select_mxfp8_tile_k(
     # BK64 is an explicitly hinted production specialization. Choosing it from
     # live M when expected_m is absent would change both tile K and generated
     # code at M=2048, violating the no-hint frozen-resolution reuse contract.
-    return (
-        64
-        if expected_m is not None
+    hinted_bk64 = (
+        expected_m is not None
         and expected_m >= 2048
-        and n >= 16384
-        and k <= 1024
-        else 128
+        and (
+            (n >= 16384 and k <= 1024)
+            or (n, k) == (4096, 4096)
+        )
     )
+    return 64 if hinted_bk64 else 128
 
 
 def _validate_mxfp8_bk64_plan(
@@ -4463,6 +4521,7 @@ def dense_gemm_fused_quant_a(
     sfb_k_replicated: bool = False,
     a_inner_span: int = 0,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    _atomic_output_precleared: bool = False,
     stream: object = None,
 ) -> torch.Tensor:
     """Small-M BF16-A -> MXFP8 GEMM with activation quantization in each CTA.
@@ -4529,12 +4588,15 @@ def dense_gemm_fused_quant_a(
     split_k_output = split_k_slices > 1
     split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
     if out is None:
+        if _atomic_output_precleared:
+            raise ValueError("a precleared fused-quant output must be caller-owned")
         out = torch.empty((m, n, 1), dtype=torch.bfloat16, device=source.device)
     if out.shape != (m, n, 1) or out.dtype != torch.bfloat16:
         raise ValueError(f"out must be BF16 with shape {(m, n, 1)}, got {out.dtype} {tuple(out.shape)}")
     split_storage = None
     if split_k_atomic_bf16:
-        out.zero_()
+        if not _atomic_output_precleared:
+            out.zero_()
         kernel_c_l = 1
         kernel_c_dtype = cutlass.BFloat16
         c_tensor_gpu = out

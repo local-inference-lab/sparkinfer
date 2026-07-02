@@ -31,6 +31,12 @@ WO_A_INPUT_QUANT_GROUP_SIZE = MXFP8_SCALE_VEC_SIZE
 _WO_QUANT_CHUNKS_PER_PROGRAM = int(
     os.environ.get("B12X_WO_QUANT_CHUNKS_PER_PROGRAM", "16")
 )
+_WO_PDL = os.environ.get("B12X_WO_PDL", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
 if _WO_QUANT_CHUNKS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32):
     raise ValueError(
         "B12X_WO_QUANT_CHUNKS_PER_PROGRAM must be one of 1, 2, 4, 8, 16, or 32, got "
@@ -458,10 +464,18 @@ def _quantize_grouped_tgd_to_tdg_kernel(
     scale_mma_s4,
     scale_mma_s5,
     CHUNKS_PER_PROGRAM: tl.constexpr,
+    USE_PDL: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
     group = tl.program_id(1)
     chunk_block = tl.program_id(2)
+    if USE_PDL:
+        # Both pieces are required for a safe dependent launch: signal the
+        # following grid early, then wait for the preceding grid's global
+        # writes before touching this kernel's inputs.
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
     chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
     d = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
 
@@ -537,10 +551,15 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     NOPE_DIM: tl.constexpr,
     HALF_ROPE_DIM: tl.constexpr,
     CHUNKS_PER_PROGRAM: tl.constexpr,
+    USE_PDL: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
     group = tl.program_id(1)
     chunk_block = tl.program_id(2)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
     chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
     d = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
 
@@ -627,9 +646,14 @@ def _quantize_group_major_trg_to_tk_kernel(
     scale_mma_s4,
     scale_mma_s5,
     CHUNKS_PER_PROGRAM: tl.constexpr,
+    USE_PDL: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
     chunk_block = tl.program_id(1)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
     chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
     cols = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
     g = cols // rank
@@ -1264,6 +1288,8 @@ def quantize_wo_a_input_mxfp8(
         out.scale_mma.stride(4),
         out.scale_mma.stride(5),
         CHUNKS_PER_PROGRAM=chunks_per_program,
+        USE_PDL=_WO_PDL,
+        launch_pdl=_WO_PDL,
         num_warps=4,
     )
     return out
@@ -1326,6 +1352,8 @@ def _run_wo_a_quant_kernel(
         NOPE_DIM=nope_dim,
         HALF_ROPE_DIM=rope_dim // 2,
         CHUNKS_PER_PROGRAM=chunks_per_program,
+        USE_PDL=_WO_PDL,
+        launch_pdl=_WO_PDL,
         num_warps=4,
     )
 
@@ -1594,6 +1622,8 @@ def _run_wo_b_quant_kernel(
         out_scale_mma.stride(4),
         out_scale_mma.stride(5),
         CHUNKS_PER_PROGRAM=chunks_per_program,
+        USE_PDL=_WO_PDL,
+        launch_pdl=_WO_PDL,
         num_warps=4,
     )
 
@@ -2335,6 +2365,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     out: torch.Tensor | None = None,
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
+    _atomic_output_precleared: bool = False,
     stream: object = None,
 ) -> torch.Tensor:
     """Run WO-B at small M with group-major quantization fused into the GEMM.
@@ -2375,6 +2406,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
         a_inner_span=inner_span,
+        _atomic_output_precleared=_atomic_output_precleared,
         stream=stream,
     )
 
@@ -2441,6 +2473,13 @@ def wo_projection_mxfp8(
         raise TypeError("wo_projection_mxfp8 requires binding for caller-owned scratch")
 
     alpha_one = _cached_alpha_one(source_tgd.device)
+    # The tiny-M WO-B schedule uses atomic split-K and therefore needs a zeroed
+    # output.  Put that independent clear before the WO-A chain when PDL is on;
+    # otherwise it sits between WO-A and WO-B and breaks the dependent-launch
+    # chain even though both GEMMs carry the PDL launch attribute.
+    atomic_output_precleared = _WO_PDL and tokens <= 8
+    if atomic_output_precleared:
+        output.zero_()
     # WO-A stays on the standalone quantizer + GEMM; fusing quant into the
     # WO-A GEMM measured ~2x slower at M=1 (small N, deep K, per-n-tile
     # requantization) -- see wo_a_dense_gemm_fused_quant_mxfp8.
@@ -2463,6 +2502,7 @@ def wo_projection_mxfp8(
             out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
+            _atomic_output_precleared=atomic_output_precleared,
             stream=stream,
         )
     else:
@@ -2527,6 +2567,16 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     )
     alpha_one = _cached_alpha_one(o.device)
     tokens = int(o.shape[0])
+    # See wo_projection_mxfp8: move the tiny-M atomic split-K clear ahead of
+    # the quantize -> WO-A -> WO-B PDL chain.  The allocation stays internal to
+    # this opaque op and is graph-stable after capture.
+    atomic_output_precleared = _WO_PDL and tokens <= 8
+    output = None
+    if atomic_output_precleared:
+        output = torch.empty(
+            (tokens, hidden, 1), dtype=torch.bfloat16, device=o.device
+        )
+        output.zero_()
     # WO-A stays on the standalone quantizer + GEMM: fusing the quant into the
     # WO-A GEMM's DMA warp measured ~2x slower at M=1 (N=rank is small, K is
     # deep, and every n-tile CTA re-quantizes the row without a source
@@ -2560,8 +2610,10 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         return wo_b_dense_gemm_fused_quant_mxfp8(
             tmp,
             weights.wo_b,
+            out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
+            _atomic_output_precleared=atomic_output_precleared,
             stream=stream_int,
         )
     tmp_q = quantize_wo_b_input_mxfp8(tmp, _initialize_scales=False)

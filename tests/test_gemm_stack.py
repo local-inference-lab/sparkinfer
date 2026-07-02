@@ -7,6 +7,7 @@ import pytest
 import torch
 import cutlass
 
+import b12x.gemm.dense as dense_module
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
 from b12x.gemm.dense import (
@@ -14,6 +15,11 @@ from b12x.gemm.dense import (
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
     dense_gemm,
+)
+from b12x.gemm.wo_projection import (
+    dequantize_mxfp8_rows_torch,
+    pack_fp8_block_scaled_weight_mxfp8,
+    quantize_mxfp8_rows_torch,
 )
 
 _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
@@ -261,12 +267,72 @@ def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
             load_path="tma",
             swap_ab=True,
         )
+
         assert not DenseGemmKernel.can_implement(
             **base,
             mma_tiler_mn=tile,
             load_path="cpasync",
             swap_ab=True,
         )
+
+
+def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    torch.manual_seed(29)
+
+    # Use the real grouped WO-A geometry. The manual BK64 path is deliberately
+    # shape-gated in production and does not claim arbitrary tiny N/K support.
+    m, n, k = 64, 1024, 512
+    groups = 4
+    group_multipliers = torch.tensor(
+        [1.0, 2.0, 4.0, 0.5], device="cuda", dtype=torch.bfloat16
+    ).view(1, 1, groups)
+    a = torch.randn((m, k, groups), device="cuda", dtype=torch.bfloat16) / 4
+    a_q = quantize_mxfp8_rows_torch(a * group_multipliers)
+    b_values = (
+        torch.randn((groups * n, k), device="cuda", dtype=torch.bfloat16) / 32
+    ).to(torch.float8_e4m3fn)
+    b_scales = (
+        torch.tensor([1.0, 2.0, 4.0, 0.5], device="cuda", dtype=torch.float32)
+        .view(groups, 1, 1)
+        .expand(groups, n // 128, k // 128)
+        .reshape(groups * (n // 128), k // 128)
+        .contiguous()
+    )
+    b_q = pack_fp8_block_scaled_weight_mxfp8(
+        b_values,
+        b_scales,
+        m=n,
+        k=k,
+        num_groups=groups,
+    )
+    assert not torch.equal(a_q.scale_rows[0], a_q.scale_rows[1])
+    assert not torch.equal(b_q.scale_rows[0], b_q.scale_rows[1])
+
+    # Force the normally shape-gated BK64 specialization so this compact test
+    # covers its manual packed-scale address arithmetic for L>1.
+    monkeypatch.setattr(dense_module, "_select_mxfp8_tile_k", lambda *_: 64)
+    out = dense_gemm(
+        (a_q.values, a_q.scale_mma),
+        (b_q.values, b_q.scale_mma),
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype="bfloat16",
+        sf_vec_size=32,
+        mma_tiler_mn=(128, 128),
+        expected_m=2048,
+        sfb_k_replicated=True,
+    )
+    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows)
+    b_deq = dequantize_mxfp8_rows_torch(
+        b_q.values, b_q.scale_rows
+    ).to(torch.bfloat16)
+    a_deq = a_deq.to(torch.bfloat16)
+    ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

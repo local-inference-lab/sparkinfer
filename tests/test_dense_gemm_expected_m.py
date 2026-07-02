@@ -107,7 +107,10 @@ def test_dense_compile_key_separates_replicated_sfb_reuse():
     replicated_scales = _bk64_launch()
 
     assert generic_scales.compile_key() != replicated_scales.compile_key()
-    assert generic_scales.compile_key()[:-1] == replicated_scales.compile_key()[:-1]
+    assert generic_scales.compile_key()[:-2] == replicated_scales.compile_key()[:-2]
+    assert generic_scales.compile_key()[-2] is False
+    assert replicated_scales.compile_key()[-2] is True
+    assert generic_scales.compile_key()[-1] == replicated_scales.compile_key()[-1]
 
 
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
@@ -117,8 +120,19 @@ def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
     atom_24 = _bk64_launch()
 
     assert atom_42.compile_key() != atom_24.compile_key()
-    assert atom_42.compile_key()[-2] is False
-    assert atom_24.compile_key()[-2] is True
+    assert atom_42.compile_key()[-3] is False
+    assert atom_24.compile_key()[-3] is True
+
+
+def test_dense_compile_key_separates_pdl_cubins(monkeypatch):
+    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", False)
+    ordinary_launch = _bk64_launch()
+    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", True)
+    pdl_launch = _bk64_launch()
+
+    assert ordinary_launch.compile_key()[:-1] == pdl_launch.compile_key()[:-1]
+    assert ordinary_launch.compile_key()[-1] is False
+    assert pdl_launch.compile_key()[-1] is True
 
 
 def test_fused_quant_compile_key_is_distinct_and_exhaustive():
@@ -157,6 +171,35 @@ def test_expected_m_short_k_large_n_uses_production_bk64_plan():
             expected_m=em,
         )
         assert policy.large_m_unroll == (em >= 8192)
+
+
+def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
+    # Match the specialized DeepGEMM O-projection schedule without changing
+    # the 1K schedule that already wins end to end.
+    n, k = 4096, 4096
+    assert _tile(1024, expected_m=1024, n=n, k=k) == (64, 128)
+    assert _select_mxfp8_tile_k(1024, n, k, 1024) == 128
+    for em in (2048, 4096, 8192):
+        tiles = {
+            _tile(live_m, expected_m=em, n=n, k=k)
+            for live_m in (1, 64, 2048, 8192)
+        }
+        assert tiles == {(128, 128)}, (n, k, em, tiles)
+        assert _select_mxfp8_tile_k(1, n, k, em) == 64
+
+
+def test_grouped_wo_a_prefill_keeps_bm64_bk128():
+    # The DeepGEMM schedule loses on b12x's grouped WO-A kernel at every probed
+    # prefill size, so keep the established narrow-N schedule.
+    n, k = 1024, 512
+    for em in (2048, 4096, 8192):
+        assert _tile(1, expected_m=em, n=n, k=k) == (64, 128)
+        assert _select_mxfp8_tile_k(1, n, k, em) == 128
+
+
+def test_wo_bk64_override_is_exact_shape_only():
+    for n, k in ((1024, 640), (1152, 512), (4096, 3968), (4224, 4096)):
+        assert _select_mxfp8_tile_k(2048, n, k, 2048) == 128
 
 
 def test_short_k_1024_and_2048_hints_have_stable_distinct_keys():
@@ -212,7 +255,7 @@ def test_short_k_no_hint_does_not_cross_bk64_cache_boundary():
         (
             (64, 128),
             128,
-            _DenseGemmPolicy(False, False, False, 1, False, True),
+            _DenseGemmPolicy(False, False, False, 1, True, True),
         )
     }
 
