@@ -644,6 +644,77 @@ def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
     assert info["compile_misses"] == 1
 
 
+def test_compile_progress_prints_before_after_and_running_total(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("B12X_PRINT_COMPILE_PROGRESS", "1")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    cute_compiler.clear_compile_cache()
+
+    calls = []
+
+    def fake_compile(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return object()
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    times = iter((10.0, 10.25, 20.0, 20.5))
+    monkeypatch.setattr(cute, "compile", fake_compile)
+    monkeypatch.setattr(cute_compiler.time, "perf_counter", lambda: next(times))
+    spec = KernelCompileSpec.from_facts(
+        "test.compile.progress",
+        3,
+        ("tile", (64, 128)),
+        ("stages", 4),
+    )
+
+    cute_compiler.compile(FakeKernel(), 1, compile_spec=spec)
+    cute_compiler.compile(FakeKernel(), 2, compile_spec=spec)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(calls) == 2
+    assert len(lines) == 4
+    assert "compile-start number=1" in lines[0]
+    assert "target=" in lines[0]
+    assert "kernel=test.compile.progress" in lines[0]
+    assert "version=3" in lines[0]
+    assert "tile" in lines[0]
+    assert "cache_key=" in lines[0]
+    assert "compile-done number=1 duration_s=0.250 total_compile_s=0.250" in lines[1]
+    assert "compile-start number=2" in lines[2]
+    assert "compile-done number=2 duration_s=0.500 total_compile_s=0.750" in lines[3]
+
+
+def test_compile_progress_prints_after_failed_compile(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PRINT_COMPILE_PROGRESS", "yes")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    cute_compiler.clear_compile_cache()
+
+    def fake_compile(*args, **kwargs):
+        raise RuntimeError("compiler exploded")
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    times = iter((3.0, 4.5))
+    monkeypatch.setattr(cute, "compile", fake_compile)
+    monkeypatch.setattr(cute_compiler.time, "perf_counter", lambda: next(times))
+
+    with pytest.raises(RuntimeError, match="compiler exploded"):
+        cute_compiler.compile(FakeKernel(), 1)
+
+    out = capsys.readouterr().out
+    assert "compile-start number=1" in out
+    assert "compile-failed number=1 duration_s=1.500 total_compile_s=1.500" in out
+    assert "error=RuntimeError: RuntimeError('compiler exploded')" in out
+
+
 def test_explicit_spec_memory_hit_uses_lightweight_shape_key(monkeypatch) -> None:
     monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
     monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)

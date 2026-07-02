@@ -4505,7 +4505,7 @@ def _compile_w4a16_small_m_direct(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         dummy(cutlass.BFloat16),
         dummy(cutlass.Uint8),
@@ -4525,6 +4525,25 @@ def _compile_w4a16_small_m_direct(
         Int32(m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_facts(
+            "moe.w4a16.small_m_direct",
+            1,
+            ("device_index", None if device is None else int(device.index or 0)),
+            ("m", int(m)),
+            ("hidden_size", int(hidden_size)),
+            ("intermediate_size", int(intermediate_size)),
+            ("num_experts", int(num_experts)),
+            ("topk", int(topk)),
+            ("activation", activation),
+            ("fast_math", bool(fast_math)),
+            ("topk_ids_dtype", str(topk_ids_dtype)),
+            ("scale_format", scale_format),
+            ("swiglu_limit", swiglu_limit),
+            ("swiglu_alpha", swiglu_alpha),
+            ("swiglu_beta", swiglu_beta),
+            ("w13_layout", w13_layout),
+            ("grid_x", int(kernel.grid_x)),
+        ),
     )
     launch = _W4A16SmallMDirectLaunch(
         compiled=compiled,

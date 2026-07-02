@@ -50,6 +50,11 @@ Scope: package kernels shipped under `b12x/`. Benchmark and probe kernels under
 | BF16-to-FP4 TMA quantization | BF16-to-packed-NVFP4 CuTe TMA kernel<br>`compile_bf16_to_fp4_tma` | `b12x/quantization/bf16_to_fp4_tma.py` | BF16 input tiles to packed NVFP4 plus scale tiles |
 | PCIe one-shot allreduce | `pcie_allreduce_kernel`<br>`PCIeOneshotAllReduce` | `b12x/distributed/pcie_oneshot.cu` | IPC-backed PCIe allreduce for FP32/FP16/BF16 |
 
+Set `B12X_PRINT_COMPILE_PROGRESS=1` to print a line immediately before and after
+each CuTe DSL compiler invocation. The output includes the kernel name, important
+cache-key parameters, per-kernel duration, and cumulative compile time; cache hits
+do not produce progress lines.
+
 ```bash
 pip install b12x
 ```

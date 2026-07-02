@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 from collections import OrderedDict
 from contextlib import contextmanager, suppress
@@ -29,10 +30,14 @@ _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
 _COMPILE_MISSES = 0
+_COMPILE_PROGRESS_LOCK = RLock()
+_COMPILE_PROGRESS_COUNT = 0
+_COMPILE_PROGRESS_TOTAL_SECONDS = 0.0
 _EXECUTOR_CACHE_LOCK = RLock()
 _EXECUTOR_CACHE_ATTR = "_b12x_cached_default_executor"
 _VLLM_ENGINE_STARTED_ENV = "B12X_VLLM_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
+_PRINT_COMPILE_PROGRESS_ENV = "B12X_PRINT_COMPILE_PROGRESS"
 
 
 @dataclass(frozen=True)
@@ -659,6 +664,11 @@ def _cute_compile_cache_dir() -> Path:
 
 def _cute_compile_log_enabled() -> bool:
     raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
+    return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _cute_compile_progress_enabled() -> bool:
+    raw = os.environ.get(_PRINT_COMPILE_PROGRESS_ENV, "")
     return raw.lower() not in {"", "0", "false", "no", "off"}
 
 
@@ -1291,6 +1301,103 @@ def _log_cute_compile_miss(
     )
 
 
+def _compile_progress_details(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    compile_spec: KernelCompileSpec | None,
+    cache_key: str,
+) -> str:
+    parts = [
+        f"target={_compile_target_name(func)}",
+        f"cache_key={cache_key[:16]}",
+    ]
+    if compile_spec is not None:
+        try:
+            params = json.loads(compile_spec.json_key)["facts"]
+        except Exception:
+            params = compile_spec.json_key
+        parts.extend(
+            (
+                f"kernel={compile_spec.kernel_id}",
+                f"version={compile_spec.version}",
+                f"params={_short_repr(params, max_len=2400)}",
+            )
+        )
+    else:
+        attrs = _compile_target_attrs(func)
+        if attrs:
+            parts.append(f"attrs={_short_repr(attrs, max_len=1200)}")
+        parts.append(
+            f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=2000)}"
+        )
+    return " ".join(parts)
+
+
+def _call_cute_compile(
+    compile_callable: Any,
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    compile_spec: KernelCompileSpec | None,
+    cache_key: str,
+) -> Any:
+    if not _cute_compile_progress_enabled():
+        return compile_callable(func, *args, **kwargs)
+
+    global _COMPILE_PROGRESS_COUNT
+    global _COMPILE_PROGRESS_TOTAL_SECONDS
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_COUNT += 1
+        compile_number = _COMPILE_PROGRESS_COUNT
+
+    try:
+        details = _compile_progress_details(
+            func,
+            args,
+            kwargs,
+            compile_spec=compile_spec,
+            cache_key=cache_key,
+        )
+    except Exception as exc:
+        details = (
+            f"target={_short_repr(func)} cache_key={cache_key[:16]} "
+            f"details_error={type(exc).__name__}"
+        )
+    print(
+        f"[b12x cute.compile] compile-start number={compile_number} {details}",
+        flush=True,
+    )
+    started = time.perf_counter()
+    try:
+        compiled = compile_callable(func, *args, **kwargs)
+    except BaseException as exc:
+        elapsed = time.perf_counter() - started
+        with _COMPILE_PROGRESS_LOCK:
+            _COMPILE_PROGRESS_TOTAL_SECONDS += elapsed
+            total = _COMPILE_PROGRESS_TOTAL_SECONDS
+        print(
+            f"[b12x cute.compile] compile-failed number={compile_number} "
+            f"duration_s={elapsed:.3f} total_compile_s={total:.3f} {details} "
+            f"error={type(exc).__name__}: {_short_repr(exc, max_len=500)}",
+            flush=True,
+        )
+        raise
+
+    elapsed = time.perf_counter() - started
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_TOTAL_SECONDS += elapsed
+        total = _COMPILE_PROGRESS_TOTAL_SECONDS
+    print(
+        f"[b12x cute.compile] compile-done number={compile_number} "
+        f"duration_s={elapsed:.3f} total_compile_s={total:.3f} {details}",
+        flush=True,
+    )
+    return compiled
+
+
 def _iter_fingerprint_files(root: Path) -> list[Path]:
     files = []
     for path in root.rglob("*"):
@@ -1832,6 +1939,8 @@ def clear_compile_cache() -> None:
     global _COMPILE_MISSES
     global _SPEC_MEMO_HITS
     global _SPEC_MEMO_MISSES
+    global _COMPILE_PROGRESS_COUNT
+    global _COMPILE_PROGRESS_TOTAL_SECONDS
     _compile_environment_key.cache_clear()
     _static_compile_cache_context.cache_clear()
     with _MEMORY_CACHE_LOCK:
@@ -1844,6 +1953,9 @@ def clear_compile_cache() -> None:
         _SPEC_MEMO.clear()
         _SPEC_MEMO_HITS = 0
         _SPEC_MEMO_MISSES = 0
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_COUNT = 0
+        _COMPILE_PROGRESS_TOTAL_SECONDS = 0.0
 
 
 def compile_cache_info() -> dict[str, int | bool]:
@@ -1968,7 +2080,14 @@ def compile(
             call_kwargs = {
                 k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
             }
-            compiled = compile_callable(func, *args, **call_kwargs)
+            compiled = _call_cute_compile(
+                compile_callable,
+                func,
+                args,
+                call_kwargs,
+                compile_spec=compile_spec,
+                cache_key=cache_key,
+            )
             with suppress(Exception):
                 _store_cute_compile_to_disk(cache_key, compiled)
             _memory_cache_put(memory_cache_key, compiled)
@@ -1998,7 +2117,14 @@ def compile(
         cache_key=compile_spec if compile_spec is not None else payload,
     )
     call_kwargs = {k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"}
-    compiled = compile_callable(func, *args, **call_kwargs)
+    compiled = _call_cute_compile(
+        compile_callable,
+        func,
+        args,
+        call_kwargs,
+        compile_spec=compile_spec,
+        cache_key=cache_key,
+    )
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
