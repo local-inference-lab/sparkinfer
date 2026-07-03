@@ -249,9 +249,10 @@ def test_w4a8_mx_w31_layout_flip() -> None:
 
 
 @pytest.mark.parametrize("m", [1, 4])
-def test_w4a8_mx_small_dynamic_band_matches_oracle(m: int) -> None:
+def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
+    from b12x.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
 
     weights = _weights()
     weight_plan = plan_b12x_fp4_moe_weights(
@@ -270,9 +271,25 @@ def test_w4a8_mx_small_dynamic_band_matches_oracle(m: int) -> None:
         weight_plan=weight_plan,
         quant_mode="w4a8_mx",
     )
-    assert plan.implementation == "dynamic"
+    assert plan.implementation == ("micro" if m == 1 else "dynamic")
 
-    ref = _oracle(m, weights)
+    x, topk_ids, topk_weights = _routed_inputs(m, 33)
+    ref = moe_reference_w4a16_fp4_e8m0_k32(
+        x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        weights["alphas"],
+        topk_ids,
+        topk_weights,
+        _E,
+        _K,
+        _N,
+        activation="silu",
+        w13_layout="w13",
+    )
     prepared = _prepare(weights)
     out = _run(m, prepared)
     n_out = out.float().norm().item()

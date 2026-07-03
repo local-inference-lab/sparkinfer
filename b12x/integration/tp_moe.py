@@ -8016,7 +8016,7 @@ def _tiny_decode_enabled() -> bool:
 
 def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -> bool:
     return (
-        1 <= num_tokens <= 4
+        num_tokens == 1
         and activation == "silu"
         and k % 256 == 0
         and n % 256 == 0
@@ -8026,74 +8026,6 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
 
 
 _TINY_DECODE_KERNEL_CACHE: dict = {}
-_TINY_DECODE_INPUT_QUANT_CACHE: dict = {}
-_TINY_DECODE_INTERMEDIATE_QUANT_CACHE: dict = {}
-
-
-def _get_tiny_decode_input_quantizer(
-    m: int,
-    k: int,
-    *,
-    device: torch.device | None = None,
-):
-    from b12x.moe.fused.tiny_decode import MoETinyDecodeInputQuantizer
-
-    del device
-    kernel = MoETinyDecodeInputQuantizer(m, k)
-    cache_key = ("tiny_decode_input_quant",) + kernel.__cache_key__
-    cached = _TINY_DECODE_INPUT_QUANT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=cache_key
-    )
-    compiled = b12x_compile(
-        kernel,
-        make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.tp_moe.tiny_decode_input_quant",
-            1,
-            cache_key,
-        ),
-    )
-    _TINY_DECODE_INPUT_QUANT_CACHE[cache_key] = compiled
-    return compiled
-
-
-def _get_tiny_decode_intermediate_quantizer(
-    rt: int,
-    n: int,
-    *,
-    device: torch.device | None = None,
-):
-    from b12x.moe.fused.tiny_decode import MoETinyDecodeIntermediateQuantizer
-
-    del device
-    kernel = MoETinyDecodeIntermediateQuantizer(rt, n)
-    cache_key = ("tiny_decode_intermediate_quant",) + kernel.__cache_key__
-    cached = _TINY_DECODE_INTERMEDIATE_QUANT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=cache_key
-    )
-    compiled = b12x_compile(
-        kernel,
-        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "integration.tp_moe.tiny_decode_intermediate_quant",
-            1,
-            cache_key,
-        ),
-    )
-    _TINY_DECODE_INTERMEDIATE_QUANT_CACHE[cache_key] = compiled
-    return compiled
 
 
 def _get_tiny_decode_kernel(
@@ -8126,8 +8058,6 @@ def _get_tiny_decode_kernel(
         compiled = b12x_compile(
             kernel,
             dummy(cutlass.BFloat16),
-            dummy(cutlass.Uint32),
-            dummy(cutlass.Uint32),
             dummy(cutlass.Uint8),
             dummy(cutlass.Uint8),
             dummy(cutlass.Float32),
@@ -8139,7 +8069,7 @@ def _get_tiny_decode_kernel(
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
-                4,
+                1,
                 cache_key,
             ),
         )
@@ -8153,7 +8083,6 @@ def _launch_tiny_decode_flat(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     micro_intermediate: torch.Tensor,
-    packed_input: torch.Tensor,
     w1_storage: torch.Tensor,
     w1_scale_storage: torch.Tensor,
     w2_storage: torch.Tensor,
@@ -8174,24 +8103,12 @@ def _launch_tiny_decode_flat(
     compiled_fc1, compiled_fc2 = _get_tiny_decode_kernel(
         weight_E, m, k, n, num_topk, device=a.device
     )
-    compiled_input_quant = _get_tiny_decode_input_quantizer(m, k, device=a.device)
     rt = m * num_topk
-    compiled_intermediate_quant = _get_tiny_decode_intermediate_quantizer(
-        rt, n, device=a.device
-    )
     inter = micro_intermediate.view(torch.float32).reshape(-1)[: rt * 2 * n]
-    packed_words = packed_input.view(torch.uint32).reshape(-1)
-    input_words = m * (k // 2)
-    qinput = packed_words[:input_words].view(m, k // 2)
-    qinter = packed_words[input_words : input_words + rt * (n // 2)].view(rt, n // 2)
     MoETinyDecodeKernelBackend.launch(
         compiled_fc1,
         compiled_fc2,
-        compiled_input_quant,
-        compiled_intermediate_quant,
-        x=a.reshape(m, k),
-        qinput=qinput,
-        qinter=qinter,
+        x=a.reshape(-1),
         w13_rp=w1_storage,
         sfb13=w1_scale_storage,
         inter_fp32=inter,
@@ -8211,7 +8128,6 @@ def _tp_moe_tiny_decode_launch_op(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     micro_intermediate: torch.Tensor,
-    packed_input: torch.Tensor,
     w1_storage: torch.Tensor,
     w1_scale_storage: torch.Tensor,
     w2_storage: torch.Tensor,
@@ -8232,7 +8148,6 @@ def _tp_moe_tiny_decode_launch_op(
         barrier_count=barrier_count,
         barrier_epoch=barrier_epoch,
         micro_intermediate=micro_intermediate,
-        packed_input=packed_input,
         w1_storage=w1_storage,
         w1_scale_storage=w1_scale_storage,
         w2_storage=w2_storage,
@@ -8254,7 +8169,6 @@ def _tp_moe_tiny_decode_launch_fake(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     micro_intermediate: torch.Tensor,
-    packed_input: torch.Tensor,
     w1_storage: torch.Tensor,
     w1_scale_storage: torch.Tensor,
     w2_storage: torch.Tensor,
@@ -8419,7 +8333,6 @@ def _launch_micro(
             workspace.barrier_count,
             workspace.barrier_epoch,
             workspace.micro_intermediate,
-            workspace.packed_input,
             weights.w1_storage,
             weights.w1_scale_storage,
             weights.w2_storage,
