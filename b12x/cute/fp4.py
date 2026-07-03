@@ -5522,3 +5522,129 @@ def compute_y_and_max_abs_f32(
         max_abs = fmax_f32(max_abs, fabs_f32(y_f32[i]))
 
     return y_f32, max_abs
+
+
+# ---------------------------------------------------------------------------
+# NF3 (3-bit NormalFloat codebook) dequant for the W4A16 "nf3_2p1" layout.
+#
+# Input per call: 8 codes in 2+1 split-plane form — lo16 (8 x 2-bit fields,
+# code j bits 1:0 at bits 2j+1:2j) and hi8 (8 x 1-bit, code j bit 2 at bit j)
+# — plus the 8-entry bf16 codebook as 4 u32 pools (lo/hi bytes of entries
+# 0..3 and 4..7).  Output: 4 packed bf16x2 fragments in the SAME element
+# order as packed_dequant_e2m1x4 pairs: o0=(v0,v1) o1=(v2,v3) o2=(v4,v5)
+# o3=(v6,v7).
+#
+# Selector build is the carry-safe shift ladder (NOT a multiply spread — the
+# 0x249 multiply trick carries between lanes).  prmt pool selectors are the
+# 3-bit codes themselves; bit 3 of every selector nibble stays 0 so prmt
+# byte-select mode is used, never sign-replicate.
+# ---------------------------------------------------------------------------
+@dsl_user_op
+def packed_dequant_nf3x8_to_bfloat2x4(
+    lo16: Uint32,
+    hi8: Uint32,
+    cb_lo01: Uint32,
+    cb_lo23: Uint32,
+    cb_hi01: Uint32,
+    cb_hi23: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """NF3 codebook dequant: 8 3-bit codes -> 4 bf16x2 fragments."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(lo16).ir_value(loc=loc, ip=ip),
+            Uint32(hi8).ir_value(loc=loc, ip=ip),
+            Uint32(cb_lo01).ir_value(loc=loc, ip=ip),
+            Uint32(cb_lo23).ir_value(loc=loc, ip=ip),
+            Uint32(cb_hi01).ir_value(loc=loc, ip=ip),
+            Uint32(cb_hi23).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b32 la, lb, ha, hb, t, u, s2, s1, selA, selB;
+            .reg .b32 loA, hiA, loB, hiB;
+
+            and.b32 la, $4, 0xFF;
+            shr.u32 lb, $4, 8;
+            and.b32 lb, lb, 0xFF;
+            and.b32 ha, $5, 0xF;
+            shr.u32 hb, $5, 4;
+            and.b32 hb, hb, 0xF;
+
+            shl.b32 t, la, 4;
+            or.b32 t, t, la;
+            and.b32 t, t, 0x0F0F;
+            shl.b32 s2, t, 2;
+            or.b32 s2, s2, t;
+            and.b32 s2, s2, 0x3333;
+            shl.b32 u, ha, 6;
+            or.b32 u, u, ha;
+            and.b32 u, u, 0x0303;
+            shl.b32 s1, u, 3;
+            or.b32 s1, s1, u;
+            and.b32 s1, s1, 0x1111;
+            shl.b32 s1, s1, 2;
+            or.b32 selA, s2, s1;
+
+            shl.b32 t, lb, 4;
+            or.b32 t, t, lb;
+            and.b32 t, t, 0x0F0F;
+            shl.b32 s2, t, 2;
+            or.b32 s2, s2, t;
+            and.b32 s2, s2, 0x3333;
+            shl.b32 u, hb, 6;
+            or.b32 u, u, hb;
+            and.b32 u, u, 0x0303;
+            shl.b32 s1, u, 3;
+            or.b32 s1, s1, u;
+            and.b32 s1, s1, 0x1111;
+            shl.b32 s1, s1, 2;
+            or.b32 selB, s2, s1;
+
+            prmt.b32 loA, $6, $7, selA;
+            prmt.b32 hiA, $8, $9, selA;
+            prmt.b32 $0, loA, hiA, 0x5140;
+            prmt.b32 $1, loA, hiA, 0x7362;
+            prmt.b32 loB, $6, $7, selB;
+            prmt.b32 hiB, $8, $9, selB;
+            prmt.b32 $2, loB, hiB, 0x5140;
+            prmt.b32 $3, loB, hiB, 0x7362;
+        }
+        """,
+        "=r,=r,=r,=r,r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    o2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    o3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(o0), Uint32(o1), Uint32(o2), Uint32(o3)
+
+
+def nf3_codebook_pools(codebook) -> tuple:
+    """Host-side: 8 floats -> (cb_lo01, cb_lo23, cb_hi01, cb_hi23) u32 prmt pools.
+
+    Entry i's bf16 bytes: lo byte -> pool byte i of (cb_lo01|cb_lo23),
+    hi byte -> same slot of (cb_hi01|cb_hi23).  Pool pair {a,b} is prmt's
+    8-byte space indexed 0..7 by the 3-bit code.
+    """
+    import struct
+
+    assert len(codebook) == 8
+    lo = [0, 0]
+    hi = [0, 0]
+    for i, v in enumerate(codebook):
+        (f32_bits,) = struct.unpack("<I", struct.pack("<f", float(v)))
+        # round-to-nearest-even f32 -> bf16
+        bf16 = (f32_bits + 0x7FFF + ((f32_bits >> 16) & 1)) >> 16
+        reg, slot = divmod(i, 4)
+        lo[reg] |= (bf16 & 0xFF) << (8 * slot)
+        hi[reg] |= ((bf16 >> 8) & 0xFF) << (8 * slot)
+    return lo[0], lo[1], hi[0], hi[1]

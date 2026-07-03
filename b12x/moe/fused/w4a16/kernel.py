@@ -49,6 +49,8 @@ from b12x.cute.fp4 import (
     packed_dequant_e4m3x4_to_half2x2,
     packed_dequant_e8m0x4_to_bfloat2x2,
     packed_dequant_e8m0x4_to_half2x2,
+    packed_dequant_nf3x8_to_bfloat2x4,
+    nf3_codebook_pools,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
@@ -98,11 +100,16 @@ _STAGES = 4
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
-_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+_WEIGHT_LAYOUTS = {"packed", "modelopt", "nf3_2p1"}
 _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
+# NF3 codebook: 8 bf16 codepoints for the 3-bit ("nf3_2p1") weight layout. The
+# device dequant reads these as prmt pools (see nf3_codebook_pools); the host
+# injects the 4 pool words as compile-time constants into the GEMM.
+_NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e8m0_k32": "e8m0_k32",
+    "e4m3_k32": "e4m3_k32",
 }
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
@@ -610,6 +617,15 @@ class W4A16GemmKernel:
         else:
             w13_layout = "packed"
             source_n_rotation = 0
+        if weight_layout == "nf3_2p1":
+            if scale_format != "e4m3_k32":
+                raise ValueError(
+                    "nf3_2p1 W4A16 weights require scale_format='e4m3_k32'"
+                )
+            if element_dtype != "bf16":
+                raise ValueError(
+                    "nf3_2p1 W4A16 weights are bf16-activation only (v1)"
+                )
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
@@ -652,6 +668,12 @@ class W4A16GemmKernel:
                 raise ValueError(
                     "E8M0 K/32 W4A16 scales require size_k/tile_k multiples of 32"
                 )
+            if scale_format == "e4m3_k32" and (
+                size_k % 32 != 0 or tile_k % 32 != 0
+            ):
+                raise ValueError(
+                    "E4M3 K/32 W4A16 scales require size_k/tile_k multiples of 32"
+                )
         if moe_block_size not in _ALLOWED_ROUTED_SIZES:
             raise ValueError(f"unsupported moe_block_size {moe_block_size}")
         if moe_block_size != 8 and moe_block_size % 16 != 0:
@@ -675,8 +697,23 @@ class W4A16GemmKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
+        self.weight_layout_nf3 = weight_layout == "nf3_2p1"
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
+        # k32 scale cadence (two K16 rows share one scale group). Shared by the
+        # native E8M0 K/32 path and the NF3 e4m3-style K/32 path; the scale
+        # DECODE stays keyed on scale_format_e8m0_k32 (e4m3_k32 uses the e4m3
+        # decode arm, its 2**116 compensation lives in the global_scale tensor).
+        self.scale_k32 = scale_format in ("e8m0_k32", "e4m3_k32")
+        # NF3 codebook prmt pools (host-computed compile-time constants injected
+        # into the device dequant). Only consumed by the nf3_2p1 path; cheap to
+        # compute unconditionally.
+        (
+            self._nf3_cb0,
+            self._nf3_cb1,
+            self._nf3_cb2,
+            self._nf3_cb3,
+        ) = nf3_codebook_pools(_NF3_CODEBOOK)
         self.scale_group_size = int(scale_group_size)
         self.scale_k_groups = _covering_count(self.size_k, self.scale_group_size)
         self.n_tiles = _covering_count(self.size_n, self.tile_n)
@@ -744,10 +781,28 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
+        # NF3 ("nf3_2p1") stages 12-byte triples per 32-code unit instead of the
+        # 16-byte int4 unit; the per-thread unit count is unchanged, only the
+        # bytes-per-unit and the 16-byte cp.async chunk count differ.
+        self.b_unit_bytes = 12 if self.weight_layout_nf3 else 16
+        self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
+        if self.weight_layout_nf3:
+            if self.b_sh_stage_bytes % 16 != 0:
+                raise ValueError(
+                    "nf3_2p1 B stage bytes must be a multiple of 16; "
+                    f"got {self.b_sh_stage_bytes}"
+                )
+            self.b_sh_chunks = self.b_sh_stage_bytes // 16
+            self.b_sh_wr_iters_nf3 = _covering_count(
+                self.b_sh_chunks, self.cta_threads
+            )
+        else:
+            self.b_sh_chunks = self.b_sh_stage
+            self.b_sh_wr_iters_nf3 = self.b_sh_wr_iters
 
         self.s_sh_stride = 16 * self.cta_n_blocks // 16
         self.s_tb_groups = (
-            self.cta_k_blocks // 2 if scale_format == "e8m0_k32" else self.cta_k_blocks
+            self.cta_k_blocks // 2 if self.scale_k32 else self.cta_k_blocks
         )
         self.s_sh_stage = self.s_tb_groups * self.s_sh_stride
         self.tb_n_warps = self.cta_n_blocks // 4
@@ -763,7 +818,11 @@ class W4A16GemmKernel:
         self.sh_topk_off = sh_block_route_indices + sh_rd_block_route_indices
 
         sh_red_size = (2 * self.cta_n_blocks + 1) * 16 * self.cta_m_blocks
-        sh_b_size = _STAGES * self.b_sh_stage
+        # B region size in int4 (16-byte) units. NF3 units are 12 bytes, so the
+        # region is 0.75x; round the total up to a 16-byte multiple so the
+        # following SMEM regions keep their 16-byte alignment (exact for all
+        # supported tiles since b_sh_stage is a multiple of 4).
+        sh_b_size = _covering_count(_STAGES * self.b_sh_stage_bytes, 16)
         sh_size_min = min(sh_red_size, sh_b_size)
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
@@ -1447,8 +1506,10 @@ class W4A16GemmKernel:
         a_gl_stride = Int32(self.size_k // 8)
         b_gl_stride = Int32(16 * self.size_n // (_PACK_FACTOR * 4))
         s_gl_stride = Int32(self.scale_n_groups)
-        if cutlass.const_expr(self.scale_format_e8m0_k32):
-            if cutlass.const_expr(self.has_logical_tail):
+        if cutlass.const_expr(self.scale_k32):
+            if cutlass.const_expr(
+                self.scale_format_e8m0_k32 and self.has_logical_tail
+            ):
                 scales_expert_stride = Int32(self.scale_k_groups * self.scale_n_groups)
             else:
                 scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
@@ -1876,8 +1937,22 @@ class W4A16GemmKernel:
                         )
 
                         for jj in cutlass.range_constexpr(4):
-                            q, s = self._select_b_scale_register(jj, b_scale_cur)
-                            self._scaled_dequant_b_fragment(b_frag, q, s)
+                            if cutlass.const_expr(self.weight_layout_nf3):
+                                # NF3 triple: lo16 = half (jj % 2) of word
+                                # (jj // 2); hi8 = byte jj of the hi word; scale
+                                # register is the same per-jj lane as packed.
+                                lo_w = b_scale_cur[0, jj // 2]
+                                lo16 = (lo_w >> Uint32(16 * (jj % 2))) & Uint32(0xFFFF)
+                                hi8 = (b_scale_cur[0, 2] >> Uint32(8 * jj)) & Uint32(
+                                    0xFF
+                                )
+                                s = b_scale_cur[1, jj]
+                                self._scaled_dequant_b_fragment_nf3(
+                                    b_frag, lo16, hi8, s
+                                )
+                            else:
+                                q, s = self._select_b_scale_register(jj, b_scale_cur)
+                                self._scaled_dequant_b_fragment(b_frag, q, s)
                             if cutlass.const_expr(uses_m_block_8):
                                 self._mma_accumulate_m8(
                                     acc,
@@ -2295,6 +2370,29 @@ class W4A16GemmKernel:
                 pipe,
                 kk,
             )
+        elif cutlass.const_expr(self.weight_layout_nf3):
+            # NF3-MAPPING-V1: the thread's 32-code unit index within the pipe's
+            # B region equals the stock staged-unit index (algebraically
+            # identical to b_sh_stride*kk + b_sh_rd): cur_group_id is the K16 row
+            # within the tile, (tid % b_sh_stride) is the N-pair. Each unit is a
+            # 12-byte (lo0, lo1, hi) triple; three scalar u32 loads over stride-3
+            # words are bank-conflict free (gcd(3, 32) == 1). q3 is unused.
+            nf3_warp_id = tid // Int32(32)
+            nf3_warp_row = nf3_warp_id // Int32(self.tb_n_warps)
+            nf3_group = Int32(self.b_sh_wr_iters) * nf3_warp_row + kk
+            nf3_unit = nf3_group * Int32(self.b_sh_stride) + (
+                tid % Int32(self.b_sh_stride)
+            )
+            b_addr = (
+                smem_base
+                + Int32(self.sh_b_off * 16)
+                + pipe * Int32(self.b_sh_stage_bytes)
+                + nf3_unit * Int32(12)
+            )
+            q0 = ld_shared_u32(b_addr)
+            q1 = ld_shared_u32(b_addr + Int32(4))
+            q2 = ld_shared_u32(b_addr + Int32(8))
+            q3 = Uint32(0)
         else:
             b_addr = self._int4_addr(
                 smem_base,
@@ -2308,7 +2406,7 @@ class W4A16GemmKernel:
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
         cur_group_id = Int32(self.b_sh_wr_iters) * warp_row + kk
-        if cutlass.const_expr(self.scale_format_e8m0_k32):
+        if cutlass.const_expr(self.scale_k32):
             scale_group_id = cur_group_id // Int32(2)
         else:
             scale_group_id = cur_group_id
@@ -2442,6 +2540,30 @@ class W4A16GemmKernel:
         frag[0, 1] = b0_1
         frag[1, 0] = b1_0
         frag[1, 1] = b1_1
+
+    @cute.jit
+    def _scaled_dequant_b_fragment_nf3(
+        self, frag: cute.Tensor, lo16: Uint32, hi8: Uint32, s: Uint32
+    ):
+        # NF3: 8 3-bit codes (2 lo-bits in lo16, 1 hi-bit in hi8) -> 4 bf16x2
+        # codebook fragments, in the SAME element order the packed path uses:
+        # o0=(cb[c0],cb[c1]) -> frag[0,0], o1 -> frag[0,1], o2 -> frag[1,0],
+        # o3 -> frag[1,1]. frag[0,*] takes the N-col-0 scale lane, frag[1,*] the
+        # N-col-1 lane (identical broadcast to _scaled_dequant_b_fragment).
+        o0, o1, o2, o3 = packed_dequant_nf3x8_to_bfloat2x4(
+            lo16,
+            hi8,
+            Uint32(self._nf3_cb0),
+            Uint32(self._nf3_cb1),
+            Uint32(self._nf3_cb2),
+            Uint32(self._nf3_cb3),
+        )
+        s_lane0 = bfloat2_broadcast_lane(s, Int32(0))
+        s_lane1 = bfloat2_broadcast_lane(s, Int32(1))
+        frag[0, 0] = self._elem2_mul(o0, s_lane0)
+        frag[0, 1] = self._elem2_mul(o1, s_lane0)
+        frag[1, 0] = self._elem2_mul(o2, s_lane1)
+        frag[1, 1] = self._elem2_mul(o3, s_lane1)
 
     @cute.jit
     def _mma_accumulate_m8(
@@ -2740,7 +2862,40 @@ class W4A16GemmKernel:
                     (row < block_valid_rows).to(Int32),
                 )
 
-        for i in cutlass.range_constexpr(self.b_sh_wr_iters):
+        if cutlass.const_expr(self.weight_layout_nf3):
+            # NF3 flat-span staging: the packer lays the per-(expert,
+            # output_n_tile, k-stage) B block out as ONE contiguous 12-byte-triple
+            # span (n_tile-major, then K16-row, then N-pair), so we copy it
+            # verbatim as 16-byte cp.async chunks. SMEM byte X of the pipe's B
+            # region == global byte X of the span, so the register read (unit*12)
+            # indexes it directly. b_gl_rd_base is unused on this path.
+            nf3_units_per_expert = (self.size_n * self.size_k) // 32
+            nf3_ntile_stride = (self.size_k // 16) * (self.tile_n // 2)
+            nf3_span_base_unit = (
+                Int32(nf3_units_per_expert) * expert_idx
+                + Int32(nf3_ntile_stride) * output_n_tile
+                + tile_idx * Int32(self.cta_k_blocks * self.b_sh_stride)
+            )
+            for i in cutlass.range_constexpr(self.b_sh_wr_iters_nf3):
+                nf3_chunk = Int32(i * self.cta_threads) + tid
+                b_dst = (
+                    smem_base
+                    + Int32(self.sh_b_off * 16)
+                    + pipe * Int32(self.b_sh_stage_bytes)
+                    + nf3_chunk * Int32(16)
+                )
+                # int32-element index of the chunk's first word:
+                # (span_base_unit*12 + chunk*16) / 4 = span_base_unit*3 + chunk*4.
+                b_src_i32 = nf3_span_base_unit * Int32(3) + nf3_chunk * Int32(4)
+                cp_async4_shared_global_pred(
+                    b_dst,
+                    get_ptr_as_int64(b_i32_flat, b_src_i32),
+                    (nf3_chunk < Int32(self.b_sh_chunks)).to(Int32),
+                )
+
+        for i in cutlass.range_constexpr(
+            0 if self.weight_layout_nf3 else self.b_sh_wr_iters
+        ):
             b_src_int4 = (
                 b_gl_rd_base
                 + tile_idx * Int32(self.cta_k_blocks) * b_gl_stride
@@ -3525,6 +3680,7 @@ class W4A16FusedMoeKernel:
         w13_layout: str = "w13",
         direct_topk_routes: bool = False,
         tc_decode_fused_sum: bool = False,
+        tc_zero_output: bool = True,
         collect_activation_amax: bool = False,
     ):
         activation = normalize_moe_activation(activation)
@@ -3544,6 +3700,10 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        # When two TC-decode launches share one pre-zeroed output (the NF3 hybrid
+        # runs an NVFP4 launch then an NF3 launch into the same tensor), only the
+        # first must zero it. Default True preserves single-launch behavior.
+        self.tc_zero_output = bool(tc_zero_output)
         self.collect_activation_amax = bool(collect_activation_amax)
         if self.collect_activation_amax and bool(direct_topk_routes):
             raise ValueError("activation amax collection requires route-packed W4A16")
@@ -3662,6 +3822,7 @@ class W4A16FusedMoeKernel:
             self.element_dtype,
             self.fast_math,
             self.direct_topk_routes,
+            self.tc_zero_output,
             self.collect_activation_amax,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -3819,13 +3980,17 @@ class W4A16FusedMoeKernel:
             # (top_k routes atomically summed into the SAME token row), so the
             # zero span is active_m*hidden_size -- NOT the per-route
             # active_m*top_k*hidden_size of _zero_fc2_output.
-            zidx = cta * Int32(self.cta_threads) + tid
-            zstride = grid_x * Int32(self.cta_threads)
-            ztotal = active_m * Int32(self.hidden_size)
-            zzero = self._cast_elem(cutlass.Float32(0.0))
-            while zidx < ztotal:
-                fc2_bf16_flat[zidx] = zzero
-                zidx += zstride
+            # tc_zero_output=False skips the zero (a paired earlier launch has
+            # already zeroed the shared output); the grid barrier below is
+            # unconditional so ordering is preserved either way.
+            if cutlass.const_expr(self.tc_zero_output):
+                zidx = cta * Int32(self.cta_threads) + tid
+                zstride = grid_x * Int32(self.cta_threads)
+                ztotal = active_m * Int32(self.hidden_size)
+                zzero = self._cast_elem(cutlass.Float32(0.0))
+                while zidx < ztotal:
+                    fc2_bf16_flat[zidx] = zzero
+                    zidx += zstride
 
         if cutlass.const_expr(self.activation_is_gated):
             self.fc1._run_persistent_gemm(
@@ -4336,13 +4501,17 @@ def _normalize_scale_format(scale_format: str) -> str:
         return _SCALE_FORMATS[scale_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            "scale_format must be one of 'e4m3_k16', 'e8m0_k32', or 'e4m3_k32', "
             f"got {scale_format!r}"
         ) from exc
 
 
 def _scale_group_size(scale_format: str) -> int:
-    return 32 if _normalize_scale_format(scale_format) == "e8m0_k32" else 16
+    return (
+        32
+        if _normalize_scale_format(scale_format) in ("e8m0_k32", "e4m3_k32")
+        else 16
+    )
 
 
 def _scale_fake_int32_elements(
@@ -4750,6 +4919,7 @@ def compile_w4a16_fused_moe(
     direct_topk_routes: bool = False,
     tc_decode_fused_sum: bool = False,
     collect_activation_amax: bool = False,
+    force_tile_config: tuple[int, int, int, int] | None = None,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -4783,7 +4953,7 @@ def compile_w4a16_fused_moe(
     )
     if direct_topk_routes and (
         int(size_m) > direct_topk_m_cap
-        or weight_layout != "packed"
+        or weight_layout not in ("packed", "nf3_2p1")
         or bool(zero_fc2_output)
     ):
         raise ValueError(
@@ -4977,6 +5147,44 @@ def compile_w4a16_fused_moe(
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
+    if force_tile_config is not None:
+        # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
+        # NF3 ("nf3_2p1") flat-span weight layout is packed for a specific CTA
+        # N-tile, so hybrid deployments pin ONE tile config across every m
+        # regime instead of the m-dependent auto selection (and TC-decode
+        # wide-N overrides) above. Overrides whatever was selected; the tiles
+        # land in the GEMM cache keys, so no cache collision is possible.
+        fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
+            int(v) for v in force_tile_config
+        )
+        fc1_cta_threads = (fc1_tile_n * fc1_tile_k) // 64
+        fc2_cta_threads = (fc2_tile_n * fc2_tile_k) // 64
+        if fc1_cta_threads != fc2_cta_threads:
+            raise ValueError(
+                "force_tile_config FC1/FC2 thread counts must match, got "
+                f"{fc1_cta_threads} vs {fc2_cta_threads}"
+            )
+        for name, forced_pn, forced_pk, forced_tn, forced_tk in (
+            ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
+            ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
+        ):
+            if not _candidate_tile_fits(
+                problem_n=forced_pn,
+                problem_k=forced_pk,
+                cta_m_blocks=_covering_count(moe_block_size, 16),
+                tile_n=forced_tn,
+                tile_k=forced_tk,
+                cta_threads=fc1_cta_threads,
+                max_shared_mem=int(max_shared_mem) - 512,
+                scale_format=scale_format,
+                allow_logical_tail=allow_native_logical_tail,
+            ):
+                raise ValueError(
+                    f"force_tile_config {name} tile "
+                    f"(tile_k={forced_tk}, tile_n={forced_tn}) does not fit "
+                    f"problem N/K={forced_pn}/{forced_pk} at "
+                    f"moe_block_size={moe_block_size}"
+                )
     kernel = W4A16FusedMoeKernel(
         size_m=size_m,
         hidden_size=hidden_size,
@@ -5071,6 +5279,18 @@ def compile_w4a16_fused_moe(
         w2_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Uint8,
             (num_experts * hidden_size * (intermediate_size // 2),),
+            assumed_align=16,
+        )
+    elif weight_layout == "nf3_2p1":
+        # NF3: int32, 3 words per 32-code unit; (size_n // 2) units per K16 row.
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (hidden_size // 16) * (fc1_cols // 2) * 3,),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (intermediate_size // 16) * (hidden_size // 2) * 3,),
             assumed_align=16,
         )
     else:
@@ -6476,7 +6696,7 @@ def run_w4a16_moe(
     use_tc_decode = bool(
         (not collect_activation_amax)
         and (fused_launch is None or preplanned_tc_decode)
-        and weight_layout == "packed"
+        and weight_layout in ("packed", "nf3_2p1")
         and expert_map is None
         and is_gated
         and element_dtype == "bf16"
@@ -6491,7 +6711,7 @@ def run_w4a16_moe(
     direct_topk_eligible = (
         (not collect_activation_amax)
         and (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
-        and weight_layout == "packed"
+        and weight_layout in ("packed", "nf3_2p1")
         and expert_map is None
     )
     use_direct_topk_routes = bool(

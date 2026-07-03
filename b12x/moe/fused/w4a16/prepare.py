@@ -11,6 +11,7 @@ from b12x.moe.fused.w4a16.host import (
     W4A16PackedBuffers,
     make_w4a16_packed_buffers as _make_w4a16_packed_buffers,
     unswizzle_expert_scales,
+    validate_nf3_moe_inputs,
     validate_w4a16_packed_inputs,
 )
 
@@ -37,6 +38,13 @@ _W13_LAYOUTS = {
     "gate_up": "w31",
 }
 _MODEL_OPT_NVFP4_FORMATS = {"modelopt_nvfp4"}
+# NF3 ("nf3_2p1") 3-bit codebook. Must match kernel._NF3_CODEBOOK. The scale
+# convention (see NF3_KERNEL_MODSPEC.md): weights decode to the FULL-precision
+# bf16 codebook value, the K/32 scale byte encodes t_s * 2**-4 (e4m3-style,
+# E4=0 arm), and the per-tensor global_scale carries the matching 2**116.
+_NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
+_NF3_SCALE_GLOBAL = 2.0**116
+_NF3_SCALE_FLOOR = 2.0 ** -10  # f16(t_s*2^-4) must stay f16-NORMAL (>=2^-14) -> t_s >= 2^-10; real early-layer scales dip below the old 2^-7
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,39 @@ class W4A16ModelOptWeights:
     # == "up_gate" physical) needs a row rotation before W4A16 SwiGLU; "w31"
     # (== "gate_up") is already in the kernel-native order.
     w13_layout: str = "w13"
+
+
+@dataclass(frozen=True)
+class PreparedNF3MoeWeights:
+    """Runtime NF3 ("nf3_2p1") hybrid-expert W4A16 weights.
+
+    Mirrors W4A16PackedWeights so run_w4a16_moe consumes it identically. The
+    packed planes are int32 (3 words per 32-code unit); the K/32 scales are
+    e4m3-style bytes viewed uint8; the global scales carry the 2**116 the NF3
+    scale convention defers out of the codebook. fc1_tile_n / fc2_tile_n record
+    the CTA N-tile the flat-span packing was built for -- the kernel MUST be
+    compiled/launched with the SAME tile_n (read them back from the compiled
+    W4A16FusedMoeCompileResult).
+    """
+
+    w13: torch.Tensor
+    w13_scale: torch.Tensor
+    w13_global_scale: torch.Tensor
+    w2: torch.Tensor
+    w2_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
+    workspace: torch.Tensor
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    is_gated: bool
+    params_dtype: torch.dtype
+    fc1_tile_n: int
+    fc2_tile_n: int
+    source_format: str = "nf3_2p1"
+    w13_layout: str = "packed"
+    weight_layout: str = "nf3_2p1"
+    scale_format: str = "e4m3_k32"
 
 
 def _make_workspace(
@@ -617,6 +658,179 @@ def _permute_nvfp4_scales(
     return packed_scales, packed_global.contiguous()
 
 
+# ---------------------------------------------------------------------------
+# NF3 ("nf3_2p1") packing.
+#
+# The kernel's B operand is a stream of 32-code "units" (2 N-columns x 16 K),
+# each a 12-byte (lo0, lo1, hi) triple. The GEMM reads unit index
+#   unit = cur_group_id * (tile_n // 2) + (tid % (tile_n // 2))
+# from the pipe's B SMEM region (see kernel._load_b_scale_registers,
+# NF3-MAPPING-V1) which -- verified algebraically -- equals the stock staged
+# unit index; cur_group_id is the K16 row within the CTA-K tile, (tid %
+# (tile_n // 2)) is the N-pair. The flat-span staging copies the packer's
+# global bytes verbatim, so the packer must place, at global unit
+#   I = nt*(K/16)*(tile_n/2) + R*(tile_n/2) + p          (n_tile-major)
+# the codes for CTA N-tile nt, K16-row-global R, N-pair p. The 4 jj words in
+# the triple correspond to the stock 4-u32 group; per jj the 8 codes decode
+# (packed_dequant_nf3x8_to_bfloat2x4) to fragments
+#   frag[0,0]=(cb[c0],cb[c1]) frag[0,1]=(cb[c2],cb[c3])
+#   frag[1,0]=(cb[c4],cb[c5]) frag[1,1]=(cb[c6],cb[c7])
+# which must equal the stock fragment identity for this thread/jj:
+#   frag[0,0]=(C1@K0,   C1@K0+1)  frag[0,1]=(C1@K0+8, C1@K0+9)
+#   frag[1,0]=(C2@K0,   C2@K0+1)  frag[1,1]=(C2@K0+8, C2@K0+9)
+# where, from _repack_4bit_no_perm composed with the read mapping,
+#   wru = p + (tile_n/2)*nt ; n_tile_64 = wru // 32 ; th_id = wru % 32
+#   tc_col = th_id // 4 ; tc_row = (th_id % 4) * 2
+#   C1 = n_tile_64*64 + jj*16 + tc_col ; C2 = C1 + 8 ; K0 = R*16 + tc_row
+# => code order [c0..c7] =
+#   [ (C1,K0),(C1,K0+1),(C1,K0+8),(C1,K0+9),
+#     (C2,K0),(C2,K0+1),(C2,K0+8),(C2,K0+9) ].
+# This whole chain is asserted by _nf3_pack_selftest against an independent
+# torch simulation of the kernel read+dequant.
+# ---------------------------------------------------------------------------
+
+
+def _nf3_check_shapes(size_k: int, size_n: int, tile_n: int) -> None:
+    if int(size_k) % 32 != 0:
+        raise ValueError(f"NF3 requires K % 32 == 0, got {size_k}")
+    if int(size_n) % 64 != 0:
+        raise ValueError(f"NF3 requires N % 64 == 0, got {size_n}")
+    if int(tile_n) % 16 != 0 or int(tile_n) < 64:
+        raise ValueError(f"NF3 tile_n must be a multiple of 16 and >= 64, got {tile_n}")
+    if int(size_n) % int(tile_n) != 0:
+        raise ValueError(f"NF3 requires N ({size_n}) divisible by tile_n ({tile_n})")
+
+
+def _nf3_code_gather_index(
+    size_k: int, size_n: int, tile_n: int, device: torch.device
+) -> torch.Tensor:
+    """[units, 4, 8] flat indices into a contiguous [N, K] code tensor.
+
+    Entry [I, jj, v] is the (C * size_k + K) index of the v-th code (NF3 order)
+    of triple word jj at global unit I. Built from the exact _repack /
+    read-mapping math documented above so the packer and the kernel agree.
+    """
+    _nf3_check_shapes(size_k, size_n, tile_n)
+    npairs = int(tile_n) // 2
+    k16 = int(size_k) // 16
+    units = k16 * (int(size_n) // 2)
+    ntile_units = k16 * npairs
+    idx_i = torch.arange(units, device=device, dtype=torch.long)
+    nt = idx_i // ntile_units
+    within = idx_i % ntile_units
+    R = within // npairs
+    p = within % npairs
+    wru = p + npairs * nt
+    n_tile_64 = wru // 32
+    th_id = wru % 32
+    tc_col = th_id // 4
+    tc_row = (th_id % 4) * 2
+    jj = torch.arange(4, device=device, dtype=torch.long)
+    col1 = jj[None, :] * 16 + tc_col[:, None]  # [units, 4]
+    col2 = col1 + 8
+    C1 = n_tile_64[:, None] * 64 + col1  # [units, 4]
+    C2 = n_tile_64[:, None] * 64 + col2
+    K0 = (R * 16 + tc_row)[:, None]  # [units, 1]
+    k_off = torch.tensor([0, 1, 8, 9], device=device, dtype=torch.long)
+    idx = torch.empty((units, 4, 8), device=device, dtype=torch.long)
+    for t in range(4):
+        idx[:, :, t] = C1 * int(size_k) + (K0 + k_off[t])
+        idx[:, :, 4 + t] = C2 * int(size_k) + (K0 + k_off[t])
+    return idx
+
+
+def _nf3_pack_codes(
+    codes_nk: torch.Tensor, *, size_k: int, size_n: int, tile_n: int
+) -> torch.Tensor:
+    """Pack one expert's [N, K] codes (0..7) into int32 [units*3] NF3 planes."""
+    if tuple(codes_nk.shape) != (int(size_n), int(size_k)):
+        raise ValueError(
+            f"expected codes shape {(int(size_n), int(size_k))}, "
+            f"got {tuple(codes_nk.shape)}"
+        )
+    device = codes_nk.device
+    flat = codes_nk.reshape(-1).to(torch.int64)
+    if bool((flat < 0).any()) or bool((flat > 7).any()):
+        raise ValueError("NF3 codes must be integers in [0, 7]")
+    idx = _nf3_code_gather_index(size_k, size_n, tile_n, device)  # [units,4,8]
+    g = flat[idx.reshape(-1)].reshape(idx.shape)  # [units,4,8]
+    sh_lo = (torch.arange(4, device=device, dtype=torch.int64) * 2).view(1, 1, 4)
+    sh_hi = torch.arange(4, device=device, dtype=torch.int64).view(1, 1, 4)
+    la = ((g[:, :, 0:4] & 3) << sh_lo).sum(-1)  # [units,4]
+    lb = ((g[:, :, 4:8] & 3) << sh_lo).sum(-1)
+    lo16 = la | (lb << 8)
+    ha = (((g[:, :, 0:4] >> 2) & 1) << sh_hi).sum(-1)
+    hb = (((g[:, :, 4:8] >> 2) & 1) << sh_hi).sum(-1)
+    hi8 = ha | (hb << 4)
+    lo0 = lo16[:, 0] | (lo16[:, 1] << 16)
+    lo1 = lo16[:, 2] | (lo16[:, 3] << 16)
+    hi = hi8[:, 0] | (hi8[:, 1] << 8) | (hi8[:, 2] << 16) | (hi8[:, 3] << 24)
+    words = torch.stack([lo0, lo1, hi], dim=1).reshape(-1)  # int64 in [0, 2**32)
+    words = torch.where(words >= 2**31, words - 2**32, words)
+    return words.to(torch.int32).contiguous()
+
+
+def _process_nf3_packed_scales(packed_scales: torch.Tensor) -> torch.Tensor:
+    """[rows, N] float t_s -> [rows, N] uint8 e4m3-style byte = highbyte(f16(t_s*2**-4)<<1)."""
+    packed_scales = packed_scales.to(torch.float16)
+    packed_scales = packed_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
+        packed_scales.size(0),
+        -1,
+    )
+    packed_scales = (packed_scales.float() * (2.0**-4)).to(torch.float16)
+    packed_scales = packed_scales.view(torch.int16) << 1
+    packed_scales = packed_scales.view(torch.uint8)
+    return packed_scales[:, 1::2].contiguous()
+
+
+def _nf3_pack_scales(
+    t_s: torch.Tensor, *, size_k: int, size_n: int
+) -> torch.Tensor:
+    """Pack one expert's [N, K//32] scales into uint8 [K//32, N] (permuted)."""
+    if tuple(t_s.shape) != (int(size_n), int(size_k) // 32):
+        raise ValueError(
+            f"expected scale shape {(int(size_n), int(size_k) // 32)}, "
+            f"got {tuple(t_s.shape)}"
+        )
+    t_s = t_s.to(torch.float32)
+    # zero scales (whole group exactly zero in the checkpoint) MUST stay zero:
+    # stored byte 0 decodes to exact +0.0. Flooring them to _NF3_SCALE_FLOOR
+    # injects noise into all-zero groups (real early-layer experts have many)
+    # -> compounding early-layer error -> prompt-dependent degeneration.
+    zero_mask = t_s == 0
+    t_s = t_s.clamp(min=_NF3_SCALE_FLOOR)
+    t_s[zero_mask] = 0.0
+    if bool((t_s >= 32.0).any()):
+        raise ValueError("NF3 scales must be < 32 for the e4m3 K/32 encoding")
+    permuted = _permute_packed_scales(
+        t_s.T.contiguous(),
+        size_k=size_k,
+        size_n=size_n,
+        group_size=32,
+    )  # [K//32, N] float
+    return _process_nf3_packed_scales(permuted)
+
+
+def _nf3_pack_code_experts(
+    codes: torch.Tensor, *, size_k: int, size_n: int, tile_n: int
+) -> torch.Tensor:
+    packed = [
+        _nf3_pack_codes(codes[e], size_k=size_k, size_n=size_n, tile_n=tile_n)
+        for e in range(int(codes.shape[0]))
+    ]
+    return torch.stack(packed, dim=0).contiguous()
+
+
+def _nf3_pack_scale_experts(
+    t_s: torch.Tensor, *, size_k: int, size_n: int
+) -> torch.Tensor:
+    packed = [
+        _nf3_pack_scales(t_s[e], size_k=size_k, size_n=size_n)
+        for e in range(int(t_s.shape[0]))
+    ]
+    return torch.stack(packed, dim=0).contiguous()
+
+
 def _prepare_w4a16_packed_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
@@ -1146,11 +1360,194 @@ def make_w4a16_packed_buffers(
     )
 
 
+def prepare_nf3_moe_weights(
+    w13_codes: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_codes: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    activation: str,
+    fc1_tile_n: int,
+    fc2_tile_n: int,
+    params_dtype: torch.dtype = torch.bfloat16,
+) -> PreparedNF3MoeWeights:
+    """Pack NF3 codes/scales into the runtime "nf3_2p1" W4A16 layout.
+
+    Inputs are per-expert integer codes (0..7) in kernel-native output order
+    (gate/up already resolved for FC1) and per-group float scales ``t_s``:
+        w13_codes [E, 2*I, hidden]   w13_scale [E, 2*I, hidden//32]
+        w2_codes  [E, hidden, I]     w2_scale  [E, hidden, I//32]
+    ``fc1_tile_n`` / ``fc2_tile_n`` MUST equal the CTA N-tiles the kernel will
+    use (read them from the compiled W4A16FusedMoeCompileResult) -- the
+    flat-span layout is tile_n specific.
+    """
+    if params_dtype != torch.bfloat16:
+        raise ValueError("nf3_2p1 W4A16 weights are bf16-only for v1")
+    shape = validate_nf3_moe_inputs(
+        w13_codes,
+        w13_scale,
+        w2_codes,
+        w2_scale,
+        activation=activation,
+    )
+    device = w13_codes.device
+    packed_w13 = _nf3_pack_code_experts(
+        w13_codes, size_k=shape.hidden_size, size_n=shape.w13_rows, tile_n=fc1_tile_n
+    )
+    packed_w2 = _nf3_pack_code_experts(
+        w2_codes,
+        size_k=shape.intermediate_size,
+        size_n=shape.hidden_size,
+        tile_n=fc2_tile_n,
+    )
+    packed_w13_scale = _nf3_pack_scale_experts(
+        w13_scale, size_k=shape.hidden_size, size_n=shape.w13_rows
+    )
+    packed_w2_scale = _nf3_pack_scale_experts(
+        w2_scale, size_k=shape.intermediate_size, size_n=shape.hidden_size
+    )
+    global_scale = torch.full(
+        (shape.num_experts,), _NF3_SCALE_GLOBAL, dtype=torch.float32, device=device
+    )
+    return PreparedNF3MoeWeights(
+        w13=packed_w13,
+        w13_scale=packed_w13_scale,
+        w13_global_scale=global_scale,
+        w2=packed_w2,
+        w2_scale=packed_w2_scale,
+        w2_global_scale=global_scale.clone(),
+        workspace=_make_workspace(device, max_blocks_per_sm=4),
+        hidden_size=shape.hidden_size,
+        intermediate_size=shape.intermediate_size,
+        num_experts=shape.num_experts,
+        is_gated=shape.is_gated,
+        params_dtype=params_dtype,
+        fc1_tile_n=int(fc1_tile_n),
+        fc2_tile_n=int(fc2_tile_n),
+    )
+
+
+def _nf3_pack_selftest() -> None:
+    """Prove the packer matches the kernel's read+dequant chain (torch/CPU).
+
+    Packs random codes, then INDEPENDENTLY simulates the kernel's flat-span
+    staging + register read (unit = cur_group_id*(tile_n//2) + tid%(tile_n//2))
+    + packed_dequant_nf3x8 fragment placement in pure torch, and asserts the
+    reconstructed dequantized matrix equals codebook[codes] at every (N, K).
+    """
+    codebook = _NF3_CODEBOOK
+
+    def simulate(packed, size_k, size_n, tile_n, tile_k):
+        cta_threads = tile_n * tile_k // 64
+        b_sh_stride = tile_n // 2
+        cta_k_blocks = tile_k // 16
+        b_sh_stage = b_sh_stride * cta_k_blocks
+        b_sh_wr_iters = b_sh_stage // cta_threads
+        tb_n_warps = tile_n // 64
+        b_chunks = b_sh_stage * 12 // 16
+        wr_iters_nf3 = (b_chunks + cta_threads - 1) // cta_threads
+        ntile_stride = (size_k // 16) * (tile_n // 2)
+        n_tiles = size_n // tile_n
+        k_tiles = size_k // tile_k
+        packed = packed.tolist()
+        w = [[None] * size_n for _ in range(size_k)]
+
+        def u32(x):
+            return x & 0xFFFFFFFF
+
+        for nt in range(n_tiles):
+            for tile_idx in range(k_tiles):
+                span_base_unit = (
+                    nt * ntile_stride + tile_idx * cta_k_blocks * b_sh_stride
+                )
+                smem = {}
+                for i in range(wr_iters_nf3):
+                    for tid in range(cta_threads):
+                        c = i * cta_threads + tid
+                        if c >= b_chunks:
+                            continue
+                        for word in range(4):
+                            smem[c * 4 + word] = u32(
+                                packed[span_base_unit * 3 + c * 4 + word]
+                            )
+                for tid in range(cta_threads):
+                    warp_row = (tid // 32) // tb_n_warps
+                    for kk in range(b_sh_wr_iters):
+                        cur = b_sh_wr_iters * warp_row + kk
+                        unit = cur * b_sh_stride + (tid % b_sh_stride)
+                        lo0 = smem[unit * 3 + 0]
+                        lo1 = smem[unit * 3 + 1]
+                        hi = smem[unit * 3 + 2]
+                        R = tile_idx * cta_k_blocks + cur
+                        p = tid % b_sh_stride
+                        for jj in range(4):
+                            lo_w = lo0 if (jj // 2) == 0 else lo1
+                            lo16 = (lo_w >> (16 * (jj % 2))) & 0xFFFF
+                            hi8 = (hi >> (8 * jj)) & 0xFF
+                            la = lo16 & 0xFF
+                            lb = (lo16 >> 8) & 0xFF
+                            ha = hi8 & 0xF
+                            hb = (hi8 >> 4) & 0xF
+
+                            def code(byte2, nib1, j):
+                                return ((byte2 >> (2 * j)) & 3) | (
+                                    ((nib1 >> j) & 1) << 2
+                                )
+
+                            cds = [code(la, ha, j) for j in range(4)] + [
+                                code(lb, hb, j) for j in range(4)
+                            ]
+                            wru = p + (tile_n // 2) * nt
+                            n64 = wru // 32
+                            th = wru % 32
+                            tc_col = th // 4
+                            tc_row = (th % 4) * 2
+                            col1 = jj * 16 + tc_col
+                            c1 = n64 * 64 + col1
+                            c2 = c1 + 8
+                            k0 = R * 16 + tc_row
+                            w[k0 + 0][c1] = codebook[cds[0]]
+                            w[k0 + 1][c1] = codebook[cds[1]]
+                            w[k0 + 8][c1] = codebook[cds[2]]
+                            w[k0 + 9][c1] = codebook[cds[3]]
+                            w[k0 + 0][c2] = codebook[cds[4]]
+                            w[k0 + 1][c2] = codebook[cds[5]]
+                            w[k0 + 8][c2] = codebook[cds[6]]
+                            w[k0 + 9][c2] = codebook[cds[7]]
+        return w
+
+    torch.manual_seed(0)
+    cases = [
+        (256, 128, 128, 128),
+        (256, 128, 128, 64),
+        (64, 256, 256, 64),
+        (512, 256, 256, 64),
+    ]
+    for size_k, size_n, tile_n, tile_k in cases:
+        codes = torch.randint(0, 8, (size_n, size_k), dtype=torch.int64)
+        packed = _nf3_pack_codes(
+            codes, size_k=size_k, size_n=size_n, tile_n=tile_n
+        )
+        w = simulate(packed, size_k, size_n, tile_n, tile_k)
+        for k in range(size_k):
+            for n in range(size_n):
+                expect = _NF3_CODEBOOK[int(codes[n, k])]
+                got = w[k][n]
+                assert got is not None, f"unfilled ({k},{n}) for {(size_k, size_n, tile_n, tile_k)}"
+                assert abs(got - expect) < 1e-9, (
+                    f"mismatch at ({k},{n}) for {(size_k, size_n, tile_n, tile_k)}: "
+                    f"{got} != {expect}"
+                )
+    print("nf3 pack self-test PASSED")
+
+
 __all__ = [
+    "PreparedNF3MoeWeights",
     "W4A16PackedBuffers",
     "W4A16ModelOptWeights",
     "W4A16PackedWeights",
     "make_w4a16_packed_buffers",
+    "prepare_nf3_moe_weights",
     "prepare_w4a16_compressed_tensors_weights",
     "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fp4_e8m0_k32_weights",
