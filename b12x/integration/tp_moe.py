@@ -8016,7 +8016,7 @@ def _tiny_decode_enabled() -> bool:
 
 def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -> bool:
     return (
-        num_tokens == 1
+        1 <= num_tokens <= 4
         and activation == "silu"
         and k % 256 == 0
         and n % 256 == 0

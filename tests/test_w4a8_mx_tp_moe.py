@@ -248,7 +248,7 @@ def test_w4a8_mx_w31_layout_flip() -> None:
         )
 
 
-@pytest.mark.parametrize("m", [1, 4])
+@pytest.mark.parametrize("m", [1, 2, 4])
 def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
@@ -271,7 +271,7 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
         weight_plan=weight_plan,
         quant_mode="w4a8_mx",
     )
-    assert plan.implementation == ("micro" if m == 1 else "dynamic")
+    assert plan.implementation == "micro"
 
     x, topk_ids, topk_weights = _routed_inputs(m, 33)
     ref = moe_reference_w4a16_fp4_e8m0_k32(
@@ -293,7 +293,7 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
     prepared = _prepare(weights)
     out = _run(m, prepared)
     n_out = out.float().norm().item()
-    assert n_out > 0.01, f"w4a8_mx dynamic output near-zero (norm={n_out})"
+    assert n_out > 0.01, f"w4a8_mx tiny output near-zero (norm={n_out})"
     cos = torch.nn.functional.cosine_similarity(
         out.float().flatten(), ref.float().flatten(), dim=0
     ).item()
