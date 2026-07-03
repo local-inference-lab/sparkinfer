@@ -97,6 +97,70 @@ def validate_w4a16_packed_inputs(
     )
 
 
+def validate_nf3_moe_inputs(
+    w13_codes: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_codes: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    activation: str,
+) -> W4A16PackedShape:
+    """Validate NF3 ("nf3_2p1") code/scale inputs to the packer.
+
+    Codes are integer tensors of values 0..7 in kernel-native output order:
+        w13_codes [E, 2*I, hidden]  w2_codes [E, hidden, I]
+    Scales are per-K/32-group ``t_s`` floats:
+        w13_scale [E, 2*I, hidden//32]  w2_scale [E, hidden, I//32]
+    The NF3 runtime contract requires K % 32 == 0 and N % 64 == 0 for both
+    GEMMs (the scale byte encoding and the 64-N tile packing).
+    """
+    is_gated = validate_activation(activation)
+    _int_dtypes = (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64)
+    if w13_codes.dtype not in _int_dtypes or w2_codes.dtype not in _int_dtypes:
+        raise TypeError("NF3 codes must be integer tensors of values 0..7")
+
+    num_experts = int(w2_codes.shape[0])
+    hidden_size = int(w2_codes.shape[1])
+    intermediate_size = int(w2_codes.shape[2])
+    w13_rows = intermediate_size * (2 if is_gated else 1)
+    if tuple(w13_codes.shape) != (num_experts, w13_rows, hidden_size):
+        raise ValueError(
+            f"expected w13_codes shape {(num_experts, w13_rows, hidden_size)}, "
+            f"got {tuple(w13_codes.shape)}"
+        )
+    if tuple(w2_codes.shape) != (num_experts, hidden_size, intermediate_size):
+        raise ValueError(
+            f"expected w2_codes shape {(num_experts, hidden_size, intermediate_size)}, "
+            f"got {tuple(w2_codes.shape)}"
+        )
+    for name, size_k, size_n in (
+        ("w13", hidden_size, w13_rows),
+        ("w2", intermediate_size, hidden_size),
+    ):
+        if int(size_k) % 32 != 0:
+            raise ValueError(f"NF3 {name} requires K % 32 == 0, got {size_k}")
+        if int(size_n) % 64 != 0:
+            raise ValueError(f"NF3 {name} requires N % 64 == 0, got {size_n}")
+    if tuple(w13_scale.shape) != (num_experts, w13_rows, hidden_size // 32):
+        raise ValueError(
+            f"expected w13_scale shape {(num_experts, w13_rows, hidden_size // 32)}, "
+            f"got {tuple(w13_scale.shape)}"
+        )
+    if tuple(w2_scale.shape) != (num_experts, hidden_size, intermediate_size // 32):
+        raise ValueError(
+            "expected w2_scale shape "
+            f"{(num_experts, hidden_size, intermediate_size // 32)}, "
+            f"got {tuple(w2_scale.shape)}"
+        )
+    return W4A16PackedShape(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w13_rows=w13_rows,
+        is_gated=is_gated,
+    )
+
+
 def unswizzle_block_scale(
     swizzled_scale: torch.Tensor, rows: int, cols_blocks: int
 ) -> torch.Tensor:
@@ -319,5 +383,6 @@ __all__ = [
     "unswizzle_block_scale",
     "unswizzle_expert_scales",
     "validate_activation",
+    "validate_nf3_moe_inputs",
     "validate_w4a16_packed_inputs",
 ]
