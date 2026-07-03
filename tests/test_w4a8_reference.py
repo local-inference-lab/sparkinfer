@@ -155,11 +155,49 @@ def test_w4a8_trace_matches_full_oracle() -> None:
         x, w1_fp4, w1_ue8m0, w1_res, ones, w2_fp4, w2_ue8m0, w2_res, ones,
         topk_ids, topk_weights, E, K, I_tp,
     )
-    full = moe_reference_w4a8_mx(*args)
+    activation_kwargs = {"swiglu_limit": 0.25}
+    full = moe_reference_w4a8_mx(*args, **activation_kwargs)
+
+    # Checkpoint W31 stores the up projection before the gate projection.
+    # Swapping both the packed rows and their scale grids must preserve the
+    # semantic W13 oracle output when the layout contract is supplied.
+    def swap_gate_up_rows(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            (tensor[:, I_tp:, ...], tensor[:, :I_tp, ...]), dim=1
+        ).contiguous()
+
+    args_w31 = (
+        x,
+        swap_gate_up_rows(w1_fp4),
+        swap_gate_up_rows(w1_ue8m0),
+        swap_gate_up_rows(w1_res),
+        ones,
+        w2_fp4,
+        w2_ue8m0,
+        w2_res,
+        ones,
+        topk_ids,
+        topk_weights,
+        E,
+        K,
+        I_tp,
+    )
+    full_w31 = moe_reference_w4a8_mx(
+        *args_w31,
+        w13_layout="w31",
+        **activation_kwargs,
+    )
+    torch.testing.assert_close(full_w31, full, atol=0, rtol=0)
+
     accum = torch.zeros_like(full)
     for t in range(m):
         for r in range(top_k):
-            trace = trace_moe_reference_w4a8_route(*args, token_idx=t, route_idx=r)
+            trace = trace_moe_reference_w4a8_route(
+                *args,
+                token_idx=t,
+                route_idx=r,
+                **activation_kwargs,
+            )
             accum[t] += trace.routed_out_accum
     torch.testing.assert_close(full, accum, atol=2e-4, rtol=1e-4)
 

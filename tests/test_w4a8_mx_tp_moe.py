@@ -48,6 +48,38 @@ def test_w4a8_mx_dynamic_tile_density_boundaries(
     ) == (expected_tile_m, 128)
 
 
+@pytest.mark.parametrize("routed_rows", [384, 768, 1536, 2304])
+def test_w4a8_mx_ds4_tp2_batch_m_uses_m32(
+    monkeypatch, routed_rows: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        routed_rows,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+    ) == (32, 128)
+
+
+@pytest.mark.parametrize("routed_rows", [383, 2305])
+def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
+    monkeypatch, routed_rows: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        routed_rows,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+    ) == (16, 128)
+
+
 def _skip_if_unavailable() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")

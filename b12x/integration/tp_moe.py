@@ -1355,11 +1355,11 @@ def _select_dynamic_tile_mn(
 ) -> Tuple[int, int]:
     """Tile planner for the dynamic kernel.
 
-    Keyed on average routed rows per expert.  That route density, rather than
-    activation precision or raw batch size, predicts how much padding each
-    grouped M tile introduces.  The scratch plan and kernel build both call
-    this with the same routed_rows and expert count, so they select the SAME
-    tile -- a mismatch mis-sizes grouped task/scale scratch.
+    Generally keyed on average routed rows per expert, with narrowly measured
+    static-shape tactic entries for serving workloads whose route distribution
+    is known.  The scratch plan and kernel build both call this with the same
+    inputs, so they select the SAME tile -- a mismatch mis-sizes grouped
+    task/scale scratch.
 
     tile_n is fixed at 128 (the verified column). A small tile_m cuts per-expert
     M-tile padding and dead rows in the grouped GEMM for small decode-band
@@ -1373,6 +1373,19 @@ def _select_dynamic_tile_mn(
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
     if _is_w4a8_quant_mode(quant_mode):
+        # DSV4-Flash TP2 speculative-verify band.  Like the CUTLASS tactic
+        # selector, this is keyed only by the static workload shape and routed
+        # row count; live expert counts still come from the device histogram.
+        # M32 reduces repeated expert-weight streaming for the measured
+        # 64--384-token band without adding a second routing/scheduling path.
+        if (
+            quant_mode == "w4a8_mx"
+            and activation == "silu"
+            and num_experts == 256
+            and int(n) == 1024
+            and 384 <= routed_rows <= 2304
+        ):
+            return (32, _LEVEL_TILE_N)
         # W4A8 uses M16/M32 for sparse decode and the split M64 compute path
         # for dense prefill.  DSV4 TP2 graph-replay probes place M32->M64
         # between 34.5 and 36 routed rows/expert (M32 wins at 34.5; M64 wins

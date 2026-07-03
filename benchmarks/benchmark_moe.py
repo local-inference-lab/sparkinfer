@@ -1378,6 +1378,39 @@ def make_benchmark_case(
     return x, topk_ids, topk_weights, routing_logits
 
 
+def repeat_routing_pattern(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    period: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat the first ``period`` token routes across the full batch.
+
+    This models concurrent requests following the same speculative-verify
+    trajectory: token M grows with concurrency while the active-expert set
+    stays close to the one-request route set.
+    """
+
+    if period <= 0:
+        return topk_ids, topk_weights
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            "topk ids and weights must have the same shape, got "
+            f"{tuple(topk_ids.shape)} and {tuple(topk_weights.shape)}"
+        )
+    if topk_ids.dim() != 2:
+        raise ValueError(f"topk tensors must be rank 2, got rank {topk_ids.dim()}")
+    tokens = int(topk_ids.shape[0])
+    if period > tokens:
+        raise ValueError(
+            f"routing repeat period {period} exceeds token count {tokens}"
+        )
+    repeats = (tokens + period - 1) // period
+    return (
+        topk_ids[:period].repeat((repeats, 1))[:tokens].contiguous(),
+        topk_weights[:period].repeat((repeats, 1))[:tokens].contiguous(),
+    )
+
+
 def _make_structured_routing_ids(
     spec: ModelSpec,
     m: int,
@@ -2226,6 +2259,8 @@ def make_oracle_reference(
             spec.hidden_size,
             spec.I_tp,
             activation=activation,
+            w13_layout=weights.w13_layout,
+            **activation_params.kwargs(),
         )
     if oracle_mode == "flashinfer":
         raise ValueError("--oracle-mode flashinfer requires --quant-mode w4a16 and source_format='fp4_e8m0_k32'")
@@ -2784,6 +2819,16 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
+    parser.add_argument(
+        "--routing-repeat-period",
+        type=int,
+        default=0,
+        help=(
+            "Repeat the first N token routes across each batch, modeling "
+            "concurrent requests with the same speculative-verify trajectory; "
+            "0 keeps the generated routing unchanged."
+        ),
+    )
     parser.add_argument("--model-profile", choices=sorted(MODEL_PROFILES), default="qwen397b")
     parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
@@ -2998,6 +3043,16 @@ def bench_e2e() -> None:
         raise ValueError("--quant-mode w4a16 currently does not support --tp-parallel")
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
+    if args.routing_repeat_period < 0:
+        raise ValueError("--routing-repeat-period must be non-negative")
+    if args.routing_repeat_period and args.graph_mode != "single-op":
+        raise ValueError("--routing-repeat-period requires --graph-mode single-op")
+    if args.routing_repeat_period and any(
+        args.routing_repeat_period > batch_size for batch_size in batch_sizes
+    ):
+        raise ValueError(
+            "--routing-repeat-period cannot exceed any requested batch size"
+        )
 
     require_sm120()
     torch.empty(1, device="cuda")
@@ -3028,6 +3083,8 @@ def bench_e2e() -> None:
     print(f"Activation: {args.activation}")
     print(f"Quant mode: {args.quant_mode}")
     print(f"Routing source: {model_profile.default_routing}")
+    if args.routing_repeat_period:
+        print(f"Routing repeat period: {args.routing_repeat_period} tokens")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
     backend_label = "b12x"
     print(f"Backend: {backend_label}")
@@ -3107,6 +3164,11 @@ def bench_e2e() -> None:
                 batch_size,
                 42 + batch_size,
                 device,
+            )
+            oracle_ids, oracle_topk = repeat_routing_pattern(
+                oracle_ids,
+                oracle_topk,
+                args.routing_repeat_period,
             )
             oracle_output = make_oracle_reference(
                 args.oracle_mode,
@@ -3309,14 +3371,37 @@ def bench_e2e() -> None:
             42 + batch_size,
             device,
         )
+        topk_ids, topk_weights = repeat_routing_pattern(
+            topk_ids,
+            topk_weights,
+            args.routing_repeat_period,
+        )
+        active_experts = int(torch.unique(topk_ids).numel())
+        active_density = batch_size * spec.top_k / max(active_experts, 1)
+        print(
+            f"  routing: {active_experts} active experts, "
+            f"{active_density:.1f} routed rows/active expert"
+        )
 
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
             if model_profile.default_routing == "model":
-                return compute_model_gate_routing(weights, x, seed=43 + batch_size)
-            assert routing_logits is not None
-            timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
-            timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
-            return normalize_kernel_routing(timed_topk_ids, timed_topk_weights)
+                timed_topk_ids, timed_topk_weights = compute_model_gate_routing(
+                    weights, x, seed=43 + batch_size
+                )
+            else:
+                assert routing_logits is not None
+                timed_topk_logits, timed_topk_ids = torch.topk(
+                    routing_logits, spec.top_k, dim=-1
+                )
+                timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
+                timed_topk_ids, timed_topk_weights = normalize_kernel_routing(
+                    timed_topk_ids, timed_topk_weights
+                )
+            return repeat_routing_pattern(
+                timed_topk_ids,
+                timed_topk_weights,
+                args.routing_repeat_period,
+            )
 
         backend_output = torch.empty_like(x)
         backend_workspace = (

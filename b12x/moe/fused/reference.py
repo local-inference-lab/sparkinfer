@@ -1360,6 +1360,10 @@ def moe_reference_w4a8_mx(
     I_tp: int,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+    w13_layout: str = "w13",
 ) -> torch.Tensor:
     """W4A8 MoE oracle: MXFP8 (UE8M0/K32 + E4M3) activations x FP4 weights.
 
@@ -1371,7 +1375,14 @@ def moe_reference_w4a8_mx(
     are unswizzled ``[E, rows, K/32]`` UE8M0 bytes; ``w*_alphas`` carry the
     per-expert weight global dequant scale (ones for MXFP4 sources).
     """
-    activation = normalize_moe_activation(activation)
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     if activation == SWIGLUOAI_UNINTERLEAVE:
         raise NotImplementedError(
             "W4A8 MoE reference does not support swigluoai_uninterleave"
@@ -1380,6 +1391,7 @@ def moe_reference_w4a8_mx(
     if K % 32 != 0 or I_tp % 32 != 0:
         raise ValueError("K and I_tp must be divisible by 32 for w4a8")
     is_gated = is_gated_moe_activation(activation)
+    w13_layout = _normalize_w13_layout(w13_layout)
     device = x.device
     fp4_lut = _make_fp4_lut(device)
     m = x.shape[0]
@@ -1405,9 +1417,21 @@ def moe_reference_w4a8_mx(
         )
         xs = x_qd[token_mask]
         if is_gated:
-            up_out = (xs @ w13_eff[:I_tp].T) * alpha_fc1
-            gate_out = (xs @ w13_eff[I_tp:].T) * alpha_fc1
-            intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+            gate_rows, up_rows = _gated_row_slices(
+                activation,
+                I_tp,
+                w13_layout=w13_layout,
+            )
+            up_out = (xs @ w13_eff[up_rows].T) * alpha_fc1
+            gate_out = (xs @ w13_eff[gate_rows].T) * alpha_fc1
+            intermediate = _apply_gated_activation(
+                gate_out,
+                up_out,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            )
         else:
             fc1_out = (xs @ w13_eff.T) * alpha_fc1
             intermediate = torch.square(torch.relu(fc1_out))
@@ -1438,9 +1462,20 @@ def trace_moe_reference_w4a8_route(
     token_idx: int,
     route_idx: int,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+    w13_layout: str = "w13",
 ) -> MoERouteTrace:
     """Single-route stage trace for the w4a8 oracle (kernel debugging aid)."""
-    activation = normalize_moe_activation(activation)
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
     if activation == SWIGLUOAI_UNINTERLEAVE:
         raise NotImplementedError(
             "W4A8 MoE reference does not support swigluoai_uninterleave"
@@ -1448,6 +1483,7 @@ def trace_moe_reference_w4a8_route(
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     is_gated = is_gated_moe_activation(activation)
+    w13_layout = _normalize_w13_layout(w13_layout)
     device = x.device
     fp4_lut = _make_fp4_lut(device)
 
@@ -1474,9 +1510,21 @@ def trace_moe_reference_w4a8_route(
     gate_out = None
     up_out = None
     if is_gated:
-        up_out = (w13_eff[:I_tp] @ x_qd) * alpha_fc1
-        gate_out = (w13_eff[I_tp:] @ x_qd) * alpha_fc1
-        intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+        gate_rows, up_rows = _gated_row_slices(
+            activation,
+            I_tp,
+            w13_layout=w13_layout,
+        )
+        up_out = (w13_eff[up_rows] @ x_qd) * alpha_fc1
+        gate_out = (w13_eff[gate_rows] @ x_qd) * alpha_fc1
+        intermediate = _apply_gated_activation(
+            gate_out,
+            up_out,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
     else:
         fc1_out = (w13_eff @ x_qd) * alpha_fc1
         intermediate = torch.square(torch.relu(fc1_out))
