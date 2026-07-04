@@ -84,7 +84,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 "rows,bytes,b12x_fused_us,b12x_plus_rms_us,"
                 "nccl_plus_rms_us"
             )
-        for rows in (1, 2, 3, 4, 5, 6, 8):
+        for rows in (1, 2, 3, 4, 5, 6, 7, 8):
             shape = (rows, hidden_size)
             weight = torch.ones(hidden_size, dtype=dtype, device=device)
 

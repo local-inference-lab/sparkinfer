@@ -45,6 +45,8 @@ constexpr int kFlagStride = 32;
 struct Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
+  alignas(128) FlagType rms_completion[kMaxBlocks];
+  alignas(128) float rms_partial[kMaxBlocks];
 };
 
 struct __align__(16) RankData {
@@ -214,19 +216,30 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   }
 }
 
-// Fold residual add into the peer-read pass so the reduced tensor never makes
-// a round trip through global memory before RMSNorm.
+// Complete the allreduce, residual add, and RMSNorm in one launch. Reduction
+// is split across several CTAs per row to preserve peer-read parallelism. The
+// last CTA to publish its row partial performs the local normalization; no CTA
+// waits for an unscheduled CTA, so this does not require cooperative launch.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) pcie_allreduce_residual_add_kernel(
+__global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kernel(
     RankData* _dp,
     RankSignals sg,
     Signal* self_sg,
     const T* __restrict__ residual,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
     T* __restrict__ residual_output,
     int rank,
-    int size) {
+    int rows,
+    int hidden_packs,
+    int base_ctas_per_row,
+    int extra_cta_rows,
+    float epsilon) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
+  __shared__ float warp_sums[32];
+  __shared__ float inv_rms;
+  __shared__ int normalize_row;
   auto dp = *_dp;
   const P* rotated[ngpus];
 #pragma unroll
@@ -236,52 +249,62 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_residual_add_kernel(
 
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   const P* residual_p = reinterpret_cast<const P*>(residual);
-  P* residual_output_p = reinterpret_cast<P*>(residual_output);
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
-       idx += gridDim.x * blockDim.x) {
-    P value = packed_reduce<P, ngpus, A>(rotated, idx);
-    packed_assign_add(value, residual_p[idx]);
-    residual_output_p[idx] = value;
-  }
-}
-
-template <typename T>
-__global__ void __launch_bounds__(1024, 1) rms_norm_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    T* __restrict__ output,
-    int rows,
-    int hidden_packs,
-    float epsilon) {
-  using P = typename packed_t<T>::P;
-  using A = typename packed_t<T>::A;
-  __shared__ float warp_sums[32];
-  __shared__ float inv_rms;
-  const P* input_p = reinterpret_cast<const P*>(input);
   const P* weight_p = reinterpret_cast<const P*>(weight);
   P* output_p = reinterpret_cast<P*>(output);
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const int row_offset = row * hidden_packs;
-    float square_sum = 0.0f;
-    for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
-      square_sum += packed_square_sum(input_p[row_offset + col]);
+  P* residual_output_p = reinterpret_cast<P*>(residual_output);
+  const int large_row_ctas = base_ctas_per_row + 1;
+  const int large_row_blocks = extra_cta_rows * large_row_ctas;
+  const bool in_large_row = blockIdx.x < large_row_blocks;
+  const int row = in_large_row
+                      ? blockIdx.x / large_row_ctas
+                      : extra_cta_rows +
+                            (blockIdx.x - large_row_blocks) / base_ctas_per_row;
+  const int row_first_block =
+      in_large_row ? row * large_row_ctas
+                   : large_row_blocks +
+                         (row - extra_cta_rows) * base_ctas_per_row;
+  const int ctas_for_row =
+      base_ctas_per_row + static_cast<int>(row < extra_cta_rows);
+  const int row_cta = blockIdx.x - row_first_block;
+  const int row_offset = row * hidden_packs;
+  float square_sum = 0.0f;
+  for (int col = row_cta * blockDim.x + threadIdx.x; col < hidden_packs;
+       col += ctas_for_row * blockDim.x) {
+    const int index = row_offset + col;
+    P value = packed_reduce<P, ngpus, A>(rotated, index);
+    packed_assign_add(value, residual_p[index]);
+    residual_output_p[index] = value;
+    square_sum += packed_square_sum(value);
+  }
+  square_sum = block_reduce_sum(square_sum, warp_sums);
+  if (threadIdx.x == 0) {
+    self_sg->rms_partial[blockIdx.x] = square_sum;
+    __threadfence();
+    const FlagType previous = atomicAdd(&self_sg->rms_completion[row], 1u);
+    normalize_row = previous == static_cast<FlagType>(ctas_for_row - 1);
+  }
+  __syncthreads();
+  if (!normalize_row) return;
+
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+#pragma unroll 1
+    for (int row_part = 0; row_part < ctas_for_row; row_part++) {
+      total += self_sg->rms_partial[row_first_block + row_part];
     }
-    square_sum = block_reduce_sum(square_sum, warp_sums);
-    if (threadIdx.x == 0) {
-      inv_rms = rsqrtf(square_sum / (hidden_packs * P::size) + epsilon);
-    }
-    __syncthreads();
-    for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
-      const int index = row_offset + col;
-      A value = upcast(input_p[index]);
-      A scale = upcast(weight_p[col]);
+    inv_rms = rsqrtf(total / (hidden_packs * P::size) + epsilon);
+    atomicExch(&self_sg->rms_completion[row], 0u);
+  }
+  __syncthreads();
+  for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
+    const int index = row_offset + col;
+    A value = upcast(residual_output_p[index]);
+    A scale = upcast(weight_p[col]);
 #pragma unroll
-      for (int i = 0; i < A::size; i++) {
-        value.data[i] *= inv_rms * scale.data[i];
-      }
-      output_p[index] = downcast<P>(value);
+    for (int i = 0; i < A::size; i++) {
+      value.data[i] *= inv_rms * scale.data[i];
     }
-    __syncthreads();
+    output_p[index] = downcast<P>(value);
   }
 }
 
@@ -496,14 +519,20 @@ class PCIeAllreduce {
 
     int rows = size / hidden_size;
     int hidden_packs = hidden_size / pack_size;
-    const int reduce_threads = 512;
+    if (rows > kMaxBlocks)
+      throw std::runtime_error(
+          "fused allreduce RMSNorm supports at most " + std::to_string(kMaxBlocks) + " rows");
+    const int threads = 512;
     const int size_packs = size / pack_size;
-    const int reduce_blocks =
-        std::min(kMaxBlocks, (size_packs + reduce_threads - 1) / reduce_threads);
+    const int blocks =
+        std::min(kMaxBlocks, std::max(rows, (size_packs + threads - 1) / threads));
+    const int base_ctas_per_row = blocks / rows;
+    const int extra_cta_rows = blocks % rows;
 
 #define KL(ngpus)                                                                                                    \
-  pcie_allreduce_residual_add_kernel<T, ngpus><<<reduce_blocks, reduce_threads, 0, stream>>>(                        \
-      ptrs, sg_, self_sg_, residual, residual_output, rank_, size_packs);
+  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus><<<blocks, threads, 0, stream>>>(                                 \
+      ptrs, sg_, self_sg_, residual, weight, output, residual_output, rank_, rows, hidden_packs, base_ctas_per_row,  \
+      extra_cta_rows, epsilon);
       switch (world_size_) {
         case 2:
           KL(2);
@@ -524,12 +553,6 @@ class PCIeAllreduce {
           throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
       }
 #undef KL
-
-    const int norm_threads =
-        std::min(1024, std::max(32, ((hidden_packs + 31) / 32) * 32));
-    const int norm_blocks = std::min(kMaxBlocks, rows);
-    rms_norm_kernel<T><<<norm_blocks, norm_threads, 0, stream>>>(
-        residual_output, weight, output, rows, hidden_packs, epsilon);
   }
 
   ~PCIeAllreduce() {

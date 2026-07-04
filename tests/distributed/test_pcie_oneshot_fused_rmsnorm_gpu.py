@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from cuda.bindings import runtime as cudart
 
 from b12x.distributed.pcie_oneshot import PCIeOneshotAllReducePool
 
@@ -70,6 +71,25 @@ def _assert_close(
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
+    graph_handle = graph.raw_cuda_graph()
+    result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
+    assert result == cudart.cudaError_t.cudaSuccess
+    result, nodes, returned_nodes = cudart.cudaGraphGetNodes(
+        graph_handle,
+        num_nodes,
+    )
+    assert result == cudart.cudaError_t.cudaSuccess
+    assert returned_nodes == num_nodes
+    kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    kernel_count = 0
+    for node in nodes[:num_nodes]:
+        result, node_type = cudart.cudaGraphNodeGetType(node)
+        assert result == cudart.cudaError_t.cudaSuccess
+        kernel_count += node_type == kernel_type
+    return kernel_count
+
+
 def _run_eager(
     pool: PCIeOneshotAllReducePool,
     device: torch.device,
@@ -77,8 +97,17 @@ def _run_eager(
 ) -> None:
     epsilon = 1e-6
     for dtype in (torch.float16, torch.bfloat16, torch.float32):
-        for rows, hidden_size in ((1, 6144), (4, 6144), (3, 128)):
-            if rows * hidden_size * dtype.itemsize > 64 * 1024:
+        for rows, hidden_size in (
+            (1, 6144),
+            (2, 6144),
+            (3, 6144),
+            (4, 6144),
+            (5, 6144),
+            (6, 6144),
+            (8, 6144),
+            (3, 128),
+        ):
+            if rows * hidden_size * dtype.itemsize > 128 * 1024:
                 continue
             inp, residual, weight = _make_inputs(
                 rows,
@@ -124,7 +153,7 @@ def _run_graph(
     out = torch.empty_like(inp)
     pool.for_stream()
 
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     with pool.capture(), torch.cuda.graph(graph):
         pool.all_reduce_fused_add_rms_norm(
             inp,
@@ -134,6 +163,7 @@ def _run_graph(
             out=out,
             residual_out=residual,
         )
+    assert _cuda_graph_kernel_count(graph) == 1
 
     for iteration in range(3):
         next_inp, next_residual, _ = _make_inputs(
@@ -170,8 +200,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
-        max_input_bytes=64 * 1024,
-        max_size=64 * 1024,
+        max_input_bytes=128 * 1024,
+        max_size=128 * 1024,
     )
     try:
         _run_eager(pool, device, rank)
