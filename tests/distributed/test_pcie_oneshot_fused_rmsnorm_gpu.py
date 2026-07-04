@@ -99,6 +99,7 @@ def _run_eager(
     for dtype in (torch.float16, torch.bfloat16, torch.float32):
         for rows, hidden_size in (
             (1, 6144),
+            (1, 8192),
             (2, 6144),
             (3, 6144),
             (4, 6144),

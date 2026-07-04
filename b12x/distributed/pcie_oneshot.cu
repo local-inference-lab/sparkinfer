@@ -216,11 +216,11 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   }
 }
 
-// Complete the allreduce, residual add, and RMSNorm in one launch. Reduction
-// is split across several CTAs per row to preserve peer-read parallelism. The
-// last CTA to publish its row partial performs the local normalization; no CTA
-// waits for an unscheduled CTA, so this does not require cooperative launch.
-template <typename T, int ngpus>
+// Complete the allreduce, residual add, and RMSNorm in one launch. Rows up to
+// 16 KiB use one CTA and only block-local synchronization. Larger rows retain
+// the multi-CTA path; the last CTA to publish its row partial normalizes it, so
+// no CTA waits for an unscheduled CTA or requires cooperative launch.
+template <typename T, int ngpus, bool single_cta_per_row>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kernel(
     RankData* _dp,
     RankSignals sg,
@@ -277,25 +277,32 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
     square_sum += packed_square_sum(value);
   }
   square_sum = block_reduce_sum(square_sum, warp_sums);
-  if (threadIdx.x == 0) {
-    self_sg->rms_partial[blockIdx.x] = square_sum;
-    __threadfence();
-    const FlagType previous = atomicAdd(&self_sg->rms_completion[row], 1u);
-    normalize_row = previous == static_cast<FlagType>(ctas_for_row - 1);
-  }
-  __syncthreads();
-  if (!normalize_row) return;
-
-  if (threadIdx.x == 0) {
-    float total = 0.0f;
-#pragma unroll 1
-    for (int row_part = 0; row_part < ctas_for_row; row_part++) {
-      total += self_sg->rms_partial[row_first_block + row_part];
+  if constexpr (single_cta_per_row) {
+    if (threadIdx.x == 0) {
+      inv_rms = rsqrtf(square_sum / (hidden_packs * P::size) + epsilon);
     }
-    inv_rms = rsqrtf(total / (hidden_packs * P::size) + epsilon);
-    atomicExch(&self_sg->rms_completion[row], 0u);
+    __syncthreads();
+  } else {
+    if (threadIdx.x == 0) {
+      self_sg->rms_partial[blockIdx.x] = square_sum;
+      __threadfence();
+      const FlagType previous = atomicAdd(&self_sg->rms_completion[row], 1u);
+      normalize_row = previous == static_cast<FlagType>(ctas_for_row - 1);
+    }
+    __syncthreads();
+    if (!normalize_row) return;
+
+    if (threadIdx.x == 0) {
+      float total = 0.0f;
+#pragma unroll 1
+      for (int row_part = 0; row_part < ctas_for_row; row_part++) {
+        total += self_sg->rms_partial[row_first_block + row_part];
+      }
+      inv_rms = rsqrtf(total / (hidden_packs * P::size) + epsilon);
+      atomicExch(&self_sg->rms_completion[row], 0u);
+    }
+    __syncthreads();
   }
-  __syncthreads();
   for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
     const int index = row_offset + col;
     A value = upcast(residual_output_p[index]);
@@ -524,34 +531,43 @@ class PCIeAllreduce {
           "fused allreduce RMSNorm supports at most " + std::to_string(kMaxBlocks) + " rows");
     const int threads = 512;
     const int size_packs = size / pack_size;
-    const int blocks =
-        std::min(kMaxBlocks, std::max(rows, (size_packs + threads - 1) / threads));
+    const bool single_cta_per_row = hidden_packs <= 1024;
+    const int blocks = single_cta_per_row
+                           ? rows
+                           : std::min(kMaxBlocks, std::max(rows, (size_packs + threads - 1) / threads));
     const int base_ctas_per_row = blocks / rows;
     const int extra_cta_rows = blocks % rows;
 
-#define KL(ngpus)                                                                                                    \
-  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus><<<blocks, threads, 0, stream>>>(                                 \
-      ptrs, sg_, self_sg_, residual, weight, output, residual_output, rank_, rows, hidden_packs, base_ctas_per_row,  \
+#define KL(ngpus, single_cta)                                                                                         \
+  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, single_cta><<<blocks, threads, 0, stream>>>(                     \
+      ptrs, sg_, self_sg_, residual, weight, output, residual_output, rank_, rows, hidden_packs, base_ctas_per_row,   \
       extra_cta_rows, epsilon);
-      switch (world_size_) {
-        case 2:
-          KL(2);
-          break;
-        case 4:
-          KL(4);
-          break;
-        case 6:
-          KL(6);
-          break;
-        case 8:
-          KL(8);
-          break;
-        case 10:
-          KL(10);
-          break;
-        default:
-          throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
-      }
+#define DISPATCH(single_cta)                                                                                         \
+  switch (world_size_) {                                                                                            \
+    case 2:                                                                                                         \
+      KL(2, single_cta);                                                                                            \
+      break;                                                                                                        \
+    case 4:                                                                                                         \
+      KL(4, single_cta);                                                                                            \
+      break;                                                                                                        \
+    case 6:                                                                                                         \
+      KL(6, single_cta);                                                                                            \
+      break;                                                                                                        \
+    case 8:                                                                                                         \
+      KL(8, single_cta);                                                                                            \
+      break;                                                                                                        \
+    case 10:                                                                                                        \
+      KL(10, single_cta);                                                                                           \
+      break;                                                                                                        \
+    default:                                                                                                        \
+      throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));             \
+  }
+    if (single_cta_per_row) {
+      DISPATCH(true);
+    } else {
+      DISPATCH(false);
+    }
+#undef DISPATCH
 #undef KL
   }
 

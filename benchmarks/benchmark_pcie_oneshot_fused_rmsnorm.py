@@ -67,10 +67,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         rank=rank,
         world_size=world_size,
     )
-    hidden_size = 6144
+    hidden_size = int(os.getenv("B12X_PCIE_ONESHOT_HIDDEN_SIZE", "6144"))
+    rows_to_benchmark = tuple(
+        int(rows)
+        for rows in os.getenv("B12X_PCIE_ONESHOT_ROWS", "1,2,3,4,5,6,7,8").split(
+            ","
+        )
+    )
     dtype = torch.bfloat16
     epsilon = 1e-6
-    max_bytes = 128 * 1024
+    max_bytes = max(
+        128 * 1024,
+        max(rows_to_benchmark) * hidden_size * dtype.itemsize,
+    )
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
@@ -84,7 +93,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 "rows,bytes,b12x_fused_us,b12x_plus_rms_us,"
                 "nccl_plus_rms_us"
             )
-        for rows in (1, 2, 3, 4, 5, 6, 7, 8):
+        for rows in rows_to_benchmark:
             shape = (rows, hidden_size)
             weight = torch.ones(hidden_size, dtype=dtype, device=device)
 
