@@ -119,6 +119,52 @@ class PCIeDmaAllReduce:
         self._piece_events = [torch.cuda.Event(), torch.cuda.Event()]
         self._input_ready = torch.cuda.Event()
         self.min_bytes = 0
+        self._log_peer_copy_bandwidth()
+
+    def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
+        """One-time raw cudaMemcpyAsync bandwidth check, bypassing the ring
+        schedule and flag sync entirely, so a slow deployment environment
+        shows up here (bandwidth) rather than only in the full ring's
+        latency (which would also be sensitive to sync/launch overhead).
+
+        Every rank concurrently writes step 1 of its successor's scratch
+        from step 0 of its own; no rank's step 0 (read) or step 1 (write)
+        is touched by anyone else, so this measures true full-ring-style
+        concurrent peer bandwidth with no self-inflicted read/write race.
+        """
+
+        if self.world_size < 2 or 2 * (self.world_size - 1) < 2:
+            return
+        nxt = (self.rank + 1) % self.world_size
+        probe_bytes = min(self.shard_capacity, 4 << 20)
+        probe_bytes -= probe_bytes % 16
+        if probe_bytes <= 0:
+            return
+        stream = torch.cuda.Stream(device=self.device)
+        dist.barrier(group=self.group)
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._ext.dma_copy(
+                    self._scratch_ptr(nxt, 1), self._scratch_ptr(self.rank, 0),
+                    probe_bytes,
+                )
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(stream)
+            for _ in range(iters):
+                self._ext.dma_copy(
+                    self._scratch_ptr(nxt, 1), self._scratch_ptr(self.rank, 0),
+                    probe_bytes,
+                )
+            end.record(stream)
+        stream.synchronize()
+        ms = start.elapsed_time(end)
+        gbps = probe_bytes * iters / (ms * 1e-3) / 1e9
+        logger.info(
+            "[PCIe DMA allreduce] rank %d -> %d raw peer copy: %.1f GB/s "
+            "(%d bytes x %d iters)",
+            self.rank, nxt, gbps, probe_bytes, iters,
+        )
 
     def _flag_ptr(self, rank: int, slot: int) -> int:
         return self._flags_base[rank] + slot * FLAG_STRIDE
@@ -334,7 +380,11 @@ def autotune_crossovers(
             step *= 2
         oneshot_losses = 0
         dma_wins = 0
+        rank0 = dist.get_rank(group=nccl_group) == 0
+        if rank0:
+            logger.info(lines[0])
         for rows in ladder:
+            point_start = time.perf_counter()
             shape = (rows, hidden_size)
             size_bytes = rows * hidden_size * dtype.itemsize
 
@@ -406,11 +456,15 @@ def autotune_crossovers(
                 dma_wins += 1
             else:
                 dma_wins = 0
-            lines.append(
+            line = (
                 f"  rows={rows:5d} ({size_bytes >> 10:6d}KB): "
                 f"oneshot {oneshot_us:9.1f}  dma {dma_us:9.1f}  "
                 f"nccl {nccl_us:9.1f} us"
+                f"  [{time.perf_counter() - point_start:.2f}s]"
             )
+            lines.append(line)
+            if rank0:
+                logger.info(line)
             if dma_wins >= 2:
                 break
     except Exception:
@@ -421,10 +475,9 @@ def autotune_crossovers(
     if dma is not None:
         dma.min_bytes = dma_min if dma_min > 0 else dma.max_bytes + 1
     if dist.get_rank(group=nccl_group) == 0:
-        lines.append(
-            f"  oneshot_max_bytes={oneshot_max} dma_min_bytes={dma_min}"
+        logger.info(
+            "  oneshot_max_bytes=%d dma_min_bytes=%d", oneshot_max, dma_min
         )
-        logger.info("\n".join(lines))
     return oneshot_max, dma_min
 
 
