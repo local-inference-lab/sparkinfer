@@ -38,7 +38,7 @@
     }                                                                   \
   } while (0)
 
-namespace pcie_ring {
+namespace pcie_dma {
 
 using FlagType = unsigned int;
 
@@ -97,9 +97,9 @@ __global__ void __launch_bounds__(256, 1) add_kernel(T* __restrict__ dst,
   }
 }
 
-}  // namespace pcie_ring
+}  // namespace pcie_dma
 
-static void ring_copy(int64_t dst_ptr, int64_t src_ptr, int64_t bytes) {
+static void dma_copy(int64_t dst_ptr, int64_t src_ptr, int64_t bytes) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   CHECK_CUDA_SUCCESS(cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr),
                                      reinterpret_cast<const void*>(src_ptr),
@@ -107,21 +107,21 @@ static void ring_copy(int64_t dst_ptr, int64_t src_ptr, int64_t bytes) {
                                      cudaMemcpyDeviceToDevice, stream));
 }
 
-static void ring_set_flag(int64_t peer_flag_ptr, int64_t counter_ptr) {
+static void dma_set_flag(int64_t peer_flag_ptr, int64_t counter_ptr) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  pcie_ring::set_flag_kernel<<<1, 1, 0, stream>>>(
-      reinterpret_cast<pcie_ring::FlagType*>(peer_flag_ptr),
-      reinterpret_cast<pcie_ring::FlagType*>(counter_ptr));
+  pcie_dma::set_flag_kernel<<<1, 1, 0, stream>>>(
+      reinterpret_cast<pcie_dma::FlagType*>(peer_flag_ptr),
+      reinterpret_cast<pcie_dma::FlagType*>(counter_ptr));
 }
 
-static void ring_wait_flag(int64_t flag_ptr, int64_t counter_ptr) {
+static void dma_wait_flag(int64_t flag_ptr, int64_t counter_ptr) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  pcie_ring::wait_flag_kernel<<<1, 1, 0, stream>>>(
-      reinterpret_cast<pcie_ring::FlagType*>(flag_ptr),
-      reinterpret_cast<pcie_ring::FlagType*>(counter_ptr));
+  pcie_dma::wait_flag_kernel<<<1, 1, 0, stream>>>(
+      reinterpret_cast<pcie_dma::FlagType*>(flag_ptr),
+      reinterpret_cast<pcie_dma::FlagType*>(counter_ptr));
 }
 
-static void ring_add(int64_t dst_ptr, int64_t src_ptr, int64_t elems,
+static void dma_add(int64_t dst_ptr, int64_t src_ptr, int64_t elems,
                      int64_t dtype_code) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   const int threads = 256;
@@ -130,25 +130,25 @@ static void ring_add(int64_t dst_ptr, int64_t src_ptr, int64_t elems,
       std::max<long long>(1, std::min<long long>(64, (packs16 + threads - 1) / threads)));
   if (dtype_code == 0) {
     const long long packs = elems / 8;
-    pcie_ring::add_kernel<nv_bfloat16><<<blocks, threads, 0, stream>>>(
+    pcie_dma::add_kernel<nv_bfloat16><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<nv_bfloat16*>(dst_ptr),
         reinterpret_cast<const nv_bfloat16*>(src_ptr), packs);
   } else if (dtype_code == 1) {
     const long long packs = elems / 8;
-    pcie_ring::add_kernel<half><<<blocks, threads, 0, stream>>>(
+    pcie_dma::add_kernel<half><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<half*>(dst_ptr), reinterpret_cast<const half*>(src_ptr),
         packs);
   } else {
     const long long packs = elems / 4;
-    pcie_ring::add_kernel<float><<<blocks, threads, 0, stream>>>(
+    pcie_dma::add_kernel<float><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<float*>(dst_ptr), reinterpret_cast<const float*>(src_ptr),
         packs);
   }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("ring_copy", &ring_copy, "CE peer copy on the current stream");
-  m.def("ring_set_flag", &ring_set_flag, "publish a monotonic flag to a peer");
-  m.def("ring_wait_flag", &ring_wait_flag, "wait for a monotonic peer flag");
-  m.def("ring_add", &ring_add, "elementwise add src into dst");
+  m.def("dma_copy", &dma_copy, "CE peer copy on the current stream");
+  m.def("dma_set_flag", &dma_set_flag, "publish a monotonic flag to a peer");
+  m.def("dma_wait_flag", &dma_wait_flag, "wait for a monotonic peer flag");
+  m.def("dma_add", &dma_add, "elementwise add src into dst");
 }

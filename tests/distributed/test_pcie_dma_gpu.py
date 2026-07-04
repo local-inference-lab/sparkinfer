@@ -8,12 +8,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_ring import PCIeRingAllReduce
+from b12x.distributed.pcie_dma import PCIeDmaAllReduce
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_RING_TEST") != "1",
-    reason="set B12X_RUN_PCIE_RING_TEST=1 to run PCIe ring allreduce GPU tests",
+    os.getenv("B12X_RUN_PCIE_DMA_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DMA_TEST=1 to run PCIe ring allreduce GPU tests",
 )
 
 
@@ -65,7 +65,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     hidden = 6144
     max_rows = 512
-    ring = PCIeRingAllReduce(
+    ring = PCIeDmaAllReduce(
         exchange_group=dist.group.WORLD,
         device=device,
         max_bytes=max_rows * hidden * 4,
@@ -99,10 +99,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_pcie_ring_all_reduce_eager_and_graph() -> None:
+def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("B12X_PCIE_RING_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

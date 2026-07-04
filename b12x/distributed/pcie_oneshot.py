@@ -788,7 +788,14 @@ class PCIeOneshotAllReduce:
 
         custom_runs = sorted(run_custom() for _ in range(3))
         nccl_runs = sorted(run_nccl() for _ in range(3))
-        return custom_runs[1], nccl_runs[1]
+        # Reduce timings across ranks so every rank reaches the same
+        # crossover verdicts; divergent local verdicts would desynchronize
+        # the sweep's collective sequence and deadlock.
+        stats = torch.tensor(
+            [custom_runs[1], nccl_runs[1]], dtype=torch.float64, device=device
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=nccl_group)
+        return float(stats[0].item()), float(stats[1].item())
 
     def find_crossover_size(
         self,

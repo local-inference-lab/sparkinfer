@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_ring import PCIeRingAllReduce
+from b12x.distributed.pcie_dma import PCIeDmaAllReduce
 
 
 def _free_port() -> int:
@@ -40,13 +40,13 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
     )
     max_bytes = 8192 * 6144 * 2
-    ring = PCIeRingAllReduce(
+    ring = PCIeDmaAllReduce(
         exchange_group=dist.group.WORLD, device=device, max_bytes=max_bytes
     )
     try:
         if rank == 0:
             print(
-                "rows,bytes,nccl_us,ring_us,nccl_bus_GBps,ring_bus_GBps,"
+                "rows,bytes,nccl_us,dma_us,nccl_bus_GBps,ring_bus_GBps,"
                 "maxerr_ratio",
                 flush=True,
             )
@@ -80,14 +80,14 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 ring.all_reduce(ring_in, out=ring_res)
 
             nccl_us = _time_graph(nccl_graph, device)
-            ring_us = _time_graph(ring_graph, device)
+            dma_us = _time_graph(ring_graph, device)
             size = inp.numel() * 2
             bus = 2 * (world_size - 1) / world_size * size
             if rank == 0:
                 print(
-                    f"{rows},{size},{nccl_us:.1f},{ring_us:.1f},"
+                    f"{rows},{size},{nccl_us:.1f},{dma_us:.1f},"
                     f"{bus / (nccl_us * 1e-6) / 1e9:.1f},"
-                    f"{bus / (ring_us * 1e-6) / 1e9:.1f},{err_ratio:.2f}",
+                    f"{bus / (dma_us * 1e-6) / 1e9:.1f},{err_ratio:.2f}",
                     flush=True,
                 )
             del nccl_graph, ring_graph

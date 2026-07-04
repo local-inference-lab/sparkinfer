@@ -11,7 +11,9 @@ replay without host patching.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -29,6 +31,8 @@ from .pcie_oneshot import (
     _OwnedSharedBuffer,
 )
 
+logger = logging.getLogger(__name__)
+
 SUPPORTED_DTYPES = {
     torch.bfloat16: 0,
     torch.float16: 1,
@@ -41,10 +45,10 @@ SCRATCH_ALIGN = 256
 
 @lru_cache(maxsize=1)
 def _load_extension():
-    source = Path(__file__).with_name("pcie_ring.cu")
-    verbose = os.getenv("B12X_PCIE_RING_VERBOSE_BUILD", "0") == "1"
+    source = Path(__file__).with_name("pcie_dma.cu")
+    verbose = os.getenv("B12X_PCIE_DMA_VERBOSE_BUILD", "0") == "1"
     return load(
-        name="b12x_pcie_ring_ext",
+        name="b12x_pcie_dma_ext",
         sources=[str(source)],
         extra_cuda_cflags=["-O2"],
         extra_ldflags=["-lcuda"],
@@ -56,7 +60,7 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-class PCIeRingAllReduce:
+class PCIeDmaAllReduce:
     """Single-channel ring allreduce over IPC scratch buffers.
 
     A channel is a single ordered stream context; concurrent use from
@@ -110,6 +114,11 @@ class PCIeRingAllReduce:
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
         self._copy_stream = torch.cuda.Stream(device=self.device)
+        # Persistent cross-stream events: captured graphs keep references to
+        # recorded events, so per-call temporaries must not be destroyed.
+        self._piece_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._input_ready = torch.cuda.Event()
+        self.min_bytes = 0
 
     def _flag_ptr(self, rank: int, slot: int) -> int:
         return self._flags_base[rank] + slot * FLAG_STRIDE
@@ -128,10 +137,10 @@ class PCIeRingAllReduce:
         numel = inp.numel()
         if numel <= 0 or numel % (self.world_size * 8) != 0:
             return False
-        return (
-            inp.is_contiguous()
-            and inp.numel() * inp.element_size() <= self.max_bytes
-        )
+        size_bytes = numel * inp.element_size()
+        if size_bytes < self.min_bytes:
+            return False
+        return inp.is_contiguous() and size_bytes <= self.max_bytes
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
@@ -166,12 +175,10 @@ class PCIeRingAllReduce:
 
         main = torch.cuda.current_stream(self.device)
         copy_stream = self._copy_stream
-        copy_stream.wait_stream(main)
 
         out.copy_(inp)
-        ready = torch.cuda.Event()
-        ready.record(main)
-        copy_stream.wait_event(ready)
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
 
         def piece_ptr(chunk: int, piece: int) -> int:
             return base + chunk * shard_bytes + piece * piece_bytes
@@ -183,8 +190,8 @@ class PCIeRingAllReduce:
             return step * pieces + piece
 
         # Events gating each step's send on the previous step's reduce of
-        # the same payload piece.
-        add_done: dict[int, torch.cuda.Event] = {}
+        # the same payload piece (persistent; re-recorded per step).
+        add_done = self._piece_events
 
         for k in range(steps):
             reduce_phase = k < world - 1
@@ -198,45 +205,43 @@ class PCIeRingAllReduce:
                 with torch.cuda.stream(copy_stream):
                     if k > 0:
                         copy_stream.wait_event(add_done[p])
-                    ext.ring_copy(
+                    ext.dma_copy(
                         scratch_piece(nxt, k, p),
                         piece_ptr(send_chunk, p),
                         piece_bytes,
                     )
-                    ext.ring_set_flag(
+                    ext.dma_set_flag(
                         self._flag_ptr(nxt, slot(k, p)),
                         self._counter_ptr(self._send_counters, slot(k, p)),
                     )
-                ext.ring_wait_flag(
+                ext.dma_wait_flag(
                     self._flag_ptr(rank, slot(k, p)),
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                 )
                 if reduce_phase:
-                    ext.ring_add(
+                    ext.dma_add(
                         piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_elems,
                         dtype_code,
                     )
                 else:
-                    ext.ring_copy(
+                    ext.dma_copy(
                         piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_bytes,
                     )
-                event = torch.cuda.Event()
-                event.record(main)
-                add_done[p] = event
+                add_done[p].record(main)
 
         # Neighbor handshake so the next call (or graph replay) cannot
         # overwrite scratch a lagging neighbor still reads. The main stream
         # must also drain the copy stream before the op is considered done.
         main.wait_stream(copy_stream)
         done = steps * pieces
-        ext.ring_set_flag(
+        ext.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
         )
-        ext.ring_wait_flag(
+        ext.dma_wait_flag(
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
         return out
@@ -256,4 +261,171 @@ class PCIeRingAllReduce:
             self.close()
 
 
-__all__ = ["PCIeRingAllReduce"]
+def autotune_crossovers(
+    oneshot,
+    dma: Optional[PCIeDmaAllReduce],
+    nccl_group: ProcessGroup,
+    *,
+    hidden_size: int,
+    max_rows: int,
+    rms_norm_op=None,
+    epsilon: float = 1e-6,
+    warmup: int = 5,
+    iters: int = 30,
+) -> tuple[int, int]:
+    """Single sweep from 1 row to the prefill chunk size with the real
+    kernels: the oneshot channel (fused AR+RMSNorm when ``rms_norm_op`` is
+    given, plain otherwise), the CE ring, and NCCL (plus ``rms_norm_op``)
+    as the fallback. Returns (oneshot_max_bytes, dma_min_bytes) and sets
+    ``dma.min_bytes``. Timings are MAX-reduced across ranks so every rank
+    reaches identical verdicts.
+    """
+
+    device = oneshot.device if oneshot is not None else dma.device
+    stream = torch.cuda.Stream(device=device)
+    dtype = torch.bfloat16
+    weight = torch.ones(hidden_size, dtype=dtype, device=device)
+    inf = float("inf")
+    oneshot_max = 0
+    dma_min = 0
+    if dma is not None:
+        original_dma_min = dma.min_bytes
+        dma.min_bytes = 0
+    lines = [
+        f"[PCIe allreduce] Crossover sweep (bf16, hidden={hidden_size}, "
+        f"fused={rms_norm_op is not None}):"
+    ]
+
+    def bench(build) -> float:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            replay = build()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            replay()
+        dist.barrier(group=nccl_group)
+        with torch.cuda.stream(stream):
+            for _ in range(warmup):
+                graph.replay()
+        stream.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.stream(stream):
+            for _ in range(iters):
+                graph.replay()
+        stream.synchronize()
+        return (time.perf_counter() - start) / iters * 1e6
+
+    try:
+        # Fully dense through 8 rows (the decode regime, where every row
+        # count occurs), quarter steps through 32-128 rows (where the
+        # NCCL/DMA boundary lives), and powers of two with midpoints
+        # elsewhere. The sweep stops once the DMA allreduce has won twice
+        # in a row: the curves are monotone above the boundary and the
+        # large probes are the expensive ones.
+        ladder = list(range(1, min(8, max_rows) + 1))
+        step = 8
+        while step <= max_rows:
+            if step not in ladder:
+                ladder.append(step)
+            if 32 <= step <= 64:
+                extra = (step + step // 4, step + step // 2, step + 3 * step // 4)
+            else:
+                extra = (step + step // 2,)
+            ladder.extend(rows for rows in extra if rows <= max_rows)
+            step *= 2
+        oneshot_losses = 0
+        dma_wins = 0
+        for rows in ladder:
+            shape = (rows, hidden_size)
+            size_bytes = rows * hidden_size * dtype.itemsize
+
+            def build_nccl():
+                inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
+                residual = torch.randn(shape, dtype=dtype, device=device)
+                if rms_norm_op is None:
+                    return lambda: dist.all_reduce(inp, group=nccl_group)
+                return lambda: (
+                    dist.all_reduce(inp, group=nccl_group),
+                    rms_norm_op(inp, residual, weight, epsilon),
+                )
+
+            nccl_us = bench(build_nccl)
+
+            # Stop probing the oneshot after it has clearly lost (its curve
+            # is monotone against NCCL); a probe the kernel refuses (row or
+            # capacity limits) counts as a loss. Every rank takes the same
+            # branch because verdicts come from MAX-reduced timings.
+            oneshot_us = inf
+            if (
+                oneshot is not None
+                and oneshot_losses < 2
+                and size_bytes <= oneshot.max_size
+            ):
+
+                def build_oneshot():
+                    inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
+                    residual = torch.randn(shape, dtype=dtype, device=device)
+                    out = torch.empty_like(inp)
+                    residual_out = torch.empty_like(inp)
+                    if rms_norm_op is None:
+                        return lambda: oneshot.all_reduce(inp, out=out)
+                    return lambda: oneshot.all_reduce_fused_add_rms_norm(
+                        inp, residual, weight, epsilon,
+                        out=out, residual_out=residual_out,
+                    )
+
+                try:
+                    oneshot_us = bench(build_oneshot)
+                except Exception:
+                    oneshot_us = inf
+
+            dma_us = inf
+            probe = torch.empty(shape, dtype=dtype, device=device)
+            if dma is not None and dma.should_allreduce(probe):
+
+                def build_dma():
+                    inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
+                    out = torch.empty_like(inp)
+                    return lambda: dma.all_reduce(inp, out=out)
+
+                dma_us = bench(build_dma)
+            del probe
+
+            stats = torch.tensor(
+                [nccl_us, oneshot_us, dma_us], dtype=torch.float64, device=device
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=nccl_group)
+            nccl_us, oneshot_us, dma_us = (float(v) for v in stats.tolist())
+            if oneshot_us < nccl_us and oneshot_us < dma_us:
+                oneshot_max = size_bytes
+                oneshot_losses = 0
+            else:
+                oneshot_losses += 1
+            if dma_us < nccl_us and dma_us < oneshot_us:
+                if dma_min == 0:
+                    dma_min = size_bytes
+                dma_wins += 1
+            else:
+                dma_wins = 0
+            lines.append(
+                f"  rows={rows:5d} ({size_bytes >> 10:6d}KB): "
+                f"oneshot {oneshot_us:9.1f}  dma {dma_us:9.1f}  "
+                f"nccl {nccl_us:9.1f} us"
+            )
+            if dma_wins >= 2:
+                break
+    except Exception:
+        if dma is not None:
+            dma.min_bytes = original_dma_min
+        raise
+
+    if dma is not None:
+        dma.min_bytes = dma_min if dma_min > 0 else dma.max_bytes + 1
+    if dist.get_rank(group=nccl_group) == 0:
+        lines.append(
+            f"  oneshot_max_bytes={oneshot_max} dma_min_bytes={dma_min}"
+        )
+        logger.info("\n".join(lines))
+    return oneshot_max, dma_min
+
+
+__all__ = ["PCIeDmaAllReduce", "autotune_crossovers"]
