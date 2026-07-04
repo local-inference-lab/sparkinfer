@@ -409,16 +409,15 @@ class PCIeOneshotAllReduce:
         ipc: CudaRTLibrary,
     ) -> _OwnedSharedBuffer:
         local_ptr = ipc.cudaMalloc(size_in_bytes)
-        if zero_fill:
-            ipc.cudaMemset(local_ptr, 0, size_in_bytes)
-        local_handle = ipc.cudaIpcGetMemHandleBytes(local_ptr)
-        world_size = dist.get_world_size(group=exchange_group)
-        rank = dist.get_rank(group=exchange_group)
-        handles = _broadcast_gather_object(local_handle, exchange_group)
-
         peer_ptrs: list[int] = []
         remote_ptrs: list[int] = []
         try:
+            if zero_fill:
+                ipc.cudaMemset(local_ptr, 0, size_in_bytes)
+            local_handle = ipc.cudaIpcGetMemHandleBytes(local_ptr)
+            world_size = dist.get_world_size(group=exchange_group)
+            rank = dist.get_rank(group=exchange_group)
+            handles = _broadcast_gather_object(local_handle, exchange_group)
             for idx, handle in enumerate(handles):
                 if idx == rank:
                     peer_ptrs.append(local_ptr)
@@ -471,24 +470,17 @@ class PCIeOneshotAllReduce:
         slab = cls._allocate_shared_buffer(
             exchange_group,
             slab_bytes,
-            zero_fill=False,
+            # Clear signals before publishing the IPC handle so a peer cannot
+            # post an arrival that a later local memset would erase.
+            zero_fill=True,
             ipc=ipc,
         )
-        try:
-            ipc.cudaMemset(slab.local_ptr + signal_offset, 0, signal_bytes)
-            return _ChannelSharedBuffers(
-                owned_buffer=slab,
-                signal_ptrs=tuple(ptr + signal_offset for ptr in slab.peer_ptrs),
-                eager0_ptrs=tuple(ptr + eager0_offset for ptr in slab.peer_ptrs),
-                eager1_ptrs=tuple(ptr + eager1_offset for ptr in slab.peer_ptrs),
-            )
-        except Exception:
-            for ptr in slab.remote_ptrs:
-                with suppress(Exception):
-                    ipc.cudaIpcCloseMemHandle(ptr)
-            with suppress(Exception):
-                ipc.cudaFree(slab.local_ptr)
-            raise
+        return _ChannelSharedBuffers(
+            owned_buffer=slab,
+            signal_ptrs=tuple(ptr + signal_offset for ptr in slab.peer_ptrs),
+            eager0_ptrs=tuple(ptr + eager0_offset for ptr in slab.peer_ptrs),
+            eager1_ptrs=tuple(ptr + eager1_offset for ptr in slab.peer_ptrs),
+        )
 
     @property
     def signal_ptrs(self) -> tuple[int, ...]:
@@ -547,6 +539,25 @@ class PCIeOneshotAllReduce:
         self._ext.register_buffer(self._ptr, list(ptrs))
         self._registered_input_ptrs[local_ptr] = ptrs
 
+    def _prepare_input(
+        self,
+        inp: torch.Tensor,
+        peer_input_ptrs: Optional[Sequence[int]],
+    ) -> None:
+        local_ptr = int(inp.data_ptr())
+        if peer_input_ptrs is not None:
+            if len(peer_input_ptrs) != self.world_size:
+                raise ValueError("peer_input_ptrs must match world size")
+            ptrs = tuple(int(ptr) for ptr in peer_input_ptrs)
+            if ptrs[self.rank] != local_ptr:
+                raise ValueError("peer_input_ptrs[self.rank] must match inp.data_ptr()")
+            self.register_buffer(ptrs)
+        elif self._eager_ptrs is None and local_ptr not in self._registered_input_ptrs:
+            raise ValueError(
+                "peer_input_ptrs are required unless eager IPC buffers are configured "
+                "or this input was already registered"
+            )
+
     def get_graph_buffer_ipc_meta(self) -> tuple[list[int], list[int]]:
         if self._closed:
             raise RuntimeError("runtime is closed")
@@ -580,7 +591,9 @@ class PCIeOneshotAllReduce:
         if self._closed:
             raise RuntimeError("runtime is closed")
         if inp.device != self.device:
-            raise ValueError(f"input device {inp.device} does not match runtime device {self.device}")
+            raise ValueError(
+                f"input device {inp.device} does not match runtime device {self.device}"
+            )
         self._check_stream()
         if not self.should_allreduce(inp):
             raise ValueError(
@@ -597,27 +610,96 @@ class PCIeOneshotAllReduce:
         if not _is_weak_contiguous(out):
             raise ValueError("output tensor must be weak-contiguous")
 
-        local_ptr = int(inp.data_ptr())
-        if peer_input_ptrs is not None:
-            if len(peer_input_ptrs) != self.world_size:
-                raise ValueError("peer_input_ptrs must match world size")
-            ptrs = tuple(int(ptr) for ptr in peer_input_ptrs)
-            if ptrs[self.rank] != local_ptr:
-                raise ValueError("peer_input_ptrs[self.rank] must match inp.data_ptr()")
-            self.register_buffer(ptrs)
-        elif self._eager_ptrs is None and local_ptr not in self._registered_input_ptrs:
-            raise ValueError(
-                "peer_input_ptrs are required unless eager IPC buffers are configured "
-                "or this input was already registered"
-            )
+        self._prepare_input(inp, peer_input_ptrs)
 
         self._ext.all_reduce(self._ptr, inp, out, 0, 0)
         return out
 
+    def all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        out: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce ``inp``, add ``residual``, and apply RMSNorm."""
+
+        if self._closed:
+            raise RuntimeError("runtime is closed")
+        if inp.device != self.device:
+            raise ValueError(
+                f"input device {inp.device} does not match runtime device {self.device}"
+            )
+        self._check_stream()
+        if not self.should_allreduce(inp):
+            raise ValueError(
+                "input does not satisfy device/dtype/size/alignment/contiguity "
+                f"requirements (shape={tuple(inp.shape)}, dtype={inp.dtype})"
+            )
+        if inp.ndim == 0:
+            raise ValueError("input must have at least one dimension")
+        hidden_size = inp.shape[-1]
+        if hidden_size * inp.element_size() % 16 != 0:
+            raise ValueError(
+                "the last input dimension must occupy a multiple of 16 bytes"
+            )
+        if residual.device != inp.device:
+            raise ValueError("residual tensor must be on the same device as the input")
+        if residual.shape != inp.shape or residual.dtype != inp.dtype:
+            raise ValueError("residual tensor must match input shape and dtype")
+        if not _is_weak_contiguous(residual):
+            raise ValueError("residual tensor must be weak-contiguous")
+        if weight.device != inp.device:
+            raise ValueError("weight tensor must be on the same device as the input")
+        if weight.shape != (hidden_size,) or weight.dtype != inp.dtype:
+            raise ValueError(
+                "weight tensor must match the input dtype and last dimension"
+            )
+        if not weight.is_contiguous():
+            raise ValueError("weight tensor must be contiguous")
+        if epsilon < 0:
+            raise ValueError("epsilon must be non-negative")
+
+        if out is None:
+            out = torch.empty_like(inp)
+        if residual_out is None:
+            residual_out = torch.empty_like(residual)
+        for name, tensor in (("output", out), ("residual output", residual_out)):
+            if tensor.device != inp.device:
+                raise ValueError(
+                    f"{name} tensor must be on the same device as the input"
+                )
+            if tensor.shape != inp.shape or tensor.dtype != inp.dtype:
+                raise ValueError(f"{name} tensor must match input shape and dtype")
+            if not _is_weak_contiguous(tensor):
+                raise ValueError(f"{name} tensor must be weak-contiguous")
+        if out.data_ptr() == residual_out.data_ptr():
+            raise ValueError("output and residual output must not alias")
+
+        self._prepare_input(inp, peer_input_ptrs)
+        self._ext.all_reduce_fused_add_rms_norm(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            out,
+            residual_out,
+            float(epsilon),
+            0,
+            0,
+        )
+        return out, residual_out
+
     @contextmanager
     def capture(self, stream: object = None):
         if self.exchange_group is None and self._eager_ptrs is None:
-            raise ValueError("exchange_group is required for CUDA graph capture registration")
+            raise ValueError(
+                "exchange_group is required for CUDA graph capture registration"
+            )
         self._check_stream(stream)
         try:
             yield
@@ -975,6 +1057,36 @@ class PCIeOneshotAllReducePool:
             with torch.cuda.stream(stream):
                 return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
         return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
+
+    def all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        out: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        channel = self.for_stream(stream)
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            return channel.all_reduce_fused_add_rms_norm(
+                inp,
+                residual,
+                weight,
+                epsilon,
+                out=out,
+                residual_out=residual_out,
+                peer_input_ptrs=peer_input_ptrs,
+            )
+
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return run()
+        return run()
 
     @contextmanager
     def capture(self, stream: object = None):

@@ -164,6 +164,35 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+template <typename T, int N>
+DINLINE float packed_square_sum(array_t<T, N> value) {
+  auto value_f = upcast(value);
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < N; i++) sum += value_f.data[i] * value_f.data[i];
+  return sum;
+}
+
+DINLINE float warp_reduce_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+DINLINE float block_reduce_sum(float value, float* warp_sums) {
+  const int lane = threadIdx.x % warpSize;
+  const int warp = threadIdx.x / warpSize;
+  value = warp_reduce_sum(value);
+  if (lane == 0) warp_sums[warp] = value;
+  __syncthreads();
+
+  value = threadIdx.x < blockDim.x / warpSize ? warp_sums[lane] : 0.0f;
+  if (warp == 0) value = warp_reduce_sum(value);
+  return value;
+}
+
 // 1-stage allreduce with staggered peer reads and start-barrier-only. The end
 // barrier is avoided by alternating between eager IPC buffers in a single
 // ordered channel. Callers must not share a channel concurrently across CUDA
@@ -182,6 +211,77 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
+  }
+}
+
+// Fold residual add into the peer-read pass so the reduced tensor never makes
+// a round trip through global memory before RMSNorm.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) pcie_allreduce_residual_add_kernel(
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    const T* __restrict__ residual,
+    T* __restrict__ residual_output,
+    int rank,
+    int size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  const P* rotated[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus];
+  }
+
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  const P* residual_p = reinterpret_cast<const P*>(residual);
+  P* residual_output_p = reinterpret_cast<P*>(residual_output);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    P value = packed_reduce<P, ngpus, A>(rotated, idx);
+    packed_assign_add(value, residual_p[idx]);
+    residual_output_p[idx] = value;
+  }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(1024, 1) rms_norm_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    int rows,
+    int hidden_packs,
+    float epsilon) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  __shared__ float warp_sums[32];
+  __shared__ float inv_rms;
+  const P* input_p = reinterpret_cast<const P*>(input);
+  const P* weight_p = reinterpret_cast<const P*>(weight);
+  P* output_p = reinterpret_cast<P*>(output);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const int row_offset = row * hidden_packs;
+    float square_sum = 0.0f;
+    for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
+      square_sum += packed_square_sum(input_p[row_offset + col]);
+    }
+    square_sum = block_reduce_sum(square_sum, warp_sums);
+    if (threadIdx.x == 0) {
+      inv_rms = rsqrtf(square_sum / (hidden_packs * P::size) + epsilon);
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
+      const int index = row_offset + col;
+      A value = upcast(input_p[index]);
+      A scale = upcast(weight_p[col]);
+#pragma unroll
+      for (int i = 0; i < A::size; i++) {
+        value.data[i] *= inv_rms * scale.data[i];
+      }
+      output_p[index] = downcast<P>(value);
+    }
+    __syncthreads();
   }
 }
 
@@ -354,6 +454,84 @@ class PCIeAllreduce {
 #undef KL
   }
 
+  template <typename T>
+  void allreduce_fused_add_rms_norm(
+      cudaStream_t stream,
+      T* input,
+      const T* residual,
+      const T* weight,
+      T* output,
+      T* residual_output,
+      int size,
+      int hidden_size,
+      float epsilon) {
+    using P = typename packed_t<T>::P;
+    const int pack_size = P::size;
+    if (hidden_size <= 0 || size <= 0 || size % hidden_size != 0)
+      throw std::runtime_error("fused allreduce RMSNorm requires complete non-empty rows");
+    if (hidden_size % pack_size != 0)
+      throw std::runtime_error(
+          "fused allreduce RMSNorm requires hidden size to be a multiple of " + std::to_string(pack_size));
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+    if (dbuf_enabled_) {
+      int slot = dbuf_slot_ % 2;
+      dbuf_slot_++;
+      AT_CUDA_CHECK(cudaMemcpyAsync(
+          dbuf_raw_[slot][rank_], input, size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+      ptrs = dbuf_rd_[slot];
+    } else if (status == cudaStreamCaptureStatusActive) {
+      throw std::runtime_error(
+          "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
+          "PCIeOneshotAllReducePool");
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
+      ptrs = it->second;
+    }
+
+    int rows = size / hidden_size;
+    int hidden_packs = hidden_size / pack_size;
+    const int reduce_threads = 512;
+    const int size_packs = size / pack_size;
+    const int reduce_blocks =
+        std::min(kMaxBlocks, (size_packs + reduce_threads - 1) / reduce_threads);
+
+#define KL(ngpus)                                                                                                    \
+  pcie_allreduce_residual_add_kernel<T, ngpus><<<reduce_blocks, reduce_threads, 0, stream>>>(                        \
+      ptrs, sg_, self_sg_, residual, residual_output, rank_, size_packs);
+      switch (world_size_) {
+        case 2:
+          KL(2);
+          break;
+        case 4:
+          KL(4);
+          break;
+        case 6:
+          KL(6);
+          break;
+        case 8:
+          KL(8);
+          break;
+        case 10:
+          KL(10);
+          break;
+        default:
+          throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
+      }
+#undef KL
+
+    const int norm_threads =
+        std::min(1024, std::max(32, ((hidden_packs + 31) / 32) * 32));
+    const int norm_blocks = std::min(kMaxBlocks, rows);
+    rms_norm_kernel<T><<<norm_blocks, norm_threads, 0, stream>>>(
+        residual_output, weight, output, rows, hidden_packs, epsilon);
+  }
+
   ~PCIeAllreduce() {
     for (auto [_, ptr] : ipc_handles_) CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
   }
@@ -421,6 +599,83 @@ static void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_
   }
 }
 
+static void all_reduce_fused_add_rms_norm(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& out,
+    torch::Tensor& residual_out,
+    double epsilon,
+    fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_GE(inp.dim(), 1);
+  TORCH_CHECK_EQ(inp.scalar_type(), residual.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), weight.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_out.scalar_type());
+  TORCH_CHECK_EQ(inp.device(), residual.device());
+  TORCH_CHECK_EQ(inp.device(), weight.device());
+  TORCH_CHECK_EQ(inp.device(), out.device());
+  TORCH_CHECK_EQ(inp.device(), residual_out.device());
+  TORCH_CHECK_EQ(inp.numel(), residual.numel());
+  TORCH_CHECK_EQ(inp.numel(), out.numel());
+  TORCH_CHECK_EQ(inp.numel(), residual_out.numel());
+  TORCH_CHECK_EQ(weight.dim(), 1);
+  TORCH_CHECK_EQ(weight.numel(), inp.size(-1));
+  TORCH_CHECK_GE(epsilon, 0.0);
+  TORCH_CHECK(_is_weak_contiguous(inp));
+  TORCH_CHECK(_is_weak_contiguous(residual));
+  TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(_is_weak_contiguous(out));
+  TORCH_CHECK(_is_weak_contiguous(residual_out));
+  TORCH_CHECK_NE(out.data_ptr(), residual_out.data_ptr());
+
+  auto input_size = inp.numel() * inp.element_size();
+  void* reg_buffer;
+  if (fa->dbuf_enabled_) {
+    reg_buffer = inp.data_ptr();
+  } else if (_reg_buffer) {
+    reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+#define CALL_FUSED(T)                                                                                              \
+  fa->allreduce_fused_add_rms_norm<T>(                                                                             \
+      stream,                                                                                                      \
+      reinterpret_cast<T*>(reg_buffer),                                                                           \
+      reinterpret_cast<const T*>(residual.data_ptr()),                                                             \
+      reinterpret_cast<const T*>(weight.data_ptr()),                                                               \
+      reinterpret_cast<T*>(out.data_ptr()),                                                                        \
+      reinterpret_cast<T*>(residual_out.data_ptr()),                                                               \
+      inp.numel(),                                                                                                  \
+      inp.size(-1),                                                                                                 \
+      static_cast<float>(epsilon));
+  switch (inp.scalar_type()) {
+    case at::ScalarType::Float:
+      CALL_FUSED(float);
+      break;
+    case at::ScalarType::Half:
+      CALL_FUSED(half);
+      break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16:
+      CALL_FUSED(nv_bfloat16);
+      break;
+#endif
+    default:
+      throw std::runtime_error("only supports float32, float16 and bfloat16");
+  }
+#undef CALL_FUSED
+}
+
 static void dispose(fptr_t _fa) {
   delete reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
 }
@@ -469,6 +724,10 @@ static void register_graph_buffers(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("init_custom_ar", &init_custom_ar, "init PCIe allreduce");
   m.def("all_reduce", &all_reduce, "PCIe allreduce");
+  m.def(
+      "all_reduce_fused_add_rms_norm",
+      &all_reduce_fused_add_rms_norm,
+      "PCIe allreduce fused with residual add and RMSNorm");
   m.def("dispose", &dispose, "dispose PCIe allreduce");
   m.def("meta_size", &meta_size, "signal metadata size");
   m.def("register_buffer", &register_buffer, "register IPC buffer");

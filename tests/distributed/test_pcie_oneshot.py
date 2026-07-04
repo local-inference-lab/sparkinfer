@@ -18,6 +18,7 @@ class _FakeExt:
         self.register_pcie_buffers_calls = []
         self.register_buffer_calls = []
         self.all_reduce_calls = []
+        self.all_reduce_fused_add_rms_norm_calls = []
         self.dispose_calls = []
         self.register_graph_buffers_calls = []
         self.handle_bytes = [1, 2, 3]
@@ -34,8 +35,48 @@ class _FakeExt:
         self.register_buffer_calls.append((ptr, tuple(peer_input_ptrs)))
 
     def all_reduce(self, ptr, inp, out, reg_buffer, reg_buffer_bytes):
-        self.all_reduce_calls.append((ptr, int(inp.data_ptr()), int(out.data_ptr()), reg_buffer, reg_buffer_bytes))
+        self.all_reduce_calls.append(
+            (
+                ptr,
+                int(inp.data_ptr()),
+                int(out.data_ptr()),
+                reg_buffer,
+                reg_buffer_bytes,
+            )
+        )
         out.copy_(inp)
+
+    def all_reduce_fused_add_rms_norm(
+        self,
+        ptr,
+        inp,
+        residual,
+        weight,
+        out,
+        residual_out,
+        epsilon,
+        reg_buffer,
+        reg_buffer_bytes,
+    ):
+        self.all_reduce_fused_add_rms_norm_calls.append(
+            (
+                ptr,
+                int(inp.data_ptr()),
+                int(residual.data_ptr()),
+                int(weight.data_ptr()),
+                int(out.data_ptr()),
+                int(residual_out.data_ptr()),
+                epsilon,
+                reg_buffer,
+                reg_buffer_bytes,
+            )
+        )
+        residual_value = residual.clone()
+        residual_out.copy_(inp)
+        residual_out.add_(residual_value)
+        variance = residual_out.float().square().mean(dim=-1, keepdim=True)
+        normalized = residual_out.float() * torch.rsqrt(variance + epsilon)
+        out.copy_((normalized * weight.float()).to(out.dtype))
 
     def dispose(self, ptr):
         self.dispose_calls.append(ptr)
@@ -160,6 +201,74 @@ def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
     assert ext.register_pcie_buffers_calls == [(12345, (200, 201), (300, 301))]
     assert ext.register_buffer_calls == []
     assert len(ext.all_reduce_calls) == 1
+
+
+def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
+    runtime = _make_runtime(eager=True)
+    ext = runtime._ext
+    inp = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8) / 8
+    residual = torch.linspace(-0.5, 0.5, 16, dtype=torch.bfloat16).reshape(2, 8)
+    weight = torch.linspace(0.75, 1.25, 8, dtype=torch.bfloat16)
+
+    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp,
+        residual,
+        weight,
+        1e-6,
+    )
+
+    expected_residual = inp + residual
+    variance = expected_residual.float().square().mean(dim=-1, keepdim=True)
+    expected_out = (
+        expected_residual.float() * torch.rsqrt(variance + 1e-6) * weight.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(residual_out, expected_residual)
+    torch.testing.assert_close(out, expected_out)
+    assert len(ext.all_reduce_fused_add_rms_norm_calls) == 1
+
+
+def test_fused_add_rms_norm_supports_inplace_residual_output():
+    runtime = _make_runtime(eager=True)
+    inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
+    residual = torch.ones_like(inp)
+    original_residual_ptr = residual.data_ptr()
+
+    _, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp,
+        residual,
+        torch.ones(8, dtype=torch.bfloat16),
+        1e-6,
+        residual_out=residual,
+    )
+
+    assert residual_out.data_ptr() == original_residual_ptr
+    torch.testing.assert_close(residual_out, inp + 1)
+
+
+def test_fused_add_rms_norm_requires_pack_aligned_rows():
+    runtime = _make_runtime(eager=True)
+    inp = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+
+    with pytest.raises(ValueError, match="last input dimension"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp,
+            torch.zeros_like(inp),
+            torch.ones(4, dtype=torch.bfloat16),
+            1e-6,
+        )
+
+
+def test_fused_add_rms_norm_validates_weight():
+    runtime = _make_runtime(eager=True)
+    inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
+
+    with pytest.raises(ValueError, match="weight tensor"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp,
+            torch.zeros_like(inp),
+            torch.ones(8, dtype=torch.float32),
+            1e-6,
+        )
 
 
 def test_world_size_10_is_supported_by_eager_pool():
@@ -325,6 +434,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
             raise AssertionError("success path should not free local ptr")
 
     ipc = FakeIPC()
+    exchange_group = object()
     signal_bytes = 300
     eager_bytes = 128
     eager0_offset = IPC_SLAB_ALIGNMENT * 2
@@ -338,14 +448,14 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     )
 
     buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
-        object(),
+        exchange_group,
         signal_bytes=signal_bytes,
         eager_buffer_bytes=eager_bytes,
         ipc=ipc,
     )
 
     assert ipc.malloc_sizes == [eager1_offset + eager_bytes]
-    assert ipc.memsets == [(1000, 0, signal_bytes)]
+    assert ipc.memsets == [(1000, 0, eager1_offset + eager_bytes)]
     assert ipc.opened == [2000, 3000]
     assert buffers.owned_buffer.local_ptr == 1000
     assert buffers.owned_buffer.remote_ptrs == (2000, 3000)
@@ -362,7 +472,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     )
 
 
-def test_eager_channel_buffers_cleanup_when_signal_zero_fails(monkeypatch):
+def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     class FakeIPC:
         def __init__(self):
             self.closed = []
@@ -403,7 +513,7 @@ def test_eager_channel_buffers_cleanup_when_signal_zero_fails(monkeypatch):
             ipc=ipc,
         )
 
-    assert ipc.closed == [2000, 3000]
+    assert ipc.closed == []
     assert ipc.freed == [1000]
 
 
