@@ -18,6 +18,7 @@ from b12x.attention.indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     _DSV4_BATCH_SLACK,
     _resolve_fused_batch_slack,
+    fused_indexer_decode_warmup_rows,
     fused_indexer_scratch_capacity,
     resolve_fused_indexer_path,
     run_fused_paged_indexer,
@@ -25,6 +26,34 @@ from b12x.attention.indexer.fused_indexer import (
 )
 
 _PS = 64  # compressed-index page size
+
+
+def test_fused_indexer_warmup_rows_cover_glm_policies(monkeypatch):
+    props = type("Props", (), {"multi_processor_count": 188})()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    rows = fused_indexer_decode_warmup_rows(
+        topk=2048,
+        num_heads=32,
+        max_pages=9114,
+        device=torch.device("cuda"),
+    )
+
+    assert rows == tuple(range(1, 17))
+
+
+def test_fused_indexer_warmup_rows_deduplicate_policies(monkeypatch):
+    props = type("Props", (), {"multi_processor_count": 4})()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    rows = fused_indexer_decode_warmup_rows(
+        topk=2048,
+        num_heads=32,
+        max_pages=9114,
+        device=torch.device("cuda"),
+    )
+
+    assert rows == (1, 2, 3)
 
 
 def test_paged_dsv4_always_uses_large_fused_carry():

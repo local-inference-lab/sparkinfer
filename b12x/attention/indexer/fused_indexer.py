@@ -443,6 +443,96 @@ def resolve_fused_indexer_path(
     return int(num_rows) <= FUSED_MAX_ROWS
 
 
+def _resolve_default_ctas_per_group(
+    *,
+    num_rows: int,
+    max_pages: int,
+    device: torch.device,
+) -> int:
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    # Target a single CTA wave (rows * ctas_per_group ~ num_sms): more CTAs
+    # only add last-CTA merge work + a second wave. Never split below 1 page.
+    return max(1, min(int(max_pages), num_sms // max(1, int(num_rows))))
+
+
+def _resolve_default_merge_threshold(
+    *,
+    ctas_per_group: int,
+    num_heads: int,
+    topk: int,
+) -> int:
+    # Cross-CTA merge auto-switch, candidate-count model (sm120, graph; refit after
+    # the last-CTA select was unrolled/de-branched to match tiled_topk). The
+    # per-group merge sees min(seq_len, ctas_per_group*topk) candidates -- each CTA
+    # trims its local top-k to topk, so ctas_per_group*topk caps the count. Coop's
+    # grid-barrier radix only amortizes its fixed barrier cost (which GROWS with
+    # ctas_per_group) above a crossover candidate count C; below it the now-fast
+    # serial last-CTA select wins. Measured crossover (rows 1/2 -> ctas_pg 188/94,
+    # topk 512/1024/2048): C ~= 22000 + 117*ctas_per_group - 13*(topk-512). When the
+    # cap ctas_per_group*topk <= C (small ctas_pg, i.e. rows>=4) coop can never reach
+    # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
+    # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
+    ctas_per_group = max(1, int(ctas_per_group))
+    topk = int(topk)
+    crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (topk - 512))
+    # The original fit was dominated by the 64-head kernel. After vectorized
+    # query staging, GLM's 32-head/top-k-2048 path still favors the serial
+    # last-CTA reducer through 16k for B2-B5; cooperative merge only wins
+    # beyond that point. This floor is runtime-seqlen dispatch inside a
+    # capture-static kernel variant, and both arms self-reset for replay.
+    if int(num_heads) == 32 and topk == 2048:
+        crossover = max(crossover, 16384)
+    cap = ctas_per_group * topk
+    return crossover if cap > crossover else _FORCE_LAST_CTA
+
+
+def fused_indexer_decode_warmup_rows(
+    *,
+    topk: int,
+    num_heads: int,
+    max_pages: int,
+    device: torch.device,
+) -> tuple[int, ...]:
+    """Return one safe launch row count per compiled decode policy.
+
+    The default fused planner specializes ``ctas_per_group`` and its merge
+    threshold by row count. Each returned row count selects a distinct policy
+    while preserving the planner's one-machine-wave launch bound. Callers can
+    launch these shapes before graph capture to populate every runtime variant.
+    """
+    if int(topk) == 2048 and int(num_heads) == 32:
+        max_rows = _GLM32_FUSED_MAX_ROWS
+    else:
+        max_rows = FUSED_MAX_ROWS
+
+    width = int(max_pages) * _PAGE_SIZE
+    rows_by_policy: list[int] = []
+    seen_policies: set[tuple[int, int]] = set()
+    for rows in range(1, max_rows + 1):
+        if not resolve_fused_indexer_path(
+            topk=int(topk),
+            num_rows=rows,
+            width=width,
+            num_heads=int(num_heads),
+        ):
+            continue
+        ctas_per_group = _resolve_default_ctas_per_group(
+            num_rows=rows,
+            max_pages=int(max_pages),
+            device=device,
+        )
+        merge_threshold = _resolve_default_merge_threshold(
+            ctas_per_group=ctas_per_group,
+            num_heads=int(num_heads),
+            topk=int(topk),
+        )
+        policy = (ctas_per_group, merge_threshold)
+        if policy not in seen_policies:
+            seen_policies.add(policy)
+            rows_by_policy.append(rows)
+    return tuple(rows_by_policy)
+
+
 # --- scratch plan trio (layout-agnostic: sizes only) --------------------------
 @dataclass(frozen=True)
 class B12XFusedIndexerScratchPlan:
@@ -2122,33 +2212,18 @@ def run_fused_paged_indexer(
     dev = q_bytes.device
     max_pages = int(real_page_table.shape[1])
     if ctas_per_group is None:
-        num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        # Target a single CTA wave (rows * ctas_per_group ~ num_sms): more CTAs
-        # only add last-CTA merge work + a second wave. Never split below 1 page.
-        ctas_per_group = max(1, min(max_pages, num_sms // max(1, rows)))
+        ctas_per_group = _resolve_default_ctas_per_group(
+            num_rows=rows,
+            max_pages=max_pages,
+            device=dev,
+        )
     ctas_per_group = max(1, int(ctas_per_group))
     if merge_threshold is None:
-        # Cross-CTA merge auto-switch, candidate-count model (sm120, graph; refit after
-        # the last-CTA select was unrolled/de-branched to match tiled_topk). The
-        # per-group merge sees min(seq_len, ctas_per_group*topk) candidates -- each CTA
-        # trims its local top-k to topk, so ctas_per_group*topk caps the count. Coop's
-        # grid-barrier radix only amortizes its fixed barrier cost (which GROWS with
-        # ctas_per_group) above a crossover candidate count C; below it the now-fast
-        # serial last-CTA select wins. Measured crossover (rows 1/2 -> ctas_pg 188/94,
-        # topk 512/1024/2048): C ~= 22000 + 117*ctas_per_group - 13*(topk-512). When the
-        # cap ctas_per_group*topk <= C (small ctas_pg, i.e. rows>=4) coop can never reach
-        # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
-        # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
-        crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (int(topk) - 512))
-        # The original fit was dominated by the 64-head kernel. After vectorized
-        # query staging, GLM's 32-head/top-k-2048 path still favors the serial
-        # last-CTA reducer through 16k for B2-B5; cooperative merge only wins
-        # beyond that point. This floor is runtime-seqlen dispatch inside a
-        # capture-static kernel variant, and both arms self-reset for replay.
-        if int(num_heads) == 32 and int(topk) == 2048:
-            crossover = max(crossover, 16384)
-        cap = ctas_per_group * int(topk)
-        merge_threshold = crossover if cap > crossover else _FORCE_LAST_CTA
+        merge_threshold = _resolve_default_merge_threshold(
+            ctas_per_group=ctas_per_group,
+            num_heads=int(num_heads),
+            topk=int(topk),
+        )
 
     out_i = (
         torch.empty((rows, topk), dtype=torch.int32, device=dev)
