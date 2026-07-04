@@ -381,8 +381,8 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor] = None,
         *,
         is_lse_base_on_e: bool = True,
-        threads: int = 128,
-        block_limit: int = 64,
+        threads: int = 256,
+        block_limit: int = 16,
     ) -> torch.Tensor:
         """Exchange rank contributions and return this rank's reduced heads."""
         self._check_stream()
@@ -411,8 +411,8 @@ class PCIeDCPA2A:
         local_input: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         *,
-        threads: int = 128,
-        block_limit: int = 64,
+        threads: int = 256,
+        block_limit: int = 16,
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         self._check_stream()
@@ -616,8 +616,8 @@ class PCIeDCPA2APool:
         out: Optional[torch.Tensor] = None,
         *,
         is_lse_base_on_e: bool = True,
-        threads: int = 128,
-        block_limit: int = 64,
+        threads: int = 256,
+        block_limit: int = 16,
         stream: object = None,
     ) -> torch.Tensor:
         channel = self.for_stream(stream)
@@ -645,8 +645,8 @@ class PCIeDCPA2APool:
         local_input: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         *,
-        threads: int = 128,
-        block_limit: int = 64,
+        threads: int = 256,
+        block_limit: int = 16,
         stream: object = None,
     ) -> torch.Tensor:
         channel = self.for_stream(stream)

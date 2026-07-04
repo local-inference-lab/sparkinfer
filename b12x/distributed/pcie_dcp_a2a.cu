@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -42,6 +43,27 @@ constexpr int kMaxBlocks = 64;
 constexpr int kMaxRanks = 8;
 constexpr int kFlagStride = 32;
 using FlagType = uint32_t;
+
+static int env_int(const char *name, int fallback) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  return std::atoi(raw);
+}
+
+// Launch-shape overrides for latency sweeps. Every rank must use identical
+// values: warp geometry decides which rows each block stages, and peer
+// block b only reads what writer block b staged.
+static int dcp_threads_override() {
+  static const int value = env_int("B12X_PCIE_DCP_THREADS", 0);
+  return value;
+}
+
+static int dcp_block_limit_override() {
+  static const int value = env_int("B12X_PCIE_DCP_BLOCK_LIMIT", 0);
+  return value;
+}
 
 struct Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
@@ -75,8 +97,11 @@ static DINLINE FlagType load_flag(FlagType *address) {
   return value;
 }
 
-template <int world_size>
+// pre_sync orders in-kernel staging stores (from every warp of the block)
+// before the flag post; without staging the flags can go out immediately.
+template <int world_size, bool pre_sync>
 DINLINE void start_barrier(const RankSignals &signals, Signal *self, int rank) {
+  if constexpr (pre_sync) __syncthreads();
   if (threadIdx.x < world_size) {
     __threadfence_system();
     const auto value = self->self_counter[blockIdx.x][threadIdx.x] +=
@@ -109,6 +134,17 @@ DINLINE float sanitize_lse(float value) {
   return isfinite(value) ? value : -CUDART_INF_F;
 }
 
+// Warp-per-row LSE-weighted reduction with in-kernel staging.
+//
+// Reader rows are the (batch, local_head) pairs of this rank's head shard,
+// and every rank strides that identical row space with identical warp
+// geometry. The warp that owns reader row (b, h) also stages this rank's
+// contributions for (b, h) across all destination shards (packs and LSE),
+// so the block-pairwise barrier covers exactly what the matching reader
+// blocks pull. Each warp reads the LSE values once per row (one lane per
+// source, packs_per_head times fewer remote scalar reads than per-pack
+// loads), builds the softmax weights via shuffles in rotated source order,
+// and streams the row's packs with lane-parallel pulls.
 template <typename T, int world_size>
 __global__ void __launch_bounds__(512, 1)
     dcp_lse_reduce_kernel(const T *__restrict__ local_output,
@@ -117,113 +153,169 @@ __global__ void __launch_bounds__(512, 1)
                           RankSignals signals, Signal *self,
                           T *__restrict__ output, int rank, int batch,
                           int total_heads, int head_dim, bool natural_log) {
-  start_barrier<world_size>(signals, self, rank);
-
   constexpr int kPackElems = 8;
   const int heads_per_rank = total_heads / world_size;
   const int packs_per_head = head_dim / kPackElems;
-  const int64_t total_packs = int64_t(batch) * heads_per_rank * packs_per_head;
+  const int rows = batch * heads_per_rank;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int warp_first = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  const int warp_stride = gridDim.x * warps_per_block;
+
   const auto *local_packs = reinterpret_cast<const Pack<T> *>(local_output);
   auto *output_packs = reinterpret_cast<Pack<T> *>(output);
 
-  for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < total_packs; index += int64_t(gridDim.x) * blockDim.x) {
-    const int64_t local_row = index / packs_per_head;
-    const int pack_index = index % packs_per_head;
-    const int batch_index = local_row / heads_per_rank;
-    const int local_head = local_row % heads_per_rank;
+  auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
+  auto *staging_lse = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(staging.ptrs[rank]) + lse_offset);
+  for (int row = warp_first; row < rows; row += warp_stride) {
+    const int batch_index = row / heads_per_rank;
+    const int local_head = row - batch_index * heads_per_rank;
+#pragma unroll
+    for (int dest = 0; dest < world_size; ++dest) {
+      const int64_t source_row = int64_t(batch_index) * total_heads +
+                                 dest * heads_per_rank + local_head;
+      const int64_t base = source_row * packs_per_head;
+      for (int pack = lane; pack < packs_per_head; pack += warpSize) {
+        staging_out[base + pack] = local_packs[base + pack];
+      }
+      if (lane == 0) {
+        staging_lse[source_row] = local_lse[source_row];
+      }
+    }
+  }
+  start_barrier<world_size, true>(signals, self, rank);
+
+  // Rotated source pointers so every later access uses a compile-time
+  // index; the self source reads the local tensors directly (still hot in
+  // L2 from staging).
+  const Pack<T> *rot_packs[world_size];
+#pragma unroll
+  for (int i = 0; i < world_size; ++i) {
+    const int src = (rank + i) % world_size;
+    rot_packs[i] = src == rank
+                       ? local_packs
+                       : reinterpret_cast<const Pack<T> *>(staging.ptrs[src]);
+  }
+
+  for (int row = warp_first; row < rows; row += warp_stride) {
+    const int batch_index = row / heads_per_rank;
+    const int local_head = row - batch_index * heads_per_rank;
     const int global_head = rank * heads_per_rank + local_head;
     const int64_t source_row = int64_t(batch_index) * total_heads + global_head;
-    const int64_t source_pack = source_row * packs_per_head + pack_index;
 
-    float lse_values[world_size];
+    // Lane i pulls rotated source i's LSE; shuffles then give every lane
+    // all sources in rotated order. The pointer is derived per lane from
+    // the kernel param block to avoid a runtime-indexed local array.
+    float lane_lse = -CUDART_INF_F;
+    if (lane < world_size) {
+      const int src = (rank + lane) % world_size;
+      const float *lse_ptr =
+          src == rank ? local_lse
+                      : reinterpret_cast<const float *>(
+                            reinterpret_cast<const char *>(staging.ptrs[src]) +
+                            lse_offset);
+      lane_lse = sanitize_lse(lse_ptr[source_row]);
+    }
+    float weights[world_size];
     float max_lse = -CUDART_INF_F;
 #pragma unroll
     for (int i = 0; i < world_size; ++i) {
-      const int source_rank = (rank + i) % world_size;
-      const float *source_lse =
-          source_rank == rank
-              ? local_lse
-              : reinterpret_cast<const float *>(
-                    reinterpret_cast<const char *>(staging.ptrs[source_rank]) +
-                    lse_offset);
-      const float value = sanitize_lse(source_lse[source_row]);
-      lse_values[source_rank] = value;
+      const float value = __shfl_sync(0xffffffff, lane_lse, i);
+      weights[i] = value;
       max_lse = fmaxf(max_lse, value);
     }
     if (!isfinite(max_lse)) {
       max_lse = 0.0f;
     }
-
-    float weights[world_size];
     float weight_sum = 0.0f;
 #pragma unroll
-    for (int source_rank = 0; source_rank < world_size; ++source_rank) {
-      const float delta = lse_values[source_rank] - max_lse;
-      const float weight = isfinite(lse_values[source_rank])
+    for (int i = 0; i < world_size; ++i) {
+      const float delta = weights[i] - max_lse;
+      const float weight = isfinite(weights[i])
                                ? (natural_log ? expf(delta) : exp2f(delta))
                                : 0.0f;
-      weights[source_rank] = weight;
+      weights[i] = weight;
       weight_sum += weight;
     }
     const float inv_weight_sum = 1.0f / fmaxf(weight_sum, 1.0e-10f);
 
-    float accum[kPackElems] = {};
+    const int64_t source_base = source_row * packs_per_head;
+    const int64_t output_base = int64_t(row) * packs_per_head;
+    for (int pack = lane; pack < packs_per_head; pack += warpSize) {
+      float accum[kPackElems] = {};
 #pragma unroll
-    for (int i = 0; i < world_size; ++i) {
-      const int source_rank = (rank + i) % world_size;
-      const auto *source_packs =
-          source_rank == rank
-              ? local_packs
-              : reinterpret_cast<const Pack<T> *>(staging.ptrs[source_rank]);
-      const Pack<T> values = source_packs[source_pack];
-      const float weight = weights[source_rank] * inv_weight_sum;
+      for (int i = 0; i < world_size; ++i) {
+        const Pack<T> values = rot_packs[i][source_base + pack];
+        const float weight = weights[i] * inv_weight_sum;
+#pragma unroll
+        for (int element = 0; element < kPackElems; ++element) {
+          accum[element] += weight * to_float(values.values[element]);
+        }
+      }
+      Pack<T> result;
 #pragma unroll
       for (int element = 0; element < kPackElems; ++element) {
-        accum[element] += weight * to_float(values.values[element]);
+        result.values[element] = from_float<T>(accum[element]);
       }
+      output_packs[output_base + pack] = result;
     }
-
-    Pack<T> result;
-#pragma unroll
-    for (int element = 0; element < kPackElems; ++element) {
-      result.values[element] = from_float<T>(accum[element]);
-    }
-    output_packs[index] = result;
   }
 }
 
+// Warp-per-output-row head gather with in-kernel staging. Every rank
+// strides the identical output row space with identical warp geometry, so
+// the writer warp that owns row (batch, global_head) with source == this
+// rank stages exactly the packs the matching reader blocks pull. Row-major
+// warps also hoist the head/source arithmetic out of the pack loop (the
+// pack-strided version paid six integer divisions per 16B pack).
 template <typename T, int world_size>
 __global__ void __launch_bounds__(512, 1)
     all_gather_heads_kernel(const T *__restrict__ local_input,
                             RankStaging staging, RankSignals signals,
                             Signal *self, T *__restrict__ output, int rank,
                             int batch, int local_heads, int head_dim) {
-  start_barrier<world_size>(signals, self, rank);
-
   constexpr int kPackElems = 8;
   const int packs_per_head = head_dim / kPackElems;
   const int total_heads = local_heads * world_size;
-  const int64_t total_packs = int64_t(batch) * total_heads * packs_per_head;
+  const int rows = batch * total_heads;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int warp_first = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  const int warp_stride = gridDim.x * warps_per_block;
   const auto *local_packs = reinterpret_cast<const Pack<T> *>(local_input);
-  auto *output_packs = reinterpret_cast<Pack<T> *>(output);
 
-  for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < total_packs; index += int64_t(gridDim.x) * blockDim.x) {
-    const int64_t output_row = index / packs_per_head;
-    const int pack_index = index % packs_per_head;
-    const int batch_index = output_row / total_heads;
-    const int global_head = output_row % total_heads;
+  auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
+  for (int row = warp_first; row < rows; row += warp_stride) {
+    const int batch_index = row / total_heads;
+    const int global_head = row - batch_index * total_heads;
     const int source_rank = global_head / local_heads;
-    const int local_head = global_head % local_heads;
-    const int64_t source_pack =
-        (int64_t(batch_index) * local_heads + local_head) * packs_per_head +
-        pack_index;
+    if (source_rank != rank) continue;
+    const int local_head = global_head - source_rank * local_heads;
+    const int64_t base =
+        (int64_t(batch_index) * local_heads + local_head) * packs_per_head;
+    for (int pack = lane; pack < packs_per_head; pack += warpSize) {
+      staging_out[base + pack] = local_packs[base + pack];
+    }
+  }
+  start_barrier<world_size, true>(signals, self, rank);
+
+  auto *output_packs = reinterpret_cast<Pack<T> *>(output);
+  for (int row = warp_first; row < rows; row += warp_stride) {
+    const int batch_index = row / total_heads;
+    const int global_head = row - batch_index * total_heads;
+    const int source_rank = global_head / local_heads;
+    const int local_head = global_head - source_rank * local_heads;
     const auto *source_packs =
         source_rank == rank
             ? local_packs
             : reinterpret_cast<const Pack<T> *>(staging.ptrs[source_rank]);
-    output_packs[index] = source_packs[source_pack];
+    const int64_t source_base =
+        (int64_t(batch_index) * local_heads + local_head) * packs_per_head;
+    const int64_t output_base = int64_t(row) * packs_per_head;
+    for (int pack = lane; pack < packs_per_head; pack += warpSize) {
+      output_packs[output_base + pack] = source_packs[source_base + pack];
+    }
   }
 }
 
@@ -275,21 +367,24 @@ public:
       throw std::runtime_error("invalid block limit");
     }
 
-    const int slot = slot_++ % 2;
-    void *local_staging = staging_[slot].ptrs[rank_];
-    CHECK_CUDA_SUCCESS(cudaMemcpyAsync(local_staging, partial_output,
-                                       output_elems * sizeof(T),
-                                       cudaMemcpyDeviceToDevice, stream));
-    CHECK_CUDA_SUCCESS(cudaMemcpyAsync(
-        reinterpret_cast<char *>(local_staging) + lse_offset_, partial_lse,
-        lse_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    if (const int env_threads = dcp_threads_override(); env_threads > 0) {
+      threads = std::min(512, std::max(64, (env_threads / 32) * 32));
+    }
+    if (const int env_blocks = dcp_block_limit_override(); env_blocks > 0) {
+      block_limit = std::min(env_blocks, kMaxBlocks);
+    }
+    if (threads % 32 != 0) {
+      throw std::runtime_error("threads must be a multiple of 32");
+    }
 
+    // Staging happens inside the kernel (warp-per-row, before the start
+    // barrier); no host staging memcpys are issued.
+    const int slot = slot_++ % 2;
     const int heads_per_rank = total_heads / world_size_;
-    const int64_t output_packs =
-        int64_t(batch) * heads_per_rank * (head_dim / 8);
-    const int blocks = std::max<int64_t>(
-        1,
-        std::min<int64_t>(block_limit, (output_packs + threads - 1) / threads));
+    const int rows = batch * heads_per_rank;
+    const int warps_per_block = threads / 32;
+    const int blocks = std::max(
+        1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
 
 #define LAUNCH(world)                                                          \
   dcp_lse_reduce_kernel<T, world><<<blocks, threads, 0, stream>>>(             \
@@ -317,7 +412,6 @@ public:
                         int batch, int local_heads, int head_dim, int threads,
                         int block_limit) {
     const int total_heads = local_heads * world_size_;
-    const int64_t local_elems = int64_t(batch) * local_heads * head_dim;
     const int64_t output_elems = int64_t(batch) * total_heads * head_dim;
     if (output_elems > output_capacity_elems_) {
       throw std::runtime_error("PCIe DCP all-gather staging capacity exceeded");
@@ -332,16 +426,23 @@ public:
       throw std::runtime_error("invalid block limit");
     }
 
-    const int slot = slot_++ % 2;
-    void *local_staging = staging_[slot].ptrs[rank_];
-    CHECK_CUDA_SUCCESS(cudaMemcpyAsync(local_staging, local_input,
-                                       local_elems * sizeof(T),
-                                       cudaMemcpyDeviceToDevice, stream));
+    if (const int env_threads = dcp_threads_override(); env_threads > 0) {
+      threads = std::min(512, std::max(64, (env_threads / 32) * 32));
+    }
+    if (const int env_blocks = dcp_block_limit_override(); env_blocks > 0) {
+      block_limit = std::min(env_blocks, kMaxBlocks);
+    }
+    if (threads % 32 != 0) {
+      throw std::runtime_error("threads must be a multiple of 32");
+    }
 
-    const int64_t output_packs = output_elems / 8;
-    const int blocks = std::max<int64_t>(
-        1,
-        std::min<int64_t>(block_limit, (output_packs + threads - 1) / threads));
+    // Staging happens inside the kernel (warp-per-row, before the start
+    // barrier); no host staging memcpy is issued.
+    const int slot = slot_++ % 2;
+    const int rows = batch * total_heads;
+    const int warps_per_block = threads / 32;
+    const int blocks = std::max(
+        1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
 
 #define LAUNCH(world)                                                          \
   all_gather_heads_kernel<T, world><<<blocks, threads, 0, stream>>>(           \
