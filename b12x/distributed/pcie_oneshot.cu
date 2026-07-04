@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -42,10 +43,43 @@ using FlagType = uint32_t;
 // 128B stride per rank to avoid PCIe false sharing.
 constexpr int kFlagStride = 32;
 
+static int env_int(const char* name, int fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') return fallback;
+  return std::atoi(raw);
+}
+
+// Fused kernel launch knobs, mainly for latency sweeps. Every rank must use
+// identical values: launch geometry decides which columns each block stages,
+// and peer block b only reads what writer block b staged. 256 threads beat
+// 512 measurably at rows >= 2 on Gen5 PCIe (three packs per thread give the
+// pull loop deeper memory-level parallelism than half-idle wider blocks).
+static int fused_threads() {
+  static const int value = [] {
+    int v = env_int("B12X_PCIE_FUSED_THREADS", 256);
+    v = std::min(512, std::max(64, v));
+    return (v / 32) * 32;
+  }();
+  return value;
+}
+
+static int fused_ctas_per_row_override() {
+  static const int value = env_int("B12X_PCIE_FUSED_CTAS_PER_ROW", 0);
+  return value;
+}
+
+// Push transport requires eager slots of world_size * max_size bytes; the
+// Python runtime scales the allocation when the same env toggle is set.
+static bool oneshot_push_enabled() {
+  static const bool value = env_int("B12X_PCIE_ONESHOT_PUSH", 0) != 0;
+  return value;
+}
+
 struct Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
-  alignas(128) FlagType rms_completion[kMaxBlocks];
+  alignas(128) FlagType rms_arrive[kMaxBlocks];
+  alignas(128) FlagType rms_gen[kMaxBlocks];
   alignas(128) float rms_partial[kMaxBlocks];
 };
 
@@ -143,6 +177,18 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   return flag;
 }
 
+static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  return flag;
+}
+
+static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  return flag;
+}
+
 template <int ngpus, bool is_start>
 DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank) {
   if constexpr (!is_start) __syncthreads();
@@ -199,9 +245,22 @@ DINLINE float block_reduce_sum(float value, float* warp_sums) {
 // barrier is avoided by alternating between eager IPC buffers in a single
 // ordered channel. Callers must not share a channel concurrently across CUDA
 // streams; multi-stream use needs separate signal and staging buffers.
-template <typename T, int ngpus>
+//
+// With stage_input the kernel copies its own grid-stride index set from the
+// local input into this channel's staging slot before the start barrier,
+// replacing the host staging memcpy. Writer block b covers exactly the packs
+// reader block b consumes on every rank, so the block-pairwise barrier is
+// sufficient for staging visibility.
+template <typename T, int ngpus, bool stage_input>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    const T* __restrict__ input,
+    T* __restrict__ result,
+    T* __restrict__ self_staging,
+    int rank,
+    int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   auto dp = *_dp;
@@ -210,36 +269,92 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   for (int i = 0; i < ngpus; i++) {
     rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus];
   }
-  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  if constexpr (stage_input) {
+    const P* input_p = reinterpret_cast<const P*>(input);
+    P* staging_p = reinterpret_cast<P*>(self_staging);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
+      staging_p[idx] = input_p[idx];
+    }
+  }
+  multi_gpu_barrier<ngpus, !stage_input>(sg, self_sg, rank);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
   }
 }
 
-// Complete the allreduce, residual add, and RMSNorm in one launch. Rows up to
-// 16 KiB use one CTA and only block-local synchronization. Larger rows retain
-// the multi-CTA path; the last CTA to publish its row partial normalizes it, so
-// no CTA waits for an unscheduled CTA or requires cooperative launch.
-template <typename T, int ngpus, bool single_cta_per_row>
+// Per-thread register budget for the fused kernel's normalize-from-registers
+// path, in 16B packs. Three packs cover hidden_size 6144 at the default
+// 256-thread block while staying inside the 128-register budget (four packs
+// plus prefetched operands spilled to the stack and the spill traffic
+// dominated the pull loop). Larger per-thread column counts fall back to
+// re-reading residual_output during normalization.
+constexpr int kRegPacks = 3;
+
+// Transport modes for the fused kernel.
+//  kModeRegistered: the input already lives in a peer-visible registered
+//    buffer; peers pull it after the start barrier.
+//  kModeStagePull: the kernel copies its columns into this rank's eager slot
+//    before the start barrier (replacing the host staging memcpy); peers
+//    pull staged data.
+//  kModeStagePush: the kernel writes its columns into a per-source shard of
+//    every peer's eager slot (PCIe posted writes run at link bandwidth while
+//    pulls are round-trip bound); after the barrier the reduction reads only
+//    local memory. Requires eager slots of world_size * max_size bytes.
+constexpr int kModeRegistered = 0;
+constexpr int kModeStagePull = 1;
+constexpr int kModeStagePush = 2;
+
+// Complete the allreduce, residual add, and RMSNorm in one launch.
+//
+// Geometry is uniform: gridDim.x == rows * ctas_per_row and block b serves
+// row b / ctas_per_row, owning columns {(b % ctas_per_row) * blockDim.x +
+// threadIdx.x + k * ctas_per_row * blockDim.x}. The same block index covers
+// the same columns on every rank, so the block-pairwise start barrier is
+// sufficient for staging visibility (writer block b stages exactly the
+// columns reader block b consumes, for every source/destination pair).
+//
+// Slot reuse stays safe without an end barrier in every mode: a rank enters
+// kernel k+2 only after its kernel k+1 retired, which required every rank to
+// have passed kernel k+1's start barrier and hence to have fully consumed
+// slot k % 2 inside kernel k.
+//
+// The reduction runs in fp32 registers straight through the residual add.
+// With single_cta each row is normalized with block-local synchronization
+// only. Otherwise each CTA publishes one fp32 square-sum partial, crosses a
+// sense-reversing per-row generation barrier, and normalizes its own columns
+// from registers, so no CTA re-reads the row it just wrote. All CTAs of a
+// row spin, which is safe for the same reason the cross-rank start barrier
+// is: the grid never exceeds kMaxBlocks <= SM count, so every block is
+// resident.
+template <typename T, int ngpus, bool single_cta, int mode>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kernel(
     RankData* _dp,
     RankSignals sg,
     Signal* self_sg,
+    const T* __restrict__ input,
     const T* __restrict__ residual,
     const T* __restrict__ weight,
     T* __restrict__ output,
     T* __restrict__ residual_output,
+    T* __restrict__ self_staging,
     int rank,
-    int rows,
     int hidden_packs,
-    int base_ctas_per_row,
-    int extra_cta_rows,
+    int ctas_per_row,
+    int shard_packs,
     float epsilon) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   __shared__ float warp_sums[32];
-  __shared__ float inv_rms;
-  __shared__ int normalize_row;
+  __shared__ float s_inv_rms;
+
+  const int row = single_cta ? blockIdx.x : blockIdx.x / ctas_per_row;
+  const int row_cta = single_cta ? 0 : blockIdx.x - row * ctas_per_row;
+  const int row_offset = row * hidden_packs;
+  const int col_stride = single_cta ? blockDim.x : ctas_per_row * blockDim.x;
+  const int col0 = row_cta * blockDim.x + threadIdx.x;
+  const int max_packs = (hidden_packs + col_stride - 1) / col_stride;
+  const bool reg_norm = max_packs <= kRegPacks;
+
   auto dp = *_dp;
   const P* rotated[ngpus];
 #pragma unroll
@@ -247,71 +362,191 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
     rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus];
   }
 
-  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  const P* input_p = reinterpret_cast<const P*>(input);
   const P* residual_p = reinterpret_cast<const P*>(residual);
   const P* weight_p = reinterpret_cast<const P*>(weight);
   P* output_p = reinterpret_cast<P*>(output);
   P* residual_output_p = reinterpret_cast<P*>(residual_output);
-  const int large_row_ctas = base_ctas_per_row + 1;
-  const int large_row_blocks = extra_cta_rows * large_row_ctas;
-  const bool in_large_row = blockIdx.x < large_row_blocks;
-  const int row = in_large_row
-                      ? blockIdx.x / large_row_ctas
-                      : extra_cta_rows +
-                            (blockIdx.x - large_row_blocks) / base_ctas_per_row;
-  const int row_first_block =
-      in_large_row ? row * large_row_ctas
-                   : large_row_blocks +
-                         (row - extra_cta_rows) * base_ctas_per_row;
-  const int ctas_for_row =
-      base_ctas_per_row + static_cast<int>(row < extra_cta_rows);
-  const int row_cta = blockIdx.x - row_first_block;
-  const int row_offset = row * hidden_packs;
-  float square_sum = 0.0f;
-  for (int col = row_cta * blockDim.x + threadIdx.x; col < hidden_packs;
-       col += ctas_for_row * blockDim.x) {
-    const int index = row_offset + col;
-    P value = packed_reduce<P, ngpus, A>(rotated, index);
-    packed_assign_add(value, residual_p[index]);
-    residual_output_p[index] = value;
-    square_sum += packed_square_sum(value);
+  P* staging_p = reinterpret_cast<P*>(self_staging);
+
+  // Sense-reversing row barrier: latch the generation before arriving.
+  // Launches are stream-serialized, so this read cannot race a peer CTA's
+  // increment for this launch (that increment needs this CTA's arrival).
+  FlagType row_gen = 0;
+  if (!single_cta && threadIdx.x == 0) {
+    row_gen = ld_flag_relaxed_gpu(&self_sg->rms_gen[row]);
   }
-  square_sum = block_reduce_sum(square_sum, warp_sums);
-  if constexpr (single_cta_per_row) {
-    if (threadIdx.x == 0) {
-      inv_rms = rsqrtf(square_sum / (hidden_packs * P::size) + epsilon);
+
+  // Stage this block's columns before the start barrier so the load/store
+  // latency hides behind the peer flag exchange. The self contribution is
+  // kept in registers instead of being re-read from staging. Residual and
+  // weight stay in-loop: their local loads overlap the peer pulls and the
+  // row barrier, and keeping them out of registers avoids spilling.
+  P self_pk[kRegPacks];
+  if (reg_norm) {
+#pragma unroll
+    for (int n = 0; n < kRegPacks; n++) {
+      const int col = col0 + n * col_stride;
+      if (col < hidden_packs) {
+        const int idx = row_offset + col;
+        self_pk[n] = mode == kModeRegistered ? rotated[0][idx] : input_p[idx];
+        if constexpr (mode == kModeStagePull) staging_p[idx] = self_pk[n];
+      }
     }
-    __syncthreads();
+    if constexpr (mode == kModeStagePush) {
+      // Peer-major order keeps each warp's stores contiguous per target so
+      // they coalesce into large PCIe TLPs.
+#pragma unroll
+      for (int i = 1; i < ngpus; i++) {
+        P* peer_shard = (P*)rotated[i] + rank * shard_packs;
+#pragma unroll
+        for (int n = 0; n < kRegPacks; n++) {
+          const int col = col0 + n * col_stride;
+          if (col < hidden_packs) peer_shard[row_offset + col] = self_pk[n];
+        }
+      }
+    }
+  } else if constexpr (mode == kModeStagePull) {
+    for (int col = col0; col < hidden_packs; col += col_stride) {
+      const int idx = row_offset + col;
+      staging_p[idx] = input_p[idx];
+    }
+  } else if constexpr (mode == kModeStagePush) {
+    for (int col = col0; col < hidden_packs; col += col_stride) {
+      const int idx = row_offset + col;
+      const P value = input_p[idx];
+#pragma unroll
+      for (int i = 1; i < ngpus; i++) {
+        ((P*)rotated[i] + rank * shard_packs)[idx] = value;
+      }
+    }
+  }
+
+  // Staging modes need the pre-barrier __syncthreads (is_start == false) so
+  // every thread's staging stores are fenced before the flag post.
+  multi_gpu_barrier<ngpus, mode == kModeRegistered>(sg, self_sg, rank);
+
+  float square_sum = 0.0f;
+  A vals_f[kRegPacks];
+  if (reg_norm) {
+#pragma unroll
+    for (int n = 0; n < kRegPacks; n++) {
+      const int col = col0 + n * col_stride;
+      if (col < hidden_packs) {
+        const int idx = row_offset + col;
+        A acc = upcast(self_pk[n]);
+        if constexpr (mode == kModeStagePush) {
+#pragma unroll
+          for (int src = 0; src < ngpus; src++) {
+            if (src != rank) {
+              packed_assign_add(acc, upcast(rotated[0][src * shard_packs + idx]));
+            }
+          }
+        } else {
+#pragma unroll
+          for (int i = 1; i < ngpus; i++) {
+            packed_assign_add(acc, upcast(rotated[i][idx]));
+          }
+        }
+        packed_assign_add(acc, upcast(residual_p[idx]));
+        residual_output_p[idx] = downcast<P>(acc);
+#pragma unroll
+        for (int j = 0; j < A::size; j++) {
+          square_sum += acc.data[j] * acc.data[j];
+        }
+        vals_f[n] = acc;
+      }
+    }
+  } else {
+    for (int col = col0; col < hidden_packs; col += col_stride) {
+      const int idx = row_offset + col;
+      A acc = upcast(mode == kModeStagePush ? input_p[idx] : rotated[0][idx]);
+      if constexpr (mode == kModeStagePush) {
+#pragma unroll
+        for (int src = 0; src < ngpus; src++) {
+          if (src != rank) {
+            packed_assign_add(acc, upcast(rotated[0][src * shard_packs + idx]));
+          }
+        }
+      } else {
+#pragma unroll
+        for (int i = 1; i < ngpus; i++) {
+          packed_assign_add(acc, upcast(rotated[i][idx]));
+        }
+      }
+      packed_assign_add(acc, upcast(residual_p[idx]));
+      residual_output_p[idx] = downcast<P>(acc);
+#pragma unroll
+      for (int j = 0; j < A::size; j++) {
+        square_sum += acc.data[j] * acc.data[j];
+      }
+    }
+  }
+
+  square_sum = block_reduce_sum(square_sum, warp_sums);
+  const float hidden_size_f = static_cast<float>(hidden_packs * P::size);
+
+  if constexpr (single_cta) {
+    if (threadIdx.x == 0) {
+      s_inv_rms = rsqrtf(square_sum / hidden_size_f + epsilon);
+    }
   } else {
     if (threadIdx.x == 0) {
       self_sg->rms_partial[blockIdx.x] = square_sum;
       __threadfence();
-      const FlagType previous = atomicAdd(&self_sg->rms_completion[row], 1u);
-      normalize_row = previous == static_cast<FlagType>(ctas_for_row - 1);
-    }
-    __syncthreads();
-    if (!normalize_row) return;
-
-    if (threadIdx.x == 0) {
-      float total = 0.0f;
-#pragma unroll 1
-      for (int row_part = 0; row_part < ctas_for_row; row_part++) {
-        total += self_sg->rms_partial[row_first_block + row_part];
+      const FlagType prior = atomicAdd(&self_sg->rms_arrive[row], 1u);
+      if (prior == static_cast<FlagType>(ctas_per_row - 1)) {
+        // Last arriver: reset the arrival count for the next launch, then
+        // release the generation. The fence orders the reset and every
+        // observed peer partial before the release.
+        self_sg->rms_arrive[row] = 0;
+        __threadfence();
+        atomicAdd(&self_sg->rms_gen[row], 1u);
+      } else {
+        while (ld_flag_acquire_gpu(&self_sg->rms_gen[row]) == row_gen) {
+        }
       }
-      inv_rms = rsqrtf(total / (hidden_packs * P::size) + epsilon);
-      atomicExch(&self_sg->rms_completion[row], 0u);
     }
     __syncthreads();
-  }
-  for (int col = threadIdx.x; col < hidden_packs; col += blockDim.x) {
-    const int index = row_offset + col;
-    A value = upcast(residual_output_p[index]);
-    A scale = upcast(weight_p[col]);
-#pragma unroll
-    for (int i = 0; i < A::size; i++) {
-      value.data[i] *= inv_rms * scale.data[i];
+    if (threadIdx.x < warpSize) {
+      float partial = 0.0f;
+      for (int i = threadIdx.x; i < ctas_per_row; i += warpSize) {
+        partial += self_sg->rms_partial[row * ctas_per_row + i];
+      }
+      partial = warp_reduce_sum(partial);
+      if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(partial / hidden_size_f + epsilon);
+      }
     }
-    output_p[index] = downcast<P>(value);
+  }
+  __syncthreads();
+  const float inv_rms = s_inv_rms;
+
+  if (reg_norm) {
+#pragma unroll
+    for (int n = 0; n < kRegPacks; n++) {
+      const int col = col0 + n * col_stride;
+      if (col < hidden_packs) {
+        A scale = upcast(weight_p[col]);
+        A value = vals_f[n];
+#pragma unroll
+        for (int j = 0; j < A::size; j++) {
+          value.data[j] *= inv_rms * scale.data[j];
+        }
+        output_p[row_offset + col] = downcast<P>(value);
+      }
+    }
+  } else {
+    for (int col = col0; col < hidden_packs; col += col_stride) {
+      const int idx = row_offset + col;
+      A value = upcast(residual_output_p[idx]);
+      A scale = upcast(weight_p[col]);
+#pragma unroll
+      for (int j = 0; j < A::size; j++) {
+        value.data[j] *= inv_rms * scale.data[j];
+      }
+      output_p[idx] = downcast<P>(value);
+    }
   }
 }
 
@@ -427,24 +662,34 @@ class PCIeAllreduce {
     graph_unreg_buffers_.clear();
   }
 
+  // 256-thread blocks with a low block cap measurably beat 512x36 on Gen5
+  // PCIe pulls at 12KB-96KB (10.0 vs 11.8 us at 12KB, 31.9 vs 39.6 us at
+  // 96KB, 8 GPUs): fewer, narrower blocks give each thread ~3 packs of
+  // memory-level parallelism instead of oversubscribing the fabric.
   template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
+  void allreduce(cudaStream_t stream, T* input, T* output, int size, int threads = 256, int block_limit = 8) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error("allreduce requires input length to be multiple of " + std::to_string(d));
+    static const int env_threads = env_int("B12X_PCIE_ONESHOT_THREADS", 0);
+    static const int env_block_limit = env_int("B12X_PCIE_ONESHOT_BLOCK_LIMIT", 0);
+    if (env_threads > 0) threads = std::min(512, std::max(64, (env_threads / 32) * 32));
+    if (env_block_limit > 0) block_limit = env_block_limit;
     if (block_limit > kMaxBlocks)
       throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks));
 
     RankData* ptrs;
+    T* staging = nullptr;
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
 
     if (dbuf_enabled_) {
+      // The kernel stages the input into the eager slot itself; no host
+      // staging memcpy is issued.
       int slot = dbuf_slot_ % 2;
       dbuf_slot_++;
-      auto input_size = size * sizeof(T);
-      AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, input_size, cudaMemcpyDeviceToDevice, stream));
       ptrs = dbuf_rd_[slot];
+      staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
     } else if (status == cudaStreamCaptureStatusActive) {
       throw std::runtime_error(
           "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
@@ -461,7 +706,16 @@ class PCIeAllreduce {
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
     blocks = std::max(blocks, 1);
 
-#define KL(ngpus) pcie_allreduce_kernel<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+#define KL(ngpus)                                                                                                     \
+  do {                                                                                                               \
+    if (staging != nullptr) {                                                                                        \
+      pcie_allreduce_kernel<T, ngpus, true>                                                                          \
+          <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, output, staging, rank_, size);                \
+    } else {                                                                                                         \
+      pcie_allreduce_kernel<T, ngpus, false>                                                                         \
+          <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, output, staging, rank_, size);                \
+    }                                                                                                                 \
+  } while (0)
     switch (world_size_) {
       case 2:
         KL(2);
@@ -504,14 +758,16 @@ class PCIeAllreduce {
           "fused allreduce RMSNorm requires hidden size to be a multiple of " + std::to_string(pack_size));
 
     RankData* ptrs;
+    T* staging = nullptr;
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
     if (dbuf_enabled_) {
+      // The kernel stages the input into the eager slot itself; no host
+      // staging memcpy is issued.
       int slot = dbuf_slot_ % 2;
       dbuf_slot_++;
-      AT_CUDA_CHECK(cudaMemcpyAsync(
-          dbuf_raw_[slot][rank_], input, size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
       ptrs = dbuf_rd_[slot];
+      staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
     } else if (status == cudaStreamCaptureStatusActive) {
       throw std::runtime_error(
           "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
@@ -529,45 +785,68 @@ class PCIeAllreduce {
     if (rows > kMaxBlocks)
       throw std::runtime_error(
           "fused allreduce RMSNorm supports at most " + std::to_string(kMaxBlocks) + " rows");
-    const int threads = 512;
-    const int size_packs = size / pack_size;
-    const bool single_cta_per_row = hidden_packs <= 1024;
-    const int blocks = single_cta_per_row
-                           ? rows
-                           : std::min(kMaxBlocks, std::max(rows, (size_packs + threads - 1) / threads));
-    const int base_ctas_per_row = blocks / rows;
-    const int extra_cta_rows = blocks % rows;
+    const int threads = fused_threads();
+    int ctas_per_row = fused_ctas_per_row_override();
+    if (ctas_per_row <= 0) {
+      // Measured on 8x Gen5 PCIe: the pull phase wants ~3 blocks in flight
+      // (12.3 vs 13.3 us at rows=1), while extra CTAs per row only add row
+      // barrier cost once rows supply that concurrency. Large hidden sizes
+      // additionally need enough CTAs to keep the normalize path in
+      // registers (kRegPacks packs per thread).
+      const int min_ctas = (hidden_packs + threads * kRegPacks - 1) / (threads * kRegPacks);
+      ctas_per_row = std::max(std::max(1, 3 / rows), min_ctas);
+    }
+    ctas_per_row = std::max(1, std::min(ctas_per_row, kMaxBlocks / rows));
+    const int blocks = rows * ctas_per_row;
+    const bool single = ctas_per_row == 1;
+    const int shard_packs = size / pack_size;
+    const int mode = staging == nullptr ? kModeRegistered
+                     : oneshot_push_enabled() ? kModeStagePush
+                                              : kModeStagePull;
 
-#define KL(ngpus, single_cta)                                                                                         \
-  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, single_cta><<<blocks, threads, 0, stream>>>(                     \
-      ptrs, sg_, self_sg_, residual, weight, output, residual_output, rank_, rows, hidden_packs, base_ctas_per_row,   \
-      extra_cta_rows, epsilon);
-#define DISPATCH(single_cta)                                                                                         \
-  switch (world_size_) {                                                                                            \
-    case 2:                                                                                                         \
-      KL(2, single_cta);                                                                                            \
-      break;                                                                                                        \
-    case 4:                                                                                                         \
-      KL(4, single_cta);                                                                                            \
-      break;                                                                                                        \
-    case 6:                                                                                                         \
-      KL(6, single_cta);                                                                                            \
-      break;                                                                                                        \
-    case 8:                                                                                                         \
-      KL(8, single_cta);                                                                                            \
-      break;                                                                                                        \
-    case 10:                                                                                                        \
-      KL(10, single_cta);                                                                                           \
-      break;                                                                                                        \
-    default:                                                                                                        \
-      throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));             \
-  }
-    if (single_cta_per_row) {
-      DISPATCH(true);
-    } else {
-      DISPATCH(false);
+#define KL(ngpus, SINGLE, MODE)                                                                                       \
+  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE><<<blocks, threads, 0, stream>>>(                   \
+      ptrs, sg_, self_sg_, input, residual, weight, output, residual_output, staging, rank_, hidden_packs,            \
+      ctas_per_row, shard_packs, epsilon);
+#define DISPATCH_MODE(ngpus, SINGLE)                                                                                  \
+  do {                                                                                                               \
+    if (mode == kModeStagePush) {                                                                                    \
+      KL(ngpus, SINGLE, kModeStagePush);                                                                             \
+    } else if (mode == kModeStagePull) {                                                                             \
+      KL(ngpus, SINGLE, kModeStagePull);                                                                             \
+    } else {                                                                                                         \
+      KL(ngpus, SINGLE, kModeRegistered);                                                                            \
+    }                                                                                                                 \
+  } while (0)
+#define DISPATCH(ngpus)                                                                                              \
+  do {                                                                                                               \
+    if (single) {                                                                                                    \
+      DISPATCH_MODE(ngpus, true);                                                                                    \
+    } else {                                                                                                         \
+      DISPATCH_MODE(ngpus, false);                                                                                   \
+    }                                                                                                                 \
+  } while (0)
+    switch (world_size_) {
+      case 2:
+        DISPATCH(2);
+        break;
+      case 4:
+        DISPATCH(4);
+        break;
+      case 6:
+        DISPATCH(6);
+        break;
+      case 8:
+        DISPATCH(8);
+        break;
+      case 10:
+        DISPATCH(10);
+        break;
+      default:
+        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
     }
 #undef DISPATCH
+#undef DISPATCH_MODE
 #undef KL
   }
 

@@ -71,6 +71,16 @@ def _current_stream_key(device: torch.device | int | str, stream: object = None)
     return int(stream)
 
 
+def _push_mode_enabled() -> bool:
+    """Match the extension's B12X_PCIE_ONESHOT_PUSH transport toggle.
+
+    Push transport writes each rank's input into a per-source shard of every
+    peer's eager slot, so each slot must hold world_size * max_size bytes.
+    """
+
+    return os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0")
+
+
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     if inp.is_contiguous():
         return True
@@ -460,6 +470,8 @@ class PCIeOneshotAllReduce:
             raise ValueError("signal_bytes must be positive")
         if eager_buffer_bytes <= 0:
             raise ValueError("eager_buffer_bytes must be positive")
+        if _push_mode_enabled():
+            eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
 
         signal_offset = 0
         eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
