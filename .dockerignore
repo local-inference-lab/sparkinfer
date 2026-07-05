@@ -1,0 +1,4 @@
+.git
+*.ncu-rep
+__pycache__
+.pytest_cache
