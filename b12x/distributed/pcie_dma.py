@@ -45,12 +45,24 @@ SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
 
 
-def _fp8_wire_enabled() -> bool:
-    """Opt-in E4M3 wire transport: quantize-once all-to-all instead of the
-    bf16 ring. Halves wire bytes (plus ~1.6% scales) and replaces 2(N-1)
-    chained hops with two concurrent phases; accumulation stays fp32."""
+def _fp8_mode() -> str:
+    """Opt-in E4M3 wire transport mode.
 
-    return os.getenv("B12X_PCIE_DMA_FP8", "0") not in ("", "0")
+    "ag" (also "1"): keep the saturated bf16 reduce-scatter ring and
+    quantize only the allgather phase. Final values quantize exactly once
+    at their owner and are forwarded verbatim around the ring, so the
+    error cost is a single rounding while AG wire bytes halve.
+
+    "a2a": quantize-once all-to-all (two roundings, half the wire in both
+    phases; currently unpipelined).
+    """
+
+    raw = os.getenv("B12X_PCIE_DMA_FP8", "0").strip().lower()
+    if raw in ("", "0", "false", "off", "no"):
+        return ""
+    if raw == "a2a":
+        return "a2a"
+    return "ag"
 
 
 @lru_cache(maxsize=1)
@@ -133,7 +145,7 @@ class PCIeDmaAllReduce:
         ]
         self._input_ready = torch.cuda.Event()
         self._ag_ready = torch.cuda.Event()
-        self._fp8 = _fp8_wire_enabled()
+        self._fp8 = _fp8_mode()
         self._fp8_stage = None
         self._fp8_stage_stride = 0
         if self._fp8:
@@ -256,12 +268,14 @@ class PCIeDmaAllReduce:
         shard_elems = inp.numel() // world
         shard_bytes = shard_elems * elem
 
-        if (
-            self._fp8
+        fp8_eligible = (
+            bool(self._fp8)
             and inp.dtype == torch.bfloat16
             and shard_elems % FP8_QUANT_BLOCK == 0
-        ):
+        )
+        if fp8_eligible and self._fp8 == "a2a":
             return self._all_reduce_fp8(inp, out, shard_elems)
+        fp8_ag = fp8_eligible and self._fp8 == "ag"
 
         base = out.data_ptr()
 
@@ -271,8 +285,12 @@ class PCIeDmaAllReduce:
         # chunking amortizes the flag round trip further as long as each
         # piece's copy time dominates the ~5us sub-step overhead.
         pieces = self._pick_pieces(shard_elems, shard_bytes)
+        if fp8_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
+            pieces = 1
         piece_elems = shard_elems // pieces
         piece_bytes = piece_elems * elem
+        # fp8 AG slices are piece-contiguous: [payload][scales] per piece.
+        piece_slice_bytes = piece_elems + piece_elems // FP8_QUANT_BLOCK * 4
         steps = 2 * (world - 1)
 
         main = torch.cuda.current_stream(self.device)
@@ -309,6 +327,11 @@ class PCIeDmaAllReduce:
         copied = self._copied_events
         flag_stream.wait_event(self._input_ready)
 
+        def fp8_scratch_piece(owner: int, step: int, piece: int) -> int:
+            return self._scratch_ptr(owner, step) + piece * piece_slice_bytes
+
+        stage = self._fp8_stage.data_ptr() if fp8_ag else 0
+
         for k in range(steps):
             reduce_phase = k < world - 1
             if reduce_phase:
@@ -317,19 +340,41 @@ class PCIeDmaAllReduce:
             else:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
-            for p in range(pieces):
-                send_src = (
-                    in_piece_ptr(send_chunk, p) if k == 0
-                    else piece_ptr(send_chunk, p)
-                )
-                with torch.cuda.stream(copy_stream):
-                    if k > 0:
-                        copy_stream.wait_event(add_done[p])
-                    ext.dma_copy(
-                        scratch_piece(nxt, k, p),
-                        send_src,
-                        piece_bytes,
+            fp8_step = fp8_ag and not reduce_phase
+            if fp8_step and k == world - 1:
+                # Own chunk is fully reduced; quantize it exactly once. It
+                # is then forwarded verbatim around the ring, so no other
+                # rounding ever touches it.
+                for p in range(pieces):
+                    ext.dma_quant(
+                        piece_ptr(send_chunk, p),
+                        stage + p * piece_slice_bytes,
+                        stage + p * piece_slice_bytes + piece_elems,
+                        piece_elems,
                     )
+                self._ag_ready.record(main)
+            for p in range(pieces):
+                if not fp8_step:
+                    send_src = (
+                        in_piece_ptr(send_chunk, p) if k == 0
+                        else piece_ptr(send_chunk, p)
+                    )
+                    send_bytes = piece_bytes
+                    send_dst = scratch_piece(nxt, k, p)
+                elif k == world - 1:
+                    send_src = stage + p * piece_slice_bytes
+                    send_bytes = piece_slice_bytes
+                    send_dst = fp8_scratch_piece(nxt, k, p)
+                else:
+                    send_src = fp8_scratch_piece(rank, k - 1, p)
+                    send_bytes = piece_slice_bytes
+                    send_dst = fp8_scratch_piece(nxt, k, p)
+                with torch.cuda.stream(copy_stream):
+                    if fp8_step and k == world - 1:
+                        copy_stream.wait_event(self._ag_ready)
+                    elif k > 0:
+                        copy_stream.wait_event(add_done[p])
+                    ext.dma_copy(send_dst, send_src, send_bytes)
                     copied[slot(k, p)].record(copy_stream)
                 with torch.cuda.stream(flag_stream):
                     flag_stream.wait_event(copied[slot(k, p)])
@@ -348,6 +393,14 @@ class PCIeDmaAllReduce:
                         scratch_piece(rank, k, p),
                         piece_elems,
                         dtype_code,
+                    )
+                elif fp8_step:
+                    payload = fp8_scratch_piece(rank, k, p)
+                    ext.dma_dequant_store(
+                        piece_ptr(recv_chunk, p),
+                        payload,
+                        payload + piece_elems,
+                        piece_elems,
                     )
                 else:
                     ext.dma_copy(

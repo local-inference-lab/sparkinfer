@@ -116,12 +116,13 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
-def _fp8_worker(rank: int, world_size: int, port: int) -> None:
-    os.environ["B12X_PCIE_DMA_FP8"] = "1"
+def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
+    os.environ["B12X_PCIE_DMA_FP8"] = mode
     _worker(rank, world_size, port)
 
 
-def test_pcie_dma_all_reduce_fp8_wire() -> None:
+@pytest.mark.parametrize("mode", ["ag", "a2a"])
+def test_pcie_dma_all_reduce_fp8_wire(mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
@@ -130,5 +131,8 @@ def test_pcie_dma_all_reduce_fp8_wire() -> None:
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
     mp.spawn(
-        _fp8_worker, args=(world_size, _free_port()), nprocs=world_size, join=True
+        _fp8_worker,
+        args=(world_size, _free_port(), mode),
+        nprocs=world_size,
+        join=True,
     )
