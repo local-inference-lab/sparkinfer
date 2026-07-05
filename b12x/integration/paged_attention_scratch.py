@@ -1452,6 +1452,7 @@ class B12XPagedAttentionScratchPlan:
         max_cache_page_count: int | None = None,
         fixed_split_size: int = -1,
         window_left: int = -1,
+        force_split_kv: bool = False,
     ) -> "B12XPagedAttentionScratchPlan":
         if not self.caps.use_cuda_graph:
             raise RuntimeError(
@@ -1621,8 +1622,8 @@ class B12XPagedAttentionScratchPlan:
             max_cu_seqlens_q,
             mode="decode",
             fixed_split_size=-1,
-            disable_split_kv=True,
-            force_split_kv=False,
+            disable_split_kv=not force_split_kv,
+            force_split_kv=force_split_kv,
             window_left=int(window_left),
             enable_cuda_graph=True,
             graph_chunk_policy=True,

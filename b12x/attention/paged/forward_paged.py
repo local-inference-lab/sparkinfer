@@ -5126,7 +5126,7 @@ class PagedForwardKernel:
 
 
         if const_expr(not self.has_attention_sink_bias):
-            if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+            if const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     if m_frag[mma_q, 0] != -Float32.inf:
                         m_frag[mma_q, 0] = Float32(m_frag[mma_q, 0] * self.softmax_scale_log2)
@@ -5135,7 +5135,7 @@ class PagedForwardKernel:
                     for row_slot in cutlass.range_constexpr(2):
                         if m_frag[mma_q, row_slot] != -Float32.inf:
                             m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
-        elif const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+        elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 q_head_idx_sink = Int32(kv_head_idx * group_size + row_local_idx[mma_q, 0])
                 _apply_attention_sink_after_lse_scale(
@@ -5204,7 +5204,7 @@ class PagedForwardKernel:
                         sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
                         sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
                         sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, 5]
-            elif const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+            elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     packed_row_local = row_local_idx[mma_q, 0]
                     if row_valid[mma_q, 0] != 0 and lane_pair_base == 0:
@@ -5513,7 +5513,7 @@ class PagedForwardKernel:
                             mLSE[partial_row_idx, q_head_idx] = row_lse
                         else:
                             mLSE[q_head_idx, q_row_idx] = row_lse
-                elif const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+                elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         packed_row_local = row_local_idx[mma_q, 0]
                         q_head_idx = q_head_idx_frag[mma_q, 0]

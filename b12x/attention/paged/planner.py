@@ -70,7 +70,7 @@ def _merge_backend_supports_split_kv(
     output_dtype: torch.dtype,
     head_dim_vo: int,
 ) -> bool:
-    return output_dtype in (torch.float16, torch.bfloat16, torch.float32) and head_dim_vo == 256
+    return output_dtype in (torch.float16, torch.bfloat16, torch.float32) and head_dim_vo in (128, 256)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -869,8 +869,6 @@ def create_paged_plan(
         raise ValueError(f"verify mode requires q_len > 1, got inferred mode {inferred_mode}")
     if force_split_kv is None:
         force_split_kv = mode == "verify" or (msa_block_sparse and mode == "decode")
-    if mode == "decode" and force_split_kv and not msa_block_sparse:
-        raise ValueError("decode plans do not support split-kv")
     if mode == "extend" and force_split_kv:
         raise ValueError("extend plans no longer support split-kv")
     if plan_budget is not None:
