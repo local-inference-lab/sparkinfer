@@ -20,12 +20,15 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
@@ -102,6 +105,100 @@ __global__ void __launch_bounds__(256, 1) add_kernel(T* __restrict__ dst,
   }
 }
 
+// ---- FP8 wire path (quantize-once all-to-all) ----
+//
+// E4M3 payload with one fp32 amax scale per 128 elements, scales packed
+// contiguously after the payload so a single CE copy ships both. Values are
+// quantized exactly once on the way in (reduce-scatter) and once on the way
+// out (broadcast); accumulation runs in fp32, so wire precision drops while
+// summation precision rises versus the bf16 ring's per-hop bf16 adds.
+
+constexpr int kQuantBlock = 128;
+constexpr float kFp8Max = 448.0f;
+
+struct __align__(16) SrcPtrs {
+  const void* ptrs[8];
+};
+
+// One warp per 128-element block: 4 elements per lane, warp amax, scale,
+// convert, store.
+__global__ void __launch_bounds__(256, 1) quant_kernel(
+    const nv_bfloat16* __restrict__ src,
+    __nv_fp8_e4m3* __restrict__ payload,
+    float* __restrict__ scales,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    float v[4];
+    const nv_bfloat16* s = src + elem0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = __bfloat162float(s[i]);
+    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
+                       fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+    const float scale = amax > 0.0f ? amax / kFp8Max : 1.0f;
+    if (lane == 0) scales[block] = scale;
+    const float inv_scale = 1.0f / scale;
+    __nv_fp8_e4m3* d = payload + elem0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) d[i] = __nv_fp8_e4m3(v[i] * inv_scale);
+  }
+}
+
+// out = inp + sum_j dequant(payload_j) in fp32, single pass over out.
+__global__ void __launch_bounds__(256, 1) dequant_accum_kernel(
+    nv_bfloat16* __restrict__ out,
+    const nv_bfloat16* __restrict__ inp,
+    SrcPtrs payloads,
+    SrcPtrs scales,
+    int nsrc,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    float acc[4];
+    const nv_bfloat16* base = inp + elem0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[i] = __bfloat162float(base[i]);
+    for (int j = 0; j < nsrc; ++j) {
+      const __nv_fp8_e4m3* p =
+          reinterpret_cast<const __nv_fp8_e4m3*>(payloads.ptrs[j]) + elem0;
+      const float scale = reinterpret_cast<const float*>(scales.ptrs[j])[block];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[i] += float(p[i]) * scale;
+    }
+    nv_bfloat16* d = out + elem0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) d[i] = __float2bfloat16(acc[i]);
+  }
+}
+
+__global__ void __launch_bounds__(256, 1) dequant_store_kernel(
+    nv_bfloat16* __restrict__ out,
+    const __nv_fp8_e4m3* __restrict__ payload,
+    const float* __restrict__ scales,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const float scale = scales[block];
+    const __nv_fp8_e4m3* p = payload + elem0;
+    nv_bfloat16* d = out + elem0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) d[i] = __float2bfloat16(float(p[i]) * scale);
+  }
+}
+
 }  // namespace pcie_dma
 
 static void dma_copy(int64_t dst_ptr, int64_t src_ptr, int64_t bytes) {
@@ -152,7 +249,62 @@ static void dma_add(int64_t dst_ptr, int64_t a_ptr, int64_t b_ptr,
   }
 }
 
+static int _fp8_blocks_grid(long long blocks, int threads) {
+  const int warps = threads / 32;
+  return static_cast<int>(std::max<long long>(
+      1, std::min<long long>(64, (blocks + warps - 1) / warps)));
+}
+
+static void dma_quant(int64_t src_ptr, int64_t payload_ptr, int64_t scales_ptr,
+                      int64_t elems) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::quant_kernel<<<_fp8_blocks_grid(blocks, threads), threads, 0, stream>>>(
+      reinterpret_cast<const nv_bfloat16*>(src_ptr),
+      reinterpret_cast<__nv_fp8_e4m3*>(payload_ptr),
+      reinterpret_cast<float*>(scales_ptr), blocks);
+}
+
+static void dma_dequant_accum(int64_t out_ptr, int64_t inp_ptr,
+                              const std::vector<int64_t>& payload_ptrs,
+                              const std::vector<int64_t>& scale_ptrs,
+                              int64_t elems) {
+  TORCH_CHECK(payload_ptrs.size() == scale_ptrs.size());
+  TORCH_CHECK(payload_ptrs.size() <= 8);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  pcie_dma::SrcPtrs payloads{};
+  pcie_dma::SrcPtrs scales{};
+  for (size_t j = 0; j < payload_ptrs.size(); ++j) {
+    payloads.ptrs[j] = reinterpret_cast<const void*>(payload_ptrs[j]);
+    scales.ptrs[j] = reinterpret_cast<const void*>(scale_ptrs[j]);
+  }
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::dequant_accum_kernel<<<_fp8_blocks_grid(blocks, threads), threads, 0,
+                                   stream>>>(
+      reinterpret_cast<nv_bfloat16*>(out_ptr),
+      reinterpret_cast<const nv_bfloat16*>(inp_ptr), payloads, scales,
+      static_cast<int>(payload_ptrs.size()), blocks);
+}
+
+static void dma_dequant_store(int64_t out_ptr, int64_t payload_ptr,
+                              int64_t scales_ptr, int64_t elems) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::dequant_store_kernel<<<_fp8_blocks_grid(blocks, threads), threads, 0,
+                                   stream>>>(
+      reinterpret_cast<nv_bfloat16*>(out_ptr),
+      reinterpret_cast<const __nv_fp8_e4m3*>(payload_ptr),
+      reinterpret_cast<const float*>(scales_ptr), blocks);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("dma_quant", &dma_quant, "quantize bf16 to e4m3 with per-128 scales");
+  m.def("dma_dequant_accum", &dma_dequant_accum,
+        "out = inp + sum of dequantized sources (fp32 accumulate)");
+  m.def("dma_dequant_store", &dma_dequant_store, "dequantize e4m3 to bf16");
   m.def("dma_copy", &dma_copy, "CE peer copy on the current stream");
   m.def("dma_set_flag", &dma_set_flag, "publish a monotonic flag to a peer");
   m.def("dma_wait_flag", &dma_wait_flag, "wait for a monotonic peer flag");
