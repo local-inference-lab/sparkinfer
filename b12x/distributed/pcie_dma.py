@@ -57,7 +57,11 @@ def _fp8_mode() -> str:
     phases; currently unpipelined).
     """
 
-    raw = os.getenv("B12X_PCIE_DMA_FP8", "0").strip().lower()
+    return _normalize_fp8_mode(os.getenv("B12X_PCIE_DMA_FP8", "0"))
+
+
+def _normalize_fp8_mode(value: str | None) -> str:
+    raw = (value or "").strip().lower()
     if raw in ("", "0", "false", "off", "no"):
         return ""
     if raw == "a2a":
@@ -97,6 +101,7 @@ class PCIeDmaAllReduce:
         device: torch.device | int | str,
         max_bytes: int,
         ext_module=None,
+        fp8: Optional[str] = None,
     ) -> None:
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
@@ -152,7 +157,9 @@ class PCIeDmaAllReduce:
         self._ag_ready = torch.cuda.Event()
         self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
         self._a2a_ownq = [torch.cuda.Event() for _ in range(MAX_PIECES)]
-        self._fp8 = _fp8_mode()
+        # Explicit argument wins over the environment so integrations can
+        # plumb the mode through their own configuration.
+        self._fp8 = _normalize_fp8_mode(fp8) if fp8 is not None else _fp8_mode()
         self._fp8_stage = None
         self._fp8_stage_stride = 0
         if self._fp8:
@@ -166,10 +173,8 @@ class PCIeDmaAllReduce:
             )
             self._fp8_stage_stride = stride
         self.min_bytes = 0
-        logger.info(
-            "[PCIe DMA allreduce] wire mode: %s",
-            self._fp8 and f"fp8-{self._fp8}" or "bf16",
-        )
+        self.wire_mode = f"fp8-{self._fp8}" if self._fp8 else "bf16"
+        logger.info("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
         self._log_peer_copy_bandwidth()
 
     def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
@@ -639,7 +644,7 @@ def autotune_crossovers(
     if dma is not None:
         original_dma_min = dma.min_bytes
         dma.min_bytes = 0
-    wire = "bf16" if dma is None or not dma._fp8 else f"fp8-{dma._fp8}"
+    wire = "bf16" if dma is None else dma.wire_mode
     lines = [
         f"[PCIe allreduce] Crossover sweep (dma wire={wire}, "
         f"hidden={hidden_size}, fused={rms_norm_op is not None}):"
