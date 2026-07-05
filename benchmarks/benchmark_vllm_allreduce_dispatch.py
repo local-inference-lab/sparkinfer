@@ -5,6 +5,12 @@ import os
 import socket
 import time
 
+# Match the serving environment's NCCL configuration: on this PCIe-only
+# topology, default NCCL refuses P2P across the root complex and falls
+# back to shared-memory transport, which understates NCCL badly.
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
+os.environ.setdefault("NCCL_PROTO", "LL,LL128,Simple")
 os.environ.setdefault("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
 os.environ.setdefault("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
