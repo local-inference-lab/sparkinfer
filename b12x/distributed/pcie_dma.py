@@ -159,6 +159,10 @@ class PCIeDmaAllReduce:
             )
             self._fp8_stage_stride = stride
         self.min_bytes = 0
+        logger.info(
+            "[PCIe DMA allreduce] wire mode: %s",
+            self._fp8 and f"fp8-{self._fp8}" or "bf16",
+        )
         self._log_peer_copy_bandwidth()
 
     def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
@@ -586,9 +590,10 @@ def autotune_crossovers(
     if dma is not None:
         original_dma_min = dma.min_bytes
         dma.min_bytes = 0
+    wire = "bf16" if dma is None or not dma._fp8 else f"fp8-{dma._fp8}"
     lines = [
-        f"[PCIe allreduce] Crossover sweep (bf16, hidden={hidden_size}, "
-        f"fused={rms_norm_op is not None}):"
+        f"[PCIe allreduce] Crossover sweep (dma wire={wire}, "
+        f"hidden={hidden_size}, fused={rms_norm_op is not None}):"
     ]
 
     def bench(build) -> float:
