@@ -75,18 +75,23 @@ __global__ void wait_flag_kernel(FlagType* flag, FlagType* expected_counter) {
   } while (static_cast<int>(observed - expected) < 0);
 }
 
+// dst = a + b; with a == dst this is the in-place accumulate, and with
+// a == the caller's input it doubles as the first-touch accumulate that
+// removes the upfront out.copy_(input) from the critical path.
 template <typename T>
 __global__ void __launch_bounds__(256, 1) add_kernel(T* __restrict__ dst,
-                                                     const T* __restrict__ src,
+                                                     const T* __restrict__ a_src,
+                                                     const T* __restrict__ b_src,
                                                      long long packs) {
   using Pack = uint4;
   Pack* dst_p = reinterpret_cast<Pack*>(dst);
-  const Pack* src_p = reinterpret_cast<const Pack*>(src);
+  const Pack* a_p = reinterpret_cast<const Pack*>(a_src);
+  const Pack* b_p = reinterpret_cast<const Pack*>(b_src);
   constexpr int kElems = sizeof(Pack) / sizeof(T);
   for (long long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < packs;
        idx += gridDim.x * blockDim.x) {
-    Pack a = dst_p[idx];
-    Pack b = src_p[idx];
+    Pack a = a_p[idx];
+    Pack b = b_p[idx];
     T* av = reinterpret_cast<T*>(&a);
     const T* bv = reinterpret_cast<const T*>(&b);
 #pragma unroll
@@ -121,8 +126,8 @@ static void dma_wait_flag(int64_t flag_ptr, int64_t counter_ptr) {
       reinterpret_cast<pcie_dma::FlagType*>(counter_ptr));
 }
 
-static void dma_add(int64_t dst_ptr, int64_t src_ptr, int64_t elems,
-                     int64_t dtype_code) {
+static void dma_add(int64_t dst_ptr, int64_t a_ptr, int64_t b_ptr,
+                    int64_t elems, int64_t dtype_code) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   const int threads = 256;
   const long long packs16 = elems * (dtype_code == 2 ? 4 : 2) / 16;
@@ -132,17 +137,18 @@ static void dma_add(int64_t dst_ptr, int64_t src_ptr, int64_t elems,
     const long long packs = elems / 8;
     pcie_dma::add_kernel<nv_bfloat16><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<nv_bfloat16*>(dst_ptr),
-        reinterpret_cast<const nv_bfloat16*>(src_ptr), packs);
+        reinterpret_cast<const nv_bfloat16*>(a_ptr),
+        reinterpret_cast<const nv_bfloat16*>(b_ptr), packs);
   } else if (dtype_code == 1) {
     const long long packs = elems / 8;
     pcie_dma::add_kernel<half><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<half*>(dst_ptr), reinterpret_cast<const half*>(src_ptr),
-        packs);
+        reinterpret_cast<half*>(dst_ptr), reinterpret_cast<const half*>(a_ptr),
+        reinterpret_cast<const half*>(b_ptr), packs);
   } else {
     const long long packs = elems / 4;
     pcie_dma::add_kernel<float><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<float*>(dst_ptr), reinterpret_cast<const float*>(src_ptr),
-        packs);
+        reinterpret_cast<float*>(dst_ptr), reinterpret_cast<const float*>(a_ptr),
+        reinterpret_cast<const float*>(b_ptr), packs);
   }
 }
 

@@ -39,7 +39,8 @@ SUPPORTED_DTYPES = {
     torch.float32: 2,
 }
 FLAG_STRIDE = 128
-FLAG_SLOTS = 40
+FLAG_SLOTS = 256
+MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 
 
@@ -114,9 +115,13 @@ class PCIeDmaAllReduce:
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
         self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._flag_stream = torch.cuda.Stream(device=self.device)
         # Persistent cross-stream events: captured graphs keep references to
         # recorded events, so per-call temporaries must not be destroyed.
-        self._piece_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
+        self._copied_events = [
+            torch.cuda.Event() for _ in range(2 * (self.world_size - 1) * MAX_PIECES)
+        ]
         self._input_ready = torch.cuda.Event()
         self.min_bytes = 0
         self._log_peer_copy_bandwidth()
@@ -175,6 +180,24 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
+    @staticmethod
+    def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
+        override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
+        # pieces=2 measured best at every size (deeper chunking pays an
+        # extra wait+add launch chain per piece on the main stream).
+        candidates = (
+            (override,)
+            if 1 <= override <= MAX_PIECES
+            else (2,)
+        )
+        for pieces in candidates:
+            if (
+                shard_elems % (pieces * 8) == 0
+                and shard_bytes // pieces >= 512 << 10
+            ):
+                return pieces
+        return 1
+
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self._closed or inp.device != self.device:
             return False
@@ -213,8 +236,10 @@ class PCIeDmaAllReduce:
 
         # Sub-chunking with a dedicated copy stream keeps the copy engine
         # busy: the CE never waits for a flag round trip or an add because
-        # sub-chunk c+1's copy overlaps sub-chunk c's wait+reduce.
-        pieces = 2 if shard_elems % (2 * 8) == 0 and shard_bytes >= 2 << 20 else 1
+        # sub-chunk c+1's copy overlaps sub-chunk c's wait+reduce. Deeper
+        # chunking amortizes the flag round trip further as long as each
+        # piece's copy time dominates the ~5us sub-step overhead.
+        pieces = self._pick_pieces(shard_elems, shard_bytes)
         piece_elems = shard_elems // pieces
         piece_bytes = piece_elems * elem
         steps = 2 * (world - 1)
@@ -222,12 +247,19 @@ class PCIeDmaAllReduce:
         main = torch.cuda.current_stream(self.device)
         copy_stream = self._copy_stream
 
-        out.copy_(inp)
+        # No upfront out.copy_(inp): the first send of each chunk reads the
+        # caller's input directly and every reduce-scatter add is a first
+        # touch (out = inp + scratch), so the accumulation base folds into
+        # the add instead of a full-size copy on the critical path.
+        in_base = inp.data_ptr()
         self._input_ready.record(main)
         copy_stream.wait_event(self._input_ready)
 
         def piece_ptr(chunk: int, piece: int) -> int:
             return base + chunk * shard_bytes + piece * piece_bytes
+
+        def in_piece_ptr(chunk: int, piece: int) -> int:
+            return in_base + chunk * shard_bytes + piece * piece_bytes
 
         def scratch_piece(owner: int, step: int, piece: int) -> int:
             return self._scratch_ptr(owner, step) + piece * piece_bytes
@@ -236,8 +268,15 @@ class PCIeDmaAllReduce:
             return step * pieces + piece
 
         # Events gating each step's send on the previous step's reduce of
-        # the same payload piece (persistent; re-recorded per step).
+        # the same payload piece (persistent; re-recorded per step). Flag
+        # kernels run on their own stream, gated per copy by copied[] events,
+        # so the copy stream is pure back-to-back CE work: an SM kernel
+        # between CE ops stalls the engine for the launch round trip, which
+        # is what made deeper sub-chunking regress.
         add_done = self._piece_events
+        flag_stream = self._flag_stream
+        copied = self._copied_events
+        flag_stream.wait_event(self._input_ready)
 
         for k in range(steps):
             reduce_phase = k < world - 1
@@ -248,14 +287,21 @@ class PCIeDmaAllReduce:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
             for p in range(pieces):
+                send_src = (
+                    in_piece_ptr(send_chunk, p) if k == 0
+                    else piece_ptr(send_chunk, p)
+                )
                 with torch.cuda.stream(copy_stream):
                     if k > 0:
                         copy_stream.wait_event(add_done[p])
                     ext.dma_copy(
                         scratch_piece(nxt, k, p),
-                        piece_ptr(send_chunk, p),
+                        send_src,
                         piece_bytes,
                     )
+                    copied[slot(k, p)].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot(k, p)])
                     ext.dma_set_flag(
                         self._flag_ptr(nxt, slot(k, p)),
                         self._counter_ptr(self._send_counters, slot(k, p)),
@@ -267,6 +313,7 @@ class PCIeDmaAllReduce:
                 if reduce_phase:
                     ext.dma_add(
                         piece_ptr(recv_chunk, p),
+                        in_piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_elems,
                         dtype_code,
@@ -281,8 +328,9 @@ class PCIeDmaAllReduce:
 
         # Neighbor handshake so the next call (or graph replay) cannot
         # overwrite scratch a lagging neighbor still reads. The main stream
-        # must also drain the copy stream before the op is considered done.
+        # must also drain the copy and flag streams before the op is done.
         main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
         done = steps * pieces
         ext.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
