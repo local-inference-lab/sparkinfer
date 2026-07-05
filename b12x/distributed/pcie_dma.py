@@ -137,6 +137,11 @@ class PCIeDmaAllReduce:
         )
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
+        # Separate CE/flag streams for the a2a broadcast phase so allgather
+        # traffic overlaps reduce-scatter traffic instead of queueing
+        # behind it.
+        self._ag_copy_stream = torch.cuda.Stream(device=self.device)
+        self._ag_flag_stream = torch.cuda.Stream(device=self.device)
         # Persistent cross-stream events: captured graphs keep references to
         # recorded events, so per-call temporaries must not be destroyed.
         self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
@@ -145,6 +150,8 @@ class PCIeDmaAllReduce:
         ]
         self._input_ready = torch.cuda.Event()
         self._ag_ready = torch.cuda.Event()
+        self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
+        self._a2a_ownq = [torch.cuda.Event() for _ in range(MAX_PIECES)]
         self._fp8 = _fp8_mode()
         self._fp8_stage = None
         self._fp8_stage_stride = 0
@@ -428,121 +435,163 @@ class PCIeDmaAllReduce:
         )
         return out
 
+    def _pick_a2a_chunks(self, shard_elems: int) -> int:
+        override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
+        candidates = (
+            (override,) if 1 <= override <= MAX_PIECES else (4, 3, 2)
+        )
+        for chunks in candidates:
+            if (
+                shard_elems % (chunks * FP8_QUANT_BLOCK) == 0
+                and shard_elems // chunks >= 384 << 10
+            ):
+                return chunks
+        return 1
+
     def _all_reduce_fp8(
         self, inp: torch.Tensor, out: torch.Tensor, shard_elems: int
     ) -> torch.Tensor:
-        """Quantize-once E4M3 all-to-all: scatter quantized slices, fp32
-        dequant-accumulate the owned shard, quantize the reduced shard once
-        and broadcast it.
+        """Pipelined quantize-once E4M3 all-to-all.
 
-        No end handshake is needed: a rank only broadcasts after its
-        accumulate consumed every reduce-scatter slice, and it only re-enters
-        the op (next call or replay) after its own stream completed, which
-        required every peer's broadcast and therefore every peer's
-        accumulate. Peers' next-call scatter writes are stream-ordered after
-        that, so scratch reuse cannot race a lagging consumer.
+        Slices are split into chunks; each chunk's quantize -> scatter ->
+        fp32 dequant-accumulate -> quantize-once broadcast wave overlaps the
+        next chunk's, with broadcast copies on their own CE stream so the
+        two phases' wire time overlaps rather than queues.
+
+        No end handshake is needed: a rank re-enters the op only after its
+        stream finished, which required every peer's broadcast of every
+        chunk and therefore every peer's accumulate and placement; peers'
+        next-call writes are stream-ordered after that.
         """
 
         ext = self._ext
         world = self.world_size
         rank = self.rank
         shard_bytes = shard_elems * 2
-        payload_bytes = shard_elems
-        slice_bytes = payload_bytes + shard_elems // FP8_QUANT_BLOCK * 4
+        chunks = self._pick_a2a_chunks(shard_elems)
+        chunk_elems = shard_elems // chunks
+        chunk_bytes = chunk_elems * 2
+        chunk_payload = chunk_elems
+        chunk_slice = chunk_payload + chunk_elems // FP8_QUANT_BLOCK * 4
         in_base = inp.data_ptr()
         out_base = out.data_ptr()
         stage_base = self._fp8_stage.data_ptr()
         stride = self._fp8_stage_stride
 
-        def stage_slice(shard: int) -> int:
-            return stage_base + shard * stride
+        def stage_chunk(shard: int, c: int) -> int:
+            return stage_base + shard * stride + c * chunk_slice
+
+        def rs_chunk(owner: int, srcpos: int, c: int) -> int:
+            return self._scratch_ptr(owner, srcpos) + c * chunk_slice
+
+        def ag_chunk(owner: int, srcpos: int, c: int) -> int:
+            return self._scratch_ptr(owner, (world - 1) + srcpos) + c * chunk_slice
+
+        def rs_slot(srcpos: int, c: int) -> int:
+            return srcpos * chunks + c
+
+        def ag_slot(srcpos: int, c: int) -> int:
+            return (world - 1) * chunks + srcpos * chunks + c
 
         main = torch.cuda.current_stream(self.device)
         copy_stream = self._copy_stream
         flag_stream = self._flag_stream
+        ag_copy = self._ag_copy_stream
+        ag_flag = self._ag_flag_stream
         copied = self._copied_events
+        half = len(copied) // 2
         peers = [(rank + 1 + i) % world for i in range(world - 1)]
+        pos_at = [(rank - j - 1) % world for j in peers]
 
-        # Phase 1: quantize outgoing slices, scatter, accumulate own shard.
-        for j in peers:
+        # Quantize all outgoing chunks up front (cheap kernels on main);
+        # per-chunk events let the scatter start as soon as its chunk is
+        # ready while later quants still run.
+        for c in range(chunks):
+            for j in peers:
+                ext.dma_quant(
+                    in_base + j * shard_bytes + c * chunk_bytes,
+                    stage_chunk(j, c),
+                    stage_chunk(j, c) + chunk_payload,
+                    chunk_elems,
+                )
+            self._a2a_qdone[c].record(main)
+
+        # Scatter: reduce-scatter slices, chunk-pipelined.
+        for c in range(chunks):
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(self._a2a_qdone[c])
+                for i, j in enumerate(peers):
+                    ext.dma_copy(
+                        rs_chunk(j, pos_at[i], c), stage_chunk(j, c), chunk_slice
+                    )
+                    copied[i * chunks + c].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                for i, j in enumerate(peers):
+                    flag_stream.wait_event(copied[i * chunks + c])
+                    slot = rs_slot(pos_at[i], c)
+                    ext.dma_set_flag(
+                        self._flag_ptr(j, slot),
+                        self._counter_ptr(self._send_counters, slot),
+                    )
+
+        # Accumulate own shard chunk by chunk; broadcast each chunk as soon
+        # as it is reduced and quantized (once).
+        for c in range(chunks):
+            for i in range(world - 1):
+                slot = rs_slot(i, c)
+                ext.dma_wait_flag(
+                    self._flag_ptr(rank, slot),
+                    self._counter_ptr(self._wait_counters, slot),
+                )
+            payloads = [rs_chunk(rank, i, c) for i in range(world - 1)]
+            scales = [ptr + chunk_payload for ptr in payloads]
+            own = rank * shard_bytes + c * chunk_bytes
+            ext.dma_dequant_accum(
+                out_base + own, in_base + own, payloads, scales, chunk_elems
+            )
             ext.dma_quant(
-                in_base + j * shard_bytes,
-                stage_slice(j),
-                stage_slice(j) + payload_bytes,
-                shard_elems,
+                out_base + own,
+                stage_chunk(rank, c),
+                stage_chunk(rank, c) + chunk_payload,
+                chunk_elems,
             )
-        self._input_ready.record(main)
-        copy_stream.wait_event(self._input_ready)
-        flag_stream.wait_event(self._input_ready)
-        for i, j in enumerate(peers):
-            srcpos = (rank - j - 1) % world
-            with torch.cuda.stream(copy_stream):
-                ext.dma_copy(
-                    self._scratch_ptr(j, srcpos), stage_slice(j), slice_bytes
-                )
-                copied[i].record(copy_stream)
-            with torch.cuda.stream(flag_stream):
-                flag_stream.wait_event(copied[i])
-                ext.dma_set_flag(
-                    self._flag_ptr(j, srcpos),
-                    self._counter_ptr(self._send_counters, srcpos),
-                )
-        for i in range(world - 1):
-            ext.dma_wait_flag(
-                self._flag_ptr(rank, i),
-                self._counter_ptr(self._wait_counters, i),
-            )
-        payloads = [self._scratch_ptr(rank, i) for i in range(world - 1)]
-        scales = [p + payload_bytes for p in payloads]
-        ext.dma_dequant_accum(
-            out_base + rank * shard_bytes,
-            in_base + rank * shard_bytes,
-            payloads,
-            scales,
-            shard_elems,
-        )
+            self._a2a_ownq[c].record(main)
+            with torch.cuda.stream(ag_copy):
+                ag_copy.wait_event(self._a2a_ownq[c])
+                for i, j in enumerate(peers):
+                    ext.dma_copy(
+                        ag_chunk(j, pos_at[i], c), stage_chunk(rank, c), chunk_slice
+                    )
+                    copied[half + i * chunks + c].record(ag_copy)
+            with torch.cuda.stream(ag_flag):
+                for i, j in enumerate(peers):
+                    ag_flag.wait_event(copied[half + i * chunks + c])
+                    slot = ag_slot(pos_at[i], c)
+                    ext.dma_set_flag(
+                        self._flag_ptr(j, slot),
+                        self._counter_ptr(self._send_counters, slot),
+                    )
 
-        # Phase 2: quantize the reduced shard once, broadcast, place.
-        ext.dma_quant(
-            out_base + rank * shard_bytes,
-            stage_slice(rank),
-            stage_slice(rank) + payload_bytes,
-            shard_elems,
-        )
-        self._ag_ready.record(main)
-        copy_stream.wait_event(self._ag_ready)
-        for i, j in enumerate(peers):
-            srcpos = (rank - j - 1) % world
-            slot = (world - 1) + srcpos
-            with torch.cuda.stream(copy_stream):
-                ext.dma_copy(
-                    self._scratch_ptr(j, (world - 1) + srcpos),
-                    stage_slice(rank),
-                    slice_bytes,
+        # Place incoming reduced shards.
+        for c in range(chunks):
+            for i in range(world - 1):
+                src = peers[i]
+                slot = ag_slot(i, c)
+                ext.dma_wait_flag(
+                    self._flag_ptr(rank, slot),
+                    self._counter_ptr(self._wait_counters, slot),
                 )
-                copied[(world - 1) + i].record(copy_stream)
-            with torch.cuda.stream(flag_stream):
-                flag_stream.wait_event(copied[(world - 1) + i])
-                ext.dma_set_flag(
-                    self._flag_ptr(j, slot),
-                    self._counter_ptr(self._send_counters, slot),
+                payload = ag_chunk(rank, i, c)
+                ext.dma_dequant_store(
+                    out_base + src * shard_bytes + c * chunk_bytes,
+                    payload,
+                    payload + chunk_payload,
+                    chunk_elems,
                 )
-        for i in range(world - 1):
-            src = peers[i]
-            slot = (world - 1) + i
-            ext.dma_wait_flag(
-                self._flag_ptr(rank, slot),
-                self._counter_ptr(self._wait_counters, slot),
-            )
-            payload = self._scratch_ptr(rank, (world - 1) + i)
-            ext.dma_dequant_store(
-                out_base + src * shard_bytes,
-                payload,
-                payload + payload_bytes,
-                shard_elems,
-            )
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
+        main.wait_stream(ag_copy)
+        main.wait_stream(ag_flag)
         return out
 
     def close(self) -> None:
