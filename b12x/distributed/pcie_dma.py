@@ -17,7 +17,8 @@ import time
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence
+from statistics import median
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -25,11 +26,7 @@ from torch.distributed import ProcessGroup
 from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
-from .pcie_oneshot import (
-    PCIeOneshotAllReduce,
-    _broadcast_gather_object,
-    _OwnedSharedBuffer,
-)
+from .pcie_oneshot import PCIeOneshotAllReduce
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +50,11 @@ def _fp8_mode() -> str:
     at their owner and are forwarded verbatim around the ring, so the
     error cost is a single rounding while AG wire bytes halve.
 
+    "ring": quantize every reduce-scatter hop and the allgather payload,
+    keeping the saturated neighbor-only topology while halving both phases.
+
     "a2a": quantize-once all-to-all (two roundings, half the wire in both
-    phases; currently unpipelined).
+    phases).
     """
 
     return _normalize_fp8_mode(os.getenv("B12X_PCIE_DMA_FP8", "0"))
@@ -64,8 +64,8 @@ def _normalize_fp8_mode(value: str | None) -> str:
     raw = (value or "").strip().lower()
     if raw in ("", "0", "false", "off", "no"):
         return ""
-    if raw == "a2a":
-        return "a2a"
+    if raw in ("a2a", "ring"):
+        return raw
     return "ag"
 
 
@@ -174,8 +174,9 @@ class PCIeDmaAllReduce:
             self._fp8_stage_stride = stride
         self.min_bytes = 0
         self.wire_mode = f"fp8-{self._fp8}" if self._fp8 else "bf16"
-        logger.info("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
-        self._log_peer_copy_bandwidth()
+        logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_peer_copy_bandwidth()
 
     def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
         """One-time raw cudaMemcpyAsync bandwidth check, bypassing the ring
@@ -197,7 +198,12 @@ class PCIeDmaAllReduce:
         if probe_bytes <= 0:
             return
         stream = torch.cuda.Stream(device=self.device)
-        dist.barrier(group=self.group)
+        device_index = (
+            self.device.index
+            if self.device.index is not None
+            else torch.cuda.current_device()
+        )
+        dist.barrier(group=self.group, device_ids=[device_index])
         with torch.cuda.stream(stream):
             for _ in range(3):
                 self._ext.dma_copy(
@@ -216,7 +222,7 @@ class PCIeDmaAllReduce:
         stream.synchronize()
         ms = start.elapsed_time(end)
         gbps = probe_bytes * iters / (ms * 1e-3) / 1e9
-        logger.info(
+        logger.debug(
             "[PCIe DMA allreduce] rank %d -> %d raw peer copy: %.1f GB/s "
             "(%d bytes x %d iters)",
             self.rank, nxt, gbps, probe_bytes, iters,
@@ -291,7 +297,8 @@ class PCIeDmaAllReduce:
         )
         if fp8_eligible and self._fp8 == "a2a":
             return self._all_reduce_fp8(inp, out, shard_elems)
-        fp8_ag = fp8_eligible and self._fp8 == "ag"
+        fp8_ring = fp8_eligible and self._fp8 == "ring"
+        fp8_ag = fp8_eligible and self._fp8 in ("ag", "ring")
 
         base = out.data_ptr()
 
@@ -348,6 +355,9 @@ class PCIeDmaAllReduce:
 
         stage = self._fp8_stage.data_ptr() if fp8_ag else 0
 
+        def fp8_stage_piece(chunk: int, piece: int) -> int:
+            return stage + chunk * self._fp8_stage_stride + piece * piece_slice_bytes
+
         for k in range(steps):
             reduce_phase = k < world - 1
             if reduce_phase:
@@ -356,21 +366,37 @@ class PCIeDmaAllReduce:
             else:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
-            fp8_step = fp8_ag and not reduce_phase
+            fp8_reduce = fp8_ring and reduce_phase
+            fp8_step = fp8_reduce or (fp8_ag and not reduce_phase)
             if fp8_step and k == world - 1:
-                # Own chunk is fully reduced; quantize it exactly once. It
-                # is then forwarded verbatim around the ring, so no other
-                # rounding ever touches it.
-                for p in range(pieces):
-                    ext.dma_quant(
-                        piece_ptr(send_chunk, p),
-                        stage + p * piece_slice_bytes,
-                        stage + p * piece_slice_bytes + piece_elems,
-                        piece_elems,
-                    )
+                # The AG-only mode quantizes the fully reduced owner chunk
+                # here.  The FP8 ring's fused final reduce hop already
+                # emitted the same payload.  Both modes forward those bytes
+                # verbatim, with no additional all-gather rounding.
+                if not fp8_ring:
+                    for p in range(pieces):
+                        ag_stage = fp8_stage_piece(send_chunk, p)
+                        ext.dma_quant(
+                            piece_ptr(send_chunk, p),
+                            ag_stage,
+                            ag_stage + piece_elems,
+                            piece_elems,
+                        )
                 self._ag_ready.record(main)
             for p in range(pieces):
-                if not fp8_step:
+                if fp8_reduce:
+                    send_src = fp8_stage_piece(send_chunk, p)
+                    if k == 0:
+                        ext.dma_quant(
+                            in_piece_ptr(send_chunk, p),
+                            send_src,
+                            send_src + piece_elems,
+                            piece_elems,
+                        )
+                        self._a2a_qdone[p].record(main)
+                    send_bytes = piece_slice_bytes
+                    send_dst = fp8_scratch_piece(nxt, k, p)
+                elif not fp8_step:
                     send_src = (
                         in_piece_ptr(send_chunk, p) if k == 0
                         else piece_ptr(send_chunk, p)
@@ -378,7 +404,7 @@ class PCIeDmaAllReduce:
                     send_bytes = piece_bytes
                     send_dst = scratch_piece(nxt, k, p)
                 elif k == world - 1:
-                    send_src = stage + p * piece_slice_bytes
+                    send_src = fp8_stage_piece(send_chunk, p)
                     send_bytes = piece_slice_bytes
                     send_dst = fp8_scratch_piece(nxt, k, p)
                 else:
@@ -386,7 +412,11 @@ class PCIeDmaAllReduce:
                     send_bytes = piece_slice_bytes
                     send_dst = fp8_scratch_piece(nxt, k, p)
                 with torch.cuda.stream(copy_stream):
-                    if fp8_step and k == world - 1:
+                    if fp8_reduce:
+                        copy_stream.wait_event(
+                            self._a2a_qdone[p] if k == 0 else add_done[p]
+                        )
+                    elif fp8_step and k == world - 1:
                         copy_stream.wait_event(self._ag_ready)
                     elif k > 0:
                         copy_stream.wait_event(add_done[p])
@@ -403,15 +433,35 @@ class PCIeDmaAllReduce:
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                 )
                 if reduce_phase:
-                    ext.dma_add(
-                        piece_ptr(recv_chunk, p),
-                        in_piece_ptr(recv_chunk, p),
-                        scratch_piece(rank, k, p),
-                        piece_elems,
-                        dtype_code,
-                    )
+                    if fp8_reduce:
+                        payload = fp8_scratch_piece(rank, k, p)
+                        reduced = fp8_stage_piece(recv_chunk, p)
+                        ext.dma_dequant_add_quant(
+                            piece_ptr(recv_chunk, p),
+                            in_piece_ptr(recv_chunk, p),
+                            payload,
+                            payload + piece_elems,
+                            reduced,
+                            reduced + piece_elems,
+                            piece_elems,
+                            k == world - 2,
+                        )
+                    else:
+                        ext.dma_add(
+                            piece_ptr(recv_chunk, p),
+                            in_piece_ptr(recv_chunk, p),
+                            scratch_piece(rank, k, p),
+                            piece_elems,
+                            dtype_code,
+                        )
                 elif fp8_step:
                     payload = fp8_scratch_piece(rank, k, p)
+                    # Forwarding reads the received FP8 payload verbatim, so
+                    # it only depends on the receive flag, not on the local
+                    # BF16 materialization below.  Publish readiness before
+                    # dequantization to overlap the next hop's CE copy with
+                    # this rank's read-only dequant/store.
+                    add_done[p].record(main)
                     ext.dma_dequant_store(
                         piece_ptr(recv_chunk, p),
                         payload,
@@ -424,7 +474,8 @@ class PCIeDmaAllReduce:
                         scratch_piece(rank, k, p),
                         piece_bytes,
                     )
-                add_done[p].record(main)
+                if reduce_phase or not fp8_step:
+                    add_done[p].record(main)
 
         # Neighbor handshake so the next call (or graph replay) cannot
         # overwrite scratch a lagging neighbor still reads. The main stream
@@ -624,14 +675,18 @@ def autotune_crossovers(
     rms_norm_op=None,
     epsilon: float = 1e-6,
     warmup: int = 5,
-    iters: int = 30,
+    iters: int = 50,
+    samples: int = 5,
+    win_margin: float = 0.02,
 ) -> tuple[int, int]:
     """Single sweep from 1 row to the prefill chunk size with the real
     kernels: the oneshot channel (fused AR+RMSNorm when ``rms_norm_op`` is
     given, plain otherwise), the CE ring, and NCCL (plus ``rms_norm_op``)
     as the fallback. Returns (oneshot_max_bytes, dma_min_bytes) and sets
-    ``dma.min_bytes``. Timings are MAX-reduced across ranks so every rank
-    reaches identical verdicts.
+    ``dma.min_bytes``. Each timing is the median of multiple CUDA-event
+    samples after MAX-reducing every sample across ranks. A backend must win
+    by ``win_margin`` and DMA must do so at two consecutive sizes before its
+    crossover is committed.
     """
 
     device = oneshot.device if oneshot is not None else dma.device
@@ -656,17 +711,32 @@ def autotune_crossovers(
             replay = build()
         with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
             replay()
-        dist.barrier(group=nccl_group)
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
+        dist.barrier(group=nccl_group, device_ids=[device_index])
         with torch.cuda.stream(stream):
             for _ in range(warmup):
                 graph.replay()
         stream.synchronize()
-        start = time.perf_counter()
-        with torch.cuda.stream(stream):
-            for _ in range(iters):
-                graph.replay()
-        stream.synchronize()
-        return (time.perf_counter() - start) / iters * 1e6
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        rank_max = torch.empty((), dtype=torch.float64, device=device)
+        timings = []
+        for _ in range(samples):
+            dist.barrier(group=nccl_group, device_ids=[device_index])
+            with torch.cuda.stream(stream):
+                start.record(stream)
+                for _ in range(iters):
+                    graph.replay()
+                end.record(stream)
+            end.synchronize()
+            rank_max.fill_(start.elapsed_time(end) * 1e3 / iters)
+            dist.all_reduce(rank_max, op=dist.ReduceOp.MAX, group=nccl_group)
+            timings.append(float(rank_max.item()))
+        return float(median(timings))
 
     try:
         # Fully dense through 8 rows (the decode regime, where every row
@@ -688,9 +758,10 @@ def autotune_crossovers(
             step *= 2
         oneshot_losses = 0
         dma_wins = 0
+        dma_candidate = 0
         rank0 = dist.get_rank(group=nccl_group) == 0
         if rank0:
-            logger.info(lines[0])
+            logger.debug(lines[0])
         for rows in ladder:
             point_start = time.perf_counter()
             shape = (rows, hidden_size)
@@ -753,17 +824,20 @@ def autotune_crossovers(
             )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=nccl_group)
             nccl_us, oneshot_us, dma_us = (float(v) for v in stats.tolist())
-            if oneshot_us < nccl_us and oneshot_us < dma_us:
+            oneshot_limit = (1.0 + win_margin) * min(nccl_us, dma_us)
+            if oneshot_us < oneshot_limit:
                 oneshot_max = size_bytes
                 oneshot_losses = 0
             else:
                 oneshot_losses += 1
-            if dma_us < nccl_us and dma_us < oneshot_us:
-                if dma_min == 0:
-                    dma_min = size_bytes
+            dma_limit = (1.0 - win_margin) * min(nccl_us, oneshot_us)
+            if dma_us < dma_limit:
+                if dma_wins == 0:
+                    dma_candidate = size_bytes
                 dma_wins += 1
             else:
                 dma_wins = 0
+                dma_candidate = 0
             line = (
                 f"  rows={rows:5d} ({size_bytes >> 10:6d}KB): "
                 f"oneshot {oneshot_us:9.1f}  dma {dma_us:9.1f}  "
@@ -772,8 +846,9 @@ def autotune_crossovers(
             )
             lines.append(line)
             if rank0:
-                logger.info(line)
+                logger.debug(line)
             if dma_wins >= 2:
+                dma_min = dma_candidate
                 break
     except Exception:
         if dma is not None:
@@ -783,7 +858,7 @@ def autotune_crossovers(
     if dma is not None:
         dma.min_bytes = dma_min if dma_min > 0 else dma.max_bytes + 1
     if dist.get_rank(group=nccl_group) == 0:
-        logger.info(
+        logger.debug(
             "  oneshot_max_bytes=%d dma_min_bytes=%d", oneshot_max, dma_min
         )
     return oneshot_max, dma_min

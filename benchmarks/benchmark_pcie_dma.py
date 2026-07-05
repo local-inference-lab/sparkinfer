@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import os
 import socket
-import time
+from statistics import median
+
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
+os.environ.setdefault("NCCL_PROTO", "LL,LL128,Simple")
 
 import torch
 import torch.distributed as dist
@@ -18,26 +22,47 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _time_graph(graph, device, warmup=5, iters=30) -> float:
-    dist.barrier()
-    for _ in range(warmup):
-        graph.replay()
+def _time_graphs(
+    graphs: dict[str, torch.cuda.CUDAGraph],
+    device: torch.device,
+    *,
+    warmup: int = 10,
+    iters: int = 100,
+    samples: int = 9,
+) -> dict[str, list[float]]:
+    for graph in graphs.values():
+        for _ in range(warmup):
+            graph.replay()
     torch.cuda.synchronize(device)
-    start = time.perf_counter()
-    for _ in range(iters):
-        graph.replay()
-    torch.cuda.synchronize(device)
-    us = (time.perf_counter() - start) * 1e6 / iters
-    lat = torch.tensor(us, dtype=torch.float64, device=device)
-    dist.all_reduce(lat, op=dist.ReduceOp.MAX)
-    return float(lat.item())
+    timings = {name: [] for name in graphs}
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    rank_max = torch.empty((), dtype=torch.float64, device=device)
+    names = list(graphs)
+    for sample in range(samples):
+        order = names if sample % 2 == 0 else list(reversed(names))
+        for name in order:
+            dist.barrier(device_ids=[device.index])
+            start.record()
+            for _ in range(iters):
+                graphs[name].replay()
+            end.record()
+            end.synchronize()
+            rank_max.fill_(start.elapsed_time(end) * 1e3 / iters)
+            dist.all_reduce(rank_max, op=dist.ReduceOp.MAX)
+            timings[name].append(float(rank_max.item()))
+    return timings
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
     )
     max_bytes = 8192 * 6144 * 2
     ring = PCIeDmaAllReduce(
@@ -46,11 +71,13 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     try:
         if rank == 0:
             print(
-                "rows,bytes,nccl_us,dma_us,nccl_bus_GBps,ring_bus_GBps,"
+                "rows,bytes,nccl_median_us,dma_median_us,nccl_min_us,"
+                "nccl_max_us,dma_min_us,dma_max_us,nccl_over_dma,"
                 "maxerr_ratio",
                 flush=True,
             )
-        for rows in (256, 1024, 4096, 8192):
+        detailed_rows = (256, 288) + tuple(range(320, 1056, 32)) + (1152, 1280)
+        for rows in detailed_rows:
             gen = torch.Generator(device=device).manual_seed(1234 + rank + rows)
             inp = torch.randn(
                 rows, 6144, dtype=torch.float32, device=device, generator=gen
@@ -79,15 +106,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             with torch.cuda.graph(ring_graph):
                 ring.all_reduce(ring_in, out=ring_res)
 
-            nccl_us = _time_graph(nccl_graph, device)
-            dma_us = _time_graph(ring_graph, device)
+            timings = _time_graphs(
+                {"nccl": nccl_graph, "dma": ring_graph},
+                device,
+            )
+            nccl_us = float(median(timings["nccl"]))
+            dma_us = float(median(timings["dma"]))
             size = inp.numel() * 2
-            bus = 2 * (world_size - 1) / world_size * size
             if rank == 0:
                 print(
                     f"{rows},{size},{nccl_us:.1f},{dma_us:.1f},"
-                    f"{bus / (nccl_us * 1e-6) / 1e9:.1f},"
-                    f"{bus / (dma_us * 1e-6) / 1e9:.1f},{err_ratio:.2f}",
+                    f"{min(timings['nccl']):.1f},{max(timings['nccl']):.1f},"
+                    f"{min(timings['dma']):.1f},{max(timings['dma']):.1f},"
+                    f"{nccl_us / dma_us:.4f},{err_ratio:.2f}",
                     flush=True,
                 )
             del nccl_graph, ring_graph

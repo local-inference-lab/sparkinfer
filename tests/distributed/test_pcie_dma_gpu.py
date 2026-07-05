@@ -45,9 +45,9 @@ def _reference(inp: torch.Tensor) -> torch.Tensor:
 
 def _assert_close(actual: torch.Tensor, ref: torch.Tensor, world_size: int) -> None:
     # Stepwise low-precision ring adds; allow world_size half-ulps around the
-    # fp32 reference. E4M3 wire (two quantizations, fp32 accumulate) needs a
-    # wider band: per-128 amax scaling gives ~6% relative error per quantized
-    # contribution.
+    # fp32 reference. E4M3 wire needs a wider band: per-128 amax scaling gives
+    # ~6% relative error per quantization, and the FP8 ring requantizes partial
+    # sums at each reduce-scatter hop.
     if os.getenv("B12X_PCIE_DMA_FP8", "0") not in ("", "0"):
         torch.testing.assert_close(
             actual.float(), ref, rtol=1.5e-1, atol=6e-2 * world_size
@@ -99,6 +99,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             graph.replay()
             torch.cuda.synchronize(device)
             _assert_close(out, ref, world_size)
+
         dist.barrier()
     finally:
         ring.close()
@@ -121,7 +122,7 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
     _worker(rank, world_size, port)
 
 
-@pytest.mark.parametrize("mode", ["ag", "a2a"])
+@pytest.mark.parametrize("mode", ["ag", "a2a", "ring"])
 def test_pcie_dma_all_reduce_fp8_wire(mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")

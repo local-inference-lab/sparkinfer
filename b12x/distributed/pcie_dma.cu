@@ -120,6 +120,29 @@ struct __align__(16) SrcPtrs {
   const void* ptrs[8];
 };
 
+__device__ __forceinline__ float4 load_bf16x4(const nv_bfloat16* src) {
+  const auto* src2 = reinterpret_cast<const __nv_bfloat162*>(src);
+  const float2 lo = __bfloat1622float2(src2[0]);
+  const float2 hi = __bfloat1622float2(src2[1]);
+  return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+__device__ __forceinline__ void store_bf16x4(nv_bfloat16* dst, const float4 v) {
+  auto* dst2 = reinterpret_cast<__nv_bfloat162*>(dst);
+  dst2[0] = __float22bfloat162_rn(make_float2(v.x, v.y));
+  dst2[1] = __float22bfloat162_rn(make_float2(v.z, v.w));
+}
+
+__device__ __forceinline__ float4 load_fp8x4(const __nv_fp8_e4m3* src) {
+  return static_cast<float4>(
+      *reinterpret_cast<const __nv_fp8x4_e4m3*>(src));
+}
+
+__device__ __forceinline__ void store_fp8x4(
+    __nv_fp8_e4m3* dst, const float4 v) {
+  *reinterpret_cast<__nv_fp8x4_e4m3*>(dst) = __nv_fp8x4_e4m3(v);
+}
+
 // One warp per 128-element block: 4 elements per lane, warp amax, scale,
 // convert, store.
 __global__ void __launch_bounds__(256, 1) quant_kernel(
@@ -132,12 +155,9 @@ __global__ void __launch_bounds__(256, 1) quant_kernel(
   for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
        block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
     const long long elem0 = block * kQuantBlock + lane * 4;
-    float v[4];
-    const nv_bfloat16* s = src + elem0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) v[i] = __bfloat162float(s[i]);
-    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
-                       fmaxf(fabsf(v[2]), fabsf(v[3])));
+    const float4 v = load_bf16x4(src + elem0);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                       fmaxf(fabsf(v.z), fabsf(v.w)));
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
@@ -145,9 +165,10 @@ __global__ void __launch_bounds__(256, 1) quant_kernel(
     const float scale = amax > 0.0f ? amax / kFp8Max : 1.0f;
     if (lane == 0) scales[block] = scale;
     const float inv_scale = 1.0f / scale;
-    __nv_fp8_e4m3* d = payload + elem0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) d[i] = __nv_fp8_e4m3(v[i] * inv_scale);
+    store_fp8x4(
+        payload + elem0,
+        make_float4(v.x * inv_scale, v.y * inv_scale,
+                    v.z * inv_scale, v.w * inv_scale));
   }
 }
 
@@ -164,20 +185,18 @@ __global__ void __launch_bounds__(256, 1) dequant_accum_kernel(
   for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
        block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
     const long long elem0 = block * kQuantBlock + lane * 4;
-    float acc[4];
-    const nv_bfloat16* base = inp + elem0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) acc[i] = __bfloat162float(base[i]);
+    float4 acc = load_bf16x4(inp + elem0);
     for (int j = 0; j < nsrc; ++j) {
       const __nv_fp8_e4m3* p =
           reinterpret_cast<const __nv_fp8_e4m3*>(payloads.ptrs[j]) + elem0;
       const float scale = reinterpret_cast<const float*>(scales.ptrs[j])[block];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) acc[i] += float(p[i]) * scale;
+      const float4 v = load_fp8x4(p);
+      acc.x += v.x * scale;
+      acc.y += v.y * scale;
+      acc.z += v.z * scale;
+      acc.w += v.w * scale;
     }
-    nv_bfloat16* d = out + elem0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) d[i] = __float2bfloat16(acc[i]);
+    store_bf16x4(out + elem0, acc);
   }
 }
 
@@ -192,10 +211,50 @@ __global__ void __launch_bounds__(256, 1) dequant_store_kernel(
        block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
     const long long elem0 = block * kQuantBlock + lane * 4;
     const float scale = scales[block];
-    const __nv_fp8_e4m3* p = payload + elem0;
-    nv_bfloat16* d = out + elem0;
+    const float4 v = load_fp8x4(payload + elem0);
+    store_bf16x4(
+        out + elem0,
+        make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale));
+  }
+}
+
+// Add this rank's BF16 contribution to an incoming FP8 partial and emit the
+// next hop's FP8 partial in one pass.  Only the final reduce-scatter hop also
+// materializes BF16; intermediate partials stay compressed between ranks.
+template <bool StoreBf16>
+__global__ void __launch_bounds__(256, 1) dequant_add_quant_kernel(
+    nv_bfloat16* __restrict__ out,
+    const nv_bfloat16* __restrict__ local,
+    const __nv_fp8_e4m3* __restrict__ payload_in,
+    const float* __restrict__ scales_in,
+    __nv_fp8_e4m3* __restrict__ payload_out,
+    float* __restrict__ scales_out,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const float scale_in = scales_in[block];
+    const float4 a = load_bf16x4(local + elem0);
+    const float4 b = load_fp8x4(payload_in + elem0);
+    const float4 v = make_float4(
+        a.x + b.x * scale_in, a.y + b.y * scale_in,
+        a.z + b.z * scale_in, a.w + b.w * scale_in);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                       fmaxf(fabsf(v.z), fabsf(v.w)));
 #pragma unroll
-    for (int i = 0; i < 4; ++i) d[i] = __float2bfloat16(float(p[i]) * scale);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+    const float scale_out = amax > 0.0f ? amax / kFp8Max : 1.0f;
+    if (lane == 0) scales_out[block] = scale_out;
+    const float inv_scale = 1.0f / scale_out;
+    store_fp8x4(
+        payload_out + elem0,
+        make_float4(v.x * inv_scale, v.y * inv_scale,
+                    v.z * inv_scale, v.w * inv_scale));
+    if constexpr (StoreBf16) store_bf16x4(out + elem0, v);
   }
 }
 
@@ -300,11 +359,37 @@ static void dma_dequant_store(int64_t out_ptr, int64_t payload_ptr,
       reinterpret_cast<const float*>(scales_ptr), blocks);
 }
 
+static void dma_dequant_add_quant(
+    int64_t out_ptr, int64_t local_ptr, int64_t payload_in_ptr,
+    int64_t scales_in_ptr, int64_t payload_out_ptr, int64_t scales_out_ptr,
+    int64_t elems, bool store_bf16) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  const int grid = _fp8_blocks_grid(blocks, threads);
+#define LAUNCH_DEQUANT_ADD_QUANT(STORE)                                      \
+  pcie_dma::dequant_add_quant_kernel<STORE><<<grid, threads, 0, stream>>>(  \
+      reinterpret_cast<nv_bfloat16*>(out_ptr),                              \
+      reinterpret_cast<const nv_bfloat16*>(local_ptr),                      \
+      reinterpret_cast<const __nv_fp8_e4m3*>(payload_in_ptr),               \
+      reinterpret_cast<const float*>(scales_in_ptr),                        \
+      reinterpret_cast<__nv_fp8_e4m3*>(payload_out_ptr),                    \
+      reinterpret_cast<float*>(scales_out_ptr), blocks)
+  if (store_bf16) {
+    LAUNCH_DEQUANT_ADD_QUANT(true);
+  } else {
+    LAUNCH_DEQUANT_ADD_QUANT(false);
+  }
+#undef LAUNCH_DEQUANT_ADD_QUANT
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dma_quant", &dma_quant, "quantize bf16 to e4m3 with per-128 scales");
   m.def("dma_dequant_accum", &dma_dequant_accum,
         "out = inp + sum of dequantized sources (fp32 accumulate)");
   m.def("dma_dequant_store", &dma_dequant_store, "dequantize e4m3 to bf16");
+  m.def("dma_dequant_add_quant", &dma_dequant_add_quant,
+        "add a BF16 contribution to an FP8 partial and requantize");
   m.def("dma_copy", &dma_copy, "CE peer copy on the current stream");
   m.def("dma_set_flag", &dma_set_flag, "publish a monotonic flag to a peer");
   m.def("dma_wait_flag", &dma_wait_flag, "wait for a monotonic peer flag");
