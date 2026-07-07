@@ -182,7 +182,7 @@ def _run(
     return out
 
 
-@pytest.mark.parametrize("n", [_N, 384, 352, 192])
+@pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
 def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     _skip_if_unavailable()
     from b12x.moe.fused.reference import moe_reference_w4a8_mx
@@ -257,9 +257,9 @@ def test_w4a8_mx_w31_layout_flip() -> None:
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4])
-# n=384 covers odd rp K-tile counts on FC2; 352/192 cover ceil-tiled tails
-# (GLM-5.2 2048/TP6 and DS4-Pro 3072/TP16 native shards).
-@pytest.mark.parametrize("n", [_N, 384, 352, 192])
+# n=384 covers odd rp K-tile counts on FC2; 352/192/320 cover ceil-tiled
+# tails (GLM-5.2 2048/TP6, DS4-Pro 3072/TP16 and 3072/TP10 native shards).
+@pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
 def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
