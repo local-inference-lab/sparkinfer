@@ -249,12 +249,14 @@ def test_w4a8_mx_w31_layout_flip() -> None:
 
 
 @pytest.mark.parametrize("m", [1, 2, 4])
-def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
+# n=384 covers odd rp K-tile counts on FC2 (GLM-5.2 2048/TP6 padded shards).
+@pytest.mark.parametrize("n", [_N, 384])
+def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
     from b12x.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
 
-    weights = _weights()
+    weights = _weights(n=n)
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
@@ -262,7 +264,7 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
         params_dtype=torch.bfloat16,
         num_experts=_E,
         hidden_size=_K,
-        intermediate_size=_N,
+        intermediate_size=n,
     )
     plan = tp_moe.plan_tp_moe_execution(
         num_tokens=m,
@@ -286,11 +288,11 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
         topk_weights,
         _E,
         _K,
-        _N,
+        n,
         activation="silu",
         w13_layout="w13",
     )
-    prepared = _prepare(weights)
+    prepared = _prepare(weights, n=n)
     out = _run(m, prepared)
     n_out = out.float().norm().item()
     assert n_out > 0.01, f"w4a8_mx tiny output near-zero (norm={n_out})"

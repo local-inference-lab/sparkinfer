@@ -8015,13 +8015,14 @@ def _tiny_decode_enabled() -> bool:
 
 
 def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -> bool:
+    # n needs whole 128-column rp tiles only; odd tile counts (e.g. n=384
+    # from GLM 2048/TP6 padded shards) run FC2 with one K tile per task.
     return (
         1 <= num_tokens <= 4
         and activation == "silu"
         and k % 256 == 0
-        and n % 256 == 0
+        and n % 128 == 0
         and (k // 128) % 4 == 0
-        and (n // 128) % 2 == 0
     )
 
 
