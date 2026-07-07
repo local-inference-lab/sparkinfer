@@ -182,7 +182,7 @@ def _run(
     return out
 
 
-@pytest.mark.parametrize("n", [_N, 384])
+@pytest.mark.parametrize("n", [_N, 384, 352, 192])
 def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     _skip_if_unavailable()
     from b12x.moe.fused.reference import moe_reference_w4a8_mx

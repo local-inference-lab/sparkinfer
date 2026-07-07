@@ -31,9 +31,22 @@ from b12x.integration.tp_moe import (
 )
 
 
-def rp_word_offset(r: int, w: int, *, rows: int, k_tiles: int, rot: int) -> int:
+def rp_word_offset(
+    r: int,
+    w: int,
+    *,
+    rows: int,
+    k_tiles: int,
+    rot: int,
+    half: int = 0,
+) -> int:
     """Logical (row, int32-word) -> flat int32-word offset in the rp buffer."""
-    p = (r - rot) % rows
+    if half:
+        half_pad = -(-half // 128) * 128
+        rel = (r - rot) % rows
+        p = rel if rel < half else half_pad + (rel - half)
+    else:
+        p = (r - rot) % rows
     nt, row = p >> 8, p & 255
     n8c, n8i, r8 = row >> 5, (row >> 3) & 3, row & 7
     kt, k32, cgrp = w >> 4, (w & 15) >> 2, w & 3
@@ -51,25 +64,32 @@ def sfb_byte_offset(r: int, c: int, *, rows: int, k_tiles: int, rot: int) -> int
 
 
 @pytest.mark.parametrize(
-    "rows,kdim,rot",
+    "rows,kdim,rot,half",
     [
-        (2048, 4096, 1024),
-        (4096, 1024, 0),
+        (2048, 4096, 1024, 0),
+        (4096, 1024, 0, 0),
         # ceil-tiled tails (2048/TP6 = 352): w13 = 704 rows rotated by 352,
         # w2 = K tail (352 = 2x128 + 96)
-        (704, 4096, 352),
-        (4096, 352, 0),
-        (352, 352, 0),
+        (704, 4096, 352, 0),
+        (4096, 352, 0, 0),
+        (352, 352, 0, 0),
+        # gated half-aligned tail layout (the serving w13 path)
+        (704, 4096, 352, 352),
     ],
-    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails"],
+    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails",
+         "w13_half_tail"],
 )
-def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
+def test_rp_weight_inverse(rows: int, kdim: int, rot: int, half: int) -> None:
     torch.manual_seed(0)
     dev = torch.device("cuda")
     logical = torch.randint(0, 256, (1, rows, kdim // 2), dtype=torch.uint8, device=dev)
     qwords = logical.clone().view(torch.int32).reshape(1, rows, kdim // 8)
     rp = _logical_weight_to_w4a8_rp_inplace(
-        logical.clone(), size_k=kdim, size_n=rows, row_rotation=(rot or None)
+        logical.clone(),
+        size_k=kdim,
+        size_n=rows,
+        row_rotation=(rot or None),
+        gated_half_rows=(half or None),
     )
     rp_flat = rp.reshape(-1).view(torch.int32)
     k_tiles = -(-kdim // 128)
@@ -77,7 +97,9 @@ def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
     ws = torch.randint(0, kdim // 8, (4096,))
     offs = torch.tensor(
         [
-            rp_word_offset(int(r), int(w), rows=rows, k_tiles=k_tiles, rot=rot)
+            rp_word_offset(
+                int(r), int(w), rows=rows, k_tiles=k_tiles, rot=rot, half=half
+            )
             for r, w in zip(rs, ws)
         ],
         device=dev,
@@ -91,7 +113,9 @@ def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
         all_w = torch.arange(kdim // 8).repeat(rows)
         all_offs = torch.tensor(
             [
-                rp_word_offset(int(r), int(w), rows=rows, k_tiles=k_tiles, rot=rot)
+                rp_word_offset(
+                    int(r), int(w), rows=rows, k_tiles=k_tiles, rot=rot, half=half
+                )
                 for r, w in zip(all_r, all_w)
             ],
             device=dev,

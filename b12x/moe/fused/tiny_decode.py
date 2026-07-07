@@ -122,6 +122,9 @@ class MoETinyDecodeKernelBackend:
             # 32-value groups of it are logically valid.
             kt2_full=n // 128,
             k2_tail_g32=(n % 128) // 32,
+            # Half-aligned rp storage: each gated half is zero-padded to a
+            # 128-row boundary (up at [0, n_pad128), gate at [n_pad128, ...)).
+            n_pad128=kt2 * 128,
             fc2_kt_per_task=fc2_kt_per_task,
             fc2_ktg=kt2 // fc2_kt_per_task,
             w13_words=nt13 * kt13 * 4096,
@@ -268,10 +271,29 @@ class MoETinyDecodeKernelBackend:
                 accs = (acc0, acc1, acc2, acc3)
                 for v in cutlass.range_constexpr(4):
                     p = nt * Int32(256) + n8c * Int32(32) + Int32(v * 8) + r8
-                    r_log = p + Int32(c["n"])
-                    if r_log >= Int32(c["two_n"]):
-                        r_log -= Int32(c["two_n"])
-                    red_add_global_f32(ibase_rt + Int64(r_log) * Int64(4), accs[v])
+                    if cutlass.const_expr(c["k2_tail_g32"] > 0):
+                        # Half-aligned tail storage: up rows at
+                        # [0, n_pad128), gate rows at [n_pad128, 2*n_pad128),
+                        # each half zero-padded past the logical n. Skip the
+                        # dead rows' stores (their accs are exact zeros, but
+                        # the mapped inter rows would go out of bounds).
+                        is_gate = p >= Int32(c["n_pad128"])
+                        half_dst = p
+                        r_log = p + Int32(c["n"])
+                        if is_gate:
+                            half_dst = p - Int32(c["n_pad128"])
+                            r_log = half_dst
+                        if half_dst < Int32(c["n"]):
+                            red_add_global_f32(
+                                ibase_rt + Int64(r_log) * Int64(4), accs[v]
+                            )
+                    else:
+                        r_log = p + Int32(c["n"])
+                        if r_log >= Int32(c["two_n"]):
+                            r_log -= Int32(c["two_n"])
+                        red_add_global_f32(
+                            ibase_rt + Int64(r_log) * Int64(4), accs[v]
+                        )
 
         if cutlass.const_expr(self.compile_time_phase == 2):
             # ---- FC2: block = (rt, nt2, ktg2) ----
