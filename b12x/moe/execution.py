@@ -604,10 +604,13 @@ def plan_moe_weight_preparation(
         if spec.quant_mode == "w4a8_mx":
             if spec.activation != "silu":
                 raise ValueError("W4A8-MX preparation currently requires silu")
-            if hidden_size % 256 != 0 or intermediate_size % 128 != 0:
+            # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
+            # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
+            # fine; consumers bound their reads by the logical sizes.
+            if hidden_size % 256 != 0 or intermediate_size % 32 != 0:
                 raise ValueError(
                     "W4A8-MX QMMA layout requires hidden_size % 256 == 0 and "
-                    "intermediate_size % 128 == 0"
+                    "intermediate_size % 32 == 0"
                 )
             transforms.add(WeightPreparationTransform.W4A8_QMMA)
             weight_layouts.add(PreparedWeightLayout.QMMA_REPACKED)

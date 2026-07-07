@@ -137,7 +137,14 @@ def _prepare(weights: dict, *, n: int = _N, w13_layout: str = "w13"):
             runtime.w2_sfb,
         )
     )
-    assert runtime_ptrs == source_ptrs
+    # Aligned shards repack in place; ceil-tiled tails (n % 128 != 0 for w2,
+    # (2n) % 256 != 0 for w13) can't fit the source storage and get fresh
+    # allocations instead.
+    has_tail = n % 128 != 0 or (2 * n) % 256 != 0
+    if has_tail:
+        assert runtime_ptrs != source_ptrs
+    else:
+        assert runtime_ptrs == source_ptrs
     return prepared
 
 
@@ -250,8 +257,9 @@ def test_w4a8_mx_w31_layout_flip() -> None:
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4])
-# n=384 covers odd rp K-tile counts on FC2 (GLM-5.2 2048/TP6 padded shards).
-@pytest.mark.parametrize("n", [_N, 384])
+# n=384 covers odd rp K-tile counts on FC2; 352/192 cover ceil-tiled tails
+# (GLM-5.2 2048/TP6 and DS4-Pro 3072/TP16 native shards).
+@pytest.mark.parametrize("n", [_N, 384, 352, 192])
 def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe

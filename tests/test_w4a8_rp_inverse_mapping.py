@@ -52,8 +52,16 @@ def sfb_byte_offset(r: int, c: int, *, rows: int, k_tiles: int, rot: int) -> int
 
 @pytest.mark.parametrize(
     "rows,kdim,rot",
-    [(2048, 4096, 1024), (4096, 1024, 0)],
-    ids=["w13_rotated", "w2"],
+    [
+        (2048, 4096, 1024),
+        (4096, 1024, 0),
+        # ceil-tiled tails (2048/TP6 = 352): w13 = 704 rows rotated by 352,
+        # w2 = K tail (352 = 2x128 + 96)
+        (704, 4096, 352),
+        (4096, 352, 0),
+        (352, 352, 0),
+    ],
+    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails"],
 )
 def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
     torch.manual_seed(0)
@@ -64,7 +72,7 @@ def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
         logical.clone(), size_k=kdim, size_n=rows, row_rotation=(rot or None)
     )
     rp_flat = rp.reshape(-1).view(torch.int32)
-    k_tiles = kdim // 128
+    k_tiles = -(-kdim // 128)
     rs = torch.randint(0, rows, (4096,))
     ws = torch.randint(0, kdim // 8, (4096,))
     offs = torch.tensor(
@@ -75,12 +83,33 @@ def test_rp_weight_inverse(rows: int, kdim: int, rot: int) -> None:
         device=dev,
     )
     assert torch.equal(rp_flat[offs], qwords[0][rs.to(dev), ws.to(dev)])
+    n_tiles = -(-rows // 256)
+    if n_tiles * 256 != rows or k_tiles * 128 != kdim:
+        # every rp word not addressed by a logical (row, word) must be zero
+        seen = torch.zeros(n_tiles * k_tiles * 4096, dtype=torch.bool, device=dev)
+        all_r = torch.arange(rows).repeat_interleave(kdim // 8)
+        all_w = torch.arange(kdim // 8).repeat(rows)
+        all_offs = torch.tensor(
+            [
+                rp_word_offset(int(r), int(w), rows=rows, k_tiles=k_tiles, rot=rot)
+                for r, w in zip(all_r, all_w)
+            ],
+            device=dev,
+        )
+        seen[all_offs] = True
+        assert (rp_flat[~seen] == 0).all()
 
 
 @pytest.mark.parametrize(
     "rows,kdim,rot",
-    [(2048, 4096, 1024), (4096, 1024, 0)],
-    ids=["w13_rotated", "w2"],
+    [
+        (2048, 4096, 1024),
+        (4096, 1024, 0),
+        (704, 4096, 352),
+        (4096, 352, 0),
+        (352, 352, 0),
+    ],
+    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails"],
 )
 def test_sfb_grid_inverse(rows: int, kdim: int, rot: int) -> None:
     torch.manual_seed(0)
@@ -97,7 +126,7 @@ def test_sfb_grid_inverse(rows: int, kdim: int, rot: int) -> None:
         scale.clone(), weight_E=1, rows=rows, k_dim=kdim, row_rotation=(rot or None)
     )
     sfb_flat = sfb.reshape(-1).view(torch.uint8)
-    k_tiles = kdim // 128
+    k_tiles = -(-kdim // 128)
     rs = torch.randint(0, rows, (4096,))
     cs = torch.randint(0, scale_cols, (4096,))
     offs = torch.tensor(

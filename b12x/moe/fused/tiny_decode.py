@@ -84,15 +84,18 @@ class MoETinyDecodeKernelBackend:
         device: torch.device | None = None,
     ) -> None:
         del device
-        # The rp tile grid needs whole 256-row tiles on each GEMM's N dim:
-        # FC1 tiles 2n rows (so n % 128 suffices) and FC2 tiles k rows.
-        if k % 256 != 0 or (2 * n) % 256 != 0:
-            raise ValueError("tiny_decode requires k % 256 == 0 and n % 128 == 0")
+        # Weights arrive in the ceil-tiled rp layout: partial 256-row / 128-col
+        # tiles are stored zero-filled, so any n % 32 shard works. FC1's
+        # zero rows contribute exact +0.0 through the rotated scatter-add;
+        # FC2 bounds its intermediate loads by k2_tail_g32 (see the kernel).
+        if k % 256 != 0 or n % 32 != 0:
+            raise ValueError("tiny_decode requires k % 256 == 0 and n % 32 == 0")
         if m < 1 or m > 4:
             raise ValueError("tiny_decode supports 1 <= m <= 4")
         rt = m * num_topk
         kt13 = k // 128
-        kt2 = n // 128
+        kt2 = -(-n // 128)
+        nt13 = -(-(2 * n) // 256)
         if kt13 % _FC1_KT_PER_TASK != 0:
             raise ValueError("tiny_decode k-tile counts not divisible by task sizes")
         # FC2 walks the intermediate dim in per-task groups of K tiles. Odd
@@ -110,18 +113,22 @@ class MoETinyDecodeKernelBackend:
             num_topk=num_topk,
             weight_E=weight_E,
             rt=rt,
-            nt13=(2 * n) // 256,
+            nt13=nt13,
             kt13=kt13,
             fc1_ktg=kt13 // _FC1_KT_PER_TASK,
             nt2=k // 256,
             kt2=kt2,
+            # Index of the partial FC2 K tile (== kt2 when none) and how many
+            # 32-value groups of it are logically valid.
+            kt2_full=n // 128,
+            k2_tail_g32=(n % 128) // 32,
             fc2_kt_per_task=fc2_kt_per_task,
             fc2_ktg=kt2 // fc2_kt_per_task,
-            w13_words=(2 * n) * k // 8,
-            w2_words=k * n // 8,
-            sfb13_bytes=(2 * n) * (k // 32),
-            sfb2_bytes=k * (n // 32),
-            fc1_tasks=rt * ((2 * n) // 256) * (kt13 // _FC1_KT_PER_TASK),
+            w13_words=nt13 * kt13 * 4096,
+            w2_words=(k // 256) * kt2 * 4096,
+            sfb13_bytes=nt13 * kt13 * 1024,
+            sfb2_bytes=(k // 256) * kt2 * 1024,
+            fc1_tasks=rt * nt13 * (kt13 // _FC1_KT_PER_TASK),
             fc2_tasks=rt * (k // 256) * (kt2 // fc2_kt_per_task),
         )
         self._c = cfg
@@ -291,24 +298,53 @@ class MoETinyDecodeKernelBackend:
                 tile_word = we_base + Int64(col_tile) * Int64(4096 * 4)
                 srow = srow_base + Int64(col_tile) * Int64(1024)
                 xs = []
-                for k32 in cutlass.range_constexpr(4):
-                    ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
-                    quads = []
-                    for jp in cutlass.range_constexpr(4):
-                        g0 = Float32(inter[ich + Int32(2 * jp)])
-                        g1 = Float32(inter[ich + Int32(2 * jp + 1)])
-                        u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
-                        u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
-                        s0 = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                        )
-                        s1 = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                        )
-                        a0 = s0 * g0 * u0 * rw
-                        a1 = s1 * g1 * u1 * rw
-                        quads.append(pack_f32x2_to_f16x2(a0, a1))
-                    xs.append((quads[0], quads[1], quads[2], quads[3]))
+                if cutlass.const_expr(c["k2_tail_g32"] > 0):
+                    # Ceil-tiled FC2 K tail: 32-groups past the logical n get
+                    # zero activations (their rp weights/scales are zero-filled
+                    # too), which also keeps the intermediate loads in bounds.
+                    kt_valid_g32 = Int32(4)
+                    if kt == Int32(c["kt2_full"]):
+                        kt_valid_g32 = Int32(c["k2_tail_g32"])
+                    for k32 in cutlass.range_constexpr(4):
+                        ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        quads = []
+                        for jp in cutlass.range_constexpr(4):
+                            a0 = Float32(0.0)
+                            a1 = Float32(0.0)
+                            if Int32(k32) < kt_valid_g32:
+                                g0 = Float32(inter[ich + Int32(2 * jp)])
+                                g1 = Float32(inter[ich + Int32(2 * jp + 1)])
+                                u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
+                                u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
+                                s0 = Float32(1.0) / (
+                                    Float32(1.0) + cute.math.exp(-g0, fastmath=False)
+                                )
+                                s1 = Float32(1.0) / (
+                                    Float32(1.0) + cute.math.exp(-g1, fastmath=False)
+                                )
+                                a0 = s0 * g0 * u0 * rw
+                                a1 = s1 * g1 * u1 * rw
+                            quads.append(pack_f32x2_to_f16x2(a0, a1))
+                        xs.append((quads[0], quads[1], quads[2], quads[3]))
+                else:
+                    for k32 in cutlass.range_constexpr(4):
+                        ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        quads = []
+                        for jp in cutlass.range_constexpr(4):
+                            g0 = Float32(inter[ich + Int32(2 * jp)])
+                            g1 = Float32(inter[ich + Int32(2 * jp + 1)])
+                            u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
+                            u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
+                            s0 = Float32(1.0) / (
+                                Float32(1.0) + cute.math.exp(-g0, fastmath=False)
+                            )
+                            s1 = Float32(1.0) / (
+                                Float32(1.0) + cute.math.exp(-g1, fastmath=False)
+                            )
+                            a0 = s0 * g0 * u0 * rw
+                            a1 = s1 * g1 * u1 * rw
+                            quads.append(pack_f32x2_to_f16x2(a0, a1))
+                        xs.append((quads[0], quads[1], quads[2], quads[3]))
                 d0, d1, d2, d3 = self._row_block_dot(
                     tile_word, srow, n8c, r8, cgrp,
                     xs[0][0], xs[0][1], xs[0][2], xs[0][3],
