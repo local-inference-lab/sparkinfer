@@ -175,11 +175,12 @@ def _run(
     return out
 
 
-def test_w4a8_mx_dynamic_matches_oracle() -> None:
+@pytest.mark.parametrize("n", [_N, 384])
+def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     _skip_if_unavailable()
     from b12x.moe.fused.reference import moe_reference_w4a8_mx
 
-    weights = _weights()
+    weights = _weights(n=n)
     m = 16
     x, topk_ids, topk_weights = _routed_inputs(m, 33)
     ref = moe_reference_w4a8_mx(
@@ -196,10 +197,10 @@ def test_w4a8_mx_dynamic_matches_oracle() -> None:
         topk_weights,
         _E,
         _K,
-        _N,
+        n,
         activation="silu",
     )
-    prepared = _prepare(weights)
+    prepared = _prepare(weights, n=n)
     out = _run(m, prepared)
     n_out = out.float().norm().item()
     assert n_out > 0.01, f"w4a8_mx output near-zero (norm={n_out})"
@@ -248,7 +249,7 @@ def test_w4a8_mx_w31_layout_flip() -> None:
         )
 
 
-@pytest.mark.parametrize("m", [1, 2, 4])
+@pytest.mark.parametrize("m", [1, 2, 3, 4])
 # n=384 covers odd rp K-tile counts on FC2 (GLM-5.2 2048/TP6 padded shards).
 @pytest.mark.parametrize("n", [_N, 384])
 def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
