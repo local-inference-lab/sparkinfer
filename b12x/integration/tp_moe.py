@@ -1439,11 +1439,10 @@ def _w4a8_dynamic_dense_candidate(
         _normalize_quant_mode(quant_mode) == "w4a8_mx"
         and activation == "silu"
         and k % 256 == 0
-        # The dynamic gated FC1 pairs the up/gate halves per 128-row
-        # tile, so the half boundary must sit on a tile edge; ceil-tiled
-        # tail shards (352/192) stay on tiny (m<=4) until the pairing
-        # learns mid-tile splits.
-        and n % 128 == 0
+        # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
+        # 128-row tile boundaries, so the per-tile pairing works for any
+        # 32-aligned shard (352 = 2048/TP6, 192 = 3072/TP16).
+        and n % 32 == 0
         and _select_dynamic_tile_mn(
             routed_rows,
             n,
@@ -1593,11 +1592,10 @@ def _w4a8_dynamic_materialized_enabled(
     m1_candidate = bool(
         int(num_tokens) == 1
         and k % 256 == 0
-        # The dynamic gated FC1 pairs the up/gate halves per 128-row
-        # tile, so the half boundary must sit on a tile edge; ceil-tiled
-        # tail shards (352/192) stay on tiny (m<=4) until the pairing
-        # learns mid-tile splits.
-        and n % 128 == 0
+        # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
+        # 128-row tile boundaries, so the per-tile pairing works for any
+        # 32-aligned shard (352 = 2048/TP6, 192 = 3072/TP16).
+        and n % 32 == 0
         and _w4a8_dynamic_direct_candidate(
             quant_mode=quant_mode,
             activation=activation,
@@ -3099,6 +3097,8 @@ def _qweight_to_w4a8_rp_kernel(
     q_expert_stride: tl.constexpr,
     dst_expert_stride: tl.constexpr,
     row_rotation: tl.constexpr,
+    half_rows: tl.constexpr,
+    half_rows_pad: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -3124,12 +3124,34 @@ def _qweight_to_w4a8_rp_kernel(
 
     row = n8c * 32 + n8i * 8 + r8
     dst_row = nt * 256 + row
-    src_row = dst_row + row_rotation
-    src_row = tl.where(src_row >= rows, src_row - rows, src_row)
     src_col = kt * 16 + k32 * 4 + cgrp
-    # Tail tiles: positions past the logical N/K read as zero (FP4 zero rows
-    # and columns), keeping the fixed 4096-word tile addressing uniform.
-    in_bounds = (dst_row < rows) & (src_col < q_cols)
+    if half_rows_pad > 0:
+        # Gated W13 with a ceil-tiled half: dst rows [0, half_pad) hold the
+        # up half, [half_pad, 2*half_pad) the gate half, each zero-padded to
+        # a 128-row boundary so the dynamic kernel's per-128-tile up/gate
+        # pairing stays aligned. `row_rotation` here is the SOURCE row of the
+        # up half (n for w31 sources, 0 for w13); the other half starts at
+        # (rotation + half) % (2*half).
+        is_gate = dst_row >= half_rows_pad
+        half_dst = dst_row - tl.where(is_gate, half_rows_pad, 0)
+        half_src_base = row_rotation + tl.where(is_gate, half_rows, 0)
+        half_src_base = tl.where(
+            half_src_base >= 2 * half_rows,
+            half_src_base - 2 * half_rows,
+            half_src_base,
+        )
+        src_row = half_src_base + half_dst
+        in_bounds = (
+            (dst_row < 2 * half_rows_pad)
+            & (half_dst < half_rows)
+            & (src_col < q_cols)
+        )
+    else:
+        src_row = dst_row + row_rotation
+        src_row = tl.where(src_row >= rows, src_row - rows, src_row)
+        # Tail tiles: positions past the logical N/K read as zero (FP4 zero
+        # rows and columns), keeping the fixed tile addressing uniform.
+        in_bounds = (dst_row < rows) & (src_col < q_cols)
     src_row = tl.where(in_bounds, src_row, 0)
     src_col = tl.where(in_bounds, src_col, 0)
     values = tl.load(
@@ -3194,6 +3216,8 @@ def _grid_to_w4a8_sfb_kernel(
     grid_expert_stride: tl.constexpr,
     dst_expert_stride: tl.constexpr,
     row_rotation: tl.constexpr,
+    half_rows: tl.constexpr,
+    half_rows_pad: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -3212,12 +3236,30 @@ def _grid_to_w4a8_sfb_kernel(
     nt = tmp // k_tiles_128
 
     dst_row = nt * 256 + n32 * 8 + row8
-    row = dst_row + row_rotation
-    row = tl.where(row >= rows, row - rows, row)
     col = kt * 4 + kb
-    # Tail tiles: scale bytes past the logical grid are zero (2^-127 scale on
-    # already-zero FP4 weights).
-    in_bounds = (dst_row < rows) & (col < scale_cols)
+    if half_rows_pad > 0:
+        # Same half-aligned mapping as the weight repack (see
+        # _qweight_to_w4a8_rp_kernel).
+        is_gate = dst_row >= half_rows_pad
+        half_dst = dst_row - tl.where(is_gate, half_rows_pad, 0)
+        half_src_base = row_rotation + tl.where(is_gate, half_rows, 0)
+        half_src_base = tl.where(
+            half_src_base >= 2 * half_rows,
+            half_src_base - 2 * half_rows,
+            half_src_base,
+        )
+        row = half_src_base + half_dst
+        in_bounds = (
+            (dst_row < 2 * half_rows_pad)
+            & (half_dst < half_rows)
+            & (col < scale_cols)
+        )
+    else:
+        row = dst_row + row_rotation
+        row = tl.where(row >= rows, row - rows, row)
+        # Tail tiles: scale bytes past the logical grid are zero (2^-127
+        # scale on already-zero FP4 weights).
+        in_bounds = (dst_row < rows) & (col < scale_cols)
     row = tl.where(in_bounds, row, 0)
     col = tl.where(in_bounds, col, 0)
     values = tl.load(
@@ -3374,6 +3416,7 @@ def _logical_weight_to_w4a8_rp_inplace(
     size_k: int,
     size_n: int,
     row_rotation: int | None = None,
+    gated_half_rows: int | None = None,
 ) -> torch.Tensor:
     size_k = int(size_k)
     size_n = int(size_n)
@@ -3390,6 +3433,17 @@ def _logical_weight_to_w4a8_rp_inplace(
     k_tiles = -(-size_k // 128)
     rp_words = _tensor_numel(rp_shape)
     has_tail = rp_words != size_n * (size_k // 8)
+    # Gated W13 tails place each half's zero rows at a 128-row boundary so
+    # the dynamic kernel's per-tile up/gate pairing stays aligned. The
+    # interpretation of row_rotation shifts to "source row of the up half"
+    # (numerically identical for the aligned case).
+    half_rows = 0
+    half_rows_pad = 0
+    if has_tail and gated_half_rows is not None:
+        half_rows = int(gated_half_rows)
+        half_rows_pad = -(-half_rows // 128) * 128
+        assert 2 * half_rows == size_n, (half_rows, size_n)
+        assert 2 * half_rows_pad == n_tiles * 256, (half_rows_pad, n_tiles)
     if weight.is_cuda:
         weight_E = int(weight.shape[0])
         q_cols = size_k // 8
@@ -3438,6 +3492,8 @@ def _logical_weight_to_w4a8_rp_inplace(
                 size_n * q_cols,
                 dst_expert_stride,
                 row_rot,
+                half_rows,
+                half_rows_pad,
                 BLOCK=block,
                 num_warps=4,
             )
@@ -3651,6 +3707,7 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     rows: int,
     k_dim: int,
     row_rotation: int | None = None,
+    gated_half_rows: int | None = None,
 ) -> torch.Tensor:
     weight_E = int(weight_E)
     rows = int(rows)
@@ -3668,6 +3725,12 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     k_tiles = -(-k_dim // 128)
     sfb_bytes = _tensor_numel(sfb_shape) * 4
     has_tail = sfb_bytes != rows * (k_dim // 32)
+    half_rows = 0
+    half_rows_pad = 0
+    if has_tail and gated_half_rows is not None:
+        half_rows = int(gated_half_rows)
+        half_rows_pad = -(-half_rows // 128) * 128
+        assert 2 * half_rows == rows, (half_rows, rows)
     if scale.is_cuda:
         scale_cols = k_dim // 32
         rows_pad = rows if is_logical else int(scale_u8.shape[2])
@@ -3728,6 +3791,8 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
                 total_per_expert,
                 sfb_bytes,
                 row_rot,
+                half_rows,
+                half_rows_pad,
                 BLOCK=block,
                 num_warps=4,
             )
@@ -4146,14 +4211,14 @@ def _prepare_w4a8_from_e8m0_source(
     _as_e8m0_k32_grid(w1_blockscale, w1_rows, k, name="w1_blockscale")
     _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale")
 
-    row_rotation = (
-        n if w13_layout == "w31" and is_gated_moe_activation(activation) else None
-    )
+    is_gated = is_gated_moe_activation(activation)
+    row_rotation = n if w13_layout == "w31" and is_gated else None
     w13_rp = _logical_weight_to_w4a8_rp_inplace(
         w1_fp4,
         size_k=k,
         size_n=w1_rows,
         row_rotation=row_rotation,
+        gated_half_rows=n if is_gated else None,
     )
     w2_rp = _logical_weight_to_w4a8_rp_inplace(
         w2_fp4,
@@ -4166,6 +4231,7 @@ def _prepare_w4a8_from_e8m0_source(
         rows=w1_rows,
         k_dim=k,
         row_rotation=row_rotation,
+        gated_half_rows=n if is_gated else None,
     )
     w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
         w2_blockscale,
@@ -7425,6 +7491,14 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
+    if w4a8_repacked and int(n) % 128 != 0:
+        # Half-aligned ceil-tiled rp/sfb storage is byte-identical to the
+        # storage of zero-padded n_pad weights, and the dynamic kernel has no
+        # external tensor with an n extent (output is [m, k]); launching at
+        # n_pad therefore computes the exact result — the padded FC1 columns
+        # are silu(0)*0 = 0 and w2's padded K rows are zero. tiny_decode
+        # keeps the logical-n bounds for the decode band.
+        n = -(-int(n) // 128) * 128
     decode_regime = bool(
         w4a8_repacked
         and _w4a8_dynamic_decode_candidate(
