@@ -507,16 +507,18 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         num_experts: int,
         scale_format: str = "e4m3_k16",
     ) -> bool:
-        # E8M0 reads the shared packed scale grid. Both block axes must be /32,
-        # and the FC2 chunking (256 intermediate values per chunk, see
-        # fc2_n_chunks) must cover the intermediate exactly: on a logical tail
-        # (e.g. 352 or 384 per-rank shards) the padded chunk region indexes
-        # scale columns past the e8m0 grid. The e4m3_k16 path masks this fine;
-        # e8m0 does not — route those shards to the fused kernels instead.
+        # E8M0 reads the shared packed scale grid. Both block axes must be /32.
+        # The FC2 chunking (256 intermediate values per chunk, fc2_n_chunks)
+        # masks a tail inside a single chunk correctly (I=128 oracle-covered),
+        # but multi-chunk shards with a partial last chunk (352, 384) index
+        # scale columns past the e8m0 grid and corrupt decode outputs — the
+        # e4m3_k16 path masks this fine; e8m0 must cover multi-chunk exactly.
         if scale_format == "e8m0_k32":
+            fc2_n_chunks = ((int(intermediate_size) // 2) + 127) // 128
             scale_block_ok = (
                 int(hidden_size) % 32 == 0
-                and int(intermediate_size) % 256 == 0
+                and int(intermediate_size) % 32 == 0
+                and (fc2_n_chunks == 1 or int(intermediate_size) % 256 == 0)
             )
         else:
             scale_block_ok = True

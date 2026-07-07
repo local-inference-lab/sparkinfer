@@ -1439,6 +1439,10 @@ def _w4a8_dynamic_dense_candidate(
         _normalize_quant_mode(quant_mode) == "w4a8_mx"
         and activation == "silu"
         and k % 256 == 0
+        # The dynamic gated FC1 pairs the up/gate halves per 128-row
+        # tile, so the half boundary must sit on a tile edge; ceil-tiled
+        # tail shards (352/192) stay on tiny (m<=4) until the pairing
+        # learns mid-tile splits.
         and n % 128 == 0
         and _select_dynamic_tile_mn(
             routed_rows,
@@ -1589,6 +1593,10 @@ def _w4a8_dynamic_materialized_enabled(
     m1_candidate = bool(
         int(num_tokens) == 1
         and k % 256 == 0
+        # The dynamic gated FC1 pairs the up/gate halves per 128-row
+        # tile, so the half boundary must sit on a tile edge; ceil-tiled
+        # tail shards (352/192) stay on tiny (m<=4) until the pairing
+        # learns mid-tile splits.
         and n % 128 == 0
         and _w4a8_dynamic_direct_candidate(
             quant_mode=quant_mode,
