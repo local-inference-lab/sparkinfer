@@ -1967,9 +1967,15 @@ class MoEDynamicKernelBackend:
                 n_int + Int32(self.tile_shape_mnk[1]) - Int32(1)
             ) // Int32(self.tile_shape_mnk[1])
         else:
-            gate_tile_cnt = Int32(b_w13.shape[0]) // Int32(self.tile_shape_mnk[1])
+            # Same ceil as the swap_ab branch: gate_tile_cnt is also the w2
+            # rp K-tile stride, so a floored count misaddresses every tile
+            # past nt=0 on non-128-aligned shards (e.g. 352).
+            n_int = Int32(b_w13.shape[0])
             if self.is_gated:
-                gate_tile_cnt = gate_tile_cnt // Int32(2)
+                n_int = n_int // Int32(2)
+            gate_tile_cnt = (
+                n_int + Int32(self.tile_shape_mnk[1]) - Int32(1)
+            ) // Int32(self.tile_shape_mnk[1])
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
         if cutlass.const_expr(self.is_w4a8):
             assert sfb_w13_mx is not None and sfb_down_mx is not None, (
