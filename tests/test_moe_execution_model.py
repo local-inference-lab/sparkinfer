@@ -308,3 +308,22 @@ def test_planner_rejects_two_incompatible_repacks() -> None:
 
 def test_storage_policy_has_no_keep_both_state() -> None:
     assert "keep_both" not in {policy.value for policy in WeightStoragePolicy}
+
+
+def test_non_128_aligned_e8m0_w4a16_shards_stay_source_native() -> None:
+    """2048/TP6 = 352 and 3072/TP16 = 192 have no packed tile configs; the
+    planner must route them through the native layout instead of failing at
+    kernel-config time. 128-aligned shards keep the packed fast path."""
+    for shard in (352, 192):
+        plan = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=shard)
+        assert WeightPreparationTransform.W4A16_NATIVE in plan.transforms
+        assert (
+            plan.required_weight_layout("w4a16")
+            is PreparedWeightLayout.SOURCE_NATIVE
+        )
+
+    aligned = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=256)
+    assert WeightPreparationTransform.W4A16_PACKED in aligned.transforms
+    assert (
+        aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED
+    )
