@@ -4784,10 +4784,15 @@ def compile_w4a16_fused_moe(
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
+    # Logical K/N tails are needed for every shard the tile table can't
+    # divide, not just sub-32 ones: 2048/TP6 = 352 and 3072/TP16 = 192 are
+    # 32-aligned yet have no dividing tile_k/tile_n. %32 shards are the
+    # ceil-scale-grid subset of the same machinery (%32 != 0 implies
+    # %128 != 0).
     allow_native_logical_tail = (
         weight_layout == "modelopt"
         and scale_format == "e8m0_k32"
-        and int(intermediate_size) % 32 != 0
+        and int(intermediate_size) % 128 != 0
     )
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
         problem_m=size_m,

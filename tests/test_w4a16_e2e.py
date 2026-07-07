@@ -573,17 +573,27 @@ def test_w4a16_e8m0_native_large_m_uses_main_gemm(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("activation", ["silu", "relu2"])
+@pytest.mark.parametrize(
+    ("activation", "intermediate_size"),
+    [
+        ("silu", 312),
+        ("relu2", 112),
+        # 32-aligned but not 128-aligned: no dividing tile config, so the
+        # same logical-tail path must engage (2048/TP6 = 352, 3072/TP16 = 192).
+        ("silu", 352),
+        ("relu2", 192),
+    ],
+)
 def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
     activation: str,
+    intermediate_size: int,
 ) -> None:
     """Native E8M0 supports compact FC2 K tails without padding I to 32."""
     experts, hidden_size = 4, 128
-    intermediate_size = 312 if activation == "silu" else 112
     rows = intermediate_size * (2 if activation == "silu" else 1)
     topk, m = 2, 24
     assert intermediate_size % 8 == 0
-    assert intermediate_size % 32 != 0
+    assert intermediate_size % 128 != 0
     torch.manual_seed(20260610)
     w13 = torch.randint(
         0, 256, (experts, rows, hidden_size // 2), dtype=torch.uint8, device="cuda"
