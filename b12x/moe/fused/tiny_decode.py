@@ -84,15 +84,24 @@ class MoETinyDecodeKernelBackend:
         device: torch.device | None = None,
     ) -> None:
         del device
-        if k % 256 != 0 or n % 256 != 0:
-            raise ValueError("tiny_decode requires k % 256 == 0 and n % 256 == 0")
+        # The rp tile grid needs whole 256-row tiles on each GEMM's N dim:
+        # FC1 tiles 2n rows (so n % 128 suffices) and FC2 tiles k rows.
+        if k % 256 != 0 or (2 * n) % 256 != 0:
+            raise ValueError("tiny_decode requires k % 256 == 0 and n % 128 == 0")
         if m < 1 or m > 4:
             raise ValueError("tiny_decode supports 1 <= m <= 4")
         rt = m * num_topk
         kt13 = k // 128
         kt2 = n // 128
-        if kt13 % _FC1_KT_PER_TASK != 0 or kt2 % _FC2_KT_PER_TASK != 0:
+        if kt13 % _FC1_KT_PER_TASK != 0:
             raise ValueError("tiny_decode k-tile counts not divisible by task sizes")
+        # FC2 walks the intermediate dim in per-task groups of K tiles. Odd
+        # tile counts (e.g. n=384 -> 3 tiles from GLM 2048/TP6 padded shards)
+        # drop to one tile per task; partials are scatter-added, so the task
+        # split does not change results.
+        fc2_kt_per_task = (
+            _FC2_KT_PER_TASK if kt2 % _FC2_KT_PER_TASK == 0 else 1
+        )
         cfg = dict(
             m=m,
             k=k,
@@ -106,13 +115,14 @@ class MoETinyDecodeKernelBackend:
             fc1_ktg=kt13 // _FC1_KT_PER_TASK,
             nt2=k // 256,
             kt2=kt2,
-            fc2_ktg=kt2 // _FC2_KT_PER_TASK,
+            fc2_kt_per_task=fc2_kt_per_task,
+            fc2_ktg=kt2 // fc2_kt_per_task,
             w13_words=(2 * n) * k // 8,
             w2_words=k * n // 8,
             sfb13_bytes=(2 * n) * (k // 32),
             sfb2_bytes=k * (n // 32),
             fc1_tasks=rt * ((2 * n) // 256) * (kt13 // _FC1_KT_PER_TASK),
-            fc2_tasks=rt * (k // 256) * (kt2 // _FC2_KT_PER_TASK),
+            fc2_tasks=rt * (k // 256) * (kt2 // fc2_kt_per_task),
         )
         self._c = cfg
         self._cfg_key = tuple(sorted(cfg.items()))
@@ -275,8 +285,8 @@ class MoETinyDecodeKernelBackend:
             acc1 = Float32(0.0)
             acc2 = Float32(0.0)
             acc3 = Float32(0.0)
-            for kt_i in cutlass.range_constexpr(_FC2_KT_PER_TASK):
-                kt = ktg * Int32(_FC2_KT_PER_TASK) + Int32(kt_i)
+            for kt_i in cutlass.range_constexpr(c["fc2_kt_per_task"]):
+                kt = ktg * Int32(c["fc2_kt_per_task"]) + Int32(kt_i)
                 col_tile = nt * Int32(c["kt2"]) + kt
                 tile_word = we_base + Int64(col_tile) * Int64(4096 * 4)
                 srow = srow_base + Int64(col_tile) * Int64(1024)
