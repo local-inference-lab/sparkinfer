@@ -1994,7 +1994,17 @@ def compile(
         # Subscript-style DSL compile options (e.g. OptLevel(2): ptxas -O3's
         # scheduler register-starves some scalar-heavy kernels; see the w4a8
         # dynamic MoE recipe).
-        compile_callable = cute.compile[dsl_compile_options]
+        if hasattr(compile_callable, "__getitem__"):
+            compile_callable = compile_callable[dsl_compile_options]
+        else:
+            # Some embedded runtimes expose cutlass.cute.compile as a plain
+            # function instead of the CompileCallable instance installed by the
+            # top-level module import.  Recreate the callable explicitly so DSL
+            # options still take effect instead of crashing or silently falling
+            # back to the default compiler options.
+            from cutlass.base_dsl.compiler import CompileCallable
+
+            compile_callable = CompileCallable(dsl_compile_options)
         kwargs = dict(kwargs)
         kwargs["__dsl_compile_options_key"] = repr(dsl_compile_options)
     memory_cache_key = _compile_memory_cache_key(
