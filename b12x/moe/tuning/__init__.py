@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import importlib
 import importlib.util
 import pathlib
-import pkgutil
 import sys
 
 from .registry import (
@@ -15,10 +13,6 @@ from .registry import (
     register_max_active_clusters_policy,
 )
 
-for _module_info in pkgutil.walk_packages(__path__, prefix=f"{__name__}."):
-    if _module_info.name.rsplit(".", 1)[-1] == "registry":
-        continue
-    importlib.import_module(_module_info.name)
 
 _PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
 for _policy_path in sorted(_PACKAGE_DIR.glob("*.py")):

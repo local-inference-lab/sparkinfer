@@ -575,27 +575,6 @@ def plan_fused_indexer_scratch(
     )
 
 
-# --- kernel constexpr configuration -------------------------------------------
-@dataclass(frozen=True)
-class FusedIndexerConfig:
-    """The compile-time specialization tuple for SparseNSAFusedIndexerKernel.
-
-    All contiguous-vs-paged / topk / output-format divergence is captured here so the
-    finite variant set is fully enumerable from workspace caps (for prewarm).
-    """
-
-    kv_layout: int  # KV_LAYOUT_CONTIGUOUS_MLA | KV_LAYOUT_PAGED
-    topk: int  # 512 | 1024 | 2048
-    paged_output: bool  # remap selected logical idx through a page table
-    num_head_tiles: int  # head-dim tiling for the m=heads MMA
-
-    def __post_init__(self) -> None:
-        if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
-            raise ValueError(f"bad kv_layout {self.kv_layout}")
-        if int(self.topk) not in _SUPPORTED_TOPK:
-            raise ValueError(f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}")
-
-
 # --- fused kernel SharedStorage -----------------------------------------------
 # 1024-thread CTA. Score phase: warps 0-3 (tx < _PAGED_THREADS_PER_CTA) run the
 # scorer MMA over a K-sub-tile into the logit staging (s_stage_*); all 1024
@@ -705,15 +684,6 @@ def _fused_indexer_shared_storage_cls(
     }
     SharedStorage.__annotations__ = annotations
     return cute.struct(SharedStorage)
-
-
-@lru_cache(maxsize=64)
-def _build_fused_indexer_kernel(config: FusedIndexerConfig):
-    # Phase 1 lands SparseNSAFusedIndexerKernel(config). Cached per constexpr
-    # tuple so prewarm can compile every variant before CUDA-graph capture.
-    raise NotImplementedError(
-        "SparseNSAFusedIndexerKernel body is implemented in Phase 1 (paged) / Phase 2 (MLA)"
-    )
 
 
 @cute.jit

@@ -497,6 +497,12 @@ class B12XPagedAttentionScratch:
                 return self
 
             if active_total_q is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "paged attention scratch prepare() requires active_total_q "
+                        "to be supplied before CUDA graph capture; inferring it from "
+                        "a device cu_seqlens_q would require an illegal host sync"
+                    )
                 inferred_mode = infer_paged_mode(cu_seqlens_q)
                 active_total_q = int(cu_seqlens_q[-1].item())
             else:

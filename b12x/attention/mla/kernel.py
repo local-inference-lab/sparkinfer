@@ -2617,14 +2617,3 @@ def run_unified_prefill(*args, **kwargs):
 
     return _impl(*args, **kwargs)
 
-
-def run_unified_merge(*args, **kwargs):
-    """Active SM120 sparse-MLA partial merge.
-
-    The active decode reuses merge.py's base-2 SparseMLASplitDecodeMergeKernel
-    directly (see run_unified_decode), so a separate merge entrypoint is not
-    needed; kept as a STUB for API symmetry."""
-    raise NotImplementedError(
-        "SM120 sparse MLA run_unified_merge: the decode reuses merge.py's merge "
-        "(run_sparse_mla_split_decode_merge) directly"
-    )
