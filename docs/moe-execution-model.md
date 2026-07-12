@@ -37,6 +37,7 @@ The canonical numeric recipes are:
 | W4A8 on NVFP4 | MXFP8 E4M3 / E8M0 K/32 | E4M3 K/16 | E8M0 K/32 base × K/16 residual |
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
+| W4A16-NF3 (`nf3_2p1`) | BF16 / none | E4M3 K/32 | source-preserving |
 
 The current kernel families map onto those axes as follows:
 
