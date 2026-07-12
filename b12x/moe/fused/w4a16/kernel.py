@@ -161,6 +161,14 @@ _W4A16_REGS_SM121 = {
     (128, 4, 4, 8, False): 255,
     (128, 4, 8, 4, False): 255,
 }
+# Layout overlay: the nf3_2p1 dequant inner loop (codebook prmt pools, 12B
+# staged triples) allocates fewer registers than the packed e2m1 loop.
+# Measured from ncu on SM120 JIT output at the production hybrid tile config;
+# unmeasured specializations fall back to the packed table (a conservative
+# upper bound).
+_W4A16_REGS_SM121_NF3 = {
+    (256, 4, 16, 4, False): 238,
+}
 _SMALL_BATCH_TILE_CONFIGS = (
     (128, 128, 256),
     (64, 128, 128),
@@ -209,6 +217,7 @@ def _w4a16_num_regs(
     cta_n_blocks: int,
     cta_k_blocks: int,
     uses_m_block_8: bool,
+    weight_layout: str = "packed",
 ) -> int:
     key = (
         int(cta_threads),
@@ -217,6 +226,10 @@ def _w4a16_num_regs(
         int(cta_k_blocks),
         bool(uses_m_block_8),
     )
+    if weight_layout == "nf3_2p1":
+        hit = _W4A16_REGS_SM121_NF3.get(key)
+        if hit is not None:
+            return hit
     try:
         return _W4A16_REGS_SM121[key]
     except KeyError as exc:
@@ -231,6 +244,7 @@ def _shared_memory_footprint(
     tile_n: int,
     tile_k: int,
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -238,6 +252,10 @@ def _shared_memory_footprint(
     sh_block_meta_size = cta_m * 16
     sh_a_size = _STAGES * (cta_m * cta_k) * 2
     sh_b_size = _STAGES * (cta_k * cta_n // _PACK_FACTOR) * 4
+    if weight_layout == "nf3_2p1":
+        # NF3 stages 12-byte triples per 32-code unit instead of 16-byte int4
+        # units (see b_unit_bytes) -- 3/4 of the packed B stage footprint.
+        sh_b_size = sh_b_size * 3 // 4
     sh_red_size = cta_m * (cta_n + 8) * 2
     sh_bias_size = cta_n * 2
     tmp_size = min(sh_b_size, sh_red_size) + sh_bias_size
@@ -261,6 +279,7 @@ def _determine_blocks_per_sm(
     sms: int,
     max_shared_mem: int,
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -268,6 +287,7 @@ def _determine_blocks_per_sm(
         cta_n_blocks=tile_n // 16,
         cta_k_blocks=tile_k // 16,
         uses_m_block_8=uses_m_block_8,
+        weight_layout=weight_layout,
     )
     register_bytes = max(num_regs, 1) * int(cta_threads) * 4
     smem_bytes = _shared_memory_footprint(
@@ -275,6 +295,7 @@ def _determine_blocks_per_sm(
         tile_n=tile_n,
         tile_k=tile_k,
         scale_format=scale_format,
+        weight_layout=weight_layout,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -312,6 +333,7 @@ def _candidate_tile_fits(
     cta_threads: int,
     max_shared_mem: int,
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
     allow_logical_tail: bool = False,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
@@ -340,6 +362,7 @@ def _candidate_tile_fits(
         tile_n=tile_n,
         tile_k=tile_k,
         scale_format=scale_format,
+        weight_layout=weight_layout,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -355,6 +378,7 @@ def _select_tile_config(
     max_shared_mem: int,
     required_cta_threads: int | None = None,
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
     allow_logical_tail: bool = False,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
@@ -378,6 +402,7 @@ def _select_tile_config(
             cta_threads=cta_threads,
             max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
+            weight_layout=weight_layout,
             allow_logical_tail=allow_logical_tail,
         ):
             continue
@@ -398,6 +423,7 @@ def _select_tile_config(
             sms=sms,
             max_shared_mem=max_shared_mem,
             scale_format=scale_format,
+            weight_layout=weight_layout,
         )
         if blocks_per_sm_limit > best_blocks_per_sm:
             best_blocks_per_sm = blocks_per_sm_limit
@@ -764,6 +790,7 @@ class W4A16GemmKernel:
             sms=self.sms,
             max_shared_mem=max_shared_mem,
             scale_format=scale_format,
+            weight_layout=weight_layout,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -4980,6 +5007,7 @@ def compile_w4a16_fused_moe(
         sms=sms,
         max_shared_mem=max_shared_mem,
         scale_format=scale_format,
+        weight_layout=weight_layout,
         allow_logical_tail=allow_native_logical_tail,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
@@ -4991,6 +5019,7 @@ def compile_w4a16_fused_moe(
         sms=sms,
         max_shared_mem=max_shared_mem,
         scale_format=scale_format,
+        weight_layout=weight_layout,
         allow_logical_tail=allow_native_logical_tail,
     )
     if fc1_cta_threads != fc2_cta_threads:
@@ -5005,6 +5034,7 @@ def compile_w4a16_fused_moe(
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
             scale_format=scale_format,
+            weight_layout=weight_layout,
             allow_logical_tail=allow_native_logical_tail,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
@@ -5017,6 +5047,7 @@ def compile_w4a16_fused_moe(
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
             scale_format=scale_format,
+            weight_layout=weight_layout,
             allow_logical_tail=allow_native_logical_tail,
         )
         if fc1_cta_threads != fc2_cta_threads:
@@ -5065,6 +5096,7 @@ def compile_w4a16_fused_moe(
             cta_threads=256,
             max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
+            weight_layout=weight_layout,
         ):
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
@@ -5095,6 +5127,7 @@ def compile_w4a16_fused_moe(
             cta_threads=256,
             max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
+            weight_layout=weight_layout,
         ):
             fc2_tile_n = 256
             fc2_tile_k = wide_fc2_tile_k
@@ -5139,6 +5172,7 @@ def compile_w4a16_fused_moe(
             tile_n=512,
             tile_k=ultra_fc2_tile_k,
             scale_format=scale_format,
+            weight_layout=weight_layout,
         )
         if (
             int(intermediate_size) % ultra_fc2_tile_k == 0
@@ -5177,6 +5211,7 @@ def compile_w4a16_fused_moe(
                 cta_threads=fc1_cta_threads,
                 max_shared_mem=int(max_shared_mem) - 512,
                 scale_format=scale_format,
+                weight_layout=weight_layout,
                 allow_logical_tail=allow_native_logical_tail,
             ):
                 raise ValueError(
