@@ -2047,6 +2047,12 @@ class MoEDynamicKernelBackend:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # The phase boundaries below use a software grid barrier.  A
+            # regular launch can admit only part of the grid while auxiliary
+            # stream work occupies the remaining SMs, leaving resident CTAs
+            # spinning and the unscheduled CTAs unable to arrive.  Cooperative
+            # launch makes the all-CTA residency contract explicit.
+            cooperative=True,
             stream=stream,
         )
         if cutlass.const_expr(self.external_materialized_fc1):
@@ -2152,7 +2158,9 @@ class MoEDynamicKernelBackend:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        # Keep the predicate in DSL IR; a Python conditional would try to
+        # convert the dynamic device value to a host bool during compilation.
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)

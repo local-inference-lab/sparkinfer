@@ -601,6 +601,67 @@ def test_w4a8_mx_dynamic_graph_replay_tracks_routing_updates() -> None:
         assert replay_eager_cos > 0.9999, (round_idx, replay_eager_cos)
 
 
+def test_w4a8_mx_m9_graph_replay_with_aux_stream_work() -> None:
+    """The M=9 two-CTA/SM grid must remain valid beside aux-stream work.
+
+    Dynamic MoE synchronizes all CTAs between routing and compute phases.  At
+    M=9 the W4A8 dispatcher uses the full two-CTA-per-SM resident grid (376
+    CTAs on RTX 6000 Pro Blackwell), which requires a cooperative launch when
+    shared-expert work is active on another stream.
+    """
+    _skip_if_unavailable()
+    from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
+    from tests.helpers import make_tp_moe_fp4_binding
+
+    clear_tp_moe_caches()
+    device = torch.device("cuda")
+    m = 9
+    weights = _weights(seed=91)
+    prepared = _prepare(weights)
+    x, topk_ids, topk_weights = _routed_inputs(m, 92)
+    output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
+    binding = make_tp_moe_fp4_binding(
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights.contiguous(),
+        topk_ids=topk_ids.contiguous(),
+        output=output,
+        input_scales_static=True,
+        quant_mode="w4a8_mx",
+    )
+
+    def _launch() -> None:
+        b12x_moe_fp4(binding=binding)
+
+    _launch()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        _launch()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    # Queue enough independent GEMM work to keep the auxiliary stream active
+    # while the graph reaches the resident-grid kernel.
+    aux_stream = torch.cuda.Stream()
+    aux_a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+    aux_b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+    aux_out = torch.empty_like(aux_a)
+    output.zero_()
+    with torch.cuda.stream(aux_stream):
+        for _ in range(16):
+            torch.mm(aux_a, aux_b, out=aux_out)
+    graph.replay()
+    torch.cuda.current_stream().wait_stream(aux_stream)
+    torch.cuda.synchronize()
+
+    assert output.isfinite().all()
+    assert output.abs().sum().item() > 0
+
+
 def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     """GLM per-rank shard geometry: E=16, K=4096, n=256 (FC1 N=512, FC2
     N=4096 with K=256) through unified dynamic, gated vs the oracle."""
