@@ -743,6 +743,11 @@ def _resolve_indexer_paged_route(
 ) -> tuple[str, int | None]:
     route = str(caps.route)
     prefill_block_k: int | None = None
+    device = torch.device(caps.device)
+    compute_capability: tuple[int, int] | None = None
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        compute_capability = (int(props.major), int(props.minor))
     if route == INDEXER_PAGED_ROUTE_AUTO:
         if bool(caps.shared_page_table) or str(caps.mode) == "prefill":
             route = INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS
@@ -759,6 +764,7 @@ def _resolve_indexer_paged_route(
                         num_rows=int(caps.max_q_rows),
                         width=int(width),
                         num_heads=int(caps.num_q_heads),
+                        compute_capability=compute_capability,
                     )
                     and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
                 ):
@@ -795,6 +801,7 @@ def _resolve_indexer_paged_route(
                 num_rows=int(caps.max_q_rows),
                 width=int(width),
                 num_heads=int(caps.num_q_heads),
+                compute_capability=compute_capability,
             )
             and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
         ):

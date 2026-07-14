@@ -45,6 +45,7 @@ def test_w4a8_mx_dynamic_tile_density_boundaries(
         "w4a8_mx",
         num_experts=_E,
         activation="silu",
+        compute_capability=(12, 0),
     ) == (expected_tile_m, 128)
 
 
@@ -77,7 +78,42 @@ def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
         "w4a8_mx",
         num_experts=256,
         activation="silu",
+        compute_capability=(12, 0),
     ) == (16, 128)
+
+
+@pytest.mark.parametrize("m", [1024, 4096, 8192, 16384])
+def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
+    monkeypatch, m: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        m * 6,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+        compute_capability=(12, 1),
+    ) == (32, 128)
+
+
+@pytest.mark.parametrize("m", [4096, 8192, 16384])
+def test_w4a8_mx_ds4_tp2_sm120_prefill_keeps_coarse_tactic(
+    monkeypatch, m: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        m * 6,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+        compute_capability=(12, 0),
+    ) == (64, 128)
 
 
 def _skip_if_unavailable() -> None:

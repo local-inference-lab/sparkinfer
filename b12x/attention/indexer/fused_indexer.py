@@ -105,12 +105,12 @@ KV_LAYOUT_PAGED = 1
 # Route metadata is capture-static; live seqlen is deliberately not a policy input,
 # so vLLM graph replay cannot switch backends.  The generic policy retains its
 # measured small-row limit.  C4's heads=64/topk=512 and GLM's heads=32/topk=2048
-# shapes are materially different: production-shape, L2-flushed SM120 measurements
-# show fused winning for every B1-B64 decode bucket.  GLM was measured at 8K, 16K,
-# 32K, and 131K capacity; C4 at 4K, 8K, 16K, and 266K capacity.
+# shapes are materially different. GLM was measured at 8K, 16K, 32K, and 131K
+# capacity. C4 keeps the tiled route on RTX-class SM120, while GB10/SM121 uses
+# fused through B16 based on L2-flushed DSV4F measurements.
 # Prefill remains packed-contiguous and never reaches this decode-only resolver.
 FUSED_MAX_ROWS = 6
-_C4_FUSED_MAX_ROWS = 64
+_C4_SM121_FUSED_MAX_ROWS = 16
 # GLM re-measured after the two-level tiled fold landed: fused keeps rows 1-16
 # (wins/ties at 8K, dominant at 32K-131K, e.g. r1@131K 41us vs 90us tiled) but
 # loses rows 32-64 everywhere (r64@131K 1541us vs 1043us tiled, r64@8K 100 vs
@@ -417,30 +417,46 @@ def resolve_fused_indexer_path(
     num_rows: int,
     width: int,
     num_heads: int | None = None,
+    compute_capability: tuple[int, int] | None = None,
 ) -> bool:
     """Route to the fused kernel only for small decode batches (rows <= N).
 
     Row count, head count, top-k, and width here are all capture-time workspace
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
-    rows. C4's 64-head/top-k-512 shape is owned by the streamed tiled route
-    (see the branch below); GLM's 32-head/top-k-2048 shape uses fused through
-    B16 and the streamed tiled route beyond, based on capture-static
-    serving-shape measurements. Prefill is selected before this decode-only
-    resolver and remains packed-contiguous.
+    rows. C4's 64-head/top-k-512 shape uses the streamed tiled route on SM120
+    and fused through B16 on SM121. GLM's 32-head/top-k-2048 shape uses fused
+    through B16 and the streamed tiled route beyond. Prefill is selected before
+    this decode-only resolver and remains packed-contiguous.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
     if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
-        # C4 (DSV4, heads=64/topk=512): the streamed tiled route + two-level
-        # fold retired fused here -- it wins or ties at rows <= 8 across the
-        # measured range and at rows 64 everywhere, leaving fused ahead only
-        # at rows 16 long-K (not enough to keep two production kernels).
-        # GLM's shape below keeps its own measured policy until re-swept.
-        return False
+        # C4 (DSV4, heads=64/topk=512): RTX-class SM120 keeps the streamed
+        # tiled route. GB10's much smaller SM count and memory bandwidth favor
+        # the single-launch fused path through the measured B16 decode bucket.
+        return (
+            compute_capability == (12, 1)
+            and int(num_rows) <= _C4_SM121_FUSED_MAX_ROWS
+        )
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
         return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
     return int(num_rows) <= FUSED_MAX_ROWS
+
+
+def fused_indexer_scratch_max_rows(
+    *,
+    topk: int,
+    num_heads: int,
+    compute_capability: tuple[int, int] | None = None,
+) -> int:
+    """Return the fixed row capacity needed by fused decode scratch."""
+
+    if int(topk) == 512 and int(num_heads) == 64 and compute_capability == (12, 1):
+        return _C4_SM121_FUSED_MAX_ROWS
+    if int(topk) == 2048 and int(num_heads) == 32:
+        return _GLM32_FUSED_MAX_ROWS
+    return FUSED_MAX_ROWS
 
 
 def _resolve_default_ctas_per_group(
@@ -500,10 +516,17 @@ def fused_indexer_decode_warmup_rows(
     while preserving the planner's one-machine-wave launch bound. Callers can
     launch these shapes before graph capture to populate every runtime variant.
     """
-    if int(topk) == 2048 and int(num_heads) == 32:
-        max_rows = _GLM32_FUSED_MAX_ROWS
-    else:
-        max_rows = FUSED_MAX_ROWS
+    props = torch.cuda.get_device_properties(device)
+    compute_capability = (
+        (int(props.major), int(props.minor))
+        if hasattr(props, "major") and hasattr(props, "minor")
+        else None
+    )
+    max_rows = fused_indexer_scratch_max_rows(
+        topk=int(topk),
+        num_heads=int(num_heads),
+        compute_capability=compute_capability,
+    )
 
     width = int(max_pages) * _PAGE_SIZE
     rows_by_policy: list[int] = []
@@ -514,6 +537,7 @@ def fused_indexer_decode_warmup_rows(
             num_rows=rows,
             width=width,
             num_heads=int(num_heads),
+            compute_capability=compute_capability,
         ):
             continue
         ctas_per_group = _resolve_default_ctas_per_group(

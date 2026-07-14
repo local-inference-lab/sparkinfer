@@ -951,6 +951,7 @@ def _b12x_mhc_post_pre_impl(
         # Gram + RMSNorm are skipped when there is no fused norm_weight.
         from b12x.integration.residual_kernels import (
             run_mhc_finalize_gram,
+            _selected_post_pre_decode_split_n,
             run_mhc_post_pre_functional,
             run_mhc_post_pre_partial,
             run_mhc_post_pre_prefill_block_m_partial,
@@ -1007,6 +1008,17 @@ def _b12x_mhc_post_pre_impl(
             and policy_m >= prefill_min_tokens
             and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
         )
+        decode_source_splits = 0
+        if not (
+            use_prefill_tf32_mma
+            or use_prefill_bf16_mma
+            or use_prefill_block_m
+            or use_prefill_compact
+        ):
+            decode_source_splits, _ = _selected_post_pre_decode_split_n(
+                num_tokens=tokens,
+                hidden_size=hidden_size,
+            )
         if use_prefill_tf32_mma:
             run_mhc_post_pre_prefill_gram(
                 x=x,
@@ -1097,6 +1109,7 @@ def _b12x_mhc_post_pre_impl(
                 if use_prefill_tf32_mma
                 else 1
             ),
+            active_source_splits=decode_source_splits,
         )
         return residual_out, post_out, comb_out, y_out
 

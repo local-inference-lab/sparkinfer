@@ -4,6 +4,95 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
+def test_mhc_decode_split_n_environment_override(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.setenv("B12X_MHC_DECODE_SPLITS", "4")
+    monkeypatch.setenv("B12X_MHC_DECODE_TILE_N", "3")
+    assert residual_kernels._selected_post_pre_decode_split_n(
+        num_tokens=16,
+        hidden_size=4096,
+        compute_capability=(12, 1),
+    ) == (4, 3)
+
+
+def test_mhc_sm121_decode_split_n_policy(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_DECODE_SPLITS", raising=False)
+    monkeypatch.delenv("B12X_MHC_DECODE_TILE_N", raising=False)
+    select = residual_kernels._selected_post_pre_decode_split_n
+
+    assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == (0, 0)
+    assert select(num_tokens=8, hidden_size=4096, compute_capability=(12, 1)) == (4, 6)
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == (8, 6)
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == (0, 0)
+    assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == (0, 0)
+
+
+def test_mhc_decode_finalize_threads_environment_override(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.setenv("B12X_MHC_DECODE_FINALIZE_THREADS", "128")
+    assert (
+        residual_kernels._selected_mhc_decode_finalize_threads(
+            num_tokens=16,
+            hidden_size=4096,
+            compute_capability=(12, 1),
+        )
+        == 128
+    )
+
+
+def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_DECODE_FINALIZE_THREADS", raising=False)
+    select = residual_kernels._selected_mhc_decode_finalize_threads
+
+    assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == 0
+    assert select(num_tokens=8, hidden_size=4096, compute_capability=(12, 1)) == 512
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == 1024
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == 0
+    assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 0
+
+
+def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+    select = residual_kernels._selected_post_pre_partials_per_cta
+
+    assert select(num_tokens=2, hidden_size=4096, compute_capability=(12, 1)) == 4
+    assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == 9
+    assert select(num_tokens=8, hidden_size=4096, compute_capability=(12, 1)) == 25
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == 25
+
+
+def test_mhc_decode_partial_group_policy_preserves_sm120(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+    select = residual_kernels._selected_post_pre_partials_per_cta
+
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == 4
+    assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 4
+
+
+def test_mhc_decode_partial_group_environment_override(monkeypatch) -> None:
+    from b12x.integration import residual_kernels
+
+    monkeypatch.setenv("B12X_MHC_PARTIALS_PER_CTA", "7")
+    assert (
+        residual_kernels._selected_post_pre_partials_per_cta(
+            num_tokens=16,
+            hidden_size=4096,
+            compute_capability=(12, 1),
+        )
+        == 7
+    )
+
+
 def test_dense_gemm_launch_has_fake_dispatch() -> None:
     __import__("b12x.gemm.dense")
 
@@ -43,7 +132,9 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             1,
             False,
+            False,
             "tma",
+            False,
             False,
             None,
         )
@@ -75,7 +166,9 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             1,
             False,
+            False,
             "tma",
+            False,
             False,
             123,
         )
@@ -125,6 +218,8 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             1e-6,
             True,
             False,
+            1,
+            0,
         )
 
 
@@ -174,6 +269,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             task,
             task,
             task,
+            task,
             row_counts,
             row_counts,
             row_counts,
@@ -189,6 +285,10 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             alpha,
             w1_storage,
             w2_storage,
+            w13,
+            w13_sf,
+            down,
+            down_sf,
             alpha,
             alpha,
             a,
@@ -209,6 +309,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             True,
             "silu",
             "nvfp4",
+            False,
             False,
             False,
             None,

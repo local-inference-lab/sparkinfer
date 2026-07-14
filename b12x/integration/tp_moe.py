@@ -119,6 +119,21 @@ _W13_LAYOUTS = {
     "gate_up": "w31",
 }
 
+_DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _current_compute_capability() -> tuple[int, int] | None:
+    """Return the active CUDA device capability without repeated driver queries."""
+
+    if not torch.cuda.is_available():
+        return None
+    device_index = torch.cuda.current_device()
+    capability = _DEVICE_CAPABILITY_CACHE.get(device_index)
+    if capability is None:
+        capability = tuple(torch.cuda.get_device_capability(device_index))
+        _DEVICE_CAPABILITY_CACHE[device_index] = capability
+    return capability
+
 
 @dataclass(kw_only=True)
 class TPMoEWorkspace:
@@ -1352,6 +1367,7 @@ def _select_dynamic_tile_mn(
     *,
     num_experts: int,
     activation: str = "silu",
+    compute_capability: tuple[int, int] | None = None,
 ) -> Tuple[int, int]:
     """Tile planner for the dynamic kernel.
 
@@ -1373,6 +1389,8 @@ def _select_dynamic_tile_mn(
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
     if _is_w4a8_quant_mode(quant_mode):
+        if compute_capability is None:
+            compute_capability = _current_compute_capability()
         # DSV4-Flash TP2 speculative-verify band.  Like the CUTLASS tactic
         # selector, this is keyed only by the static workload shape and routed
         # row count; live expert counts still come from the device histogram.
@@ -1384,6 +1402,20 @@ def _select_dynamic_tile_mn(
             and num_experts == 256
             and int(n) == 1024
             and 384 <= routed_rows <= 2304
+        ):
+            return (32, _LEVEL_TILE_N)
+        # GB10 has only 48 SMs and substantially less memory bandwidth than
+        # desktop SM120 parts.  Its fused M32 specialization keeps FC1/FC2 in
+        # one persistent kernel and wins through the measured DSV4 TP2 prefill
+        # band; the M64/M128 tactics split routing, FC1, and FC2 into three
+        # launches and lose 16--36% here.  Keep the SM120 crossover unchanged.
+        if (
+            compute_capability == (12, 1)
+            and quant_mode == "w4a8_mx"
+            and activation == "silu"
+            and num_experts == 256
+            and int(n) == 1024
+            and 2304 < routed_rows <= 384 * num_experts
         ):
             return (32, _LEVEL_TILE_N)
         # W4A8 uses M16/M32 for sparse decode and the split M64 compute path
