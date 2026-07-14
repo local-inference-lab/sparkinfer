@@ -23,6 +23,34 @@ from .compressed_reference import (
 
 
 _LN2 = math.log(2.0)
+
+
+def _should_use_sm121_single_pass_decode(
+    *,
+    rows: int,
+    heads: int,
+    swa_width: int,
+    indexed_width: int,
+    swa_page_size: int,
+    indexed_page_size: int | None,
+    compute_capability: tuple[int, int] | None = None,
+) -> bool:
+    """Select the 32-head final-output kernel for Spark's one-wave decode."""
+
+    if compute_capability is None:
+        if not torch.cuda.is_available():
+            return False
+        compute_capability = tuple(torch.cuda.get_device_capability())
+    if compute_capability != (12, 1):
+        return False
+    if rows < 16 or heads != 32 or int(swa_page_size) != 64:
+        return False
+    if indexed_width and int(indexed_page_size or 0) != 64:
+        return False
+    chunks = (int(swa_width) + 63) // 64 + (int(indexed_width) + 63) // 64
+    return chunks <= 10
+
+
 def compressed_mla_decode_forward(
     *,
     q_all: torch.Tensor | None = None,
@@ -176,6 +204,32 @@ def compressed_mla_decode_forward(
         _validate_compressed_mla_out(out, q3=q3)
 
     if scratch.mode in ("extend", "verify", "draft_extend"):
+        return _run_sm120_compressed_prefill(
+            q3=q3,
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices_2d,
+            swa_topk_lengths=swa_topk_lengths,
+            workspace=scratch,
+            sm_scale=sm_scale,
+            swa_page_size=swa_page_size,
+            indexed_k_cache=indexed_k_cache if has_indexed else None,
+            indexed_indices=indexed_indices_2d,
+            indexed_topk_lengths=indexed_topk_lengths if has_indexed else None,
+            indexed_page_size=indexed_page_size if has_indexed else None,
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
+            out=out,
+        )
+
+    if _should_use_sm121_single_pass_decode(
+        rows=rows,
+        heads=heads,
+        swa_width=int(swa_indices_2d.shape[1]),
+        indexed_width=(int(indexed_indices_2d.shape[1]) if has_indexed else 0),
+        swa_page_size=int(swa_page_size),
+        indexed_page_size=(int(indexed_page_size) if has_indexed else None),
+    ):
         return _run_sm120_compressed_prefill(
             q3=q3,
             swa_k_cache=swa_k_cache,

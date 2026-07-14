@@ -19,6 +19,7 @@ from b12x.attention.indexer.fused_indexer import (
     _DSV4_BATCH_SLACK,
     _resolve_fused_batch_slack,
     fused_indexer_decode_warmup_rows,
+    fused_indexer_scratch_max_rows,
     fused_indexer_scratch_capacity,
     resolve_fused_indexer_path,
     run_fused_paged_indexer,
@@ -131,6 +132,35 @@ def test_fused_indexer_route_stops_after_c4_decode_buckets():
         width=4160 * 64,
         num_heads=64,
     )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_fused_indexer_route_covers_sm121_c4_decode_buckets(rows):
+    assert resolve_fused_indexer_path(
+        topk=512,
+        num_rows=rows,
+        width=1024 * 64,
+        num_heads=64,
+        compute_capability=(12, 1),
+    )
+
+
+def test_fused_indexer_route_stops_after_sm121_c4_decode_buckets():
+    assert not resolve_fused_indexer_path(
+        topk=512,
+        num_rows=32,
+        width=1024 * 64,
+        num_heads=64,
+        compute_capability=(12, 1),
+    )
+
+
+def test_fused_indexer_scratch_rows_cover_sm121_c4_policy():
+    assert fused_indexer_scratch_max_rows(
+        topk=512,
+        num_heads=64,
+        compute_capability=(12, 1),
+    ) == 16
 
 
 def _build_case(rows, heads, seqlen, topk, *, seed, device):

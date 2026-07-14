@@ -404,14 +404,108 @@ def _validate_post_pre_partials_per_cta(partials_per_cta: int) -> int:
     return partials_per_cta
 
 
-def _selected_post_pre_partials_per_cta() -> int:
+def _selected_post_pre_decode_split_n(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    compute_capability: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    raw_splits = os.environ.get("B12X_MHC_DECODE_SPLITS")
+    if raw_splits is not None and raw_splits != "":
+        try:
+            splits = int(raw_splits)
+            tile_n = int(os.environ.get("B12X_MHC_DECODE_TILE_N", "3"))
+        except ValueError as exc:
+            raise ValueError(
+                "B12X_MHC_DECODE_SPLITS and B12X_MHC_DECODE_TILE_N must be integers"
+            ) from exc
+        if splits == 0:
+            return 0, 0
+    else:
+        if compute_capability is None and torch.cuda.is_available():
+            compute_capability = tuple(torch.cuda.get_device_capability())
+        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
+            return 0, 0
+        if int(num_tokens) >= 16:
+            splits, tile_n = 8, 6
+        elif int(num_tokens) >= 8:
+            splits, tile_n = 4, 6
+        else:
+            return 0, 0
+    if splits <= 0 or splits > _SOURCE_TILES or int(hidden_size) % splits != 0:
+        raise ValueError(
+            "B12X_MHC_DECODE_SPLITS must be a positive divisor of hidden_size "
+            f"no larger than {_SOURCE_TILES}, got {splits}"
+        )
+    if tile_n <= 0 or _MIXES % tile_n != 0:
+        raise ValueError(
+            f"B12X_MHC_DECODE_TILE_N must divide {_MIXES}, got {tile_n}"
+        )
+    return splits, tile_n
+
+
+def _selected_mhc_decode_finalize_threads(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    compute_capability: tuple[int, int] | None = None,
+) -> int:
+    raw = os.environ.get("B12X_MHC_DECODE_FINALIZE_THREADS")
+    if raw is not None and raw != "":
+        try:
+            threads = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid B12X_MHC_DECODE_FINALIZE_THREADS={raw!r}"
+            ) from exc
+    else:
+        if compute_capability is None and torch.cuda.is_available():
+            compute_capability = tuple(torch.cuda.get_device_capability())
+        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
+            return 0
+        if int(num_tokens) >= 16:
+            threads = 1024
+        elif int(num_tokens) >= 8:
+            threads = 512
+        else:
+            return 0
+    if threads == 0:
+        return 0
+    if (
+        threads <= 0
+        or threads > 1024
+        or threads % 32 != 0
+        or int(hidden_size) % (2 * threads) != 0
+    ):
+        raise ValueError(
+            "B12X_MHC_DECODE_FINALIZE_THREADS must be a positive multiple of "
+            "32 that evenly vectorizes hidden_size, got "
+            f"threads={threads}, hidden_size={hidden_size}"
+        )
+    return threads
+
+
+def _selected_post_pre_partials_per_cta(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    compute_capability: tuple[int, int] | None = None,
+) -> int:
     raw = os.environ.get("B12X_MHC_PARTIALS_PER_CTA")
-    if raw is None or raw == "":
-        return _POST_PRE_PARTIALS_PER_CTA
-    try:
-        return _validate_post_pre_partials_per_cta(int(raw))
-    except ValueError as exc:
-        raise ValueError(f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}") from exc
+    if raw is not None and raw != "":
+        try:
+            return _validate_post_pre_partials_per_cta(int(raw))
+        except ValueError as exc:
+            raise ValueError(f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}") from exc
+
+    if compute_capability is None and torch.cuda.is_available():
+        compute_capability = tuple(torch.cuda.get_device_capability())
+    if compute_capability == (12, 1) and int(hidden_size) == _HIDDEN:
+        if int(num_tokens) >= 8:
+            return 25
+        if int(num_tokens) >= 4:
+            return 9
+    return _POST_PRE_PARTIALS_PER_CTA
 
 
 @lru_cache(maxsize=16)
@@ -439,6 +533,39 @@ def _post_pre_partial_group_storage_cls(
         ]
     PostPrePartialGroupStorage.__annotations__ = annotations
     return cute.struct(PostPrePartialGroupStorage)
+
+
+@lru_cache(maxsize=16)
+def _post_pre_decode_split_n_storage_cls(
+    tile_n: int,
+    compute_gram: bool = False,
+):
+    nwarps = 256 // 32
+
+    class PostPreDecodeSplitNStorage:
+        pass
+
+    annotations = {
+        "warp_sums": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, (tile_n + 1) * nwarps],
+            16,
+        ],
+        "post": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _MHC_MULT],
+            16,
+        ],
+        "comb": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _MHC_MULT * _MHC_MULT],
+            16,
+        ],
+    }
+    if compute_gram:
+        annotations["gram_sums"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _GRAM_PAIRS * nwarps],
+            16,
+        ]
+    PostPreDecodeSplitNStorage.__annotations__ = annotations
+    return cute.struct(PostPreDecodeSplitNStorage)
 
 
 @lru_cache(maxsize=4)
@@ -534,6 +661,31 @@ def _post_pre_prefill_block_m_storage_cls(
 def _warp_allreduce_sum(value: Float32) -> Float32:
     for shift in cutlass.range_constexpr(5):
         value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=1 << shift))
+    return value
+
+
+@cute.jit
+def _warp_quad_allreduce_sum(value: Float32) -> Float32:
+    value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=1))
+    value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=2))
+    return value
+
+
+@cute.jit
+def _warp_quad_allreduce_max(value: Float32) -> Float32:
+    peer = Float32(cute.arch.shuffle_sync_bfly(value, offset=1))
+    if peer > value:
+        value = peer
+    peer = Float32(cute.arch.shuffle_sync_bfly(value, offset=2))
+    if peer > value:
+        value = peer
+    return value
+
+
+@cute.jit
+def _warp_column4_allreduce_sum(value: Float32) -> Float32:
+    value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=4))
+    value = Float32(value + cute.arch.shuffle_sync_bfly(value, offset=8))
     return value
 
 
@@ -777,6 +929,279 @@ class MHCPostPrePartialKernel:
                                 gtotal += Float32(gram_sums[gp, src_warp])
                                 src_warp += Int32(1)
                             partials[token, Int32(self.gram_row0) + hidden_tile, gp] = gtotal
+
+        if const_expr(_MHC_PDL):
+            cute.arch.sync_threads()
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+class MHCPostPreDecodeSplitNPartialKernel:
+    """Fused decode partial using split hidden slices and narrow output tiles."""
+
+    num_threads = 256
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = _HIDDEN,
+        split_k: int | None = None,
+        source_splits: int = 4,
+        tile_n: int = 3,
+        compute_gram: bool = False,
+    ):
+        self.hidden_size = int(hidden_size)
+        self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
+        self.split_k = (
+            _split_k_for_hidden(self.hidden_size)
+            if split_k is None
+            else int(split_k)
+        )
+        _validate_split_k(self.hidden_size, self.split_k)
+        self.source_splits = int(source_splits)
+        if (
+            self.source_splits <= 0
+            or self.source_splits > self.source_tiles
+            or self.hidden_size % self.source_splits != 0
+        ):
+            raise ValueError(f"invalid decode source_splits={self.source_splits}")
+        self.hidden_per_split = self.hidden_size // self.source_splits
+        if self.hidden_per_split % self.num_threads != 0:
+            raise ValueError(
+                f"hidden_size/source_splits={self.hidden_per_split} must be "
+                f"divisible by {self.num_threads} threads"
+            )
+        self.hidden_iters = self.hidden_per_split // self.num_threads
+        self.tile_n = int(tile_n)
+        if self.tile_n <= 0 or _MIXES % self.tile_n != 0:
+            raise ValueError(f"decode tile_n must divide {_MIXES}, got {self.tile_n}")
+        self.n_tiles = _MIXES // self.tile_n
+        self.compute_gram = bool(compute_gram)
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        residual: cute.Tensor,
+        prev_post: cute.Tensor,
+        prev_comb: cute.Tensor,
+        fn: cute.Tensor,
+        partials: cute.Tensor,
+        out: cute.Tensor,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        if const_expr(x.element_type != cutlass.BFloat16):
+            raise TypeError("x must be BFloat16")
+        if const_expr(residual.element_type != cutlass.BFloat16):
+            raise TypeError("residual must be BFloat16")
+        if const_expr(prev_post.element_type != cutlass.Float32):
+            raise TypeError("prev_post must be Float32")
+        if const_expr(prev_comb.element_type != cutlass.Float32):
+            raise TypeError("prev_comb must be Float32")
+        if const_expr(fn.element_type != cutlass.Float32):
+            raise TypeError("fn must be Float32")
+        if const_expr(partials.element_type != cutlass.Float32):
+            raise TypeError("partials must be Float32")
+        if const_expr(out.element_type != cutlass.BFloat16):
+            raise TypeError("out must be BFloat16")
+        self.kernel(x, residual, prev_post, prev_comb, fn, partials, out).launch(
+            grid=(num_tokens, self.n_tiles, self.source_splits),
+            block=[self.num_threads, 1, 1],
+            min_blocks_per_mp=3,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        residual: cute.Tensor,
+        prev_post: cute.Tensor,
+        prev_comb: cute.Tensor,
+        fn: cute.Tensor,
+        partials: cute.Tensor,
+        out: cute.Tensor,
+    ):
+        token, n_tile, source_split = cute.arch.block_idx()
+        tidx = Int32(cute.arch.thread_idx()[0])
+        lane = tidx % Int32(32)
+        warp_idx = tidx // Int32(32)
+        nwarps = self.num_threads // 32
+        mix0 = n_tile * Int32(self.tile_n)
+
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(
+            _post_pre_decode_split_n_storage_cls(
+                self.tile_n,
+                self.compute_gram,
+            )
+        )
+        warp_sums = storage.warp_sums.get_tensor(
+            cute.make_layout(
+                (self.tile_n + 1, nwarps), stride=(nwarps, 1)
+            )
+        )
+        s_post = storage.post.get_tensor(
+            cute.make_layout((_MHC_MULT,), stride=(1,))
+        )
+        s_comb = storage.comb.get_tensor(
+            cute.make_layout((_MHC_MULT, _MHC_MULT), stride=(_MHC_MULT, 1))
+        )
+        if const_expr(self.compute_gram):
+            gram_sums = storage.gram_sums.get_tensor(
+                cute.make_layout((_GRAM_PAIRS, nwarps), stride=(nwarps, 1))
+            )
+
+        if tidx < Int32(_MHC_MULT):
+            s_post[tidx] = Float32(prev_post[token, tidx])
+        if tidx < Int32(_MHC_MULT * _MHC_MULT):
+            row = tidx // Int32(_MHC_MULT)
+            col = tidx - row * Int32(_MHC_MULT)
+            s_comb[row, col] = Float32(prev_comb[token, row, col])
+
+        cute.arch.sync_threads()
+
+        pm = cute.make_rmem_tensor(
+            cute.make_layout((_MHC_MULT,), stride=(1,)), Float32
+        )
+        cm = cute.make_rmem_tensor(
+            cute.make_layout(
+                (_MHC_MULT, _MHC_MULT), stride=(_MHC_MULT, 1)
+            ),
+            Float32,
+        )
+        for j in cutlass.range_constexpr(_MHC_MULT):
+            pm[j] = Float32(s_post[j])
+            for k in cutlass.range_constexpr(_MHC_MULT):
+                cm[k, j] = Float32(s_comb[k, j])
+
+        acc = cute.make_rmem_tensor(
+            cute.make_layout((self.tile_n,), stride=(1,)), Float32
+        )
+        for ni in cutlass.range_constexpr(self.tile_n):
+            acc[ni] = Float32(0.0)
+        sqr = Float32(0.0)
+        if const_expr(self.compute_gram):
+            gvals = cute.make_rmem_tensor(
+                cute.make_layout((_GRAM_PAIRS,), stride=(1,)), Float32
+            )
+            for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                gvals[gp] = Float32(0.0)
+
+        h_split0 = source_split * Int32(self.hidden_per_split)
+        for hidden_iter in cutlass.range_constexpr(self.hidden_iters):
+            h = h_split0 + Int32(hidden_iter * self.num_threads) + tidx
+            xh = Float32(x[token, h])
+            rin0 = Float32(residual[token, Int32(0), h])
+            rin1 = Float32(residual[token, Int32(1), h])
+            rin2 = Float32(residual[token, Int32(2), h])
+            rin3 = Float32(residual[token, Int32(3), h])
+            o0 = (
+                pm[0] * xh
+                + cm[0, 0] * rin0
+                + cm[1, 0] * rin1
+                + cm[2, 0] * rin2
+                + cm[3, 0] * rin3
+            ).to(cutlass.BFloat16)
+            o1 = (
+                pm[1] * xh
+                + cm[0, 1] * rin0
+                + cm[1, 1] * rin1
+                + cm[2, 1] * rin2
+                + cm[3, 1] * rin3
+            ).to(cutlass.BFloat16)
+            o2 = (
+                pm[2] * xh
+                + cm[0, 2] * rin0
+                + cm[1, 2] * rin1
+                + cm[2, 2] * rin2
+                + cm[3, 2] * rin3
+            ).to(cutlass.BFloat16)
+            o3 = (
+                pm[3] * xh
+                + cm[0, 3] * rin0
+                + cm[1, 3] * rin1
+                + cm[2, 3] * rin2
+                + cm[3, 3] * rin3
+            ).to(cutlass.BFloat16)
+            r0 = Float32(o0)
+            r1 = Float32(o1)
+            r2 = Float32(o2)
+            r3 = Float32(o3)
+
+            if n_tile == Int32(0):
+                out[token, Int32(0), h] = o0
+                out[token, Int32(1), h] = o1
+                out[token, Int32(2), h] = o2
+                out[token, Int32(3), h] = o3
+                sqr += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+                if const_expr(self.compute_gram):
+                    gvals[0] += r0 * r0
+                    gvals[1] += r1 * r1
+                    gvals[2] += r2 * r2
+                    gvals[3] += r3 * r3
+                    gvals[4] += r0 * r1
+                    gvals[5] += r0 * r2
+                    gvals[6] += r0 * r3
+                    gvals[7] += r1 * r2
+                    gvals[8] += r1 * r3
+                    gvals[9] += r2 * r3
+
+            for ni in cutlass.range_constexpr(self.tile_n):
+                mix = mix0 + Int32(ni)
+                acc[ni] += (
+                    Float32(fn[mix, h]) * r0
+                    + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
+                    + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
+                    + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
+                )
+
+        for ni in cutlass.range_constexpr(self.tile_n):
+            acc[ni] = _warp_allreduce_sum(acc[ni])
+        if n_tile == Int32(0):
+            sqr = _warp_allreduce_sum(sqr)
+            if const_expr(self.compute_gram):
+                for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                    gvals[gp] = _warp_allreduce_sum(gvals[gp])
+
+        if lane == Int32(0):
+            for ni in cutlass.range_constexpr(self.tile_n):
+                warp_sums[ni, warp_idx] = acc[ni]
+            if n_tile == Int32(0):
+                warp_sums[self.tile_n, warp_idx] = sqr
+                if const_expr(self.compute_gram):
+                    for gp in cutlass.range_constexpr(_GRAM_PAIRS):
+                        gram_sums[gp, warp_idx] = gvals[gp]
+        cute.arch.sync_threads()
+
+        if warp_idx == Int32(0):
+            if lane < Int32(self.tile_n):
+                total = Float32(0.0)
+                src_warp = Int32(0)
+                while src_warp < Int32(nwarps):
+                    total += Float32(warp_sums[lane, src_warp])
+                    src_warp += Int32(1)
+                partials[token, source_split, mix0 + lane + Int32(1)] = total
+            if n_tile == Int32(0):
+                if lane == Int32(0):
+                    total = Float32(0.0)
+                    src_warp = Int32(0)
+                    while src_warp < Int32(nwarps):
+                        total += Float32(warp_sums[self.tile_n, src_warp])
+                        src_warp += Int32(1)
+                    partials[token, source_split, Int32(0)] = total
+                if const_expr(self.compute_gram):
+                    if lane < Int32(_GRAM_PAIRS):
+                        total = Float32(0.0)
+                        src_warp = Int32(0)
+                        while src_warp < Int32(nwarps):
+                            total += Float32(gram_sums[lane, src_warp])
+                            src_warp += Int32(1)
+                        partials[
+                            token,
+                            Int32(self.source_tiles) + source_split,
+                            lane,
+                        ] = total
 
         if const_expr(_MHC_PDL):
             cute.arch.sync_threads()
@@ -2477,10 +2902,17 @@ class MHCFinalizeGramKernel:
         fuse_norm: bool = True,
         compact_partials: bool = False,
         compact_projection_splits: int = 1,
+        single_cta: bool = False,
+        single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
+        active_source_splits: int = 0,
     ):
         self.hidden_size = int(hidden_size)
+        self.single_cta = bool(single_cta)
+        self.single_cta_threads = int(single_cta_threads)
         self.num_threads = (
-            _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H
+            self.single_cta_threads
+            if self.single_cta
+            else (_PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H)
         )
         self.block_h = self.num_threads
         if self.hidden_size % self.block_h != 0:
@@ -2490,7 +2922,18 @@ class MHCFinalizeGramKernel:
             )
         self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
         self.hidden_tiles = self.hidden_size // self.block_h
-        self.source_warps = (self.source_tiles + 31) // 32
+        self.active_source_splits = int(active_source_splits)
+        if self.active_source_splits == 0:
+            self.active_source_splits = self.source_tiles
+        if (
+            self.active_source_splits <= 0
+            or self.active_source_splits > self.source_tiles
+        ):
+            raise ValueError(
+                f"active_source_splits must be in [1, {self.source_tiles}], "
+                f"got {self.active_source_splits}"
+            )
+        self.source_warps = (self.active_source_splits + 31) // 32
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
             _split_k_for_hidden(self.hidden_size)
@@ -2514,15 +2957,26 @@ class MHCFinalizeGramKernel:
             raise ValueError(
                 "compact_projection_splits requires compact_partials=True"
             )
+        if self.compact_partials and self.active_source_splits != self.source_tiles:
+            raise ValueError(
+                "active_source_splits is only valid for standard partial layouts"
+            )
         if self.compact_projection_splits >= self.split_k:
             raise ValueError(
                 "compact_projection_splits must be less than partials split_k"
             )
-        self.tiles_per_cta = self.hidden_tiles if self.compact_partials else 1
-        if self.compact_partials and self.hidden_size % (2 * self.num_threads) != 0:
+        self.tiles_per_cta = (
+            self.hidden_tiles
+            if self.compact_partials or self.single_cta
+            else 1
+        )
+        if (
+            (self.compact_partials or self.single_cta)
+            and self.hidden_size % (2 * self.num_threads) != 0
+        ):
             raise ValueError(
                 f"hidden_size={self.hidden_size} must be divisible by "
-                f"2 * prefill finalize threads={2 * self.num_threads}"
+                f"2 * vectorized finalize threads={2 * self.num_threads}"
             )
 
     @cute.jit
@@ -2581,6 +3035,11 @@ class MHCFinalizeGramKernel:
         storage = smem.allocate(_finalize_storage_cls(self.num_threads, False))
         s_pre = storage.pre.get_tensor(cute.make_layout((_MHC_MULT,), stride=(1,)))
         s_post = storage.post.get_tensor(cute.make_layout((_MHC_MULT,), stride=(1,)))
+        s_comb = storage.comb.get_tensor(
+            cute.make_layout(
+                (_MHC_MULT, _MHC_MULT), stride=(_MHC_MULT, 1)
+            )
+        )
 
         sums = cute.make_rmem_tensor(
             cute.make_layout((self.partials,), stride=(1,)), Float32
@@ -2588,7 +3047,33 @@ class MHCFinalizeGramKernel:
         gram = cute.make_rmem_tensor(
             cute.make_layout((self.gram_pairs,), stride=(1,)), Float32
         )
-        if const_expr(self.compact_partials):
+        if const_expr(self.single_cta):
+            source_values = storage.partials.get_tensor(
+                cute.make_layout((self.num_threads,), stride=(1,))
+            )
+            if tidx < Int32(_PARTIALS):
+                total = Float32(0.0)
+                for source_split in cutlass.range_constexpr(
+                    self.active_source_splits
+                ):
+                    total += Float32(partials[token, source_split, tidx])
+                source_values[tidx] = total
+            if const_expr(self.fuse_norm):
+                if tidx < Int32(_GRAM_PAIRS):
+                    total = Float32(0.0)
+                    for source_split in cutlass.range_constexpr(
+                        self.active_source_splits
+                    ):
+                        total += Float32(
+                            partials[
+                                token,
+                                Int32(self.gram_row0 + source_split),
+                                tidx,
+                            ]
+                        )
+                    source_values[Int32(32) + tidx] = total
+            cute.arch.sync_threads()
+        elif const_expr(self.compact_partials):
             if tidx == Int32(0):
                 for column in cutlass.range_constexpr(_PARTIALS):
                     sums[column] = Float32(partials[token, Int32(0), column])
@@ -2610,13 +3095,13 @@ class MHCFinalizeGramKernel:
             if tidx < Int32(32):
                 for column in cutlass.range_constexpr(_PARTIALS):
                     value = Float32(0.0)
-                    if tidx < Int32(self.source_tiles):
+                    if tidx < Int32(self.active_source_splits):
                         value = Float32(partials[token, tidx, column])
                     sums[column] = _warp_allreduce_sum(value)
                 if const_expr(self.fuse_norm):
                     for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                         gvalue = Float32(0.0)
-                        if tidx < Int32(self.source_tiles):
+                        if tidx < Int32(self.active_source_splits):
                             gvalue = Float32(
                                 partials[token, Int32(_GRAM_ROW0) + tidx, gp]
                             )
@@ -2631,7 +3116,7 @@ class MHCFinalizeGramKernel:
             if tidx < Int32(64):
                 for column in cutlass.range_constexpr(_PARTIALS):
                     value = Float32(0.0)
-                    if source_tile < Int32(self.source_tiles):
+                    if source_tile < Int32(self.active_source_splits):
                         value = Float32(partials[token, source_tile, column])
                     value = _warp_allreduce_sum(value)
                     if lane == Int32(0):
@@ -2639,7 +3124,7 @@ class MHCFinalizeGramKernel:
                 if const_expr(self.fuse_norm):
                     for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                         gvalue = Float32(0.0)
-                        if source_tile < Int32(self.source_tiles):
+                        if source_tile < Int32(self.active_source_splits):
                             gvalue = Float32(
                                 partials[token, Int32(self.gram_row0) + source_tile, gp]
                             )
@@ -2669,7 +3154,7 @@ class MHCFinalizeGramKernel:
             for column in cutlass.range_constexpr(_PARTIALS):
                 value = Float32(0.0)
                 if tidx < source_warp_threads:
-                    if tidx < Int32(self.source_tiles):
+                    if tidx < Int32(self.active_source_splits):
                         value = Float32(partials[token, tidx, column])
                     value = _warp_allreduce_sum(value)
                     if lane == Int32(0):
@@ -2687,7 +3172,7 @@ class MHCFinalizeGramKernel:
                 for gp in cutlass.range_constexpr(_GRAM_PAIRS):
                     gvalue = Float32(0.0)
                     if tidx < source_warp_threads:
-                        if tidx < Int32(self.source_tiles):
+                        if tidx < Int32(self.active_source_splits):
                             gvalue = Float32(
                                 partials[token, Int32(self.gram_row0) + tidx, gp]
                             )
@@ -2704,7 +3189,134 @@ class MHCFinalizeGramKernel:
                         gram[gp] = gtotal
                     cute.arch.sync_threads()
 
-        if tidx == Int32(0):
+        if const_expr(self.single_cta):
+            lane = tidx % Int32(32)
+            if tidx == Int32(0):
+                s_post[0] = cute.math.rsqrt(
+                    Float32(source_values[0]) / Float32(self.total_k)
+                    + Float32(self.rms_eps),
+                    fastmath=True,
+                )
+            cute.arch.sync_threads()
+
+            mix_value = Float32(0.0)
+            one_value = Float32(1.0)
+            value = Float32(0.0)
+            if tidx < Int32(_MIXES):
+                mix_value = Float32(
+                    source_values[tidx + Int32(1)]
+                ) * Float32(s_post[0])
+                if tidx < Int32(4):
+                    value = one_value / (
+                        one_value
+                        + cute.math.exp(
+                            -(mix_value * Float32(scale[0]) + Float32(bias[tidx])),
+                            fastmath=True,
+                        )
+                    ) + Float32(self.hc_eps)
+                    s_pre[tidx] = value
+                elif tidx < Int32(8):
+                    value = Float32(2.0) / (
+                        one_value
+                        + cute.math.exp(
+                            -(mix_value * Float32(scale[1]) + Float32(bias[tidx])),
+                            fastmath=True,
+                        )
+                    )
+                    if tile_group == Int32(0):
+                        post[token, tidx - Int32(4)] = value
+                else:
+                    cidx = tidx - Int32(8)
+                    row = cidx // Int32(4)
+                    col = cidx - row * Int32(4)
+                    s_comb[row, col] = (
+                        mix_value * Float32(scale[2]) + Float32(bias[tidx])
+                    )
+            cute.arch.sync_threads()
+
+            if tidx < Int32(32):
+                cvalue = Float32(0.0)
+                if lane < Int32(16):
+                    row = lane // Int32(4)
+                    col = lane - row * Int32(4)
+                    cvalue = Float32(s_comb[row, col])
+                row_max = _warp_quad_allreduce_max(cvalue)
+                cvalue = cute.math.exp(cvalue - row_max, fastmath=True)
+                row_sum = _warp_quad_allreduce_sum(cvalue)
+                cvalue = (
+                    cvalue * cute.arch.rcp_approx(row_sum)
+                    + Float32(self.hc_eps)
+                )
+                col_sum = (
+                    _warp_column4_allreduce_sum(cvalue) + Float32(self.hc_eps)
+                )
+                cvalue = cvalue * cute.arch.rcp_approx(col_sum)
+                for _ in cutlass.range_constexpr(self.sinkhorn_iters - 1):
+                    row_sum = (
+                        _warp_quad_allreduce_sum(cvalue)
+                        + Float32(self.hc_eps)
+                    )
+                    cvalue = cvalue * cute.arch.rcp_approx(row_sum)
+                    col_sum = (
+                        _warp_column4_allreduce_sum(cvalue)
+                        + Float32(self.hc_eps)
+                    )
+                    cvalue = cvalue * cute.arch.rcp_approx(col_sum)
+
+                if lane < Int32(16):
+                    row = lane // Int32(4)
+                    col = lane - row * Int32(4)
+                    s_comb[row, col] = cvalue
+                    if tile_group == Int32(0):
+                        comb[token, row, col] = cvalue
+
+                if const_expr(self.fuse_norm):
+                    p0 = Float32(s_pre[0])
+                    p1 = Float32(s_pre[1])
+                    p2 = Float32(s_pre[2])
+                    p3 = Float32(s_pre[3])
+                    term = Float32(0.0)
+                    if lane == Int32(0):
+                        term = p0 * p0 * Float32(source_values[Int32(32)])
+                    elif lane == Int32(1):
+                        term = p1 * p1 * Float32(source_values[Int32(33)])
+                    elif lane == Int32(2):
+                        term = p2 * p2 * Float32(source_values[Int32(34)])
+                    elif lane == Int32(3):
+                        term = p3 * p3 * Float32(source_values[Int32(35)])
+                    elif lane == Int32(4):
+                        term = Float32(2.0) * p0 * p1 * Float32(
+                            source_values[Int32(36)]
+                        )
+                    elif lane == Int32(5):
+                        term = Float32(2.0) * p0 * p2 * Float32(
+                            source_values[Int32(37)]
+                        )
+                    elif lane == Int32(6):
+                        term = Float32(2.0) * p0 * p3 * Float32(
+                            source_values[Int32(38)]
+                        )
+                    elif lane == Int32(7):
+                        term = Float32(2.0) * p1 * p2 * Float32(
+                            source_values[Int32(39)]
+                        )
+                    elif lane == Int32(8):
+                        term = Float32(2.0) * p1 * p3 * Float32(
+                            source_values[Int32(40)]
+                        )
+                    elif lane == Int32(9):
+                        term = Float32(2.0) * p2 * p3 * Float32(
+                            source_values[Int32(41)]
+                        )
+                    sy2 = _warp_allreduce_sum(term)
+                    if lane == Int32(0):
+                        s_post[0] = cute.math.rsqrt(
+                            sy2 / Float32(self.hidden_size)
+                            + Float32(self.norm_eps),
+                            fastmath=True,
+                        )
+
+        if tidx == Int32(0) and const_expr(not self.single_cta):
             total_sqsum = Float32(sums[0])
             mixes = cute.make_rmem_tensor(
                 cute.make_layout((self.mixes,), stride=(1,)), Float32
@@ -2953,7 +3565,7 @@ class MHCFinalizeGramKernel:
         p1 = Float32(s_pre[1])
         p2 = Float32(s_pre[2])
         p3 = Float32(s_pre[3])
-        if const_expr(self.compact_partials):
+        if const_expr(self.compact_partials or self.single_cta):
             y_u32 = cute.recast_tensor(y, Uint32)
             for pair_iter in cutlass.range_constexpr(
                 self.hidden_size // (2 * self.num_threads)
@@ -3056,6 +3668,23 @@ def _post_pre_partial_kernel(
     )
 
 
+@lru_cache(maxsize=32)
+def _post_pre_decode_split_n_partial_kernel(
+    hidden_size: int,
+    split_k: int,
+    source_splits: int,
+    tile_n: int,
+    compute_gram: bool = False,
+) -> MHCPostPreDecodeSplitNPartialKernel:
+    return MHCPostPreDecodeSplitNPartialKernel(
+        hidden_size=hidden_size,
+        split_k=split_k,
+        source_splits=source_splits,
+        tile_n=tile_n,
+        compute_gram=compute_gram,
+    )
+
+
 @lru_cache(maxsize=16)
 def _post_pre_prefill_partial_kernel(
     hidden_size: int,
@@ -3145,6 +3774,9 @@ def _finalize_gram_kernel(
     fuse_norm: bool,
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
+    single_cta: bool = False,
+    single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
+    active_source_splits: int = 0,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=hidden_size,
@@ -3156,6 +3788,9 @@ def _finalize_gram_kernel(
         fuse_norm=fuse_norm,
         compact_partials=compact_partials,
         compact_projection_splits=compact_projection_splits,
+        single_cta=single_cta,
+        single_cta_threads=single_cta_threads,
+        active_source_splits=active_source_splits,
     )
 
 
@@ -3174,7 +3809,14 @@ def _run_mhc_post_pre_partial_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    partials_per_cta = _selected_post_pre_partials_per_cta()
+    decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+    )
+    partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+    )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
@@ -3263,7 +3905,28 @@ def _run_mhc_post_pre_partial_launch(
         ),
     )
     hidden_specialization = _hidden_specialization_name(hidden_size)
-    if hidden_size == _HIDDEN and split_k == _SPLIT_K:
+    if decode_source_splits > 0:
+        compile_name = (
+            "integration.residual.mhc_post_pre_decode_split_n_"
+            f"{hidden_specialization}_s{decode_source_splits}n{decode_tile_n}"
+        )
+        compile_key = (
+            ("hidden_size", hidden_size),
+            ("split_k", split_k),
+            ("source_splits", decode_source_splits),
+            ("tile_n", decode_tile_n),
+            ("compute_gram", compute_gram),
+            ("pdl", _MHC_PDL),
+            cache_key,
+        )
+        kernel = _post_pre_decode_split_n_partial_kernel(
+            hidden_size,
+            split_k,
+            decode_source_splits,
+            decode_tile_n,
+            compute_gram,
+        )
+    elif hidden_size == _HIDDEN and split_k == _SPLIT_K:
         compile_name = (
             "integration.residual.mhc_post_pre_partial_hidden4096_hctile128"
             f"_all{partials_per_cta}"
@@ -3273,6 +3936,14 @@ def _run_mhc_post_pre_partial_launch(
             ("compute_gram", compute_gram),
             ("pdl", _MHC_PDL),
             cache_key,
+        )
+        kernel = _post_pre_partial_kernel(
+            hidden_size,
+            split_k,
+            compute_gram,
+            False,
+            False,
+            partials_per_cta,
         )
     else:
         compile_name = (
@@ -3288,15 +3959,16 @@ def _run_mhc_post_pre_partial_launch(
             ("pdl", _MHC_PDL),
             cache_key,
         )
-    b12x_launch(
-        _post_pre_partial_kernel(
+        kernel = _post_pre_partial_kernel(
             hidden_size,
             split_k,
             compute_gram,
             False,
             False,
             partials_per_cta,
-        ),
+        )
+    b12x_launch(
+        kernel,
         compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
@@ -4508,7 +5180,10 @@ def _run_mhc_pre_partial_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    partials_per_cta = _selected_post_pre_partials_per_cta()
+    partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+    )
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
@@ -4665,6 +5340,7 @@ def _run_mhc_finalize_gram_launch(
     fuse_norm: bool,
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
+    active_source_splits: int = 0,
 ) -> None:
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
@@ -4673,6 +5349,7 @@ def _run_mhc_finalize_gram_launch(
     fuse_norm = bool(fuse_norm)
     compact_partials = bool(compact_partials)
     compact_projection_splits = int(compact_projection_splits)
+    active_source_splits = int(active_source_splits)
     norm_weight_tensor = _norm_weight_kernel_tensor(
         norm_weight if fuse_norm else None,
         y,
@@ -4681,6 +5358,15 @@ def _run_mhc_finalize_gram_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
+    single_cta_threads = (
+        0
+        if compact_partials
+        else _selected_mhc_decode_finalize_threads(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
+    )
+    single_cta = single_cta_threads > 0
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("scale", scale, (3,))
@@ -4731,12 +5417,19 @@ def _run_mhc_finalize_gram_launch(
             "impl",
             "prefill_finalize_gram_bf16x2_io_v3"
             if compact_partials
-            else "finalize_gram_multicta_v2",
+            else (
+                "finalize_gram_single_cta_bf16x2_io_v1"
+                if single_cta
+                else "finalize_gram_multicta_v2"
+            ),
         ),
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
         ("compact_partials", compact_partials),
         ("compact_projection_splits", compact_projection_splits),
+        ("single_cta", single_cta),
+        ("single_cta_threads", single_cta_threads),
+        ("active_source_splits", active_source_splits),
         ("pdl", _MHC_PDL),
         ("norm_eps", norm_eps if fuse_norm else 0.0),
         rms_eps,
@@ -4786,11 +5479,19 @@ def _run_mhc_finalize_gram_launch(
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
         suffix = "_compact" if compact_partials else ""
+        if single_cta:
+            suffix = f"_single_cta_t{single_cta_threads}"
         compile_name = f"integration.residual.mhc_finalize_gram_hidden4096{suffix}"
         compile_key = (
             (
                 "block_h",
-                _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H,
+                single_cta_threads
+                if single_cta
+                else (
+                    _PREFILL_FINALIZE_THREADS
+                    if compact_partials
+                    else _GRAM_BLOCK_H
+                ),
             ),
             ("source_tiles", _SOURCE_TILES),
             ("gram_row0", _GRAM_ROW0),
@@ -4798,6 +5499,8 @@ def _run_mhc_finalize_gram_launch(
         )
     else:
         suffix = "_compact" if compact_partials else ""
+        if single_cta:
+            suffix = f"_single_cta_t{single_cta_threads}"
         compile_name = (
             "integration.residual.mhc_finalize_gram_"
             f"{hidden_specialization}{suffix}"
@@ -4807,7 +5510,13 @@ def _run_mhc_finalize_gram_launch(
             ("split_k", split_k),
             (
                 "block_h",
-                _PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H,
+                single_cta_threads
+                if single_cta
+                else (
+                    _PREFILL_FINALIZE_THREADS
+                    if compact_partials
+                    else _GRAM_BLOCK_H
+                ),
             ),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("gram_row0", hidden_size // _SOURCE_TILE_H),
@@ -4824,6 +5533,9 @@ def _run_mhc_finalize_gram_launch(
             fuse_norm,
             compact_partials,
             compact_projection_splits,
+            single_cta,
+            single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
+            active_source_splits,
         ),
         compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
@@ -4851,6 +5563,7 @@ def _mhc_finalize_gram_launch_op(
     fuse_norm: bool,
     compact_partials: bool,
     compact_projection_splits: int,
+    active_source_splits: int,
 ) -> None:
     _run_mhc_finalize_gram_launch(
         residual=residual,
@@ -4868,6 +5581,7 @@ def _mhc_finalize_gram_launch_op(
         fuse_norm=fuse_norm,
         compact_partials=compact_partials,
         compact_projection_splits=compact_projection_splits,
+        active_source_splits=active_source_splits,
     )
 
 
@@ -4888,6 +5602,7 @@ def _mhc_finalize_gram_launch_fake(
     fuse_norm: bool,
     compact_partials: bool,
     compact_projection_splits: int,
+    active_source_splits: int,
 ) -> None:
     return None
 
@@ -4908,6 +5623,7 @@ def run_mhc_finalize_gram(
     norm_eps: float,
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
+    active_source_splits: int = 0,
 ) -> None:
     # When norm_weight is None the kernel ignores it (fuse_norm=False), but it
     # still needs a valid tensor arg. Do NOT alias `y` here: `y` is a mutated arg
@@ -4934,6 +5650,7 @@ def run_mhc_finalize_gram(
         norm_weight is not None,
         bool(compact_partials),
         int(compact_projection_splits),
+        int(active_source_splits),
     )
 
 
@@ -5162,6 +5879,10 @@ def _mhc_post_pre_launch_functional_op(
             out=residual_out,
             compute_gram=fuse_norm,
         )
+        decode_source_splits, _ = _selected_post_pre_decode_split_n(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
         _run_mhc_finalize_gram_launch(
             residual=residual_out,
             partials=partials,
@@ -5176,6 +5897,7 @@ def _mhc_post_pre_launch_functional_op(
             norm_weight=norm_weight,
             norm_eps=norm_eps,
             fuse_norm=fuse_norm,
+            active_source_splits=decode_source_splits,
         )
     return residual_out, post, comb, y
 

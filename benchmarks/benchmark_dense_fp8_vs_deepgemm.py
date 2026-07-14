@@ -12,6 +12,7 @@ GPU serialization, when enabled, is managed outside this command. Do not wrap
 the benchmark in traffic-control tooling yourself.
 """
 
+import argparse
 import statistics
 import sys
 
@@ -98,9 +99,20 @@ def run(M, N, K, l2, warmup, iters):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=[2, 8, 32, 128, 512, 2048, 4096],
+    )
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=50)
+    args = parser.parse_args()
+
     torch.manual_seed(0)
     l2 = make_l2_flush_fn(enabled=True)
-    warmup, iters = 10, 50
+    warmup, iters = args.warmup, args.iters
     # DeepSeek-V4-Flash q/k/v projections at TP=2 (hidden=4096, heads=64->32 local,
     # q_lora_rank=1024, head_dim=512). N=out_features, K=in_features.
     configs = [
@@ -109,7 +121,7 @@ def main():
         ("wo_a (per-group; L=4)", 1024, 4096),  # group_width(8*512) -> o_lora_rank(1024)
         ("wo_b", 4096, 4096),          # n_local_groups*o_lora(4*1024) -> hidden(4096)
     ]
-    Ms = [2, 8, 32, 128, 512, 2048, 4096]  # decode (2-8) -> prefill
+    Ms = args.batch_sizes
 
     by_cfg = {}
     for label, N, K in configs:

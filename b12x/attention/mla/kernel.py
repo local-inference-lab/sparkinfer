@@ -183,7 +183,13 @@ def _dsv4_h16_auto(
     heads: int,
     num_chunks: int,
     h8_num_splits: int,
+    sm_count: int | None = None,
 ) -> bool:
+    # Spark reaches a full H8 launch wave much earlier than the 188-SM tuning
+    # target. Sharing each KV stage across 16 heads wins from B=8 for C4/C128,
+    # while the two-chunk SWA path keeps H8's lower fixed latency.
+    if sm_count is not None and sm_count <= 64 and rows >= 8 and num_chunks > 2:
+        return True
     if num_chunks >= _DSV4_H16_MIN_BW_CHUNKS and rows >= _DSV4_H16_MIN_BW_ROWS:
         return True
     h8_ctas = rows * (heads // 8) * max(1, int(h8_num_splits))
@@ -2327,7 +2333,11 @@ def run_unified_decode(
             extra_topk=extra_topk,
         )
         native_dsv4_h16 = _dsv4_h16_auto(
-            rows=rows, heads=heads, num_chunks=_nc8, h8_num_splits=_ns8
+            rows=rows,
+            heads=heads,
+            num_chunks=_nc8,
+            h8_num_splits=_ns8,
+            sm_count=sm_count,
         )
     else:
         native_dsv4_h16 = bool(h16_allowed and h16_mode)

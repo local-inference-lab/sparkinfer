@@ -604,10 +604,13 @@ def plan_moe_weight_preparation(
         if spec.quant_mode == "w4a8_mx":
             if spec.activation != "silu":
                 raise ValueError("W4A8-MX preparation currently requires silu")
-            if hidden_size % 256 != 0 or intermediate_size % 128 != 0:
+            # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
+            # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
+            # fine; consumers bound their reads by the logical sizes.
+            if hidden_size % 256 != 0 or intermediate_size % 32 != 0:
                 raise ValueError(
                     "W4A8-MX QMMA layout requires hidden_size % 256 == 0 and "
-                    "intermediate_size % 128 == 0"
+                    "intermediate_size % 32 == 0"
                 )
             transforms.add(WeightPreparationTransform.W4A8_QMMA)
             weight_layouts.add(PreparedWeightLayout.QMMA_REPACKED)
@@ -616,10 +619,17 @@ def plan_moe_weight_preparation(
         if spec.quant_mode == "w4a16":
             layout = requested_w4a16_layout
             if layout is None:
+                # The packed MMA kernels only have tile configs for
+                # 128-aligned intermediate shards; the native path already
+                # supports compact sub-32 tails (see
+                # test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid),
+                # so route every non-128-aligned e8m0 shard through it
+                # instead of failing at kernel-config time (e.g. 2048/TP6 =
+                # 352, 3072/TP16 = 192).
                 layout = (
                     PreparedWeightLayout.SOURCE_NATIVE
                     if source_format == "modelopt_nvfp4"
-                    or (source_format == "fp4_e8m0_k32" and intermediate_size % 32 != 0)
+                    or (source_format == "fp4_e8m0_k32" and intermediate_size % 128 != 0)
                     else PreparedWeightLayout.MMA_PACKED
                 )
             if (

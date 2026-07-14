@@ -620,6 +620,8 @@ def _indexed_cache_tokens(
     case: BenchmarkCase,
     *,
     shared_indexed_cache: bool,
+    reuse_cache_pool: bool = False,
+    cache_num_pages: int = 0,
 ) -> int:
     """Size the indexed cache for independent rows or one shared prefill pool."""
 
@@ -627,7 +629,25 @@ def _indexed_cache_tokens(
         return 0
     if shared_indexed_cache:
         return case.indexed_width
+    if reuse_cache_pool:
+        assert case.indexed_page_size is not None
+        return max(case.indexed_width, cache_num_pages * case.indexed_page_size)
     return case.indexed_width * max(case.rows, 1)
+
+
+def _swa_cache_tokens(
+    case: BenchmarkCase,
+    *,
+    shared_indexed_cache: bool,
+    reuse_cache_pool: bool,
+    cache_num_pages: int,
+    swa_page_size: int,
+) -> int:
+    if shared_indexed_cache:
+        return max(case.swa_width, 1)
+    if reuse_cache_pool:
+        return max(case.swa_width, cache_num_pages * swa_page_size, 1)
+    return max(case.swa_width * max(case.rows, 1), 1)
 
 
 def _benchmark_workspace_mode(*, shared_indexed_cache: bool) -> str:
@@ -758,6 +778,7 @@ def _benchmark_case(
     reference: str,
     context_length: int | None,
     shared_indexed_cache: bool,
+    reuse_cache_pool: bool,
 ) -> CaseReport:
     clear_mla_caches()
     q = _make_q(rows=case.rows, num_q_heads=num_q_heads, seed=seed, device=device)
@@ -771,7 +792,13 @@ def _benchmark_case(
             device=device,
         )
 
-    swa_tokens = max(case.swa_width, 1)
+    swa_tokens = _swa_cache_tokens(
+        case,
+        shared_indexed_cache=shared_indexed_cache,
+        reuse_cache_pool=reuse_cache_pool,
+        cache_num_pages=cache_num_pages,
+        swa_page_size=swa_page_size,
+    )
     swa_packed = _make_compressed_cache(
         tokens=swa_tokens,
         page_size=swa_page_size,
@@ -784,6 +811,8 @@ def _benchmark_case(
         indexed_tokens = _indexed_cache_tokens(
             case,
             shared_indexed_cache=shared_indexed_cache,
+            reuse_cache_pool=reuse_cache_pool,
+            cache_num_pages=cache_num_pages,
         )
         indexed_packed = _make_compressed_cache(
             tokens=indexed_tokens,
@@ -837,6 +866,8 @@ def _benchmark_case(
         indexed_tokens = _indexed_cache_tokens(
             case,
             shared_indexed_cache=shared_indexed_cache,
+            reuse_cache_pool=reuse_cache_pool,
+            cache_num_pages=cache_num_pages,
         )
         assert indexed_packed is not None
         indexed_cache = _make_cache_views(
@@ -1042,6 +1073,7 @@ def collect_case_reports(
                 reference=args.reference,
                 context_length=args.context_length,
                 shared_indexed_cache=args.shared_indexed_cache,
+                reuse_cache_pool=args.reuse_cache_pool,
             )
         )
     return reports
@@ -1240,6 +1272,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "single-sequence chunked prefill and select the extend workspace "
             "contract instead of modeling each row as an independent decode "
             "sequence"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-cache-pool",
+        action="store_true",
+        help=(
+            "address the finite packed cache pool across decode rows while "
+            "preserving the decode workspace contract"
         ),
     )
     parser.add_argument(

@@ -45,6 +45,7 @@ def test_w4a8_mx_dynamic_tile_density_boundaries(
         "w4a8_mx",
         num_experts=_E,
         activation="silu",
+        compute_capability=(12, 0),
     ) == (expected_tile_m, 128)
 
 
@@ -77,7 +78,42 @@ def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
         "w4a8_mx",
         num_experts=256,
         activation="silu",
+        compute_capability=(12, 0),
     ) == (16, 128)
+
+
+@pytest.mark.parametrize("m", [1024, 4096, 8192, 16384])
+def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
+    monkeypatch, m: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        m * 6,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+        compute_capability=(12, 1),
+    ) == (32, 128)
+
+
+@pytest.mark.parametrize("m", [4096, 8192, 16384])
+def test_w4a8_mx_ds4_tp2_sm120_prefill_keeps_coarse_tactic(
+    monkeypatch, m: int
+) -> None:
+    from b12x.integration import tp_moe
+
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    assert tp_moe._select_dynamic_tile_mn(
+        m * 6,
+        1024,
+        "w4a8_mx",
+        num_experts=256,
+        activation="silu",
+        compute_capability=(12, 0),
+    ) == (64, 128)
 
 
 def _skip_if_unavailable() -> None:
@@ -137,7 +173,14 @@ def _prepare(weights: dict, *, n: int = _N, w13_layout: str = "w13"):
             runtime.w2_sfb,
         )
     )
-    assert runtime_ptrs == source_ptrs
+    # Aligned shards repack in place; ceil-tiled tails (n % 128 != 0 for w2,
+    # (2n) % 256 != 0 for w13) can't fit the source storage and get fresh
+    # allocations instead.
+    has_tail = n % 128 != 0 or (2 * n) % 256 != 0
+    if has_tail:
+        assert runtime_ptrs != source_ptrs
+    else:
+        assert runtime_ptrs == source_ptrs
     return prepared
 
 
@@ -175,11 +218,12 @@ def _run(
     return out
 
 
-def test_w4a8_mx_dynamic_matches_oracle() -> None:
+@pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
+def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     _skip_if_unavailable()
     from b12x.moe.fused.reference import moe_reference_w4a8_mx
 
-    weights = _weights()
+    weights = _weights(n=n)
     m = 16
     x, topk_ids, topk_weights = _routed_inputs(m, 33)
     ref = moe_reference_w4a8_mx(
@@ -196,10 +240,10 @@ def test_w4a8_mx_dynamic_matches_oracle() -> None:
         topk_weights,
         _E,
         _K,
-        _N,
+        n,
         activation="silu",
     )
-    prepared = _prepare(weights)
+    prepared = _prepare(weights, n=n)
     out = _run(m, prepared)
     n_out = out.float().norm().item()
     assert n_out > 0.01, f"w4a8_mx output near-zero (norm={n_out})"
@@ -248,13 +292,16 @@ def test_w4a8_mx_w31_layout_flip() -> None:
         )
 
 
-@pytest.mark.parametrize("m", [1, 2, 4])
-def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
+@pytest.mark.parametrize("m", [1, 2, 3, 4])
+# n=384 covers odd rp K-tile counts on FC2; 352/192/320 cover ceil-tiled
+# tails (GLM-5.2 2048/TP6, DS4-Pro 3072/TP16 and 3072/TP10 native shards).
+@pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
+def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
     from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
     from b12x.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
 
-    weights = _weights()
+    weights = _weights(n=n)
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
@@ -262,7 +309,7 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
         params_dtype=torch.bfloat16,
         num_experts=_E,
         hidden_size=_K,
-        intermediate_size=_N,
+        intermediate_size=n,
     )
     plan = tp_moe.plan_tp_moe_execution(
         num_tokens=m,
@@ -286,11 +333,11 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int) -> None:
         topk_weights,
         _E,
         _K,
-        _N,
+        n,
         activation="silu",
         w13_layout="w13",
     )
-    prepared = _prepare(weights)
+    prepared = _prepare(weights, n=n)
     out = _run(m, prepared)
     n_out = out.float().norm().item()
     assert n_out > 0.01, f"w4a8_mx tiny output near-zero (norm={n_out})"

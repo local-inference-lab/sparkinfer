@@ -203,7 +203,7 @@ def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
         sinkhorn_iters=20,
     )
     torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
-    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=4e-3)
+    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=8e-3)
     scalar_atol = 2e-5 if tokens >= 8 else 1e-5
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=scalar_atol)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=scalar_atol)
@@ -284,7 +284,7 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
     torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=6e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
-    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
 def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference() -> None:

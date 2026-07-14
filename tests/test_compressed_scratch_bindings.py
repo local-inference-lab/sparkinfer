@@ -250,6 +250,30 @@ def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
     assert plan.layout.route == "paged_tiled"
 
 
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32])
+def test_indexer_common_plan_selects_sm121_c4_decode_routes(monkeypatch, rows) -> None:
+    props = type(
+        "Props",
+        (),
+        {"major": 12, "minor": 1, "multi_processor_count": 48},
+    )()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cuda",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=64,
+            max_q_rows=rows,
+            max_page_table_width=1024,
+            topk=512,
+            mode="decode",
+        )
+    )
+
+    assert plan.layout.route == ("paged_fused" if rows <= 16 else "paged_tiled")
+
+
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
 def test_indexer_common_plan_selects_measured_glm_decode_routes(rows) -> None:
     plan = plan_indexer_scratch(

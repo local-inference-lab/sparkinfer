@@ -169,6 +169,35 @@ def test_shared_indexed_cache_uses_one_production_prefill_pool() -> None:
     ) == "decode"
 
 
+def test_reused_cache_pool_preserves_decode_workspace() -> None:
+    case = benchmark_compressed_mla.BenchmarkCase(
+        name="swa-c128",
+        rows=16,
+        swa_width=128,
+        indexed_width=8192,
+        indexed_page_size=2,
+    )
+
+    assert benchmark_compressed_mla._indexed_cache_tokens(
+        case,
+        shared_indexed_cache=False,
+        reuse_cache_pool=True,
+        cache_num_pages=7792,
+    ) == 15_584
+    assert benchmark_compressed_mla._swa_cache_tokens(
+        case,
+        shared_indexed_cache=False,
+        reuse_cache_pool=True,
+        cache_num_pages=7792,
+        swa_page_size=64,
+    ) == 498_688
+    args = benchmark_compressed_mla._parse_args(["--reuse-cache-pool"])
+    assert args.reuse_cache_pool
+    assert benchmark_compressed_mla._benchmark_workspace_mode(
+        shared_indexed_cache=args.shared_indexed_cache
+    ) == "decode"
+
+
 def test_model_config_derives_live_dsv4_selected_widths() -> None:
     profile = benchmark_compressed_mla._derive_dsv4_compressed_mla_profile(
         {

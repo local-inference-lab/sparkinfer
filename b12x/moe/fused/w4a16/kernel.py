@@ -508,10 +508,17 @@ class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
         scale_format: str = "e4m3_k16",
     ) -> bool:
         # E8M0 reads the shared packed scale grid. Both block axes must be /32.
+        # The FC2 chunking (256 intermediate values per chunk, fc2_n_chunks)
+        # masks a tail inside a single chunk correctly (I=128 oracle-covered),
+        # but multi-chunk shards with a partial last chunk (352, 384) index
+        # scale columns past the e8m0 grid and corrupt decode outputs — the
+        # e4m3_k16 path masks this fine; e8m0 must cover multi-chunk exactly.
         if scale_format == "e8m0_k32":
+            fc2_n_chunks = ((int(intermediate_size) // 2) + 127) // 128
             scale_block_ok = (
                 int(hidden_size) % 32 == 0
                 and int(intermediate_size) % 32 == 0
+                and (fc2_n_chunks == 1 or int(intermediate_size) % 256 == 0)
             )
         else:
             scale_block_ok = True
@@ -4784,10 +4791,15 @@ def compile_w4a16_fused_moe(
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
+    # Logical K/N tails are needed for every shard the tile table can't
+    # divide, not just sub-32 ones: 2048/TP6 = 352 and 3072/TP16 = 192 are
+    # 32-aligned yet have no dividing tile_k/tile_n. %32 shards are the
+    # ceil-scale-grid subset of the same machinery (%32 != 0 implies
+    # %128 != 0).
     allow_native_logical_tail = (
         weight_layout == "modelopt"
         and scale_format == "e8m0_k32"
-        and int(intermediate_size) % 32 != 0
+        and int(intermediate_size) % 128 != 0
     )
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
         problem_m=size_m,

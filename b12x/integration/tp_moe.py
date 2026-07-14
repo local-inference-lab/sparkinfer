@@ -119,6 +119,21 @@ _W13_LAYOUTS = {
     "gate_up": "w31",
 }
 
+_DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _current_compute_capability() -> tuple[int, int] | None:
+    """Return the active CUDA device capability without repeated driver queries."""
+
+    if not torch.cuda.is_available():
+        return None
+    device_index = torch.cuda.current_device()
+    capability = _DEVICE_CAPABILITY_CACHE.get(device_index)
+    if capability is None:
+        capability = tuple(torch.cuda.get_device_capability(device_index))
+        _DEVICE_CAPABILITY_CACHE[device_index] = capability
+    return capability
+
 
 @dataclass(kw_only=True)
 class TPMoEWorkspace:
@@ -1352,6 +1367,7 @@ def _select_dynamic_tile_mn(
     *,
     num_experts: int,
     activation: str = "silu",
+    compute_capability: tuple[int, int] | None = None,
 ) -> Tuple[int, int]:
     """Tile planner for the dynamic kernel.
 
@@ -1373,6 +1389,8 @@ def _select_dynamic_tile_mn(
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
     if _is_w4a8_quant_mode(quant_mode):
+        if compute_capability is None:
+            compute_capability = _current_compute_capability()
         # DSV4-Flash TP2 speculative-verify band.  Like the CUTLASS tactic
         # selector, this is keyed only by the static workload shape and routed
         # row count; live expert counts still come from the device histogram.
@@ -1384,6 +1402,20 @@ def _select_dynamic_tile_mn(
             and num_experts == 256
             and int(n) == 1024
             and 384 <= routed_rows <= 2304
+        ):
+            return (32, _LEVEL_TILE_N)
+        # GB10 has only 48 SMs and substantially less memory bandwidth than
+        # desktop SM120 parts.  Its fused M32 specialization keeps FC1/FC2 in
+        # one persistent kernel and wins through the measured DSV4 TP2 prefill
+        # band; the M64/M128 tactics split routing, FC1, and FC2 into three
+        # launches and lose 16--36% here.  Keep the SM120 crossover unchanged.
+        if (
+            compute_capability == (12, 1)
+            and quant_mode == "w4a8_mx"
+            and activation == "silu"
+            and num_experts == 256
+            and int(n) == 1024
+            and 2304 < routed_rows <= 384 * num_experts
         ):
             return (32, _LEVEL_TILE_N)
         # W4A8 uses M16/M32 for sparse decode and the split M64 compute path
@@ -1439,7 +1471,10 @@ def _w4a8_dynamic_dense_candidate(
         _normalize_quant_mode(quant_mode) == "w4a8_mx"
         and activation == "silu"
         and k % 256 == 0
-        and n % 128 == 0
+        # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
+        # 128-row tile boundaries, so the per-tile pairing works for any
+        # 32-aligned shard (352 = 2048/TP6, 192 = 3072/TP16).
+        and n % 32 == 0
         and _select_dynamic_tile_mn(
             routed_rows,
             n,
@@ -1589,7 +1624,10 @@ def _w4a8_dynamic_materialized_enabled(
     m1_candidate = bool(
         int(num_tokens) == 1
         and k % 256 == 0
-        and n % 128 == 0
+        # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
+        # 128-row tile boundaries, so the per-tile pairing works for any
+        # 32-aligned shard (352 = 2048/TP6, 192 = 3072/TP16).
+        and n % 32 == 0
         and _w4a8_dynamic_direct_candidate(
             quant_mode=quant_mode,
             activation=activation,
@@ -2980,11 +3018,17 @@ def _as_e8m0_k32_grid(
             f"got {scales.dtype}"
         )
     grid = scales.view(torch.uint8)
-    expected = (int(grid.shape[0]), rows, k_dim // 32)
-    if grid.dim() != 3 or tuple(grid.shape) != expected:
+    # Already-prepared ceil-tiled sfb views arrive with padded extents
+    # (rows to 256-tiles, K to 128-tiles); logical grids arrive unpadded.
+    rows_pad = -(-rows // 256) * 256
+    cols = k_dim // 32
+    cols_pad = (-(-k_dim // 128) * 128) // 32
+    expected = (int(grid.shape[0]), rows, cols)
+    expected_pad = (int(grid.shape[0]), rows_pad, cols_pad)
+    if grid.dim() != 3 or tuple(grid.shape) not in (expected, expected_pad):
         raise ValueError(
-            f"{name} must be [E, rows, K//32] = {expected} for w4a8_mx, "
-            f"got {tuple(grid.shape)}"
+            f"{name} must be [E, rows, K//32] = {expected} (or the ceil-tiled "
+            f"{expected_pad}) for w4a8_mx, got {tuple(grid.shape)}"
         )
     return grid.contiguous()
 
@@ -2992,23 +3036,26 @@ def _as_e8m0_k32_grid(
 def _w4a8_rp_shape(size_n: int, size_k: int) -> tuple[int, int, int, int, int, int]:
     size_n = int(size_n)
     size_k = int(size_k)
-    if size_n % 256 != 0 or size_k % 128 != 0:
+    if size_n % 8 != 0 or size_k % 32 != 0:
         raise ValueError(
-            "W4A8 weight repack requires N multiple of 256 and K "
-            f"multiple of 128; got N={size_n}, K={size_k}"
+            "W4A8 weight repack requires N multiple of 8 and K "
+            f"multiple of 32; got N={size_n}, K={size_k}"
         )
-    return (size_n // 256, size_k // 128, 4, 8, 32, 4)
+    # Ceil-tiled: shards that 256/128 tiles don't divide (e.g. 2048/TP6 = 352)
+    # store zero-filled tail tiles so the fixed 4096-word tile addressing
+    # stays uniform; kernels bound their reads by the logical sizes.
+    return (-(-size_n // 256), -(-size_k // 128), 4, 8, 32, 4)
 
 
 def _w4a8_sfb_shape(size_n: int, size_k: int) -> tuple[int, int, int, int]:
     size_n = int(size_n)
     size_k = int(size_k)
-    if size_n % 256 != 0 or size_k % 128 != 0:
+    if size_n % 8 != 0 or size_k % 32 != 0:
         raise ValueError(
-            "W4A8 scale repack requires N multiple of 256 and K "
-            f"multiple of 128; got N={size_n}, K={size_k}"
+            "W4A8 scale repack requires N multiple of 8 and K "
+            f"multiple of 32; got N={size_n}, K={size_k}"
         )
-    return (size_n // 256, size_k // 128, 32, 8)
+    return (-(-size_n // 256), -(-size_k // 128), 32, 8)
 
 
 def _w4a16_packed_weight_shape(size_k: int, size_n: int) -> tuple[int, int]:
@@ -3082,6 +3129,8 @@ def _qweight_to_w4a8_rp_kernel(
     q_expert_stride: tl.constexpr,
     dst_expert_stride: tl.constexpr,
     row_rotation: tl.constexpr,
+    half_rows: tl.constexpr,
+    half_rows_pad: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -3106,10 +3155,43 @@ def _qweight_to_w4a8_rp_kernel(
     k32 = tmp >> 3
 
     row = n8c * 32 + n8i * 8 + r8
-    src_row = nt * 256 + row + row_rotation
-    src_row = tl.where(src_row >= rows, src_row - rows, src_row)
+    dst_row = nt * 256 + row
     src_col = kt * 16 + k32 * 4 + cgrp
-    values = tl.load(q + expert * q_expert_stride + src_row * q_cols + src_col)
+    if half_rows_pad > 0:
+        # Gated W13 with a ceil-tiled half: dst rows [0, half_pad) hold the
+        # up half, [half_pad, 2*half_pad) the gate half, each zero-padded to
+        # a 128-row boundary so the dynamic kernel's per-128-tile up/gate
+        # pairing stays aligned. `row_rotation` here is the SOURCE row of the
+        # up half (n for w31 sources, 0 for w13); the other half starts at
+        # (rotation + half) % (2*half).
+        is_gate = dst_row >= half_rows_pad
+        half_dst = dst_row - tl.where(is_gate, half_rows_pad, 0)
+        half_src_base = row_rotation + tl.where(is_gate, half_rows, 0)
+        half_src_base = tl.where(
+            half_src_base >= 2 * half_rows,
+            half_src_base - 2 * half_rows,
+            half_src_base,
+        )
+        src_row = half_src_base + half_dst
+        in_bounds = (
+            (dst_row < 2 * half_rows_pad)
+            & (half_dst < half_rows)
+            & (src_col < q_cols)
+        )
+    else:
+        src_row = dst_row + row_rotation
+        src_row = tl.where(src_row >= rows, src_row - rows, src_row)
+        # Tail tiles: positions past the logical N/K read as zero (FP4 zero
+        # rows and columns), keeping the fixed tile addressing uniform.
+        in_bounds = (dst_row < rows) & (src_col < q_cols)
+    src_row = tl.where(in_bounds, src_row, 0)
+    src_col = tl.where(in_bounds, src_col, 0)
+    values = tl.load(
+        q + expert * q_expert_stride + src_row * q_cols + src_col,
+        mask=mask & in_bounds,
+        other=0,
+    )
+    values = tl.where(in_bounds, values, 0)
     dst_base = expert * dst_expert_stride + (nt * k_tiles_128 + kt) * 4096
     tl.store(dst + dst_base + idx, values, mask=mask)
 
@@ -3166,13 +3248,15 @@ def _grid_to_w4a8_sfb_kernel(
     grid_expert_stride: tl.constexpr,
     dst_expert_stride: tl.constexpr,
     row_rotation: tl.constexpr,
+    half_rows: tl.constexpr,
+    half_rows_pad: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     idx = pid * BLOCK + tl.arange(0, BLOCK)
     mask = idx < total_elements
-    expert = idx // (rows * scale_cols)
-    local = idx - expert * (rows * scale_cols)
+    expert = idx // dst_expert_stride
+    local = idx - expert * dst_expert_stride
 
     kb = local & 3
     tmp = local >> 2
@@ -3183,10 +3267,39 @@ def _grid_to_w4a8_sfb_kernel(
     kt = tmp % k_tiles_128
     nt = tmp // k_tiles_128
 
-    row = nt * 256 + n32 * 8 + row8 + row_rotation
-    row = tl.where(row >= rows, row - rows, row)
+    dst_row = nt * 256 + n32 * 8 + row8
     col = kt * 4 + kb
-    values = tl.load(grid + expert * grid_expert_stride + row * scale_cols + col)
+    if half_rows_pad > 0:
+        # Same half-aligned mapping as the weight repack (see
+        # _qweight_to_w4a8_rp_kernel).
+        is_gate = dst_row >= half_rows_pad
+        half_dst = dst_row - tl.where(is_gate, half_rows_pad, 0)
+        half_src_base = row_rotation + tl.where(is_gate, half_rows, 0)
+        half_src_base = tl.where(
+            half_src_base >= 2 * half_rows,
+            half_src_base - 2 * half_rows,
+            half_src_base,
+        )
+        row = half_src_base + half_dst
+        in_bounds = (
+            (dst_row < 2 * half_rows_pad)
+            & (half_dst < half_rows)
+            & (col < scale_cols)
+        )
+    else:
+        row = dst_row + row_rotation
+        row = tl.where(row >= rows, row - rows, row)
+        # Tail tiles: scale bytes past the logical grid are zero (2^-127
+        # scale on already-zero FP4 weights).
+        in_bounds = (dst_row < rows) & (col < scale_cols)
+    row = tl.where(in_bounds, row, 0)
+    col = tl.where(in_bounds, col, 0)
+    values = tl.load(
+        grid + expert * grid_expert_stride + row * scale_cols + col,
+        mask=mask & in_bounds,
+        other=0,
+    )
+    values = tl.where(in_bounds, values, 0)
     tl.store(dst + expert * dst_expert_stride + local, values, mask=mask)
 
 
@@ -3335,6 +3448,7 @@ def _logical_weight_to_w4a8_rp_inplace(
     size_k: int,
     size_n: int,
     row_rotation: int | None = None,
+    gated_half_rows: int | None = None,
 ) -> torch.Tensor:
     size_k = int(size_k)
     size_n = int(size_n)
@@ -3347,6 +3461,21 @@ def _logical_weight_to_w4a8_rp_inplace(
             f"got {weight.dtype} {tuple(weight.shape)}"
         )
     rp_shape = _w4a8_rp_shape(size_n, size_k)
+    n_tiles = -(-size_n // 256)
+    k_tiles = -(-size_k // 128)
+    rp_words = _tensor_numel(rp_shape)
+    has_tail = rp_words != size_n * (size_k // 8)
+    # Gated W13 tails place each half's zero rows at a 128-row boundary so
+    # the dynamic kernel's per-tile up/gate pairing stays aligned. The
+    # interpretation of row_rotation shifts to "source row of the up half"
+    # (numerically identical for the aligned case).
+    half_rows = 0
+    half_rows_pad = 0
+    if has_tail and gated_half_rows is not None:
+        half_rows = int(gated_half_rows)
+        half_rows_pad = -(-half_rows // 128) * 128
+        assert 2 * half_rows == size_n, (half_rows, size_n)
+        assert 2 * half_rows_pad == n_tiles * 256, (half_rows_pad, n_tiles)
     if weight.is_cuda:
         weight_E = int(weight.shape[0])
         q_cols = size_k // 8
@@ -3358,34 +3487,56 @@ def _logical_weight_to_w4a8_rp_inplace(
         block = 1024
         row_rot = 0 if row_rotation is None else int(row_rotation)
         weight_i32 = weight.view(torch.int32)
-        dst_expert_stride = _tensor_numel(rp_shape)
+        # Ceil-tiled tails don't fit the source storage; write a fresh
+        # destination and read the (never-aliased) source directly.
+        out_i32 = (
+            torch.empty(
+                (weight_E, rp_words), dtype=torch.int32, device=weight.device
+            )
+            if has_tail
+            else None
+        )
+        dst_expert_stride = rp_words
         blocks_per_tile = triton.cdiv(4096, block)
         for e0 in range(0, weight_E, chunk):
             e1 = min(weight_E, e0 + chunk)
-            q_scratch = torch.empty(
-                (e1 - e0, size_n, q_cols),
-                dtype=torch.int32,
-                device=weight.device,
-            )
-            q_scratch.copy_(weight_i32[e0:e1].reshape(e1 - e0, size_n, q_cols))
-            total_programs = (e1 - e0) * (size_n // 256) * (size_k // 128)
+            if has_tail:
+                q_chunk = weight_i32[e0:e1].reshape(e1 - e0, size_n, q_cols)
+                dst_chunk = out_i32[e0:e1]
+            else:
+                q_chunk = torch.empty(
+                    (e1 - e0, size_n, q_cols),
+                    dtype=torch.int32,
+                    device=weight.device,
+                )
+                q_chunk.copy_(weight_i32[e0:e1].reshape(e1 - e0, size_n, q_cols))
+                dst_chunk = weight_i32[e0:e1]
+            total_programs = (e1 - e0) * n_tiles * k_tiles
             total_programs *= blocks_per_tile
             _qweight_to_w4a8_rp_kernel[(total_programs,)](
-                q_scratch,
-                weight_i32[e0:e1],
+                q_chunk,
+                dst_chunk,
                 total_programs,
-                size_n // 256,
-                size_k // 128,
+                n_tiles,
+                k_tiles,
                 q_cols,
                 size_n,
                 size_n * q_cols,
                 dst_expert_stride,
                 row_rot,
+                half_rows,
+                half_rows_pad,
                 BLOCK=block,
                 num_warps=4,
             )
-        return weight_i32.view(weight_E, *rp_shape)
+        base = out_i32 if has_tail else weight_i32
+        return base.view(weight_E, *rp_shape)
 
+    if has_tail:
+        raise NotImplementedError(
+            "ceil-tiled W4A8 repack tails are CUDA-only; move the weights to "
+            f"a CUDA device (N={size_n}, K={size_k})"
+        )
     q_scratch = torch.empty(
         (size_n, size_k // 8),
         dtype=torch.int32,
@@ -3588,6 +3739,7 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     rows: int,
     k_dim: int,
     row_rotation: int | None = None,
+    gated_half_rows: int | None = None,
 ) -> torch.Tensor:
     weight_E = int(weight_E)
     rows = int(rows)
@@ -3601,6 +3753,16 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
         k_dim=k_dim,
     )
     sfb_shape = _w4a8_sfb_shape(rows, k_dim)
+    n_tiles = -(-rows // 256)
+    k_tiles = -(-k_dim // 128)
+    sfb_bytes = _tensor_numel(sfb_shape) * 4
+    has_tail = sfb_bytes != rows * (k_dim // 32)
+    half_rows = 0
+    half_rows_pad = 0
+    if has_tail and gated_half_rows is not None:
+        half_rows = int(gated_half_rows)
+        half_rows_pad = -(-half_rows // 128) * 128
+        assert 2 * half_rows == rows, (half_rows, rows)
     if scale.is_cuda:
         scale_cols = k_dim // 32
         rows_pad = rows if is_logical else int(scale_u8.shape[2])
@@ -3618,6 +3780,14 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
         row_rot = 0 if row_rotation is None else int(row_rotation)
         total_per_expert = rows * scale_cols
         source_stride = rows * scale_cols if is_logical else scale_cols * rows_pad
+        # Ceil-tiled tails don't fit the source storage in place.
+        out_u8 = (
+            torch.empty(
+                (weight_E, sfb_bytes), dtype=torch.uint8, device=scale.device
+            )
+            if has_tail
+            else None
+        )
         for e0 in range(0, weight_E, chunk):
             e1 = min(weight_E, e0 + chunk)
             chunk_experts = e1 - e0
@@ -3640,22 +3810,32 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
                 BLOCK=block,
                 num_warps=4,
             )
-            _grid_to_w4a8_sfb_kernel[(triton.cdiv(total, block),)](
+            dst_chunk = out_u8[e0:e1] if has_tail else scale_u8[e0:e1]
+            total_sfb = chunk_experts * sfb_bytes
+            _grid_to_w4a8_sfb_kernel[(triton.cdiv(total_sfb, block),)](
                 grid_scratch,
-                scale_u8[e0:e1],
-                total,
+                dst_chunk,
+                total_sfb,
                 rows,
                 scale_cols,
-                rows // 256,
-                k_dim // 128,
+                n_tiles,
+                k_tiles,
                 total_per_expert,
-                total_per_expert,
+                sfb_bytes,
                 row_rot,
+                half_rows,
+                half_rows_pad,
                 BLOCK=block,
                 num_warps=4,
             )
-        return scale_u8.view(torch.int32).view(weight_E, *sfb_shape)
+        base = out_u8 if has_tail else scale_u8
+        return base.view(torch.int32).view(weight_E, *sfb_shape)
 
+    if has_tail:
+        raise NotImplementedError(
+            "ceil-tiled W4A8 scale tails are CUDA-only; move the scales to "
+            f"a CUDA device (rows={rows}, K={k_dim})"
+        )
     grid_scratch = torch.empty(
         (rows, scale_cols),
         dtype=torch.uint8,
@@ -3817,14 +3997,17 @@ def _get_weight_views(
         # source-native 3-D shape for pointer plumbing. The prep rotation
         # already normalized the half order -- never flip rp storage in place.
         e_dim = w1_fp4.shape[0]
-        w1_fp4 = w1_fp4.view(torch.uint8).reshape(
-            e_dim, activation_spec.w1_rows(n), k // 2
-        )
-        w2_fp4 = w2_fp4.view(torch.uint8).reshape(e_dim, k, n // 2)
+        # Ceil-tiled storage views back as ceil-row/col 3-D shapes (equal to
+        # the logical shapes when the tiles divide exactly); consumers use rp
+        # tile addressing from the base pointer, never these extents.
+        w1_rows_pad = -(-activation_spec.w1_rows(n) // 256) * 256
+        n_pad = -(-n // 128) * 128
+        w1_fp4 = w1_fp4.view(torch.uint8).reshape(e_dim, w1_rows_pad, k // 2)
+        w2_fp4 = w2_fp4.view(torch.uint8).reshape(e_dim, k, n_pad // 2)
         w1_blockscale = w1_blockscale.view(torch.uint8).reshape(
-            e_dim, activation_spec.w1_rows(n), k // 32
+            e_dim, w1_rows_pad, k // 32
         )
-        w2_blockscale = w2_blockscale.view(torch.uint8).reshape(e_dim, k, n // 32)
+        w2_blockscale = w2_blockscale.view(torch.uint8).reshape(e_dim, k, n_pad // 32)
         w13_layout = "w13"
     w13_layout = _normalize_w13_layout_for_activation(
         activation_spec.activation,
@@ -4060,14 +4243,14 @@ def _prepare_w4a8_from_e8m0_source(
     _as_e8m0_k32_grid(w1_blockscale, w1_rows, k, name="w1_blockscale")
     _as_e8m0_k32_grid(w2_blockscale, k, n, name="w2_blockscale")
 
-    row_rotation = (
-        n if w13_layout == "w31" and is_gated_moe_activation(activation) else None
-    )
+    is_gated = is_gated_moe_activation(activation)
+    row_rotation = n if w13_layout == "w31" and is_gated else None
     w13_rp = _logical_weight_to_w4a8_rp_inplace(
         w1_fp4,
         size_k=k,
         size_n=w1_rows,
         row_rotation=row_rotation,
+        gated_half_rows=n if is_gated else None,
     )
     w2_rp = _logical_weight_to_w4a8_rp_inplace(
         w2_fp4,
@@ -4080,6 +4263,7 @@ def _prepare_w4a8_from_e8m0_source(
         rows=w1_rows,
         k_dim=k,
         row_rotation=row_rotation,
+        gated_half_rows=n if is_gated else None,
     )
     w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
         w2_blockscale,
@@ -7339,6 +7523,14 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
+    if w4a8_repacked and int(n) % 128 != 0:
+        # Half-aligned ceil-tiled rp/sfb storage is byte-identical to the
+        # storage of zero-padded n_pad weights, and the dynamic kernel has no
+        # external tensor with an n extent (output is [m, k]); launching at
+        # n_pad therefore computes the exact result — the padded FC1 columns
+        # are silu(0)*0 = 0 and w2's padded K rows are zero. tiny_decode
+        # keeps the logical-n bounds for the decode band.
+        n = -(-int(n) // 128) * 128
     decode_regime = bool(
         w4a8_repacked
         and _w4a8_dynamic_decode_candidate(
@@ -8015,13 +8207,15 @@ def _tiny_decode_enabled() -> bool:
 
 
 def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -> bool:
+    # The rp storage is ceil-tiled with zero-filled tails, and the tiny FC2
+    # bounds its intermediate loads by the logical n, so any 32-aligned shard
+    # works (e.g. 352 from GLM 2048/TP6, 192 from DS4-Pro 3072/TP16).
     return (
         1 <= num_tokens <= 4
         and activation == "silu"
         and k % 256 == 0
-        and n % 256 == 0
+        and n % 32 == 0
         and (k // 128) % 4 == 0
-        and (n // 128) % 2 == 0
     )
 
 

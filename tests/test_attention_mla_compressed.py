@@ -23,6 +23,10 @@ from b12x.attention.mla.compressed_reference import (
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
 )
+from b12x.attention.mla.compressed_api import (
+    _should_use_sm121_single_pass_decode,
+)
+from b12x.attention.mla.kernel import _dsv4_h16_auto
 from b12x.attention.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
@@ -43,6 +47,73 @@ _SHARED_CORE_HEAD_DIM = 576
 _SHARED_CORE_V_HEAD_DIM = 512
 _LOCAL_Q_HEADS = 32
 _SM_SCALE = 1.0 / math.sqrt(_COMPRESSED_HEAD_DIM)
+
+
+@pytest.mark.parametrize("indexed_width", [0, 512])
+def test_sm121_single_pass_decode_policy_covers_b16_short_context(
+    indexed_width: int,
+) -> None:
+    assert _should_use_sm121_single_pass_decode(
+        rows=16,
+        heads=32,
+        swa_width=128,
+        indexed_width=indexed_width,
+        swa_page_size=64,
+        indexed_page_size=64 if indexed_width else None,
+        compute_capability=(12, 1),
+    )
+
+
+def test_sm121_single_pass_decode_policy_rejects_other_regimes() -> None:
+    common = dict(
+        heads=32,
+        swa_width=128,
+        swa_page_size=64,
+        compute_capability=(12, 1),
+    )
+    assert not _should_use_sm121_single_pass_decode(
+        rows=8,
+        indexed_width=512,
+        indexed_page_size=64,
+        **common,
+    )
+    assert not _should_use_sm121_single_pass_decode(
+        rows=16,
+        indexed_width=8192,
+        indexed_page_size=2,
+        **common,
+    )
+    assert not _should_use_sm121_single_pass_decode(
+        rows=16,
+        indexed_width=0,
+        indexed_page_size=None,
+        compute_capability=(12, 0),
+        **{key: value for key, value in common.items() if key != "compute_capability"},
+    )
+
+
+def test_spark_h16_policy_keeps_swa_h8_and_promotes_c4() -> None:
+    assert not _dsv4_h16_auto(
+        rows=8,
+        heads=32,
+        num_chunks=2,
+        h8_num_splits=1,
+        sm_count=48,
+    )
+    assert _dsv4_h16_auto(
+        rows=8,
+        heads=32,
+        num_chunks=10,
+        h8_num_splits=3,
+        sm_count=48,
+    )
+    assert not _dsv4_h16_auto(
+        rows=8,
+        heads=32,
+        num_chunks=10,
+        h8_num_splits=3,
+        sm_count=188,
+    )
 
 
 def _make_split_merge_tensors(

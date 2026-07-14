@@ -1601,7 +1601,8 @@ class B12XAttentionArena:
         if use_cuda_graph:
             workspace._allocate_paged_indexer_runtime_metadata()
         # Reserve the fused-indexer decode merge scratch now, at construction (before any
-        # lock/capture), so the rows<=FUSED_MAX_ROWS fused route never allocates live.
+        # lock/capture), so every architecture-specific fused route fits without a live
+        # allocation.
         workspace._reserve_fused_indexer_scratch()
         return workspace
 
@@ -1719,9 +1720,8 @@ class B12XAttentionWorkspace:
     _contract_tmp_output: torch.Tensor | None = None
     _contract_tmp_lse: torch.Tensor | None = None
     # Fused-indexer cross-CTA merge scratch (pack_v, pack_i, state). Reserved EAGERLY at
-    # construction at a FIXED, seq-/batch-independent capacity (num_sms*topk pack +
-    # FUSED_MAX_ROWS*state) so a live rows<=FUSED_MAX_ROWS decode never allocates after
-    # lock_workspace()/graph capture.
+    # construction at a FIXED, seq-/batch-independent architecture-policy capacity so a
+    # live fused decode never allocates after lock_workspace()/graph capture.
     _b12x_fused_indexer_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     _indexer_contiguous_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_prewarmed: bool = False
@@ -1913,27 +1913,31 @@ class B12XAttentionWorkspace:
     def _reserve_fused_indexer_scratch(self) -> None:
         """Eagerly allocate the fused-indexer cross-CTA merge scratch at a FIXED capacity.
 
-        Sized once at construction from the workspace constants -- pack = num_sms * topk
+        Sized once at construction from the workspace contract -- pack = num_sms * topk
         (seq- AND batch-independent: the merge candidate count is capped by per-CTA top-k
-        trimming, not seq/max_model_len), state = FUSED_MAX_ROWS * _COOP_STATE_WORDS. This
-        is allocated BEFORE lock_workspace()/graph capture so the rows<=FUSED_MAX_ROWS
-        fused decode route never grows the workspace on a live step (the failure the
-        prefill cap fix chased). ~0.75 MB at topk=512. Idempotent; no-op off CUDA."""
+        trimming), while state rows follow the architecture-specific routing policy. This
+        is allocated BEFORE lock_workspace()/graph capture. Idempotent; no-op off CUDA."""
         if self._b12x_fused_indexer_scratch is not None:
             return
         if self.device is None or self.device.type != "cuda":
             return
-        topk = int(self.topk)
+        topk = int(self.indexer_topk)
         if topk <= 0:
             return
         from b12x.attention.indexer.fused_indexer import (
-            FUSED_MAX_ROWS,
+            fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
 
-        num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        props = torch.cuda.get_device_properties(self.device)
+        num_sms = props.multi_processor_count
+        max_rows = fused_indexer_scratch_max_rows(
+            topk=topk,
+            num_heads=int(self.indexer_num_q_heads),
+            compute_capability=(int(props.major), int(props.minor)),
+        )
         pack_elems, state_words = fused_indexer_scratch_capacity(
-            FUSED_MAX_ROWS, topk, num_sms
+            max_rows, topk, num_sms
         )
         self._b12x_fused_indexer_scratch = (
             torch.empty((pack_elems,), dtype=torch.float32, device=self.device),
@@ -1955,13 +1959,19 @@ class B12XAttentionWorkspace:
                 "fused indexer scratch unavailable (non-CUDA workspace or topk<=0)"
             )
         from b12x.attention.indexer.fused_indexer import (
-            FUSED_MAX_ROWS,
+            fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
 
-        num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        props = torch.cuda.get_device_properties(self.device)
+        num_sms = props.multi_processor_count
+        max_rows = fused_indexer_scratch_max_rows(
+            topk=int(topk),
+            num_heads=int(self.indexer_num_q_heads),
+            compute_capability=(int(props.major), int(props.minor)),
+        )
         need_pack, need_state = fused_indexer_scratch_capacity(
-            FUSED_MAX_ROWS, int(topk), num_sms
+            max_rows, int(topk), num_sms
         )
         if cache[0].numel() < need_pack or cache[2].numel() < need_state:
             raise RuntimeError(
