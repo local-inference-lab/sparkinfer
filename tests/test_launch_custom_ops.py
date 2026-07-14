@@ -447,6 +447,10 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             "modelopt",
             "e8m0_k32",
             "w13",
+            64,
+            128,
+            64,
+            128,
             False,
             False,
             0,
@@ -494,6 +498,10 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             "modelopt",
             "e8m0_k32",
             "w13",
+            64,
+            128,
+            64,
+            128,
             0,
         )
 

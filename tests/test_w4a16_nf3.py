@@ -95,7 +95,11 @@ def _build_problem(m: int, seed: int = 0):
         0, 8, (num_experts, w13_rows, hidden), dtype=torch.int32, device=_DEVICE
     )
     w2_codes = torch.randint(
-        0, 8, (num_experts, hidden, intermediate_size), dtype=torch.int32, device=_DEVICE
+        0,
+        8,
+        (num_experts, hidden, intermediate_size),
+        dtype=torch.int32,
+        device=_DEVICE,
     )
     w13_scale = _round_to_e4m3_scale(
         0.01 + 0.24 * torch.rand(num_experts, w13_rows, hidden // 32, device=_DEVICE)
@@ -241,3 +245,121 @@ def _run_case(m: int, *, tc_decode: bool) -> None:
 )
 def test_nf3_matches_dequant_reference(m: int, tc_decode: bool) -> None:
     _run_case(m, tc_decode=tc_decode)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nf3_tc_decode_production_shape_with_tier_mask() -> None:
+    """Cover the GLM-5.2 TP4 hybrid contract used by the vLLM integration.
+
+    The serving path compiles one m=8 launch at pinned 256-wide tiles, reuses
+    it at m=1, and maps routes belonging to the other precision tier to -1.
+    """
+    torch.manual_seed(20260714)
+    m, capacity_m = 1, 8
+    num_experts, topk = 4, 8
+    hidden, intermediate = 6144, 512
+    w13_rows = 2 * intermediate
+
+    w13_codes = torch.randint(
+        0,
+        8,
+        (num_experts, w13_rows, hidden),
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    w2_codes = torch.randint(
+        0,
+        8,
+        (num_experts, hidden, intermediate),
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    w13_scale = _round_to_e4m3_scale(
+        0.01 + 0.24 * torch.rand(num_experts, w13_rows, hidden // 32, device=_DEVICE)
+    )
+    w2_scale = _round_to_e4m3_scale(
+        0.01
+        + 0.24 * torch.rand(num_experts, hidden, intermediate // 32, device=_DEVICE)
+    )
+    x = (torch.randn(m, hidden, device=_DEVICE) * 0.1).to(_DTYPE)
+    topk_ids = torch.tensor(
+        [[0, -1, 1, -1, 2, -1, 3, -1]], dtype=torch.int32, device=_DEVICE
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device=_DEVICE), dim=-1)
+
+    sms, max_shared_mem = _device_limits()
+    fused = compile_w4a16_fused_moe(
+        size_m=capacity_m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=num_experts,
+        top_k=topk,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=8,
+        max_m_blocks=capacity_m * topk,
+        element_dtype="bf16",
+        fast_math=True,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        weight_layout="nf3_2p1",
+        scale_format="e4m3_k32",
+        w13_layout="w13",
+        direct_topk_routes=True,
+        tc_decode_fused_sum=True,
+        force_tile_config=(64, 256, 64, 256),
+    )
+    prepared = prepare_nf3_moe_weights(
+        w13_codes,
+        w13_scale,
+        w2_codes,
+        w2_scale,
+        activation="silu",
+        fc1_tile_n=256,
+        fc2_tile_n=256,
+        params_dtype=_DTYPE,
+    )
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=capacity_m,
+        topk=topk,
+        dtype=_DTYPE,
+        device=_DEVICE,
+    )
+    out = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output[:m],
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        fused_launch=fused,
+    )
+    torch.cuda.synchronize()
+
+    w13_deq = _dequant(w13_codes, w13_scale)
+    w2_deq = _dequant(w2_codes, w2_scale)
+    ref = torch.zeros((m, hidden), dtype=torch.float32, device=_DEVICE)
+    x_f = x.float()
+    for route in range(topk):
+        expert = int(topk_ids[0, route])
+        if expert < 0:
+            continue
+        fc1 = x_f[0] @ w13_deq[expert].float().T
+        gate, up = fc1[:intermediate], fc1[intermediate:]
+        act = (gate * torch.sigmoid(gate)).to(_DTYPE) * up.to(_DTYPE)
+        ref[0] += float(topk_weights[0, route]) * (
+            act.float() @ w2_deq[expert].float().T
+        )
+
+    denom = ref.abs().amax().clamp(min=1e-6)
+    rel = (out.float() - ref).abs().amax() / denom
+    assert rel < 2e-2, f"production-shape NF3 TC decode rel err {float(rel):.4f}"
