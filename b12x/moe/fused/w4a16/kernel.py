@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass, replace
 from typing import NamedTuple
@@ -5846,6 +5845,10 @@ def _w4a16_fused_moe_launch_flat(
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
     collect_activation_amax: bool,
@@ -5882,6 +5885,10 @@ def _w4a16_fused_moe_launch_flat(
         direct_topk_routes=bool(direct_topk_routes),
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
         collect_activation_amax=collect_activation_amax,
+        # The custom-op boundary cannot carry the compiled launch object. Re-pin
+        # its selected geometry so tile-specific packs (notably NF3) resolve the
+        # identical cache entry instead of silently recompiling with auto tiles.
+        force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
     )
     fused.compiled(
         make_ptr(
@@ -6021,6 +6028,10 @@ def _w4a16_fused_moe_launch_op(
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
     stream_int: int,
@@ -6067,6 +6078,10 @@ def _w4a16_fused_moe_launch_op(
         weight_layout=weight_layout,
         scale_format=scale_format,
         w13_layout=w13_layout,
+        fc1_tile_k=fc1_tile_k,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        fc2_tile_n=fc2_tile_n,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
         collect_activation_amax=False,
@@ -6115,6 +6130,10 @@ def _w4a16_fused_moe_launch_fake(
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
     stream_int: int,
@@ -6168,6 +6187,10 @@ def _w4a16_fused_moe_calibrated_launch_op(
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
     stream_int: int,
 ) -> None:
     _w4a16_fused_moe_launch_flat(
@@ -6212,6 +6235,10 @@ def _w4a16_fused_moe_calibrated_launch_op(
         weight_layout=weight_layout,
         scale_format=scale_format,
         w13_layout=w13_layout,
+        fc1_tile_k=fc1_tile_k,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        fc2_tile_n=fc2_tile_n,
         direct_topk_routes=False,
         tc_decode_fused_sum=False,
         collect_activation_amax=True,
@@ -6262,6 +6289,10 @@ def _w4a16_fused_moe_calibrated_launch_fake(
     weight_layout: str,
     scale_format: str,
     w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
     stream_int: int,
 ) -> None:
     return None
@@ -7048,6 +7079,10 @@ def run_w4a16_moe(
         weight_layout,
         scale_format,
         w13_layout,
+        int(fused.fc1_tile_k),
+        int(fused.fc1_tile_n),
+        int(fused.fc2_tile_k),
+        int(fused.fc2_tile_n),
     )
     if collect_activation_amax:
         assert activation_amax is not None
