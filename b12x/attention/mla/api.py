@@ -27,6 +27,8 @@ _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
+_KV_FP8_ROPE_ENV = "KV_FP8_ROPE"
+_KV_FP8_ROPE_ENABLED = os.environ.get(_KV_FP8_ROPE_ENV, "0") == "1"
 
 
 if triton is not None and tl is not None:
@@ -134,6 +136,14 @@ def _is_supported_packed_kv_cache_view(
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_kv_fp8_rope(value: bool | None) -> bool:
+    # Cache layout is a process-lifetime ABI: only the literal operator gate
+    # value "1" enables it; unset and every other value retain the 432-byte ABI.
+    if value is not None:
+        return bool(value)
+    return _KV_FP8_ROPE_ENABLED
 
 
 def _use_sm120_sparse_mla(*, backend: str | None, device: torch.device) -> bool:
@@ -362,6 +372,7 @@ def sparse_mla_decode_forward(
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
     binding=None,
     sm_scale: float,
+    latent_scale: float = 1.0,
     v_head_dim: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
@@ -369,6 +380,8 @@ def sparse_mla_decode_forward(
     identity_page_table: bool = False,
     backend: str | None = None,
     forced_num_splits: int | None = None,
+    scale_format: int | None = None,
+    fp8_rope: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -390,6 +403,7 @@ def sparse_mla_decode_forward(
         active_token_counts=nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=sm_scale,
+        latent_scale=latent_scale,
         v_head_dim=v_head_dim,
         return_lse=return_lse,
         lse_scale=lse_scale,
@@ -397,6 +411,8 @@ def sparse_mla_decode_forward(
         identity_page_table=identity_page_table,
         backend=backend,
         forced_num_splits=forced_num_splits,
+        scale_format=scale_format,
+        fp8_rope=fp8_rope,
     )
 
 
@@ -409,10 +425,13 @@ def sparse_mla_extend_forward(
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
     binding=None,
     sm_scale: float,
+    latent_scale: float = 1.0,
     v_head_dim: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     identity_page_table: bool = False,
+    scale_format: int | None = None,
+    fp8_rope: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, selected_token_offsets, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -434,10 +453,13 @@ def sparse_mla_extend_forward(
         active_token_counts=nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=sm_scale,
+        latent_scale=latent_scale,
         v_head_dim=v_head_dim,
         return_lse=return_lse,
         lse_scale=lse_scale,
         identity_page_table=identity_page_table,
+        scale_format=scale_format,
+        fp8_rope=fp8_rope,
     )
 
 
@@ -450,6 +472,7 @@ def _run_sparse_mla(
     active_token_counts: torch.Tensor,
     workspace: object,
     sm_scale: float,
+    latent_scale: float = 1.0,
     v_head_dim: int,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
@@ -457,6 +480,8 @@ def _run_sparse_mla(
     identity_page_table: bool = False,
     backend: str | None = None,
     forced_num_splits: int | None = None,
+    scale_format: int | None = None,
+    fp8_rope: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -544,6 +569,34 @@ def _run_sparse_mla(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
     _sm120_route = _use_sm120_sparse_mla(backend=backend, device=q_all.device)
+    # NVFP4 (scale_format=2) selection: explicit kwarg wins; otherwise the
+    # scratch/workspace planned kv_cache_dtype supplies it. None -> inferred
+    # from q_head_dim inside the kernel launchers (fp8 GLM default).
+    scale_format_for_call = (
+        scale_format if scale_format is not None else getattr(workspace, "scale_format", None)
+    )
+    if int(scale_format_for_call or -1) == 2 and fp8_rope is None:
+        # Normal vLLM calls arrive through b12x.integration.mla, whose stable
+        # public signature does not carry this new option. The allocated record
+        # is therefore the authoritative process-lifetime ABI at this boundary;
+        # derive the specialization from it instead of rereading a mutable env.
+        record_bytes = int(kv_cache.shape[-1])
+        if record_bytes not in (368, 432):
+            raise ValueError(
+                "NVFP4 sparse MLA cache record must be 368 or 432 bytes, got "
+                f"{record_bytes}"
+            )
+        fp8_rope_for_call = record_bytes == 368
+    else:
+        fp8_rope_for_call = _resolve_kv_fp8_rope(fp8_rope)
+    if int(scale_format_for_call or -1) == 2:
+        expected_record_bytes = 368 if fp8_rope_for_call else 432
+        if int(kv_cache.shape[-1]) != expected_record_bytes:
+            raise ValueError(
+                "NVFP4 sparse MLA cache record disagrees with KV_FP8_ROPE: "
+                f"got {int(kv_cache.shape[-1])} bytes, expected "
+                f"{expected_record_bytes}"
+            )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
@@ -606,10 +659,13 @@ def _run_sparse_mla(
                 active_token_counts=active_token_counts,
                 workspace=workspace,
                 sm_scale=float(sm_scale),
+                latent_scale=float(latent_scale),
                 v_head_dim=int(v_head_dim),
                 attn_sink=attn_sink,
                 return_lse=return_lse,
                 lse_scale=lse_scale,
+                scale_format=scale_format_for_call,
+                fp8_rope=fp8_rope_for_call,
             )
         from .kernel import run_unified_decode
 
@@ -620,11 +676,14 @@ def _run_sparse_mla(
             swa_topk_lengths=active_token_counts,
             workspace=workspace,
             sm_scale=float(sm_scale),
+            latent_scale=float(latent_scale),
             swa_page_size=int(workspace.page_size),
             attn_sink=attn_sink,
             return_lse=return_lse,
             lse_scale=lse_scale,
             forced_num_splits=forced_num_splits,
+            scale_format_override=scale_format_for_call,
+            fp8_rope_override=fp8_rope_for_call,
         )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(
@@ -661,10 +720,13 @@ def _run_sm120_prefill(
     active_token_counts: torch.Tensor,
     workspace: object,
     sm_scale: float,
+    latent_scale: float,
     v_head_dim: int,
     attn_sink: torch.Tensor | None,
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
+    scale_format: int | None = None,
+    fp8_rope: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a prefill-like call to the active SM120 single-pass prefill."""
     from .kernel import run_unified_prefill
@@ -679,10 +741,13 @@ def _run_sm120_prefill(
         kv_cache=kv_cache,
         topk_indices=selected_indices,
         sm_scale=float(sm_scale),
+        latent_scale=float(latent_scale),
         page_block_size=int(workspace.page_size),
         topk_length=active_token_counts,
         attn_sink=attn_sink,
         output=output,
+        scale_format=scale_format,
+        fp8_rope=fp8_rope,
     )
     if not return_lse:
         return output
