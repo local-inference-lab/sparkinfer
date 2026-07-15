@@ -19,6 +19,7 @@ from b12x.gemm.dense import (
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
+    _wo_pdl_enabled_for_sm_count,
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
@@ -36,6 +37,11 @@ def _bk64_launch(
     launch_type=_DenseGemmLaunch,
     policy: _DenseGemmPolicy | None = None,
     sfb_k_reuse: bool = True,
+    n: int = 16384,
+    k: int = 1024,
+    l: int = 1,
+    mma_tiler_mn: tuple[int, int] = (128, 128),
+    b_tile_major: bool = False,
 ) -> _DenseGemmLaunch:
     if policy is None:
         policy = _DenseGemmPolicy(
@@ -47,9 +53,9 @@ def _bk64_launch(
             large_m_unroll=True,
         )
     return launch_type(
-        n=16384,
-        k=1024,
-        l=1,
+        n=n,
+        k=k,
+        l=l,
         c_l=1,
         a_major="k",
         b_major="k",
@@ -61,7 +67,7 @@ def _bk64_launch(
         sf_vec_size=32,
         mma_k=32,
         tile_k=64,
-        mma_tiler_mn=(128, 128),
+        mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         policy=policy,
         sm_count=SM,
@@ -69,7 +75,20 @@ def _bk64_launch(
         load_path="tma",
         swap_ab=False,
         sfb_k_reuse=sfb_k_reuse,
+        b_tile_major=b_tile_major,
     )
+
+
+def _compile_key_differences(
+    lhs: _DenseGemmLaunch, rhs: _DenseGemmLaunch
+) -> list[tuple[object, object]]:
+    return [
+        (lhs_value, rhs_value)
+        for lhs_value, rhs_value in zip(
+            lhs.compile_key(), rhs.compile_key(), strict=True
+        )
+        if lhs_value != rhs_value
+    ]
 
 
 def test_expected_m_decode_regime_selects_32x128():
@@ -106,11 +125,9 @@ def test_dense_compile_key_separates_replicated_sfb_reuse():
     generic_scales = _bk64_launch(sfb_k_reuse=False)
     replicated_scales = _bk64_launch()
 
-    assert generic_scales.compile_key() != replicated_scales.compile_key()
-    assert generic_scales.compile_key()[:-2] == replicated_scales.compile_key()[:-2]
-    assert generic_scales.compile_key()[-2] is False
-    assert replicated_scales.compile_key()[-2] is True
-    assert generic_scales.compile_key()[-1] == replicated_scales.compile_key()[-1]
+    assert _compile_key_differences(generic_scales, replicated_scales) == [
+        (False, True)
+    ]
 
 
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
@@ -119,20 +136,37 @@ def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
     monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", True)
     atom_24 = _bk64_launch()
 
-    assert atom_42.compile_key() != atom_24.compile_key()
-    assert atom_42.compile_key()[-3] is False
-    assert atom_24.compile_key()[-3] is True
+    assert _compile_key_differences(atom_42, atom_24) == [(False, True)]
 
 
 def test_dense_compile_key_separates_pdl_cubins(monkeypatch):
     monkeypatch.setattr(dense_module, "_B12X_WO_PDL", False)
-    ordinary_launch = _bk64_launch()
+    ordinary_launch = _bk64_launch(
+        n=4096,
+        k=4096,
+        mma_tiler_mn=(16, 128),
+        b_tile_major=True,
+    )
     monkeypatch.setattr(dense_module, "_B12X_WO_PDL", True)
-    pdl_launch = _bk64_launch()
+    pdl_launch = _bk64_launch(
+        n=4096,
+        k=4096,
+        mma_tiler_mn=(16, 128),
+        b_tile_major=True,
+    )
 
-    assert ordinary_launch.compile_key()[:-1] == pdl_launch.compile_key()[:-1]
-    assert ordinary_launch.compile_key()[-1] is False
-    assert pdl_launch.compile_key()[-1] is True
+    assert _compile_key_differences(ordinary_launch, pdl_launch) == [(False, True)]
+
+
+def test_wo_pdl_default_is_spark_only_but_env_remains_an_override(monkeypatch):
+    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", None)
+    assert _wo_pdl_enabled_for_sm_count(20)
+    assert not _wo_pdl_enabled_for_sm_count(188)
+
+    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", True)
+    assert _wo_pdl_enabled_for_sm_count(188)
+    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", False)
+    assert not _wo_pdl_enabled_for_sm_count(20)
 
 
 def test_fused_quant_compile_key_is_distinct_and_exhaustive():

@@ -89,12 +89,22 @@ from b12x.cute.fp4 import (
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
-_B12X_WO_PDL = os.environ.get("B12X_WO_PDL", "1").lower() not in {
-    "0",
-    "false",
-    "no",
-    "",
-}
+_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL")
+_B12X_WO_PDL: bool | None = (
+    None
+    if _B12X_WO_PDL_RAW is None
+    else _B12X_WO_PDL_RAW.lower() not in {"0", "false", "no", ""}
+)
+_WO_SPARK_MAX_SMS = 64
+
+
+def _wo_pdl_enabled_for_sm_count(sm_count: int) -> bool:
+    """Select the Spark PDL chain while preserving the explicit override."""
+    if _B12X_WO_PDL is not None:
+        return bool(_B12X_WO_PDL)
+    return int(sm_count) <= _WO_SPARK_MAX_SMS
+
+
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
     "VLLM_B12X_TIMING", "0"
 ) == "1"
@@ -2417,7 +2427,11 @@ class DenseGemmKernel:
 
                 pdl_prestaged_stages = Int32(0)
                 if cutlass.const_expr(self.pdl_prestage_b):
-                    if tile_sched.num_tiles_executed == Int32(0):
+                    if cutlass.const_expr(self.direct_one_m_tile_scheduler):
+                        pdl_first_tile = Int32(1)
+                    else:
+                        pdl_first_tile = tile_sched.num_tiles_executed == Int32(0)
+                    if pdl_first_tile:
                         # B is immutable across the chain, so it can fill the
                         # initial pipeline window while this grid is still
                         # waiting for its predecessor-produced A/SFA/source.
@@ -3673,8 +3687,10 @@ class _DenseGemmLaunch:
             and mma_tiler_mn == (32, 64)
             and (n, k, l) == (1024, 4096, 4)
         )
-        self._enable_pdl = _B12X_WO_PDL and b_tile_major and (
-            mma_tiler_mn[0] == 16 or exact_b16_wo_a
+        self._enable_pdl = (
+            _wo_pdl_enabled_for_sm_count(sm_count)
+            and b_tile_major
+            and (mma_tiler_mn[0] == 16 or exact_b16_wo_a)
         )
 
         if not DenseGemmKernel.can_implement(

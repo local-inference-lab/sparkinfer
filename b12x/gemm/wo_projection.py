@@ -17,6 +17,7 @@ from b12x.attention.workspace import (
 )
 from b12x.cute.utils import cuda_stream_to_int
 from b12x.gemm.dense import (
+    _WO_SPARK_MAX_SMS,
     dense_gemm,
     dense_gemm_fused_quant_a,
     dense_gemm_fused_quant_a_grouped,
@@ -49,6 +50,20 @@ if _WO_QUANT_CHUNKS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32):
         f"{_WO_QUANT_CHUNKS_PER_PROGRAM}"
     )
 _ALPHA_ONE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+
+def _use_spark_wo_policy(device: torch.device) -> bool:
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return (
+        int(torch.cuda.get_device_properties(index).multi_processor_count)
+        <= _WO_SPARK_MAX_SMS
+    )
+
+
+def _should_use_exact_b16_wo(*, tokens: int, sm_count: int) -> bool:
+    return int(tokens) == 16 and int(sm_count) <= _WO_SPARK_MAX_SMS
 
 
 @dataclass(frozen=True)
@@ -1430,7 +1445,9 @@ def _run_wo_a_quant_kernel(
         and rope_dim == 64
         and chunks_per_program == 16
     )
-    use_pdl = _WO_PDL or (_WO_EXACT_B16_PDL and fast_b16_scale)
+    use_pdl = _WO_PDL or (
+        _WO_EXACT_B16_PDL and fast_b16_scale and _use_spark_wo_policy(o.device)
+    )
     clear_programs = (
         groups * group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program
     )
@@ -2815,7 +2832,10 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             rope_dim=rope_dim,
             _initialize_scales=False,
         )
-    if tokens == 16:
+    if _should_use_exact_b16_wo(
+        tokens=tokens,
+        sm_count=torch.cuda.get_device_properties(o.device).multi_processor_count,
+    ):
         tmp_q_bases = empty_mxfp8_rows_bases(
             tokens,
             rank * groups,
