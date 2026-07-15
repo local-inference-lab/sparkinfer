@@ -57,6 +57,24 @@ def test_fused_indexer_warmup_rows_deduplicate_policies(monkeypatch):
     assert rows == (1, 2, 3)
 
 
+def test_fused_indexer_warmup_rows_cover_sm120_c4_policies(monkeypatch):
+    props = type(
+        "Props",
+        (),
+        {"major": 12, "minor": 0, "multi_processor_count": 188},
+    )()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    rows = fused_indexer_decode_warmup_rows(
+        topk=512,
+        num_heads=64,
+        max_pages=1024,
+        device=torch.device("cuda"),
+    )
+
+    assert rows == tuple(range(1, 17))
+
+
 def test_paged_dsv4_always_uses_large_fused_carry():
     assert _resolve_fused_batch_slack(
         kv_layout=KV_LAYOUT_PAGED,
@@ -114,9 +132,9 @@ def test_fused_indexer_route_keeps_generic_head_count_limit():
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
-def test_fused_indexer_route_retired_for_c4_decode_buckets(rows):
-    # C4 decode is owned by the streamed tiled route + two-level fold; fused
-    # remains only for MSA/contiguous and explicit opt-in.
+def test_fused_indexer_route_requires_c4_blackwell_capability(rows):
+    # C4 routing is hardware-specific. An unknown/CPU capability keeps the
+    # streamed tiled route instead of assuming either Blackwell policy.
     assert not resolve_fused_indexer_path(
         topk=512,
         num_rows=rows,
@@ -134,32 +152,40 @@ def test_fused_indexer_route_stops_after_c4_decode_buckets():
     )
 
 
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1)])
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
-def test_fused_indexer_route_covers_sm121_c4_decode_buckets(rows):
+def test_fused_indexer_route_covers_sm12x_c4_decode_buckets(
+    compute_capability, rows
+):
     assert resolve_fused_indexer_path(
         topk=512,
         num_rows=rows,
         width=1024 * 64,
         num_heads=64,
-        compute_capability=(12, 1),
+        compute_capability=compute_capability,
     )
 
 
-def test_fused_indexer_route_stops_after_sm121_c4_decode_buckets():
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1)])
+@pytest.mark.parametrize("rows", [17, 32])
+def test_fused_indexer_route_stops_after_sm12x_c4_decode_buckets(
+    compute_capability, rows
+):
     assert not resolve_fused_indexer_path(
         topk=512,
-        num_rows=32,
+        num_rows=rows,
         width=1024 * 64,
         num_heads=64,
-        compute_capability=(12, 1),
+        compute_capability=compute_capability,
     )
 
 
-def test_fused_indexer_scratch_rows_cover_sm121_c4_policy():
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1)])
+def test_fused_indexer_scratch_rows_cover_sm12x_c4_policy(compute_capability):
     assert fused_indexer_scratch_max_rows(
         topk=512,
         num_heads=64,
-        compute_capability=(12, 1),
+        compute_capability=compute_capability,
     ) == 16
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "b12x"
-version = "0.30.0"
+version = "0.30.2"
 description = "Unapologetically SM120-only CuTe DSL kernels for NVFP4 GEMM and MoE."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"

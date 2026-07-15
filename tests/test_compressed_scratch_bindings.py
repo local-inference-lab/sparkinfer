@@ -232,9 +232,8 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
 def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
-    # C4 decode is owned by the streamed tiled route + two-level fold; the
-    # fused kernel is retired from this shape (kept for MSA/contiguous and as
-    # an explicit opt-in).
+    # C4 routing is hardware-specific. A CPU plan has no Blackwell capability
+    # metadata, so it conservatively retains the streamed tiled route.
     plan = plan_indexer_scratch(
         B12XIndexerScratchCaps(
             device="cpu",
@@ -250,12 +249,15 @@ def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
     assert plan.layout.route == "paged_tiled"
 
 
+@pytest.mark.parametrize("minor,sm_count", [(0, 188), (1, 48)])
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32])
-def test_indexer_common_plan_selects_sm121_c4_decode_routes(monkeypatch, rows) -> None:
+def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
+    monkeypatch, minor, sm_count, rows
+) -> None:
     props = type(
         "Props",
         (),
-        {"major": 12, "minor": 1, "multi_processor_count": 48},
+        {"major": 12, "minor": minor, "multi_processor_count": sm_count},
     )()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
 
