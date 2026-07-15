@@ -37,6 +37,12 @@ _WO_PDL = os.environ.get("B12X_WO_PDL", "0").lower() not in {
     "no",
     "",
 }
+_WO_EXACT_B16_PDL = os.environ.get("B12X_WO_PDL", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
 if _WO_QUANT_CHUNKS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32):
     raise ValueError(
         "B12X_WO_QUANT_CHUNKS_PER_PROGRAM must be one of 1, 2, 4, 8, 16, or 32, got "
@@ -54,12 +60,15 @@ class MXFP8Rows:
     dense kernel consumes raw pointers and reconstructs its own K-major layout.
     `scale_rows` is the compact row/chunk view `[L, M, K/32]`, and `scale_mma`
     is the strided `[32, 4, ceil(M/128), 4, ceil(K/128), L]` view consumed by
-    the CuTe kernel.
+    the CuTe kernel. `values_tiled`, when present, is an additional load-time
+    packed copy for a specialized dense-GEMM RHS; `values` remains the logical
+    operand used by every fallback path.
     """
 
     values: torch.Tensor
     scale_rows: torch.Tensor
     scale_mma: torch.Tensor
+    values_tiled: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -530,6 +539,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     values,
     scale_rows,
     scale_mma,
+    clear_output,
     tokens,
     groups: tl.constexpr,
     heads_per_group: tl.constexpr,
@@ -547,10 +557,16 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     scale_mma_s3,
     scale_mma_s4,
     scale_mma_s5,
+    clear_output_stride_t,
+    clear_output_stride_n,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     HALF_ROPE_DIM: tl.constexpr,
     CHUNKS_PER_PROGRAM: tl.constexpr,
+    FAST_B16_SCALE: tl.constexpr,
+    CLEAR_OUTPUT: tl.constexpr,
+    CLEAR_HIDDEN: tl.constexpr,
+    CLEAR_BLOCK_SIZE: tl.constexpr,
     USE_PDL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
@@ -562,6 +578,18 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         tl.extra.cuda.gdc_wait()
     chunk = chunk_block * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
     d = chunk[:, None] * 32 + tl.arange(0, 32)[None, :]
+
+    if CLEAR_OUTPUT:
+        chunk_blocks = group_width // 32 // CHUNKS_PER_PROGRAM
+        clear_block = group * chunk_blocks + chunk_block
+        clear_n = clear_block * CLEAR_BLOCK_SIZE + tl.arange(0, CLEAR_BLOCK_SIZE)
+        tl.store(
+            clear_output
+            + token * clear_output_stride_t
+            + clear_n * clear_output_stride_n,
+            0.0,
+            mask=clear_n < CLEAR_HIDDEN,
+        )
 
     head_in_group = d // HEAD_DIM
     head_d = d - head_in_group * HEAD_DIM
@@ -591,9 +619,31 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     src = tl.where(is_rope, rotated, src)
 
     max_abs = tl.max(tl.abs(src), axis=1)
-    quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
-    scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
-    scale = tl.exp2(scale_exp)
+    if FAST_B16_SCALE:
+        max_bits = max_abs.to(tl.uint32, bitcast=True)
+        biased_exp = (max_bits >> 23) & 0xFF
+        mantissa = max_bits & 0x7FFFFF
+        scale_exp = (
+            biased_exp.to(tl.int32)
+            - 135
+            + (mantissa > 0x600000).to(tl.int32)
+        )
+        scale_exp = tl.minimum(tl.maximum(scale_exp, -127), 127)
+        scale_exp = tl.where(max_abs > 0.0, scale_exp, 0)
+        inv_scale_bits = tl.where(
+            scale_exp == 127,
+            max_bits * 0 + 0x00400000,
+            (127 - scale_exp).to(tl.uint32) << 23,
+        )
+        inv_scale = inv_scale_bits.to(tl.float32, bitcast=True)
+        scaled_src = src * inv_scale[:, None]
+    else:
+        quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
+        scale_exp = tl.minimum(
+            tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0
+        )
+        scale = tl.exp2(scale_exp)
+        scaled_src = src / scale[:, None]
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
 
     tl.store(
@@ -601,7 +651,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         + token * values_stride_t
         + d * values_stride_d
         + group * values_stride_g,
-        (src / scale[:, None]).to(tl.float8e4nv),
+        scaled_src.to(tl.float8e4nv),
     )
 
     sf_cols = group_width // 32
@@ -1140,7 +1190,32 @@ def pack_fp8_block_scaled_weight_mxfp8(
         k=k,
         num_groups=num_groups,
     )
-    return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
+    values_tiled = None
+    tile_n = 0
+    if (num_groups, m, k) == (4, 1024, 4096):
+        tile_n = 64
+    elif (num_groups, m, k) == (1, 4096, 4096):
+        tile_n = 128
+    if tile_n:
+        # Physical [L, Ntile, Ktile, Ninner, Kinner], specialized for the
+        # production decode WO Ntile/BK128 GEMMs. Keep `values` in its logical
+        # layout for all other schedules and callers.
+        values_lnk = (
+            values.permute(2, 0, 1) if num_groups > 1 else values.unsqueeze(0)
+        )
+        values_tiled = (
+            values_lnk.reshape(
+                num_groups, m // tile_n, tile_n, k // 128, 128
+            )
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+    return MXFP8Rows(
+        values=values,
+        scale_rows=scale_rows,
+        scale_mma=scale_mma,
+        values_tiled=values_tiled,
+    )
 
 
 def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
@@ -1201,6 +1276,32 @@ def _check_mxfp8_rows_storage(
         raise ValueError(
             f"out.scale_mma must be float8_e8m0fnu, got {out.scale_mma.dtype}"
         )
+    if out.values_tiled is not None:
+        _check_gpu_tensor("out.values_tiled", out.values_tiled)
+        if out.values_tiled.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "out.values_tiled must be float8_e4m3fn, "
+                f"got {out.values_tiled.dtype}"
+            )
+        expected_tiled_shapes = {
+            (4, 1024, 4096): (4, 16, 32, 64, 128),
+            (1, 4096, 4096): (1, 32, 32, 128, 128),
+        }
+        expected_tiled_shape = expected_tiled_shapes.get((num_groups, m, k))
+        if expected_tiled_shape is None or tuple(
+            out.values_tiled.shape
+        ) != expected_tiled_shape:
+            raise ValueError(
+                "out.values_tiled is only supported for production WO-A/WO-B; "
+                f"got dimensions {(num_groups, m, k)} and shape "
+                f"{tuple(out.values_tiled.shape)}, expected {expected_tiled_shape}"
+            )
+        if out.values_tiled.device != out.values.device:
+            raise ValueError(
+                "out.values_tiled and out.values must be on the same device"
+            )
+        if not out.values_tiled.is_contiguous():
+            raise ValueError("out.values_tiled must be contiguous")
     if num_groups == 1:
         if out.values.shape != (m, k):
             raise ValueError(
@@ -1309,6 +1410,7 @@ def _run_wo_a_quant_kernel(
     head_dim: int,
     nope_dim: int,
     rope_dim: int,
+    clear_output: torch.Tensor | None = None,
 ) -> None:
     # Measured on RTX PRO 6000 at the DS4-Flash TP2 prefill shape (M=8192):
     # this Triton kernel (263us) beats the branchless CuTe inverse-RoPE port
@@ -1318,6 +1420,44 @@ def _run_wo_a_quant_kernel(
     out_scale_mma_u8 = out_scale_mma.view(torch.uint8)
     values_stride_g = out_values.stride(2) if out_values.ndim == 3 else 0
     chunks_per_program = _wo_quant_chunks_per_program(group_width)
+    fast_b16_scale = (
+        tokens == 16
+        and groups == 4
+        and heads_per_group == 8
+        and group_width == 4096
+        and head_dim == 512
+        and nope_dim == 448
+        and rope_dim == 64
+        and chunks_per_program == 16
+    )
+    use_pdl = _WO_PDL or (_WO_EXACT_B16_PDL and fast_b16_scale)
+    clear_programs = (
+        groups * group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program
+    )
+    if clear_output is None:
+        clear_output_arg = out_values
+        clear_output_stride_t = 0
+        clear_output_stride_n = 0
+        clear_hidden = 0
+        clear_block_size = 1
+    else:
+        if (
+            clear_output.ndim != 3
+            or int(clear_output.shape[0]) != tokens
+            or int(clear_output.shape[2]) != 1
+            or clear_output.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "quantizer clear output must be BF16 [tokens, hidden, 1], got "
+                f"{clear_output.dtype} {tuple(clear_output.shape)}"
+            )
+        clear_output_arg = clear_output
+        clear_output_stride_t = clear_output.stride(0)
+        clear_output_stride_n = clear_output.stride(1)
+        clear_hidden = int(clear_output.shape[1])
+        clear_block_size = triton.next_power_of_2(
+            math.ceil(clear_hidden / clear_programs)
+        )
     _quantize_attention_inv_rope_to_tdg_kernel[
         (
             tokens,
@@ -1331,6 +1471,7 @@ def _run_wo_a_quant_kernel(
         out_values,
         out_scale_rows.view(torch.uint8),
         out_scale_mma_u8,
+        clear_output_arg,
         tokens,
         groups,
         heads_per_group,
@@ -1348,13 +1489,19 @@ def _run_wo_a_quant_kernel(
         out_scale_mma.stride(3),
         out_scale_mma.stride(4),
         out_scale_mma.stride(5),
+        clear_output_stride_t,
+        clear_output_stride_n,
         HEAD_DIM=head_dim,
         NOPE_DIM=nope_dim,
         HALF_ROPE_DIM=rope_dim // 2,
         CHUNKS_PER_PROGRAM=chunks_per_program,
-        USE_PDL=_WO_PDL,
-        launch_pdl=_WO_PDL,
-        num_warps=4,
+        FAST_B16_SCALE=fast_b16_scale,
+        CLEAR_OUTPUT=clear_output is not None,
+        CLEAR_HIDDEN=clear_hidden,
+        CLEAR_BLOCK_SIZE=clear_block_size,
+        USE_PDL=use_pdl,
+        launch_pdl=use_pdl,
+        num_warps=2 if tokens == 16 else 4,
     )
 
 
@@ -2187,6 +2334,7 @@ def wo_a_dense_gemm_mxfp8(
     wo_a_rdg: MXFP8Rows,
     *,
     out: torch.Tensor | None = None,
+    quantized_out: MXFP8Rows | None = None,
     alpha: torch.Tensor | None = None,
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
@@ -2212,16 +2360,25 @@ def wo_a_dense_gemm_mxfp8(
         )
     if out is not None:
         _check_dense_gemm_mnl_view("out", out)
+    tokens = int(x_tdg.values.shape[0])
+    rank = int(wo_a_rdg.values.shape[0])
+    groups = int(wo_a_rdg.values.shape[2]) if wo_a_rdg.values.ndim == 3 else 1
+    if quantized_out is not None:
+        _check_mxfp8_rows_storage(
+            quantized_out,
+            m=tokens,
+            k=rank * groups,
+            num_groups=1,
+        )
     # When out is None, dense_gemm allocates + returns functionally (no caller
     # view mutated in the compile graph). The returned [M,N,L] is read downstream
     # via strides, so its physical layout does not matter.
-    mma_tiler_mn = (
-        (16, 64)
-        if expected_m is not None
-        and 1 <= expected_m <= 8
-        and wo_a_rdg.values.shape[0] <= 1536
-        else None
-    )
+    mma_tiler_mn = None
+    if expected_m is not None and wo_a_rdg.values.shape[0] <= 1536:
+        if 1 <= expected_m <= 8:
+            mma_tiler_mn = (16, 64)
+        elif expected_m == 16:
+            mma_tiler_mn = (32, 64)
     x_values = x_tdg.values
     wo_a_values = wo_a_rdg.values
     if x_values.ndim == 2:
@@ -2230,6 +2387,11 @@ def wo_a_dense_gemm_mxfp8(
     return dense_gemm(
         (x_values, x_tdg.scale_mma),
         (wo_a_values, wo_a_rdg.scale_mma),
+        rhs_values_tiled=(
+            wo_a_rdg.values_tiled
+            if mma_tiler_mn in ((16, 64), (32, 64), (64, 64))
+            else None
+        ),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
@@ -2239,6 +2401,15 @@ def wo_a_dense_gemm_mxfp8(
         mma_tiler_mn=mma_tiler_mn,
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
+        _quantized_c=(
+            (
+                quantized_out.values,
+                quantized_out.scale_rows.reshape(tokens, -1),
+                quantized_out.scale_mma,
+            )
+            if quantized_out is not None
+            else None
+        ),
         stream=stream,
     )
 
@@ -2268,6 +2439,7 @@ def wo_b_dense_gemm_mxfp8(
         )
     if out is not None:
         _check_dense_gemm_mnl_view("out", out)
+    mma_tiler_mn = (32, 64) if expected_m == 16 else None
     # out=None -> dense_gemm allocates + returns functionally (no caller view
     # mutated in the compile graph).
     return dense_gemm(
@@ -2287,12 +2459,16 @@ def wo_b_dense_gemm_mxfp8(
             ),
             wo_b_hgr.scale_mma,
         ),
+        rhs_values_tiled=(
+            wo_b_hgr.values_tiled if expected_m == 16 else None
+        ),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=out,
         alpha=alpha,
+        mma_tiler_mn=mma_tiler_mn,
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
         stream=stream,
@@ -2405,6 +2581,11 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         out=out,
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
+        rhs_values_tiled=(
+            wo_b_hgr.values_tiled
+            if expected_m is not None and 1 <= expected_m <= 8
+            else None
+        ),
         a_inner_span=inner_span,
         _atomic_output_precleared=_atomic_output_precleared,
         stream=stream,
@@ -2530,9 +2711,11 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     wo_a_values: torch.Tensor,
+    wo_a_values_tiled: torch.Tensor | None,
     wo_a_scale_rows: torch.Tensor,
     wo_a_scale_mma: torch.Tensor,
     wo_b_values: torch.Tensor,
+    wo_b_values_tiled: torch.Tensor | None,
     wo_b_scale_rows: torch.Tensor,
     wo_b_scale_mma: torch.Tensor,
     groups: int,
@@ -2554,10 +2737,16 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     # [tokens, hidden, 1] base.
     weights = WOProjectionMXFP8Weights(
         wo_a=MXFP8Rows(
-            values=wo_a_values, scale_rows=wo_a_scale_rows, scale_mma=wo_a_scale_mma
+            values=wo_a_values,
+            scale_rows=wo_a_scale_rows,
+            scale_mma=wo_a_scale_mma,
+            values_tiled=wo_a_values_tiled,
         ),
         wo_b=MXFP8Rows(
-            values=wo_b_values, scale_rows=wo_b_scale_rows, scale_mma=wo_b_scale_mma
+            values=wo_b_values,
+            scale_rows=wo_b_scale_rows,
+            scale_mma=wo_b_scale_mma,
+            values_tiled=wo_b_values_tiled,
         ),
         groups=groups,
         group_width=group_width,
@@ -2567,16 +2756,8 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     )
     alpha_one = _cached_alpha_one(o.device)
     tokens = int(o.shape[0])
-    # See wo_projection_mxfp8: move the tiny-M atomic split-K clear ahead of
-    # the quantize -> WO-A -> WO-B PDL chain.  The allocation stays internal to
-    # this opaque op and is graph-stable after capture.
-    atomic_output_precleared = _WO_PDL and tokens <= 8
-    output = None
-    if atomic_output_precleared:
-        output = torch.empty(
-            (tokens, hidden, 1), dtype=torch.bfloat16, device=o.device
-        )
-        output.zero_()
+    # Tiny-M WO-B uses atomic split-K. Clear its output inside the initial
+    # inverse-RoPE quantizer so the decode graph does not need a fill launch.
     # WO-A stays on the standalone quantizer + GEMM: fusing the quant into the
     # WO-A GEMM's DMA warp measured ~2x slower at M=1 (N=rank is small, K is
     # deep, and every n-tile CTA re-quantizes the row without a source
@@ -2586,16 +2767,83 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     # uint8 unity-fill launches; poisoned-padding tests pin that it cannot
     # affect a logical output row. Standalone quantizers retain initialized
     # padding.
-    x_q = quantize_wo_a_input_inv_rope_mxfp8(
-        o,
-        positions,
-        cos_sin_cache,
-        groups=groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        _initialize_scales=False,
-    )
+    atomic_output_precleared = tokens <= 8
+    output = None
+    if atomic_output_precleared:
+        output = torch.empty(
+            (tokens, hidden, 1), dtype=torch.bfloat16, device=o.device
+        )
+        values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+            tokens,
+            group_width,
+            num_groups=groups,
+            device=o.device,
+            initialize_scales=False,
+        )
+        x_q = mxfp8_rows_from_bases(
+            values_base,
+            scale_rows_base,
+            scale_physical_base,
+            tokens,
+            group_width,
+            num_groups=groups,
+        )
+        _run_wo_a_quant_kernel(
+            o,
+            positions,
+            cos_sin_cache,
+            x_q.values,
+            x_q.scale_rows,
+            x_q.scale_mma,
+            tokens,
+            groups,
+            heads_per_group,
+            group_width,
+            nope_dim + rope_dim,
+            nope_dim,
+            rope_dim,
+            clear_output=output,
+        )
+    else:
+        x_q = quantize_wo_a_input_inv_rope_mxfp8(
+            o,
+            positions,
+            cos_sin_cache,
+            groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            _initialize_scales=False,
+        )
+    if tokens == 16:
+        tmp_q_bases = empty_mxfp8_rows_bases(
+            tokens,
+            rank * groups,
+            num_groups=1,
+            device=o.device,
+            initialize_scales=False,
+        )
+        tmp_q = mxfp8_rows_from_bases(
+            *tmp_q_bases,
+            tokens,
+            rank * groups,
+            num_groups=1,
+        )
+        wo_a_dense_gemm_mxfp8(
+            x_q,
+            weights.wo_a,
+            quantized_out=tmp_q,
+            expected_m=expected_m,
+            sfb_k_replicated=weights.sfb_k_replicated,
+            stream=stream_int,
+        )
+        return wo_b_dense_gemm_mxfp8(
+            tmp_q,
+            weights.wo_b,
+            expected_m=expected_m,
+            sfb_k_replicated=weights.sfb_k_replicated,
+            stream=stream_int,
+        )
     tmp = wo_a_dense_gemm_mxfp8(
         x_q,
         weights.wo_a,
@@ -2633,9 +2881,11 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     wo_a_values: torch.Tensor,
+    wo_a_values_tiled: torch.Tensor | None,
     wo_a_scale_rows: torch.Tensor,
     wo_a_scale_mma: torch.Tensor,
     wo_b_values: torch.Tensor,
+    wo_b_values_tiled: torch.Tensor | None,
     wo_b_scale_rows: torch.Tensor,
     wo_b_scale_mma: torch.Tensor,
     groups: int,
@@ -2740,9 +2990,11 @@ def wo_projection_inv_rope_mxfp8(
         positions,
         cos_sin_cache,
         weights.wo_a.values,
+        weights.wo_a.values_tiled,
         weights.wo_a.scale_rows,
         weights.wo_a.scale_mma,
         weights.wo_b.values,
+        weights.wo_b.values_tiled,
         weights.wo_b.scale_rows,
         weights.wo_b.scale_mma,
         weights.groups,

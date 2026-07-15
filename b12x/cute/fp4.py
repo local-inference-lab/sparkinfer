@@ -649,6 +649,31 @@ def ld_global_v4_f32(
 
 
 @dsl_user_op
+def st_global_u32(
+    base_ptr: Int64,
+    value: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store one uint32 to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_global_v4_u32(
     base_ptr: Int64,
     v0: Uint32,
