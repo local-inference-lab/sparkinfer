@@ -2394,7 +2394,14 @@ def wo_a_dense_gemm_mxfp8(
     if expected_m is not None and wo_a_rdg.values.shape[0] <= 1536:
         if 1 <= expected_m <= 8:
             mma_tiler_mn = (16, 64)
-        elif expected_m == 16:
+        # B16 is the existing generic decode policy; the B9-15 extension is
+        # measured for the DSV4 TP2 WO-A shape only.
+        elif expected_m == 16 or (
+            9 <= expected_m <= 15
+            and rank == 1024
+            and int(x_tdg.values.shape[1]) == 512
+            and groups == 4
+        ):
             mma_tiler_mn = (32, 64)
     x_values = x_tdg.values
     wo_a_values = wo_a_rdg.values
@@ -2456,7 +2463,14 @@ def wo_b_dense_gemm_mxfp8(
         )
     if out is not None:
         _check_dense_gemm_mnl_view("out", out)
-    mma_tiler_mn = (32, 64) if expected_m == 16 else None
+    # Preserve the generic B16 policy while limiting the B9-15 packed tile to
+    # the measured DSV4 TP2 WO-B shape.
+    use_decode_tile = expected_m == 16 or (
+        expected_m is not None
+        and 9 <= expected_m <= 15
+        and tuple(wo_b_hgr.values.shape) == (4096, 4096)
+    )
+    mma_tiler_mn = (32, 64) if use_decode_tile else None
     # out=None -> dense_gemm allocates + returns functionally (no caller view
     # mutated in the compile graph).
     return dense_gemm(
@@ -2477,7 +2491,7 @@ def wo_b_dense_gemm_mxfp8(
             wo_b_hgr.scale_mma,
         ),
         rhs_values_tiled=(
-            wo_b_hgr.values_tiled if expected_m == 16 else None
+            wo_b_hgr.values_tiled if use_decode_tile else None
         ),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
@@ -2832,10 +2846,24 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             rope_dim=rope_dim,
             _initialize_scales=False,
         )
-    if _should_use_exact_b16_wo(
+    sm_count = torch.cuda.get_device_properties(o.device).multi_processor_count
+    # Keep upstream's Spark-only B16 policy. The B9-15 extension is likewise
+    # retained only for the measured DSV4 TP2 inverse-RoPE contract.
+    use_quantized_intermediate = _should_use_exact_b16_wo(
         tokens=tokens,
-        sm_count=torch.cuda.get_device_properties(o.device).multi_processor_count,
-    ):
+        sm_count=sm_count,
+    ) or (
+        9 <= tokens <= 15
+        and sm_count <= _WO_SPARK_MAX_SMS
+        and groups == 4
+        and group_width == 512
+        and rank == 1024
+        and hidden == 4096
+        and heads_per_group == 1
+        and nope_dim == 448
+        and rope_dim == 64
+    )
+    if use_quantized_intermediate:
         tmp_q_bases = empty_mxfp8_rows_bases(
             tokens,
             rank * groups,

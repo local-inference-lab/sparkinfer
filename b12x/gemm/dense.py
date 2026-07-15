@@ -5219,10 +5219,11 @@ def _select_default_mma_tiler_mn(
         # (N,K,expected_m), reused for every live M in that regime under frozen
         # resolution (M-independent within the regime). Probe optima
         # (benchmarks/probe_dense_fp8_tile_sweep.py): exact M=1 -> 16x64
-        # (flushed common-shape decode sweep); expected_m=2..8 -> 16x128
-        # (tiny-M decode; mirrors the no-hint m<=8 specialization so cudagraph
-        # decode batches <=8 -- where callers like vLLM set expected_m == live m
-        # -- get the decode tile instead of being lumped into the 32x128 bucket);
+        # (flushed common-shape decode sweep); expected_m=2..8 -> 16x128.
+        # The DSV4 TP2 q_b shape keeps that tile through M=16; its 16-row tile
+        # sustains two resident CTAs per SM, while 32x128 drops to one and loses
+        # the evict-first short-K load policy. Other wide-N shapes retain the
+        # existing 32x128 small-batch regime.
         # <=128 (small batch) -> 32x128 (~25% faster than 64x128 at M=32..128);
         # else -> 64x128 (the M-independent default, good to prefill).
         if expected_m is not None:
@@ -5243,7 +5244,9 @@ def _select_default_mma_tiler_mn(
                 return (128, 128)
             if expected_m == 1:
                 return (16, 64)
-            if expected_m <= 8:
+            if expected_m <= 8 or (
+                expected_m <= 16 and (n, k) == (16384, 1024)
+            ):
                 return (16, 128)
             if expected_m <= 128:
                 return (32, 128)

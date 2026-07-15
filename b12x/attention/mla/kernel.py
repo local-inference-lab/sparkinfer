@@ -185,18 +185,49 @@ def _dsv4_h16_auto(
     h8_num_splits: int,
     sm_count: int | None = None,
 ) -> bool:
+    h8_ctas = rows * (heads // 8) * max(1, int(h8_num_splits))
     # Spark reaches a full H8 launch wave much earlier than the 188-SM tuning
     # target. C128's 130-chunk gather is enough to amortize H16 even at B=1;
-    # shorter gathers need B=8 before sharing each KV stage across 16 heads wins.
+    # shorter gathers usually need B=8 before sharing each KV stage across 16
+    # heads wins. Two short-gather wave cliffs are exceptions: C4/B7's H8 plan
+    # launches more than two waves, while C1/B13-15 halves its launch grid with
+    # H16. Both regimes are measured wins on the 48-SM Spark.
     if sm_count is not None and sm_count <= 64:
         if num_chunks >= 128:
             return True
         if rows >= 8 and num_chunks > 2:
             return True
+        if heads == 32 and sm_count == 48:
+            if num_chunks == 2 and 13 <= rows <= 15:
+                return True
+            if num_chunks == 10 and h8_ctas > 2 * sm_count:
+                return True
     if num_chunks >= _DSV4_H16_MIN_BW_CHUNKS and rows >= _DSV4_H16_MIN_BW_ROWS:
         return True
-    h8_ctas = rows * (heads // 8) * max(1, int(h8_num_splits))
     return h8_ctas > _DSV4_H16_H8_CTA_LIMIT
+
+
+def _dsv4_spark_short_gather_num_splits(
+    *,
+    rows: int,
+    heads: int,
+    num_chunks: int,
+    sm_count: int | None,
+    native_dsv4_h16: bool,
+) -> int | None:
+    """Return measured Spark split overrides for DSV4 TP2 short gathers."""
+    if (
+        not native_dsv4_h16
+        or heads != 32
+        or sm_count is None
+        or sm_count != 48
+    ):
+        return None
+    if num_chunks == 2 and 13 <= rows <= 15:
+        return 1
+    if num_chunks == 10:
+        return {7: 2, 13: 4, 14: 3}.get(rows)
+    return None
 
 
 def _wave_balanced_num_splits(
@@ -264,6 +295,7 @@ def plan_unified_decode_splits(
     h_blocks: int = 1,
     sm_count: int | None = None,
     extra_topk: int = 0,
+    preferred_num_splits: int | None = None,
 ) -> tuple[int, int, int]:
     """Return ``(num_chunks, num_splits, chunks_per_split)``.
 
@@ -280,7 +312,8 @@ def plan_unified_decode_splits(
     Override precedence (highest first):
       1. ``forced_num_splits`` (explicit caller arg -- multi-split numeric checks).
       2. ``B12X_MLA_SM120_NUM_SPLITS`` env (>=1 pins; <=0/unset -> heuristic).
-      3. The FlashInfer-ported wave-balanced heuristic (needs ``sm_count``;
+      3. ``preferred_num_splits`` (shape-only hardware policy, when provided).
+      4. The FlashInfer-ported wave-balanced heuristic (needs ``sm_count``;
          falls back to 1 if ``sm_count`` is unavailable).
 
     ``num_splits`` is clamped to ``[1, num_chunks]`` and to ``max_chunks`` (the
@@ -310,6 +343,8 @@ def plan_unified_decode_splits(
         env_override = _env_num_splits_override()
         if env_override > 0:
             num_splits = env_override
+        elif preferred_num_splits is not None:
+            num_splits = max(1, int(preferred_num_splits))
         elif sm_count and sm_count > 0:
             num_splits = _wave_balanced_num_splits(
                 num_chunks=num_chunks,
@@ -2458,6 +2493,15 @@ def run_unified_decode(
             extra_len_t = torch.full(
                 (rows,), extra_topk, dtype=torch.int32, device=q_all.device
             )
+    preferred_num_splits = None
+    if int(model_type) == int(ModelType.DSV4):
+        preferred_num_splits = _dsv4_spark_short_gather_num_splits(
+            rows=rows,
+            heads=heads,
+            num_chunks=num_main_chunks + num_extra_chunks,
+            sm_count=sm_count,
+            native_dsv4_h16=native_dsv4_h16,
+        )
     num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
         topk=topk,
         max_chunks=max_chunks,
@@ -2466,6 +2510,7 @@ def run_unified_decode(
         h_blocks=h_blocks,
         sm_count=sm_count,
         extra_topk=extra_topk,
+        preferred_num_splits=preferred_num_splits,
     )
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
