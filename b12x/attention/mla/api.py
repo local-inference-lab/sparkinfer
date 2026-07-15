@@ -597,6 +597,10 @@ def _run_sparse_mla(
                 f"got {int(kv_cache.shape[-1])} bytes, expected "
                 f"{expected_record_bytes}"
             )
+        if not _sm120_route:
+            raise NotImplementedError(
+                "NVFP4 sparse MLA requires the active SM120 kernel path"
+            )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
