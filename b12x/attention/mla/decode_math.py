@@ -363,16 +363,18 @@ def s0_quantize_q_to_smem(
             i += Int32(num_threads)
 
     # --- Steps 2-3: per-(head,tile) absmax over valid heads. ---
+    # Keep the dynamic-loop index names distinct across const_expr branches:
+    # CuTe joins same-named Python locals before pruning and rejects None->Int32.
     if cutlass.const_expr(fused_subgroup_quant):
         # Native DSV4 gives each 8-lane subgroup one complete 64-value tile.
         # Keep its eight values per lane live through the reduction so scale
         # construction and quantization need no shared amax round-trip or
         # second global Q load.
         lane8 = tid & Int32(7)
-        slot = tid >> Int32(3)
-        while slot < Int32(hpb * num_scales):
-            h = slot // Int32(num_scales)
-            blk = slot - h * Int32(num_scales)
+        fused_slot = tid >> Int32(3)
+        while fused_slot < Int32(hpb * num_scales):
+            h = fused_slot // Int32(num_scales)
+            blk = fused_slot - h * Int32(num_scales)
             values = [Float32(0.0) for _ in range(quant_tile // 8)]
             amax = Float32(0.0)
             for k in cutlass.range_constexpr(quant_tile // 8):
@@ -388,7 +390,7 @@ def s0_quantize_q_to_smem(
             raw = fmax_f32(amax, Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
             rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
             if lane8 == Int32(0):
-                q_sc_view[slot] = rounded
+                q_sc_view[fused_slot] = rounded
 
             inv_scale = Float32(1.0) / rounded
             for k in cutlass.range_constexpr(quant_tile // 8):
@@ -401,7 +403,7 @@ def s0_quantize_q_to_smem(
                     _smem_byte(q_fp8_base_addr, out_byte),
                     (fp8_bits & Uint32(0xFF)).to(cutlass.Uint8),
                 )
-            slot += Int32(num_threads // 8)
+            fused_slot += Int32(num_threads // 8)
 
         cute.arch.barrier(**bar_kw)
         return
@@ -410,10 +412,10 @@ def s0_quantize_q_to_smem(
         # Native DSV4 uses 64-value tiles. Four 8-lane subgroups per warp each
         # own one tile, so every max has a single writer and needs no atomic.
         lane8 = tid & Int32(7)
-        slot = tid >> Int32(3)
-        while slot < valid_hpb * Int32(num_scales):
-            h = slot // Int32(num_scales)
-            blk = slot - h * Int32(num_scales)
+        subgroup_slot = tid >> Int32(3)
+        while subgroup_slot < valid_hpb * Int32(num_scales):
+            h = subgroup_slot // Int32(num_scales)
+            blk = subgroup_slot - h * Int32(num_scales)
             amax = Float32(0.0)
             for k in cutlass.range_constexpr(quant_tile // 8):
                 d = blk * Int32(quant_tile) + lane8 + Int32(k * 8)
@@ -425,8 +427,8 @@ def s0_quantize_q_to_smem(
                     amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)
                 )
             if lane8 == Int32(0):
-                amax_view[slot] = amax
-            slot += Int32(num_threads // 8)
+                amax_view[subgroup_slot] = amax
+            subgroup_slot += Int32(num_threads // 8)
     else:
         i = tid
         while i < Int32(hpb * num_scales):
@@ -440,8 +442,10 @@ def s0_quantize_q_to_smem(
             d = idx - h * Int32(d_nope)
             blk = d // Int32(quant_tile)
             v = Float32(q_token[head_base + h, d])
-            slot = h * Int32(num_scales) + blk
-            amax_addr = shared_ptr_to_u32(amax_view.iterator) + slot * Int32(4)
+            amax_slot = h * Int32(num_scales) + blk
+            amax_addr = (
+                shared_ptr_to_u32(amax_view.iterator) + amax_slot * Int32(4)
+            )
             atomic_max_shared_f32(amax_addr, fabs_f32(v))
             idx += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
