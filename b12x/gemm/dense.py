@@ -316,7 +316,7 @@ def _dense_gemm_policy_for(
     # Tiny M already has distinct scheduler/load policies and is warmed
     # separately by contract.
     use_large_m_unroll = (
-        expected_m >= 8192
+        expected_m >= 4096
         if expected_m is not None
         else not single_work_tile_per_cta
         and not direct_one_m_tile_scheduler
@@ -390,6 +390,7 @@ class DenseGemmKernel:
         quantize_c: bool = False,
         alpha_is_one: bool = False,
         direct_sfa_live16: bool = False,
+        target_occupancy: int = 1,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -485,7 +486,7 @@ class DenseGemmKernel:
             self.atom_shape = (4, 2, 1)
 
         self.tiled_mma = None
-        self.occupancy = 1
+        self.occupancy = target_occupancy
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.num_mma_warps = 2
         elif mma_atom_mn in ((32, 64), (32, 128)):
@@ -3256,14 +3257,27 @@ class DenseGemmKernel:
                                         ),
                                     )
                             else:
-                                cute.copy(
-                                    tma_atom_b,
-                                    tBgB_k,
-                                    tBsB_pipe,
-                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                        mainloop_producer_state
-                                    ),
-                                )
+                                if cutlass.const_expr(self.occupancy > 1):
+                                    cute.copy(
+                                        tma_atom_b,
+                                        tBgB_k,
+                                        tBsB_pipe,
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        cache_policy=Int64(
+                                            0x12F0000000000000
+                                        ),
+                                    )
+                                else:
+                                    cute.copy(
+                                        tma_atom_b,
+                                        tBgB_k,
+                                        tBsB_pipe,
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                    )
                         if cutlass.const_expr(
                             not self.manual_bk64_sf
                             and not self.direct_sfb_representative
@@ -3604,6 +3618,7 @@ class _DenseGemmLaunch:
         quantize_c: bool = False,
         alpha_is_one: bool = False,
         direct_sfa_live16: bool = False,
+        target_occupancy: int = 1,
     ):
         self._n = n
         self._k = k
@@ -3635,6 +3650,7 @@ class _DenseGemmLaunch:
         self._quantize_c = quantize_c
         self._alpha_is_one = alpha_is_one
         self._direct_sfa_live16 = direct_sfa_live16
+        self._target_occupancy = target_occupancy
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -3685,8 +3701,9 @@ class _DenseGemmLaunch:
                 f"load_path={load_path}, swap_ab={swap_ab}"
             )
 
-        self._max_active_clusters = _max_active_clusters_for(
-            self._cluster_shape_mn, sm_count
+        self._max_active_clusters = (
+            _max_active_clusters_for(self._cluster_shape_mn, sm_count)
+            * self._target_occupancy
         )
         if (
             mma_tiler_mn == (32, 64)
@@ -3732,6 +3749,7 @@ class _DenseGemmLaunch:
             self._quantize_c,
             self._alpha_is_one,
             self._direct_sfa_live16,
+            self._target_occupancy,
         )
 
     @cute.jit
@@ -3844,6 +3862,7 @@ class _DenseGemmLaunch:
             quantize_c=self._quantize_c,
             alpha_is_one=self._alpha_is_one,
             direct_sfa_live16=self._direct_sfa_live16,
+            target_occupancy=self._target_occupancy,
         )(
             a_tensor,
             a_tensor,
@@ -3964,6 +3983,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             atom_shape_24=self._atom_shape_24,
             enable_pdl=self._enable_pdl,
             b_tile_major=self._b_tile_major,
+            target_occupancy=self._target_occupancy,
         )(
             a_tensor,
             a_source,
@@ -4193,6 +4213,7 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
             enable_pdl=self._enable_pdl,
+            target_occupancy=self._target_occupancy,
         )(
             a_tensor,
             a_source,
@@ -4473,6 +4494,39 @@ def dense_gemm_fused_quant_a_grouped(
     )
 
 
+def _dense_gemm_target_occupancy(
+    *,
+    n: int,
+    k: int,
+    l: int,
+    ab_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    tile_k: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    sm_count: int,
+    load_path: str,
+    swap_ab: bool,
+    b_tile_major: bool,
+) -> int:
+    tile_m, tile_n = mma_tiler_mn
+    n_tiles = ((n + tile_n - 1) // tile_n) * l
+    return (
+        2
+        if ab_dtype == cutlass.Float8E4M3FN
+        and c_dtype == cutlass.BFloat16
+        and tile_k == 128
+        and tile_m == 16
+        and k <= 1024
+        and cluster_shape_mn == (1, 1)
+        and load_path == "tma"
+        and not swap_ab
+        and not b_tile_major
+        and n_tiles >= 2 * sm_count
+        else 1
+    )
+
+
 @functools.cache
 def _get_compiled_dense_gemm(
     n: int,
@@ -4592,6 +4646,20 @@ def _get_compiled_dense_gemm(
         quantize_c=quantize_c,
         alpha_is_one=alpha_is_one,
         direct_sfa_live16=direct_sfa_live16,
+        target_occupancy=_dense_gemm_target_occupancy(
+            n=n,
+            k=k,
+            l=l,
+            ab_dtype=ab_dtype,
+            c_dtype=c_dtype,
+            tile_k=tile_k,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sm_count=sm_count,
+            load_path=load_path,
+            swap_ab=swap_ab,
+            b_tile_major=b_tile_major,
+        ),
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -5131,6 +5199,8 @@ def _select_default_mma_tiler_mn(
         # <=128 (small batch) -> 32x128 (~25% faster than 64x128 at M=32..128);
         # else -> 64x128 (the M-independent default, good to prefill).
         if expected_m is not None:
+            if expected_m >= 2048 and (n, k) == (16384, 1024):
+                return (64, 128)
             if (
                 expected_m >= 2048
                 and n >= 16384
@@ -5234,6 +5304,8 @@ def _select_mxfp8_tile_k(
     k: int,
     expected_m: Optional[int],
 ) -> int:
+    if expected_m is not None and expected_m >= 2048 and (n, k) == (16384, 1024):
+        return 128
     # BK64 is an explicitly hinted production specialization. Choosing it from
     # live M when expected_m is absent would change both tile K and generated
     # code at M=2048, violating the no-hint frozen-resolution reuse contract.
