@@ -98,6 +98,8 @@ def io_issue_gather(
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
     packed_glm: cutlass.Constexpr = False,
     packed_dsv4: cutlass.Constexpr = False,
+    split_mbar_arrival: cutlass.Constexpr = False,
+    overlap_footer_gather: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -153,6 +155,139 @@ def io_issue_gather(
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
     _FOOT = Int32(scale_bytes_per_token)
 
+    def _issue_payload_entry(entry: Int32, idx_raw: Int32):
+        full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
+        idx = idx_raw
+        if idx < Int32(0):
+            idx = Int32(0)
+        block_idx = idx // _section_pbs
+        local_idx = idx - block_idx * _section_pbs
+        data_base_off = (
+            Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
+        )
+        data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
+
+        if cutlass.const_expr(packed_glm):
+            cp_async_bulk_g2s_mbar(
+                kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                data_base_i64,
+                Int32(_GLM_GMEM_STRIDE),
+                full_mbar_u32,
+            )
+        elif cutlass.const_expr(packed_dsv4):
+            cp_async_bulk_g2s_mbar(
+                kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                data_base_i64,
+                Int32(_DSV4_IO_STRIDE),
+                full_mbar_u32,
+            )
+        else:
+            cp_async_bulk_g2s_mbar(
+                kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                data_base_i64,
+                _NOPE,
+                full_mbar_u32,
+            )
+            cp_async_bulk_g2s_mbar(
+                kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+                data_base_i64 + _ROPE_SRC,
+                _ROPE,
+                full_mbar_u32,
+            )
+
+    def _issue_payload():
+        eo = Int32(0)
+        for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+            entry = eo + io_lane
+            if entry < Int32(bi):
+                cand_pos = g_start + entry
+                idx_raw = Int32(-1)
+                if cand_pos < g_end:
+                    idx_raw = Int32(_section_idx[cand_pos])
+                idx = idx_raw
+                if idx < Int32(0):
+                    idx = Int32(0)
+                block_idx = idx // _section_pbs
+                local_idx = idx - block_idx * _section_pbs
+                data_base_off = (
+                    Int64(block_idx) * _section_stride
+                    + Int64(local_idx) * _IOS
+                )
+                data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
+                full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
+
+                if cutlass.const_expr(packed_glm):
+                    cp_async_bulk_g2s_mbar(
+                        kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                        data_base_i64,
+                        Int32(_GLM_GMEM_STRIDE),
+                        full_mbar_u32,
+                    )
+                elif cutlass.const_expr(packed_dsv4):
+                    cp_async_bulk_g2s_mbar(
+                        kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                        data_base_i64,
+                        Int32(_DSV4_IO_STRIDE),
+                        full_mbar_u32,
+                    )
+                else:
+                    cp_async_bulk_g2s_mbar(
+                        kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                        data_base_i64,
+                        _NOPE,
+                        full_mbar_u32,
+                    )
+                    cp_async_bulk_g2s_mbar(
+                        kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+                        data_base_i64 + _ROPE_SRC,
+                        _ROPE,
+                        full_mbar_u32,
+                    )
+            eo += Int32(io_threads)
+
+    # Native H16 can overlap the random scalar footer load with the much larger
+    # payload transfer. Its producer leaders set the transaction count without
+    # arriving; their post-footer arrivals remain the release condition.
+    if cutlass.const_expr(overlap_footer_gather):
+        if (io_lane & Int32(31)) == Int32(0):
+            cute.arch.mbarrier_expect_tx(
+                full_mbar_ptr, Int32(bulk_tx_bytes // 2)
+            )
+        # H16 has exactly one row per IO thread. Start the random footer load,
+        # launch the independent payload copy, and only then consume the footer
+        # result in shared stores so the two memory operations overlap.
+        overlap_entry = io_lane
+        overlap_cand_pos = g_start + overlap_entry
+        overlap_idx_raw = Int32(-1)
+        if overlap_cand_pos < g_end:
+            overlap_idx_raw = Int32(_section_idx[overlap_cand_pos])
+        token_idx_view[overlap_entry] = overlap_idx_raw
+
+        overlap_f0 = Uint32(0)
+        overlap_f1 = Uint32(0)
+        if overlap_idx_raw >= Int32(0):
+            overlap_block_idx = overlap_idx_raw // _section_pbs
+            overlap_local_idx = overlap_idx_raw - overlap_block_idx * _section_pbs
+            overlap_scale_base_off = (
+                Int64(overlap_block_idx) * _section_stride
+                + Int64(_section_pbs) * _IOS
+                + Int64(overlap_local_idx) * Int64(_FOOT)
+            )
+            overlap_f0, overlap_f1 = ld_global_nc_v2_u32(
+                get_ptr_as_int64(_section_kv, overlap_scale_base_off)
+            )
+
+        _issue_payload_entry(overlap_entry, overlap_idx_raw)
+        overlap_s_byte = overlap_entry * _FOOT
+        st_shared_u32(kv_sc_dst_addr + overlap_s_byte, overlap_f0)
+        st_shared_u32(
+            kv_sc_dst_addr + overlap_s_byte + Int32(4), overlap_f1
+        )
+        cute.arch.fence_acq_rel_cta()
+        if (io_lane & Int32(31)) == Int32(0):
+            cute.arch.mbarrier_arrive(full_mbar_ptr)
+        return
+
     # --- (1) per-entry validity index staging + (DSV4 only) scalar footer gather. ---
     eo = Int32(0)
     for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
@@ -185,66 +320,26 @@ def io_issue_gather(
                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
         eo += Int32(io_threads)
 
-    # --- (2) CTA-scope fence: footer/index stores visible before expect_tx. ---
+    # --- (2) CTA-scope fence: footer/index stores visible before release. ---
     # == FlashInfer __threadfence_block() (issue_gather :281). try_wait.parity
     # has no implicit memory fence so this acq-rel is load-bearing.
     cute.arch.fence_acq_rel_cta()
 
-    # --- (3) IO leader arrives + sets the bulk transaction byte count. ---
-    if io_lane == Int32(0):
-        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bulk_tx_bytes))
-
-    # --- (4) cp.async.bulk NoPE(+inline scales for GLM) + RoPE per entry. ---
-    full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
-    eo = Int32(0)
-    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
-        entry = eo + io_lane
-        if entry < Int32(bi):
-            cand_pos = g_start + entry
-            idx_raw = Int32(-1)
-            if cand_pos < g_end:
-                idx_raw = Int32(_section_idx[cand_pos])
-            idx = idx_raw
-            if idx < Int32(0):
-                idx = Int32(0)
-            block_idx = idx // _section_pbs
-            local_idx = idx - block_idx * _section_pbs
-            data_base_off = (
-                Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
-            )
-            data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
-
-            if cutlass.const_expr(packed_glm):
-                # Native GLM H8 keeps the source's contiguous 656-byte record
-                # intact in smem, replacing separate 528B + 128B bulk copies.
-                cp_async_bulk_g2s_mbar(
-                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
-                    data_base_i64,
-                    Int32(_GLM_GMEM_STRIDE),
-                    full_mbar_u32,
+    # --- (3) Publish the footer stores, or start the conventional payload. ---
+    if cutlass.const_expr(overlap_footer_gather):
+        if (io_lane & Int32(31)) == Int32(0):
+            cute.arch.mbarrier_arrive(full_mbar_ptr)
+    else:
+        if cutlass.const_expr(split_mbar_arrival):
+            # Native H16 has two producer warps, each responsible for 32 of the
+            # 64 packed rows. Each leader contributes half the transaction bytes.
+            if (io_lane & Int32(31)) == Int32(0):
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    full_mbar_ptr, Int32(bulk_tx_bytes // 2)
                 )
-            elif cutlass.const_expr(packed_dsv4):
-                # DSV4 copies its contiguous 448B NoPE + 128B RoPE payload into
-                # a padded row; its grouped footer remains scalar-gathered.
-                cp_async_bulk_g2s_mbar(
-                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
-                    data_base_i64,
-                    Int32(_DSV4_IO_STRIDE),
-                    full_mbar_u32,
+        else:
+            if io_lane == Int32(0):
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    full_mbar_ptr, Int32(bulk_tx_bytes)
                 )
-            else:
-                # NoPE (DSV4 448B e4m3 / GLM 528B e4m3+inline-fp32) -> kv_fp8 row.
-                cp_async_bulk_g2s_mbar(
-                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
-                    data_base_i64,
-                    _NOPE,
-                    full_mbar_u32,
-                )
-                # RoPE: 128B -> kv_rope[entry*D_ROPE bf16] (byte stride = D_ROPE*2).
-                cp_async_bulk_g2s_mbar(
-                    kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
-                    data_base_i64 + _ROPE_SRC,
-                    _ROPE,
-                    full_mbar_u32,
-                )
-        eo += Int32(io_threads)
+        _issue_payload()

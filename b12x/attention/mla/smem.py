@@ -115,7 +115,7 @@ class SmemLayout:
     # q_rope FIRST to match FlashInfer DecodeDsv4Smem OFF_Q_ROPE = 0.
     q_rope_off: int
     q_rope_bytes: int
-    q_rope_stride: int  # D_ROPE (bf16 elems per head row)
+    q_rope_stride: int  # D_ROPE plus optional bank-conflict pad
 
     q_fp8_off: int
     q_fp8_bytes: int
@@ -210,10 +210,12 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 
     off = 0
 
-    # --- Q rope (bf16), FlashInfer OFF_Q_ROPE = 0. Linear h*D_ROPE + d. ---
+    # --- Q rope (bf16), FlashInfer OFF_Q_ROPE = 0. ---
     q_rope_off = off
-    q_rope_stride = d_rope
-    q_rope_bytes = hpb * d_rope * 2
+    # DSV4's 64-bf16 rows otherwise repeat every 128 bytes and alias banks
+    # across heads during the native H8/H16 scalar Q-RoPE loads.
+    q_rope_stride = d_rope + (8 if traits.has_extra_cache else 0)
+    q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
     # --- Q nope quantized to fp8 at Q_NOPE_STRIDE (448 + 16 pad). ---
@@ -290,8 +292,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- static sm_p_full (bf16), 128B-aligned for the S6b ldmatrix.x4 read. ---
     off = _align_up(off, 128)
     sm_p_full_off = off
-    sm_p_full_stride = bi
-    sm_p_full_bytes = hpb * bi * 2
+    sm_p_full_stride = bi + (8 if traits.has_extra_cache else 0)
+    sm_p_full_bytes = hpb * sm_p_full_stride * 2
     off = sm_p_full_off + sm_p_full_bytes
 
     # --- native H16 group-1 w_head_sc (tail region; base offsets unchanged).
@@ -303,7 +305,9 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     w_head_sc2_off = off
     w_head_sc2_bytes = (
-        n_v_chunks * hpb * 4 + 8 * bi * 2 if traits.has_extra_cache else 0
+        n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2
+        if traits.has_extra_cache
+        else 0
     )
     off = w_head_sc2_off + w_head_sc2_bytes
 

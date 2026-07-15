@@ -63,6 +63,8 @@ from b12x.cute.fp4 import (
     fmin_f32,
     fp8_e4m3_to_f32,
     get_ptr_as_int64,
+    ld_global_nc_v2_u32,
+    ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_shared_f32,
     ld_shared_u32,
@@ -76,6 +78,7 @@ from b12x.cute.fp4 import (
     shared_ptr_to_u32,
     st_shared_bf16_from_f32,
     st_shared_f32,
+    st_shared_u32,
     st_shared_u8,
     st_global_v4_u32,
 )
@@ -300,6 +303,10 @@ def s0_quantize_q_to_smem(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,   # named-barrier slot for the math-only sync
     barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
+    fused_subgroup_quant: cutlass.Constexpr = False,
+    subgroup_amax: cutlass.Constexpr = False,
+    vectorized_rope_copy: cutlass.Constexpr = False,
+    packed_q_scale_words: cutlass.Constexpr = False,
 ):
     """S0: cooperative BF16->E4M3 Q quant with per-tile pow2 UE8M0 scale.
 
@@ -323,35 +330,120 @@ def s0_quantize_q_to_smem(
     )
 
     # --- Step 1: copy Q-rope bf16 -> smem; zero-fill invalid heads. ---
-    i = tid
-    while i < Int32(hpb * d_rope):
-        h = i // Int32(d_rope)
-        d = i - h * Int32(d_rope)
-        s_byte = (h * Int32(q_rope_stride) + d) * Int32(2)
-        val = Float32(0.0)
-        if h < valid_hpb:
-            val = Float32(q_token[head_base + h, Int32(d_nope) + d])
-        st_shared_bf16_from_f32(_smem_byte(q_rope_base_addr, s_byte), val)
-        i += Int32(num_threads)
+    if cutlass.const_expr(vectorized_rope_copy):
+        chunks_per_head = d_rope // 4
+        i = tid
+        while i < Int32(hpb * chunks_per_head):
+            h = i // Int32(chunks_per_head)
+            chunk = i - h * Int32(chunks_per_head)
+            d = chunk * Int32(4)
+            q0 = Uint32(0)
+            q1 = Uint32(0)
+            if h < valid_hpb:
+                q_off = cute.crd2idx(
+                    (head_base + h, Int32(d_nope) + d), q_token.layout
+                )
+                q0, q1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
+            s_addr = q_rope_base_addr + (
+                h * Int32(q_rope_stride) + d
+            ) * Int32(2)
+            st_shared_u32(s_addr, q0)
+            st_shared_u32(s_addr + Int32(4), q1)
+            i += Int32(num_threads)
+    else:
+        i = tid
+        while i < Int32(hpb * d_rope):
+            h = i // Int32(d_rope)
+            d = i - h * Int32(d_rope)
+            s_byte = (h * Int32(q_rope_stride) + d) * Int32(2)
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + h, Int32(d_nope) + d])
+            st_shared_bf16_from_f32(_smem_byte(q_rope_base_addr, s_byte), val)
+            i += Int32(num_threads)
 
-    # --- Step 2: init amax = 0. ---
-    i = tid
-    while i < Int32(hpb * num_scales):
-        amax_view[i] = Float32(0.0)
-        i += Int32(num_threads)
-    cute.arch.barrier(**bar_kw)
+    # --- Steps 2-3: per-(head,tile) absmax over valid heads. ---
+    if cutlass.const_expr(fused_subgroup_quant):
+        # Native DSV4 gives each 8-lane subgroup one complete 64-value tile.
+        # Keep its eight values per lane live through the reduction so scale
+        # construction and quantization need no shared amax round-trip or
+        # second global Q load.
+        lane8 = tid & Int32(7)
+        slot = tid >> Int32(3)
+        while slot < Int32(hpb * num_scales):
+            h = slot // Int32(num_scales)
+            blk = slot - h * Int32(num_scales)
+            values = [Float32(0.0) for _ in range(quant_tile // 8)]
+            amax = Float32(0.0)
+            for k in cutlass.range_constexpr(quant_tile // 8):
+                d = blk * Int32(quant_tile) + lane8 + Int32(k * 8)
+                if h < valid_hpb:
+                    values[k] = Float32(q_token[head_base + h, d])
+                amax = fmax_f32(amax, fabs_f32(values[k]))
+            for offset in (1, 2, 4):
+                amax = fmax_f32(
+                    amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)
+                )
 
-    # --- Step 3: per-(head,tile) absmax over valid heads. ---
-    idx = tid
-    while idx < valid_hpb * Int32(d_nope):
-        h = idx // Int32(d_nope)
-        d = idx - h * Int32(d_nope)
-        blk = d // Int32(quant_tile)
-        v = Float32(q_token[head_base + h, d])
-        slot = h * Int32(num_scales) + blk
-        amax_addr = shared_ptr_to_u32(amax_view.iterator) + slot * Int32(4)
-        atomic_max_shared_f32(amax_addr, fabs_f32(v))
-        idx += Int32(num_threads)
+            raw = fmax_f32(amax, Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
+            rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
+            if lane8 == Int32(0):
+                q_sc_view[slot] = rounded
+
+            inv_scale = Float32(1.0) / rounded
+            for k in cutlass.range_constexpr(quant_tile // 8):
+                d = blk * Int32(quant_tile) + lane8 + Int32(k * 8)
+                v = values[k] * inv_scale
+                v = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), v))
+                fp8_bits = cvt_f32_to_e4m3(v)
+                out_byte = h * Int32(q_nope_stride) + d
+                st_shared_u8(
+                    _smem_byte(q_fp8_base_addr, out_byte),
+                    (fp8_bits & Uint32(0xFF)).to(cutlass.Uint8),
+                )
+            slot += Int32(num_threads // 8)
+
+        cute.arch.barrier(**bar_kw)
+        return
+
+    if cutlass.const_expr(subgroup_amax):
+        # Native DSV4 uses 64-value tiles. Four 8-lane subgroups per warp each
+        # own one tile, so every max has a single writer and needs no atomic.
+        lane8 = tid & Int32(7)
+        slot = tid >> Int32(3)
+        while slot < valid_hpb * Int32(num_scales):
+            h = slot // Int32(num_scales)
+            blk = slot - h * Int32(num_scales)
+            amax = Float32(0.0)
+            for k in cutlass.range_constexpr(quant_tile // 8):
+                d = blk * Int32(quant_tile) + lane8 + Int32(k * 8)
+                amax = fmax_f32(
+                    amax, fabs_f32(Float32(q_token[head_base + h, d]))
+                )
+            for offset in (1, 2, 4):
+                amax = fmax_f32(
+                    amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)
+                )
+            if lane8 == Int32(0):
+                amax_view[slot] = amax
+            slot += Int32(num_threads // 8)
+    else:
+        i = tid
+        while i < Int32(hpb * num_scales):
+            amax_view[i] = Float32(0.0)
+            i += Int32(num_threads)
+        cute.arch.barrier(**bar_kw)
+
+        idx = tid
+        while idx < valid_hpb * Int32(d_nope):
+            h = idx // Int32(d_nope)
+            d = idx - h * Int32(d_nope)
+            blk = d // Int32(quant_tile)
+            v = Float32(q_token[head_base + h, d])
+            slot = h * Int32(num_scales) + blk
+            amax_addr = shared_ptr_to_u32(amax_view.iterator) + slot * Int32(4)
+            atomic_max_shared_f32(amax_addr, fabs_f32(v))
+            idx += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
     # --- Step 4: scale = pow2_ceil(max(amax,1e-4)/FP8_MAX) -> q_sc (FP32). ---
@@ -360,6 +452,16 @@ def s0_quantize_q_to_smem(
         raw = fmax_f32(amax_view[i], Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
         rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
         q_sc_view[i] = rounded
+        if cutlass.const_expr(packed_q_scale_words):
+            h = i // Int32(num_scales)
+            blk = i - h * Int32(num_scales)
+            st_shared_u8(
+                q_fp8_base_addr
+                + h * Int32(q_nope_stride)
+                + Int32(d_nope)
+                + blk,
+                (_ue8m0 & Uint32(0xFF)).to(cutlass.Uint8),
+            )
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
@@ -636,6 +738,8 @@ def s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
     q_nope_stride: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
     scale_bytes_per_token: cutlass.Constexpr,
+    packed_footer_words: cutlass.Constexpr = False,
+    packed_q_scale_words: cutlass.Constexpr = False,
 ):
     """DSV4 H8 QK with candidates in hardware A and heads in hardware B.
 
@@ -655,14 +759,35 @@ def s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
     sfa_cand = warp_first_cand + gid + (lane & Int32(1)) * Int32(8)
     sfb_head = gid
 
+    footer_lo = Uint32(0)
+    footer_hi = Uint32(0)
+    if cutlass.const_expr(packed_footer_words):
+        footer_lo, footer_hi = ld_shared_v2_u32(
+            kv_sc_base_addr + sfa_cand * Int32(scale_bytes_per_token)
+        )
+    q_scale_lo = Uint32(0)
+    q_scale_hi = Uint32(0)
+    if cutlass.const_expr(packed_q_scale_words):
+        q_scale_lo, q_scale_hi = ld_shared_v2_u32(
+            q_fp8_base_addr
+            + sfb_head * Int32(q_nope_stride)
+            + Int32(num_scales * quant_tile)
+        )
+
     for blk in cutlass.range_constexpr(num_scales):
-        sfa = _ld_u8_zext(
-            kv_sc_base_addr,
-            sfa_cand * Int32(scale_bytes_per_token) + Int32(blk),
-        )
-        sfb = _fp32_to_ue8m0_byte(
-            q_sc_view[sfb_head * Int32(num_scales) + Int32(blk)]
-        )
+        if cutlass.const_expr(packed_footer_words):
+            sfa = _packed_u8(footer_lo, footer_hi, blk)
+        else:
+            sfa = _ld_u8_zext(
+                kv_sc_base_addr,
+                sfa_cand * Int32(scale_bytes_per_token) + Int32(blk),
+            )
+        if cutlass.const_expr(packed_q_scale_words):
+            sfb = _packed_u8(q_scale_lo, q_scale_hi, blk)
+        else:
+            sfb = _fp32_to_ue8m0_byte(
+                q_sc_view[sfb_head * Int32(num_scales) + Int32(blk)]
+            )
         for ks in cutlass.range_constexpr(quant_tile // 32):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(32)
             a_addr = _smem_byte(
@@ -697,6 +822,7 @@ def s2_qk_rope_bf16(
     lane: Int32,
     *,
     d_rope: cutlass.Constexpr,        # 64
+    q_rope_stride: cutlass.Constexpr,
     valid_hpb: cutlass.Constexpr = 16,
 ):
     """S2: accumulate Q_rope . K_rope into qk[0..3] via D_ROPE/16=4 bf16 MMAs.
@@ -715,8 +841,8 @@ def s2_qk_rope_bf16(
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
-        # A: Q-rope (bf16) at q_rope + ks*16 (elems), stride D_ROPE elems.
-        a_byte = a_row * Int32(d_rope * 2) + (ko + a_col) * Int32(2)
+        # A: Q-rope (bf16) at q_rope + ks*16 (elems).
+        a_byte = a_row * Int32(q_rope_stride * 2) + (ko + a_col) * Int32(2)
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_base_addr, a_byte))
         # B: per-lane scalar reads of two consecutive bf16 pairs.
         row_byte = entry * Int32(d_rope * 2) + ko * Int32(2)
@@ -744,6 +870,7 @@ def s2_qk_rope_bf16_glm_h8_swap_ab(
     lane: Int32,
     *,
     d_rope: cutlass.Constexpr,
+    q_rope_stride: cutlass.Constexpr,
     kv_rope_stride_bytes: cutlass.Constexpr,
 ):
     """GLM TP8 RoPE dot product in the same swapped fragment layout as S1."""
@@ -762,7 +889,7 @@ def s2_qk_rope_bf16_glm_h8_swap_ab(
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
             _smem_byte(kv_rope_base_addr, a_byte)
         )
-        row_byte = q_head * Int32(d_rope * 2) + ko * Int32(2)
+        row_byte = q_head * Int32(q_rope_stride * 2) + ko * Int32(2)
         b0 = _ld_u32(
             q_rope_base_addr, row_byte + tid * Int32(2) * Int32(2)
         )
@@ -885,6 +1012,17 @@ def _ld_u8_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
     sh = (byte_off & Int32(3)) * Int32(8)
     val = ld_shared_u32(base_addr + word)
     return (val >> sh.to(Uint32)) & Uint32(0xFF)
+
+
+@cute.jit
+def _packed_u8(
+    lo: Uint32,
+    hi: Uint32,
+    byte_idx: cutlass.Constexpr,
+) -> Uint32:
+    if cutlass.const_expr(byte_idx < 4):
+        return (lo >> Uint32(byte_idx * 8)) & Uint32(0xFF)
+    return (hi >> Uint32((byte_idx - 4) * 8)) & Uint32(0xFF)
 
 
 @cute.jit
@@ -1240,6 +1378,7 @@ def s5_fill_sm_p_full(
     tid_flat: Int32,
     *,
     bi: cutlass.Constexpr,           # 64
+    sm_p_stride: cutlass.Constexpr,
     n_v_chunks: cutlass.Constexpr,   # 7
     hpb: cutlass.Constexpr,          # 16
     num_threads: cutlass.Constexpr,  # 256
@@ -1252,11 +1391,11 @@ def s5_fill_sm_p_full(
     cand_col_base = warp_id * Int32(8)  # ENTRIES_PER_WARP = 8 (DSV4_QK_N_TILES=1)
     c0 = cand_col_base + tid * Int32(2)
     c1 = c0 + Int32(1)
-    # sm_p_full[head][cand] bf16, row stride BI elems (2 bytes each).
-    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(bi) + c0) * Int32(2), w_pre[0])
-    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(bi) + c1) * Int32(2), w_pre[1])
-    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(bi) + c0) * Int32(2), w_pre[2])
-    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(bi) + c1) * Int32(2), w_pre[3])
+    # sm_p_full[head][cand] bf16.
+    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(sm_p_stride) + c0) * Int32(2), w_pre[0])
+    st_shared_bf16_from_f32(sm_p_full_addr + (gid * Int32(sm_p_stride) + c1) * Int32(2), w_pre[1])
+    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + c0) * Int32(2), w_pre[2])
+    st_shared_bf16_from_f32(sm_p_full_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + c1) * Int32(2), w_pre[3])
 
     # zero-init w_head_sc (cooperative; covered by the caller's barrier).
     i = tid_flat
@@ -1764,6 +1903,7 @@ def s6_xv_nope_dsv4_h8_swap_ab(
     v_chunk: cutlass.Constexpr,
     hpb: cutlass.Constexpr,
     bi: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
     w_fp8_stride: cutlass.Constexpr,
     n_warps: cutlass.Constexpr,
@@ -1772,6 +1912,7 @@ def s6_xv_nope_dsv4_h8_swap_ab(
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
+    packed_footer_words: cutlass.Constexpr = False,
 ):
     """DSV4 H8 PV fed directly by the swapped score fragment.
 
@@ -1793,16 +1934,16 @@ def s6_xv_nope_dsv4_h8_swap_ab(
 
     # Swapped score-fragment ownership -> ordinary [head, candidate] staging.
     st_shared_bf16_from_f32(
-        sm_p_full_addr + (head0 * Int32(bi) + cand0) * Int32(2), w_pre[0]
+        sm_p_full_addr + (head0 * Int32(sm_p_stride) + cand0) * Int32(2), w_pre[0]
     )
     st_shared_bf16_from_f32(
-        sm_p_full_addr + (head1 * Int32(bi) + cand0) * Int32(2), w_pre[1]
+        sm_p_full_addr + (head1 * Int32(sm_p_stride) + cand0) * Int32(2), w_pre[1]
     )
     st_shared_bf16_from_f32(
-        sm_p_full_addr + (head0 * Int32(bi) + cand1) * Int32(2), w_pre[2]
+        sm_p_full_addr + (head0 * Int32(sm_p_stride) + cand1) * Int32(2), w_pre[2]
     )
     st_shared_bf16_from_f32(
-        sm_p_full_addr + (head1 * Int32(bi) + cand1) * Int32(2), w_pre[3]
+        sm_p_full_addr + (head1 * Int32(sm_p_stride) + cand1) * Int32(2), w_pre[3]
     )
 
     i = tid_flat
@@ -1820,9 +1961,28 @@ def s6_xv_nope_dsv4_h8_swap_ab(
         )
 
     scale_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+    max_footer0_lo = Uint32(0)
+    max_footer0_hi = Uint32(0)
+    max_footer1_lo = Uint32(0)
+    max_footer1_hi = Uint32(0)
+    if cutlass.const_expr(packed_footer_words):
+        max_footer0_lo, max_footer0_hi = ld_shared_v2_u32(
+            kv_sc_base_addr + cand0 * Int32(scale_bytes_per_token)
+        )
+        max_footer1_lo, max_footer1_hi = ld_shared_v2_u32(
+            kv_sc_base_addr + cand1 * Int32(scale_bytes_per_token)
+        )
     for vc in cutlass.range_constexpr(n_v_chunks):
-        vsc0 = _vsc(cand0, vc)
-        vsc1 = _vsc(cand1, vc)
+        if cutlass.const_expr(packed_footer_words):
+            vsc0 = _ue8m0_zext_byte_to_fp32(
+                _packed_u8(max_footer0_lo, max_footer0_hi, vc)
+            )
+            vsc1 = _ue8m0_zext_byte_to_fp32(
+                _packed_u8(max_footer1_lo, max_footer1_hi, vc)
+            )
+        else:
+            vsc0 = _vsc(cand0, vc)
+            vsc1 = _vsc(cand1, vc)
         atomic_max_shared_f32(
             scale_base + (Int32(vc) * Int32(hpb) + head0) * Int32(4),
             fmax_f32(fabs_f32(w_pre[0] * vsc0), fabs_f32(w_pre[2] * vsc1)),
@@ -1847,14 +2007,33 @@ def s6_xv_nope_dsv4_h8_swap_ab(
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
+    quant_footer0_lo = Uint32(0)
+    quant_footer0_hi = Uint32(0)
+    quant_footer1_lo = Uint32(0)
+    quant_footer1_hi = Uint32(0)
+    if cutlass.const_expr(packed_footer_words):
+        quant_footer0_lo, quant_footer0_hi = ld_shared_v2_u32(
+            kv_sc_base_addr + cand0 * Int32(scale_bytes_per_token)
+        )
+        quant_footer1_lo, quant_footer1_hi = ld_shared_v2_u32(
+            kv_sc_base_addr + cand1 * Int32(scale_bytes_per_token)
+        )
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(16)
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
         si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + head0 + Int32(8)]
         si1 = w_head_sc_view[Int32(vc) * Int32(hpb) + head1 + Int32(8)]
-        vsc0 = _vsc(cand0, vc)
-        vsc1 = _vsc(cand1, vc)
+        if cutlass.const_expr(packed_footer_words):
+            vsc0 = _ue8m0_zext_byte_to_fp32(
+                _packed_u8(quant_footer0_lo, quant_footer0_hi, vc)
+            )
+            vsc1 = _ue8m0_zext_byte_to_fp32(
+                _packed_u8(quant_footer1_lo, quant_footer1_hi, vc)
+            )
+        else:
+            vsc0 = _vsc(cand0, vc)
+            vsc1 = _vsc(cand1, vc)
 
         f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
         f01 = _quant_e4m3_byte(w_pre[1] * vsc0 * si1)
@@ -1921,6 +2100,7 @@ def s6b_xv_rope(
     lane: Int32,
     *,
     bi: cutlass.Constexpr,           # 64
+    sm_p_stride: cutlass.Constexpr,
     d_rope: cutlass.Constexpr,       # 64
     n_warps: cutlass.Constexpr,      # 8
 ):
@@ -1939,8 +2119,8 @@ def s6b_xv_rope(
 
     for ks in cutlass.range_constexpr(bi // 16):
         k_base = Int32(ks) * Int32(16)
-        # A: sm_p_full[0][ks*16], stride BI bf16 elems.
-        a_byte = (a_row * Int32(bi) + (k_base + a_col)) * Int32(2)
+        # A: sm_p_full[0][ks*16].
+        a_byte = (a_row * Int32(sm_p_stride) + (k_base + a_col)) * Int32(2)
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
         # B: per-lane scalar reads of v[ent][col], packed (ent0,ent1)/(ent8,ent9).
         ent0 = k_base + tid * Int32(2)
@@ -1966,6 +2146,7 @@ def s6b_xv_rope_h8_swap_ab(
     lane: Int32,
     *,
     bi: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
     d_rope: cutlass.Constexpr,
     n_warps: cutlass.Constexpr,
     tiles_per_warp: cutlass.Constexpr,
@@ -1982,7 +2163,7 @@ def s6b_xv_rope_h8_swap_ab(
         r = nt * 4
         for ks in cutlass.range_constexpr(bi // 16):
             k_base = Int32(ks) * Int32(16)
-            a_byte = (a_row * Int32(bi) + k_base + a_col) * Int32(2)
+            a_byte = (a_row * Int32(sm_p_stride) + k_base + a_col) * Int32(2)
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
                 sm_p_full_addr + a_byte
             )

@@ -186,10 +186,13 @@ def _dsv4_h16_auto(
     sm_count: int | None = None,
 ) -> bool:
     # Spark reaches a full H8 launch wave much earlier than the 188-SM tuning
-    # target. Sharing each KV stage across 16 heads wins from B=8 for C4/C128,
-    # while the two-chunk SWA path keeps H8's lower fixed latency.
-    if sm_count is not None and sm_count <= 64 and rows >= 8 and num_chunks > 2:
-        return True
+    # target. C128's 130-chunk gather is enough to amortize H16 even at B=1;
+    # shorter gathers need B=8 before sharing each KV stage across 16 heads wins.
+    if sm_count is not None and sm_count <= 64:
+        if num_chunks >= 128:
+            return True
+        if rows >= 8 and num_chunks > 2:
+            return True
     if num_chunks >= _DSV4_H16_MIN_BW_CHUNKS and rows >= _DSV4_H16_MIN_BW_ROWS:
         return True
     h8_ctas = rows * (heads // 8) * max(1, int(h8_num_splits))
@@ -326,8 +329,9 @@ class UnifiedDecodeKernel:
 
     Grid = (num_tokens, H_BLOCKS, num_splits). Each CTA owns one query token, one
     HPB=16-head block, and one chunk-range slice (split). The generic path uses
-    8 math warps plus one IO warp; the native GLM and DSV4 H8 paths use 4 math
-    warps plus one IO warp. Math consumes the double-buffered KV gathered with
+    8 math warps plus one IO warp; native DSV4 H16 uses two IO warps, while the
+    native GLM and DSV4 H8 paths use 4 math warps plus one IO warp. Math consumes
+    the double-buffered KV gathered with
     cp.async.bulk and mbarriers (io.py), then runs S0-S6b over the split's chunks
     and S7 writes this split's NORMALIZED partial O + base-2 LSE into mid_out /
     mid_lse in the exact split.py merge convention.
@@ -409,7 +413,10 @@ class UnifiedDecodeKernel:
         # head_base computation is byte-identical to the pre-P10 kernel.
         self.head_block_offset = int(head_block_offset)
         self.math_threads = int(traits.math_threads)
-        self.block_threads = int(traits.block_threads)
+        self.block_threads = (
+            320 if self.native_dsv4_h16 else int(traits.block_threads)
+        )
+        self.io_threads = self.block_threads - self.math_threads
 
     @cute.jit
     def __call__(
@@ -653,9 +660,12 @@ class UnifiedDecodeKernel:
         mbar_base = st.mbar.data_ptr()
         n_buf = int(L.kv_bufs)
 
+        full_arrivals = 2 if self.native_dsv4_h16 else 1
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
-                cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
+                cute.arch.mbarrier_init(
+                    mbar_base + s, Int32(full_arrivals)
+                )
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
@@ -681,7 +691,7 @@ class UnifiedDecodeKernel:
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
         # ════════════════════════════════════════════════════════════════════
         if is_io:
-            io_lane = lane
+            io_lane = tid - Int32(self.math_threads)
             prod_phase = Int32(1)
             prod_idx = Int32(0)
             for lc in cutlass.range(active_chunks, unroll=1):
@@ -711,6 +721,8 @@ class UnifiedDecodeKernel:
                     rope_smem_stride=t.d_rope,
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
                     scale_format=t.scale_format,
+                    io_threads=self.io_threads,
+                    split_mbar_arrival=self.native_dsv4_h16,
                     packed_glm=self.native_glm_h8,
                     packed_dsv4=self.native_dsv4_h8,
                 )
@@ -732,6 +744,10 @@ class UnifiedDecodeKernel:
                 q_nope_stride=t.q_nope_stride,
                 q_rope_stride=L.q_rope_stride,
                 num_threads=self.math_threads, barrier_id=2,
+                fused_subgroup_quant=self.native_dsv4_h8,
+                subgroup_amax=self.native_dsv4_h8,
+                vectorized_rope_copy=self.native_dsv4_h8,
+                packed_q_scale_words=self.native_dsv4_h16,
             )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
@@ -805,6 +821,8 @@ class UnifiedDecodeKernel:
                             q_nope_stride=t.q_nope_stride,
                             kv_smem_stride=staged_kv_stride,
                             scale_bytes_per_token=8,
+                            packed_footer_words=self.native_dsv4_h16,
+                            packed_q_scale_words=self.native_dsv4_h16,
                         )
                         h8_rope_addr = kv_rope_b
                         h8_rope_stride = staged_kv_stride
@@ -812,6 +830,7 @@ class UnifiedDecodeKernel:
                         qk, q_rope_addr, h8_rope_addr,
                         warp_first_cand, lane,
                         d_rope=t.d_rope,
+                        q_rope_stride=L.q_rope_stride,
                         kv_rope_stride_bytes=h8_rope_stride,
                     )
                     qk = s3_mask_and_scale_glm_h8_swap_ab(
@@ -849,11 +868,13 @@ class UnifiedDecodeKernel:
                             warp_id, lane, tid,
                             n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
                             hpb=t.hpb, bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
                             kv_smem_stride=staged_kv_stride,
                             w_fp8_stride=t.bi + 16, n_warps=4,
                             nt_per_warp_xv=t.nt_per_warp_xv,
                             scale_bytes_per_token=8,
                             num_threads=self.math_threads, barrier_id=3,
+                            packed_footer_words=self.native_dsv4_h16,
                         )
                 else:
                     qk = s1_qk_nope_block_scaled(
@@ -866,7 +887,7 @@ class UnifiedDecodeKernel:
                     )
                     qk = s2_qk_rope_bf16(
                         qk, q_rope_addr, kv_rope_b, warp_first_cand, lane,
-                        d_rope=t.d_rope,
+                        d_rope=t.d_rope, q_rope_stride=L.q_rope_stride,
                     )
                     qk = s3_mask_and_scale(
                         qk, tok_buf_view, warp_first_cand,
@@ -889,7 +910,8 @@ class UnifiedDecodeKernel:
                     ]
                     s5_fill_sm_p_full(
                         w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
-                        bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                        bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                        n_v_chunks=t.n_v_chunks, hpb=t.hpb,
                         num_threads=self.math_threads, barrier_id=3,
                     )
                     cute.arch.barrier(
@@ -913,14 +935,16 @@ class UnifiedDecodeKernel:
                     if cutlass.const_expr(self.native_dsv4_h8):
                         acc_rope = s6b_xv_rope_h8_swap_ab(
                             acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
-                            bi=t.bi, d_rope=t.d_rope, n_warps=4,
+                            bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                            d_rope=t.d_rope, n_warps=4,
                             tiles_per_warp=2,
                             kv_rope_stride_bytes=staged_kv_stride,
                         )
                     else:
                         acc_rope = s6b_xv_rope(
                             acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
-                            bi=t.bi, d_rope=t.d_rope, n_warps=8,
+                            bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                            d_rope=t.d_rope, n_warps=8,
                         )
 
                 for at in cutlass.range_constexpr(n_acc_tiles):
@@ -1238,9 +1262,12 @@ class UnifiedDecodeKernel:
         mbar_base = st.mbar.data_ptr()
         n_buf = int(L.kv_bufs)
 
+        full_arrivals = 2 if self.native_dsv4_h16 else 1
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
-                cute.arch.mbarrier_init(mbar_base + s, Int32(1))           # full[s]
+                cute.arch.mbarrier_init(
+                    mbar_base + s, Int32(full_arrivals)
+                )
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))   # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
@@ -1306,7 +1333,7 @@ class UnifiedDecodeKernel:
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
         # ════════════════════════════════════════════════════════════════════
         if is_io:
-            io_lane = lane
+            io_lane = tid - Int32(self.math_threads)
             prod_phase = Int32(1)
             prod_idx = Int32(0)
             for lc in cutlass.range(active_chunks, unroll=1):
@@ -1328,8 +1355,11 @@ class UnifiedDecodeKernel:
                     rope_smem_stride=t.d_rope,
                     scale_bytes_per_token=8, bulk_tx_bytes=t.bulk_tx_bytes,
                     scale_format=t.scale_format,
+                    io_threads=self.io_threads,
+                    split_mbar_arrival=self.native_dsv4_h16,
                     packed_glm=self.native_glm_h8,
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
+                    overlap_footer_gather=self.native_dsv4_h16,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -1432,7 +1462,9 @@ class UnifiedDecodeKernel:
                 reduce_max_stage = reduce_max_addr + group * Int32(4 * t.hpb * 4)
                 reduce_sum_stage = reduce_sum_addr + group * Int32(4 * t.hpb * 4)
                 w_fp8_stage = w_fp8_addr + group * Int32(8 * (t.bi + 16))
-                sm_p_stage = sm_p_full_addr + group * Int32(8 * t.bi * 2)
+                sm_p_stage = sm_p_full_addr + group * Int32(
+                    8 * L.sm_p_full_stride * 2
+                )
                 # Group 1 gets the dedicated tail region (w_head_sc packs
                 # scale+reciprocal across its full 16-wide row, so the groups
                 # cannot split one row).
@@ -1456,6 +1488,10 @@ class UnifiedDecodeKernel:
                 q_rope_stride=L.q_rope_stride,
                 num_threads=nt_stage, barrier_id=2,
                 barrier_threads=bt_stage,
+                fused_subgroup_quant=self.native_dsv4_h8,
+                subgroup_amax=(self.native_dsv4_h8 or self.native_dsv4_h16),
+                vectorized_rope_copy=(self.native_dsv4_h8 or self.native_dsv4_h16),
+                packed_q_scale_words=self.native_dsv4_h16,
             )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
@@ -1530,6 +1566,8 @@ class UnifiedDecodeKernel:
                             q_nope_stride=t.q_nope_stride,
                             kv_smem_stride=staged_kv_stride,
                             scale_bytes_per_token=8,
+                            packed_footer_words=self.native_dsv4_h16,
+                            packed_q_scale_words=self.native_dsv4_h16,
                         )
                         h8_rope_addr = kv_rope_b
                         h8_rope_stride = staged_kv_stride
@@ -1537,6 +1575,7 @@ class UnifiedDecodeKernel:
                         qk, q_rope_stage, h8_rope_addr,
                         warp_first_cand, lane,
                         d_rope=t.d_rope,
+                        q_rope_stride=L.q_rope_stride,
                         kv_rope_stride_bytes=h8_rope_stride,
                     )
                     sc_start = split_cand_start
@@ -1590,12 +1629,14 @@ class UnifiedDecodeKernel:
                             warp_sel, lane, tid_sel,
                             n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
                             hpb=t.hpb, bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
                             kv_smem_stride=staged_kv_stride,
                             w_fp8_stride=t.bi + 16, n_warps=4,
                             nt_per_warp_xv=t.nt_per_warp_xv,
                             scale_bytes_per_token=8,
                             num_threads=nt_stage, barrier_id=3,
                             barrier_threads=bt_stage,
+                            packed_footer_words=self.native_dsv4_h16,
                         )
                 else:
                     qk = s1_qk_nope_block_scaled(
@@ -1608,7 +1649,7 @@ class UnifiedDecodeKernel:
                     )
                     qk = s2_qk_rope_bf16(
                         qk, q_rope_addr, kv_rope_b, warp_first_cand, lane,
-                        d_rope=t.d_rope,
+                        d_rope=t.d_rope, q_rope_stride=L.q_rope_stride,
                     )
 
                     # Per-chunk section dispatch for the S3 mask: compare the
@@ -1652,7 +1693,8 @@ class UnifiedDecodeKernel:
                     ]
                     s5_fill_sm_p_full(
                         w_pre, sm_p_full_addr, w_head_sc_view, warp_id, lane, tid,
-                        bi=t.bi, n_v_chunks=t.n_v_chunks, hpb=t.hpb,
+                        bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                        n_v_chunks=t.n_v_chunks, hpb=t.hpb,
                         num_threads=self.math_threads, barrier_id=3,
                     )
                     cute.arch.barrier(
@@ -1678,14 +1720,16 @@ class UnifiedDecodeKernel:
                     ):
                         acc_rope = s6b_xv_rope_h8_swap_ab(
                             acc_rope, sm_p_stage, kv_rope_b, warp_sel, lane,
-                            bi=t.bi, d_rope=t.d_rope, n_warps=4,
+                            bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                            d_rope=t.d_rope, n_warps=4,
                             tiles_per_warp=2,
                             kv_rope_stride_bytes=staged_kv_stride,
                         )
                     else:
                         acc_rope = s6b_xv_rope(
                             acc_rope, sm_p_full_addr, kv_rope_b, warp_id, lane,
-                            bi=t.bi, d_rope=t.d_rope, n_warps=8,
+                            bi=t.bi, sm_p_stride=L.sm_p_full_stride,
+                            d_rope=t.d_rope, n_warps=8,
                         )
 
                 for at in cutlass.range_constexpr(n_acc_tiles):
@@ -2440,8 +2484,12 @@ def run_unified_decode(
         native_dsv4_h16=native_dsv4_h16,
         heads_per_block=(8 if native_h8 else 16),
         math_warps=(4 if native_h8 else 8),
-        block_threads=(160 if native_h8 else int(traits.block_threads)),
-        io_warps=1,
+        block_threads=(
+            160
+            if native_h8
+            else (320 if native_dsv4_h16 else int(traits.block_threads))
+        ),
+        io_warps=(2 if native_dsv4_h16 else 1),
         kv_stage_packed=native_h8 or native_dsv4_h16,
         kv_smem_stride=(
             _GLM_KV_GMEM_STRIDE
@@ -2626,4 +2674,3 @@ def run_unified_prefill(*args, **kwargs):
     from .prefill import run_unified_prefill as _impl
 
     return _impl(*args, **kwargs)
-
