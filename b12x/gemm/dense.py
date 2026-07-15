@@ -96,6 +96,7 @@ _B12X_WO_PDL: bool | None = (
     else _B12X_WO_PDL_RAW.lower() not in {"0", "false", "no", ""}
 )
 _WO_SPARK_MAX_SMS = 64
+_DENSE_SPARK_MAX_SMS = 64
 
 
 def _wo_pdl_enabled_for_sm_count(sm_count: int) -> bool:
@@ -103,6 +104,11 @@ def _wo_pdl_enabled_for_sm_count(sm_count: int) -> bool:
     if _B12X_WO_PDL is not None:
         return bool(_B12X_WO_PDL)
     return int(sm_count) <= _WO_SPARK_MAX_SMS
+
+
+def _dense_spark_policy_for_sm_count(sm_count: int) -> bool:
+    """Select dense-GEMM tactics measured on the low-SM DGX Spark class."""
+    return int(sm_count) <= _DENSE_SPARK_MAX_SMS
 
 
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
@@ -324,9 +330,14 @@ def _dense_gemm_policy_for(
     # scheduler regime (m >= 16); otherwise warming a large prefill and serving
     # a smaller live prefill resolves a second kernel under frozen resolution.
     # Tiny M already has distinct scheduler/load policies and is warmed
-    # separately by contract.
+    # separately by contract. M=4096 unrolling is a Spark win, but the RTX
+    # audit measured regressions on q_b and wo_b, so RTX keeps the M=8192
+    # threshold.
+    large_m_unroll_threshold = (
+        4096 if _dense_spark_policy_for_sm_count(sm_count) else 8192
+    )
     use_large_m_unroll = (
-        expected_m >= 4096
+        expected_m >= large_m_unroll_threshold
         if expected_m is not None
         else not single_work_tile_per_cta
         and not direct_one_m_tile_scheduler
@@ -5215,7 +5226,13 @@ def _select_default_mma_tiler_mn(
         # <=128 (small batch) -> 32x128 (~25% faster than 64x128 at M=32..128);
         # else -> 64x128 (the M-independent default, good to prefill).
         if expected_m is not None:
-            if expected_m >= 2048 and (n, k) == (16384, 1024):
+            # BM64/BK128 is the 20-SM Spark q_b winner. The 188-SM RTX audit
+            # keeps the following BM128/BK64 specialization instead.
+            if (
+                expected_m >= 2048
+                and (n, k) == (16384, 1024)
+                and _dense_spark_policy_for_sm_count(sm_count)
+            ):
                 return (64, 128)
             if (
                 expected_m >= 2048
@@ -5319,8 +5336,16 @@ def _select_mxfp8_tile_k(
     n: int,
     k: int,
     expected_m: Optional[int],
+    sm_count: int,
 ) -> int:
-    if expected_m is not None and expected_m >= 2048 and (n, k) == (16384, 1024):
+    # Keep tile-M and tile-K as one hardware-specific q_b plan: Spark uses
+    # BM64/BK128, while the RTX specialization below remains BM128/BK64.
+    if (
+        expected_m is not None
+        and expected_m >= 2048
+        and (n, k) == (16384, 1024)
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
         return 128
     # BK64 is an explicitly hinted production specialization. Choosing it from
     # live M when expected_m is absent would change both tile K and generated
@@ -5562,6 +5587,8 @@ def dense_gemm(
 
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
+    if sm_count is None:
+        sm_count = get_num_sm(a_torch.device)
     if ab_dtype == "float4_e2m1fn":
         is_mxfp8 = False
         k *= 2
@@ -5570,12 +5597,10 @@ def dense_gemm(
     elif ab_dtype == "float8_e4m3fn":
         is_mxfp8 = True
         mma_k = 32
-        tile_k = _select_mxfp8_tile_k(m, n, k, expected_m)
+        tile_k = _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
 
-    if sm_count is None:
-        sm_count = get_num_sm(a_torch.device)
     ab_cutlass_dtype = get_cutlass_dtype(ab_dtype)
     c_cutlass_dtype = get_cutlass_dtype(c_dtype)
     if mma_tiler_mn is None or load_path is None or swap_ab is None:

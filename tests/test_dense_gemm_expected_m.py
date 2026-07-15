@@ -16,6 +16,8 @@ from b12x.gemm.dense import (
     _DenseGemmLaunch,
     _DenseGemmPolicy,
     _dense_gemm_policy_for,
+    _dense_gemm_target_occupancy,
+    _dense_spark_policy_for_sm_count,
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
@@ -23,12 +25,13 @@ from b12x.gemm.dense import (
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
+SPARK_SM = 20  # DGX Spark GB10
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
 
 
-def _tile(m, *, expected_m=None, n=WIDE_N, k=None):
+def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=SM):
     return _select_default_mma_tiler_mn(
-        m, n, SM, is_mxfp8=True, expected_m=expected_m, k=k
+        m, n, sm_count, is_mxfp8=True, expected_m=expected_m, k=k
     )
 
 
@@ -181,8 +184,7 @@ def test_fused_quant_compile_key_is_distinct_and_exhaustive():
 
 
 def test_expected_m_short_k_large_n_uses_production_bk64_plan():
-    # DSV4 TP2 q_b production supplies expected_m, so pin every compile-time
-    # choice that must match the optimized production-hinted benchmark.
+    # RTX keeps the BM128/BK64 q_b prefill plan measured by the SM120 audit.
     for em in (2048, 4096, 8192):
         for live_m in (1, 64, 4096):
             assert _tile(
@@ -191,7 +193,7 @@ def test_expected_m_short_k_large_n_uses_production_bk64_plan():
                 n=16384,
                 k=1024,
             ) == (128, 128)
-            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em) == 64
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, SM) == 64
         policy = _dense_gemm_policy_for(
             m=64,
             n=16384,
@@ -207,19 +209,70 @@ def test_expected_m_short_k_large_n_uses_production_bk64_plan():
         assert policy.large_m_unroll == (em >= 8192)
 
 
+def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
+    # The candidate's BM64/BK128 and M>=4096 unroll choices remain selected on
+    # DGX Spark instead of being reverted globally to the RTX winners.
+    for em in (2048, 4096, 8192):
+        for live_m in (1, 64, 4096):
+            assert _tile(
+                live_m,
+                expected_m=em,
+                n=16384,
+                k=1024,
+                sm_count=SPARK_SM,
+            ) == (64, 128)
+            assert (
+                _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM)
+                == 128
+            )
+        policy = _dense_gemm_policy_for(
+            m=64,
+            n=16384,
+            k=1024,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=(64, 128),
+            cluster_shape_mn=(1, 1),
+            sm_count=SPARK_SM,
+            expected_m=em,
+        )
+        assert policy.large_m_unroll == (em >= 4096)
+
+
+def test_short_k_two_cta_occupancy_is_spark_only_for_q_b_decode():
+    kwargs = dict(
+        n=16384,
+        k=1024,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        tile_k=128,
+        mma_tiler_mn=(16, 128),
+        cluster_shape_mn=(1, 1),
+        load_path="tma",
+        swap_ab=False,
+        b_tile_major=False,
+    )
+    assert _dense_gemm_target_occupancy(sm_count=SPARK_SM, **kwargs) == 2
+    assert _dense_gemm_target_occupancy(sm_count=SM, **kwargs) == 1
+    assert _dense_spark_policy_for_sm_count(SPARK_SM)
+    assert not _dense_spark_policy_for_sm_count(SM)
+
+
 def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
     # Match the specialized DeepGEMM O-projection schedule without changing
     # the 1K schedule that already wins end to end.
     n, k = 4096, 4096
     assert _tile(1024, expected_m=1024, n=n, k=k) == (64, 128)
-    assert _select_mxfp8_tile_k(1024, n, k, 1024) == 128
+    assert _select_mxfp8_tile_k(1024, n, k, 1024, SM) == 128
     for em in (2048, 4096, 8192):
         tiles = {
             _tile(live_m, expected_m=em, n=n, k=k)
             for live_m in (1, 64, 2048, 8192)
         }
         assert tiles == {(128, 128)}, (n, k, em, tiles)
-        assert _select_mxfp8_tile_k(1, n, k, em) == 64
+        assert _select_mxfp8_tile_k(1, n, k, em, SM) == 64
 
 
 def test_grouped_wo_a_prefill_keeps_bm64_bk128():
@@ -228,18 +281,18 @@ def test_grouped_wo_a_prefill_keeps_bm64_bk128():
     n, k = 1024, 512
     for em in (2048, 4096, 8192):
         assert _tile(1, expected_m=em, n=n, k=k) == (64, 128)
-        assert _select_mxfp8_tile_k(1, n, k, em) == 128
+        assert _select_mxfp8_tile_k(1, n, k, em, SM) == 128
 
 
 def test_wo_bk64_override_is_exact_shape_only():
     for n, k in ((1024, 640), (1152, 512), (4096, 3968), (4224, 4096)):
-        assert _select_mxfp8_tile_k(2048, n, k, 2048) == 128
+        assert _select_mxfp8_tile_k(2048, n, k, 2048, SM) == 128
 
 
 def test_short_k_1024_and_2048_hints_have_stable_distinct_keys():
     def specialization(live_m: int, expected_m: int | None):
         tile = _tile(live_m, expected_m=expected_m, n=16384, k=1024)
-        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, expected_m)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, expected_m, SM)
         policy = _dense_gemm_policy_for(
             m=live_m,
             n=16384,
@@ -271,7 +324,7 @@ def test_short_k_no_hint_does_not_cross_bk64_cache_boundary():
     specializations = set()
     for live_m in (16, 1024, 2048, 4096, 8192):
         tile = _tile(live_m, expected_m=None, n=16384, k=1024)
-        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, None)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, None, SM)
         policy = _dense_gemm_policy_for(
             m=live_m,
             n=16384,
