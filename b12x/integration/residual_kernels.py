@@ -426,7 +426,7 @@ def _selected_post_pre_decode_split_n(
             compute_capability = tuple(torch.cuda.get_device_capability())
         if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
             return 0, 0
-        if int(num_tokens) >= 16:
+        if int(num_tokens) >= 10:
             splits, tile_n = 8, 6
         elif int(num_tokens) >= 8:
             splits, tile_n = 4, 6
@@ -464,7 +464,11 @@ def _selected_mhc_decode_finalize_threads(
         if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
             return 0
         if int(num_tokens) >= 16:
-            threads = 1024
+            threads = 128
+        elif int(num_tokens) >= 13:
+            threads = 512
+        elif int(num_tokens) >= 10:
+            threads = 128
         elif int(num_tokens) >= 8:
             threads = 512
         else:
@@ -947,6 +951,7 @@ class MHCPostPreDecodeSplitNPartialKernel:
         split_k: int | None = None,
         source_splits: int = 4,
         tile_n: int = 3,
+        bf16x2: bool = False,
         compute_gram: bool = False,
     ):
         self.hidden_size = int(hidden_size)
@@ -975,6 +980,13 @@ class MHCPostPreDecodeSplitNPartialKernel:
         if self.tile_n <= 0 or _MIXES % self.tile_n != 0:
             raise ValueError(f"decode tile_n must divide {_MIXES}, got {self.tile_n}")
         self.n_tiles = _MIXES // self.tile_n
+        self.bf16x2 = bool(bf16x2)
+        if self.bf16x2 and self.hidden_per_split % (2 * self.num_threads) != 0:
+            raise ValueError(
+                f"hidden_size/source_splits={self.hidden_per_split} must be "
+                f"divisible by {2 * self.num_threads} for bf16x2"
+            )
+        self.hidden_pair_iters = self.hidden_per_split // (2 * self.num_threads)
         self.compute_gram = bool(compute_gram)
 
     @cute.jit
@@ -1089,72 +1101,235 @@ class MHCPostPreDecodeSplitNPartialKernel:
                 gvals[gp] = Float32(0.0)
 
         h_split0 = source_split * Int32(self.hidden_per_split)
-        for hidden_iter in cutlass.range_constexpr(self.hidden_iters):
-            h = h_split0 + Int32(hidden_iter * self.num_threads) + tidx
-            xh = Float32(x[token, h])
-            rin0 = Float32(residual[token, Int32(0), h])
-            rin1 = Float32(residual[token, Int32(1), h])
-            rin2 = Float32(residual[token, Int32(2), h])
-            rin3 = Float32(residual[token, Int32(3), h])
-            o0 = (
-                pm[0] * xh
-                + cm[0, 0] * rin0
-                + cm[1, 0] * rin1
-                + cm[2, 0] * rin2
-                + cm[3, 0] * rin3
-            ).to(cutlass.BFloat16)
-            o1 = (
-                pm[1] * xh
-                + cm[0, 1] * rin0
-                + cm[1, 1] * rin1
-                + cm[2, 1] * rin2
-                + cm[3, 1] * rin3
-            ).to(cutlass.BFloat16)
-            o2 = (
-                pm[2] * xh
-                + cm[0, 2] * rin0
-                + cm[1, 2] * rin1
-                + cm[2, 2] * rin2
-                + cm[3, 2] * rin3
-            ).to(cutlass.BFloat16)
-            o3 = (
-                pm[3] * xh
-                + cm[0, 3] * rin0
-                + cm[1, 3] * rin1
-                + cm[2, 3] * rin2
-                + cm[3, 3] * rin3
-            ).to(cutlass.BFloat16)
-            r0 = Float32(o0)
-            r1 = Float32(o1)
-            r2 = Float32(o2)
-            r3 = Float32(o3)
-
-            if n_tile == Int32(0):
-                out[token, Int32(0), h] = o0
-                out[token, Int32(1), h] = o1
-                out[token, Int32(2), h] = o2
-                out[token, Int32(3), h] = o3
-                sqr += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
-                if const_expr(self.compute_gram):
-                    gvals[0] += r0 * r0
-                    gvals[1] += r1 * r1
-                    gvals[2] += r2 * r2
-                    gvals[3] += r3 * r3
-                    gvals[4] += r0 * r1
-                    gvals[5] += r0 * r2
-                    gvals[6] += r0 * r3
-                    gvals[7] += r1 * r2
-                    gvals[8] += r1 * r3
-                    gvals[9] += r2 * r3
-
-            for ni in cutlass.range_constexpr(self.tile_n):
-                mix = mix0 + Int32(ni)
-                acc[ni] += (
-                    Float32(fn[mix, h]) * r0
-                    + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
-                    + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
-                    + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
+        if const_expr(self.bf16x2):
+            out_u32 = cute.recast_tensor(out, Uint32)
+            for hidden_pair_iter in cutlass.range_constexpr(
+                self.hidden_pair_iters
+            ):
+                h = (
+                    h_split0
+                    + Int32(2 * hidden_pair_iter * self.num_threads)
+                    + tidx * Int32(2)
                 )
+                x_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        x,
+                        token * Int32(self.hidden_size) + h,
+                    )
+                )
+                rin0_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size) + h,
+                    )
+                )
+                rin1_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(self.hidden_size)
+                        + h,
+                    )
+                )
+                rin2_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(2 * self.hidden_size)
+                        + h,
+                    )
+                )
+                rin3_pair = ld_global_nc_u32(
+                    get_ptr_as_int64(
+                        residual,
+                        token * Int32(_MHC_MULT * self.hidden_size)
+                        + Int32(3 * self.hidden_size)
+                        + h,
+                    )
+                )
+                x0, x1 = bfloat2_to_float2_scaled(x_pair, Float32(1.0))
+                rin00, rin01 = bfloat2_to_float2_scaled(
+                    rin0_pair, Float32(1.0)
+                )
+                rin10, rin11 = bfloat2_to_float2_scaled(
+                    rin1_pair, Float32(1.0)
+                )
+                rin20, rin21 = bfloat2_to_float2_scaled(
+                    rin2_pair, Float32(1.0)
+                )
+                rin30, rin31 = bfloat2_to_float2_scaled(
+                    rin3_pair, Float32(1.0)
+                )
+
+                o_values = cute.make_rmem_tensor(
+                    cute.make_layout((_MHC_MULT, 2), stride=(2, 1)),
+                    Float32,
+                )
+                for pair_lane in cutlass.range_constexpr(2):
+                    xh = x0
+                    rin0 = rin00
+                    rin1 = rin10
+                    rin2 = rin20
+                    rin3 = rin30
+                    if const_expr(pair_lane == 1):
+                        xh = x1
+                        rin0 = rin01
+                        rin1 = rin11
+                        rin2 = rin21
+                        rin3 = rin31
+                    o_values[0, pair_lane] = (
+                        pm[0] * xh
+                        + cm[0, 0] * rin0
+                        + cm[1, 0] * rin1
+                        + cm[2, 0] * rin2
+                        + cm[3, 0] * rin3
+                    )
+                    o_values[1, pair_lane] = (
+                        pm[1] * xh
+                        + cm[0, 1] * rin0
+                        + cm[1, 1] * rin1
+                        + cm[2, 1] * rin2
+                        + cm[3, 1] * rin3
+                    )
+                    o_values[2, pair_lane] = (
+                        pm[2] * xh
+                        + cm[0, 2] * rin0
+                        + cm[1, 2] * rin1
+                        + cm[2, 2] * rin2
+                        + cm[3, 2] * rin3
+                    )
+                    o_values[3, pair_lane] = (
+                        pm[3] * xh
+                        + cm[0, 3] * rin0
+                        + cm[1, 3] * rin1
+                        + cm[2, 3] * rin2
+                        + cm[3, 3] * rin3
+                    )
+
+                o0_pair = pack_f32x2_to_bfloat2(o_values[0, 0], o_values[0, 1])
+                o1_pair = pack_f32x2_to_bfloat2(o_values[1, 0], o_values[1, 1])
+                o2_pair = pack_f32x2_to_bfloat2(o_values[2, 0], o_values[2, 1])
+                o3_pair = pack_f32x2_to_bfloat2(o_values[3, 0], o_values[3, 1])
+                r00, r01 = bfloat2_to_float2_scaled(o0_pair, Float32(1.0))
+                r10, r11 = bfloat2_to_float2_scaled(o1_pair, Float32(1.0))
+                r20, r21 = bfloat2_to_float2_scaled(o2_pair, Float32(1.0))
+                r30, r31 = bfloat2_to_float2_scaled(o3_pair, Float32(1.0))
+
+                if n_tile == Int32(0):
+                    out_h = h // Int32(2)
+                    out_u32[token, Int32(0), out_h] = o0_pair
+                    out_u32[token, Int32(1), out_h] = o1_pair
+                    out_u32[token, Int32(2), out_h] = o2_pair
+                    out_u32[token, Int32(3), out_h] = o3_pair
+                    sqr += r00 * r00 + r10 * r10 + r20 * r20 + r30 * r30
+                    sqr += r01 * r01 + r11 * r11 + r21 * r21 + r31 * r31
+                    if const_expr(self.compute_gram):
+                        gvals[0] += r00 * r00 + r01 * r01
+                        gvals[1] += r10 * r10 + r11 * r11
+                        gvals[2] += r20 * r20 + r21 * r21
+                        gvals[3] += r30 * r30 + r31 * r31
+                        gvals[4] += r00 * r10 + r01 * r11
+                        gvals[5] += r00 * r20 + r01 * r21
+                        gvals[6] += r00 * r30 + r01 * r31
+                        gvals[7] += r10 * r20 + r11 * r21
+                        gvals[8] += r10 * r30 + r11 * r31
+                        gvals[9] += r20 * r30 + r21 * r31
+
+                for pair_lane in cutlass.range_constexpr(2):
+                    hp = h + Int32(pair_lane)
+                    r0 = r00
+                    r1 = r10
+                    r2 = r20
+                    r3 = r30
+                    if const_expr(pair_lane == 1):
+                        r0 = r01
+                        r1 = r11
+                        r2 = r21
+                        r3 = r31
+                    for ni in cutlass.range_constexpr(self.tile_n):
+                        mix = mix0 + Int32(ni)
+                        acc[ni] += (
+                            Float32(fn[mix, hp]) * r0
+                            + Float32(
+                                fn[mix, Int32(self.hidden_size) + hp]
+                            )
+                            * r1
+                            + Float32(
+                                fn[mix, Int32(2 * self.hidden_size) + hp]
+                            )
+                            * r2
+                            + Float32(
+                                fn[mix, Int32(3 * self.hidden_size) + hp]
+                            )
+                            * r3
+                        )
+        else:
+            for hidden_iter in cutlass.range_constexpr(self.hidden_iters):
+                h = h_split0 + Int32(hidden_iter * self.num_threads) + tidx
+                xh = Float32(x[token, h])
+                rin0 = Float32(residual[token, Int32(0), h])
+                rin1 = Float32(residual[token, Int32(1), h])
+                rin2 = Float32(residual[token, Int32(2), h])
+                rin3 = Float32(residual[token, Int32(3), h])
+                o0 = (
+                    pm[0] * xh
+                    + cm[0, 0] * rin0
+                    + cm[1, 0] * rin1
+                    + cm[2, 0] * rin2
+                    + cm[3, 0] * rin3
+                ).to(cutlass.BFloat16)
+                o1 = (
+                    pm[1] * xh
+                    + cm[0, 1] * rin0
+                    + cm[1, 1] * rin1
+                    + cm[2, 1] * rin2
+                    + cm[3, 1] * rin3
+                ).to(cutlass.BFloat16)
+                o2 = (
+                    pm[2] * xh
+                    + cm[0, 2] * rin0
+                    + cm[1, 2] * rin1
+                    + cm[2, 2] * rin2
+                    + cm[3, 2] * rin3
+                ).to(cutlass.BFloat16)
+                o3 = (
+                    pm[3] * xh
+                    + cm[0, 3] * rin0
+                    + cm[1, 3] * rin1
+                    + cm[2, 3] * rin2
+                    + cm[3, 3] * rin3
+                ).to(cutlass.BFloat16)
+                r0 = Float32(o0)
+                r1 = Float32(o1)
+                r2 = Float32(o2)
+                r3 = Float32(o3)
+
+                if n_tile == Int32(0):
+                    out[token, Int32(0), h] = o0
+                    out[token, Int32(1), h] = o1
+                    out[token, Int32(2), h] = o2
+                    out[token, Int32(3), h] = o3
+                    sqr += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+                    if const_expr(self.compute_gram):
+                        gvals[0] += r0 * r0
+                        gvals[1] += r1 * r1
+                        gvals[2] += r2 * r2
+                        gvals[3] += r3 * r3
+                        gvals[4] += r0 * r1
+                        gvals[5] += r0 * r2
+                        gvals[6] += r0 * r3
+                        gvals[7] += r1 * r2
+                        gvals[8] += r1 * r3
+                        gvals[9] += r2 * r3
+
+                for ni in cutlass.range_constexpr(self.tile_n):
+                    mix = mix0 + Int32(ni)
+                    acc[ni] += (
+                        Float32(fn[mix, h]) * r0
+                        + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
+                        + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
+                        + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
+                    )
 
         for ni in cutlass.range_constexpr(self.tile_n):
             acc[ni] = _warp_allreduce_sum(acc[ni])
@@ -2904,11 +3079,17 @@ class MHCFinalizeGramKernel:
         compact_projection_splits: int = 1,
         single_cta: bool = False,
         single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
+        single_cta_groups: int = 1,
         active_source_splits: int = 0,
     ):
         self.hidden_size = int(hidden_size)
         self.single_cta = bool(single_cta)
         self.single_cta_threads = int(single_cta_threads)
+        self.single_cta_groups = int(single_cta_groups)
+        if self.single_cta_groups <= 0:
+            raise ValueError("single_cta_groups must be positive")
+        if not self.single_cta and self.single_cta_groups != 1:
+            raise ValueError("single_cta_groups requires single_cta=True")
         self.num_threads = (
             self.single_cta_threads
             if self.single_cta
@@ -2920,8 +3101,22 @@ class MHCFinalizeGramKernel:
                 f"hidden_size={self.hidden_size} must be divisible by "
                 f"finalize block_h={self.block_h}"
             )
+        if self.single_cta and (
+            self.hidden_size % (2 * self.num_threads * self.single_cta_groups)
+            != 0
+        ):
+            raise ValueError(
+                f"hidden_size={self.hidden_size} must be divisible by "
+                "2 * single-CTA threads * groups="
+                f"{2 * self.num_threads * self.single_cta_groups}"
+            )
         self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
         self.hidden_tiles = self.hidden_size // self.block_h
+        if self.hidden_tiles % self.single_cta_groups != 0:
+            raise ValueError(
+                f"hidden tiles={self.hidden_tiles} must be divisible by "
+                f"single_cta_groups={self.single_cta_groups}"
+            )
         self.active_source_splits = int(active_source_splits)
         if self.active_source_splits == 0:
             self.active_source_splits = self.source_tiles
@@ -2966,8 +3161,10 @@ class MHCFinalizeGramKernel:
                 "compact_projection_splits must be less than partials split_k"
             )
         self.tiles_per_cta = (
-            self.hidden_tiles
-            if self.compact_partials or self.single_cta
+            self.hidden_tiles // self.single_cta_groups
+            if self.single_cta
+            else self.hidden_tiles
+            if self.compact_partials
             else 1
         )
         if (
@@ -3567,10 +3764,20 @@ class MHCFinalizeGramKernel:
         p3 = Float32(s_pre[3])
         if const_expr(self.compact_partials or self.single_cta):
             y_u32 = cute.recast_tensor(y, Uint32)
+            first_pair = Int32(0)
+            if const_expr(self.single_cta and self.single_cta_groups > 1):
+                first_pair = tile_group * Int32(
+                    self.hidden_size // (2 * self.single_cta_groups)
+                )
             for pair_iter in cutlass.range_constexpr(
-                self.hidden_size // (2 * self.num_threads)
+                self.hidden_size
+                // (2 * self.num_threads * self.single_cta_groups)
             ):
-                h = Int32(2 * pair_iter * self.num_threads) + tidx * Int32(2)
+                h = (
+                    first_pair
+                    + Int32(pair_iter * self.num_threads)
+                    + tidx
+                ) * Int32(2)
                 residual_base = token * Int32(_MHC_MULT * self.hidden_size) + h
                 ro0_pair = ld_global_nc_u32(
                     get_ptr_as_int64(residual, residual_base)
@@ -3674,6 +3881,7 @@ def _post_pre_decode_split_n_partial_kernel(
     split_k: int,
     source_splits: int,
     tile_n: int,
+    bf16x2: bool = False,
     compute_gram: bool = False,
 ) -> MHCPostPreDecodeSplitNPartialKernel:
     return MHCPostPreDecodeSplitNPartialKernel(
@@ -3681,6 +3889,7 @@ def _post_pre_decode_split_n_partial_kernel(
         split_k=split_k,
         source_splits=source_splits,
         tile_n=tile_n,
+        bf16x2=bf16x2,
         compute_gram=compute_gram,
     )
 
@@ -3776,6 +3985,7 @@ def _finalize_gram_kernel(
     compact_projection_splits: int = 1,
     single_cta: bool = False,
     single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
+    single_cta_groups: int = 1,
     active_source_splits: int = 0,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
@@ -3790,6 +4000,7 @@ def _finalize_gram_kernel(
         compact_projection_splits=compact_projection_splits,
         single_cta=single_cta,
         single_cta_threads=single_cta_threads,
+        single_cta_groups=single_cta_groups,
         active_source_splits=active_source_splits,
     )
 
@@ -3813,6 +4024,14 @@ def _run_mhc_post_pre_partial_launch(
         num_tokens=tokens,
         hidden_size=hidden_size,
     )
+    raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
+    decode_bf16x2 = (
+        raw_bf16x2 != "0"
+        if raw_bf16x2 is not None
+        else tokens == 16
+        and hidden_size == _HIDDEN
+        and decode_source_splits > 0
+    )
     partials_per_cta = _selected_post_pre_partials_per_cta(
         num_tokens=tokens,
         hidden_size=hidden_size,
@@ -3824,6 +4043,10 @@ def _run_mhc_post_pre_partial_launch(
     _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
+    decode_bf16x2 = decode_bf16x2 and all(
+        tensor.is_contiguous() and tensor.data_ptr() % 4 == 0
+        for tensor in (x, residual, out)
+    )
     compute_gram = bool(compute_gram)
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
@@ -3909,12 +4132,14 @@ def _run_mhc_post_pre_partial_launch(
         compile_name = (
             "integration.residual.mhc_post_pre_decode_split_n_"
             f"{hidden_specialization}_s{decode_source_splits}n{decode_tile_n}"
+            f"x{2 if decode_bf16x2 else 1}"
         )
         compile_key = (
             ("hidden_size", hidden_size),
             ("split_k", split_k),
             ("source_splits", decode_source_splits),
             ("tile_n", decode_tile_n),
+            ("bf16x2", decode_bf16x2),
             ("compute_gram", compute_gram),
             ("pdl", _MHC_PDL),
             cache_key,
@@ -3924,6 +4149,7 @@ def _run_mhc_post_pre_partial_launch(
             split_k,
             decode_source_splits,
             decode_tile_n,
+            decode_bf16x2,
             compute_gram,
         )
     elif hidden_size == _HIDDEN and split_k == _SPLIT_K:
@@ -5367,6 +5593,14 @@ def _run_mhc_finalize_gram_launch(
         )
     )
     single_cta = single_cta_threads > 0
+    raw_single_cta_groups = os.environ.get("B12X_MHC_DECODE_FINALIZE_CTAS")
+    single_cta_groups = 1
+    if single_cta:
+        single_cta_groups = (
+            int(raw_single_cta_groups)
+            if raw_single_cta_groups is not None
+            else 8 if single_cta_threads == 128 and tokens >= 10 else 1
+        )
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("scale", scale, (3,))
@@ -5418,7 +5652,7 @@ def _run_mhc_finalize_gram_launch(
             "prefill_finalize_gram_bf16x2_io_v3"
             if compact_partials
             else (
-                "finalize_gram_single_cta_bf16x2_io_v1"
+                "finalize_gram_single_cta_bf16x2_io_v2"
                 if single_cta
                 else "finalize_gram_multicta_v2"
             ),
@@ -5429,6 +5663,7 @@ def _run_mhc_finalize_gram_launch(
         ("compact_projection_splits", compact_projection_splits),
         ("single_cta", single_cta),
         ("single_cta_threads", single_cta_threads),
+        ("single_cta_groups", single_cta_groups),
         ("active_source_splits", active_source_splits),
         ("pdl", _MHC_PDL),
         ("norm_eps", norm_eps if fuse_norm else 0.0),
@@ -5480,7 +5715,7 @@ def _run_mhc_finalize_gram_launch(
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
         suffix = "_compact" if compact_partials else ""
         if single_cta:
-            suffix = f"_single_cta_t{single_cta_threads}"
+            suffix = f"_single_cta_t{single_cta_threads}g{single_cta_groups}"
         compile_name = f"integration.residual.mhc_finalize_gram_hidden4096{suffix}"
         compile_key = (
             (
@@ -5500,7 +5735,7 @@ def _run_mhc_finalize_gram_launch(
     else:
         suffix = "_compact" if compact_partials else ""
         if single_cta:
-            suffix = f"_single_cta_t{single_cta_threads}"
+            suffix = f"_single_cta_t{single_cta_threads}g{single_cta_groups}"
         compile_name = (
             "integration.residual.mhc_finalize_gram_"
             f"{hidden_specialization}{suffix}"
@@ -5535,6 +5770,7 @@ def _run_mhc_finalize_gram_launch(
             compact_projection_splits,
             single_cta,
             single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
+            single_cta_groups,
             active_source_splits,
         ),
         compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
