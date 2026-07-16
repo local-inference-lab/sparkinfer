@@ -412,6 +412,15 @@ class SparseNSATiledTopkKernel:
                 clipped_start = input_index_offset
             clipped_end = row_end
             chunk_end = input_index_offset + input_extent
+            if cutlass.const_expr(self.is_tiled):
+                # A balanced extent split can round its final slice up by one
+                # tile. Clip that slice to the tiles actually present instead
+                # of reading the next scratch region as logits.
+                tiled_end = input_index_offset + (
+                    num_k_tiles - tile_k_offset
+                ) * block_k
+                if chunk_end > tiled_end:
+                    chunk_end = tiled_end
             if clipped_end > chunk_end:
                 clipped_end = chunk_end
             if clipped_end > clipped_start:

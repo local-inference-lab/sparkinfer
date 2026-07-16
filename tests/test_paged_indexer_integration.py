@@ -755,6 +755,65 @@ def test_paged_index_supertile_plan_records_launch_contract() -> None:
     assert plan.layout.tile_logits_elements == 32 * 512
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_paged_index_two_level_fold_clips_rounded_final_slice() -> None:
+    device = torch.device("cuda")
+    rows, num_heads, topk = 1, 16, 512
+    supertile_k = 33 * 512
+    width_blocks = 2 * (supertile_k // 64)
+    width_tokens = width_blocks * 64
+
+    seqlens = torch.full((rows,), width_tokens, dtype=torch.int32, device=device)
+    page_table = torch.arange(
+        width_blocks, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    q_fp8 = torch.zeros(
+        (rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device
+    )
+    q_fp8[:, 0, 0] = 1
+    weights = torch.zeros((rows, num_heads), dtype=torch.float32, device=device)
+    weights[:, 0] = -1
+    k = torch.zeros((width_tokens, 128), dtype=torch.float32, device=device)
+    k[:, 0] = torch.linspace(1, 2, width_tokens, device=device)
+    index_k_cache = pack_paged_index_k_cache_reference(k)
+    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        supertile_k=supertile_k,
+    )
+
+    index_topk_fp8(
+        q_fp8=q_fp8,
+        weights=weights.unsqueeze(-1),
+        index_k_cache=index_k_cache,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        binding=binding,
+        out_indices=actual,
+        supertile_k=supertile_k,
+    )
+    torch.cuda.synchronize(device)
+
+    expected = _expected_paged_index_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        topk=topk,
+    )
+    assert torch.equal(
+        torch.sort(actual, dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
