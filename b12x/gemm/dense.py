@@ -89,7 +89,7 @@ from b12x.cute.fp4 import (
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
-_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL")
+_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL", "0")
 _B12X_WO_PDL: bool | None = (
     None
     if _B12X_WO_PDL_RAW is None
@@ -278,6 +278,35 @@ def _use_direct_sfa_live16(
     )
 
 
+def _use_direct_m1_wo_a_inputs(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    l: int,
+    sf_vec_size: int,
+    tile_k: int,
+    mma_tiler_mn: Tuple[int, int],
+    load_path: str,
+    swap_ab: bool,
+    b_tile_major: bool,
+    sfb_k_reuse: bool,
+    is_mxfp8: bool,
+) -> bool:
+    return (
+        m == 1
+        and (n, k, l) == (1024, 4096, 4)
+        and is_mxfp8
+        and sf_vec_size == 32
+        and tile_k == 128
+        and mma_tiler_mn == (16, 64)
+        and load_path == "tma"
+        and not swap_ab
+        and b_tile_major
+        and sfb_k_reuse
+    )
+
+
 def _dense_gemm_policy_for(
     *,
     m: int,
@@ -411,6 +440,7 @@ class DenseGemmKernel:
         quantize_c: bool = False,
         alpha_is_one: bool = False,
         direct_sfa_live16: bool = False,
+        direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
     ):
         self.acc_dtype = cutlass.Float32
@@ -476,11 +506,20 @@ class DenseGemmKernel:
         self.alpha_is_one = alpha_is_one
         self.direct_sfb_representative = (
             sfb_k_reuse
-            and alpha_is_one
             and b_tile_major
-            and not fused_quant_a
-            and self.tile_shape_mnk == (32, 64, 128)
+            and (
+                (
+                    not fused_quant_a
+                    and self.tile_shape_mnk
+                    in ((16, 64, 128), (32, 64, 128))
+                )
+                or (
+                    fused_quant_a
+                    and self.tile_shape_mnk == (16, 128, 128)
+                )
+            )
         )
+        self.direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         # Exact B16 consumes only rows 0-15 of each 128-row SFA atom. Those
         # rows are the contiguous first 256 bytes in both the packed global
         # and shared-memory layouts.
@@ -703,9 +742,11 @@ class DenseGemmKernel:
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             1,
         )
-        if cutlass.const_expr(self.fused_quant_a):
-            # A is produced directly into shared memory; reuse B's descriptor
-            # as a type-compatible placeholder for the dead A TMA argument.
+        if cutlass.const_expr(
+            self.fused_quant_a or self.direct_m1_wo_a_inputs
+        ):
+            # A does not use a TMA descriptor on these paths. Reuse B's as a
+            # type-compatible placeholder for the dead kernel argument.
             tma_atom_a = tma_atom_b
             tma_tensor_a = a
         else:
@@ -1050,6 +1091,7 @@ class DenseGemmKernel:
                 self.load_path == "tma"
                 and not self.use_m1_non_tma_a
                 and not self.fused_quant_a
+                and not self.direct_m1_wo_a_inputs
             ):
                 cpasync.prefetch_descriptor(tma_atom_a)
             if cutlass.const_expr(self.load_path == "tma"):
@@ -1100,11 +1142,16 @@ class DenseGemmKernel:
                 tma_copy_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
         else:
             tma_copy_bytes = (
-                cute.size_in_bytes(self.a_dtype, a_smem_layout)
-                + cute.size_in_bytes(self.b_dtype, b_smem_layout)
+                cute.size_in_bytes(self.b_dtype, b_smem_layout)
                 + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
                 + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
             )
+            if cutlass.const_expr(self.direct_m1_wo_a_inputs):
+                tma_copy_bytes += 128
+            else:
+                tma_copy_bytes += cute.size_in_bytes(
+                    self.a_dtype, a_smem_layout
+                )
         if cutlass.const_expr(self.direct_sfb_representative):
             tma_copy_bytes -= cute.size_in_bytes(
                 self.sf_dtype, sfb_smem_layout
@@ -1230,6 +1277,7 @@ class DenseGemmKernel:
             self.load_path == "tma"
             and not self.use_m1_non_tma_a
             and not self.fused_quant_a
+            and not self.direct_m1_wo_a_inputs
         ):
             tAsA, tAgA = cpasync.tma_partition(
                 tma_atom_a,
@@ -2402,6 +2450,7 @@ class DenseGemmKernel:
                     self.load_path == "tma"
                     and not self.use_m1_non_tma_a
                     and not self.fused_quant_a
+                and not self.direct_m1_wo_a_inputs
                 ):
                     tAgA_mkl = tAgA[
                         (None, tile_coord_mnl[0], None, tile_coord_mnl[2])
@@ -2481,19 +2530,23 @@ class DenseGemmKernel:
                         tBgB_k = tBgB_nkl[(None, k_tile_global)]
                         tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
                         if cutlass.const_expr(
-                            not self.use_m1_non_tma_a and not self.fused_quant_a
+                            not self.use_m1_non_tma_a
+                            and not self.fused_quant_a
+                            and not self.direct_m1_wo_a_inputs
                         ):
                             tAgA_k = tAgA_mkl[(None, k_tile_global)]
                             tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
 
-                            if cutlass.const_expr(
-                                not self.manual_bk64_sf
-                                and not self.direct_sfa_prefix
-                            ):
-                                tAgSFA_k = tAgSFA_mkl[(None, k_tile_global)]
-                                tAsSFA_pipe = tAsSFA[
-                                    (None, mainloop_producer_state.index)
-                                ]
+                        if cutlass.const_expr(
+                            not self.use_m1_non_tma_sfa
+                            and not self.fused_quant_a
+                            and not self.manual_bk64_sf
+                            and not self.direct_sfa_prefix
+                        ):
+                            tAgSFA_k = tAgSFA_mkl[(None, k_tile_global)]
+                            tAsSFA_pipe = tAsSFA[
+                                (None, mainloop_producer_state.index)
+                            ]
 
                         if cutlass.const_expr(
                             not self.manual_bk64_sf
@@ -3037,6 +3090,34 @@ class DenseGemmKernel:
                                         tile_coord_mnl[2],
                                     )
                                 ]
+                    elif cutlass.const_expr(self.direct_m1_wo_a_inputs):
+                        lane = Int32(tidx % self.num_threads_per_warp)
+                        if lane == Int32(0):
+                            a_offset = (
+                                tile_coord_mnl[2]
+                                * Int32(directA_mkl.shape[0])
+                                * Int32(directA_mkl.shape[1])
+                                + k_tile_global * Int32(self.tile_shape_mnk[2])
+                            )
+                            cp_async_bulk_g2s_mbar(
+                                shared_ptr_to_u32(
+                                    elem_pointer(
+                                        sA,
+                                        (
+                                            Int32(0),
+                                            Int32(0),
+                                            mainloop_producer_state.index,
+                                        ),
+                                    )
+                                ),
+                                get_ptr_as_int64(directA_mkl, a_offset),
+                                Int32(128),
+                                shared_ptr_to_u32(
+                                    mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    )
+                                ),
+                            )
                     else:
                         cute.copy(
                             tma_atom_a,
@@ -3643,6 +3724,7 @@ class _DenseGemmLaunch:
         quantize_c: bool = False,
         alpha_is_one: bool = False,
         direct_sfa_live16: bool = False,
+        direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
     ):
         self._n = n
@@ -3675,6 +3757,7 @@ class _DenseGemmLaunch:
         self._quantize_c = quantize_c
         self._alpha_is_one = alpha_is_one
         self._direct_sfa_live16 = direct_sfa_live16
+        self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
@@ -3776,6 +3859,7 @@ class _DenseGemmLaunch:
             self._quantize_c,
             self._alpha_is_one,
             self._direct_sfa_live16,
+            self._direct_m1_wo_a_inputs,
             self._target_occupancy,
         )
 
@@ -3889,6 +3973,7 @@ class _DenseGemmLaunch:
             quantize_c=self._quantize_c,
             alpha_is_one=self._alpha_is_one,
             direct_sfa_live16=self._direct_sfa_live16,
+            direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
         )(
             a_tensor,
@@ -4582,6 +4667,7 @@ def _get_compiled_dense_gemm(
     quantize_c: bool = False,
     alpha_is_one: bool = False,
     direct_sfa_live16: bool = False,
+    direct_m1_wo_a_inputs: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -4673,6 +4759,7 @@ def _get_compiled_dense_gemm(
         quantize_c=quantize_c,
         alpha_is_one=alpha_is_one,
         direct_sfa_live16=direct_sfa_live16,
+        direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -4840,6 +4927,20 @@ def _dense_gemm_launch_flat(
             b_tile_major=b_tile_major,
             sfb_k_reuse=sfb_k_reuse,
             alpha_is_one=alpha_is_one,
+            is_mxfp8=ab_dtype == "float8_e4m3fn",
+        ),
+        direct_m1_wo_a_inputs=_use_direct_m1_wo_a_inputs(
+            m=int(a_tensor_gpu.shape[0]),
+            n=n,
+            k=k,
+            l=l,
+            sf_vec_size=sf_vec_size,
+            tile_k=tile_k,
+            mma_tiler_mn=(mma_tile_m, mma_tile_n),
+            load_path=load_path,
+            swap_ab=swap_ab,
+            b_tile_major=b_tile_major,
+            sfb_k_reuse=sfb_k_reuse,
             is_mxfp8=ab_dtype == "float8_e4m3fn",
         ),
     )
