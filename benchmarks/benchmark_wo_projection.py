@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 
 import b12x.gemm.wo_projection as wo_projection_impl
-from b12x.cute.utils import get_hardware_info
 from b12x.gemm.wo_projection import (
     WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
@@ -39,14 +38,12 @@ from b12x.gemm.wo_projection import (
     wo_projection_inv_rope_mxfp8,
     wo_projection_mxfp8,
 )
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
 
 REFERENCE_LABEL = "PyTorch graph BF16 einsum+matmul"
 DEEPGEMM_LABEL = "deepgemm"
 COSINE_THRESHOLD = 0.995
-_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
-_AUTO_L2_FLUSH_MULTIPLIER = 2
-_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 class BenchmarkAbort(RuntimeError):
@@ -55,37 +52,6 @@ class BenchmarkAbort(RuntimeError):
 
 class CorrectnessError(BenchmarkAbort):
     """Raised when replay outputs fail the correctness gate."""
-
-
-def resolve_l2_flush_bytes(bytes_hint: int) -> int:
-    if bytes_hint < 0:
-        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
-    if bytes_hint > 0:
-        return int(bytes_hint)
-    try:
-        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
-    except Exception:
-        l2_bytes = 0
-    if l2_bytes > 0:
-        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
-    return _FALLBACK_L2_FLUSH_BYTES
-
-
-def make_l2_flush_fn(*, bytes_hint: int = 0) -> Callable[[], None]:
-    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
-    device_idx = torch.cuda.current_device()
-    key = (device_idx, flush_bytes)
-    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
-    if buffer is None:
-        buffer = torch.empty(
-            flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}"
-        )
-        _L2_FLUSH_BUFFER_CACHE[key] = buffer
-
-    def flush(cache_buffer: torch.Tensor = buffer) -> None:
-        cache_buffer.bitwise_not_()
-
-    return flush
 
 
 def require_sm120() -> None:
@@ -632,7 +598,10 @@ def main() -> None:
 
     require_sm120()
     torch.empty(1, device="cuda")
-    l2_flush = make_l2_flush_fn(bytes_hint=args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(
+        enabled=True,
+        bytes_hint=args.l2_flush_bytes,
+    )
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
 
     print(f"WO projection: b12x native MXFP8 two-GEMM vs {REFERENCE_LABEL}")

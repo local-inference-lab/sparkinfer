@@ -12,8 +12,10 @@ from b12x.cute.utils import get_hardware_info
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _AUTO_L2_FLUSH_MULTIPLIER = 2
-_FALLBACK_L2_FLUSH_BYTES = 32 << 20
-_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_FALLBACK_L2_FLUSH_BYTES = 128 << 20
+_L2_FLUSH_BUFFER_CACHE: dict[
+    tuple[int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def require_sm120() -> torch.device:
@@ -23,12 +25,20 @@ def require_sm120() -> torch.device:
 
 
 def resolve_l2_flush_bytes(bytes_hint: int) -> int:
+    if bytes_hint < 0:
+        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
     if bytes_hint > 0:
         return int(bytes_hint)
     try:
         l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
     except Exception:
         l2_bytes = 0
+    if l2_bytes <= 0:
+        try:
+            properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+            l2_bytes = int(properties.L2_cache_size)
+        except Exception:
+            l2_bytes = 0
     if l2_bytes > 0:
         return _AUTO_L2_FLUSH_MULTIPLIER * l2_bytes
     return _FALLBACK_L2_FLUSH_BYTES
@@ -38,18 +48,29 @@ def make_l2_flush_fn(
     enabled: bool,
     bytes_hint: int = 0,
 ) -> Callable[[], None] | None:
+    """Return an L2 eviction sweep without leaving bulk writeback traffic."""
     if not enabled:
         return None
     flush_bytes = resolve_l2_flush_bytes(bytes_hint)
     device_idx = torch.cuda.current_device()
     cache_key = (device_idx, flush_bytes)
-    buffer = _L2_FLUSH_BUFFER_CACHE.get(cache_key)
-    if buffer is None or buffer.numel() != flush_bytes:
-        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
-        _L2_FLUSH_BUFFER_CACHE[cache_key] = buffer
+    state = _L2_FLUSH_BUFFER_CACHE.get(cache_key)
+    if state is None:
+        buffer = torch.ones(
+            (flush_bytes + 3) // 4,
+            dtype=torch.float32,
+            device=f"cuda:{device_idx}",
+        )
+        reduction = torch.empty((), dtype=torch.float32, device=buffer.device)
+        state = (buffer, reduction)
+        _L2_FLUSH_BUFFER_CACHE[cache_key] = state
+    buffer, reduction = state
 
-    def flush(buf: torch.Tensor = buffer) -> None:
-        buf.bitwise_not_()
+    def flush(
+        buf: torch.Tensor = buffer,
+        out: torch.Tensor = reduction,
+    ) -> None:
+        torch.sum(buf, dim=0, out=out)
 
     return flush
 

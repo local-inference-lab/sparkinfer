@@ -13,23 +13,24 @@ the benchmark in traffic-control tooling yourself.
 """
 
 import argparse
+import pathlib
 import statistics
 import sys
 
 sys.path.insert(0, "/home/luke/projects/vllm-other/vllm/third_party")
-sys.path.insert(0, "/home/luke/projects/b12x/benchmarks")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 import deep_gemm
 
 print("deep_gemm from:", deep_gemm.__file__)
 
-from benchmark_dense_gemm import (
+from benchmarks.benchmark_dense_gemm import (
     bench_events,
     capture_graph_replay,
-    make_l2_flush_fn,
     make_mxfp8_operand,
 )
+from benchmarks.common import make_l2_flush_fn
 from b12x.gemm.dense import dense_gemm
 
 

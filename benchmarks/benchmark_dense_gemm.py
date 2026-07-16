@@ -27,11 +27,11 @@ from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,
-    get_hardware_info,
 )
 from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
 from b12x.gemm.dense import dense_gemm
 from b12x.gemm.wo_projection import empty_mxfp8_rows_for_dense_gemm
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
 from flashinfer import mxfp8_quantize
 from flashinfer.gemm import mm_fp4, mm_mxfp8
@@ -81,9 +81,6 @@ FP8_REFERENCE_LABEL = "FlashInfer CUTLASS MXFP8"
 DEEPGEMM_E2E_REFERENCE_LABEL = "DeepGEMM fp8_gemm_nt e2e"
 COSINE_THRESHOLD = 0.999999
 DEEPGEMM_COSINE_THRESHOLD = 0.999
-_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
-_AUTO_L2_FLUSH_MULTIPLIER = 2
-_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 class BenchmarkAbort(RuntimeError):
@@ -92,43 +89,6 @@ class BenchmarkAbort(RuntimeError):
 
 class CorrectnessError(BenchmarkAbort):
     """Raised when replay outputs fail the correctness gate."""
-
-
-def resolve_l2_flush_bytes(bytes_hint: int) -> int:
-    if bytes_hint < 0:
-        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
-    if bytes_hint > 0:
-        return int(bytes_hint)
-    try:
-        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
-    except Exception:
-        l2_bytes = 0
-    if l2_bytes > 0:
-        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
-    return _FALLBACK_L2_FLUSH_BYTES
-
-
-def make_l2_flush_fn(
-    *,
-    enabled: bool,
-    bytes_hint: int = 0,
-) -> Callable[[], None] | None:
-    if not enabled:
-        return None
-    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
-    device_idx = torch.cuda.current_device()
-    key = (device_idx, flush_bytes)
-    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
-    if buffer is None:
-        buffer = torch.empty(
-            flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}"
-        )
-        _L2_FLUSH_BUFFER_CACHE[key] = buffer
-
-    def flush(cache_buffer: torch.Tensor = buffer) -> None:
-        cache_buffer.bitwise_not_()
-
-    return flush
 
 
 def bench_events(

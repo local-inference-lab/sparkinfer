@@ -22,14 +22,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import cutlass
 import torch
 
-from benchmark_dense_gemm import (
+from benchmarks.benchmark_dense_gemm import (
     bench_events,
     capture_graph_replay,
     cosine_similarity,
-    make_l2_flush_fn,
     make_quantized_operand,
-    resolve_l2_flush_bytes,
 )
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.cute.utils import convert_sf_from_mma_layout
 from b12x.gemm.dense import DenseGemmKernel, dense_gemm
 from flashinfer.gemm import mm_fp4

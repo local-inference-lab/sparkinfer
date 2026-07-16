@@ -49,7 +49,7 @@ from b12x.moe.fused.activations import (
     normalize_moe_activation,
 )
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
-from b12x.cute.utils import get_hardware_info
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from tests.w4a16_reference import moe_reference_w4a16
 
 
@@ -77,9 +77,6 @@ TP_SIZE = 4
 TP_RANK = 0
 EP_SIZE = 1
 EP_RANK = 0
-_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
-_AUTO_L2_FLUSH_MULTIPLIER = 2
-_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 BENCHMARK_ACTIVATION_CHOICES = sorted(SUPPORTED_MOE_ACTIVATIONS)
 _FP4_E2M1_VALUES = (
     0.0,
@@ -118,41 +115,6 @@ class ActivationParams:
 def require_sm120() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-
-
-def resolve_l2_flush_bytes(bytes_hint: int) -> int:
-    if bytes_hint < 0:
-        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
-    if bytes_hint > 0:
-        return int(bytes_hint)
-    try:
-        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
-    except Exception:
-        l2_bytes = 0
-    if l2_bytes > 0:
-        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
-    return _FALLBACK_L2_FLUSH_BYTES
-
-
-def make_l2_flush_fn(
-    *,
-    enabled: bool,
-    bytes_hint: int = 0,
-) -> Callable[[], None] | None:
-    if not enabled:
-        return None
-    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
-    device_idx = torch.cuda.current_device()
-    key = (device_idx, flush_bytes)
-    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
-    if buffer is None:
-        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
-        _L2_FLUSH_BUFFER_CACHE[key] = buffer
-
-    def flush(cache_buffer: torch.Tensor = buffer) -> None:
-        cache_buffer.bitwise_not_()
-
-    return flush
 
 
 def bench_events(

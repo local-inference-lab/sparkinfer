@@ -12,6 +12,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
+from benchmarks.common import make_l2_flush_fn
 from b12x.attention.indexer import uses_paged_mqa_schedule
 from b12x.attention.indexer.kernel import (
     run_paged_supertile_logits_kernel,
@@ -141,28 +142,6 @@ def _validate_analytic_topk(
         actual_valid_scores, expected_valid_scores, rtol=2e-3, atol=2e-3
     )
     return max_abs
-
-
-def _make_l2_flush(enabled: bool):
-    """Evict L2 between timed replays so each measures HBM-bound (serving) speed,
-    not L2-resident speed. Mirrors benchmark_moe: a 2x-L2 buffer, bitwise_not_ to
-    write it through. Without this, replaying the same graph on the same inputs
-    leaves the K-cache/page-table hot in L2 (128MB here) and inflates throughput."""
-    if not enabled:
-        return None
-    try:
-        from b12x.cute.utils import get_hardware_info
-
-        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
-    except Exception:
-        l2_bytes = 0
-    flush_bytes = (l2_bytes * 2) if l2_bytes > 0 else (128 << 20)
-    buffer = torch.empty(flush_bytes, dtype=torch.uint8, device="cuda")
-
-    def flush() -> None:
-        buffer.bitwise_not_()
-
-    return flush
 
 
 def _event_time_us(fn, *, warmup: int, iters: int, l2_flush=None) -> list[float]:
@@ -808,7 +787,7 @@ def main() -> None:
             real_page_table=metadata.real_page_table,
             output_physical_slots=output_physical_slots,
         )
-    l2_flush = _make_l2_flush(not args.no_l2_flush)
+    l2_flush = make_l2_flush_fn(not args.no_l2_flush)
     if args.eager:
         samples_us = _event_time_us(
             run, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush

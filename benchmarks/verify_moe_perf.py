@@ -12,16 +12,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from benchmarks.benchmark_moe import (
     MODEL_PATH,
     ModelSpec,
     bench_repeated,
     get_scale_contract_params,
     load_expert_weights,
-    make_l2_flush_fn,
     prepare_b12x_benchmark_weights,
     require_sm120,
-    resolve_l2_flush_bytes,
 )
 from b12x.integration.tp_moe import (
     B12XFP4ExpertWeights,
