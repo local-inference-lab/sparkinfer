@@ -13,7 +13,7 @@ import math
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -35,19 +35,25 @@ from b12x.attention.indexer.reference import (  # noqa: E402
     paged_decode_logits_reference,
 )
 from b12x.integration.mla import (  # noqa: E402
+    B12XSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
+    plan_sparse_mla_scratch,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
 from b12x.attention.indexer import (  # noqa: E402
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+    INDEXER_SOURCE_LAYOUT_PAGED,
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
     paged_decode_logits,
     contiguous_logits,
+    plan_indexer_scratch,
 )
 
 
@@ -491,14 +497,139 @@ def _make_workspace(
     )
 
 
+def _allocate_plan_scratch(plan: Any) -> list[torch.Tensor]:
+    return [
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in plan.scratch_specs()
+    ]
+
+
+def _make_paged_indexer_binding(
+    *,
+    device: torch.device,
+    q_rows: int,
+    index_heads: int,
+    topk: int,
+    real_page_table: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    schedule_metadata: torch.Tensor | None,
+    use_cuda_graph: bool = False,
+):
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=index_heads,
+            max_q_rows=max(q_rows, 1),
+            max_page_table_width=int(real_page_table.shape[1]),
+            topk=topk,
+            max_batch=max(q_rows, 1),
+            page_size=PAGE_SIZE,
+            mode="decode",
+        )
+    )
+    binding = plan.bind(
+        scratch=_allocate_plan_scratch(plan),
+        real_page_table=real_page_table,
+        cache_seqlens_int32=cache_seqlens_int32,
+        schedule_metadata=schedule_metadata,
+        expected_num_q_heads=index_heads,
+    )
+    binding.scratch.use_cuda_graph = bool(use_cuda_graph)
+    return binding
+
+
+def _make_contiguous_indexer_binding(
+    *,
+    device: torch.device,
+    q_rows: int,
+    index_heads: int,
+    topk: int,
+    max_k_rows: int,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+):
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+            num_q_heads=index_heads,
+            max_q_rows=max(q_rows, 1),
+            max_k_rows=max(max_k_rows, 1),
+            topk=topk,
+            max_batch=max(q_rows, 1),
+            mode="prefill",
+        )
+    )
+    binding = plan.bind(
+        scratch=_allocate_plan_scratch(plan),
+        k_start=k_start,
+        k_end=k_end,
+        topk=topk,
+    )
+    # This battery validates every logit. Plan bindings normally select the
+    # strict tiled-output/top-k path; disabling that output view retains the
+    # current binding-owned metadata while requesting dense diagnostic logits.
+    return replace(binding, tile_logits=None, strict=False)
+
+
+def _make_sparse_mla_binding(
+    *,
+    mode: Literal["decode", "extend", "verify", "draft_extend"],
+    device: torch.device,
+    q_all: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
+    topk: int,
+    max_batch: int,
+    max_kv_rows: int = 0,
+    use_cuda_graph: bool = False,
+):
+    plan = plan_sparse_mla_scratch(
+        B12XSparseMLAScratchCaps(
+            mode=mode,
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=int(q_all.shape[1]),
+            head_dim=MLA_Q_DIM,
+            v_head_dim=MLA_V_HEAD_DIM,
+            max_width=topk,
+            max_q_rows=max(int(q_all.shape[0]), 1),
+            max_batch=max(max_batch, 1),
+            max_kv_rows=max(max_kv_rows, 0),
+            page_size=PAGE_SIZE,
+        )
+    )
+    binding = plan.bind(
+        scratch=_allocate_plan_scratch(plan),
+        q=q_all,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+    )
+    binding.scratch.use_cuda_graph = bool(use_cuda_graph)
+    return binding
+
+
 def _select_paged_topk_from_logits(
     *,
     logits: torch.Tensor,
     page_table_1: torch.Tensor,
     topk: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows = logits.shape[0]
-    out = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    if out is None:
+        out = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    else:
+        if out.shape != (rows, topk) or out.dtype != torch.int32:
+            raise BatteryFailure(
+                f"paged top-k out must be int32 {(rows, topk)}, got "
+                f"{tuple(out.shape)} {out.dtype}"
+            )
+        out.fill_(-1)
     gather_k = min(int(topk), int(logits.shape[1]), int(page_table_1.shape[1]))
     if gather_k <= 0:
         return out
@@ -749,30 +880,22 @@ def _run_indexer_paged_eager(case: IndexerPagedCase, device: torch.device) -> di
         seed=case.seed + 20,
         device=device,
     )
-    workspace = _make_workspace(
-        mode="decode",
+    schedule = build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE)
+    binding = _make_paged_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=case.q_rows,
-        max_batch=case.q_rows,
-        max_paged_q_rows=case.q_rows,
-        max_page_table_width=real_page_table.shape[1],
-        mla_heads=1,
+        q_rows=case.q_rows,
         index_heads=case.index_heads,
-    )
-    metadata = IndexerPagedDecodeMetadata(
+        topk=case.topk,
         real_page_table=real_page_table,
         cache_seqlens_int32=seqlens,
-        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE),
+        schedule_metadata=schedule,
     )
     actual = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
         page_size=PAGE_SIZE,
-        contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
-        workspace=workspace,
+        binding=binding,
     )
     expected = paged_decode_logits_reference(
         q_fp8=q_fp8,
@@ -831,22 +954,15 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
     graph_seqlens = torch.empty((case.q_rows,), dtype=torch.int32, device=device)
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     graph_schedule = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
-    workspace = _make_workspace(
-        mode="decode",
+    binding = _make_paged_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=case.q_rows,
-        max_batch=case.q_rows,
-        max_paged_q_rows=case.q_rows,
-        max_page_table_width=graph_pages,
-        mla_heads=1,
+        q_rows=case.q_rows,
         index_heads=case.index_heads,
-        use_cuda_graph=True,
-    )
-    metadata = IndexerPagedDecodeMetadata(
+        topk=case.topk,
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
-        paged_mqa_schedule_metadata=graph_schedule,
+        schedule_metadata=graph_schedule,
+        use_cuda_graph=True,
     )
 
     def prepare(real_page_table: torch.Tensor, seqlens: torch.Tensor) -> None:
@@ -868,10 +984,8 @@ def _run_indexer_paged_graph(case: IndexerPagedCase, device: torch.device) -> di
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=metadata,
             page_size=PAGE_SIZE,
-            contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
-            workspace=workspace,
+            binding=binding,
         )
         return captured_out
 
@@ -1000,17 +1114,12 @@ def _run_indexer_contiguous_eager(case: IndexerExtendCase, device: torch.device)
     )
     q_rows = int(layout["q_rows"])
     padded_k = int(layout["padded_k"])
-    workspace = _make_workspace(
-        mode="extend",
+    binding = _make_contiguous_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=len(case.request_shapes),
-        max_kv_rows=padded_k,
-        mla_heads=1,
+        q_rows=q_rows,
         index_heads=case.index_heads,
-    )
-    metadata = IndexerContiguousMetadata(
+        topk=case.topk,
+        max_k_rows=padded_k,
         k_start=layout["k_start"],
         k_end=layout["k_end"],
     )
@@ -1018,9 +1127,7 @@ def _run_indexer_contiguous_eager(case: IndexerExtendCase, device: torch.device)
         q_fp8=layout["q_fp8"],
         weights=layout["weights"],
         kv_fp8=(layout["k_quant"], layout["k_scale"]),
-        metadata=metadata,
-        contract_phantoms=workspace.get_indexer_contract_phantoms(),
-        workspace=workspace,
+        binding=binding,
         preinitialize_invalid_logits=case.preinitialize_invalid_logits,
     )
     expected = contiguous_logits_reference(
@@ -1094,55 +1201,28 @@ def _run_mla_eager(case: MLACase, device: torch.device) -> dict[str, float | int
     )
     cache_seqlens = torch.full((case.batch,), case.cache_len, dtype=torch.int32, device=device)
     workspace_mode = "verify" if case.mode == "target_verify" else case.mode
-    workspace = _make_workspace(
+    binding = _make_sparse_mla_binding(
         mode=workspace_mode,
         device=device,
+        q_all=q_all,
+        selected_indices=selected,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=active_counts,
         topk=case.topk,
-        max_total_q=case.q_rows,
         max_batch=case.batch,
         max_kv_rows=pool_tokens if workspace_mode != "decode" else 0,
-        mla_heads=case.mla_heads,
-        index_heads=1,
     )
     if case.mode == "decode":
-        metadata = MLASparseDecodeMetadata(
-            page_table_1=selected,
-            cache_seqlens_int32=cache_seqlens,
-            nsa_cache_seqlens_int32=active_counts,
-            max_seq_len_k=case.cache_len,
-        )
         actual = sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=packed,
-            page_table_1=metadata.page_table_1,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            workspace=workspace,
+            binding=binding,
             sm_scale=MLA_SM_SCALE,
             v_head_dim=MLA_V_HEAD_DIM,
         )
     else:
-        q_per_batch = max(1, math.ceil(case.q_rows / case.batch))
-        cu_q = torch.arange(0, case.batch + 1, dtype=torch.int32, device=device) * q_per_batch
-        cu_q[-1] = case.q_rows
-        cu_k = torch.arange(0, case.batch + 1, dtype=torch.int32, device=device) * case.cache_len
-        metadata = MLASparseExtendMetadata(
-            selected_token_offsets=selected,
-            cache_seqlens_int32=cache_seqlens,
-            nsa_cache_seqlens_int32=active_counts,
-            nsa_cu_seqlens_q=cu_q,
-            nsa_cu_seqlens_k=cu_k,
-            max_seq_len_q=q_per_batch,
-            max_seq_len_k=case.cache_len,
-            mode=case.mode,
-        )
         actual = sparse_mla_extend_forward(
-            q_all=q_all,
             kv_cache=packed,
-            selected_token_offsets=metadata.selected_token_offsets,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            workspace=workspace,
+            binding=binding,
             sm_scale=MLA_SM_SCALE,
             v_head_dim=MLA_V_HEAD_DIM,
         )
@@ -1201,21 +1281,16 @@ def _run_mla_graph(case: MLACase, device: torch.device) -> dict[str, float | int
     graph_selected = torch.full_like(selected_a, -1)
     graph_active = torch.empty_like(active_a)
     graph_cache_seqlens = torch.full((case.batch,), case.cache_len, dtype=torch.int32, device=device)
-    workspace = _make_workspace(
+    binding = _make_sparse_mla_binding(
         mode="decode",
         device=device,
-        topk=case.topk,
-        max_total_q=case.q_rows,
-        max_batch=case.batch,
-        mla_heads=case.mla_heads,
-        index_heads=1,
-        use_cuda_graph=True,
-    )
-    metadata = MLASparseDecodeMetadata(
-        page_table_1=graph_selected,
+        q_all=q_all,
+        selected_indices=graph_selected,
         cache_seqlens_int32=graph_cache_seqlens,
         nsa_cache_seqlens_int32=graph_active,
-        max_seq_len_k=case.cache_len,
+        topk=case.topk,
+        max_batch=case.batch,
+        use_cuda_graph=True,
     )
 
     def prepare(selected: torch.Tensor, active: torch.Tensor) -> None:
@@ -1227,12 +1302,8 @@ def _run_mla_graph(case: MLACase, device: torch.device) -> dict[str, float | int
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=packed,
-            page_table_1=metadata.page_table_1,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            workspace=workspace,
+            binding=binding,
             sm_scale=MLA_SM_SCALE,
             v_head_dim=MLA_V_HEAD_DIM,
         )
@@ -1316,30 +1387,22 @@ def _run_e2e_decode_eager(case: E2EDecodeCase, device: torch.device) -> dict[str
         seed=case.seed + 4,
         device=device,
     )
-    indexer_workspace = _make_workspace(
-        mode="decode",
+    schedule = build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE)
+    indexer_binding = _make_paged_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=q_rows,
-        max_paged_q_rows=q_rows,
-        max_page_table_width=real_page_table.shape[1],
-        mla_heads=case.mla_heads,
+        q_rows=q_rows,
         index_heads=case.index_heads,
-    )
-    metadata = IndexerPagedDecodeMetadata(
+        topk=case.topk,
         real_page_table=real_page_table,
         cache_seqlens_int32=seqlens,
-        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(seqlens.contiguous(), PAGE_SIZE),
+        schedule_metadata=schedule,
     )
     logits = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
         page_size=PAGE_SIZE,
-        contract_phantoms=indexer_workspace.get_paged_indexer_contract_phantoms(),
-        workspace=indexer_workspace,
+        binding=indexer_binding,
     )
     expected_logits = paged_decode_logits_reference(
         q_fp8=q_fp8,
@@ -1367,28 +1430,19 @@ def _run_e2e_decode_eager(case: E2EDecodeCase, device: torch.device) -> dict[str
     )
     topk_metrics = _assert_topk_equal(selected, expected_selected)
     active_counts = torch.count_nonzero(selected >= 0, dim=1).to(torch.int32)
-    mla_workspace = _make_workspace(
+    mla_binding = _make_sparse_mla_binding(
         mode="decode",
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=q_rows,
-        mla_heads=case.mla_heads,
-        index_heads=case.index_heads,
-    )
-    mla_metadata = MLASparseDecodeMetadata(
-        page_table_1=selected,
+        q_all=q_all,
+        selected_indices=selected,
         cache_seqlens_int32=seqlens,
         nsa_cache_seqlens_int32=active_counts,
-        max_seq_len_k=int(seqlens.max().item()),
+        topk=case.topk,
+        max_batch=q_rows,
     )
     actual_mla = sparse_mla_decode_forward(
-        q_all=q_all,
         kv_cache=packed,
-        page_table_1=mla_metadata.page_table_1,
-        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-        workspace=mla_workspace,
+        binding=mla_binding,
         sm_scale=MLA_SM_SCALE,
         v_head_dim=MLA_V_HEAD_DIM,
     )
@@ -1471,35 +1525,36 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
         dtype=torch.int32,
         device=device,
     )
+    graph_selected = torch.full(
+        (q_rows, case.topk),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_active = torch.empty((q_rows,), dtype=torch.int32, device=device)
     graph_seqlens = torch.empty((q_rows,), dtype=torch.int32, device=device)
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     graph_schedule = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
-    indexer_workspace = _make_workspace(
-        mode="decode",
+    indexer_binding = _make_paged_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=q_rows,
-        max_paged_q_rows=q_rows,
-        max_page_table_width=graph_pages,
-        mla_heads=case.mla_heads,
+        q_rows=q_rows,
         index_heads=case.index_heads,
-        use_cuda_graph=True,
-    )
-    mla_workspace = _make_workspace(
-        mode="decode",
-        device=device,
         topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=q_rows,
-        mla_heads=case.mla_heads,
-        index_heads=case.index_heads,
-        use_cuda_graph=True,
-    )
-    indexer_metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
-        paged_mqa_schedule_metadata=graph_schedule,
+        schedule_metadata=graph_schedule,
+        use_cuda_graph=True,
+    )
+    mla_binding = _make_sparse_mla_binding(
+        mode="decode",
+        device=device,
+        q_all=q_all,
+        selected_indices=graph_selected,
+        cache_seqlens_int32=graph_seqlens,
+        nsa_cache_seqlens_int32=graph_active,
+        topk=case.topk,
+        max_batch=q_rows,
+        use_cuda_graph=True,
     )
 
     def prepare(
@@ -1532,30 +1587,24 @@ def _run_e2e_decode_graph(case: E2EDecodeCase, device: torch.device) -> dict[str
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=indexer_metadata,
             page_size=PAGE_SIZE,
-            contract_phantoms=indexer_workspace.get_paged_indexer_contract_phantoms(),
-            workspace=indexer_workspace,
+            binding=indexer_binding,
         )
         captured_selected = _select_paged_topk_from_logits(
             logits=captured_logits,
             page_table_1=graph_page_table_1,
             topk=case.topk,
+            out=graph_selected,
         )
-        active_counts = torch.count_nonzero(captured_selected >= 0, dim=1).to(torch.int32)
-        mla_metadata = MLASparseDecodeMetadata(
-            page_table_1=captured_selected,
-            cache_seqlens_int32=graph_seqlens,
-            nsa_cache_seqlens_int32=active_counts,
-            max_seq_len_k=case.graph_width_tokens,
+        torch.sum(
+            captured_selected >= 0,
+            dim=1,
+            dtype=torch.int32,
+            out=graph_active,
         )
         captured_mla = sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=packed,
-            page_table_1=mla_metadata.page_table_1,
-            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-            workspace=mla_workspace,
+            binding=mla_binding,
             sm_scale=MLA_SM_SCALE,
             v_head_dim=MLA_V_HEAD_DIM,
         )
@@ -1663,24 +1712,20 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         cursor += prefix + q_len
     cache_seqlens_t = torch.tensor(cache_seqlens, dtype=torch.int32, device=device)
 
-    indexer_workspace = _make_workspace(
-        mode="extend",
+    indexer_binding = _make_contiguous_indexer_binding(
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=len(case.request_shapes),
-        max_kv_rows=padded_k,
-        mla_heads=case.mla_heads,
+        q_rows=q_rows,
         index_heads=case.index_heads,
+        topk=case.topk,
+        max_k_rows=padded_k,
+        k_start=k_start,
+        k_end=k_end,
     )
-    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
     logits = contiguous_logits(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=(k_quant, k_scale),
-        metadata=metadata,
-        contract_phantoms=indexer_workspace.get_indexer_contract_phantoms(),
-        workspace=indexer_workspace,
+        binding=indexer_binding,
         preinitialize_invalid_logits=False,
     )
     expected_logits = contiguous_logits_reference(
@@ -1727,44 +1772,20 @@ def _run_e2e_extend_eager(case: E2EExtendCase, device: torch.device) -> dict[str
         device=device,
     )
     active_counts = torch.count_nonzero(selected >= 0, dim=1).to(torch.int32)
-    q_cu = torch.empty((len(case.request_shapes) + 1,), dtype=torch.int32, device=device)
-    k_cu = torch.empty_like(q_cu)
-    q_cu[0] = 0
-    k_cu[0] = 0
-    q_cursor = 0
-    k_cursor = 0
-    for idx, (prefix, q_len) in enumerate(case.request_shapes):
-        q_cursor += q_len
-        k_cursor += prefix + q_len
-        q_cu[idx + 1] = q_cursor
-        k_cu[idx + 1] = k_cursor
-    mla_workspace = _make_workspace(
+    mla_binding = _make_sparse_mla_binding(
         mode="extend",
         device=device,
-        topk=case.topk,
-        max_total_q=q_rows,
-        max_batch=len(case.request_shapes),
-        max_kv_rows=padded_k,
-        mla_heads=case.mla_heads,
-        index_heads=case.index_heads,
-    )
-    mla_metadata = MLASparseExtendMetadata(
-        selected_token_offsets=selected,
+        q_all=q_all,
+        selected_indices=selected,
         cache_seqlens_int32=cache_seqlens_t,
         nsa_cache_seqlens_int32=active_counts,
-        nsa_cu_seqlens_q=q_cu,
-        nsa_cu_seqlens_k=k_cu,
-        max_seq_len_q=max(q_len for _prefix, q_len in case.request_shapes),
-        max_seq_len_k=max(cache_seqlens),
-        mode="extend",
+        topk=case.topk,
+        max_batch=len(case.request_shapes),
+        max_kv_rows=padded_k,
     )
     actual_mla = sparse_mla_extend_forward(
-        q_all=q_all,
         kv_cache=packed,
-        selected_token_offsets=mla_metadata.selected_token_offsets,
-        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-        workspace=mla_workspace,
+        binding=mla_binding,
         sm_scale=MLA_SM_SCALE,
         v_head_dim=MLA_V_HEAD_DIM,
     )
@@ -2792,7 +2813,7 @@ def _e2e_extend_cases() -> list[E2EExtendCase]:
             request_shapes=((128, 2), (257, 3)),
             index_heads=8,
             mla_heads=8,
-            topk=128,
+            topk=512,
             seed=50_001,
         ),
         E2EExtendCase(

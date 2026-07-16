@@ -10,7 +10,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
 from b12x.attention.mla.reference import _MLA_GROUP_SIZE, dense_mla_reference, pack_mla_kv_cache_reference
-from b12x.attention.mla.kernel import (
+from b12x.attention.mla.legacy.kernel import (
     _MLA_HEADS_PER_TILE,
     _MLA_NUM_MMA_KV,
     _MLA_NOPE_GROUP_KV_VECS,
