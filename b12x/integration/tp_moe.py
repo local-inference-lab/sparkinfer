@@ -1527,8 +1527,17 @@ def _w4a8_dynamic_direct_candidate(
 ) -> bool:
     """Whether tiny prepared W4A8 can bypass grouped route compaction."""
 
+    direct_limit = _DIRECT_ROUTING_MAX_ROUTED_ROWS
+    if (
+        _current_compute_capability() == (12, 1)
+        and num_experts == 256
+        and n == 1024
+    ):
+        # DSV4F TP2 is bandwidth-bound in this band; grouping routes avoids
+        # re-streaming weights when speculative tokens share experts.
+        direct_limit = 0
     return bool(
-        routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        routed_rows <= direct_limit
         and _w4a8_dynamic_decode_candidate(
             quant_mode=quant_mode,
             activation=activation,
@@ -7599,6 +7608,16 @@ def _launch_dynamic_flat(
             effective_mac * 2,
             get_num_sm(torch.device("cuda")) * 2,
         )
+        if (
+            _current_compute_capability() == (12, 1)
+            and E == 256
+            and k == 6144
+            and n == 1024
+            and 24 <= routed_rows <= 48
+        ):
+            # DSV4F TP2 decode saturates Spark's memory controllers with 24
+            # resident CTAs; a larger grid only adds barrier participants.
+            effective_mac = min(effective_mac, 24)
     if direct_routing:
         # One physical M tile per routed pair and one task per N128 slice.
         # Materialized M=1 has a second, wider route x N256 phase; size the
@@ -8212,6 +8231,14 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
     # works (e.g. 352 from GLM 2048/TP6, 192 from DS4-Pro 3072/TP16).
     return (
         1 <= num_tokens <= 4
+        # On the DSV4F TP2 shard, dynamic's tensor-core path overtakes the
+        # scalar tiny kernel once three tokens provide 24 routed rows.
+        and not (
+            _current_compute_capability() == (12, 1)
+            and num_tokens >= 3
+            and k == 6144
+            and n == 1024
+        )
         and activation == "silu"
         and k % 256 == 0
         and n % 32 == 0
