@@ -875,7 +875,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
 
 
 @torch.inference_mode()
-def test_mimo_v25_fp8_decode_graph_full_then_swa_uses_static_plan_metadata(
+def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm120()
@@ -888,8 +888,21 @@ def test_mimo_v25_fp8_decode_graph_full_then_swa_uses_static_plan_metadata(
         "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
         fail_regular_metadata_update,
     )
-    _run_mimo_v25_fp8_decode_graph_case(window_left=-1, seed=3100)
-    _run_mimo_v25_fp8_decode_graph_case(window_left=127, seed=3200)
+    cache_seqlens = [129, 193, 257, 385, 449, 513, 577]
+    _run_mimo_v25_fp8_decode_graph_case(
+        window_left=-1,
+        seed=3100,
+        batch=7,
+        cache_seqlens_list=cache_seqlens,
+        page_table_width=10,
+    )
+    _run_mimo_v25_fp8_decode_graph_case(
+        window_left=127,
+        seed=3200,
+        batch=7,
+        cache_seqlens_list=cache_seqlens,
+        page_table_width=10,
+    )
 
 
 @torch.inference_mode()

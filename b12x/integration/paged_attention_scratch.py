@@ -847,9 +847,14 @@ class B12XPagedAttentionScratch:
         if self._plan is None:
             raise RuntimeError("decode graph scratch has not been prepared")
 
-        self._validate_decode_graph_replay_capacity(
-            batch=int(self.cache_seqlens.shape[0])
+        uses_compact_work_metadata = self._plan.split_kv and (
+            getattr(self._plan, "msa_block_sparse", False)
+            or not self._use_regular_decode_graph_replay
         )
+        if uses_compact_work_metadata:
+            self._validate_decode_graph_replay_capacity(
+                batch=int(self.cache_seqlens.shape[0])
+            )
         window_page_span = self._window_page_span_from_plan(self._plan)
         if not self._plan.split_kv:
             if int(self._plan.window_left) < 0:
