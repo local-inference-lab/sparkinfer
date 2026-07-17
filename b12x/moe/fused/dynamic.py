@@ -2373,6 +2373,8 @@ class MoEDynamicKernelBackend:
         num_k_tiles = (cols + Int32(63)) // Int32(64)
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
+        if cutlass.const_expr(self.deterministic_output):
+            task_slice_chunk = route_gate_tile_cnt
         materialized_num_groups = (
             route_gate_tile_cnt + task_slice_chunk - Int32(1)
         ) // task_slice_chunk
@@ -3782,6 +3784,38 @@ class MoEDynamicKernelBackend:
                 fc1_n_tiles = cute.size(tCrB, mode=[1])
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
+                    # FC2 rebinds A/SFA to the quantized intermediate at offset
+                    # zero. Restore FC1's routed-input slice before every
+                    # additional intermediate slice in a grouped task.
+                    if cutlass.const_expr(
+                        self.deterministic_output
+                        and (not self.is_w4a8)
+                        and self.sfa_tiles_per_block > 1
+                    ):
+                        _fc1_off = task_m_tile_idx % Int32(
+                            self.sfa_tiles_per_block
+                        )
+                        _sA_il = cute.local_tile(
+                            sA,
+                            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (_fc1_off, 0, None),
+                        )
+                        tCrA = tiled_mma.make_fragment_A(
+                            thr_mma.partition_A(_sA_il)[None, None, None, 0]
+                        )
+                        csA = thr_ld_A.partition_S(_sA_il)
+                        crA = thr_ld_A.retile(tCrA)
+                        _sSFA_il = cute.local_tile(
+                            sSFA,
+                            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (_fc1_off, 0, None),
+                        )
+                        tCrSFA = self._dense_cls._partition_fragment_SFA(
+                            self, _sSFA_il[None, None, 0], thr_mma, tidx
+                        )
+                        csSFA = thr_ld_SFA.partition_S(_sSFA_il)
+                        crSFA = thr_ld_SFA.retile(tCrSFA)
+
                     # ============================================================
                     # PHASE A: FC1 for this slice (gate/only pass, plus up for silu)
                     # ============================================================
@@ -5291,29 +5325,81 @@ class MoEDynamicKernelBackend:
                                         )
                                     if cutlass.const_expr(self.deterministic_output):
                                         scatter_output[tok, global_col] = cutlass.BFloat16(
-                                            sc_v0
+                                            cutlass.Float32(
+                                                scatter_output[tok, global_col]
+                                            )
+                                            + sc_v0
                                         )
                                         scatter_output[
                                             tok, global_col + Int32(1)
-                                        ] = cutlass.BFloat16(sc_v1)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(1)
+                                                ]
+                                            )
+                                            + sc_v1
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(2)
-                                        ] = cutlass.BFloat16(sc_v2)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(2)
+                                                ]
+                                            )
+                                            + sc_v2
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(3)
-                                        ] = cutlass.BFloat16(sc_v3)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(3)
+                                                ]
+                                            )
+                                            + sc_v3
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(4)
-                                        ] = cutlass.BFloat16(sc_v4)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(4)
+                                                ]
+                                            )
+                                            + sc_v4
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(5)
-                                        ] = cutlass.BFloat16(sc_v5)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(5)
+                                                ]
+                                            )
+                                            + sc_v5
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(6)
-                                        ] = cutlass.BFloat16(sc_v6)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(6)
+                                                ]
+                                            )
+                                            + sc_v6
+                                        )
                                         scatter_output[
                                             tok, global_col + Int32(7)
-                                        ] = cutlass.BFloat16(sc_v7)
+                                        ] = cutlass.BFloat16(
+                                            cutlass.Float32(
+                                                scatter_output[
+                                                    tok, global_col + Int32(7)
+                                                ]
+                                            )
+                                            + sc_v7
+                                        )
                                     else:
                                         scatter_add_v4_bf16x2(
                                             get_ptr_as_int64(

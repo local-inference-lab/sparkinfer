@@ -316,3 +316,85 @@ def test_silu_single_token_multi_expert_dynamic_direct_matches_reference() -> No
     )
     metrics = compare_to_reference(output, reference)
     assert metrics.cos > 0.9999, f"silu/direct: {metrics}"
+
+
+def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grouped deterministic FC2 slices preserve FC1 input and accumulate."""
+    device = require_sm120()
+    torch.manual_seed(20260716)
+    m, experts_count, k, n, topk = 29, 32, 256, 384, 6
+
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.2
+    topk_logits, topk_ids = torch.topk(
+        torch.randn(m, experts_count, device=device), topk, dim=-1
+    )
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = torch.softmax(topk_logits, dim=-1)
+    w1_fp4 = torch.randint(
+        0,
+        256,
+        (experts_count, 2 * n, k // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w2_fp4 = torch.randint(
+        0,
+        256,
+        (experts_count, k, n // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w1_blockscale = swizzle_block_scale(
+        torch.full(
+            (experts_count, 2 * n, k // 16),
+            0.015625,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+    )
+    w2_blockscale = swizzle_block_scale(
+        torch.full(
+            (experts_count, k, n // 16),
+            0.015625,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+    )
+    scales = torch.ones(experts_count, device=device, dtype=torch.float32)
+    experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=scales,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=scales,
+        a2_gscale=scales,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=scales,
+    )
+
+    def run() -> torch.Tensor:
+        clear_tp_moe_caches()
+        output = run_tp_moe_fp4(
+            a=x,
+            experts=experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            input_scales_static=True,
+        ).clone()
+        torch.cuda.synchronize(device)
+        return output
+
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "16x128")
+    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+    atomic = run()
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    deterministic = run()
+    repeat = run()
+
+    assert torch.equal(deterministic, repeat)
+    metrics = compare_to_reference(deterministic, atomic)
+    assert metrics.max_abs <= 5e-4, metrics
+    assert metrics.cos > 0.9999, metrics
