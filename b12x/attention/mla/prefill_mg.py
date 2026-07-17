@@ -3945,6 +3945,21 @@ def run_unified_prefill_mg(
             "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
         )
+    if scale_format == ScaleFormat.NVFP4_E4M3:
+        record_bytes = int(kv_cache.shape[-1])
+        if fp8_rope is None:
+            if record_bytes not in (368, 432):
+                raise ValueError(
+                    "NVFP4 sparse MLA MG cache record must be 368 or 432 bytes, "
+                    f"got {record_bytes}"
+                )
+            fp8_rope = record_bytes == 368
+        expected_record_bytes = 368 if fp8_rope else 432
+        if record_bytes != expected_record_bytes:
+            raise ValueError(
+                "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
+                f"got {record_bytes} bytes, expected {expected_record_bytes}"
+            )
     traits = make_unified_traits(
         model_type, int(compute_mode), scale_format, fp8_rope=fp8_rope
     )
