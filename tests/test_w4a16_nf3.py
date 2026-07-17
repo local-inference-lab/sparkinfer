@@ -14,6 +14,8 @@ back off the compile result, and packs with exactly those. The same
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -363,3 +365,22 @@ def test_nf3_tc_decode_production_shape_with_tier_mask() -> None:
     denom = ref.abs().amax().clamp(min=1e-6)
     rel = (out.float() - ref).abs().amax() / denom
     assert rel < 2e-2, f"production-shape NF3 TC decode rel err {float(rel):.4f}"
+
+    mismatched = replace(prepared, fc1_tile_n=128)
+    with pytest.raises(RuntimeError, match="NF3 packing geometry"):
+        run_w4a16_moe(
+            x,
+            mismatched,
+            topk_weights,
+            topk_ids,
+            activation="silu",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output[:m],
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            fused_launch=fused,
+        )

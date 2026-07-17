@@ -6986,6 +6986,19 @@ def run_w4a16_moe(
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
+    if weight_layout == "nf3_2p1":
+        prepared_tiles = (
+            int(getattr(prepared, "fc1_tile_n", 0)),
+            int(getattr(prepared, "fc2_tile_n", 0)),
+        )
+        compiled_tiles = (int(fused.fc1_tile_n), int(fused.fc2_tile_n))
+        if prepared_tiles != compiled_tiles:
+            raise RuntimeError(
+                "prepared NF3 packing geometry does not match the compiled "
+                "W4A16 launch: "
+                f"prepared_fc1_fc2_tile_n={prepared_tiles}, "
+                f"compiled_fc1_fc2_tile_n={compiled_tiles}"
+            )
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
     if intermediate_cache13_flat.numel() < capacity_routed_rows * max(fc1_cols, hidden_size):
