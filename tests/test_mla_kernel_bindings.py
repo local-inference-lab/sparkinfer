@@ -141,6 +141,8 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
             0,
             0,
             0,
+            0,
+            False,
             64,
             4,
             4,
@@ -173,6 +175,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
             indices,      # extra_indices_t
             lengths,      # extra_len_t
             0.1,          # sm_scale
+            1.0,          # latent_scale
             64,           # page_block_size
             4,            # topk
             2,            # num_tiles
