@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention.mla import api, traits
 from b12x.attention.mla.kernel import run_unified_decode
+from b12x.attention.mla.prefill_mg import run_unified_prefill_mg
 from b12x.attention.mla.smem import make_smem_layout
 from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
 
@@ -33,6 +34,16 @@ def test_nvfp4_decode_rejects_fp8_rope_layout_mismatch() -> None:
         _run_invalid_nvfp4_decode(record_bytes=368, fp8_rope=False)
 
 
+def test_nvfp4_mg_prefill_rejects_unknown_record_width() -> None:
+    with pytest.raises(ValueError, match="must be 368 or 432 bytes"):
+        _run_invalid_nvfp4_mg_prefill(record_bytes=400, fp8_rope=None)
+
+
+def test_nvfp4_mg_prefill_rejects_explicit_layout_mismatch() -> None:
+    with pytest.raises(ValueError, match="disagrees with fp8_rope"):
+        _run_invalid_nvfp4_mg_prefill(record_bytes=368, fp8_rope=False)
+
+
 def test_api_uses_traits_fp8_rope_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(traits, "KV_FP8_ROPE_ENABLED", True)
     assert api._resolve_kv_fp8_rope(None) is True
@@ -54,4 +65,19 @@ def _run_invalid_nvfp4_decode(*, record_bytes: int, fp8_rope: bool | None) -> No
         swa_page_size=64,
         scale_format_override=ScaleFormat.NVFP4_E4M3,
         fp8_rope_override=fp8_rope,
+    )
+
+
+def _run_invalid_nvfp4_mg_prefill(*, record_bytes: int, fp8_rope: bool | None) -> None:
+    rows = 1
+    topk = 4
+    run_unified_prefill_mg(
+        q=torch.empty((rows, 16, 576), dtype=torch.bfloat16),
+        kv_cache=torch.empty((1, 1, record_bytes), dtype=torch.uint8),
+        topk_indices=torch.zeros((rows, topk), dtype=torch.int32),
+        sm_scale=0.1,
+        page_block_size=1,
+        model_type=ModelType.GLM_NSA,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        fp8_rope=fp8_rope,
     )
