@@ -683,6 +683,51 @@ def _apply_attention_sink_after_lse_scale(
             m_frag[mma_q, row_slot] = Float32(new_m)
 
 
+@cute.jit
+def _apply_relative_attention_bias(
+    frag_s: cute.Tensor,
+    mRelativeAttentionBias: cute.Tensor,
+    q_row_idx_frag: cute.Tensor,
+    q_head_idx_frag: cute.Tensor,
+    causal_k_limit: cute.Tensor,
+    tile_key_base: Int32,
+    warp_kv_base: Int32,
+    lane_pair_base: Int32,
+    inverse_softmax_scale: Float32,
+    num_mma_q,
+    num_mma_kv,
+):
+    relative_extent = mRelativeAttentionBias.shape[2]
+    for mma_q in cutlass.range_constexpr(num_mma_q):
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            for reg_id in cutlass.range_constexpr(8):
+                row_slot = (reg_id % 4) // 2
+                if frag_s[mma_q, mma_kv, reg_id] != -Float32.inf:
+                    key_local = (
+                        warp_kv_base
+                        + mma_kv * 16
+                        + lane_pair_base
+                        + 8 * (reg_id // 4)
+                        + (reg_id % 2)
+                    )
+                    distance = (
+                        causal_k_limit[mma_q, row_slot]
+                        - tile_key_base
+                        - key_local
+                    )
+                    if distance >= Int32(0) and distance < relative_extent:
+                        bias = Float32(
+                            mRelativeAttentionBias[
+                                q_row_idx_frag[mma_q, row_slot],
+                                q_head_idx_frag[mma_q, row_slot],
+                                distance,
+                            ]
+                        )
+                        frag_s[mma_q, mma_kv, reg_id] += (
+                            bias * inverse_softmax_scale
+                        )
+
+
 @dsl_user_op
 def _exit_thread(
     *,
@@ -859,7 +904,7 @@ def _donor_update_mdo_states_fp32_pack_p(
         scale_term = (
             Float32(1.0)
             if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+            else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
         )
         d_frag[0, row_slot] = Float32(d_frag[0, row_slot] * scale_term)
         for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -868,12 +913,13 @@ def _donor_update_mdo_states_fp32_pack_p(
             o_frag[0, mma_d, row_slot * 2 + 4] *= scale_term
             o_frag[0, mma_d, row_slot * 2 + 5] *= scale_term
 
-        m_scaled = Float32(m_new * sm_scale_log2)
         for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
             acc_S_mn[row_slot, c] = (
                 Float32(0.0)
                 if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(acc_S_mn[row_slot, c] * sm_scale_log2 - m_scaled)
+                else _exp2_approx_ftz_f32(
+                    (acc_S_mn[row_slot, c] - m_new) * sm_scale_log2
+                )
             )
         m_frag[0, row_slot] = Float32(m_new)
 
@@ -2136,7 +2182,7 @@ def _literal_update_mdo_states_fp32_pack_p(
             scale_term = (
                 Float32(1.0)
                 if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+                else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
             )
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * scale_term)
             for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2145,34 +2191,37 @@ def _literal_update_mdo_states_fp32_pack_p(
                 o_frag[mma_q, mma_d, row_slot * 2 + 4] *= scale_term
                 o_frag[mma_q, mma_d, row_slot * 2 + 5] *= scale_term
 
-            m_scaled = Float32(m_new * sm_scale_log2)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
                 p0 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 0] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p1 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 1] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p2 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 4] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p3 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 5] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
@@ -2200,6 +2249,7 @@ class PagedForwardKernel:
         enable_paged_kv_tma: bool = False,
         window_left: int = -1,
         has_attention_sink_bias: bool = False,
+        has_relative_attention_bias: bool = False,
         msa_block_sparse: bool = False,
         msa_union_tile: bool = False,
         page_size: int = 64,
@@ -2212,6 +2262,7 @@ class PagedForwardKernel:
         self.split_kv = False
         self.window_left = int(window_left)
         self.has_attention_sink_bias = bool(has_attention_sink_bias)
+        self.has_relative_attention_bias = bool(has_relative_attention_bias)
         self.msa_block_sparse = bool(msa_block_sparse)
         self.msa_union_tile = bool(msa_union_tile)
         self.MSA_BLOCK_TOKENS = 128
@@ -2375,6 +2426,7 @@ class PagedForwardKernel:
             and traits.num_mma_kv % 2 == 0
         )
         self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.inverse_softmax_scale = Float32(traits.head_dim_qk**0.5)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -2878,6 +2930,7 @@ class PagedForwardKernel:
         mMSAUnionMasks: cute.Tensor | None,
         mMSAUnionCounts: cute.Tensor | None,
         mAttentionSinkBias: cute.Tensor,
+        mRelativeAttentionBias: cute.Tensor | None,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -2911,6 +2964,14 @@ class PagedForwardKernel:
             raise ValueError("mVDescale must have shape (batch,) or (batch, kv_heads)")
         if const_expr(self.msa_block_sparse and mQ2KIndices is None):
             raise ValueError("MSA block-sparse paged extend requires mQ2KIndices")
+        if const_expr(
+            self.has_relative_attention_bias
+            and len(mRelativeAttentionBias.shape) != 3
+        ):
+            raise ValueError(
+                "mRelativeAttentionBias must have shape "
+                "(total_q_capacity, q_heads, relative_extent)"
+            )
         if const_expr(
             self.msa_union_tile
             and (
@@ -3047,6 +3108,7 @@ class PagedForwardKernel:
             mMSAUnionMasks,
             mMSAUnionCounts,
             mAttentionSinkBias,
+            mRelativeAttentionBias,
             mO,
             mLSE,
             mKDescale,
@@ -3136,6 +3198,7 @@ class PagedForwardKernel:
         mMSAUnionMasks: cute.Tensor | None,
         mMSAUnionCounts: cute.Tensor | None,
         mAttentionSinkBias: cute.Tensor,
+        mRelativeAttentionBias: cute.Tensor | None,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -4353,6 +4416,20 @@ class PagedForwardKernel:
                                     frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                 else:
                                     frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                    if const_expr(self.has_relative_attention_bias):
+                        _apply_relative_attention_bias(
+                            frag_S,
+                            mRelativeAttentionBias,
+                            q_row_idx_frag,
+                            q_head_idx_frag,
+                            causal_k_limit,
+                            tile_key_base,
+                            warp_kv_base,
+                            lane_pair_base,
+                            self.inverse_softmax_scale,
+                            num_mma_q,
+                            num_mma_kv,
+                        )
                     p_frag_scalar = p_frag_scalar_debug if const_expr(
                         self.debug_dump_paged_kv_extend_pscalars
                     ) else None
@@ -4447,6 +4524,20 @@ class PagedForwardKernel:
                                     frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                 else:
                                     frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                    if const_expr(self.has_relative_attention_bias):
+                        _apply_relative_attention_bias(
+                            frag_S,
+                            mRelativeAttentionBias,
+                            q_row_idx_frag,
+                            q_head_idx_frag,
+                            causal_k_limit,
+                            tile_key_base,
+                            warp_kv_base,
+                            lane_pair_base,
+                            self.inverse_softmax_scale,
+                            num_mma_q,
+                            num_mma_kv,
+                        )
                     p_frag_scalar = p_frag_scalar_debug if const_expr(
                         self.debug_dump_paged_kv_extend_pscalars
                     ) else None
@@ -4567,6 +4658,20 @@ class PagedForwardKernel:
                             )
                         _exit_thread()
 
+                    if const_expr(self.has_relative_attention_bias):
+                        _apply_relative_attention_bias(
+                            frag_S,
+                            mRelativeAttentionBias,
+                            q_row_idx_frag,
+                            q_head_idx_frag,
+                            causal_k_limit,
+                            tile_key_base,
+                            warp_kv_base,
+                            lane_pair_base,
+                            self.inverse_softmax_scale,
+                            num_mma_q,
+                            num_mma_kv,
+                        )
                     p_frag_scalar = p_frag_scalar_debug if const_expr(
                         self.debug_dump_paged_kv_extend_pscalars
                     ) else None
@@ -6225,6 +6330,7 @@ def build_extend_forward_kernel(
     *,
     window_left: int = -1,
     has_attention_sink_bias: bool = False,
+    has_relative_attention_bias: bool = False,
     msa_block_sparse: bool = False,
     msa_union_tile: bool = False,
     page_size: int = 64,
@@ -6241,6 +6347,7 @@ def build_extend_forward_kernel(
         enable_paged_kv_tma=enable_paged_kv_tma,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
+        has_relative_attention_bias=has_relative_attention_bias,
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
         page_size=page_size,

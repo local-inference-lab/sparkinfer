@@ -343,6 +343,7 @@ def _build_forward_kernel(
     decode_native_fp8_runtime_chunk_guard: bool,
     window_left: int,
     has_attention_sink_bias: bool,
+    has_relative_attention_bias: bool,
     msa_block_sparse: bool,
     page_size: int,
     page_tiles_per_entry: int,
@@ -364,6 +365,7 @@ def _build_forward_kernel(
         decode_native_fp8_runtime_chunk_guard=decode_native_fp8_runtime_chunk_guard,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
+        has_relative_attention_bias=has_relative_attention_bias,
         msa_block_sparse=msa_block_sparse,
         page_size=page_size,
         page_tiles_per_entry=page_tiles_per_entry,
@@ -377,6 +379,7 @@ def _build_extend_forward_kernel(
     use_native_fp8_pv: bool,
     window_left: int,
     has_attention_sink_bias: bool,
+    has_relative_attention_bias: bool,
     msa_block_sparse: bool,
     msa_union_tile: bool,
     page_size: int,
@@ -387,6 +390,7 @@ def _build_extend_forward_kernel(
         use_native_fp8_pv,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
+        has_relative_attention_bias=has_relative_attention_bias,
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
         page_size=page_size,
@@ -431,12 +435,14 @@ def _resolve_paged_attention_binding(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     attention_sink_bias: torch.Tensor | None,
+    relative_attention_bias: torch.Tensor | None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     object,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -456,6 +462,7 @@ def _resolve_paged_attention_binding(
             ("k_descale", k_descale),
             ("v_descale", v_descale),
             ("attention_sink_bias", attention_sink_bias),
+            ("relative_attention_bias", relative_attention_bias),
         )
         if value is not None
     ]
@@ -477,6 +484,7 @@ def _resolve_paged_attention_binding(
         binding.k_descale,
         binding.v_descale,
         binding.attention_sink_bias,
+        binding.relative_attention_bias,
     )
 
 
@@ -515,9 +523,21 @@ def paged_attention_forward(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    relative_attention_bias: torch.Tensor | None = None,
     binding=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k_cache, v_cache, workspace, output, q2k_indices, k_descale, v_descale, attention_sink_bias = (
+    (
+        q,
+        k_cache,
+        v_cache,
+        workspace,
+        output,
+        q2k_indices,
+        k_descale,
+        v_descale,
+        attention_sink_bias,
+        relative_attention_bias,
+    ) = (
         _resolve_paged_attention_binding(
             binding=binding,
             q=q,
@@ -528,6 +548,7 @@ def paged_attention_forward(
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
+            relative_attention_bias=relative_attention_bias,
         )
     )
     plan = workspace.plan
@@ -569,6 +590,11 @@ def paged_attention_forward(
         if attention_sink_bias is not None:
             raise ValueError(
                 "MSA block-sparse paged attention does not support attention_sink_bias"
+            )
+        if relative_attention_bias is not None:
+            raise ValueError(
+                "MSA block-sparse paged attention does not support "
+                "relative_attention_bias"
             )
         if q2k_indices is None:
             raise ValueError("MSA block-sparse paged attention requires q2k_indices")
@@ -616,6 +642,40 @@ def paged_attention_forward(
         if not attention_sink_bias.is_contiguous():
             attention_sink_bias = attention_sink_bias.contiguous()
 
+    has_relative_attention_bias = relative_attention_bias is not None
+    if relative_attention_bias is not None:
+        if relative_attention_bias.ndim != 3:
+            raise ValueError(
+                "relative_attention_bias must be rank-3 "
+                "[total_q_capacity, num_q_heads, relative_extent], got "
+                f"{tuple(relative_attention_bias.shape)}"
+            )
+        if int(relative_attention_bias.shape[0]) < int(plan.total_q):
+            raise ValueError(
+                "relative_attention_bias first dimension must be at least "
+                f"total_q={plan.total_q}, got "
+                f"{int(relative_attention_bias.shape[0])}"
+            )
+        if int(relative_attention_bias.shape[1]) != plan.num_q_heads:
+            raise ValueError(
+                "relative_attention_bias must have "
+                f"{plan.num_q_heads} query heads, got "
+                f"{int(relative_attention_bias.shape[1])}"
+            )
+        if int(relative_attention_bias.shape[2]) <= 0:
+            raise ValueError("relative_attention_bias extent must be positive")
+        if relative_attention_bias.device != q.device:
+            raise ValueError(
+                "relative_attention_bias must be on the same CUDA device as q"
+            )
+        if relative_attention_bias.dtype != q.dtype:
+            raise TypeError(
+                "relative_attention_bias must have the same dtype as q; "
+                f"got {relative_attention_bias.dtype} and {q.dtype}"
+            )
+        if not relative_attention_bias.is_contiguous():
+            raise ValueError("relative_attention_bias must be contiguous")
+
     traits = select_paged_forward_traits_from_plan(plan)
     use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard = (
         _resolve_native_fp8_attention_mma_flags(plan=plan)
@@ -657,6 +717,7 @@ def paged_attention_forward(
             use_native_fp8_pv,
             plan.window_left,
             has_attention_sink_bias,
+            has_relative_attention_bias,
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
             page_size,
@@ -698,6 +759,7 @@ def paged_attention_forward(
             decode_native_fp8_runtime_chunk_guard,
             plan.window_left,
             has_attention_sink_bias,
+            has_relative_attention_bias,
             bool(plan.msa_block_sparse),
             page_size,
             page_tiles_per_entry,
@@ -789,6 +851,10 @@ def paged_attention_forward(
     )
     attention_sink_bias_arg = _to_kernel_tensor(
         attention_sink_bias, cutlass.Float32, assumed_align=4
+    )
+    relative_attention_bias_arg = _to_kernel_tensor(
+        relative_attention_bias,
+        _torch_to_cutlass_dtype(q.dtype),
     )
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
@@ -894,6 +960,7 @@ def paged_attention_forward(
             bool(decode_native_fp8_runtime_chunk_guard),
             int(plan.window_left),
             bool(has_attention_sink_bias),
+            bool(has_relative_attention_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
             int(page_size),
@@ -927,6 +994,10 @@ def paged_attention_forward(
             dynamic_dims=grid_worklist_dynamic_first_dim,
         ),
         _tensor_meta_key(attention_sink_bias),
+        _tensor_meta_key(
+            relative_attention_bias,
+            dynamic_dims=dynamic_first_dim,
+        ),
         _tensor_meta_key(output_cache_tensor, dynamic_dims=dynamic_first_dim),
         _tensor_meta_key(
             forward_lse,
@@ -953,6 +1024,7 @@ def paged_attention_forward(
         "kv_window_start_tokens",
         "block_valid_mask",
         "attention_sink_bias",
+        "relative_attention_bias",
         "output_contract" if use_capacity_contract else "forward_output",
         "forward_lse",
         "k_descale",
@@ -1017,6 +1089,7 @@ def paged_attention_forward(
     forward_args.extend(
         [
             attention_sink_bias_arg,
+            relative_attention_bias_arg,
             forward_output_arg,
             forward_lse_arg,
             k_descale_arg,

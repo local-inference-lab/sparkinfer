@@ -1451,6 +1451,7 @@ class PagedAttentionWorkspace:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
     ):
         from b12x.integration.paged_attention_scratch import build_paged_attention_binding
 
@@ -1470,6 +1471,7 @@ class PagedAttentionWorkspace:
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
+            relative_attention_bias=relative_attention_bias,
         )
 
     def _validate_q2k_indices_reference(
@@ -1491,6 +1493,7 @@ class PagedAttentionWorkspace:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
         prepare_decode_graph_metadata: bool | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
         from .api import paged_attention_forward
@@ -1534,6 +1537,7 @@ class PagedAttentionWorkspace:
                 k_descale=k_descale,
                 v_descale=v_descale,
                 attention_sink_bias=attention_sink_bias,
+                relative_attention_bias=relative_attention_bias,
             )
         )
         return out, lse

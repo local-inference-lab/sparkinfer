@@ -25,6 +25,7 @@ def attention_reference(
     causal: bool = True,
     window_left: int = -1,
     attention_sink_bias: torch.Tensor | None = None,
+    relative_attention_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute exact self-attention for contiguous rank-3 or rank-4 tensors.
 
@@ -71,6 +72,38 @@ def attention_reference(
     v_f = v.permute(0, 2, 1, 3).to(torch.float32)
 
     scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * float(softmax_scale)
+    if relative_attention_bias is not None:
+        if relative_attention_bias.ndim == 3:
+            relative_attention_bias = relative_attention_bias.unsqueeze(0)
+        expected_prefix = (batch, seqlen_q, q_heads)
+        if relative_attention_bias.ndim != 4 or tuple(
+            relative_attention_bias.shape[:3]
+        ) != expected_prefix:
+            raise ValueError(
+                "relative_attention_bias must have shape "
+                f"{expected_prefix} + (relative_extent,), got "
+                f"{tuple(relative_attention_bias.shape)}"
+            )
+        relative_extent = int(relative_attention_bias.shape[3])
+        q_idx = torch.arange(
+            seqlen_q, device=scores.device, dtype=torch.int64
+        ).view(seqlen_q, 1)
+        k_idx = torch.arange(
+            seqlen_k, device=scores.device, dtype=torch.int64
+        ).view(1, seqlen_k)
+        distance = q_idx + seqlen_k - seqlen_q - k_idx
+        in_extent = (distance >= 0) & (distance < relative_extent)
+        distance = distance.clamp(min=0, max=relative_extent - 1)
+        bias = relative_attention_bias.to(
+            device=scores.device, dtype=scores.dtype
+        ).permute(0, 2, 1, 3)
+        gather_idx = distance.view(1, 1, seqlen_q, seqlen_k).expand(
+            batch, q_heads, -1, -1
+        )
+        bias = torch.gather(bias, dim=-1, index=gather_idx)
+        scores = scores + bias.masked_fill(
+            ~in_extent.view(1, 1, seqlen_q, seqlen_k), 0.0
+        )
     if causal:
         causal_mask = _causal_mask_right_aligned(seqlen_q, seqlen_k, device=scores.device)
         scores = scores.masked_fill(causal_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
@@ -148,6 +181,7 @@ def paged_attention_reference(
     causal: bool = True,
     window_left: int = -1,
     attention_sink_bias: torch.Tensor | None = None,
+    relative_attention_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference paged self-attention for the SGLang serving contract.
 
@@ -194,6 +228,11 @@ def paged_attention_reference(
             causal=causal,
             window_left=window_left,
             attention_sink_bias=attention_sink_bias,
+            relative_attention_bias=(
+                None
+                if relative_attention_bias is None
+                else relative_attention_bias[q_start:q_end]
+            ),
         )
         out[q_start:q_end].copy_(out_cur)
         lse[q_start:q_end].copy_(lse_cur.transpose(0, 1))

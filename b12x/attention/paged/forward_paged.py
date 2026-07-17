@@ -830,6 +830,51 @@ def _apply_attention_sink_after_lse_scale(
             m_frag[mma_q, row_slot] = Float32(new_m)
 
 
+@cute.jit
+def _apply_relative_attention_bias(
+    frag_s: cute.Tensor,
+    mRelativeAttentionBias: cute.Tensor,
+    q_row_idx_frag: cute.Tensor,
+    q_head_idx_frag: cute.Tensor,
+    causal_k_limit: cute.Tensor,
+    tile_key_base: Int32,
+    warp_kv_base: Int32,
+    lane_pair_base: Int32,
+    inverse_softmax_scale: Float32,
+    num_mma_q,
+    num_mma_kv,
+):
+    relative_extent = mRelativeAttentionBias.shape[2]
+    for mma_q in cutlass.range_constexpr(num_mma_q):
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            for reg_id in cutlass.range_constexpr(8):
+                row_slot = (reg_id % 4) // 2
+                if frag_s[mma_q, mma_kv, reg_id] != -Float32.inf:
+                    key_local = (
+                        warp_kv_base
+                        + mma_kv * 16
+                        + lane_pair_base
+                        + 8 * (reg_id // 4)
+                        + (reg_id % 2)
+                    )
+                    distance = (
+                        causal_k_limit[mma_q, row_slot]
+                        - tile_key_base
+                        - key_local
+                    )
+                    if distance >= Int32(0) and distance < relative_extent:
+                        bias = Float32(
+                            mRelativeAttentionBias[
+                                q_row_idx_frag[mma_q, row_slot],
+                                q_head_idx_frag[mma_q, row_slot],
+                                distance,
+                            ]
+                        )
+                        frag_s[mma_q, mma_kv, reg_id] += (
+                            bias * inverse_softmax_scale
+                        )
+
+
 @dsl_user_op
 def _exit_thread(
     *,
@@ -2163,7 +2208,7 @@ def _literal_update_mdo_states_fp32_pack_p(
             scale_term = (
                 Float32(1.0)
                 if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+                else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
             )
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * scale_term)
             for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2172,34 +2217,37 @@ def _literal_update_mdo_states_fp32_pack_p(
                 o_frag[mma_q, mma_d, row_slot * 2 + 4] *= scale_term
                 o_frag[mma_q, mma_d, row_slot * 2 + 5] *= scale_term
 
-            m_scaled = Float32(m_new * sm_scale_log2)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
                 p0 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 0] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p1 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 1] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p2 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 4] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p3 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                        (s_frag[mma_q, mma_kv, row_slot * 2 + 5] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
@@ -2241,7 +2289,7 @@ def _literal_update_mdo_states_fp32_pack_p_row0(
         scale_term = (
             Float32(1.0)
             if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+            else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
         )
         d_frag[mma_q, 0] = Float32(d_frag[mma_q, 0] * scale_term)
         for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2250,34 +2298,33 @@ def _literal_update_mdo_states_fp32_pack_p_row0(
             o_frag[mma_q, mma_d, 4] *= scale_term
             o_frag[mma_q, mma_d, 5] *= scale_term
 
-        m_scaled = Float32(m_new * sm_scale_log2)
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
             p0 = (
                 Float32(0.0)
                 if m_new == -Float32.inf
                 else _exp2_approx_ftz_f32(
-                    s_frag[mma_q, mma_kv, 0] * sm_scale_log2 - m_scaled
+                    (s_frag[mma_q, mma_kv, 0] - m_new) * sm_scale_log2
                 )
             )
             p1 = (
                 Float32(0.0)
                 if m_new == -Float32.inf
                 else _exp2_approx_ftz_f32(
-                    s_frag[mma_q, mma_kv, 1] * sm_scale_log2 - m_scaled
+                    (s_frag[mma_q, mma_kv, 1] - m_new) * sm_scale_log2
                 )
             )
             p2 = (
                 Float32(0.0)
                 if m_new == -Float32.inf
                 else _exp2_approx_ftz_f32(
-                    s_frag[mma_q, mma_kv, 4] * sm_scale_log2 - m_scaled
+                    (s_frag[mma_q, mma_kv, 4] - m_new) * sm_scale_log2
                 )
             )
             p3 = (
                 Float32(0.0)
                 if m_new == -Float32.inf
                 else _exp2_approx_ftz_f32(
-                    s_frag[mma_q, mma_kv, 5] * sm_scale_log2 - m_scaled
+                    (s_frag[mma_q, mma_kv, 5] - m_new) * sm_scale_log2
                 )
             )
             p_frag[mma_q, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
@@ -2310,7 +2357,7 @@ def _literal_update_mdo_states_fp32_pack_p_row0_1x1(
     scale_term = (
         Float32(1.0)
         if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+        else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
     )
     d_frag[0, 0] = Float32(d_frag[0, 0] * scale_term)
     for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2319,26 +2366,25 @@ def _literal_update_mdo_states_fp32_pack_p_row0_1x1(
         o_frag[0, mma_d, 4] *= scale_term
         o_frag[0, mma_d, 5] *= scale_term
 
-    m_scaled = Float32(m_new * sm_scale_log2)
     p0 = (
         Float32(0.0)
         if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32(s_frag[0, 0, 0] * sm_scale_log2 - m_scaled)
+        else _exp2_approx_ftz_f32((s_frag[0, 0, 0] - m_new) * sm_scale_log2)
     )
     p1 = (
         Float32(0.0)
         if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32(s_frag[0, 0, 1] * sm_scale_log2 - m_scaled)
+        else _exp2_approx_ftz_f32((s_frag[0, 0, 1] - m_new) * sm_scale_log2)
     )
     p2 = (
         Float32(0.0)
         if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32(s_frag[0, 0, 4] * sm_scale_log2 - m_scaled)
+        else _exp2_approx_ftz_f32((s_frag[0, 0, 4] - m_new) * sm_scale_log2)
     )
     p3 = (
         Float32(0.0)
         if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32(s_frag[0, 0, 5] * sm_scale_log2 - m_scaled)
+        else _exp2_approx_ftz_f32((s_frag[0, 0, 5] - m_new) * sm_scale_log2)
     )
     p_frag[0, 0, 0] = pack_f32x2_to_bfloat2(p0, p1)
     p_frag[0, 0, 2] = pack_f32x2_to_bfloat2(p2, p3)
@@ -2393,7 +2439,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
             scale_term = (
                 Float32(1.0)
                 if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+                else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
             )
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * scale_term)
             for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2402,62 +2448,69 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                 o_frag[mma_q, mma_d, row_slot * 2 + 4] *= scale_term
                 o_frag[mma_q, mma_d, row_slot * 2 + 5] *= scale_term
 
-            m_scaled = Float32(m_new * sm_scale_log2)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
                 p00 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                        (s_frag0[mma_q, mma_kv, row_slot * 2 + 0] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p01 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                        (s_frag0[mma_q, mma_kv, row_slot * 2 + 1] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p02 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                        (s_frag0[mma_q, mma_kv, row_slot * 2 + 4] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p03 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                        (s_frag0[mma_q, mma_kv, row_slot * 2 + 5] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p10 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                        (s_frag1[mma_q, mma_kv, row_slot * 2 + 0] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p11 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                        (s_frag1[mma_q, mma_kv, row_slot * 2 + 1] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p12 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                        (s_frag1[mma_q, mma_kv, row_slot * 2 + 4] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p13 = (
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                        (s_frag1[mma_q, mma_kv, row_slot * 2 + 5] - m_new)
+                        * sm_scale_log2
                     )
                 )
                 p_frag0[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p00, p01)
@@ -2490,6 +2543,7 @@ class PagedForwardKernel:
         decode_native_fp8_runtime_chunk_guard: bool = False,
         window_left: int = -1,
         has_attention_sink_bias: bool = False,
+        has_relative_attention_bias: bool = False,
         msa_block_sparse: bool = False,
         page_size: int = 64,
         page_tiles_per_entry: int = 1,
@@ -2507,6 +2561,7 @@ class PagedForwardKernel:
         self.decode_only = decode_only
         self.window_left = int(window_left)
         self.has_attention_sink_bias = bool(has_attention_sink_bias)
+        self.has_relative_attention_bias = bool(has_relative_attention_bias)
         self.msa_block_sparse = bool(msa_block_sparse)
         self.MSA_BLOCK_TOKENS = 128
         self.MSA_TOPK = 16
@@ -2533,6 +2588,7 @@ class PagedForwardKernel:
         ) * (dtype_kv_storage.width // 8)
         bf16_minimax_head128_decode = (
             decode_only
+            and not self.has_relative_attention_bias
             and dtype_q == cutlass.BFloat16
             and dtype_kv == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
@@ -2679,6 +2735,7 @@ class PagedForwardKernel:
             self.use_native_fp8_qk_mma and decode_only and decode_native_fp8_runtime_chunk_guard
         )
         self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.inverse_softmax_scale = Float32(traits.head_dim_qk**0.5)
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -3087,6 +3144,7 @@ class PagedForwardKernel:
         mBlockValidMask: cute.Tensor,
         mQ2KIndices: cute.Tensor | None,
         mAttentionSinkBias: cute.Tensor,
+        mRelativeAttentionBias: cute.Tensor | None,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -3118,6 +3176,14 @@ class PagedForwardKernel:
             raise ValueError("mVDescale must have shape (batch,) or (batch, kv_heads)")
         if const_expr(self.msa_block_sparse and mQ2KIndices is None):
             raise ValueError("MSA block-sparse paged attention requires mQ2KIndices")
+        if const_expr(
+            self.has_relative_attention_bias
+            and len(mRelativeAttentionBias.shape) != 3
+        ):
+            raise ValueError(
+                "mRelativeAttentionBias must have shape "
+                "(total_q_capacity, q_heads, relative_extent)"
+            )
         if const_expr(self.msa_block_sparse and self.window_left >= 0):
             raise ValueError("MSA block-sparse paged attention does not support window_left")
         if const_expr(
@@ -3227,6 +3293,7 @@ class PagedForwardKernel:
             mBlockValidMask,
             mQ2KIndices,
             mAttentionSinkBias,
+            mRelativeAttentionBias,
             mO,
             mLSE,
             mKDescale,
@@ -3262,6 +3329,7 @@ class PagedForwardKernel:
         mBlockValidMask: cute.Tensor,
         mQ2KIndices: cute.Tensor | None,
         mAttentionSinkBias: cute.Tensor,
+        mRelativeAttentionBias: cute.Tensor | None,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -3815,6 +3883,7 @@ class PagedForwardKernel:
         )
         decode_qwen_single_row_fastpath = const_expr(
             self.decode_only
+            and not self.has_relative_attention_bias
             and self.single_request_decode_graph
             and self.split_kv
             and self.traits.num_mma_q == 1
@@ -3824,6 +3893,7 @@ class PagedForwardKernel:
         )
         decode_row_metadata_fastpath = const_expr(
             self.decode_only
+            and not self.has_relative_attention_bias
             and not self.single_request_decode_graph
             and not self.single_qtile_decode_graph
             and not self.regularized_decode_graph
@@ -4595,6 +4665,21 @@ class PagedForwardKernel:
                                 tile_tokens,
                             )
                         _exit_thread()
+
+                if const_expr(self.has_relative_attention_bias):
+                    _apply_relative_attention_bias(
+                        frag_S,
+                        mRelativeAttentionBias,
+                        q_row_idx_frag,
+                        q_head_idx_frag,
+                        causal_k_limit,
+                        tile_key_base,
+                        warp_kv_base,
+                        lane_pair_base,
+                        self.inverse_softmax_scale,
+                        num_mma_q,
+                        num_mma_kv,
+                    )
 
                 next_tile_base = prefetch_base
                 if const_expr(decode_row0_k_release_fastpath):

@@ -408,6 +408,7 @@ class B12XPagedAttentionScratch:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
     ) -> "B12XPagedAttentionBinding":
         return build_paged_attention_binding(
             scratch=self,
@@ -426,6 +427,7 @@ class B12XPagedAttentionScratch:
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
+            relative_attention_bias=relative_attention_bias,
         )
 
     @torch._dynamo.disable
@@ -1022,6 +1024,7 @@ class B12XPagedAttentionBinding:
     k_descale: torch.Tensor | None = None
     v_descale: torch.Tensor | None = None
     attention_sink_bias: torch.Tensor | None = None
+    relative_attention_bias: torch.Tensor | None = None
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         from b12x.attention.paged.api import paged_attention_forward
@@ -1101,6 +1104,7 @@ def build_paged_attention_binding(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    relative_attention_bias: torch.Tensor | None = None,
 ) -> B12XPagedAttentionBinding:
     scratch._validate_static_shapes(q, k_cache, v_cache)
     _validate_output(output, scratch=scratch)
@@ -1110,6 +1114,11 @@ def build_paged_attention_binding(
         attention_sink_bias,
         scratch=scratch,
         name="attention_sink_bias",
+    )
+    _validate_optional_tensor_device(
+        relative_attention_bias,
+        scratch=scratch,
+        name="relative_attention_bias",
     )
 
     metadata = _metadata_tuple(
@@ -1141,6 +1150,7 @@ def build_paged_attention_binding(
         k_descale=k_descale,
         v_descale=v_descale,
         attention_sink_bias=attention_sink_bias,
+        relative_attention_bias=relative_attention_bias,
     )
 
 
@@ -1669,6 +1679,7 @@ class B12XPagedAttentionScratchPlan:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
         q2k_indices: torch.Tensor | None = None,
     ) -> B12XPagedAttentionBinding:
         scratch_storage = scratch_tensor(
@@ -1708,6 +1719,7 @@ class B12XPagedAttentionScratchPlan:
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
+            relative_attention_bias=relative_attention_bias,
             q2k_indices=q2k_indices,
         )
         self._q2k_indices_data_ptr = scratch_views._q2k_indices_data_ptr
