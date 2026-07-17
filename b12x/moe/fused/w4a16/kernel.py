@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
+import cuda.bindings.runtime as cuda_runtime
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -648,9 +649,7 @@ class W4A16GemmKernel:
                     "nf3_2p1 W4A16 weights require scale_format='e4m3_k32'"
                 )
             if element_dtype != "bf16":
-                raise ValueError(
-                    "nf3_2p1 W4A16 weights are bf16-activation only (v1)"
-                )
+                raise ValueError("nf3_2p1 W4A16 weights are bf16-activation only (v1)")
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
@@ -661,9 +660,7 @@ class W4A16GemmKernel:
         has_n_tile_tail = int(size_n) % int(tile_n) != 0
         has_k_tile_tail = int(size_k) % int(tile_k) != 0
         has_scale_k_tail = int(size_k) % scale_group_size != 0
-        has_logical_tail = (
-            has_n_tile_tail or has_k_tile_tail or has_scale_k_tail
-        )
+        has_logical_tail = has_n_tile_tail or has_k_tile_tail or has_scale_k_tail
         if has_logical_tail:
             if weight_layout != "modelopt" or scale_format != "e8m0_k32":
                 raise ValueError(
@@ -675,9 +672,7 @@ class W4A16GemmKernel:
                     "native E8M0 W4A16 tail tiles require size_n % 16 == 0"
                 )
             if int(size_k) % 8 != 0:
-                raise ValueError(
-                    "native E8M0 W4A16 tail tiles require size_k % 8 == 0"
-                )
+                raise ValueError("native E8M0 W4A16 tail tiles require size_k % 8 == 0")
             if int(tile_k) % scale_group_size != 0:
                 raise ValueError(
                     "native E8M0 W4A16 tail tiles require tile_k multiples of 32"
@@ -687,15 +682,11 @@ class W4A16GemmKernel:
                 raise ValueError("size_n must be divisible by tile_n")
             if size_k % tile_k != 0:
                 raise ValueError("size_k must be divisible by tile_k")
-            if scale_format == "e8m0_k32" and (
-                size_k % 32 != 0 or tile_k % 32 != 0
-            ):
+            if scale_format == "e8m0_k32" and (size_k % 32 != 0 or tile_k % 32 != 0):
                 raise ValueError(
                     "E8M0 K/32 W4A16 scales require size_k/tile_k multiples of 32"
                 )
-            if scale_format == "e4m3_k32" and (
-                size_k % 32 != 0 or tile_k % 32 != 0
-            ):
+            if scale_format == "e4m3_k32" and (size_k % 32 != 0 or tile_k % 32 != 0):
                 raise ValueError(
                     "E4M3 K/32 W4A16 scales require size_k/tile_k multiples of 32"
                 )
@@ -819,9 +810,7 @@ class W4A16GemmKernel:
                     f"got {self.b_sh_stage_bytes}"
                 )
             self.b_sh_chunks = self.b_sh_stage_bytes // 16
-            self.b_sh_wr_iters_nf3 = _covering_count(
-                self.b_sh_chunks, self.cta_threads
-            )
+            self.b_sh_wr_iters_nf3 = _covering_count(self.b_sh_chunks, self.cta_threads)
         else:
             self.b_sh_chunks = self.b_sh_stage
             self.b_sh_wr_iters_nf3 = self.b_sh_wr_iters
@@ -1533,9 +1522,7 @@ class W4A16GemmKernel:
         b_gl_stride = Int32(16 * self.size_n // (_PACK_FACTOR * 4))
         s_gl_stride = Int32(self.scale_n_groups)
         if cutlass.const_expr(self.scale_k32):
-            if cutlass.const_expr(
-                self.scale_format_e8m0_k32 and self.has_logical_tail
-            ):
+            if cutlass.const_expr(self.scale_format_e8m0_k32 and self.has_logical_tail):
                 scales_expert_stride = Int32(self.scale_k_groups * self.scale_n_groups)
             else:
                 scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
@@ -2694,8 +2681,10 @@ class W4A16GemmKernel:
             valid_bytes = packed_cols - tile_byte
             if valid_bytes > Int32(16):
                 valid_bytes = Int32(16)
-            if valid_n and valid_bytes >= Int32(16) and cutlass.const_expr(
-                not self.has_scale_k_tail
+            if (
+                valid_n
+                and valid_bytes >= Int32(16)
+                and cutlass.const_expr(not self.has_scale_k_tail)
             ):
                 cp_async4_shared_global(
                     smem_addr,
@@ -2736,12 +2725,7 @@ class W4A16GemmKernel:
         n_delta: cutlass.Constexpr[int],
         k_delta: cutlass.Constexpr[int],
     ) -> Uint32:
-        local_n = (
-            n_tile * Int32(64)
-            + warp_id * Int32(16)
-            + tc_col
-            + Int32(n_delta)
-        )
+        local_n = n_tile * Int32(64) + warp_id * Int32(16) + tc_col + Int32(n_delta)
         local_k = k_tile * Int32(16) + tc_row + Int32(k_delta)
         byte_offset = local_n * Int32(self.tile_k // 2) + local_k // Int32(2)
         word_byte_offset = byte_offset - (byte_offset & Int32(3))
@@ -2878,9 +2862,7 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(a_bf16_flat, a_int4 * Int32(8)),
                     )
                 else:
-                    st_shared_v4_u32(
-                        a_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                    )
+                    st_shared_v4_u32(a_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
             else:
                 cp_async4_shared_global_pred(
                     a_dst,
@@ -2970,9 +2952,7 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
                 else:
-                    st_shared_v4_u32(
-                        s_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                    )
+                    st_shared_v4_u32(s_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
             else:
                 cp_async4_shared_global(
                     s_dst,
@@ -3220,9 +3200,7 @@ class W4A16GemmKernel:
         c_gl_stride = Int32(self.size_n // 8)
         c_sh_stride = Int32(2 * self.cta_n_blocks + 1)
         c_gl_wr_delta = c_gl_stride * Int32(self.cta_threads // (2 * self.cta_n_blocks))
-        c_sh_rd_delta = c_sh_stride * Int32(
-            self.cta_threads // (2 * self.cta_n_blocks)
-        )
+        c_sh_rd_delta = c_sh_stride * Int32(self.cta_threads // (2 * self.cta_n_blocks))
         c_gl_wr = (
             c_gl_stride * (tid // Int32(2 * self.cta_n_blocks))
             + (tid % Int32(2 * self.cta_n_blocks))
@@ -3446,9 +3424,7 @@ class W4A16GemmKernel:
                 )
         cute.arch.sync_threads()
 
-        store_iters = _covering_count(
-            16, self.cta_threads // (2 * self.cta_n_blocks)
-        )
+        store_iters = _covering_count(16, self.cta_threads // (2 * self.cta_n_blocks))
         if cutlass.const_expr(self.has_n_tile_tail):
             self._drain_output_smem_tail(
                 c_bf16_flat,
@@ -3734,7 +3710,9 @@ class W4A16FusedMoeKernel:
         if self.collect_activation_amax and bool(direct_topk_routes):
             raise ValueError("activation amax collection requires route-packed W4A16")
         if self.collect_activation_amax and self.tc_decode_fused_sum:
-            raise ValueError("activation amax collection is incompatible with TC-decode")
+            raise ValueError(
+                "activation amax collection is incompatible with TC-decode"
+            )
         if self.tc_decode_fused_sum and not bool(direct_topk_routes):
             raise ValueError("tc_decode_fused_sum requires direct_topk_routes")
         if self.tc_decode_fused_sum and element_dtype != "bf16":
@@ -3766,11 +3744,7 @@ class W4A16FusedMoeKernel:
         self.direct_topk_routes = bool(direct_topk_routes)
         fc1_source_n_rotation = (
             int(intermediate_size)
-            if (
-                weight_layout == "modelopt"
-                and w13_layout == "w13"
-                and is_gated
-            )
+            if (weight_layout == "modelopt" and w13_layout == "w13" and is_gated)
             else 0
         )
         self.fc1 = W4A16GemmKernel(
@@ -3790,8 +3764,7 @@ class W4A16FusedMoeKernel:
             scale_format=scale_format,
             w13_layout=w13_layout,
             source_n_rotation=fc1_source_n_rotation,
-            single_token_route_fast_path=size_m == 1
-            and not self.direct_topk_routes,
+            single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
         )
         self.fc2 = W4A16GemmKernel(
@@ -3809,8 +3782,7 @@ class W4A16FusedMoeKernel:
             weight_layout=weight_layout,
             scale_format=scale_format,
             w13_layout=w13_layout,
-            single_token_route_fast_path=size_m == 1
-            and not self.direct_topk_routes,
+            single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
@@ -3909,9 +3881,7 @@ class W4A16FusedMoeKernel:
     ):
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
-            layout=cute.make_layout(
-                (active_m * Int32(self.hidden_size),), stride=(1,)
-            ),
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -4167,10 +4137,9 @@ class W4A16FusedMoeKernel:
                 block_amax = ld_shared_f32(smem_base + lane * Int32(4))
             block_amax = warp_reduce(block_amax, fmax_f32)
             if lane == Int32(0) and block_amax > cutlass.Float32(0.0):
-                out_idx = (
-                    (layer_idx * Int32(self.num_experts) + expert_idx) * Int32(2)
-                    + slot
-                )
+                out_idx = (layer_idx * Int32(self.num_experts) + expert_idx) * Int32(
+                    2
+                ) + slot
                 red_max_global_f32_nonnegative(
                     get_ptr_as_int64(activation_amax_flat, out_idx),
                     block_amax,
@@ -4195,9 +4164,9 @@ class W4A16FusedMoeKernel:
     ):
         live_routes = active_m * Int32(self.top_k)
         route_count = packed_route_count[Int32(0)].to(Int32)
-        route_blocks = (
-            route_count + Int32(self.moe_block_size) - Int32(1)
-        ) // Int32(self.moe_block_size)
+        route_blocks = (route_count + Int32(self.moe_block_size) - Int32(1)) // Int32(
+            self.moe_block_size
+        )
         expert_idx = cta
         while expert_idx < Int32(self.num_experts):
             local_fc1 = cutlass.Float32(0.0)
@@ -4441,9 +4410,7 @@ class W4A16ActivationKernel:
 
 
 class W4A16TopKSumKernel:
-    def __init__(
-        self, *, topk: int, hidden_size: int, element_dtype: str = "bf16"
-    ):
+    def __init__(self, *, topk: int, hidden_size: int, element_dtype: str = "bf16"):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if topk <= 0 or hidden_size <= 0:
@@ -4534,9 +4501,7 @@ def _normalize_scale_format(scale_format: str) -> str:
 
 def _scale_group_size(scale_format: str) -> int:
     return (
-        32
-        if _normalize_scale_format(scale_format) in ("e8m0_k32", "e4m3_k32")
-        else 16
+        32 if _normalize_scale_format(scale_format) in ("e8m0_k32", "e4m3_k32") else 16
     )
 
 
@@ -4551,9 +4516,7 @@ def _scale_fake_int32_elements(
 ) -> int:
     group_size = _scale_group_size(scale_format)
     if int(size_n) % 16 != 0:
-        raise ValueError(
-            f"W4A16 {scale_format} scales require size_n divisible by 16"
-        )
+        raise ValueError(f"W4A16 {scale_format} scales require size_n divisible by 16")
     if int(size_k) % group_size != 0 and not allow_k_tail:
         raise ValueError(
             f"W4A16 {scale_format} scales require size_k divisible by {group_size}, "
@@ -5299,9 +5262,7 @@ def compile_w4a16_fused_moe(
     compile_route_blocks = compile_routed_rows if direct_topk_routes else 1
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     packed_route_fake_elements = (
-        compile_routed_rows
-        if direct_topk_routes
-        else compile_route_slots
+        compile_routed_rows if direct_topk_routes else compile_route_slots
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     if weight_layout == "modelopt":
@@ -5508,6 +5469,9 @@ def clear_w4a16_kernel_cache() -> None:
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
     _SMALL_M_DIRECT_CACHE.clear()
+    grid188_kernel = globals().get("W4A16HybridMappedGrid188Kernel")
+    if grid188_kernel is not None:
+        grid188_kernel._COMPILE_CACHE.clear()
 
 
 def compile_w4a16_activation(
@@ -6454,9 +6418,7 @@ def _validate_activation_amax(
     if not activation_amax.is_contiguous():
         raise ValueError("activation_amax must be contiguous")
     if activation_amax.ndim != 3 or int(activation_amax.shape[2]) != 2:
-        raise ValueError(
-            "activation_amax must have shape [num_layers, num_experts, 2]"
-        )
+        raise ValueError("activation_amax must have shape [num_layers, num_experts, 2]")
     if int(activation_amax.shape[1]) < int(num_experts):
         raise ValueError(
             "activation_amax expert dimension is smaller than the local expert count"
@@ -7001,7 +6963,9 @@ def run_w4a16_moe(
             )
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
-    if intermediate_cache13_flat.numel() < capacity_routed_rows * max(fc1_cols, hidden_size):
+    if intermediate_cache13_flat.numel() < capacity_routed_rows * max(
+        fc1_cols, hidden_size
+    ):
         raise ValueError(
             "intermediate_cache13 is smaller than the selected W4A16 launch capacity: "
             f"capacity_rows={capacity_m}, topk={topk}"
@@ -7143,20 +7107,2165 @@ def run_w4a16_moe(
     return output
 
 
+@dataclass(frozen=True)
+class W4A16HybridDirectCompileResult:
+    """Compiled exact-geometry heterogeneous direct-decode kernel."""
+
+    compiled: object
+    executor: object
+    size_m: int
+    hidden_size: int
+    intermediate_size: int
+    nv_num_experts: int
+    nf_num_experts: int
+    top_k: int
+    activation: str
+    element_dtype: str
+    fast_math: bool
+    fc1_tile_k: int
+    fc1_tile_n: int
+    fc2_tile_k: int
+    fc2_tile_n: int
+    moe_block_size: int
+    cta_threads: int
+    blocks_per_sm: int
+    shared_words: int
+    shared_memory_bytes: int
+    workspace_words: int
+    scratch_elements: int
+    grid_x: int
+    route_slots: int
+    fc1_tasks: int
+    fc2_tasks: int
+    fc1_waves: int
+    fc2_waves: int
+    activation_rows: int
+    activation_elements: int
+    barrier_count: int
+    output_zero_count: int
+    nv_weight_layout: str
+    nv_scale_format: str
+    nf_weight_layout: str
+    nf_scale_format: str
+    child_cache_keys: tuple[tuple[object, ...], ...]
+    cache_key: tuple[object, ...]
+    compile_spec: KernelCompileSpec
+    compiled_abi: tuple[str, ...]
+    phase_order: tuple[str, ...]
+    registers_per_thread: int
+    local_memory_bytes: int
+    spill_store_bytes: int
+    spill_load_bytes: int
+    generated_code_bytes: int
+    kernel_resources: tuple[tuple[str, int, int], ...]
+    codegen_resource_metadata: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True)
+class W4A16HybridMappedCompileResult(W4A16HybridDirectCompileResult):
+    """Compiled exact-geometry heterogeneous global-route-map kernel."""
+
+    map_slots: int
+    abi_version: int
+
+
+class W4A16HybridDirectKernel(W4A16FusedMoeKernel):
+    """Exact one-grid E64 NVFP4 + E192 NF3 direct-decode kernel."""
+
+    ROUTE_SLOTS = 32
+    SCRATCH_ELEMENTS = 2_097_152
+    GRID_X = 128
+    WORKSPACE_LOCK_WORDS_PER_SM = 4
+
+    def __init__(
+        self,
+        *,
+        size_m: int,
+        hidden_size: int,
+        intermediate_size: int,
+        nv_num_experts: int,
+        nf_num_experts: int,
+        top_k: int,
+        activation: str,
+        element_dtype: str,
+        fast_math: bool,
+        sms: int,
+        max_shared_mem: int,
+        force_tile_config: tuple[int, int, int, int],
+    ):
+        activation = normalize_moe_activation(activation)
+        if (
+            int(size_m) != 4
+            or int(hidden_size) != 6144
+            or int(intermediate_size) != 512
+            or int(nv_num_experts) != 64
+            or int(nf_num_experts) != 192
+            or int(top_k) != 8
+            or activation != "silu"
+            or element_dtype != "bf16"
+        ):
+            raise ValueError(
+                "W4A16 hybrid direct v1 requires m4/H6144/I512/topk8, "
+                "E64 packed + E192 NF3, gated SiLU, and BF16"
+            )
+        if tuple(int(v) for v in force_tile_config) != (64, 256, 64, 256):
+            raise ValueError(
+                "W4A16 hybrid direct v1 requires tile config (64, 256, 64, 256)"
+            )
+        if int(sms) < self.GRID_X:
+            raise ValueError(
+                "W4A16 hybrid direct v1 requires at least 128 SMs for its "
+                "128-CTA software-barrier grid"
+            )
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            if (int(props.major), int(props.minor)) != (12, 0):
+                raise ValueError(
+                    "W4A16 hybrid direct v1 requires SM120, got "
+                    f"SM{int(props.major)}{int(props.minor)}"
+                )
+            if int(sms) != int(props.multi_processor_count):
+                raise ValueError(
+                    "W4A16 hybrid direct sms must match the current SM120 device: "
+                    f"{int(sms)} != {int(props.multi_processor_count)}"
+                )
+            device_max_shared_mem = int(
+                getattr(
+                    props,
+                    "shared_memory_per_block_optin",
+                    _DEFAULT_MAX_SHARED_MEM,
+                )
+            )
+            if int(max_shared_mem) != device_max_shared_mem:
+                raise ValueError(
+                    "W4A16 hybrid direct max_shared_mem must match the current "
+                    f"SM120 device: {int(max_shared_mem)} != {device_max_shared_mem}"
+                )
+
+        self.size_m = 4
+        self.hidden_size = 6144
+        self.intermediate_size = 512
+        self.fc1_cols = 1024
+        self.nv_num_experts = 64
+        self.nf_num_experts = 192
+        self.top_k = 8
+        self.moe_block_size = 8
+        self.activation = activation
+        self.activation_is_gated = True
+        self.activation_is_swigluoai = False
+        self.has_swiglu_limit = False
+        self.swiglu_limit = 0.0
+        self.swiglu_alpha = 1.0
+        self.swiglu_beta = 0.0
+        self.element_dtype = element_dtype
+        self.is_fp16 = False
+        self.fast_math = bool(fast_math)
+        self.direct_topk_routes = True
+        self.sms = int(sms)
+
+        self.nv_fc1 = W4A16GemmKernel(
+            size_m=4,
+            size_n=1024,
+            size_k=6144,
+            num_experts=64,
+            top_k=8,
+            mul_topk_weights=False,
+            tile_n=256,
+            tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=4,
+            element_dtype="bf16",
+            weight_layout="packed",
+            scale_format="e4m3_k16",
+            direct_topk_routes=True,
+        )
+        self.nf_fc1 = W4A16GemmKernel(
+            size_m=4,
+            size_n=1024,
+            size_k=6144,
+            num_experts=192,
+            top_k=8,
+            mul_topk_weights=False,
+            tile_n=256,
+            tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=4,
+            element_dtype="bf16",
+            weight_layout="nf3_2p1",
+            scale_format="e4m3_k32",
+            direct_topk_routes=True,
+        )
+        self.nv_fc2 = W4A16GemmKernel(
+            size_m=32,
+            size_n=6144,
+            size_k=512,
+            num_experts=64,
+            top_k=1,
+            mul_topk_weights=True,
+            tile_n=256,
+            tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=32,
+            element_dtype="bf16",
+            weight_layout="packed",
+            scale_format="e4m3_k16",
+            direct_topk_routes=True,
+            fused_topk_sum=True,
+            fused_sum_topk=8,
+        )
+        self.nf_fc2 = W4A16GemmKernel(
+            size_m=32,
+            size_n=6144,
+            size_k=512,
+            num_experts=192,
+            top_k=1,
+            mul_topk_weights=True,
+            tile_n=256,
+            tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=32,
+            element_dtype="bf16",
+            weight_layout="nf3_2p1",
+            scale_format="e4m3_k32",
+            direct_topk_routes=True,
+            fused_topk_sum=True,
+            fused_sum_topk=8,
+        )
+
+        children = (self.nv_fc1, self.nf_fc1, self.nv_fc2, self.nf_fc2)
+        if any(child.cta_threads != 256 for child in children):
+            raise ValueError("W4A16 hybrid direct v1 requires 256-thread children")
+        if any(child.moe_block_size != 8 for child in children):
+            raise ValueError("W4A16 hybrid direct v1 requires block-8 children")
+        if any(child.blocks_per_sm != 1 for child in children):
+            raise ValueError("W4A16 hybrid direct v1 requires one CTA per SM")
+        if (
+            self.nv_fc1.n_tiles != self.nf_fc1.n_tiles
+            or self.nv_fc1.k_tiles != self.nf_fc1.k_tiles
+            or self.nv_fc2.n_tiles != self.nf_fc2.n_tiles
+            or self.nv_fc2.k_tiles != self.nf_fc2.k_tiles
+        ):
+            raise ValueError(
+                "W4A16 hybrid direct tier children disagree on tile counts"
+            )
+        if (
+            self.nv_fc1.top_k != 8
+            or self.nf_fc1.top_k != 8
+            or self.nv_fc2.top_k != 1
+            or self.nf_fc2.top_k != 1
+            or self.nv_fc1.mul_topk_weights
+            or self.nf_fc1.mul_topk_weights
+            or not self.nv_fc2.mul_topk_weights
+            or not self.nf_fc2.mul_topk_weights
+            or not self.nv_fc2.fused_topk_sum
+            or not self.nf_fc2.fused_topk_sum
+        ):
+            raise ValueError("W4A16 hybrid direct children violate FC1/FC2 semantics")
+
+        self.cta_threads = 256
+        self.blocks_per_sm = 1
+        self.shared_words = max(child.shared_words for child in children)
+        if self.shared_words * 4 > int(max_shared_mem):
+            raise ValueError(
+                "W4A16 hybrid direct shared memory exceeds the device limit: "
+                f"{self.shared_words * 4} > {int(max_shared_mem)}"
+            )
+        self.workspace_words = self.sms * self.WORKSPACE_LOCK_WORDS_PER_SM + 2
+        self.barrier_count_off = self.workspace_words - 2
+        self.barrier_sense_off = self.workspace_words - 1
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            "w4a16_hybrid_direct",
+            self.size_m,
+            self.hidden_size,
+            self.intermediate_size,
+            self.nv_num_experts,
+            self.nf_num_experts,
+            self.top_k,
+            self.activation,
+            self.element_dtype,
+            self.fast_math,
+            self.moe_block_size,
+            (64, 256, 64, 256),
+            self.sms,
+            self.GRID_X,
+            self.ROUTE_SLOTS,
+            self.SCRATCH_ELEMENTS,
+            self.nv_fc1.__cache_key__,
+            self.nf_fc1.__cache_key__,
+            self.nv_fc2.__cache_key__,
+            self.nf_fc2.__cache_key__,
+            "outer_once",
+            self.cta_threads,
+            self.blocks_per_sm,
+            self.shared_words,
+            self.workspace_words,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a_bf16_ptr: cute.Pointer,
+        nv_w13_i32_flat: cute.Tensor,
+        nv_w2_i32_flat: cute.Tensor,
+        nv_w13_scales_i32_flat: cute.Tensor,
+        nv_w2_scales_i32_flat: cute.Tensor,
+        nv_w13_global_scale: cute.Tensor,
+        nv_w2_global_scale: cute.Tensor,
+        nf_w13_i32_flat: cute.Tensor,
+        nf_w2_i32_flat: cute.Tensor,
+        nf_w13_scales_i32_flat: cute.Tensor,
+        nf_w2_scales_i32_flat: cute.Tensor,
+        nf_w13_global_scale: cute.Tensor,
+        nf_w2_global_scale: cute.Tensor,
+        nv_local_ids_i32_flat: cute.Tensor,
+        nf_local_ids_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_ptr: cute.Pointer,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        a_bf16_flat = cute.make_tensor(
+            a_bf16_ptr,
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+        )
+        topk_weights_flat = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+        )
+        self.kernel(
+            a_bf16_flat,
+            nv_w13_i32_flat,
+            nv_w2_i32_flat,
+            nv_w13_scales_i32_flat,
+            nv_w2_scales_i32_flat,
+            nv_w13_global_scale,
+            nv_w2_global_scale,
+            nf_w13_i32_flat,
+            nf_w2_i32_flat,
+            nf_w13_scales_i32_flat,
+            nf_w2_scales_i32_flat,
+            nf_w13_global_scale,
+            nf_w2_global_scale,
+            nv_local_ids_i32_flat,
+            nf_local_ids_i32_flat,
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            output_bf16_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            workspace_i32_flat,
+            active_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        a_bf16_flat: cute.Tensor,
+        nv_w13_i32_flat: cute.Tensor,
+        nv_w2_i32_flat: cute.Tensor,
+        nv_w13_scales_i32_flat: cute.Tensor,
+        nv_w2_scales_i32_flat: cute.Tensor,
+        nv_w13_global_scale: cute.Tensor,
+        nv_w2_global_scale: cute.Tensor,
+        nf_w13_i32_flat: cute.Tensor,
+        nf_w2_i32_flat: cute.Tensor,
+        nf_w13_scales_i32_flat: cute.Tensor,
+        nf_w2_scales_i32_flat: cute.Tensor,
+        nf_w13_global_scale: cute.Tensor,
+        nf_w2_global_scale: cute.Tensor,
+        nv_local_ids_i32_flat: cute.Tensor,
+        nf_local_ids_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        zidx = cta * Int32(self.cta_threads) + tid
+        zstride = grid_x * Int32(self.cta_threads)
+        ztotal = active_m * Int32(self.hidden_size)
+        zero = self._cast_elem(cutlass.Float32(0.0))
+        while zidx < ztotal:
+            output_bf16_flat[zidx] = zero
+            zidx += zstride
+
+        self._run_persistent_gemm_hybrid_direct(
+            a_bf16_flat,
+            nv_w13_i32_flat,
+            nv_w13_scales_i32_flat,
+            nv_w13_global_scale,
+            nf_w13_i32_flat,
+            nf_w13_scales_i32_flat,
+            nf_w13_global_scale,
+            fc1_bf16_flat,
+            nv_local_ids_i32_flat,
+            nf_local_ids_i32_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            workspace_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+            True,
+        )
+        self._grid_barrier(workspace_i32_flat, tid, grid_x)
+        self._run_activation(
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+        )
+        self._grid_barrier(workspace_i32_flat, tid, grid_x)
+        self._run_persistent_gemm_hybrid_direct(
+            activated_bf16_flat,
+            nv_w2_i32_flat,
+            nv_w2_scales_i32_flat,
+            nv_w2_global_scale,
+            nf_w2_i32_flat,
+            nf_w2_scales_i32_flat,
+            nf_w2_global_scale,
+            output_bf16_flat,
+            nv_local_ids_i32_flat,
+            nf_local_ids_i32_flat,
+            topk_weights_flat,
+            fc2_c_tmp_f32_flat,
+            workspace_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m * Int32(self.top_k),
+            False,
+        )
+
+    @cute.jit
+    def _run_persistent_gemm_hybrid_direct(
+        self,
+        a_bf16_flat: cute.Tensor,
+        nv_b_i32_flat: cute.Tensor,
+        nv_scales_i32_flat: cute.Tensor,
+        nv_global_scale: cute.Tensor,
+        nf_b_i32_flat: cute.Tensor,
+        nf_scales_i32_flat: cute.Tensor,
+        nf_global_scale: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        nv_local_ids_i32_flat: cute.Tensor,
+        nf_local_ids_i32_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_size_m: Int32,
+        is_fc1: cutlass.Constexpr[bool],
+    ):
+        if cutlass.const_expr(is_fc1):
+            n_tiles = Int32(self.nv_fc1.n_tiles)
+            k_tiles = Int32(self.nv_fc1.k_tiles)
+            route_blocks = active_size_m * Int32(self.nv_fc1.top_k)
+        else:
+            n_tiles = Int32(self.nv_fc2.n_tiles)
+            k_tiles = Int32(self.nv_fc2.k_tiles)
+            route_blocks = active_size_m * Int32(self.nv_fc2.top_k)
+
+        global_mn_tiles = route_blocks * n_tiles
+        work_mn_tile = cta
+        while work_mn_tile < global_mn_tiles:
+            route_ordinal = work_mn_tile // n_tiles
+            output_n_tile = work_mn_tile - route_ordinal * n_tiles
+            original_slot = route_ordinal
+            nv_local_expert = nv_local_ids_i32_flat[route_ordinal].to(Int32)
+            if nv_local_expert >= Int32(0):
+                if nv_local_expert < Int32(self.nv_num_experts):
+                    if cutlass.const_expr(is_fc1):
+                        self.nv_fc1._run_tile(
+                            a_bf16_flat,
+                            nv_b_i32_flat,
+                            c_bf16_flat,
+                            nv_scales_i32_flat,
+                            nv_global_scale,
+                            nv_local_ids_i32_flat,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            workspace_i32_flat,
+                            smem_base,
+                            tid,
+                            original_slot,
+                            nv_local_expert,
+                            output_n_tile,
+                            Int32(0),
+                            k_tiles,
+                            Int32(1),
+                            Int32(0),
+                            cta,
+                            active_size_m,
+                        )
+                    else:
+                        self.nv_fc2._run_tile(
+                            a_bf16_flat,
+                            nv_b_i32_flat,
+                            c_bf16_flat,
+                            nv_scales_i32_flat,
+                            nv_global_scale,
+                            nv_local_ids_i32_flat,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            workspace_i32_flat,
+                            smem_base,
+                            tid,
+                            original_slot,
+                            nv_local_expert,
+                            output_n_tile,
+                            Int32(0),
+                            k_tiles,
+                            Int32(1),
+                            Int32(0),
+                            cta,
+                            active_size_m,
+                        )
+            else:
+                nf_local_expert = nf_local_ids_i32_flat[route_ordinal].to(Int32)
+                if nf_local_expert >= Int32(0) and nf_local_expert < Int32(
+                    self.nf_num_experts
+                ):
+                    if cutlass.const_expr(is_fc1):
+                        self.nf_fc1._run_tile(
+                            a_bf16_flat,
+                            nf_b_i32_flat,
+                            c_bf16_flat,
+                            nf_scales_i32_flat,
+                            nf_global_scale,
+                            nf_local_ids_i32_flat,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            workspace_i32_flat,
+                            smem_base,
+                            tid,
+                            original_slot,
+                            nf_local_expert,
+                            output_n_tile,
+                            Int32(0),
+                            k_tiles,
+                            Int32(1),
+                            Int32(0),
+                            cta,
+                            active_size_m,
+                        )
+                    else:
+                        self.nf_fc2._run_tile(
+                            a_bf16_flat,
+                            nf_b_i32_flat,
+                            c_bf16_flat,
+                            nf_scales_i32_flat,
+                            nf_global_scale,
+                            nf_local_ids_i32_flat,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            workspace_i32_flat,
+                            smem_base,
+                            tid,
+                            original_slot,
+                            nf_local_expert,
+                            output_n_tile,
+                            Int32(0),
+                            k_tiles,
+                            Int32(1),
+                            Int32(0),
+                            cta,
+                            active_size_m,
+                        )
+            work_mn_tile += grid_x
+
+
+_W4A16_HYBRID_MAPPED_GRID188_GRID_X = 188
+_W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS = 188
+_W4A16_HYBRID_MAPPED_GRID188_FC1_TASKS = 128
+_W4A16_HYBRID_MAPPED_GRID188_FC2_TASKS = 768
+
+
+def _hybrid_direct_query_kernel_resources(
+    compiled: object,
+    executor: object,
+    get_kernel: object,
+    get_attributes: object,
+    success_status: object,
+) -> tuple[tuple[str, int, int], ...]:
+    """Query one current CUDA-dialect CuTe kernel through injected runtime calls."""
+
+    if not callable(get_kernel) or not callable(get_attributes):
+        raise RuntimeError("W4A16 hybrid direct CUDA resource APIs are unavailable")
+    kernel_info = getattr(compiled, "kernel_info", None)
+    if not isinstance(kernel_info, dict):
+        raise RuntimeError(
+            "W4A16 hybrid direct compiled kernel_info mapping is unavailable"
+        )
+    symbols = tuple(kernel_info)
+    jit_module = getattr(executor, "jit_module", None)
+    libraries = getattr(jit_module, "cuda_library", None)
+    if libraries is None:
+        raise RuntimeError(
+            "W4A16 hybrid direct CUDA-dialect executor lacks cuda_library"
+        )
+    library_handles = tuple(libraries)
+    if len(symbols) != 1 or len(library_handles) != 1:
+        raise RuntimeError(
+            "W4A16 hybrid direct requires exactly one kernel and CUDA library, got "
+            f"{len(symbols)} symbols and {len(library_handles)} libraries"
+        )
+
+    symbol = symbols[0]
+    if not isinstance(symbol, str) or not symbol:
+        raise RuntimeError("W4A16 hybrid direct CUDA kernel symbol is unavailable")
+    kernel_result = get_kernel(library_handles[0], symbol.encode("utf-8"))
+    if not isinstance(kernel_result, tuple) or len(kernel_result) != 2:
+        raise RuntimeError(
+            "W4A16 hybrid direct cudaLibraryGetKernel returned an invalid result"
+        )
+    kernel_status, kernel_handle = kernel_result
+    if kernel_status != success_status:
+        raise RuntimeError(
+            "W4A16 hybrid direct cudaLibraryGetKernel failed for "
+            f"{symbol}: {kernel_status}"
+        )
+    attributes_result = get_attributes(kernel_handle)
+    if not isinstance(attributes_result, tuple) or len(attributes_result) != 2:
+        raise RuntimeError(
+            "W4A16 hybrid direct cudaFuncGetAttributes returned an invalid result"
+        )
+    attributes_status, attributes = attributes_result
+    if attributes_status != success_status:
+        raise RuntimeError(
+            "W4A16 hybrid direct cudaFuncGetAttributes failed for "
+            f"{symbol}: {attributes_status}"
+        )
+    registers_per_thread = int(getattr(attributes, "numRegs", -1))
+    local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
+    if registers_per_thread < 0 or local_memory_bytes < 0:
+        raise RuntimeError(
+            f"W4A16 hybrid direct CUDA function attributes are incomplete for {symbol}"
+        )
+    return ((symbol, registers_per_thread, local_memory_bytes),)
+
+
+def _hybrid_direct_admit_codegen_resources(
+    kernel_resources: tuple[tuple[str, int, int], ...],
+    cubin: object,
+) -> tuple[int, int, int, int, int]:
+    """Fail closed unless the compiled kernel has complete admissible resources."""
+
+    if len(kernel_resources) != 1:
+        raise RuntimeError(
+            "W4A16 hybrid direct requires exactly one kernel resource record"
+        )
+    _, registers_per_thread, local_memory_bytes = kernel_resources[0]
+    if registers_per_thread < 1 or registers_per_thread > 255:
+        raise RuntimeError(
+            "W4A16 hybrid direct codegen requires 1..255 registers/thread, got "
+            f"{registers_per_thread}"
+        )
+    if local_memory_bytes != 0:
+        raise RuntimeError(
+            "W4A16 hybrid direct codegen has forbidden local memory: "
+            f"{local_memory_bytes} bytes/thread"
+        )
+    if not isinstance(cubin, bytes) or not cubin:
+        raise RuntimeError(
+            "W4A16 hybrid direct requires retained compiled.__cubin__ bytes "
+            "for code-resource admission"
+        )
+    # A zero LOCAL_SIZE_BYTES driver result proves that no spill stack exists.
+    # CUDA has no separate CUfunction spill-traffic byte attributes, so expose
+    # the two spill fields as the derived exact zero only after that admission.
+    spill_store_bytes = 0
+    spill_load_bytes = 0
+    return (
+        registers_per_thread,
+        local_memory_bytes,
+        spill_store_bytes,
+        spill_load_bytes,
+        len(cubin),
+    )
+
+
+def _hybrid_direct_validate_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    elements: int,
+    assumed_align: int,
+    exact: bool = True,
+) -> None:
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    actual = int(tensor.numel())
+    if (exact and actual != int(elements)) or (not exact and actual < int(elements)):
+        relation = "exactly" if exact else "at least"
+        raise ValueError(
+            f"{name} must contain {relation} {int(elements)} elements, got {actual}"
+        )
+    address = int(tensor.data_ptr())
+    if address == 0 or address % int(assumed_align) != 0:
+        raise ValueError(
+            f"{name} address {address:#x} violates assumed_align={int(assumed_align)}"
+        )
+
+
+def _hybrid_direct_validate_aliases(
+    tensors: tuple[tuple[str, torch.Tensor, bool], ...],
+) -> None:
+    """Reject every byte overlap involving a mutable hybrid launch tensor."""
+
+    ranges: list[tuple[str, int, int, bool]] = []
+    for name, tensor, mutable in tensors:
+        start = int(tensor.data_ptr())
+        stop = start + int(tensor.numel()) * int(tensor.element_size())
+        ranges.append((name, start, stop, bool(mutable)))
+    for left_idx in range(len(ranges)):
+        left_name, left_start, left_stop, left_mutable = ranges[left_idx]
+        for right_idx in range(left_idx + 1, len(ranges)):
+            right_name, right_start, right_stop, right_mutable = ranges[right_idx]
+            if not left_mutable and not right_mutable:
+                continue
+            if left_start < right_stop and right_start < left_stop:
+                raise ValueError(
+                    "W4A16 hybrid direct unsafe storage alias: "
+                    f"{left_name} overlaps {right_name}"
+                )
+
+
+def _hybrid_mapped_validate_aliases(
+    tensors: tuple[tuple[str, torch.Tensor, bool], ...],
+) -> None:
+    """Reject mutable overlaps and every alias involving mapped route inputs."""
+
+    _hybrid_direct_validate_aliases(tensors)
+    protected = {"global_topk_ids_i32", "tier_local_map_i32"}
+    ranges = tuple(
+        (
+            name,
+            int(tensor.data_ptr()),
+            int(tensor.data_ptr()) + int(tensor.numel()) * int(tensor.element_size()),
+        )
+        for name, tensor, _ in tensors
+    )
+    for left_idx in range(len(ranges)):
+        left_name, left_start, left_stop = ranges[left_idx]
+        for right_idx in range(left_idx + 1, len(ranges)):
+            right_name, right_start, right_stop = ranges[right_idx]
+            if left_name not in protected and right_name not in protected:
+                continue
+            if left_start < right_stop and right_start < left_stop:
+                raise ValueError(
+                    "W4A16 hybrid mapped unsafe route storage alias: "
+                    f"{left_name} overlaps {right_name}"
+                )
+
+
+def w4a16_hybrid_mapped_grid188_task_map(
+    task_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Return the exact task=cta+wave*188 assignment for every CTA."""
+
+    task_count = int(task_count)
+    if task_count not in (
+        _W4A16_HYBRID_MAPPED_GRID188_FC1_TASKS,
+        _W4A16_HYBRID_MAPPED_GRID188_FC2_TASKS,
+    ):
+        raise ValueError("mapped grid188 task_count must be exactly 128 or 768")
+    return tuple(
+        tuple(
+            cta + wave * _W4A16_HYBRID_MAPPED_GRID188_GRID_X
+            for wave in range(
+                (task_count - cta + _W4A16_HYBRID_MAPPED_GRID188_GRID_X - 1)
+                // _W4A16_HYBRID_MAPPED_GRID188_GRID_X
+            )
+        )
+        if cta < task_count
+        else ()
+        for cta in range(_W4A16_HYBRID_MAPPED_GRID188_GRID_X)
+    )
+
+
+def w4a16_hybrid_mapped_grid188_mapping_proof() -> dict[str, object]:
+    """Prove exact FC1/FC2 partitions and their grid188 CTA counts."""
+
+    fc1_by_cta = w4a16_hybrid_mapped_grid188_task_map(
+        _W4A16_HYBRID_MAPPED_GRID188_FC1_TASKS
+    )
+    fc2_by_cta = w4a16_hybrid_mapped_grid188_task_map(
+        _W4A16_HYBRID_MAPPED_GRID188_FC2_TASKS
+    )
+    fc1_flat = tuple(task for tasks in fc1_by_cta for task in tasks)
+    fc2_flat = tuple(task for tasks in fc2_by_cta for task in tasks)
+    fc1_counts = tuple(len(tasks) for tasks in fc1_by_cta)
+    fc2_counts = tuple(len(tasks) for tasks in fc2_by_cta)
+    if (
+        len(fc1_flat) != _W4A16_HYBRID_MAPPED_GRID188_FC1_TASKS
+        or len(set(fc1_flat)) != len(fc1_flat)
+        or set(fc1_flat) != set(range(_W4A16_HYBRID_MAPPED_GRID188_FC1_TASKS))
+    ):
+        raise AssertionError("mapped grid188 FC1 mapping is not an exact partition")
+    if (
+        len(fc2_flat) != _W4A16_HYBRID_MAPPED_GRID188_FC2_TASKS
+        or len(set(fc2_flat)) != len(fc2_flat)
+        or set(fc2_flat) != set(range(_W4A16_HYBRID_MAPPED_GRID188_FC2_TASKS))
+    ):
+        raise AssertionError("mapped grid188 FC2 mapping is not an exact partition")
+    if fc1_counts != (1,) * 128 + (0,) * 60:
+        raise AssertionError("mapped grid188 FC1 must be 128x1+60x0")
+    if fc2_counts != (5,) * 16 + (4,) * 172:
+        raise AssertionError("mapped grid188 FC2 must be 16x5+172x4")
+    return {
+        "grid_x": _W4A16_HYBRID_MAPPED_GRID188_GRID_X,
+        "fc1_tasks": fc1_flat,
+        "fc2_tasks": fc2_flat,
+        "fc1_per_cta_counts": fc1_counts,
+        "fc2_per_cta_counts": fc2_counts,
+        "fc1_waves": 1,
+        "fc2_waves": 5,
+        "fc1_idle_ctas": tuple(range(128, 188)),
+    }
+
+
+def _hybrid_mapped_grid188_validate_current_device(
+    *,
+    sms: int,
+    max_shared_mem: int,
+) -> tuple[int, int]:
+    """Fail closed unless the current device is the exact SM120/188 target."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("W4A16 hybrid mapped grid188 requires CUDA")
+    device = int(torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    capability = (int(props.major), int(props.minor))
+    if capability != (12, 0):
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 requires exact SM120, got "
+            f"SM{capability[0]}{capability[1]}"
+        )
+    detected_sms = int(props.multi_processor_count)
+    if detected_sms != _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS:
+        raise RuntimeError(
+            f"W4A16 hybrid mapped grid188 requires exactly 188 SMs, got {detected_sms}"
+        )
+    if int(sms) != detected_sms:
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 sms must match the current device: "
+            f"{int(sms)} != {detected_sms}"
+        )
+    device_max_shared_mem_value = getattr(props, "shared_memory_per_block_optin", None)
+    if device_max_shared_mem_value is None:
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 cannot determine shared-memory capacity"
+        )
+    device_max_shared_mem = int(device_max_shared_mem_value)
+    if device_max_shared_mem <= 0:
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 has invalid shared-memory capacity: "
+            f"{device_max_shared_mem}"
+        )
+    if int(max_shared_mem) != device_max_shared_mem:
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 max_shared_mem must match the current "
+            f"device: {int(max_shared_mem)} != {device_max_shared_mem}"
+        )
+    return device, device_max_shared_mem
+
+
+class W4A16HybridMappedGrid188Kernel(W4A16HybridDirectKernel):
+    """Mapped production kernel launched with exactly 188 CTAs."""
+
+    GRID_X = _W4A16_HYBRID_MAPPED_GRID188_GRID_X
+    TARGET_SMS = _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS
+    MAP_SLOTS = 256
+    ABI_VERSION = 1
+    _COMPILE_CACHE: dict[tuple, W4A16HybridMappedCompileResult] = {}
+
+    def __init__(
+        self,
+        *,
+        size_m: int,
+        hidden_size: int,
+        intermediate_size: int,
+        nv_num_experts: int,
+        nf_num_experts: int,
+        top_k: int,
+        activation: str,
+        element_dtype: str,
+        fast_math: bool,
+        sms: int,
+        max_shared_mem: int,
+        force_tile_config: tuple[int, int, int, int],
+    ):
+        _hybrid_mapped_grid188_validate_current_device(
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+        )
+        super().__init__(
+            size_m=size_m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            nv_num_experts=nv_num_experts,
+            nf_num_experts=nf_num_experts,
+            top_k=top_k,
+            activation=activation,
+            element_dtype=element_dtype,
+            fast_math=fast_math,
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+            force_tile_config=force_tile_config,
+        )
+        if self.blocks_per_sm != 1:
+            raise RuntimeError(
+                "W4A16 hybrid mapped grid188 requires one resident CTA per SM"
+            )
+        if self.sms * self.blocks_per_sm < self.GRID_X:
+            raise RuntimeError(
+                "W4A16 hybrid mapped grid188 cannot keep its whole grid resident"
+            )
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            "w4a16_hybrid_mapped_grid188",
+            self.ABI_VERSION,
+            self.MAP_SLOTS,
+            super().__cache_key__,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a_bf16_ptr: cute.Pointer,
+        nv_w13_i32_flat: cute.Tensor,
+        nv_w2_i32_flat: cute.Tensor,
+        nv_w13_scales_i32_flat: cute.Tensor,
+        nv_w2_scales_i32_flat: cute.Tensor,
+        nv_w13_global_scale: cute.Tensor,
+        nv_w2_global_scale: cute.Tensor,
+        nf_w13_i32_flat: cute.Tensor,
+        nf_w2_i32_flat: cute.Tensor,
+        nf_w13_scales_i32_flat: cute.Tensor,
+        nf_w2_scales_i32_flat: cute.Tensor,
+        nf_w13_global_scale: cute.Tensor,
+        nf_w2_global_scale: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_ptr: cute.Pointer,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        a_bf16_flat = cute.make_tensor(
+            a_bf16_ptr,
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+        )
+        topk_weights_flat = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+        )
+        self.kernel(
+            a_bf16_flat,
+            nv_w13_i32_flat,
+            nv_w2_i32_flat,
+            nv_w13_scales_i32_flat,
+            nv_w2_scales_i32_flat,
+            nv_w13_global_scale,
+            nv_w2_global_scale,
+            nf_w13_i32_flat,
+            nf_w2_i32_flat,
+            nf_w13_scales_i32_flat,
+            nf_w2_scales_i32_flat,
+            nf_w13_global_scale,
+            nf_w2_global_scale,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            output_bf16_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            workspace_i32_flat,
+            active_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        a_bf16_flat: cute.Tensor,
+        nv_w13_i32_flat: cute.Tensor,
+        nv_w2_i32_flat: cute.Tensor,
+        nv_w13_scales_i32_flat: cute.Tensor,
+        nv_w2_scales_i32_flat: cute.Tensor,
+        nv_w13_global_scale: cute.Tensor,
+        nv_w2_global_scale: cute.Tensor,
+        nf_w13_i32_flat: cute.Tensor,
+        nf_w2_i32_flat: cute.Tensor,
+        nf_w13_scales_i32_flat: cute.Tensor,
+        nf_w2_scales_i32_flat: cute.Tensor,
+        nf_w13_global_scale: cute.Tensor,
+        nf_w2_global_scale: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        zidx = cta * Int32(self.cta_threads) + tid
+        zstride = grid_x * Int32(self.cta_threads)
+        ztotal = active_m * Int32(self.hidden_size)
+        zero = self._cast_elem(cutlass.Float32(0.0))
+        while zidx < ztotal:
+            output_bf16_flat[zidx] = zero
+            zidx += zstride
+
+        self._run_persistent_gemm_hybrid_mapped(
+            a_bf16_flat,
+            nv_w13_i32_flat,
+            nv_w13_scales_i32_flat,
+            nv_w13_global_scale,
+            nf_w13_i32_flat,
+            nf_w13_scales_i32_flat,
+            nf_w13_global_scale,
+            fc1_bf16_flat,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            workspace_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+            True,
+        )
+        self._grid_barrier(workspace_i32_flat, tid, grid_x)
+        self._run_activation(
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+        )
+        self._grid_barrier(workspace_i32_flat, tid, grid_x)
+        self._run_persistent_gemm_hybrid_mapped(
+            activated_bf16_flat,
+            nv_w2_i32_flat,
+            nv_w2_scales_i32_flat,
+            nv_w2_global_scale,
+            nf_w2_i32_flat,
+            nf_w2_scales_i32_flat,
+            nf_w2_global_scale,
+            output_bf16_flat,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc2_c_tmp_f32_flat,
+            workspace_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m * Int32(self.top_k),
+            False,
+        )
+
+    @cute.jit
+    def _run_persistent_gemm_hybrid_mapped(
+        self,
+        a_bf16_flat: cute.Tensor,
+        nv_b_i32_flat: cute.Tensor,
+        nv_scales_i32_flat: cute.Tensor,
+        nv_global_scale: cute.Tensor,
+        nf_b_i32_flat: cute.Tensor,
+        nf_scales_i32_flat: cute.Tensor,
+        nf_global_scale: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        workspace_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_size_m: Int32,
+        is_fc1: cutlass.Constexpr[bool],
+    ):
+        if cutlass.const_expr(is_fc1):
+            n_tiles = Int32(self.nv_fc1.n_tiles)
+            k_tiles = Int32(self.nv_fc1.k_tiles)
+            route_blocks = active_size_m * Int32(self.nv_fc1.top_k)
+        else:
+            n_tiles = Int32(self.nv_fc2.n_tiles)
+            k_tiles = Int32(self.nv_fc2.k_tiles)
+            route_blocks = active_size_m * Int32(self.nv_fc2.top_k)
+
+        global_mn_tiles = route_blocks * n_tiles
+        work_mn_tile = cta
+        while work_mn_tile < global_mn_tiles:
+            route_ordinal = work_mn_tile // n_tiles
+            output_n_tile = work_mn_tile - route_ordinal * n_tiles
+            original_slot = route_ordinal
+            global_expert = global_topk_ids_i32_flat[route_ordinal].to(Int32)
+            if global_expert >= Int32(0):
+                if global_expert < Int32(self.MAP_SLOTS):
+                    descriptor = tier_local_map_i32_flat[global_expert].to(Int32)
+                    if descriptor >= Int32(0):
+                        tier = descriptor >> Int32(8)
+                        local_expert = descriptor & Int32(0xFF)
+                        if tier == Int32(0):
+                            if local_expert < Int32(self.nv_num_experts):
+                                if cutlass.const_expr(is_fc1):
+                                    self.nv_fc1._run_tile(
+                                        a_bf16_flat,
+                                        nv_b_i32_flat,
+                                        c_bf16_flat,
+                                        nv_scales_i32_flat,
+                                        nv_global_scale,
+                                        global_topk_ids_i32_flat,
+                                        topk_weights_flat,
+                                        c_tmp_f32_flat,
+                                        workspace_i32_flat,
+                                        smem_base,
+                                        tid,
+                                        original_slot,
+                                        local_expert,
+                                        output_n_tile,
+                                        Int32(0),
+                                        k_tiles,
+                                        Int32(1),
+                                        Int32(0),
+                                        cta,
+                                        active_size_m,
+                                    )
+                                else:
+                                    self.nv_fc2._run_tile(
+                                        a_bf16_flat,
+                                        nv_b_i32_flat,
+                                        c_bf16_flat,
+                                        nv_scales_i32_flat,
+                                        nv_global_scale,
+                                        global_topk_ids_i32_flat,
+                                        topk_weights_flat,
+                                        c_tmp_f32_flat,
+                                        workspace_i32_flat,
+                                        smem_base,
+                                        tid,
+                                        original_slot,
+                                        local_expert,
+                                        output_n_tile,
+                                        Int32(0),
+                                        k_tiles,
+                                        Int32(1),
+                                        Int32(0),
+                                        cta,
+                                        active_size_m,
+                                    )
+                        else:
+                            if tier == Int32(1):
+                                if local_expert < Int32(self.nf_num_experts):
+                                    if cutlass.const_expr(is_fc1):
+                                        self.nf_fc1._run_tile(
+                                            a_bf16_flat,
+                                            nf_b_i32_flat,
+                                            c_bf16_flat,
+                                            nf_scales_i32_flat,
+                                            nf_global_scale,
+                                            global_topk_ids_i32_flat,
+                                            topk_weights_flat,
+                                            c_tmp_f32_flat,
+                                            workspace_i32_flat,
+                                            smem_base,
+                                            tid,
+                                            original_slot,
+                                            local_expert,
+                                            output_n_tile,
+                                            Int32(0),
+                                            k_tiles,
+                                            Int32(1),
+                                            Int32(0),
+                                            cta,
+                                            active_size_m,
+                                        )
+                                    else:
+                                        self.nf_fc2._run_tile(
+                                            a_bf16_flat,
+                                            nf_b_i32_flat,
+                                            c_bf16_flat,
+                                            nf_scales_i32_flat,
+                                            nf_global_scale,
+                                            global_topk_ids_i32_flat,
+                                            topk_weights_flat,
+                                            c_tmp_f32_flat,
+                                            workspace_i32_flat,
+                                            smem_base,
+                                            tid,
+                                            original_slot,
+                                            local_expert,
+                                            output_n_tile,
+                                            Int32(0),
+                                            k_tiles,
+                                            Int32(1),
+                                            Int32(0),
+                                            cta,
+                                            active_size_m,
+                                        )
+            work_mn_tile += grid_x
+
+
+def _hybrid_mapped_grid188_admit_residency(
+    *,
+    sms: int,
+    max_shared_mem: int,
+    grid_x: int,
+    blocks_per_sm: int,
+    cta_threads: int,
+    shared_memory_bytes: int,
+    registers_per_thread: int,
+    local_memory_bytes: int,
+) -> tuple[tuple[str, object], ...]:
+    """Admit only resource-complete whole-grid-resident SM120/188 code."""
+
+    if int(sms) != _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS:
+        raise RuntimeError("mapped grid188 admission requires exactly 188 SMs")
+    if int(grid_x) != _W4A16_HYBRID_MAPPED_GRID188_GRID_X:
+        raise RuntimeError("mapped grid188 admission requires exactly 188 CTAs")
+    if int(blocks_per_sm) != 1:
+        raise RuntimeError("mapped grid188 admission requires one CTA per SM")
+    if int(cta_threads) != 256:
+        raise RuntimeError("mapped grid188 admission requires 256-thread CTAs")
+    resident_capacity_ctas = int(sms) * int(blocks_per_sm)
+    if int(grid_x) != resident_capacity_ctas:
+        raise RuntimeError("mapped grid188 requires exactly one CTA on every SM")
+    registers_per_thread_value = int(registers_per_thread)
+    if not 1 <= registers_per_thread_value <= 255:
+        raise RuntimeError(
+            "mapped grid188 admission requires a reported 1..255 registers/thread, "
+            f"got {registers_per_thread_value}"
+        )
+    if int(local_memory_bytes) != 0:
+        raise RuntimeError("mapped grid188 admission forbids local memory")
+    register_bytes_per_cta = registers_per_thread_value * int(cta_threads) * 4
+    register_capacity_ctas = _DEVICE_MAX_REG_BYTES // register_bytes_per_cta
+    if register_capacity_ctas < 1:
+        raise RuntimeError(
+            "mapped grid188 register admission cannot retain one CTA/SM: "
+            f"registers_per_thread={registers_per_thread_value}, "
+            f"register_bytes_per_cta={register_bytes_per_cta}, "
+            f"register_budget_bytes={_DEVICE_MAX_REG_BYTES}"
+        )
+    if int(shared_memory_bytes) != 45_184:
+        raise RuntimeError(
+            "mapped grid188 admission requires exactly 45,184 shared-memory bytes"
+        )
+    if int(shared_memory_bytes) + 1536 > int(max_shared_mem):
+        raise RuntimeError("mapped grid188 exceeds the per-SM shared-memory budget")
+    return (
+        ("candidate", "w4a16_hybrid_mapped_grid188"),
+        ("architecture", "sm120"),
+        ("abi_version", W4A16HybridMappedGrid188Kernel.ABI_VERSION),
+        ("target_sms", _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS),
+        ("grid_x", _W4A16_HYBRID_MAPPED_GRID188_GRID_X),
+        ("blocks_per_sm", int(blocks_per_sm)),
+        ("resident_capacity_ctas", resident_capacity_ctas),
+        ("whole_grid_resident", True),
+        ("one_cta_per_sm", True),
+        ("registers_per_thread_actual", registers_per_thread_value),
+        ("shared_memory_bytes_exact", 45_184),
+        ("task_schedule", "task=cta+wave*188"),
+        ("fc1_schedule", "128x1+60x0"),
+        ("fc2_schedule", "16x5+172x4"),
+        ("register_bytes_per_cta", register_bytes_per_cta),
+        ("register_budget_bytes", _DEVICE_MAX_REG_BYTES),
+        ("register_capacity_ctas", register_capacity_ctas),
+        ("shared_memory_guard_bytes", 1536),
+    )
+
+
+def compile_w4a16_hybrid_mapped_grid188(
+    *,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    nv_num_experts: int,
+    nf_num_experts: int,
+    top_k: int,
+    activation: str,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    force_tile_config: tuple[int, int, int, int],
+) -> W4A16HybridMappedCompileResult:
+    """Compile the exact one-grid global-route-map heterogeneous kernel."""
+
+    device, _ = _hybrid_mapped_grid188_validate_current_device(
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+    )
+    cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    kernel = W4A16HybridMappedGrid188Kernel(
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        nv_num_experts=nv_num_experts,
+        nf_num_experts=nf_num_experts,
+        top_k=top_k,
+        activation=activation,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        force_tile_config=force_tile_config,
+    )
+    fixed_resources = (
+        kernel.GRID_X,
+        kernel.cta_threads,
+        kernel.blocks_per_sm,
+        kernel.shared_words,
+        kernel.workspace_words,
+        kernel.SCRATCH_ELEMENTS,
+        kernel.ROUTE_SLOTS,
+        kernel.MAP_SLOTS,
+    )
+    if fixed_resources != (188, 256, 1, 11_296, 754, 2_097_152, 32, 256):
+        raise ValueError(
+            "W4A16 hybrid mapped grid188 v1 fixed resources changed: "
+            f"{fixed_resources!r}"
+        )
+
+    cache_key = (
+        "w4a16_hybrid_mapped_grid188",
+        device,
+        int(max_shared_mem),
+        "mapped_grid188_cute_compile_keep_cubin",
+        kernel.__cache_key__,
+    )
+    cached = W4A16HybridMappedGrid188Kernel._COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    compile_spec = KernelCompileSpec.from_key(
+        "moe.w4a16.hybrid_mapped_grid188",
+        W4A16HybridMappedGrid188Kernel.ABI_VERSION,
+        cache_key,
+    )
+    a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    nv_w13_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (50_331_648,), assumed_align=16
+    )
+    nv_w2_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (25_165_824,), assumed_align=16
+    )
+    nv_w13_scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (6_291_456,), assumed_align=16
+    )
+    nv_w2_scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (3_145_728,), assumed_align=16
+    )
+    nv_w13_global_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (64,), assumed_align=16
+    )
+    nv_w2_global_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (64,), assumed_align=16
+    )
+    nf_w13_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (113_246_208,), assumed_align=16
+    )
+    nf_w2_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (56_623_104,), assumed_align=16
+    )
+    nf_w13_scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (9_437_184,), assumed_align=16
+    )
+    nf_w2_scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (4_718_592,), assumed_align=16
+    )
+    nf_w13_global_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (192,), assumed_align=16
+    )
+    nf_w2_global_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (192,), assumed_align=16
+    )
+    global_topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (W4A16HybridMappedGrid188Kernel.ROUTE_SLOTS,),
+        assumed_align=16,
+    )
+    tier_local_map_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (W4A16HybridMappedGrid188Kernel.MAP_SLOTS,),
+        assumed_align=16,
+    )
+    fc1_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (32 * 1024,), assumed_align=16
+    )
+    activated_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (32 * 512,), assumed_align=16
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (4 * 6144,), assumed_align=16
+    )
+    topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    fc1_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (kernel.SCRATCH_ELEMENTS,), assumed_align=16
+    )
+    fc2_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (kernel.SCRATCH_ELEMENTS,), assumed_align=16
+    )
+    workspace_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (kernel.workspace_words,),
+        assumed_align=16,
+    )
+
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = cute.compile(
+        kernel,
+        a_fake,
+        nv_w13_fake,
+        nv_w2_fake,
+        nv_w13_scales_fake,
+        nv_w2_scales_fake,
+        nv_w13_global_fake,
+        nv_w2_global_fake,
+        nf_w13_fake,
+        nf_w2_fake,
+        nf_w13_scales_fake,
+        nf_w2_scales_fake,
+        nf_w13_global_fake,
+        nf_w2_global_fake,
+        global_topk_ids_fake,
+        tier_local_map_fake,
+        fc1_fake,
+        activated_fake,
+        output_fake,
+        topk_fake,
+        fc1_c_tmp_fake,
+        fc2_c_tmp_fake,
+        workspace_fake,
+        4,
+        kernel.GRID_X,
+        current_cuda_stream(),
+        options="--keep-cubin",
+    )
+
+    to_executor = getattr(compiled, "to", None)
+    if not callable(to_executor):
+        raise RuntimeError(
+            "W4A16 hybrid mapped grid188 compile result cannot bind a CuTe executor"
+        )
+    executor = to_executor(device)
+    kernel_resources = _hybrid_direct_query_kernel_resources(
+        compiled,
+        executor,
+        cuda_runtime.cudaLibraryGetKernel,
+        cuda_runtime.cudaFuncGetAttributes,
+        cuda_runtime.cudaError_t(0),
+    )
+    (
+        registers_per_thread,
+        local_memory_bytes,
+        spill_store_bytes,
+        spill_load_bytes,
+        generated_code_bytes,
+    ) = _hybrid_direct_admit_codegen_resources(
+        kernel_resources,
+        getattr(compiled, "__cubin__", None),
+    )
+    residency_metadata = _hybrid_mapped_grid188_admit_residency(
+        sms=kernel.sms,
+        max_shared_mem=max_shared_mem,
+        grid_x=kernel.GRID_X,
+        blocks_per_sm=kernel.blocks_per_sm,
+        cta_threads=kernel.cta_threads,
+        shared_memory_bytes=kernel.shared_words * 4,
+        registers_per_thread=registers_per_thread,
+        local_memory_bytes=local_memory_bytes,
+    )
+    codegen_resource_metadata: tuple[tuple[str, object], ...] = residency_metadata + (
+        ("architecture", "sm120"),
+        ("abi_version", kernel.ABI_VERSION),
+        ("cta_threads", kernel.cta_threads),
+        ("min_blocks_per_mp", kernel.blocks_per_sm),
+        ("grid_x", kernel.GRID_X),
+        ("shared_words", kernel.shared_words),
+        ("shared_memory_bytes", kernel.shared_words * 4),
+        ("workspace_words", kernel.workspace_words),
+        ("scratch_elements", kernel.SCRATCH_ELEMENTS),
+        ("route_slots", kernel.ROUTE_SLOTS),
+        ("map_slots", kernel.MAP_SLOTS),
+        ("registers_per_thread", registers_per_thread),
+        ("local_memory_bytes", local_memory_bytes),
+        ("spill_store_bytes", spill_store_bytes),
+        ("spill_load_bytes", spill_load_bytes),
+        ("generated_code_bytes", generated_code_bytes),
+        ("kernel_symbol", kernel_resources[0][0]),
+    )
+    compiled_abi = (
+        "a_bf16_ptr",
+        "nv_w13_i32",
+        "nv_w2_i32",
+        "nv_w13_scale_i32",
+        "nv_w2_scale_i32",
+        "nv_w13_global_f32",
+        "nv_w2_global_f32",
+        "nf_w13_i32",
+        "nf_w2_i32",
+        "nf_w13_scale_i32",
+        "nf_w2_scale_i32",
+        "nf_w13_global_f32",
+        "nf_w2_global_f32",
+        "global_topk_ids_i32",
+        "tier_local_map_i32",
+        "fc1_bf16",
+        "activated_bf16",
+        "output_bf16",
+        "topk_weights_f32_ptr",
+        "fc1_c_tmp_f32",
+        "fc2_c_tmp_f32",
+        "workspace_i32",
+        "active_m",
+        "grid_x",
+        "stream",
+    )
+    result = W4A16HybridMappedCompileResult(
+        compiled=compiled,
+        executor=executor,
+        size_m=4,
+        hidden_size=6144,
+        intermediate_size=512,
+        nv_num_experts=64,
+        nf_num_experts=192,
+        top_k=8,
+        activation="silu",
+        element_dtype="bf16",
+        fast_math=bool(fast_math),
+        fc1_tile_k=64,
+        fc1_tile_n=256,
+        fc2_tile_k=64,
+        fc2_tile_n=256,
+        moe_block_size=8,
+        cta_threads=256,
+        blocks_per_sm=1,
+        shared_words=kernel.shared_words,
+        shared_memory_bytes=kernel.shared_words * 4,
+        workspace_words=kernel.workspace_words,
+        scratch_elements=kernel.SCRATCH_ELEMENTS,
+        grid_x=kernel.GRID_X,
+        route_slots=kernel.ROUTE_SLOTS,
+        fc1_tasks=128,
+        fc2_tasks=768,
+        fc1_waves=1,
+        fc2_waves=5,
+        activation_rows=32,
+        activation_elements=32 * 512,
+        barrier_count=2,
+        output_zero_count=1,
+        nv_weight_layout="packed",
+        nv_scale_format="e4m3_k16",
+        nf_weight_layout="nf3_2p1",
+        nf_scale_format="e4m3_k32",
+        child_cache_keys=(
+            kernel.nv_fc1.__cache_key__,
+            kernel.nf_fc1.__cache_key__,
+            kernel.nv_fc2.__cache_key__,
+            kernel.nf_fc2.__cache_key__,
+        ),
+        cache_key=cache_key,
+        compile_spec=compile_spec,
+        compiled_abi=compiled_abi,
+        phase_order=(
+            "output_zero",
+            "hybrid_fc1",
+            "grid_barrier",
+            "gated_silu",
+            "grid_barrier",
+            "hybrid_fc2_fused_sum",
+        ),
+        registers_per_thread=registers_per_thread,
+        local_memory_bytes=local_memory_bytes,
+        spill_store_bytes=spill_store_bytes,
+        spill_load_bytes=spill_load_bytes,
+        generated_code_bytes=generated_code_bytes,
+        kernel_resources=kernel_resources,
+        codegen_resource_metadata=codegen_resource_metadata,
+        map_slots=kernel.MAP_SLOTS,
+        abi_version=kernel.ABI_VERSION,
+    )
+    W4A16HybridMappedGrid188Kernel._COMPILE_CACHE[cache_key] = result
+    return result
+
+
+def _w4a16_hybrid_mapped_grid188_launch_flat(
+    a_input: torch.Tensor,
+    nv_w13_i32: torch.Tensor,
+    nv_w2_i32: torch.Tensor,
+    nv_w13_scale_i32: torch.Tensor,
+    nv_w2_scale_i32: torch.Tensor,
+    nv_w13_global_f32: torch.Tensor,
+    nv_w2_global_f32: torch.Tensor,
+    nf_w13_i32: torch.Tensor,
+    nf_w2_i32: torch.Tensor,
+    nf_w13_scale_i32: torch.Tensor,
+    nf_w2_scale_i32: torch.Tensor,
+    nf_w13_global_f32: torch.Tensor,
+    nf_w2_global_f32: torch.Tensor,
+    global_topk_ids_i32: torch.Tensor,
+    tier_local_map_i32: torch.Tensor,
+    fc1_bf16: torch.Tensor,
+    activated_bf16: torch.Tensor,
+    output_bf16: torch.Tensor,
+    topk_weights_f32: torch.Tensor,
+    fc1_c_tmp_f32: torch.Tensor,
+    fc2_c_tmp_f32: torch.Tensor,
+    workspace_i32: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    nv_num_experts: int,
+    nf_num_experts: int,
+    topk: int,
+    activation: str,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    grid_x: int,
+    stream_int: int,
+) -> None:
+    if not a_input.is_cuda:
+        raise ValueError("W4A16 hybrid mapped grid188 input must be a CUDA tensor")
+    device_index = a_input.device.index
+    if device_index is None:
+        raise ValueError("W4A16 hybrid mapped grid188 input lacks a CUDA device index")
+    current_device = int(torch.cuda.current_device())
+    if int(device_index) != current_device:
+        raise ValueError(
+            "W4A16 hybrid mapped grid188 input must be on the current CUDA device: "
+            f"cuda:{int(device_index)} != cuda:{current_device}"
+        )
+    current_stream_int = int(torch.cuda.current_stream(a_input.device).cuda_stream)
+    if int(stream_int) != current_stream_int:
+        raise ValueError(
+            "W4A16 hybrid mapped grid188 stream must be the current input-device stream: "
+            f"{int(stream_int)} != {current_stream_int}"
+        )
+    if int(m) != 4 or int(size_m) != 4:
+        raise ValueError("W4A16 hybrid mapped grid188 v1 requires m=size_m=4")
+    if int(grid_x) != W4A16HybridMappedGrid188Kernel.GRID_X:
+        raise ValueError("W4A16 hybrid mapped grid188 requires exact grid_x=188")
+    _hybrid_mapped_grid188_validate_current_device(
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+    )
+    force_tile_config = (
+        int(fc1_tile_k),
+        int(fc1_tile_n),
+        int(fc2_tile_k),
+        int(fc2_tile_n),
+    )
+    hybrid = compile_w4a16_hybrid_mapped_grid188(
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        nv_num_experts=nv_num_experts,
+        nf_num_experts=nf_num_experts,
+        top_k=topk,
+        activation=activation,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        force_tile_config=force_tile_config,
+    )
+
+    resource_metadata = dict(hybrid.codegen_resource_metadata)
+    if (
+        hybrid.grid_x != W4A16HybridMappedGrid188Kernel.GRID_X
+        or hybrid.blocks_per_sm != 1
+        or resource_metadata.get("candidate") != "w4a16_hybrid_mapped_grid188"
+        or resource_metadata.get("target_sms")
+        != _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS
+        or resource_metadata.get("grid_x") != _W4A16_HYBRID_MAPPED_GRID188_GRID_X
+        or resource_metadata.get("resident_capacity_ctas")
+        != _W4A16_HYBRID_MAPPED_GRID188_TARGET_SMS
+        or resource_metadata.get("whole_grid_resident") is not True
+        or resource_metadata.get("one_cta_per_sm") is not True
+        or resource_metadata.get("registers_per_thread_actual")
+        != hybrid.registers_per_thread
+        or resource_metadata.get("shared_memory_bytes_exact") != 45_184
+        or resource_metadata.get("register_bytes_per_cta")
+        != hybrid.registers_per_thread * hybrid.cta_threads * 4
+        or int(resource_metadata.get("register_capacity_ctas", 0)) < 1
+        or resource_metadata.get("task_schedule") != "task=cta+wave*188"
+        or resource_metadata.get("fc1_schedule") != "128x1+60x0"
+        or resource_metadata.get("fc2_schedule") != "16x5+172x4"
+    ):
+        raise RuntimeError("W4A16 hybrid mapped grid188 lacks exact resource admission")
+
+    tensor_contracts = (
+        ("a_input", a_input, torch.bfloat16, 4 * 6144, True, 16, False),
+        ("nv_w13_i32", nv_w13_i32, torch.int32, 50_331_648, True, 16, False),
+        ("nv_w2_i32", nv_w2_i32, torch.int32, 25_165_824, True, 16, False),
+        (
+            "nv_w13_scale_i32",
+            nv_w13_scale_i32,
+            torch.int32,
+            6_291_456,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nv_w2_scale_i32",
+            nv_w2_scale_i32,
+            torch.int32,
+            3_145_728,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nv_w13_global_f32",
+            nv_w13_global_f32,
+            torch.float32,
+            64,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nv_w2_global_f32",
+            nv_w2_global_f32,
+            torch.float32,
+            64,
+            True,
+            16,
+            False,
+        ),
+        ("nf_w13_i32", nf_w13_i32, torch.int32, 113_246_208, True, 16, False),
+        ("nf_w2_i32", nf_w2_i32, torch.int32, 56_623_104, True, 16, False),
+        (
+            "nf_w13_scale_i32",
+            nf_w13_scale_i32,
+            torch.int32,
+            9_437_184,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nf_w2_scale_i32",
+            nf_w2_scale_i32,
+            torch.int32,
+            4_718_592,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nf_w13_global_f32",
+            nf_w13_global_f32,
+            torch.float32,
+            192,
+            True,
+            16,
+            False,
+        ),
+        (
+            "nf_w2_global_f32",
+            nf_w2_global_f32,
+            torch.float32,
+            192,
+            True,
+            16,
+            False,
+        ),
+        (
+            "global_topk_ids_i32",
+            global_topk_ids_i32,
+            torch.int32,
+            hybrid.route_slots,
+            True,
+            16,
+            False,
+        ),
+        (
+            "tier_local_map_i32",
+            tier_local_map_i32,
+            torch.int32,
+            hybrid.map_slots,
+            True,
+            16,
+            False,
+        ),
+        ("fc1_bf16", fc1_bf16, torch.bfloat16, 32 * 1024, True, 16, True),
+        (
+            "activated_bf16",
+            activated_bf16,
+            torch.bfloat16,
+            32 * 512,
+            True,
+            16,
+            True,
+        ),
+        (
+            "output_bf16",
+            output_bf16,
+            torch.bfloat16,
+            4 * 6144,
+            True,
+            16,
+            True,
+        ),
+        (
+            "topk_weights_f32",
+            topk_weights_f32,
+            torch.float32,
+            32,
+            True,
+            4,
+            False,
+        ),
+        (
+            "fc1_c_tmp_f32",
+            fc1_c_tmp_f32,
+            torch.float32,
+            hybrid.scratch_elements,
+            False,
+            16,
+            True,
+        ),
+        (
+            "fc2_c_tmp_f32",
+            fc2_c_tmp_f32,
+            torch.float32,
+            hybrid.scratch_elements,
+            False,
+            16,
+            True,
+        ),
+        (
+            "workspace_i32",
+            workspace_i32,
+            torch.int32,
+            hybrid.workspace_words,
+            False,
+            16,
+            True,
+        ),
+    )
+    for name, tensor, dtype, elements, exact, assumed_align, _ in tensor_contracts:
+        _hybrid_direct_validate_tensor(
+            name,
+            tensor,
+            dtype=dtype,
+            elements=elements,
+            assumed_align=assumed_align,
+            exact=exact,
+        )
+        if tensor.device != a_input.device:
+            raise ValueError(
+                f"{name} device {tensor.device} does not match input device "
+                f"{a_input.device}"
+            )
+    _hybrid_mapped_validate_aliases(
+        tuple(
+            (name, tensor, mutable)
+            for name, tensor, _, _, _, _, mutable in tensor_contracts
+        )
+    )
+
+    hybrid.executor(
+        make_ptr(
+            cutlass.BFloat16,
+            a_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        nv_w13_i32,
+        nv_w2_i32,
+        nv_w13_scale_i32,
+        nv_w2_scale_i32,
+        nv_w13_global_f32,
+        nv_w2_global_f32,
+        nf_w13_i32,
+        nf_w2_i32,
+        nf_w13_scale_i32,
+        nf_w2_scale_i32,
+        nf_w13_global_f32,
+        nf_w2_global_f32,
+        global_topk_ids_i32,
+        tier_local_map_i32,
+        fc1_bf16,
+        activated_bf16,
+        output_bf16,
+        make_ptr(
+            cutlass.Float32,
+            topk_weights_f32.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        fc1_c_tmp_f32,
+        fc2_c_tmp_f32,
+        workspace_i32,
+        4,
+        hybrid.grid_x,
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_hybrid_mapped_grid188_launch",
+    mutates_args="unknown",
+    device_types="cuda",
+)
+def _w4a16_hybrid_mapped_grid188_launch_op(
+    a_input: torch.Tensor,
+    nv_w13_i32: torch.Tensor,
+    nv_w2_i32: torch.Tensor,
+    nv_w13_scale_i32: torch.Tensor,
+    nv_w2_scale_i32: torch.Tensor,
+    nv_w13_global_f32: torch.Tensor,
+    nv_w2_global_f32: torch.Tensor,
+    nf_w13_i32: torch.Tensor,
+    nf_w2_i32: torch.Tensor,
+    nf_w13_scale_i32: torch.Tensor,
+    nf_w2_scale_i32: torch.Tensor,
+    nf_w13_global_f32: torch.Tensor,
+    nf_w2_global_f32: torch.Tensor,
+    global_topk_ids_i32: torch.Tensor,
+    tier_local_map_i32: torch.Tensor,
+    fc1_bf16: torch.Tensor,
+    activated_bf16: torch.Tensor,
+    output_bf16: torch.Tensor,
+    topk_weights_f32: torch.Tensor,
+    fc1_c_tmp_f32: torch.Tensor,
+    fc2_c_tmp_f32: torch.Tensor,
+    workspace_i32: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    nv_num_experts: int,
+    nf_num_experts: int,
+    topk: int,
+    activation: str,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    grid_x: int,
+    stream_int: int,
+) -> None:
+    _w4a16_hybrid_mapped_grid188_launch_flat(
+        a_input,
+        nv_w13_i32,
+        nv_w2_i32,
+        nv_w13_scale_i32,
+        nv_w2_scale_i32,
+        nv_w13_global_f32,
+        nv_w2_global_f32,
+        nf_w13_i32,
+        nf_w2_i32,
+        nf_w13_scale_i32,
+        nf_w2_scale_i32,
+        nf_w13_global_f32,
+        nf_w2_global_f32,
+        global_topk_ids_i32,
+        tier_local_map_i32,
+        fc1_bf16,
+        activated_bf16,
+        output_bf16,
+        topk_weights_f32,
+        fc1_c_tmp_f32,
+        fc2_c_tmp_f32,
+        workspace_i32,
+        m,
+        size_m,
+        hidden_size,
+        intermediate_size,
+        nv_num_experts,
+        nf_num_experts,
+        topk,
+        activation,
+        element_dtype,
+        fast_math,
+        sms,
+        max_shared_mem,
+        fc1_tile_k,
+        fc1_tile_n,
+        fc2_tile_k,
+        fc2_tile_n,
+        grid_x,
+        stream_int,
+    )
+
+
+@_w4a16_hybrid_mapped_grid188_launch_op.register_fake
+def _w4a16_hybrid_mapped_grid188_launch_fake(
+    a_input: torch.Tensor,
+    nv_w13_i32: torch.Tensor,
+    nv_w2_i32: torch.Tensor,
+    nv_w13_scale_i32: torch.Tensor,
+    nv_w2_scale_i32: torch.Tensor,
+    nv_w13_global_f32: torch.Tensor,
+    nv_w2_global_f32: torch.Tensor,
+    nf_w13_i32: torch.Tensor,
+    nf_w2_i32: torch.Tensor,
+    nf_w13_scale_i32: torch.Tensor,
+    nf_w2_scale_i32: torch.Tensor,
+    nf_w13_global_f32: torch.Tensor,
+    nf_w2_global_f32: torch.Tensor,
+    global_topk_ids_i32: torch.Tensor,
+    tier_local_map_i32: torch.Tensor,
+    fc1_bf16: torch.Tensor,
+    activated_bf16: torch.Tensor,
+    output_bf16: torch.Tensor,
+    topk_weights_f32: torch.Tensor,
+    fc1_c_tmp_f32: torch.Tensor,
+    fc2_c_tmp_f32: torch.Tensor,
+    workspace_i32: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    nv_num_experts: int,
+    nf_num_experts: int,
+    topk: int,
+    activation: str,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    grid_x: int,
+    stream_int: int,
+) -> None:
+    return None
+
+
 __all__ = [
     "W4A16ActivationCompileResult",
     "W4A16FusedMoeCompileResult",
     "W4A16GemmCompileResult",
     "W4A16TopKSumCompileResult",
+    "W4A16HybridMappedCompileResult",
     "W4A16FusedMoeKernel",
     "W4A16ActivationKernel",
     "W4A16GemmKernel",
     "W4A16TopKSumKernel",
+    "W4A16HybridMappedGrid188Kernel",
     "clear_w4a16_kernel_cache",
     "compile_w4a16_activation",
     "compile_w4a16_fused_moe",
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
+    "compile_w4a16_hybrid_mapped_grid188",
     "pack_topk_routes_by_expert",
     "run_w4a16_moe",
+    "w4a16_hybrid_mapped_grid188_mapping_proof",
+    "w4a16_hybrid_mapped_grid188_task_map",
 ]
