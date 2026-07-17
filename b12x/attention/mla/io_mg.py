@@ -33,6 +33,12 @@ _IO_THREADS = 128
 # issued here.
 _GLM_IO_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528
+# NVFP4 MLA latent record: 256B E2M1 NoPE + 32B E4M3 group-16 scales + 16B pad
+# + 128B BF16 RoPE. The 288B NoPE+scales+pad region bulk-copies into the kv_fp8
+# row; RoPE is read from global/L2 by the math exactly like GLM.
+_NVFP4_IO_STRIDE = 432
+_NVFP4_NOPE_SCALE_BYTES = 288
+_NVFP4_FP8_ROPE_IO_STRIDE = 368
 
 
 @cute.jit
@@ -132,8 +138,10 @@ def io_issue_gather_glm_mg(
     cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
-    kv_smem_stride: cutlass.Constexpr,   # 528 (512 nope + 16 inline fp32 scales)
+    kv_smem_stride: cutlass.Constexpr,   # 528 GLM / 288 NVFP4 (smem nope row stride)
     io_threads: cutlass.Constexpr = _IO_THREADS,
+    scale_format: cutlass.Constexpr = 1,
+    fp8_rope: cutlass.Constexpr = False,
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -143,12 +151,22 @@ def io_issue_gather_glm_mg(
     NO grouped UE8M0 footer (so NO scalar scale gather) and -- like the DSV4 MG
     path -- RoPE is read from global/L2 by the math (NOT staged to smem), so the
     528-stride GLM KV fits the carveout for mg_n_hg==2. Single full mbarrier (the
-    MG convention): the leader arrives + expect_tx over the BI 528B bulks."""
-    _ios = Int64(_GLM_IO_STRIDE)
-    _nope = Int32(_GLM_NOPE_SCALE_BYTES)
+    MG convention): the leader arrives + expect_tx over the BI 528B bulks.
+
+    ``scale_format`` (const_expr): ARBITRARY_FP32 (1, GLM 656B/528B) or
+    NVFP4_E4M3 (2, NVFP4 432B/288B) record geometry."""
+    if cutlass.const_expr(scale_format == 2):
+        if cutlass.const_expr(fp8_rope):
+            _ios = Int64(_NVFP4_FP8_ROPE_IO_STRIDE)
+        else:
+            _ios = Int64(_NVFP4_IO_STRIDE)
+        _nope = Int32(_NVFP4_NOPE_SCALE_BYTES)
+    else:
+        _ios = Int64(_GLM_IO_STRIDE)
+        _nope = Int32(_GLM_NOPE_SCALE_BYTES)
 
     if io_lane == Int32(0):
-        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi * _GLM_NOPE_SCALE_BYTES))
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi) * _nope)
 
     full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
     eo = Int32(0)

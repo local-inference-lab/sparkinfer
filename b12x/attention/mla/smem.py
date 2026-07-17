@@ -20,7 +20,7 @@ and read it as ``entry * STRIDE + dim``.
 
 Regions (DSV4 ``DecodeDsv4Smem`` order; offsets are const_expr ints):
   * ``q_rope``   HPB x D_ROPE bf16            (linear ``h*D_ROPE + d``)
-  * ``q_fp8``    HPB x Q_NOPE_STRIDE fp8      (linear ``h*Q_NOPE_STRIDE + d``)
+  * ``q_fp8``    HPB x Q_NOPE_STRIDE staging  (FP8 normally; BF16 for NVFP4)
   * ``q_sc``     HPB x NUM_SCALES fp32        (power-of-2 FP32; converted to the
                                                UE8M0 ``sfa`` selector at use via
                                                ``pow2_ceil_ue8m0`` -- matches
@@ -59,7 +59,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from .traits import UnifiedMLATraits
+from .traits import ScaleFormat, UnifiedMLATraits
 
 
 # SM120 dynamic-smem opt-in carveout cap: (100-1)*1024 (see cutlass
@@ -218,9 +218,10 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
-    # --- Q nope quantized to fp8 at Q_NOPE_STRIDE (448 + 16 pad). ---
+    # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
     q_fp8_off = off
-    q_fp8_bytes = hpb * q_nope_stride * 1
+    q_element_bytes = 2 if traits.scale_format == ScaleFormat.NVFP4_E4M3 else 1
+    q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
 
     # --- Q per-head scales: FP32 power-of-2 (converted to UE8M0 sfa at use). ---

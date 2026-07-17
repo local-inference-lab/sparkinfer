@@ -45,11 +45,15 @@ def _cache_block_stride_bytes(
     *,
     page_size: int,
     model_type: ModelType,
+    record_bytes: int | None = None,
 ) -> int:
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
     if model_type == ModelType.GLM_NSA:
-        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
+        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
+        # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
+        rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
+        expected = int(page_size) * rec
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
     # Contiguous inputs are flattened before launch, so their original rank is
@@ -109,6 +113,9 @@ def run_unified_prefill(
     extra_page_block_size: int | None = None,
     stride_extra_kv_block: int | None = None,
     workspace=None,
+    scale_format: int | None = None,
+    latent_scale: float = 1.0,
+    fp8_rope: bool | None = None,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -142,6 +149,7 @@ def run_unified_prefill(
       extra_kv_cache / extra_indices / extra_topk_length / extra_page_block_size:
                     DSV4 dual-cache EXTRA pool (all-or-none; partial trio RAISEs).
       stride_extra_kv_block: EXTRA per-block byte stride (derived when omitted).
+      latent_scale: per-layer outer scale for the reconstructed NVFP4 latent.
       workspace:    unused (prefill is single-pass, no split/merge workspace);
                     accepted for launcher-signature symmetry.
 
@@ -168,8 +176,26 @@ def run_unified_prefill(
             f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
         )
 
-    model_type, compute_mode, scale_format = infer_model_type(q_head_dim, kv_cache.dtype)
-    traits = make_unified_traits(model_type, compute_mode, scale_format)
+    model_type, compute_mode, inferred_scale_format = infer_model_type(
+        q_head_dim, kv_cache.dtype
+    )
+    if scale_format is None:
+        scale_format = inferred_scale_format
+    else:
+        scale_format = int(scale_format)
+        if q_head_dim == _GLM_HEAD_DIM and scale_format == ScaleFormat.NVFP4_E4M3:
+            # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
+            # dequant + BF16 MMA); FP8 compute would misread the 432B record.
+            compute_mode = ComputeMode.BF16
+        elif scale_format != inferred_scale_format:
+            raise ValueError(
+                "SM120 sparse MLA prefill scale_format does not match q_head_dim: "
+                f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
+                f"override={int(scale_format)}"
+            )
+    traits = make_unified_traits(
+        model_type, compute_mode, scale_format, fp8_rope=fp8_rope
+    )
     d_v = int(traits.d_v)
 
     # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
@@ -208,6 +234,7 @@ def run_unified_prefill(
             kv_cache,
             page_size=int(page_block_size),
             model_type=model_type,
+            record_bytes=int(traits.kv_gmem_stride),
         )
 
     q = q.contiguous()
@@ -239,6 +266,7 @@ def run_unified_prefill(
                 kv_cache=kv_cache,
                 topk_indices=topk_indices,
                 sm_scale=sm_scale,
+                latent_scale=latent_scale,
                 page_block_size=page_block_size,
                 topk_length=topk_length,
                 attn_sink=attn_sink,
@@ -249,6 +277,7 @@ def run_unified_prefill(
                 mg_n_hg=mg_n_hg,
                 model_type=model_type,
                 scale_format=scale_format,
+                fp8_rope=bool(traits.fp8_rope),
             )
             if extra_kv_cache is not None:
                 kwargs.update(
@@ -306,6 +335,22 @@ def run_unified_prefill(
             model_type=ModelType.GLM_NSA,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
+    # ── NVFP4 (E2M1 + E4M3 group-16, GLM-family) MG gate ───────────────────────
+    # Same MG head-group structure as GLM; the math arms are the BF16-QK path
+    # with native in-register E2M1/E4M3 dequant (the same math as the validated
+    # NVFP4 decode). topk==128 additionally routes here (BF16-QK shape).
+    _mg_nvfp4 = (
+        _mg_enabled
+        and not has_extra
+        and model_type == ModelType.GLM_NSA
+        and scale_format == ScaleFormat.NVFP4_E4M3
+    )
+    if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+        return _run_partitioned_mg(
+            compute_mode=ComputeMode.BF16,
+            model_type=ModelType.GLM_NSA,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+        )
     _mg_base = (
         _mg_enabled
         and not has_extra
@@ -360,5 +405,7 @@ def run_unified_prefill(
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
-        "GLM_NSA topk in {512, 1024, 2048}. No decode-reuse fallback."
+        "GLM_NSA topk in {512, 1024, 2048}; "
+        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
+        "No decode-reuse fallback."
     )

@@ -70,6 +70,19 @@ _GLM_GMEM_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528  # 512 e4m3 + 16 inline fp32; bulk #1 (-> kv_fp8 row).
 _GLM_ROPE_BYTES = 128        # 64 bf16; bulk #2 (-> kv_rope).
 
+# NVFP4 MLA latent layout: 256B E2M1 NoPE + 32B E4M3 scales + 16B pad + 128B
+# BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
+# dequants the E2M1 data and E4M3 group-16 scales in registers.
+_NVFP4_GMEM_STRIDE = 432
+_NVFP4_NOPE_SCALE_BYTES = 288
+_NVFP4_ROPE_BYTES = 128
+_NVFP4_ROPE_SRC = 304
+# GLM-only KV_FP8_ROPE tail.  The latent bytes [0,288) are identical to the
+# stock record; [288,304) holds fp32 scale + 12B zero pad and [304,368) is E4M3.
+_NVFP4_FP8_ROPE_GMEM_STRIDE = 368
+_NVFP4_FP8_ROPE_TAIL_BYTES = 80
+_NVFP4_FP8_ROPE_TAIL_SRC = 288
+
 # IO warp width (one warp = 32 threads; FlashInfer DSV4_IO_THREADS).
 _IO_THREADS = 32
 
@@ -95,6 +108,7 @@ def io_issue_gather(
     scale_bytes_per_token: cutlass.Constexpr,  # 8 (DSV4 footer); unused for GLM
     bulk_tx_bytes: cutlass.Constexpr,      # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
     scale_format: cutlass.Constexpr = 0,   # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    fp8_rope: cutlass.Constexpr = False,
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
     packed_glm: cutlass.Constexpr = False,
     packed_dsv4: cutlass.Constexpr = False,
@@ -143,11 +157,24 @@ def io_issue_gather(
 
     # Per-model gmem geometry (const_expr). DSV4: 576B data + grouped 8B footer;
     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
+    # NVFP4: 432B contiguous (288 nope+E4M3-scales+pad + 128 rope), NO footer.
     if cutlass.const_expr(scale_format == 0):
         _IOS = Int64(_DSV4_IO_STRIDE)          # 576 per-token data stride
         _NOPE = Int32(_DSV4_NOPE_BYTES)        # 448 -> kv_fp8 (e4m3 nope)
         _ROPE = Int32(_DSV4_ROPE_BYTES)        # 128 -> kv_rope
         _ROPE_SRC = Int64(_DSV4_NOPE_BYTES)    # rope follows nope in the record
+    elif cutlass.const_expr(scale_format == 2):
+        _NOPE = Int32(_NVFP4_NOPE_SCALE_BYTES)
+        if cutlass.const_expr(fp8_rope):
+            _IOS = Int64(_NVFP4_FP8_ROPE_GMEM_STRIDE)
+            # Stage scale+pad+FP8 payload contiguously in the existing 128-byte
+            # BF16-rope smem row. decode_math interprets scale at +0 and E4M3 at +16.
+            _ROPE = Int32(_NVFP4_FP8_ROPE_TAIL_BYTES)
+            _ROPE_SRC = Int64(_NVFP4_FP8_ROPE_TAIL_SRC)
+        else:
+            _IOS = Int64(_NVFP4_GMEM_STRIDE)
+            _ROPE = Int32(_NVFP4_ROPE_BYTES)
+            _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
     else:
         _IOS = Int64(_GLM_GMEM_STRIDE)         # 656 per-token contiguous record
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)   # 528 nope+inline-fp32 -> kv_fp8
