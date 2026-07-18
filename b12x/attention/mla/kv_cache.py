@@ -157,6 +157,7 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
         k_pe_stride: Int32,  # k_pe.stride(0), elements
         block_stride: Int64,  # kv_cache.stride(0), bytes
         entry_stride: Int32,  # kv_cache.stride(1), bytes
+        slot_capacity: Int32,
         num_tokens: Int32,
         stream: cuda.CUstream,
     ):
@@ -169,6 +170,7 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
             k_pe_stride,
             block_stride,
             entry_stride,
+            slot_capacity,
         ).launch(
             grid=(num_tokens, 1, 1),
             block=[_THREADS, 1, 1],
@@ -186,6 +188,7 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
         k_pe_stride: Int32,
         block_stride: Int64,
         entry_stride: Int32,
+        slot_capacity: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, _ = cute.arch.block_idx()
@@ -193,9 +196,9 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
         token = Int32(token_idx)
 
         slot = Int64(slot_mapping[token])
-        if slot >= Int64(0):
-            # Slot capacity is host-asserted < 2^31, so the block/offset
-            # split runs in Int32 (the byte offset below is Int64).
+        if (slot >= Int64(0)) & (slot < slot_capacity.to(Int64)):
+            # Capacity is host-asserted in (0, 2^31), so the block/offset
+            # split is safe in Int32 after the Int64 bounds check.
             slot32 = slot.to(Int32)
             block_idx = slot32 // Int32(self.block_size)
             block_off = slot32 % Int32(self.block_size)
@@ -329,18 +332,20 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     if num_tokens == 0:
         return
     block_size = int(kv_cache.shape[1])
+    slot_capacity = int(kv_cache.shape[0]) * block_size
     is_bf16 = kv_c.dtype == torch.bfloat16
     kernel = _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(block_size, is_bf16)
 
     args = (
         _to_kernel_tensor(kv_c, assumed_align=4, leading_dim=1),
-        _to_kernel_tensor(k_pe, assumed_align=2, leading_dim=1),
+        _to_kernel_tensor(k_pe, assumed_align=4, leading_dim=1),
         _to_kernel_tensor(kv_cache, assumed_align=16, leading_dim=2),
         _to_kernel_tensor(slot_mapping, assumed_align=8, leading_dim=0),
         Int32(int(kv_c.stride(0))),
         Int32(int(k_pe.stride(0))),
         Int64(int(kv_cache.stride(0))),
         Int32(int(kv_cache.stride(1))),
+        Int32(slot_capacity),
         Int32(num_tokens),
         current_cuda_stream(),
     )
@@ -359,7 +364,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     )
     spec = KernelCompileSpec.from_key(
         "attention.mla.nvfp4_fp8_rope_kv_cache",
-        1,
+        2,
         cache_key,
         labels=(
             "kv_c",
@@ -414,8 +419,8 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     :param k_pe: decoupled RoPE key, ``(>= num_tokens, 64)``, same dtype.
     :param kv_cache: paged cache viewed ``(num_blocks, block_size, 368)``
         uint8; mutated in place.
-    :param slot_mapping: ``(num_tokens,)`` int64 flat slot ids; entries < 0
-        are skipped.
+    :param slot_mapping: ``(num_tokens,)`` int64 flat slot ids; entries outside
+        ``[0, num_blocks * block_size)`` are skipped.
     :param scale: accepted for signature parity with the fp8 cache-op
         family; the nvfp4_ds_mla record has an implicit global scale of 1.0
         (group scales carry all magnitude), so it is unused.
@@ -438,6 +443,8 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
             "kv_cache must be (num_blocks, block_size, "
             f"{_RECORD_BYTES}) uint8, got {tuple(kv_cache.shape)}"
         )
+    if int(kv_cache.shape[0]) <= 0 or int(kv_cache.shape[1]) <= 0:
+        raise ValueError("kv_cache num_blocks and block_size must be positive")
     if kv_cache.dtype != torch.uint8:
         raise TypeError(f"kv_cache must be uint8, got {kv_cache.dtype}")
     if slot_mapping.ndim != 1 or slot_mapping.dtype != torch.int64:
@@ -460,14 +467,14 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     if kv_c.stride(0) % 2 != 0 or kv_c.data_ptr() % 4 != 0:
         # The group loads are 32-bit (element pairs), same as the CUDA writer.
         raise ValueError("kv_c rows must be 4-byte aligned (even row stride)")
+    if k_pe.stride(0) % 2 != 0 or k_pe.data_ptr() % 4 != 0:
+        raise ValueError("k_pe rows must be 4-byte aligned (even row stride)")
     if (
-        kv_cache.data_ptr() % 8 != 0
-        or kv_cache.stride(0) % 8 != 0
-        or kv_cache.stride(1) % 8 != 0
+        kv_cache.data_ptr() % 16 != 0
+        or kv_cache.stride(0) % 16 != 0
+        or kv_cache.stride(1) % 16 != 0
     ):
-        raise ValueError(
-            "kv_cache records must be 8-byte aligned for the packed E2M1 stores"
-        )
+        raise ValueError("kv_cache records must be 16-byte aligned")
     if int(kv_cache.shape[0]) * int(kv_cache.shape[1]) >= 2**31:
         raise ValueError("kv_cache slot capacity must fit in int32")
     if not (
