@@ -5201,6 +5201,31 @@ def compile_w4a16_fused_moe(
             ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
             ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
         ):
+            if (
+                name == "fc2"
+                and int(forced_tk) == 32
+                and int(forced_tn) == 512
+                and int(forced_pn) % 512 == 0
+                and int(forced_pk) % 32 == 0
+                and int(forced_tk) % _scale_group_size(scale_format) == 0
+                and _shared_memory_footprint(
+                    cta_m_blocks=_covering_count(moe_block_size, 16),
+                    tile_n=512,
+                    tile_k=32,
+                    scale_format=scale_format,
+                    weight_layout=weight_layout,
+                )
+                <= int(max_shared_mem) - 512
+            ):
+                # The TC-decode FC2 ultra-wide tile (tile_k=32, tile_n=512)
+                # is admitted by the auto selection above via a direct
+                # footprint check because tile_k=32 sits below the generic
+                # tile_k>=64 floor in _candidate_tile_fits. Re-pinning the
+                # selected tiles across the custom-op boundary must admit
+                # the same shape, or every deployment whose SM count fires
+                # the ultra override (e.g. 48-SM GB10) rejects its own
+                # auto-selected config here.
+                continue
             if not _candidate_tile_fits(
                 problem_n=forced_pn,
                 problem_k=forced_pk,
