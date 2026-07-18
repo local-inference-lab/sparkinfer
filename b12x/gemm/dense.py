@@ -89,7 +89,7 @@ from b12x.cute.fp4 import (
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
-_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL", "0")
+_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL")
 _B12X_WO_PDL: bool | None = (
     None
     if _B12X_WO_PDL_RAW is None

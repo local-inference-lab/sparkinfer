@@ -38,7 +38,7 @@ _WO_PDL = os.environ.get("B12X_WO_PDL", "0").lower() not in {
     "no",
     "",
 }
-_WO_EXACT_B16_PDL = os.environ.get("B12X_WO_PDL", "0").lower() not in {
+_WO_EXACT_B16_PDL = os.environ.get("B12X_WO_PDL", "1").lower() not in {
     "0",
     "false",
     "no",
