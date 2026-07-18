@@ -5345,6 +5345,18 @@ def _select_default_mma_tiler_mn(
                 return (128, 128)
             if expected_m == 1:
                 return (16, 64)
+            # 48-SM Spark q_b decode: (16,128) yields 128 N-tiles over the 96
+            # resident CTAs (occupancy 2), so the remainder wave streams B with
+            # only 32 CTAs and drops below the sustained-read ceiling. (16,64)
+            # quantizes the tail at 64 columns with 2/3 of CTAs still active,
+            # matching the M=1 (16,64) profile that already runs at ceiling.
+            # RTX keeps the probe-swept (16,128).
+            if (
+                expected_m <= 16
+                and (n, k) == (16384, 1024)
+                and _dense_spark_policy_for_sm_count(sm_count)
+            ):
+                return (16, 64)
             if expected_m <= 8 or (
                 expected_m <= 16 and (n, k) == (16384, 1024)
             ):
