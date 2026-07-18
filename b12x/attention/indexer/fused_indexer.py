@@ -23,6 +23,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -95,6 +97,13 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
     threadfence,
 )
+
+# Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
+# the staged pipeline (which also restores the v2 cache keys), so serving can
+# A/B the direct-L2 score in place without a checkout change.
+_DIRECT_K_SCORE_ENABLED = os.environ.get(
+    "B12X_INDEXER_DIRECT_K", "1"
+).lower() not in {"0", "false", "no", ""}
 
 _THREADS_PER_CTA = 1024
 # Per-CTA K-slice cap (cooperative split granularity). Matches persistent_topk's
@@ -1216,7 +1225,8 @@ class SparseNSAFusedIndexerKernel:
         # win (measured +25% at rows=1, +3.5% at rows=2); they keep the
         # historical path.
         self.direct_k_score = (
-            self.kv_layout == KV_LAYOUT_PAGED
+            _DIRECT_K_SCORE_ENABLED
+            and self.kv_layout == KV_LAYOUT_PAGED
             and self.num_q_head_tiles == 4
             and self.ctas_per_group <= 16
         )
