@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
+import cuda.bindings.runtime as cuda_runtime
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -630,6 +632,7 @@ class W4A16GemmKernel:
         direct_topk_routes: bool = False,
         fused_topk_sum: bool = False,
         fused_sum_topk: int = 1,
+        schedule_whole_tiles: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -761,6 +764,13 @@ class W4A16GemmKernel:
         self.direct_topk_routes = bool(direct_topk_routes)
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
+        # Whole-tile persistent scheduling: every mn-tile is computed by one
+        # CTA over the full K (grid-strided waves, ragged last wave), skipping
+        # the split-K tail machinery entirely. Requires the host to bound the
+        # wave count; used by the exact-geometry hybrid decode schedule.
+        self.schedule_whole_tiles = bool(schedule_whole_tiles)
+        if self.schedule_whole_tiles and not self.direct_topk_routes:
+            raise ValueError("schedule_whole_tiles requires direct_topk_routes")
         if self.fused_topk_sum and not self.direct_topk_routes:
             raise ValueError("fused_topk_sum requires direct_topk_routes")
         if self.fused_topk_sum and self.fused_sum_topk < 1:
@@ -893,6 +903,7 @@ class W4A16GemmKernel:
             # planned for different residency targets out of the same cache
             # entry even when their arithmetic geometry otherwise matches.
             self.blocks_per_sm,
+            self.schedule_whole_tiles,
         )
 
     @cute.jit
@@ -1119,6 +1130,7 @@ class W4A16GemmKernel:
         cta: Int32,
         grid_x: Int32,
         active_size_m: Int32,
+        emit_tile: cutlass.Constexpr = None,
     ):
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
@@ -1132,27 +1144,34 @@ class W4A16GemmKernel:
         tail_mn_tiles = global_mn_tiles
         full_grid_mn_iters = Int32(0)
         force_one_tile_per_cta = Int32(0)
-        if cutlass.const_expr(self.uses_m_block_8):
-            # TC-decode small-M: when every mn-tile fits inside the launched grid
-            # (FC1 has only route_blocks*n_tiles tiles, far fewer than grid_x),
-            # the default tail path fans each mn-tile across multiple CTAs along
-            # K and pays a lock-serialized cross-CTA split-K finalize plus the
-            # reduction-turn handshake. Instead give the first global_mn_tiles
-            # CTAs exactly one full mn-tile (all k_tiles, reduce_slice_count==1,
-            # no finalize, no lock traffic) and idle the rest. grid_x and the
-            # grid-barrier participant count are unchanged (so FC2 coverage is
-            # untouched); only FC1's intra-GEMM work partition changes. Numerically
-            # identical: a single CTA computes the whole K-reduction per tile.
-            if global_mn_tiles <= grid_x:
-                force_one_tile_per_cta = Int32(1)
-        if force_one_tile_per_cta != Int32(0):
+        if cutlass.const_expr(self.schedule_whole_tiles):
+            # Whole-tile waves: one CTA computes each mn-tile over the full K,
+            # task = cta + wave * grid_x, ragged last wave skipped through the
+            # route_block_idx bound below. No split-K tail, no lock traffic.
             tail_mn_tiles = Int32(0)
-            full_grid_mn_iters = Int32(1)
-        elif global_mn_tiles > grid_x:
-            tail_mn_tiles = global_mn_tiles - (global_mn_tiles // grid_x) * grid_x
-            if tail_mn_tiles * Int32(3) <= grid_x:
-                tail_mn_tiles += grid_x
-            full_grid_mn_iters = (global_mn_tiles - tail_mn_tiles) // grid_x
+            full_grid_mn_iters = (global_mn_tiles + grid_x - Int32(1)) // grid_x
+        if cutlass.const_expr(not self.schedule_whole_tiles):
+            if cutlass.const_expr(self.uses_m_block_8):
+                # TC-decode small-M: when every mn-tile fits inside the launched grid
+                # (FC1 has only route_blocks*n_tiles tiles, far fewer than grid_x),
+                # the default tail path fans each mn-tile across multiple CTAs along
+                # K and pays a lock-serialized cross-CTA split-K finalize plus the
+                # reduction-turn handshake. Instead give the first global_mn_tiles
+                # CTAs exactly one full mn-tile (all k_tiles, reduce_slice_count==1,
+                # no finalize, no lock traffic) and idle the rest. grid_x and the
+                # grid-barrier participant count are unchanged (so FC2 coverage is
+                # untouched); only FC1's intra-GEMM work partition changes. Numerically
+                # identical: a single CTA computes the whole K-reduction per tile.
+                if global_mn_tiles <= grid_x:
+                    force_one_tile_per_cta = Int32(1)
+            if force_one_tile_per_cta != Int32(0):
+                tail_mn_tiles = Int32(0)
+                full_grid_mn_iters = Int32(1)
+            elif global_mn_tiles > grid_x:
+                tail_mn_tiles = global_mn_tiles - (global_mn_tiles // grid_x) * grid_x
+                if tail_mn_tiles * Int32(3) <= grid_x:
+                    tail_mn_tiles += grid_x
+                full_grid_mn_iters = (global_mn_tiles - tail_mn_tiles) // grid_x
 
         iters = (k_tiles * tail_mn_tiles + grid_x - Int32(1)) // grid_x
 
@@ -1249,33 +1268,48 @@ class W4A16GemmKernel:
                 and reduce_tile_count > Int32(0)
                 and route_block_idx < route_blocks
             ):
-                if cutlass.const_expr(self.direct_topk_routes):
-                    expert_idx = packed_route_indices[route_block_idx].to(Int32)
-                else:
-                    expert_idx = block_expert_ids[route_block_idx].to(Int32)
-                if expert_idx >= Int32(0):
-                    self._run_tile(
-                        a_bf16_flat,
-                        b_i32_flat,
-                        c_bf16_flat,
-                        scales_i32_flat,
-                        global_scale,
-                        packed_route_indices,
-                        topk_weights_flat,
-                        c_tmp_f32_flat,
-                        locks_i32_flat,
-                        smem_base,
-                        tid,
+                if cutlass.const_expr(emit_tile is not None):
+                    # Trace-time tile emission hook: the caller owns expert
+                    # resolution and the _run_tile dispatch (e.g. the hybrid
+                    # multi-tier route map). The scheduling state machine above
+                    # is unchanged; only tile emission is delegated.
+                    emit_tile(
                         route_block_idx,
-                        expert_idx,
                         output_n_tile,
                         reduce_k_tile,
                         reduce_tile_count,
                         reduce_slice_count,
                         reduce_slice_idx,
                         lock_slot,
-                        active_size_m,
                     )
+                else:
+                    if cutlass.const_expr(self.direct_topk_routes):
+                        expert_idx = packed_route_indices[route_block_idx].to(Int32)
+                    else:
+                        expert_idx = block_expert_ids[route_block_idx].to(Int32)
+                    if expert_idx >= Int32(0):
+                        self._run_tile(
+                            a_bf16_flat,
+                            b_i32_flat,
+                            c_bf16_flat,
+                            scales_i32_flat,
+                            global_scale,
+                            packed_route_indices,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            locks_i32_flat,
+                            smem_base,
+                            tid,
+                            route_block_idx,
+                            expert_idx,
+                            output_n_tile,
+                            reduce_k_tile,
+                            reduce_tile_count,
+                            reduce_slice_count,
+                            reduce_slice_idx,
+                            lock_slot,
+                            active_size_m,
+                        )
 
             if has_work != Int32(0):
                 if in_tail_region == Int32(0):
@@ -3708,6 +3742,7 @@ class W4A16FusedMoeKernel:
         tc_decode_fused_sum: bool = False,
         tc_zero_output: bool = True,
         collect_activation_amax: bool = False,
+        schedule_whole_tiles: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -3764,6 +3799,7 @@ class W4A16FusedMoeKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
         self.direct_topk_routes = bool(direct_topk_routes)
+        self.schedule_whole_tiles = bool(schedule_whole_tiles)
         fc1_source_n_rotation = (
             int(intermediate_size)
             if (
@@ -3793,6 +3829,7 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
+            schedule_whole_tiles=self.schedule_whole_tiles,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -3814,6 +3851,7 @@ class W4A16FusedMoeKernel:
             direct_topk_routes=self.direct_topk_routes,
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
+            schedule_whole_tiles=self.schedule_whole_tiles,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -3989,6 +4027,68 @@ class W4A16FusedMoeKernel:
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
 
+        self._moe_body(
+            a_bf16_flat,
+            w13_i32_flat,
+            w2_i32_flat,
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            fc2_bf16_flat,
+            w13_scales_i32_flat,
+            w2_scales_i32_flat,
+            w13_global_scale,
+            w2_global_scale,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            activation_amax_flat,
+            layer_idx,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+        )
+
+    @cute.jit
+    def _moe_body(
+        self,
+        a_bf16_flat: cute.Tensor,
+        w13_i32_flat: cute.Tensor,
+        w2_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        fc2_bf16_flat: cute.Tensor,
+        w13_scales_i32_flat: cute.Tensor,
+        w2_scales_i32_flat: cute.Tensor,
+        w13_global_scale: cute.Tensor,
+        w2_global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
+        layer_idx: cutlass.Int32,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+        fc1_emit_tile: cutlass.Constexpr = None,
+        fc2_emit_tile: cutlass.Constexpr = None,
+    ):
+        # Phase assembly shared by the single-tier fused kernel and the hybrid
+        # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
+        # barrier, FC2. The emit hooks delegate per-tile expert resolution and
+        # dispatch (used by the hybrid route map); None keeps the single-tier
+        # resolution inside _run_persistent_gemm.
         if cutlass.const_expr(self.tc_decode_fused_sum):
             # The TC-decode FC2 epilogue atomically accumulates per-route
             # partials directly into the per-token output, so the output must be
@@ -4036,6 +4136,7 @@ class W4A16FusedMoeKernel:
                 cta,
                 grid_x,
                 active_m,
+                fc1_emit_tile,
             )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
             self._run_activation(
@@ -4064,6 +4165,7 @@ class W4A16FusedMoeKernel:
                 cta,
                 grid_x,
                 active_m,
+                fc1_emit_tile,
             )
         self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
@@ -4101,6 +4203,7 @@ class W4A16FusedMoeKernel:
             cta,
             grid_x,
             active_m * Int32(self.top_k),
+            fc2_emit_tile,
         )
 
     @cute.jit
@@ -4300,6 +4403,458 @@ class W4A16FusedMoeKernel:
                     x = cutlass.Float32(0.0)
                 activated_bf16_flat[idx] = self._cast_elem(x * x)
             idx += stride
+
+
+class W4A16FusedMoeHybridKernel:
+    """Two-tier heterogeneous-quantization fused MoE entry.
+
+    Composition over W4A16FusedMoeKernel: each tier's fused kernel supplies
+    its FC1/FC2 children and the shared phase machinery (_moe_body, grid
+    barrier, activation). This entry only widens the launch ABI to carry both
+    tiers' weights plus a global-expert descriptor map, and installs the
+    route-map emit hooks that resolve tier + local expert per mn-tile. Tier 0
+    drives scheduling; both tiers are validated to identical geometry, so the
+    schedule constants agree by construction.
+
+    Route contract: the routes tensor carries GLOBAL expert ids (one per
+    size_m*top_k slot, -1 for inactive). tier_local_map holds one int32
+    descriptor per global expert id: (tier << 8) | local_expert_id, negative
+    for unmapped. Unmapped or out-of-range ids skip the tile, matching the
+    -1-route behavior of the single-tier direct path.
+    """
+
+    ABI_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        tier0: W4A16FusedMoeKernel,
+        tier1: W4A16FusedMoeKernel,
+        map_slots: int,
+    ):
+        for name, moe in (("tier0", tier0), ("tier1", tier1)):
+            if not moe.direct_topk_routes:
+                raise ValueError(f"hybrid W4A16 {name} requires direct_topk_routes")
+            if not moe.tc_decode_fused_sum:
+                raise ValueError(f"hybrid W4A16 {name} requires tc_decode_fused_sum")
+            if not moe.activation_is_gated:
+                raise ValueError(f"hybrid W4A16 {name} requires a gated activation")
+            if moe.collect_activation_amax:
+                raise ValueError(
+                    f"hybrid W4A16 {name} is incompatible with activation amax"
+                )
+            if moe.zero_fc2_output:
+                raise ValueError(f"hybrid W4A16 {name} forbids zero_fc2_output")
+            if not moe.tc_zero_output:
+                raise ValueError(f"hybrid W4A16 {name} requires tc_zero_output")
+        for attr in (
+            "size_m",
+            "hidden_size",
+            "intermediate_size",
+            "fc1_cols",
+            "top_k",
+            "moe_block_size",
+            "activation",
+            "activation_is_swigluoai",
+            "has_swiglu_limit",
+            "swiglu_limit",
+            "swiglu_alpha",
+            "swiglu_beta",
+            "element_dtype",
+            "is_fp16",
+            "fast_math",
+            "apply_router_weight_on_input",
+            "cta_threads",
+            "sms",
+            "blocks_per_sm",
+            "barrier_count_off",
+            "barrier_sense_off",
+            "schedule_whole_tiles",
+        ):
+            if getattr(tier0, attr) != getattr(tier1, attr):
+                raise ValueError(
+                    f"hybrid W4A16 tiers disagree on {attr}: "
+                    f"{getattr(tier0, attr)!r} != {getattr(tier1, attr)!r}"
+                )
+        for phase in ("fc1", "fc2"):
+            gemm0 = getattr(tier0, phase)
+            gemm1 = getattr(tier1, phase)
+            if (gemm0.n_tiles, gemm0.k_tiles, gemm0.tile_n, gemm0.tile_k) != (
+                gemm1.n_tiles,
+                gemm1.k_tiles,
+                gemm1.tile_n,
+                gemm1.tile_k,
+            ):
+                raise ValueError(f"hybrid W4A16 tiers disagree on {phase} tiling")
+            if (
+                gemm0.top_k,
+                gemm0.mul_topk_weights,
+                gemm0.fused_topk_sum,
+                gemm0.fused_sum_topk,
+                gemm0.moe_block_size,
+                gemm0.cta_threads,
+                gemm0.schedule_whole_tiles,
+            ) != (
+                gemm1.top_k,
+                gemm1.mul_topk_weights,
+                gemm1.fused_topk_sum,
+                gemm1.fused_sum_topk,
+                gemm1.moe_block_size,
+                gemm1.cta_threads,
+                gemm1.schedule_whole_tiles,
+            ):
+                raise ValueError(f"hybrid W4A16 tiers disagree on {phase} semantics")
+        if int(map_slots) < tier0.num_experts + tier1.num_experts:
+            raise ValueError(
+                "hybrid W4A16 map_slots must cover both tiers' expert counts"
+            )
+        if tier0.num_experts > 256 or tier1.num_experts > 256:
+            raise ValueError(
+                "hybrid W4A16 local expert ids must fit the 8-bit descriptor field"
+            )
+        self.tier0 = tier0
+        self.tier1 = tier1
+        self.map_slots = int(map_slots)
+        self.size_m = tier0.size_m
+        self.hidden_size = tier0.hidden_size
+        self.intermediate_size = tier0.intermediate_size
+        self.top_k = tier0.top_k
+        self.element_dtype = tier0.element_dtype
+        self.cta_threads = tier0.cta_threads
+        self.sms = tier0.sms
+        self.blocks_per_sm = tier0.blocks_per_sm
+        self.shared_words = max(tier0.shared_words, tier1.shared_words)
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            "w4a16_fused_moe_hybrid",
+            self.ABI_VERSION,
+            self.map_slots,
+            self.tier0.__cache_key__,
+            self.tier1.__cache_key__,
+            self.shared_words,
+        )
+
+    @cute.jit
+    def _emit_route_map_tile(
+        self,
+        is_fc1: cutlass.Constexpr,
+        a_bf16_flat: cute.Tensor,
+        t0_b_i32_flat: cute.Tensor,
+        t0_scales_i32_flat: cute.Tensor,
+        t0_global_scale: cute.Tensor,
+        t1_b_i32_flat: cute.Tensor,
+        t1_scales_i32_flat: cute.Tensor,
+        t1_global_scale: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        active_size_m: Int32,
+        route_block_idx: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+    ):
+        gid = global_topk_ids_i32_flat[route_block_idx].to(Int32)
+        if gid >= Int32(0) and gid < Int32(self.map_slots):
+            descriptor = tier_local_map_i32_flat[gid].to(Int32)
+            if descriptor >= Int32(0):
+                tier = descriptor >> Int32(8)
+                local_expert = descriptor & Int32(0xFF)
+                if tier == Int32(0):
+                    if local_expert < Int32(self.tier0.num_experts):
+                        if cutlass.const_expr(is_fc1):
+                            self.tier0.fc1._run_tile(
+                                a_bf16_flat,
+                                t0_b_i32_flat,
+                                c_bf16_flat,
+                                t0_scales_i32_flat,
+                                t0_global_scale,
+                                global_topk_ids_i32_flat,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+                        else:
+                            self.tier0.fc2._run_tile(
+                                a_bf16_flat,
+                                t0_b_i32_flat,
+                                c_bf16_flat,
+                                t0_scales_i32_flat,
+                                t0_global_scale,
+                                global_topk_ids_i32_flat,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+                else:
+                    if tier == Int32(1):
+                        if local_expert < Int32(self.tier1.num_experts):
+                            if cutlass.const_expr(is_fc1):
+                                self.tier1.fc1._run_tile(
+                                    a_bf16_flat,
+                                    t1_b_i32_flat,
+                                    c_bf16_flat,
+                                    t1_scales_i32_flat,
+                                    t1_global_scale,
+                                    global_topk_ids_i32_flat,
+                                    topk_weights_flat,
+                                    c_tmp_f32_flat,
+                                    locks_i32_flat,
+                                    smem_base,
+                                    tid,
+                                    route_block_idx,
+                                    local_expert,
+                                    output_n_tile,
+                                    reduce_k_tile,
+                                    reduce_tile_count,
+                                    reduce_slice_count,
+                                    reduce_slice_idx,
+                                    lock_slot,
+                                    active_size_m,
+                                )
+                            else:
+                                self.tier1.fc2._run_tile(
+                                    a_bf16_flat,
+                                    t1_b_i32_flat,
+                                    c_bf16_flat,
+                                    t1_scales_i32_flat,
+                                    t1_global_scale,
+                                    global_topk_ids_i32_flat,
+                                    topk_weights_flat,
+                                    c_tmp_f32_flat,
+                                    locks_i32_flat,
+                                    smem_base,
+                                    tid,
+                                    route_block_idx,
+                                    local_expert,
+                                    output_n_tile,
+                                    reduce_k_tile,
+                                    reduce_tile_count,
+                                    reduce_slice_count,
+                                    reduce_slice_idx,
+                                    lock_slot,
+                                    active_size_m,
+                                )
+
+    @cute.jit
+    def __call__(
+        self,
+        a_bf16_ptr: cute.Pointer,
+        t0_w13_i32_flat: cute.Tensor,
+        t0_w2_i32_flat: cute.Tensor,
+        t0_w13_scales_i32_flat: cute.Tensor,
+        t0_w2_scales_i32_flat: cute.Tensor,
+        t0_w13_global_scale: cute.Tensor,
+        t0_w2_global_scale: cute.Tensor,
+        t1_w13_i32_flat: cute.Tensor,
+        t1_w2_i32_flat: cute.Tensor,
+        t1_w13_scales_i32_flat: cute.Tensor,
+        t1_w2_scales_i32_flat: cute.Tensor,
+        t1_w13_global_scale: cute.Tensor,
+        t1_w2_global_scale: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_ptr: cute.Pointer,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        a_bf16_flat = cute.make_tensor(
+            a_bf16_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.hidden_size),), stride=(1,)
+            ),
+        )
+        topk_weights_flat = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+        )
+        self.kernel(
+            a_bf16_flat,
+            t0_w13_i32_flat,
+            t0_w2_i32_flat,
+            t0_w13_scales_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w13_global_scale,
+            t0_w2_global_scale,
+            t1_w13_i32_flat,
+            t1_w2_i32_flat,
+            t1_w13_scales_i32_flat,
+            t1_w2_scales_i32_flat,
+            t1_w13_global_scale,
+            t1_w2_global_scale,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            output_bf16_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            active_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        a_bf16_flat: cute.Tensor,
+        t0_w13_i32_flat: cute.Tensor,
+        t0_w2_i32_flat: cute.Tensor,
+        t0_w13_scales_i32_flat: cute.Tensor,
+        t0_w2_scales_i32_flat: cute.Tensor,
+        t0_w13_global_scale: cute.Tensor,
+        t0_w2_global_scale: cute.Tensor,
+        t1_w13_i32_flat: cute.Tensor,
+        t1_w2_i32_flat: cute.Tensor,
+        t1_w13_scales_i32_flat: cute.Tensor,
+        t1_w2_scales_i32_flat: cute.Tensor,
+        t1_w13_global_scale: cute.Tensor,
+        t1_w2_global_scale: cute.Tensor,
+        global_topk_ids_i32_flat: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        output_bf16_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        fc1_emit_tile = partial(
+            self._emit_route_map_tile,
+            True,
+            a_bf16_flat,
+            t0_w13_i32_flat,
+            t0_w13_scales_i32_flat,
+            t0_w13_global_scale,
+            t1_w13_i32_flat,
+            t1_w13_scales_i32_flat,
+            t1_w13_global_scale,
+            fc1_bf16_flat,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            active_m,
+        )
+        fc2_emit_tile = partial(
+            self._emit_route_map_tile,
+            False,
+            activated_bf16_flat,
+            t0_w2_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w2_global_scale,
+            t1_w2_i32_flat,
+            t1_w2_scales_i32_flat,
+            t1_w2_global_scale,
+            output_bf16_flat,
+            global_topk_ids_i32_flat,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            active_m * Int32(self.top_k),
+        )
+        # Tier 0 drives the shared phase assembly; the unused single-tier
+        # route/amax parameters receive placeholder tensors that the direct
+        # route + no-amax const_expr configuration never reads.
+        self.tier0._moe_body(
+            a_bf16_flat,
+            t0_w13_i32_flat,
+            t0_w2_i32_flat,
+            fc1_bf16_flat,
+            activated_bf16_flat,
+            output_bf16_flat,
+            t0_w13_scales_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w13_global_scale,
+            t0_w2_global_scale,
+            global_topk_ids_i32_flat,
+            global_topk_ids_i32_flat,
+            global_topk_ids_i32_flat,
+            global_topk_ids_i32_flat,
+            Int32(0),
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+            fc1_emit_tile,
+            fc2_emit_tile,
+        )
 
 
 class W4A16ActivationKernel:
@@ -5502,6 +6057,369 @@ def compile_w4a16_fused_moe(
     return result
 
 
+@dataclass(frozen=True)
+class W4A16FusedMoeHybridCompileResult:
+    compiled: object
+    size_m: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    activation: str
+    element_dtype: str
+    fast_math: bool
+    map_slots: int
+    tier0_num_experts: int
+    tier0_weight_layout: str
+    tier0_scale_format: str
+    tier0_w13_layout: str
+    tier1_num_experts: int
+    tier1_weight_layout: str
+    tier1_scale_format: str
+    tier1_w13_layout: str
+    fc1_tile_n: int
+    fc1_tile_k: int
+    fc2_tile_n: int
+    fc2_tile_k: int
+    moe_block_size: int
+    max_m_blocks: int
+    cta_threads: int
+    blocks_per_sm: int
+    shared_memory_bytes: int
+    schedule_whole_tiles: bool
+    direct_topk_routes: bool
+    tc_decode_fused_sum: bool
+    # -1 when the compiled object came from the on-disk object cache, whose
+    # loader does not expose CUDA-dialect introspection; a fresh compile of the
+    # identical source/toolchain state ran the spill admission below at least
+    # once before the entry could exist.
+    registers_per_thread: int
+    local_memory_bytes: int
+
+
+def _query_w4a16_kernel_resources(compiled: object) -> tuple[str, int, int] | None:
+    """Return (symbol, registers/thread, local bytes/thread) for a one-kernel
+    CUDA-dialect compile result, or None when the object does not expose the
+    introspection surface (e.g. an on-disk object-cache reload)."""
+
+    kernel_info = getattr(compiled, "kernel_info", None)
+    to_executor = getattr(compiled, "to", None)
+    if not isinstance(kernel_info, dict) or not callable(to_executor):
+        return None
+    symbols = tuple(kernel_info)
+    if len(symbols) != 1 or not isinstance(symbols[0], str) or not symbols[0]:
+        return None
+    executor = to_executor(int(torch.cuda.current_device()))
+    libraries = tuple(
+        getattr(getattr(executor, "jit_module", None), "cuda_library", None) or ()
+    )
+    if len(libraries) != 1:
+        return None
+    success = cuda_runtime.cudaError_t(0)
+    kernel_status, kernel_handle = cuda_runtime.cudaLibraryGetKernel(
+        libraries[0], symbols[0].encode("utf-8")
+    )
+    if kernel_status != success:
+        raise RuntimeError(
+            f"cudaLibraryGetKernel failed for {symbols[0]}: {kernel_status}"
+        )
+    attributes_status, attributes = cuda_runtime.cudaFuncGetAttributes(kernel_handle)
+    if attributes_status != success:
+        raise RuntimeError(
+            f"cudaFuncGetAttributes failed for {symbols[0]}: {attributes_status}"
+        )
+    registers_per_thread = int(getattr(attributes, "numRegs", -1))
+    local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
+    if registers_per_thread < 0 or local_memory_bytes < 0:
+        raise RuntimeError(f"incomplete CUDA function attributes for {symbols[0]}")
+    return symbols[0], registers_per_thread, local_memory_bytes
+
+
+def _w4a16_weight_flat_elements(
+    *,
+    num_experts: int,
+    size_n: int,
+    size_k: int,
+    weight_layout: str,
+) -> int:
+    """Flat element count of a packed W4A16 weight tensor (uint8 for modelopt,
+    int32 otherwise), matching the compile-time fake construction."""
+
+    if weight_layout == "modelopt":
+        return int(num_experts) * int(size_n) * (int(size_k) // 2)
+    if weight_layout == "nf3_2p1":
+        return int(num_experts) * (int(size_k) // 16) * (int(size_n) // 2) * 3
+    return int(num_experts) * (int(size_k) // 16) * (int(size_n) // 16 * 32)
+
+
+def compile_w4a16_fused_moe_hybrid(
+    *,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tier0_num_experts: int,
+    tier1_num_experts: int,
+    top_k: int,
+    activation: str,
+    map_slots: int,
+    moe_block_size: int = 8,
+    element_dtype: str = "bf16",
+    fast_math: bool = True,
+    sms: int,
+    max_shared_mem: int,
+    tier0_weight_layout: str = "packed",
+    tier0_scale_format: str = "e4m3_k16",
+    tier0_w13_layout: str = "packed",
+    tier1_weight_layout: str = "nf3_2p1",
+    tier1_scale_format: str = "e4m3_k32",
+    tier1_w13_layout: str = "w13",
+    force_tile_config: tuple[int, int, int, int],
+    schedule_whole_tiles: bool = True,
+) -> W4A16FusedMoeHybridCompileResult:
+    """Compile the two-tier heterogeneous-quantization fused MoE kernel.
+
+    v1 contract: TC-decode direct-topk geometry (gated activation, fused FC2
+    top-k sum) with an explicitly pinned tile config shared by both tiers.
+    Spill admission is fail-closed on every fresh compile: nonzero local
+    memory raises before the result can be cached or launched.
+    """
+
+    activation = normalize_moe_activation(activation)
+    if not validate_activation(activation):
+        raise ValueError("hybrid W4A16 requires a gated activation")
+    cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
+        int(v) for v in force_tile_config
+    )
+    max_m_blocks = int(size_m) * int(top_k)
+
+    def _tier_kernel(
+        num_experts: int, weight_layout: str, scale_format: str, w13_layout: str
+    ) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=size_m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=fc1_tile_n,
+            fc1_tile_k=fc1_tile_k,
+            fc2_tile_n=fc2_tile_n,
+            fc2_tile_k=fc2_tile_k,
+            moe_block_size=moe_block_size,
+            max_m_blocks=max_m_blocks,
+            element_dtype=element_dtype,
+            fast_math=fast_math,
+            weight_layout=weight_layout,
+            scale_format=scale_format,
+            w13_layout=w13_layout,
+            direct_topk_routes=True,
+            tc_decode_fused_sum=True,
+            schedule_whole_tiles=bool(schedule_whole_tiles),
+        )
+
+    kernel = W4A16FusedMoeHybridKernel(
+        tier0=_tier_kernel(
+            int(tier0_num_experts),
+            tier0_weight_layout,
+            _normalize_scale_format(tier0_scale_format),
+            tier0_w13_layout,
+        ),
+        tier1=_tier_kernel(
+            int(tier1_num_experts),
+            tier1_weight_layout,
+            _normalize_scale_format(tier1_scale_format),
+            tier1_w13_layout,
+        ),
+        map_slots=int(map_slots),
+    )
+    if kernel.shared_words * 4 > int(max_shared_mem) - 512:
+        raise ValueError(
+            "hybrid W4A16 shared memory exceeds the device limit: "
+            f"{kernel.shared_words * 4} > {int(max_shared_mem) - 512}"
+        )
+
+    cache_key = (
+        "w4a16_fused_moe_hybrid",
+        device,
+        kernel.__cache_key__,
+    )
+    cached = _FUSED_CACHE.get(cache_key)
+    if cached is not None:
+        return replace(cached, size_m=size_m, max_m_blocks=max_m_blocks)
+
+    fc1_cols = kernel.tier0.fc1_cols
+    compile_size_m = _fake_m_for_specialization(size_m)
+    compile_routed_rows = int(compile_size_m) * int(top_k)
+
+    def _weight_fake(num_experts: int, size_n: int, size_k: int, weight_layout: str):
+        elements = _w4a16_weight_flat_elements(
+            num_experts=num_experts,
+            size_n=size_n,
+            size_k=size_k,
+            weight_layout=weight_layout,
+        )
+        fake_dtype = cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32
+        return cute.runtime.make_fake_compact_tensor(
+            fake_dtype, (elements,), assumed_align=16
+        )
+
+    def _scales_fake(
+        num_experts: int, size_n: int, size_k: int, scale_format: str
+    ):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (
+                _scale_fake_int32_elements(
+                    num_experts=num_experts,
+                    size_k=size_k,
+                    size_n=size_n,
+                    scale_format=scale_format,
+                ),
+            ),
+            assumed_align=16,
+        )
+
+    def _global_fake(num_experts: int):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (num_experts,), assumed_align=16
+        )
+
+    a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    tier0 = kernel.tier0
+    tier1 = kernel.tier1
+    scratch_elements = max(
+        fc1_cols * compile_routed_rows,
+        hidden_size * compile_routed_rows,
+        4 * 256 * moe_block_size * 256,
+    )
+    compile_args = (
+        a_fake,
+        _weight_fake(
+            tier0.num_experts, fc1_cols, hidden_size, tier0.weight_layout
+        ),
+        _weight_fake(
+            tier0.num_experts, hidden_size, intermediate_size, tier0.weight_layout
+        ),
+        _scales_fake(
+            tier0.num_experts, fc1_cols, hidden_size, tier0.scale_format
+        ),
+        _scales_fake(
+            tier0.num_experts, hidden_size, intermediate_size, tier0.scale_format
+        ),
+        _global_fake(tier0.num_experts),
+        _global_fake(tier0.num_experts),
+        _weight_fake(
+            tier1.num_experts, fc1_cols, hidden_size, tier1.weight_layout
+        ),
+        _weight_fake(
+            tier1.num_experts, hidden_size, intermediate_size, tier1.weight_layout
+        ),
+        _scales_fake(
+            tier1.num_experts, fc1_cols, hidden_size, tier1.scale_format
+        ),
+        _scales_fake(
+            tier1.num_experts, hidden_size, intermediate_size, tier1.scale_format
+        ),
+        _global_fake(tier1.num_experts),
+        _global_fake(tier1.num_experts),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (compile_routed_rows,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (int(map_slots),), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass_dtype, (compile_routed_rows * fc1_cols,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass_dtype,
+            (compile_routed_rows * intermediate_size,),
+            assumed_align=16,
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass_dtype, (compile_size_m * hidden_size,), assumed_align=16
+        ),
+        topk_fake,
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (scratch_elements,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (scratch_elements,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (4 * 256 + 2,), assumed_align=16
+        ),
+        1,
+        1,
+        current_cuda_stream(),
+    )
+
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = b12x_compile(
+        kernel,
+        *compile_args,
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.fused_moe_hybrid",
+            W4A16FusedMoeHybridKernel.ABI_VERSION,
+            cache_key,
+        ),
+    )
+    registers_per_thread = -1
+    local_memory_bytes = -1
+    resources = _query_w4a16_kernel_resources(compiled)
+    if resources is not None:
+        _, registers_per_thread, local_memory_bytes = resources
+        if local_memory_bytes != 0:
+            raise RuntimeError(
+                "hybrid W4A16 codegen spills to local memory "
+                f"({local_memory_bytes} bytes/thread); refusing to admit the "
+                "kernel for the latency-critical decode path"
+            )
+
+    result = W4A16FusedMoeHybridCompileResult(
+        compiled=compiled,
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        activation=activation,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        map_slots=int(map_slots),
+        tier0_num_experts=tier0.num_experts,
+        tier0_weight_layout=tier0.weight_layout,
+        tier0_scale_format=tier0.scale_format,
+        tier0_w13_layout=tier0.w13_layout,
+        tier1_num_experts=tier1.num_experts,
+        tier1_weight_layout=tier1.weight_layout,
+        tier1_scale_format=tier1.scale_format,
+        tier1_w13_layout=tier1.w13_layout,
+        fc1_tile_n=fc1_tile_n,
+        fc1_tile_k=fc1_tile_k,
+        fc2_tile_n=fc2_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        cta_threads=kernel.cta_threads,
+        blocks_per_sm=kernel.blocks_per_sm,
+        shared_memory_bytes=kernel.shared_words * 4,
+        schedule_whole_tiles=bool(schedule_whole_tiles),
+        direct_topk_routes=True,
+        tc_decode_fused_sum=True,
+        registers_per_thread=registers_per_thread,
+        local_memory_bytes=local_memory_bytes,
+    )
+    _FUSED_CACHE[cache_key] = result
+    return result
+
+
 def clear_w4a16_kernel_cache() -> None:
     _CACHE.clear()
     _FUSED_CACHE.clear()
@@ -5971,6 +6889,24 @@ def _w4a16_fused_persistent_grid_x(
     fc1_mn_tiles = route_blocks * n_tiles
     if fc1_mn_tiles <= 0 or cap <= 0:
         return max(cap, 1)
+    if bool(getattr(fused, "schedule_whole_tiles", False)):
+        # Whole-tile scheduling tolerates ragged waves, so the whole-cover
+        # constraint below does not apply. Minimize the FC1+FC2 critical path
+        # in whole-tile waves per CTA; ties go to the smaller grid (fewer
+        # grid-barrier participants). Measured on the GLM-5.2 TP4 hybrid
+        # shard (m=4: FC2 768 tiles), cap=188 CTAs runs FC2 in 5-deep waves
+        # vs 6-deep at the FC1-right-sized 128 CTAs: 95.9us vs 107.1us.
+        fc2_tile_n = int(getattr(fused, "fc2_tile_n", 0))
+        hidden = int(getattr(fused, "hidden_size", 0))
+        if fc2_tile_n <= 0 or hidden <= 0 or hidden % fc2_tile_n != 0:
+            return max(cap, 1)
+        fc2_mn_tiles = route_blocks * (hidden // fc2_tile_n)
+
+        def whole_tile_critical_path(grid: int) -> int:
+            return -(-fc1_mn_tiles // grid) + -(-fc2_mn_tiles // grid)
+
+        candidates = sorted({int(cap), min(fc1_mn_tiles, int(cap))})
+        return min(candidates, key=lambda g: (whole_tile_critical_path(g), g))
     waves = (fc1_mn_tiles + cap - 1) // cap
     if waves <= 0:
         return max(cap, 1)
@@ -7143,20 +8079,760 @@ def run_w4a16_moe(
     return output
 
 
+def build_w4a16_tier_local_map(
+    tier0_global_ids,
+    tier1_global_ids,
+    *,
+    map_slots: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Build the int32 [map_slots] global-expert descriptor table.
+
+    Entry g = (tier << 8) | local_expert_id for a mapped global expert id g,
+    -1 for unmapped. tierN_global_ids[i] is the global id of that tier's local
+    expert i, i.e. the order the tier's weights were packed in.
+    """
+
+    map_slots = int(map_slots)
+    table = torch.full((map_slots,), -1, dtype=torch.int32)
+    seen: set[int] = set()
+    for tier, ids in ((0, tier0_global_ids), (1, tier1_global_ids)):
+        ids_list = [int(v) for v in ids]
+        if len(ids_list) > 256:
+            raise ValueError(
+                f"tier {tier} has {len(ids_list)} experts; the descriptor "
+                "local-id field is 8 bits"
+            )
+        for local, gid in enumerate(ids_list):
+            if gid < 0 or gid >= map_slots:
+                raise ValueError(
+                    f"tier {tier} local expert {local} has global id {gid} "
+                    f"outside [0, {map_slots})"
+                )
+            if gid in seen:
+                raise ValueError(f"global expert id {gid} is mapped twice")
+            seen.add(gid)
+            table[gid] = (tier << 8) | local
+    if device is not None:
+        table = table.to(device)
+    return table.contiguous()
+
+
+def _w4a16_hybrid_validate_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    elements: int,
+    assumed_align: int,
+    exact: bool,
+) -> None:
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    actual = int(tensor.numel())
+    if (exact and actual != int(elements)) or (not exact and actual < int(elements)):
+        relation = "exactly" if exact else "at least"
+        raise ValueError(
+            f"{name} must contain {relation} {int(elements)} elements, got {actual}"
+        )
+    address = int(tensor.data_ptr())
+    if address == 0 or address % int(assumed_align) != 0:
+        raise ValueError(
+            f"{name} address {address:#x} violates assumed_align={int(assumed_align)}"
+        )
+
+
+def _w4a16_hybrid_validate_aliases(
+    tensors: tuple[tuple[str, torch.Tensor, bool], ...],
+) -> None:
+    """Reject byte overlaps involving a mutable tensor or a route-map input."""
+
+    protected = {"global_topk_ids", "tier_local_map"}
+    ranges = tuple(
+        (
+            name,
+            int(tensor.data_ptr()),
+            int(tensor.data_ptr()) + int(tensor.numel()) * int(tensor.element_size()),
+            bool(mutable),
+        )
+        for name, tensor, mutable in tensors
+    )
+    for left_idx in range(len(ranges)):
+        left_name, left_start, left_stop, left_mutable = ranges[left_idx]
+        for right_idx in range(left_idx + 1, len(ranges)):
+            right_name, right_start, right_stop, right_mutable = ranges[right_idx]
+            overlap_matters = (
+                left_mutable
+                or right_mutable
+                or left_name in protected
+                or right_name in protected
+            )
+            if not overlap_matters:
+                continue
+            if left_start < right_stop and right_start < left_stop:
+                raise ValueError(
+                    "hybrid W4A16 unsafe storage alias: "
+                    f"{left_name} overlaps {right_name}"
+                )
+
+
+def _w4a16_fused_moe_hybrid_launch_flat(
+    a_input: torch.Tensor,
+    t0_w13: torch.Tensor,
+    t0_w2: torch.Tensor,
+    t0_w13_scale_i32: torch.Tensor,
+    t0_w2_scale_i32: torch.Tensor,
+    t0_w13_global: torch.Tensor,
+    t0_w2_global: torch.Tensor,
+    t1_w13: torch.Tensor,
+    t1_w2: torch.Tensor,
+    t1_w13_scale_i32: torch.Tensor,
+    t1_w2_scale_i32: torch.Tensor,
+    t1_w13_global: torch.Tensor,
+    t1_w2_global: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    output_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    t0_num_experts: int,
+    t1_num_experts: int,
+    topk: int,
+    activation: str,
+    map_slots: int,
+    moe_block_size: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    t0_weight_layout: str,
+    t0_scale_format: str,
+    t0_w13_layout: str,
+    t1_weight_layout: str,
+    t1_scale_format: str,
+    t1_w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    schedule_whole_tiles: bool,
+    stream_int: int,
+) -> None:
+    if not a_input.is_cuda:
+        raise ValueError("hybrid W4A16 input must be a CUDA tensor")
+    device_index = a_input.device.index
+    current_device = int(torch.cuda.current_device())
+    if device_index is None or int(device_index) != current_device:
+        raise ValueError(
+            "hybrid W4A16 input must be on the current CUDA device: "
+            f"cuda:{device_index} != cuda:{current_device}"
+        )
+    current_stream_int = int(torch.cuda.current_stream(a_input.device).cuda_stream)
+    if int(stream_int) != current_stream_int:
+        raise ValueError(
+            "hybrid W4A16 stream must be the current input-device stream: "
+            f"{int(stream_int)} != {current_stream_int}"
+        )
+    if int(m) < 1 or int(m) > int(size_m):
+        raise ValueError(f"hybrid W4A16 requires 1 <= m <= size_m, got m={m}")
+
+    hybrid = compile_w4a16_fused_moe_hybrid(
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tier0_num_experts=t0_num_experts,
+        tier1_num_experts=t1_num_experts,
+        top_k=topk,
+        activation=activation,
+        map_slots=map_slots,
+        moe_block_size=moe_block_size,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        tier0_weight_layout=t0_weight_layout,
+        tier0_scale_format=t0_scale_format,
+        tier0_w13_layout=t0_w13_layout,
+        tier1_weight_layout=t1_weight_layout,
+        tier1_scale_format=t1_scale_format,
+        tier1_w13_layout=t1_w13_layout,
+        force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
+        schedule_whole_tiles=bool(schedule_whole_tiles),
+    )
+
+    element_torch_dtype = (
+        torch.float16 if element_dtype == "fp16" else torch.bfloat16
+    )
+    fc1_cols = int(intermediate_size) * 2
+    routed_rows = int(m) * int(topk)
+    weight_dtypes = {
+        "modelopt": torch.uint8,
+    }
+    tensor_contracts = (
+        ("a_input", a_input, element_torch_dtype, m * hidden_size, 16, False, False),
+        (
+            "t0_w13",
+            t0_w13,
+            weight_dtypes.get(t0_weight_layout, torch.int32),
+            _w4a16_weight_flat_elements(
+                num_experts=t0_num_experts,
+                size_n=fc1_cols,
+                size_k=hidden_size,
+                weight_layout=t0_weight_layout,
+            ),
+            16,
+            True,
+            False,
+        ),
+        (
+            "t0_w2",
+            t0_w2,
+            weight_dtypes.get(t0_weight_layout, torch.int32),
+            _w4a16_weight_flat_elements(
+                num_experts=t0_num_experts,
+                size_n=hidden_size,
+                size_k=intermediate_size,
+                weight_layout=t0_weight_layout,
+            ),
+            16,
+            True,
+            False,
+        ),
+        (
+            "t1_w13",
+            t1_w13,
+            weight_dtypes.get(t1_weight_layout, torch.int32),
+            _w4a16_weight_flat_elements(
+                num_experts=t1_num_experts,
+                size_n=fc1_cols,
+                size_k=hidden_size,
+                weight_layout=t1_weight_layout,
+            ),
+            16,
+            True,
+            False,
+        ),
+        (
+            "t1_w2",
+            t1_w2,
+            weight_dtypes.get(t1_weight_layout, torch.int32),
+            _w4a16_weight_flat_elements(
+                num_experts=t1_num_experts,
+                size_n=hidden_size,
+                size_k=intermediate_size,
+                weight_layout=t1_weight_layout,
+            ),
+            16,
+            True,
+            False,
+        ),
+        ("t0_w13_scale_i32", t0_w13_scale_i32, torch.int32, 1, 16, False, False),
+        ("t0_w2_scale_i32", t0_w2_scale_i32, torch.int32, 1, 16, False, False),
+        ("t1_w13_scale_i32", t1_w13_scale_i32, torch.int32, 1, 16, False, False),
+        ("t1_w2_scale_i32", t1_w2_scale_i32, torch.int32, 1, 16, False, False),
+        (
+            "t0_w13_global",
+            t0_w13_global,
+            torch.float32,
+            t0_num_experts,
+            16,
+            True,
+            False,
+        ),
+        ("t0_w2_global", t0_w2_global, torch.float32, t0_num_experts, 16, True, False),
+        (
+            "t1_w13_global",
+            t1_w13_global,
+            torch.float32,
+            t1_num_experts,
+            16,
+            True,
+            False,
+        ),
+        ("t1_w2_global", t1_w2_global, torch.float32, t1_num_experts, 16, True, False),
+        (
+            "global_topk_ids",
+            global_topk_ids,
+            torch.int32,
+            routed_rows,
+            16,
+            False,
+            False,
+        ),
+        ("tier_local_map", tier_local_map, torch.int32, map_slots, 16, True, False),
+        (
+            "fc1_out",
+            fc1_out,
+            element_torch_dtype,
+            routed_rows * fc1_cols,
+            16,
+            False,
+            True,
+        ),
+        (
+            "activated",
+            activated,
+            element_torch_dtype,
+            routed_rows * intermediate_size,
+            16,
+            False,
+            True,
+        ),
+        (
+            "output_out",
+            output_out,
+            element_torch_dtype,
+            m * hidden_size,
+            16,
+            False,
+            True,
+        ),
+        ("topk_weights", topk_weights, torch.float32, routed_rows, 4, False, False),
+        ("fc1_scratch", fc1_scratch, torch.float32, 1, 16, False, True),
+        ("fc2_scratch", fc2_scratch, torch.float32, 1, 16, False, True),
+        (
+            "workspace",
+            workspace,
+            torch.int32,
+            int(sms) * 4 + 2,
+            16,
+            False,
+            True,
+        ),
+    )
+    for name, tensor, dtype, elements, align, exact, _ in tensor_contracts:
+        _w4a16_hybrid_validate_tensor(
+            name,
+            tensor,
+            dtype=dtype,
+            elements=elements,
+            assumed_align=align,
+            exact=exact,
+        )
+        if tensor.device != a_input.device:
+            raise ValueError(
+                f"{name} device {tensor.device} does not match input "
+                f"device {a_input.device}"
+            )
+    _w4a16_hybrid_validate_aliases(
+        tuple(
+            (name, tensor, mutable)
+            for name, tensor, _, _, _, _, mutable in tensor_contracts
+        )
+    )
+
+    grid_x = _w4a16_fused_persistent_grid_x(
+        fused=hybrid,
+        m=m,
+        topk=topk,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        direct_topk_routes=True,
+        sms=sms,
+    )
+    hybrid.compiled(
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            a_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        t0_w13,
+        t0_w2,
+        t0_w13_scale_i32,
+        t0_w2_scale_i32,
+        t0_w13_global,
+        t0_w2_global,
+        t1_w13,
+        t1_w2,
+        t1_w13_scale_i32,
+        t1_w2_scale_i32,
+        t1_w13_global,
+        t1_w2_global,
+        global_topk_ids,
+        tier_local_map,
+        fc1_out,
+        activated,
+        output_out,
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        fc1_scratch,
+        fc2_scratch,
+        workspace,
+        m,
+        grid_x,
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_fused_moe_hybrid_launch",
+    mutates_args="unknown",
+    device_types="cuda",
+)
+def _w4a16_fused_moe_hybrid_launch_op(
+    a_input: torch.Tensor,
+    t0_w13: torch.Tensor,
+    t0_w2: torch.Tensor,
+    t0_w13_scale_i32: torch.Tensor,
+    t0_w2_scale_i32: torch.Tensor,
+    t0_w13_global: torch.Tensor,
+    t0_w2_global: torch.Tensor,
+    t1_w13: torch.Tensor,
+    t1_w2: torch.Tensor,
+    t1_w13_scale_i32: torch.Tensor,
+    t1_w2_scale_i32: torch.Tensor,
+    t1_w13_global: torch.Tensor,
+    t1_w2_global: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    output_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    t0_num_experts: int,
+    t1_num_experts: int,
+    topk: int,
+    activation: str,
+    map_slots: int,
+    moe_block_size: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    t0_weight_layout: str,
+    t0_scale_format: str,
+    t0_w13_layout: str,
+    t1_weight_layout: str,
+    t1_scale_format: str,
+    t1_w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    schedule_whole_tiles: bool,
+    stream_int: int,
+) -> None:
+    _w4a16_fused_moe_hybrid_launch_flat(
+        a_input,
+        t0_w13,
+        t0_w2,
+        t0_w13_scale_i32,
+        t0_w2_scale_i32,
+        t0_w13_global,
+        t0_w2_global,
+        t1_w13,
+        t1_w2,
+        t1_w13_scale_i32,
+        t1_w2_scale_i32,
+        t1_w13_global,
+        t1_w2_global,
+        global_topk_ids,
+        tier_local_map,
+        fc1_out,
+        activated,
+        output_out,
+        topk_weights,
+        fc1_scratch,
+        fc2_scratch,
+        workspace,
+        m,
+        size_m,
+        hidden_size,
+        intermediate_size,
+        t0_num_experts,
+        t1_num_experts,
+        topk,
+        activation,
+        map_slots,
+        moe_block_size,
+        element_dtype,
+        fast_math,
+        sms,
+        max_shared_mem,
+        t0_weight_layout,
+        t0_scale_format,
+        t0_w13_layout,
+        t1_weight_layout,
+        t1_scale_format,
+        t1_w13_layout,
+        fc1_tile_k,
+        fc1_tile_n,
+        fc2_tile_k,
+        fc2_tile_n,
+        schedule_whole_tiles,
+        stream_int,
+    )
+
+
+@_w4a16_fused_moe_hybrid_launch_op.register_fake
+def _w4a16_fused_moe_hybrid_launch_fake(
+    a_input: torch.Tensor,
+    t0_w13: torch.Tensor,
+    t0_w2: torch.Tensor,
+    t0_w13_scale_i32: torch.Tensor,
+    t0_w2_scale_i32: torch.Tensor,
+    t0_w13_global: torch.Tensor,
+    t0_w2_global: torch.Tensor,
+    t1_w13: torch.Tensor,
+    t1_w2: torch.Tensor,
+    t1_w13_scale_i32: torch.Tensor,
+    t1_w2_scale_i32: torch.Tensor,
+    t1_w13_global: torch.Tensor,
+    t1_w2_global: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    output_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    t0_num_experts: int,
+    t1_num_experts: int,
+    topk: int,
+    activation: str,
+    map_slots: int,
+    moe_block_size: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    t0_weight_layout: str,
+    t0_scale_format: str,
+    t0_w13_layout: str,
+    t1_weight_layout: str,
+    t1_scale_format: str,
+    t1_w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    schedule_whole_tiles: bool,
+    stream_int: int,
+) -> None:
+    return None
+
+
+def run_w4a16_moe_hybrid(
+    a_input: torch.Tensor,
+    prepared_tier0,
+    prepared_tier1,
+    topk_weights: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    *,
+    activation: str,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    force_tile_config: tuple[int, int, int, int],
+    size_m: int | None = None,
+    fc1_c_tmp: torch.Tensor | None = None,
+    fc2_c_tmp: torch.Tensor | None = None,
+    fast_math: bool = True,
+    schedule_whole_tiles: bool = True,
+    stream: cuda.CUstream | None = None,
+) -> torch.Tensor:
+    """Run one hybrid two-tier W4A16 fused MoE layer.
+
+    global_topk_ids carries GLOBAL expert ids ([m, topk] int32, -1 inactive);
+    tier_local_map is the descriptor table from build_w4a16_tier_local_map.
+    prepared_tier0/prepared_tier1 are per-tier prepared weight bundles whose
+    packing tile config must match force_tile_config.
+    """
+
+    activation = normalize_moe_activation(activation)
+    if not validate_activation(activation):
+        raise ValueError("hybrid W4A16 requires a gated activation")
+    element_dtype = _normalize_element_dtype(a_input.dtype)
+    m, hidden_size = a_input.shape
+    capacity_m = int(size_m) if size_m is not None else int(m)
+    topk = int(topk_weights.shape[-1])
+    if topk_weights.dtype != torch.float32:
+        raise TypeError("topk_weights must be torch.float32")
+    if global_topk_ids.dtype != torch.int32:
+        raise TypeError("global_topk_ids must be torch.int32")
+    if global_topk_ids.shape != (m, topk) and global_topk_ids.numel() != m * topk:
+        raise ValueError(
+            f"global_topk_ids must have m*topk={m * topk} elements, got "
+            f"{tuple(global_topk_ids.shape)}"
+        )
+
+    for name, prepared in (("tier0", prepared_tier0), ("tier1", prepared_tier1)):
+        prepared_dtype = getattr(prepared, "params_dtype", a_input.dtype)
+        if prepared_dtype != a_input.dtype:
+            raise TypeError(
+                f"{name} prepared weights were built for {prepared_dtype}, "
+                f"but a_input has dtype {a_input.dtype}"
+            )
+        if int(prepared.hidden_size) != int(hidden_size):
+            raise ValueError(f"{name} hidden_size mismatch")
+    intermediate_size = int(prepared_tier0.intermediate_size)
+    if int(prepared_tier1.intermediate_size) != intermediate_size:
+        raise ValueError("hybrid tiers disagree on intermediate_size")
+    fc1_cols = intermediate_size * 2
+
+    def _tier_layouts(prepared) -> tuple[str, str, str]:
+        weight_layout = getattr(prepared, "weight_layout", "packed")
+        scale_format = _normalize_scale_format(
+            getattr(prepared, "scale_format", None) or "e4m3_k16"
+        )
+        if weight_layout == "modelopt":
+            w13_layout = getattr(prepared, "w13_layout", "w13")
+        else:
+            w13_layout = "packed"
+        return weight_layout, scale_format, w13_layout
+
+    t0_layouts = _tier_layouts(prepared_tier0)
+    t1_layouts = _tier_layouts(prepared_tier1)
+
+    def _weight_args(prepared) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(prepared, "weight_layout", "packed") == "modelopt":
+            return (
+                prepared.w13.view(torch.uint8).view(-1),
+                prepared.w2.view(torch.uint8).view(-1),
+            )
+        return (
+            prepared.w13.view(torch.int32).view(-1),
+            prepared.w2.view(torch.int32).view(-1),
+        )
+
+    t0_w13, t0_w2 = _weight_args(prepared_tier0)
+    t1_w13, t1_w2 = _weight_args(prepared_tier1)
+
+    props = torch.cuda.get_device_properties(a_input.device)
+    sms = int(props.multi_processor_count)
+    max_shared_mem = int(
+        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+    )
+
+    capacity_routed_rows = capacity_m * topk
+    intermediate_cache13_flat = intermediate_cache13.view(-1)
+    intermediate_cache2_flat = intermediate_cache2.view(-1)
+    if intermediate_cache13_flat.numel() < capacity_routed_rows * fc1_cols:
+        raise ValueError("intermediate_cache13 is smaller than launch capacity")
+    if intermediate_cache2_flat.numel() < capacity_routed_rows * intermediate_size:
+        raise ValueError("intermediate_cache2 is smaller than launch capacity")
+    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
+    activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
+
+    scratch_elements = packed_gemm_scratch_elements(
+        size_n=max(fc1_cols, hidden_size),
+        route_slots=capacity_routed_rows,
+        moe_block_size=8,
+        sms=sms,
+    )
+    fc1_scratch = _get_c_tmp(
+        scratch_elements, device=a_input.device, scratch=fc1_c_tmp
+    )
+    fc2_scratch = _get_c_tmp(
+        scratch_elements, device=a_input.device, scratch=fc2_c_tmp
+    )
+    workspace = prepared_tier0.workspace
+    stream = current_cuda_stream() if stream is None else stream
+
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
+        int(v) for v in force_tile_config
+    )
+    torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
+        a_input,
+        t0_w13,
+        t0_w2,
+        prepared_tier0.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier0.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier0.w13_global_scale,
+        prepared_tier0.w2_global_scale,
+        t1_w13,
+        t1_w2,
+        prepared_tier1.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier1.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier1.w13_global_scale,
+        prepared_tier1.w2_global_scale,
+        global_topk_ids.view(-1),
+        tier_local_map,
+        fc1_out,
+        activated,
+        output.view(-1),
+        topk_weights,
+        fc1_scratch,
+        fc2_scratch,
+        workspace,
+        int(m),
+        capacity_m,
+        int(hidden_size),
+        intermediate_size,
+        int(prepared_tier0.num_experts),
+        int(prepared_tier1.num_experts),
+        topk,
+        activation,
+        int(tier_local_map.numel()),
+        8,
+        element_dtype,
+        bool(fast_math),
+        sms,
+        max_shared_mem,
+        t0_layouts[0],
+        t0_layouts[1],
+        t0_layouts[2],
+        t1_layouts[0],
+        t1_layouts[1],
+        t1_layouts[2],
+        fc1_tile_k,
+        fc1_tile_n,
+        fc2_tile_k,
+        fc2_tile_n,
+        bool(schedule_whole_tiles),
+        int(stream),
+    )
+    return output
+
+
 __all__ = [
     "W4A16ActivationCompileResult",
     "W4A16FusedMoeCompileResult",
+    "W4A16FusedMoeHybridCompileResult",
     "W4A16GemmCompileResult",
     "W4A16TopKSumCompileResult",
     "W4A16FusedMoeKernel",
+    "W4A16FusedMoeHybridKernel",
     "W4A16ActivationKernel",
     "W4A16GemmKernel",
     "W4A16TopKSumKernel",
+    "build_w4a16_tier_local_map",
     "clear_w4a16_kernel_cache",
     "compile_w4a16_activation",
     "compile_w4a16_fused_moe",
+    "compile_w4a16_fused_moe_hybrid",
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
     "pack_topk_routes_by_expert",
     "run_w4a16_moe",
+    "run_w4a16_moe_hybrid",
 ]
