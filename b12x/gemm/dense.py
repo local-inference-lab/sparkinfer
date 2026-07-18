@@ -89,21 +89,8 @@ from b12x.cute.fp4 import (
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
-_B12X_WO_PDL_RAW = os.environ.get("B12X_WO_PDL")
-_B12X_WO_PDL: bool | None = (
-    None
-    if _B12X_WO_PDL_RAW is None
-    else _B12X_WO_PDL_RAW.lower() not in {"0", "false", "no", ""}
-)
 _WO_SPARK_MAX_SMS = 64
 _DENSE_SPARK_MAX_SMS = 64
-
-
-def _wo_pdl_enabled_for_sm_count(sm_count: int) -> bool:
-    """Select the Spark PDL chain while preserving the explicit override."""
-    if _B12X_WO_PDL is not None:
-        return bool(_B12X_WO_PDL)
-    return int(sm_count) <= _WO_SPARK_MAX_SMS
 
 
 def _dense_spark_policy_for_sm_count(sm_count: int) -> bool:
@@ -415,7 +402,6 @@ class DenseGemmKernel:
         tile_k: Optional[int] = None,
         single_work_tile_per_cta: bool = False,
         use_prefetch: bool = False,
-        enable_pdl: bool = False,
         direct_one_m_tile_scheduler: bool = False,
         split_k_slices: int = 1,
         split_k_atomic_bf16: bool = False,
@@ -463,7 +449,6 @@ class DenseGemmKernel:
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
         self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
-        self.enable_pdl = enable_pdl
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
         self.split_k_slices = split_k_slices
         self.split_k_atomic_bf16 = split_k_atomic_bf16
@@ -525,14 +510,6 @@ class DenseGemmKernel:
         # and shared-memory layouts.
         self.direct_sfa_prefix = (
             direct_sfa_live16 and self.direct_sfb_representative
-        )
-        # Tile-major B is an immutable weight, so any PDL launch may fill the
-        # initial pipeline window with B stages before waiting on the
-        # predecessor; A/SFA/source keep their loads after the wait.
-        self.pdl_prestage_b = (
-            self.enable_pdl
-            and self.load_path == "tma"
-            and self.b_tile_major
         )
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
@@ -877,7 +854,6 @@ class DenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
-            use_pdl=self.enable_pdl,
         )
         return
 
@@ -1070,13 +1046,6 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
-        if cutlass.const_expr(self.enable_pdl):
-            # Selected WO kernels can stage predecessor-independent RHS bytes
-            # before waiting. A/SFA/source preserve their RAW ordering.
-            cute.arch.griddepcontrol_launch_dependents()
-            if cutlass.const_expr(not self.pdl_prestage_b):
-                cute.arch.griddepcontrol_wait()
-
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
 
@@ -1449,10 +1418,6 @@ class DenseGemmKernel:
 
         # MMA warp group
         if warp_idx < self.num_mma_warps:
-            if cutlass.const_expr(
-                self.pdl_prestage_b
-            ):
-                cute.arch.griddepcontrol_wait()
             cute.arch.setmaxregister_increase(self.mma_register_requirement)
 
             num_k_blocks = cute.size(tCrA, mode=[2])
@@ -2484,45 +2449,10 @@ class DenseGemmKernel:
 
                 mainloop_producer_state.reset_count()
 
-                pdl_prestaged_stages = Int32(0)
-                if cutlass.const_expr(self.pdl_prestage_b):
-                    if cutlass.const_expr(self.direct_one_m_tile_scheduler):
-                        pdl_first_tile = Int32(1)
-                    else:
-                        pdl_first_tile = tile_sched.num_tiles_executed == Int32(0)
-                    if pdl_first_tile:
-                        # B is immutable across the chain, so it can fill the
-                        # initial pipeline window while this grid is still
-                        # waiting for its predecessor-produced A/SFA/source.
-                        pdl_b_state = mainloop_producer_state.clone()
-                        for _pdl_stage in cutlass.range_constexpr(
-                            self.ab_stage
-                        ):
-                            mainloop_pipeline.producer_acquire(pdl_b_state)
-                            pdl_b_k = k_tile_start + pdl_b_state.count
-                            cute.copy(
-                                tma_atom_b,
-                                tBgB_nkl[(None, pdl_b_k)],
-                                tBsB[(None, pdl_b_state.index)],
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                    pdl_b_state
-                                ),
-                                cache_policy=Int64(0x12F0000000000000),
-                            )
-                            pdl_b_state.advance()
-                        cute.arch.griddepcontrol_wait()
-                        pdl_prestaged_stages = Int32(self.ab_stage)
-
                 for k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
-                    if cutlass.const_expr(self.pdl_prestage_b):
-                        if k_tile >= pdl_prestaged_stages:
-                            mainloop_pipeline.producer_acquire(
-                                mainloop_producer_state
-                            )
-                    else:
-                        mainloop_pipeline.producer_acquire(
-                            mainloop_producer_state
-                        )
+                    mainloop_pipeline.producer_acquire(
+                        mainloop_producer_state
+                    )
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
                     if cutlass.const_expr(self.load_path == "tma"):
@@ -2562,29 +2492,15 @@ class DenseGemmKernel:
                             # Start the large weight transfer before synchronous
                             # A quantization. SFB stays below as a post-fence
                             # doorbell because TMA producer_commit is a no-op.
-                            if cutlass.const_expr(self.enable_pdl):
-                                if k_tile >= pdl_prestaged_stages:
-                                    cute.copy(
-                                        tma_atom_b,
-                                        tBgB_k,
-                                        tBsB_pipe,
-                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                            mainloop_producer_state
-                                        ),
-                                        cache_policy=Int64(
-                                            0x12F0000000000000
-                                        ),
-                                    )
-                            else:
-                                cute.copy(
-                                    tma_atom_b,
-                                    tBgB_k,
-                                    tBsB_pipe,
-                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                        mainloop_producer_state
-                                    ),
-                                    cache_policy=Int64(0x12F0000000000000),
-                                )
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_k,
+                                tBsB_pipe,
+                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                    mainloop_producer_state
+                                ),
+                                cache_policy=Int64(0x12F0000000000000),
+                            )
 
                     if cutlass.const_expr(self.load_path == "cpasync"):
                         tAgA_cpasync_k = tAgA_cpasync_mkl[
@@ -3336,31 +3252,17 @@ class DenseGemmKernel:
                             not (self.fused_quant_a and self.b_tile_major)
                         ):
                             if cutlass.const_expr(self.b_tile_major):
-                                if cutlass.const_expr(self.pdl_prestage_b):
-                                    if k_tile >= pdl_prestaged_stages:
-                                        cute.copy(
-                                            tma_atom_b,
-                                            tBgB_k,
-                                            tBsB_pipe,
-                                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                                mainloop_producer_state
-                                            ),
-                                            cache_policy=Int64(
-                                                0x12F0000000000000
-                                            ),
-                                        )
-                                else:
-                                    cute.copy(
-                                        tma_atom_b,
-                                        tBgB_k,
-                                        tBsB_pipe,
-                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                            mainloop_producer_state
-                                        ),
-                                        cache_policy=Int64(
-                                            0x12F0000000000000
-                                        ),
-                                    )
+                                cute.copy(
+                                    tma_atom_b,
+                                    tBgB_k,
+                                    tBsB_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    cache_policy=Int64(
+                                        0x12F0000000000000
+                                    ),
+                                )
                             else:
                                 if cutlass.const_expr(self.occupancy > 1):
                                     cute.copy(
@@ -3770,34 +3672,6 @@ class _DenseGemmLaunch:
                 )
         else:
             self._b_tile_n = 0
-        # Import-time experimental switch, captured in the persistent compile
-        # key so PDL and non-PDL cubins can never alias.
-        exact_b16_wo_a = (
-            direct_sfa_live16
-            and quantize_c
-            and sfb_k_reuse
-            and alpha_is_one
-            and mma_tiler_mn == (32, 64)
-            and (n, k, l) == (1024, 4096, 4)
-        )
-        exact_b16_wo_b = (
-            direct_sfa_live16
-            and not quantize_c
-            and sfb_k_reuse
-            and alpha_is_one
-            and mma_tiler_mn == (32, 64)
-            and (n, k, l) == (4096, 4096, 1)
-        )
-        self._enable_pdl = (
-            _wo_pdl_enabled_for_sm_count(sm_count)
-            and b_tile_major
-            and (
-                mma_tiler_mn[0] == 16
-                or exact_b16_wo_a
-                or exact_b16_wo_b
-            )
-        )
-
         if not DenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
@@ -3866,7 +3740,6 @@ class _DenseGemmLaunch:
             self._sfb_k_reuse,
             self._b_tile_major,
             self._b_tile_n,
-            self._enable_pdl,
             self._quantize_c,
             self._alpha_is_one,
             self._direct_sfa_live16,
@@ -3979,7 +3852,6 @@ class _DenseGemmLaunch:
             swap_ab=self._swap_ab,
             sfb_k_reuse=self._sfb_k_reuse,
             atom_shape_24=self._atom_shape_24,
-            enable_pdl=self._enable_pdl,
             b_tile_major=self._b_tile_major,
             quantize_c=self._quantize_c,
             alpha_is_one=self._alpha_is_one,
@@ -4104,7 +3976,6 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             fused_quant_a_inner_span=self._fused_quant_a_inner_span,
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
-            enable_pdl=self._enable_pdl,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
         )(
@@ -4335,7 +4206,6 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_rope_dim=self._fused_quant_a_rope_dim,
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
-            enable_pdl=self._enable_pdl,
             target_occupancy=self._target_occupancy,
         )(
             a_tensor,

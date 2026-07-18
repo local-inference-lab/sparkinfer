@@ -21,7 +21,6 @@ from b12x.gemm.dense import (
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
-    _wo_pdl_enabled_for_sm_count,
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
@@ -140,36 +139,6 @@ def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
     atom_24 = _bk64_launch()
 
     assert _compile_key_differences(atom_42, atom_24) == [(False, True)]
-
-
-def test_dense_compile_key_separates_pdl_cubins(monkeypatch):
-    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", False)
-    ordinary_launch = _bk64_launch(
-        n=4096,
-        k=4096,
-        mma_tiler_mn=(16, 128),
-        b_tile_major=True,
-    )
-    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", True)
-    pdl_launch = _bk64_launch(
-        n=4096,
-        k=4096,
-        mma_tiler_mn=(16, 128),
-        b_tile_major=True,
-    )
-
-    assert _compile_key_differences(ordinary_launch, pdl_launch) == [(False, True)]
-
-
-def test_wo_pdl_default_is_spark_only_but_env_remains_an_override(monkeypatch):
-    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", None)
-    assert _wo_pdl_enabled_for_sm_count(20)
-    assert not _wo_pdl_enabled_for_sm_count(188)
-
-    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", True)
-    assert _wo_pdl_enabled_for_sm_count(188)
-    monkeypatch.setattr(dense_module, "_B12X_WO_PDL", False)
-    assert not _wo_pdl_enabled_for_sm_count(20)
 
 
 def test_fused_quant_compile_key_is_distinct_and_exhaustive():
