@@ -2006,7 +2006,9 @@ def compile(
 
             compile_callable = CompileCallable(dsl_compile_options)
         kwargs = dict(kwargs)
-        kwargs["__dsl_compile_options_key"] = repr(dsl_compile_options)
+        kwargs["__dsl_compile_options_key"] = _structural_cache_key(
+            dsl_compile_options
+        )
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )
