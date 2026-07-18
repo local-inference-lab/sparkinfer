@@ -1210,14 +1210,15 @@ class SparseNSAFusedIndexerKernel:
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
         # Warp-owns-tokens direct-L2 score: no K staging, no page barriers.
         # Gated to the 4-head-tile paged decode contract (DSV4 64-head) at
-        # rows >= 2 (ctas_per_group <= 24): those rows re-read an L2-resident
-        # K where 16B fragment loads are free. rows=1 streams the cache cold
-        # from DRAM once, where the staged pipeline's contiguous 128B pages
-        # are ~25% better; it keeps the historical path.
+        # rows >= 3 (ctas_per_group <= 16): those rows re-read an L2-resident
+        # K where 16B fragment loads are free. rows 1-2 stream mostly-cold K
+        # from DRAM, where the staged pipeline's contiguous 128B page loads
+        # win (measured +25% at rows=1, +3.5% at rows=2); they keep the
+        # historical path.
         self.direct_k_score = (
             self.kv_layout == KV_LAYOUT_PAGED
             and self.num_q_head_tiles == 4
-            and self.ctas_per_group <= 24
+            and self.ctas_per_group <= 16
         )
         self.score_warps = self.token_groups * self.num_q_head_tiles
         self.score_threads = self.score_warps * _WARP_THREADS
