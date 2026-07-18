@@ -61,6 +61,10 @@ def _invalid_writer_args(case: str) -> tuple[torch.Tensor, ...]:
         args[2] = torch.empty((2, _PAGE_SIZE, _RECORD_BYTES - 1), dtype=torch.uint8)
     elif case == "cache_dtype":
         args[2] = torch.empty((2, _PAGE_SIZE, _RECORD_BYTES), dtype=torch.bfloat16)
+    elif case == "zero_num_blocks":
+        args[2] = torch.empty((0, _PAGE_SIZE, _RECORD_BYTES), dtype=torch.uint8)
+    elif case == "zero_block_size":
+        args[2] = torch.empty((2, 0, _RECORD_BYTES), dtype=torch.uint8)
     elif case == "slot_dtype":
         args[3] = torch.arange(2, dtype=torch.int32)
     elif case == "slot_layout":
@@ -77,10 +81,19 @@ def _invalid_writer_args(case: str) -> tuple[torch.Tensor, ...]:
         args[0] = torch.empty((2, _V_HEAD_DIM + 1), dtype=torch.bfloat16)[
             :, :_V_HEAD_DIM
         ]
+    elif case == "k_pe_row_alignment":
+        args[1] = torch.empty((2, _HEAD_DIM - _V_HEAD_DIM + 1), dtype=torch.bfloat16)[
+            :, : _HEAD_DIM - _V_HEAD_DIM
+        ]
     elif case == "cache_record_alignment":
         args[2] = torch.empty((2, _PAGE_SIZE, _RECORD_BYTES + 1), dtype=torch.uint8)[
             ..., :_RECORD_BYTES
         ]
+    elif case == "cache_base_alignment":
+        numel = 2 * _PAGE_SIZE * _RECORD_BYTES
+        args[2] = torch.empty(numel + 8, dtype=torch.uint8)[8:].view(
+            2, _PAGE_SIZE, _RECORD_BYTES
+        )
     elif case != "cpu_device":
         raise AssertionError(f"unknown invalid writer case {case}")
     return tuple(args)
@@ -95,13 +108,17 @@ def _invalid_writer_args(case: str) -> tuple[torch.Tensor, ...]:
         ("k_pe_dtype", TypeError, "must match kv_c dtype"),
         ("cache_shape", ValueError, "kv_cache must be"),
         ("cache_dtype", TypeError, "kv_cache must be uint8"),
+        ("zero_num_blocks", ValueError, "num_blocks.*positive"),
+        ("zero_block_size", ValueError, "block_size.*positive"),
         ("slot_dtype", TypeError, "slot_mapping must be a 1-D int64 tensor"),
         ("slot_layout", ValueError, "slot_mapping must be contiguous"),
         ("short_source", ValueError, "must cover slot_mapping"),
         ("kv_c_inner_layout", ValueError, "must be innermost-contiguous"),
         ("cache_inner_layout", ValueError, "must be innermost-contiguous"),
         ("kv_c_row_alignment", ValueError, "must be 4-byte aligned"),
-        ("cache_record_alignment", ValueError, "must be 8-byte aligned"),
+        ("k_pe_row_alignment", ValueError, "k_pe.*4-byte aligned"),
+        ("cache_record_alignment", ValueError, "must be 16-byte aligned"),
+        ("cache_base_alignment", ValueError, "must be 16-byte aligned"),
         ("cpu_device", ValueError, "all tensors must be on CUDA"),
     ],
 )
@@ -241,7 +258,7 @@ def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
     dtype: torch.dtype,
 ) -> None:
     device = require_sm120()
-    num_tokens = 4
+    num_tokens = 6
     kv_c, k_pe, expected_packed, expected_group_scales, expected_rope_scales = (
         _make_exactly_quantizable_inputs(
             num_tokens=num_tokens,
@@ -250,9 +267,10 @@ def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
         )
     )
 
-    # The cache view has a full guard page on each side. A broken negative-slot
-    # branch therefore changes a visible guard record instead of corrupting an
-    # unowned allocation.
+    # The cache view has a full guard page on each side. The capacity slot
+    # targets the first trailing guard record without an upper-bound check. The
+    # huge slot's low 32 bits name an otherwise untouched in-cache record, so a
+    # check performed only after Int32 narrowing is also observable.
     backing = torch.full(
         (5, _PAGE_SIZE, _RECORD_BYTES),
         _SENTINEL,
@@ -260,7 +278,12 @@ def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
         device=device,
     )
     cache = backing[1:4]
-    slot_mapping = torch.tensor([0, -1, 65, 130], dtype=torch.int64, device=device)
+    capacity = cache.shape[0] * cache.shape[1]
+    slot_mapping = torch.tensor(
+        [0, -1, capacity, 65, 2**40 + 17, 130],
+        dtype=torch.int64,
+        device=device,
+    )
     if dtype == torch.float16:
         concat_and_cache_nvfp4_mla_fp8_rope(
             kv_c,
@@ -288,7 +311,7 @@ def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
     assert torch.equal(changed_records, expected_changed)
 
     live_slots = torch.tensor([0, 65, 130], dtype=torch.int64, device=device)
-    live_tokens = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
+    live_tokens = torch.tensor([0, 3, 5], dtype=torch.int64, device=device)
     records = cache.reshape(-1, _RECORD_BYTES).index_select(0, live_slots)
 
     # These byte ranges are the public record ABI consumed by the real readers.
