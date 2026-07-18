@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.base_dsl.compiler import OptLevel
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
 from cutlass.base_dsl._mlir_helpers import op as cutlass_op_helpers
@@ -642,6 +643,43 @@ def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
     info = cute_compiler.compile_cache_info()
     assert info["memory_cache_hits"] == 1
     assert info["compile_misses"] == 1
+
+
+def test_dsl_compile_options_use_stable_cache_key(monkeypatch) -> None:
+    captured_keys = []
+    cached = object()
+
+    def capture_memory_key(compile_callable, func, args, kwargs, compile_spec):
+        captured_keys.append(kwargs["__dsl_compile_options_key"])
+        return ("captured", len(captured_keys))
+
+    monkeypatch.setattr(
+        cute_compiler, "_compile_memory_cache_key", capture_memory_key
+    )
+    monkeypatch.setattr(cute_compiler, "_memory_cache_get", lambda key: cached)
+
+    def kernel() -> None:
+        pass
+
+    assert cute_compiler.compile(
+        kernel, dsl_compile_options=OptLevel(2)
+    ) is cached
+    assert cute_compiler.compile(
+        kernel, dsl_compile_options=OptLevel(2)
+    ) is cached
+    assert cute_compiler.compile(
+        kernel, dsl_compile_options=OptLevel(3)
+    ) is cached
+
+    assert captured_keys[0] == captured_keys[1]
+    assert captured_keys[0] != captured_keys[2]
+    assert captured_keys[0][:3] == (
+        "object",
+        "cutlass.base_dsl.compiler",
+        "OptLevel",
+    )
+    assert captured_keys[0][3] == (("_value", 2),)
+    assert "object at" not in repr(captured_keys[0])
 
 
 def test_compile_progress_prints_before_after_and_running_total(
