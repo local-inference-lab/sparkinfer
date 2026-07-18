@@ -526,14 +526,13 @@ class DenseGemmKernel:
         self.direct_sfa_prefix = (
             direct_sfa_live16 and self.direct_sfb_representative
         )
+        # Tile-major B is an immutable weight, so any PDL launch may fill the
+        # initial pipeline window with B stages before waiting on the
+        # predecessor; A/SFA/source keep their loads after the wait.
         self.pdl_prestage_b = (
             self.enable_pdl
             and self.load_path == "tma"
             and self.b_tile_major
-            and (
-                self.fused_quant_a
-                or (self.direct_sfa_prefix and self.quantize_c)
-            )
         )
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
@@ -3781,10 +3780,22 @@ class _DenseGemmLaunch:
             and mma_tiler_mn == (32, 64)
             and (n, k, l) == (1024, 4096, 4)
         )
+        exact_b16_wo_b = (
+            direct_sfa_live16
+            and not quantize_c
+            and sfb_k_reuse
+            and alpha_is_one
+            and mma_tiler_mn == (32, 64)
+            and (n, k, l) == (4096, 4096, 1)
+        )
         self._enable_pdl = (
             _wo_pdl_enabled_for_sm_count(sm_count)
             and b_tile_major
-            and (mma_tiler_mn[0] == 16 or exact_b16_wo_a)
+            and (
+                mma_tiler_mn[0] == 16
+                or exact_b16_wo_a
+                or exact_b16_wo_b
+            )
         )
 
         if not DenseGemmKernel.can_implement(
