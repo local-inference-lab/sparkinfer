@@ -2316,8 +2316,17 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     (the existing indexer kernels rely on it). Row-bearing key tensors use dynamic
     row dimensions; policy distinguishes the constexpr variant.
     """
+    # Variants that do not take the direct-K path trace byte-identical code to
+    # the v2 kernel, so they keep their v2 cache keys: the heavy legacy
+    # variants (e.g. heads=16/topk=2048/ctas=96) have pathologically long cold
+    # compiles and their warm cubins are load-bearing.
+    variant = (
+        "fused_indexer_v3_directk"
+        if kernel.direct_k_score
+        else "fused_indexer_v2_coop"
+    )
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
-        ("fused_indexer_v3_directk",) + tuple(policy),
+        (variant,) + tuple(policy),
     )
     labels = tuple(name for name, _ in key_tensors) + ("policy",)
     compile_spec = KernelCompileSpec.from_key(
