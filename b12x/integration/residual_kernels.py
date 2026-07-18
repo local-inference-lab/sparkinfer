@@ -765,7 +765,7 @@ class MHCPostPrePartialKernel:
             raise TypeError("fn must be Float32")
         if const_expr((not self.post_only) and partials.element_type != cutlass.Float32):
             raise TypeError("partials must be Float32")
-        if const_expr((not self.pre_only) and out.element_type != cutlass.BFloat16):
+        if const_expr(out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
         partial_groups = (
             1
@@ -818,10 +818,21 @@ class MHCPostPrePartialKernel:
 
         partial0 = partial_group * Int32(self.partials_per_cta)
         h = hidden_tile * Int32(self.source_tile_h) + tidx
-        r0 = Float32(residual[token, Int32(0), h])
-        r1 = Float32(residual[token, Int32(1), h])
-        r2 = Float32(residual[token, Int32(2), h])
-        r3 = Float32(residual[token, Int32(3), h])
+        if const_expr(self.pre_only):
+            r0 = Float32(residual[token, h])
+            r1 = r0
+            r2 = r0
+            r3 = r0
+            if partial_group == Int32(0):
+                out[token, Int32(0), h] = r0.to(cutlass.BFloat16)
+                out[token, Int32(1), h] = r0.to(cutlass.BFloat16)
+                out[token, Int32(2), h] = r0.to(cutlass.BFloat16)
+                out[token, Int32(3), h] = r0.to(cutlass.BFloat16)
+        else:
+            r0 = Float32(residual[token, Int32(0), h])
+            r1 = Float32(residual[token, Int32(1), h])
+            r2 = Float32(residual[token, Int32(2), h])
+            r3 = Float32(residual[token, Int32(3), h])
 
         if const_expr(not self.pre_only):
             xh = Float32(x[token, h])
@@ -898,6 +909,10 @@ class MHCPostPrePartialKernel:
                 value = Float32(0.0)
                 if partial == Int32(0):
                     value = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+                elif const_expr(self.pre_only):
+                    if partial < Int32(self.partials):
+                        mix = partial - Int32(1)
+                        value = Float32(fn[mix, h]) * r0
                 elif partial < Int32(self.partials):
                     mix = partial - Int32(1)
                     value = (
@@ -5400,19 +5415,21 @@ def _run_mhc_pre_partial_launch(
     residual: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    out: torch.Tensor,
     compute_gram: bool = False,
 ) -> None:
     tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[2])
+    hidden_size = int(residual.shape[1])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
     partials_per_cta = _selected_post_pre_partials_per_cta(
         num_tokens=tokens,
         hidden_size=hidden_size,
     )
-    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
-    _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
+    _validate_tensor_shape("residual", residual, (tokens, hidden_size))
+    _validate_tensor_shape("fn", fn, (_MIXES, hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
+    _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
     compute_gram = bool(compute_gram)
     args = (
         _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
@@ -5436,7 +5453,7 @@ def _run_mhc_pre_partial_launch(
             assumed_align=4,
             dynamic_layout=True,
         ),
-        _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
         Int32(tokens),
         current_cuda_stream(),
     )
@@ -5446,14 +5463,13 @@ def _run_mhc_pre_partial_launch(
             residual,
             dims=(
                 DimKey.dynamic(),
-                DimKey.exact(_MHC_MULT),
                 DimKey.exact(hidden_size),
             ),
         ),
         tensor_key(
             "fn",
             fn,
-            dims=(DimKey.exact(_MIXES), DimKey.exact(_MHC_MULT * hidden_size)),
+            dims=(DimKey.exact(_MIXES), DimKey.exact(hidden_size)),
         ),
         tensor_key(
             "partials",
@@ -5462,6 +5478,15 @@ def _run_mhc_pre_partial_launch(
                 DimKey.dynamic(),
                 DimKey.exact(split_k),
                 DimKey.exact(_PARTIALS),
+            ),
+        ),
+        tensor_key(
+            "out",
+            out,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(_MHC_MULT),
+                DimKey.exact(hidden_size),
             ),
         ),
     )
@@ -5508,18 +5533,20 @@ def _run_mhc_pre_partial_launch(
 
 @torch.library.custom_op(
     "b12x::mhc_pre_partial_launch",
-    mutates_args=("partials",),
+    mutates_args=("partials", "out"),
 )
 def _mhc_pre_partial_launch_op(
     residual: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    out: torch.Tensor,
     compute_gram: bool,
 ) -> None:
     _run_mhc_pre_partial_launch(
         residual=residual,
         fn=fn,
         partials=partials,
+        out=out,
         compute_gram=compute_gram,
     )
 
@@ -5529,6 +5556,7 @@ def _mhc_pre_partial_launch_fake(
     residual: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    out: torch.Tensor,
     compute_gram: bool,
 ) -> None:
     return None
@@ -5539,12 +5567,14 @@ def run_mhc_pre_partial(
     residual: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    out: torch.Tensor,
     compute_gram: bool = False,
 ) -> None:
     torch.ops.b12x.mhc_pre_partial_launch(
         residual,
         fn,
         partials,
+        out,
         bool(compute_gram),
     )
 
@@ -5952,9 +5982,9 @@ def _mhc_pre_launch_functional_op(
     sinkhorn_iters: int,
     norm_eps: float,
     fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[2])
+    hidden_size = int(residual.shape[1])
     split_k = _split_k_for_hidden(hidden_size)
     partials = torch.empty(
         (tokens, split_k, _PARTIALS),
@@ -5976,15 +6006,21 @@ def _mhc_pre_launch_functional_op(
         dtype=torch.float32,
         device=residual.device,
     )
+    out = torch.empty(
+        (tokens, _MHC_MULT, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
     if tokens != 0:
         _run_mhc_pre_partial_launch(
             residual=residual,
             fn=fn,
             partials=partials,
+            out=out,
             compute_gram=fuse_norm,
         )
         _run_mhc_finalize_gram_launch(
-            residual=residual,
+            residual=out,
             partials=partials,
             scale=scale,
             bias=bias,
@@ -5998,7 +6034,7 @@ def _mhc_pre_launch_functional_op(
             norm_eps=norm_eps,
             fuse_norm=fuse_norm,
         )
-    return y, post, comb
+    return out, post, comb, y
 
 
 @_mhc_pre_launch_functional_op.register_fake
@@ -6013,9 +6049,9 @@ def _mhc_pre_launch_functional_fake(
     sinkhorn_iters: int,
     norm_eps: float,
     fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = residual.shape[0]
-    hidden_size = residual.shape[2]
+    hidden_size = residual.shape[1]
     y = torch.empty(
         (tokens, hidden_size),
         dtype=residual.dtype,
@@ -6031,7 +6067,12 @@ def _mhc_pre_launch_functional_fake(
         dtype=torch.float32,
         device=residual.device,
     )
-    return y, post, comb
+    out = torch.empty(
+        (tokens, _MHC_MULT, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    return out, post, comb, y
 
 
 def run_mhc_pre_functional(
@@ -6045,7 +6086,7 @@ def run_mhc_pre_functional(
     sinkhorn_iters: int,
     norm_weight: torch.Tensor | None,
     norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
     return torch.ops.b12x.mhc_pre_launch_functional(
         residual,

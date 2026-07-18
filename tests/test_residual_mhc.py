@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from b12x.integration import (
     B12XMHCScratchCaps,
+    b12x_mhc_pre,
     b12x_mhc_post,
     b12x_mhc_post_pre,
     plan_mhc_scratch,
@@ -107,6 +108,74 @@ def _make_mhc_binding(
         comb=torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
         out=torch.empty((tokens, 4, hidden_size), dtype=torch.bfloat16, device=device),
     )
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 8])
+def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
+    device = require_sm120()
+    hidden_size = 4096
+    _, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_420 + tokens,
+        device=device,
+    )
+    fn_broadcast = fn.view(24, 4, hidden_size).sum(dim=1).contiguous()
+    binding = _make_mhc_binding(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        device=device,
+    )
+    norm_gen = torch.Generator(device="cpu")
+    norm_gen.manual_seed(91_421 + tokens)
+    norm_weight = (
+        torch.randn((hidden_size,), generator=norm_gen, dtype=torch.float32)
+        .to(device)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+
+    residual, post, comb, y = b12x_mhc_pre(
+        x,
+        fn_broadcast,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+        binding=binding,
+    )
+    torch.cuda.synchronize(device)
+
+    residual_ref = x.unsqueeze(1).expand(-1, 4, -1)
+    y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
+        residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    rms_scale = torch.rsqrt(
+        y_raw_ref.square().mean(dim=-1, keepdim=True) + 1e-6
+    )
+    y_ref = (
+        y_raw_ref.to(torch.bfloat16).float()
+        * rms_scale
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    assert residual.untyped_storage().data_ptr() == binding.out.untyped_storage().data_ptr()
+    assert post.untyped_storage().data_ptr() == binding.post_buffer.untyped_storage().data_ptr()
+    assert comb.untyped_storage().data_ptr() == binding.comb_buffer.untyped_storage().data_ptr()
+    assert y.untyped_storage().data_ptr() == binding.y.untyped_storage().data_ptr()
+    torch.testing.assert_close(residual, residual_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])

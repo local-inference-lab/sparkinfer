@@ -91,7 +91,7 @@ class B12XMHCBinding:
         norm_eps: float = 0.0,
         block_k: int = MHC_DEFAULT_BLOCK_K,
         block_h: int = MHC_DEFAULT_BLOCK_H,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return b12x_mhc_pre(
             residual,
             fn,
@@ -464,18 +464,19 @@ def _validate_pre_inputs(
         raise ValueError("residual must be a CUDA tensor")
     if residual.dtype != torch.bfloat16:
         raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
-    if residual.ndim != 3:
-        raise ValueError(f"residual must be rank-3 [tokens, 4, hidden], got {tuple(residual.shape)}")
-    tokens, hc_mult, hidden_size = map(int, residual.shape)
-    if hc_mult != MHC_MULT:
-        raise ValueError(f"residual hc dimension must be {MHC_MULT}, got {hc_mult}")
+    if residual.ndim != 2:
+        raise ValueError(
+            "residual must be rank-2 [tokens, hidden], got "
+            f"{tuple(residual.shape)}"
+        )
+    tokens, hidden_size = map(int, residual.shape)
     if hidden_size <= 0:
         raise ValueError("hidden_size must be positive")
     if fn.dtype != torch.float32:
         raise ValueError(f"fn must be torch.float32, got {fn.dtype}")
-    if fn.shape != (MHC_MIXES, MHC_MULT * hidden_size):
+    if fn.shape != (MHC_MIXES, hidden_size):
         raise ValueError(
-            f"fn must have shape {(MHC_MIXES, MHC_MULT * hidden_size)}, got {tuple(fn.shape)}"
+            f"fn must have shape {(MHC_MIXES, hidden_size)}, got {tuple(fn.shape)}"
         )
     if hc_scale.dtype != torch.float32 or tuple(hc_scale.shape) != (3,):
         raise ValueError(f"hc_scale must be float32 shape [3], got {hc_scale.dtype} {tuple(hc_scale.shape)}")
@@ -484,6 +485,58 @@ def _validate_pre_inputs(
             f"hc_base must be float32 shape [{MHC_MIXES}], got {hc_base.dtype} {tuple(hc_base.shape)}"
         )
     if fn.device != residual.device or hc_scale.device != residual.device or hc_base.device != residual.device:
+        raise ValueError("fn, hc_scale, and hc_base must be on the residual device")
+    _require_contiguous(residual, name="residual")
+    _require_contiguous(fn, name="fn")
+    _require_contiguous(hc_scale, name="hc_scale")
+    _require_contiguous(hc_base, name="hc_base")
+    return tokens, hidden_size, MHC_MULT * hidden_size
+
+
+def _validate_post_pre_inputs(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+) -> tuple[int, int, int]:
+    if residual.device.type != "cuda":
+        raise ValueError("residual must be a CUDA tensor")
+    if residual.dtype != torch.bfloat16:
+        raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
+    if residual.ndim != 3:
+        raise ValueError(
+            "residual must be rank-3 [tokens, 4, hidden], got "
+            f"{tuple(residual.shape)}"
+        )
+    tokens, hc_mult, hidden_size = map(int, residual.shape)
+    if hc_mult != MHC_MULT:
+        raise ValueError(
+            f"residual hc dimension must be {MHC_MULT}, got {hc_mult}"
+        )
+    if hidden_size <= 0:
+        raise ValueError("hidden_size must be positive")
+    if fn.dtype != torch.float32:
+        raise ValueError(f"fn must be torch.float32, got {fn.dtype}")
+    if fn.shape != (MHC_MIXES, MHC_MULT * hidden_size):
+        raise ValueError(
+            "fn must have shape "
+            f"{(MHC_MIXES, MHC_MULT * hidden_size)}, got {tuple(fn.shape)}"
+        )
+    if hc_scale.dtype != torch.float32 or tuple(hc_scale.shape) != (3,):
+        raise ValueError(
+            "hc_scale must be float32 shape [3], got "
+            f"{hc_scale.dtype} {tuple(hc_scale.shape)}"
+        )
+    if hc_base.dtype != torch.float32 or tuple(hc_base.shape) != (MHC_MIXES,):
+        raise ValueError(
+            f"hc_base must be float32 shape [{MHC_MIXES}], got "
+            f"{hc_base.dtype} {tuple(hc_base.shape)}"
+        )
+    if (
+        fn.device != residual.device
+        or hc_scale.device != residual.device
+        or hc_base.device != residual.device
+    ):
         raise ValueError("fn, hc_scale, and hc_base must be on the residual device")
     _require_contiguous(residual, name="residual")
     _require_contiguous(fn, name="fn")
@@ -542,6 +595,7 @@ def _b12x_mhc_pre_impl(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    residual_out: torch.Tensor | None = None,
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
@@ -551,12 +605,13 @@ def _b12x_mhc_pre_impl(
     split_k: int = MHC_DEFAULT_SPLIT_K,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # See b12x_mhc_post_pre: caller-owned buffers -> mutating ops; no buffers
     # (e.g. torch.compile) -> a single functional op (allocate + return) so the
     # compile graph has zero auto_functionalized mHC nodes. No is_compiling.
     _caller_owned_buffers = (
         binding is not None
+        or residual_out is not None
         or y_out is not None
         or post_out is not None
         or comb_out is not None
@@ -566,6 +621,7 @@ def _b12x_mhc_pre_impl(
         extras = [
             name
             for name, value in (
+                ("residual_out", residual_out),
                 ("y_out", y_out),
                 ("post_out", post_out),
                 ("comb_out", comb_out),
@@ -578,6 +634,7 @@ def _b12x_mhc_pre_impl(
                 f"do not also pass {', '.join(extras)}"
             )
         partials = binding.partials
+        residual_out = binding.out
         y_out = binding.y
         post_out = binding.post_buffer
         comb_out = binding.comb_buffer
@@ -621,6 +678,22 @@ def _b12x_mhc_pre_impl(
             raise ValueError("mHC partials must be float32 on the residual device")
         _require_contiguous(partials, name="mHC partials")
 
+    if residual_out is None:
+        residual_out = torch.empty(
+            (tokens, MHC_MULT, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
+    else:
+        residual_out = _slice_capacity_view(
+            residual_out,
+            tokens=tokens,
+            tail_shape=(MHC_MULT, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="residual_out",
+        )
+
     if y_out is None:
         y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
     else:
@@ -655,18 +728,23 @@ def _b12x_mhc_pre_impl(
             name="comb_out",
         )
 
+    if residual_out.shape != (tokens, MHC_MULT, hidden_size):
+        raise ValueError("residual_out must have shape [tokens, 4, hidden_size]")
+    if residual_out.dtype != residual.dtype or residual_out.device != residual.device:
+        raise ValueError("residual_out must match the residual dtype and device")
     if y_out.shape != (tokens, hidden_size) or y_out.dtype != residual.dtype or y_out.device != residual.device:
         raise ValueError("y_out must match shape [tokens, hidden_size], residual dtype, and residual device")
     if post_out.shape != (tokens, MHC_MULT) or post_out.dtype != torch.float32 or post_out.device != residual.device:
         raise ValueError("post_out must match shape [tokens, 4], dtype float32, and residual device")
     if comb_out.shape != (tokens, MHC_MULT, MHC_MULT) or comb_out.dtype != torch.float32 or comb_out.device != residual.device:
         raise ValueError("comb_out must match shape [tokens, 4, 4], dtype float32, and residual device")
+    _require_contiguous(residual_out, name="residual_out")
     _require_contiguous(y_out, name="y_out")
     _require_contiguous(post_out, name="post_out")
     _require_contiguous(comb_out, name="comb_out")
 
     if tokens == 0:
-        return y_out, post_out, comb_out
+        return residual_out, post_out, comb_out, y_out
 
     if (
         partials is not None
@@ -706,10 +784,11 @@ def _b12x_mhc_pre_impl(
             residual=residual,
             fn=fn,
             partials=partials,
+            out=residual_out,
             compute_gram=norm_weight is not None,
         )
         run_mhc_finalize_gram(
-            residual=residual,
+            residual=residual_out,
             partials=partials,
             scale=hc_scale,
             bias=hc_base,
@@ -722,7 +801,7 @@ def _b12x_mhc_pre_impl(
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
         )
-        return y_out, post_out, comb_out
+        return residual_out, post_out, comb_out, y_out
 
     raise ValueError(
         "b12x_mhc_pre is served only by the fused Gram kernel, which "
@@ -809,7 +888,9 @@ def _b12x_mhc_post_pre_impl(
         if expected_m is None:
             expected_m = binding.expected_m
 
-    tokens, hidden_size, _ = _validate_pre_inputs(residual, fn, hc_scale, hc_base)
+    tokens, hidden_size, _ = _validate_post_pre_inputs(
+        residual, fn, hc_scale, hc_base
+    )
     expected_m = _canonicalize_mhc_expected_m(expected_m, min_tokens=tokens)
     policy_m = tokens if expected_m is None else expected_m
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
@@ -1235,7 +1316,7 @@ def _mhc_pre_planned_functional_op(
     split_k: int,
     block_k: int,
     block_h: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _b12x_mhc_pre_impl(
         residual,
         fn,
@@ -1267,12 +1348,12 @@ def _mhc_pre_planned_functional_fake(
     split_k: int,
     block_k: int,
     block_h: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del fn, hc_scale, hc_base, norm_weight
     del rms_eps, hc_eps, sinkhorn_iters, norm_eps, fuse_norm
     del split_k, block_k, block_h
     tokens = residual.shape[0]
-    hidden_size = residual.shape[2]
+    hidden_size = residual.shape[1]
     y = torch.empty(
         (tokens, hidden_size),
         dtype=residual.dtype,
@@ -1288,7 +1369,12 @@ def _mhc_pre_planned_functional_fake(
         dtype=torch.float32,
         device=residual.device,
     )
-    return y, post, comb
+    residual_out = torch.empty(
+        (tokens, MHC_MULT, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    return residual_out, post, comb, y
 
 
 @torch.library.custom_op(
@@ -1423,6 +1509,7 @@ def b12x_mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    residual_out: torch.Tensor | None = None,
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
@@ -1432,10 +1519,14 @@ def b12x_mhc_pre(
     split_k: int = MHC_DEFAULT_SPLIT_K,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     compiling = torch.compiler.is_compiling()
     no_caller_owned_buffers = (
-        binding is None and y_out is None and post_out is None and comb_out is None
+        binding is None
+        and residual_out is None
+        and y_out is None
+        and post_out is None
+        and comb_out is None
     )
     if compiling and no_caller_owned_buffers:
         norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
@@ -1467,6 +1558,7 @@ def b12x_mhc_pre(
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
+        residual_out=residual_out,
         y_out=y_out,
         post_out=post_out,
         comb_out=comb_out,

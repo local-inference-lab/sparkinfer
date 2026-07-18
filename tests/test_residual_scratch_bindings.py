@@ -242,14 +242,16 @@ def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
     y_storage = torch.empty((4, 16), dtype=torch.bfloat16)
     post_storage = torch.empty((4, 4), dtype=torch.float32)
     comb_storage = torch.empty((4, 4, 4), dtype=torch.float32)
+    residual_storage = torch.empty((4, 4, 16), dtype=torch.bfloat16)
     binding = plan.bind(
         scratch=scratch,
         y=y_storage,
         post=post_storage,
         comb=comb_storage,
+        out=residual_storage,
     )
-    residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
-    fn = torch.empty((24, 64), dtype=torch.float32)
+    residual = torch.empty((0, 16), dtype=torch.bfloat16)
+    fn = torch.empty((24, 16), dtype=torch.float32)
     hc_scale = torch.empty((3,), dtype=torch.float32)
     hc_base = torch.empty((24,), dtype=torch.float32)
 
@@ -258,7 +260,7 @@ def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
 
     monkeypatch.setattr(residual_impl, "_validate_pre_inputs", fake_validate_pre_inputs)
 
-    y, post, comb = residual_impl.b12x_mhc_pre(
+    residual_out, post, comb, y = residual_impl.b12x_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -269,12 +271,14 @@ def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
         binding=binding,
     )
 
+    assert residual_out.shape == (0, 4, 16)
     assert y.shape == (0, 16)
     assert post.shape == (0, 4)
     assert comb.shape == (0, 4, 4)
     assert y.untyped_storage().data_ptr() == y_storage.untyped_storage().data_ptr()
     assert post.untyped_storage().data_ptr() == post_storage.untyped_storage().data_ptr()
     assert comb.untyped_storage().data_ptr() == comb_storage.untyped_storage().data_ptr()
+    assert residual_out.untyped_storage().data_ptr() == residual_storage.untyped_storage().data_ptr()
 
 
 def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
@@ -307,10 +311,14 @@ def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
     hc_scale = torch.empty((3,), dtype=torch.float32)
     hc_base = torch.empty((24,), dtype=torch.float32)
 
-    def fake_validate_pre_inputs(*args):
+    def fake_validate_post_pre_inputs(*args):
         return 0, 16, MHC_DEFAULT_SPLIT_K * MHC_DEFAULT_BLOCK_K
 
-    monkeypatch.setattr(residual_impl, "_validate_pre_inputs", fake_validate_pre_inputs)
+    monkeypatch.setattr(
+        residual_impl,
+        "_validate_post_pre_inputs",
+        fake_validate_post_pre_inputs,
+    )
 
     residual_cur, post, comb, y = residual_impl.b12x_mhc_post_pre(
         x,
@@ -352,8 +360,8 @@ def test_mhc_pre_binding_owns_outputs() -> None:
 
     with pytest.raises(ValueError, match="binding owns scratch and output buffers"):
         residual_impl.b12x_mhc_pre(
-            torch.empty((0, 4, 16), dtype=torch.bfloat16),
-            torch.empty((24, 64), dtype=torch.float32),
+            torch.empty((0, 16), dtype=torch.bfloat16),
+            torch.empty((24, 16), dtype=torch.float32),
             torch.empty((3,), dtype=torch.float32),
             torch.empty((24,), dtype=torch.float32),
             rms_eps=1e-6,
