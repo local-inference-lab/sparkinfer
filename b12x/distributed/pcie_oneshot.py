@@ -913,6 +913,7 @@ class PCIeOneshotAllReducePool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeOneshotAllReduce] = {}
+        self._capture_channel_stack: list[PCIeOneshotAllReduce] = []
         self._closed = False
 
         self._ipc = ipc
@@ -1045,11 +1046,18 @@ class PCIeOneshotAllReducePool:
         if _is_current_stream_capturing(self.device):
             # Piecewise / inductor CUDA graphs (MTP, spec-decode) capture on a
             # torch-owned stream that we cannot pre-register before capture
-            # starts. Allocating a fresh channel here is impossible (it would
-            # touch CUDA APIs that are illegal mid-capture), so reuse an
-            # existing channel: the signal/IPC buffers are stream-agnostic and
-            # the all-reduce is recorded on the current (capturing) stream and
-            # replays on whatever stream the caller uses.
+            # starts. Reuse the channel selected by the enclosing vLLM graph
+            # capture, not an arbitrary channel from another graph manager.
+            # Target and draft graph managers can replay independently; if
+            # their nested captures share signal/staging buffers, they race.
+            if self._capture_channel_stack:
+                channel = self._capture_channel_stack[-1]
+                self._channels[channel_key] = channel
+                return channel
+            # Preserve compatibility for callers that enter CUDA capture
+            # without the pool.capture() context. They must already have a
+            # channel because allocating CUDA IPC storage mid-capture is
+            # illegal.
             if self._channels:
                 channel = next(iter(self._channels.values()))
                 self._channels[channel_key] = channel
@@ -1111,7 +1119,13 @@ class PCIeOneshotAllReducePool:
     def capture(self, stream: object = None):
         channel = self.for_stream(stream)
         with channel.capture(stream=stream):
-            yield channel
+            self._capture_channel_stack.append(channel)
+            try:
+                yield channel
+            finally:
+                popped = self._capture_channel_stack.pop()
+                if popped is not channel:
+                    raise RuntimeError("PCIe oneshot capture channel stack corrupted")
 
     def close(self) -> None:
         if self._closed:

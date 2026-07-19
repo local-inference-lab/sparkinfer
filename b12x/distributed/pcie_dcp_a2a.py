@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -512,6 +512,7 @@ class PCIeDCPA2APool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
+        self._capture_channel_stack: list[PCIeDCPA2A] = []
         self._closed = False
         if channel_factory is None and exchange_group is None:
             raise ValueError("exchange_group is required unless channel_factory is set")
@@ -597,6 +598,13 @@ class PCIeDCPA2APool:
         if channel is not None:
             return channel
         if _is_current_stream_capturing(self.device):
+            # Nested piecewise captures use a torch-owned stream key that is
+            # unavailable before capture begins. Reuse the channel selected by
+            # the enclosing graph manager, never one owned by another graph.
+            if self._capture_channel_stack:
+                channel = self._capture_channel_stack[-1]
+                self._channels[key] = channel
+                return channel
             if self._channels:
                 channel = next(iter(self._channels.values()))
                 self._channels[key] = channel
@@ -664,6 +672,18 @@ class PCIeDCPA2APool:
             threads=threads,
             block_limit=block_limit,
         )
+
+    @contextmanager
+    def capture(self, stream: object = None):
+        """Bind nested CUDA captures to the enclosing stream's channel."""
+        channel = self.for_stream(stream)
+        self._capture_channel_stack.append(channel)
+        try:
+            yield channel
+        finally:
+            popped = self._capture_channel_stack.pop()
+            if popped is not channel:
+                raise RuntimeError("PCIe DCP A2A capture channel stack corrupted")
 
     def close(self) -> None:
         if self._closed:

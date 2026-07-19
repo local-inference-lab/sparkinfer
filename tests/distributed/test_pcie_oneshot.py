@@ -660,3 +660,48 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
     pool._channels[7] = _make_runtime(eager=True)
 
     assert pool.for_stream() is pool._channels[7]
+
+
+def test_nested_capture_reuses_its_outer_channel(monkeypatch):
+    created = []
+    current_stream = [7]
+    capturing = [False]
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as target_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is target_channel
+        capturing[0] = False
+
+    with pool.capture(8) as draft_channel:
+        capturing[0] = True
+        current_stream[0] = 80
+        assert pool.for_stream() is draft_channel
+        capturing[0] = False
+
+    assert target_channel is not draft_channel
+    assert pool._channels[70] is target_channel
+    assert pool._channels[80] is draft_channel
+    assert [entry[0] for entry in created] == [7, 8]
