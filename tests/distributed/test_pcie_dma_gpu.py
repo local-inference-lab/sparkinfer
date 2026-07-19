@@ -122,7 +122,9 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
     _worker(rank, world_size, port)
 
 
-@pytest.mark.parametrize("mode", ["ag", "a2a", "ring"])
+@pytest.mark.parametrize(
+    "mode", ["ag", "a2a", "ring", "i8", "i8_a2a", "i8_ring"]
+)
 def test_pcie_dma_all_reduce_fp8_wire(mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
