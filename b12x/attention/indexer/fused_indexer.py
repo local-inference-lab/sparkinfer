@@ -88,6 +88,7 @@ from b12x.cute.fp4 import (
     atomic_add_global_i32,
     fmax_f32,
     get_ptr_as_int64,
+    ld_global_nc_f32,
     ld_global_nc_u32,
     ld_global_v4_u32,
     ldmatrix_m8n8x4_b16,
@@ -359,7 +360,7 @@ def _score_tokens_direct_k(
     s_w: cute.Tensor,
     num_heads: Int32,
     k_quant_bytes: cute.Tensor,
-    k_byte_off: Int32,
+    k_byte_off: Int64,
     lane: Int32,
     num_q_head_tiles: cutlass.Constexpr[int],
 ):
@@ -377,13 +378,13 @@ def _score_tokens_direct_k(
     q_row = lane & Int32(15)
     q_half = lane >> Int32(4)
     k0_0 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off))
-    k1_0 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(16)))
-    k0_1 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(32)))
-    k1_1 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(48)))
-    k0_2 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(64)))
-    k1_2 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(80)))
-    k0_3 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(96)))
-    k1_3 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int32(112)))
+    k1_0 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(16)))
+    k0_1 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(32)))
+    k1_1 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(48)))
+    k0_2 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(64)))
+    k1_2 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(80)))
+    k0_3 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(96)))
+    k1_3 = ld_global_nc_u32(get_ptr_as_int64(k_quant_bytes, k_byte_off + Int64(112)))
     total0 = Float32(0.0)
     total1 = Float32(0.0)
     qgrp = lane // Int32(4)
@@ -1522,9 +1523,8 @@ class SparseNSAFusedIndexerKernel:
                 t0 = Float32(0.0)
                 t1 = Float32(0.0)
                 if pid >= Int32(0):
-                    k_off = (
-                        pid * Int32(self.k_quant_page_stride)
-                        + (tip0 + lane // Int32(4)) * Int32(_INDEX_HEAD_DIM)
+                    k_off = Int64(pid) * Int64(self.k_quant_page_stride) + Int64(
+                        (tip0 + lane // Int32(4)) * Int32(_INDEX_HEAD_DIM)
                         + lane4 * Int32(4)
                     )
                     t0, t1 = _score_tokens_direct_k(
@@ -1548,8 +1548,14 @@ class SparseNSAFusedIndexerKernel:
                                     tsel = t0
                                 else:
                                     tsel = t1
+                                scale_addr = get_ptr_as_int64(
+                                    k_scales,
+                                    Int64(pid)
+                                    * Int64(self.k_scales_row_stride)
+                                    + Int64(tip0 + col),
+                                )
                                 val = Float32(
-                                    tsel * Float32(k_scales[pid, tip0 + col])
+                                    tsel * ld_global_nc_f32(scale_addr)
                                 )
                                 if cutlass.const_expr(self.paged_output):
                                     gidx = pid * Int32(_PAGE_SIZE) + tip0 + col
@@ -2324,7 +2330,7 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     # variants (e.g. heads=16/topk=2048/ctas=96) have pathologically long cold
     # compiles and their warm cubins are load-bearing.
     variant = (
-        "fused_indexer_v3_directk"
+        "fused_indexer_v4_directk64"
         if kernel.direct_k_score
         else "fused_indexer_v2_coop"
     )
