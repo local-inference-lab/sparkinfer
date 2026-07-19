@@ -67,6 +67,7 @@ from .tp_moe import (
     plan_tp_moe_execution,
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
+    tp_moe_plan_supports_aux_stream_overlap,
 )
 from .ep_moe import (
     EPExpertMap,
@@ -136,6 +137,7 @@ __all__ = [
     "plan_tp_moe_execution",
     "plan_b12x_fp4_moe_weights",
     "prepare_b12x_fp4_moe_weights",
+    "tp_moe_plan_supports_aux_stream_overlap",
     "EPExpertMap",
     "EPMoEFP4Binding",
     "EPMoEScratchCaps",

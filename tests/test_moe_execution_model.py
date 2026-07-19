@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from b12x.integration import tp_moe as tp_moe_impl
-from b12x.integration import plan_b12x_fp4_moe_weights, plan_tp_moe_execution
+from b12x.integration import (
+    plan_b12x_fp4_moe_weights,
+    plan_tp_moe_execution,
+    tp_moe_plan_supports_aux_stream_overlap,
+)
 from b12x.moe.execution import (
     GemmEngine,
     MoERegime,
@@ -212,6 +216,49 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
     assert w4a16.execution.route_block_rows is not None
 
 
+@pytest.mark.parametrize("quant_mode", ["nvfp4", "w4a8_nvfp4"])
+def test_nvfp4_split_micro_allows_aux_stream_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_mode: str,
+) -> None:
+    monkeypatch.delenv("B12X_NVFP4_SPLIT_DECODE", raising=False)
+    weights = _weight_plan(quant_mode, source_format="modelopt_nvfp4")
+    plan = plan_tp_moe_execution(
+        num_tokens=8,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode=quant_mode,
+    )
+
+    assert plan.implementation == "micro"
+    assert tp_moe_plan_supports_aux_stream_overlap(plan)
+
+
+def test_aux_stream_overlap_rejects_barrier_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weights = _weight_plan("nvfp4", source_format="modelopt_nvfp4")
+    micro = plan_tp_moe_execution(
+        num_tokens=8,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode="nvfp4",
+    )
+    dynamic = plan_tp_moe_execution(
+        num_tokens=64,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode="nvfp4",
+    )
+
+    monkeypatch.setenv("B12X_NVFP4_SPLIT_DECODE", "0")
+    assert not tp_moe_plan_supports_aux_stream_overlap(micro)
+    assert not tp_moe_plan_supports_aux_stream_overlap(dynamic)
+
+
 def test_workspace_plan_uses_weight_plan_source_contract() -> None:
     weights = _weight_plan(
         "w4a8_mx",
@@ -318,12 +365,9 @@ def test_non_128_aligned_e8m0_w4a16_shards_stay_source_native() -> None:
         plan = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=shard)
         assert WeightPreparationTransform.W4A16_NATIVE in plan.transforms
         assert (
-            plan.required_weight_layout("w4a16")
-            is PreparedWeightLayout.SOURCE_NATIVE
+            plan.required_weight_layout("w4a16") is PreparedWeightLayout.SOURCE_NATIVE
         )
 
     aligned = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=256)
     assert WeightPreparationTransform.W4A16_PACKED in aligned.transforms
-    assert (
-        aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED
-    )
+    assert aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED
