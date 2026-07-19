@@ -24,6 +24,23 @@
   values. Do not reuse stale arch strings or benchmark leaders without current
   evidence.
 
+## 64-bit addressing for pool-scaled offsets
+
+Any arithmetic that scales a page/block/row id into a byte or element offset
+(`pid * page_stride`, `block_id * row_stride`, ...) must be done in `Int64`.
+Serving pools on 100GB+ unified-memory parts exceed `2^31 / stride` pages, and
+allocators hand out high recycled ids — an `Int32` product works in every
+benchmark and dies in production.
+
+Corollary for testing: every repro or test for a kernel that indexes a paged
+pool MUST include a big-pid case with live pages parked past the
+`2^31 / stride` line (allocate a large mostly-uninitialized pool and point the
+page table at its tail). Small sequential test ids can never catch a 32-bit
+offset overflow: the direct-K indexer score (fixed in 778f66d) passed an
+exact-reference adversarial sweep and compute-sanitizer clean, then crashed
+vLLM with an illegal access on the second pass of every cached prompt — the
+first pass gets low pool ids, the second lands on high recycled ones.
+
 ## CUTLASS DSL migration methodology
 
 - Keep compiler migrations in a dedicated worktree with a matching isolated
