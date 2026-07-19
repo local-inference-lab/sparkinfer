@@ -50,6 +50,40 @@ IPC-backed PCIe one-shot allreduce (`b12x/distributed/`). The
 planning, scratch layout, and policy, so integrations only supply metadata and
 capacity limits.
 
+## PCIe DMA wire modes
+
+`PCIeDmaAllReduce` can compress eligible BF16 all-reduces. Configure it with
+`B12X_PCIE_DMA_FP8` (the legacy name now selects either E4M3 or signed INT8),
+or pass the same value as the `fp8=` constructor argument. The b12x vLLM
+integration forwards `VLLM_PCIE_DMA_FP8`.
+
+| Mode | Reduce-scatter | All-gather | When to use it |
+|---|---|---|---|
+| `0` | BF16 ring | BF16 ring | Unquantized baseline |
+| `ag` | BF16 ring | block E4M3 ring | E4M3 with quantization limited to the final broadcast |
+| `ring` | block E4M3 ring, requantized per hop | block E4M3 ring | Compress both phases while retaining the neighbor-ring topology |
+| `a2a` | block E4M3 scatter with FP32 accumulation | block E4M3 broadcast | Quantize each input once and overlap direct peer transfers |
+| `i8` | BF16 ring | block INT8 ring | INT8 with quantization limited to the final broadcast |
+| `i8_ring` | block INT8 ring, requantized per hop | block INT8 ring | Compress both phases with the INT8 codec |
+| `i8_a2a` | block INT8 scatter with FP32 accumulation | block INT8 broadcast | Use the quantize-once all-to-all topology with INT8 |
+
+Every compressed mode stores 128 one-byte values plus one FP32 scale per
+128-value block: 132 bytes instead of 256 bytes for BF16, a 48.4% wire-byte
+reduction with the same staging footprint for E4M3 and INT8. These modes are
+most useful for large prefill collectives on PCIe-only multi-GPU systems where
+peer transport is the bottleneck; they do not change the KV-cache format and
+usually do not affect small decode collectives. Choose an INT8 mode when E4M3
+does not pass the model's quality gates, and benchmark the ring and all-to-all
+variants on the target PCIe topology before selecting one.
+
+Compressed transport requires BF16 input and a per-rank shard divisible by
+128 elements; other shapes use the BF16 path. For vLLM launchers that expose
+both names, keep them equal:
+
+```bash
+VLLM_PCIE_DMA_FP8=i8 B12X_PCIE_DMA_FP8=i8 vllm serve ...
+```
+
 ## Using it
 
 Kernels are registered as torch custom ops under the `b12x::` namespace, so
