@@ -14,9 +14,7 @@ import torch
 from cutlass.base_dsl.compiler import OptLevel
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
-from cutlass.base_dsl._mlir_helpers import op as cutlass_op_helpers
-from cutlass.base_dsl.runtime import cuda as cutlass_cuda_runtime
-from cutlass.cute.nvgpu.warp import mma
+from cutlass._mlir_helpers import op as cutlass_op_helpers
 
 import b12x.cute.compiler as cute_compiler
 from b12x.cute.compiler import (
@@ -28,8 +26,9 @@ from b12x.cute.compiler import (
     _structural_cache_key,
     tensor_key,
 )
-from b12x.cute.runtime_patches import apply_cutlass_runtime_patches
 from b12x.cute.utils import make_ptr
+
+from .helpers import require_sm120
 
 
 def test_compile_only_cache_warning_is_suppressed() -> None:
@@ -72,47 +71,35 @@ def test_cutlass_source_locations_do_not_scan_for_enclosing_function(
     assert "getframeinfo(frame)" in frame_info.code_context[0]
 
 
-def test_cutlass_memory_debug_helpers_are_stubbed_when_disabled(monkeypatch) -> None:
-    if not hasattr(cutlass_cuda_runtime, "_memory_debug_snapshot") or not hasattr(
-        cutlass_cuda_runtime, "_memory_debug_log"
-    ):
-        pytest.skip("CUTLASS runtime has no memory debug snapshot helper")
+def test_cutlass_46_adapts_live_cuda_stream_handles() -> None:
+    device = require_sm120()
+    torch_stream = torch.cuda.Stream(device=device)
+    source = torch.arange(256, dtype=torch.float32, device=device)
+    result = torch.empty_like(source)
+    with torch.cuda.stream(torch_stream):
+        torch.add(source, 1.0, out=result)
 
-    monkeypatch.delenv("CUTLASS_DSL_CUDA_MEMORY_DEBUG", raising=False)
-    apply_cutlass_runtime_patches()
-
-    assert getattr(cutlass_cuda_runtime, "_b12x_memory_debug_patched", False)
-    assert cutlass_cuda_runtime._memory_debug_snapshot() == {
-        "free": None,
-        "total": None,
-        "used": None,
-        "torch_allocated": None,
-        "torch_reserved": None,
-        "external": None,
-        "device": None,
-    }
-    assert cutlass_cuda_runtime._memory_debug_log("test", {}) is None
-
-
-def test_cutlass_45_provides_sm121a_blockscaled_mma() -> None:
-    archs = {str(arch) for arch in mma.MmaSM120BlockScaledOp.admissible_archs}
-
-    assert "sm_121a" in archs
-    assert not hasattr(mma.MmaSM120BlockScaledOp, "_b12x_sm121a_patch")
-
-
-def test_cutlass_45_adapts_cuda_stream_handles() -> None:
     def kernel(stream: cuda.CUstream) -> None:
         pass
 
-    stream = cuda.CUstream(123)
+    stream = cuda.CUstream(torch_stream.cuda_stream)
     execution_args = ExecutionArgs(inspect.signature(kernel), kernel.__name__)
     exe_args, adapted_args = execution_args.generate_execution_args((stream,), {})
 
     assert len(adapted_args) == 1
     assert exe_args == [stream.getPtr()]
     stream_handle = ctypes.cast(exe_args[0], ctypes.POINTER(ctypes.c_void_p)).contents
-    assert stream_handle.value == 123
+    assert stream_handle.value == torch_stream.cuda_stream
+
+    # Synchronize the queued GPU work through the handle produced by CUTLASS's
+    # argument adapter.  This checks the 4.6 ABI against a live stream rather
+    # than only inspecting a fabricated host-side integer.
+    (status,) = cuda.cuStreamSynchronize(cuda.CUstream(stream_handle.value))
+    assert status == cuda.CUresult.CUDA_SUCCESS
+    torch.testing.assert_close(
+        result.cpu(),
+        torch.arange(256, dtype=torch.float32) + 1.0,
+    )
 
 
 def test_b12x_pointer_cache_key_is_structural() -> None:
@@ -146,8 +133,12 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
 
 
 def test_explicit_compile_spec_ignores_full_compile_signature() -> None:
-    fake_a = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
-    fake_b = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (8, 8), assumed_align=4)
+    fake_a = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (4, 8), assumed_align=4
+    )
+    fake_b = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (8, 8), assumed_align=4
+    )
     spec = KernelCompileSpec.from_fields(
         "test.explicit",
         1,

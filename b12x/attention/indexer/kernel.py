@@ -789,7 +789,6 @@ class SparseNSAPagedLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -812,7 +811,6 @@ class SparseNSAPagedLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1077,7 +1075,6 @@ class SparseNSAPagedSupertileLogitsKernel(SparseNSAPagedLogitsKernel):
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -1100,7 +1097,6 @@ class SparseNSAPagedSupertileLogitsKernel(SparseNSAPagedLogitsKernel):
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1193,7 +1189,6 @@ class SparseNSAScheduledSingleRowLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -1215,7 +1210,6 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1525,7 +1519,6 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -1547,7 +1540,6 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -3134,7 +3126,6 @@ class SparseNSAPagedStreamLogitsKernel:
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -3149,7 +3140,6 @@ class SparseNSAPagedStreamLogitsKernel:
         ).launch(
             grid=(q_bytes.shape[0], self.persistent_ctas, 1),
             block=[_STREAM_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -3494,4 +3484,3 @@ def _build_sparse_nsa_paged_stream_supertile_kernel(
         k_quant_page_stride=k_quant_page_stride,
         k_scales_row_stride=k_scales_row_stride,
     )
-

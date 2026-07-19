@@ -12,6 +12,8 @@ from benchmarks.benchmark_paged_attention import (
     _make_decode_bucket_shared_inputs,
     _relative_l2_error,
     _resolve_decode_graph_bucket_policy,
+    _strict_backend_replay_for_correctness,
+    _strict_guarded_replay_for_correctness,
 )
 
 from .helpers import require_sm120
@@ -115,15 +117,17 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         b12x_bucket.prepare_replay(context_tokens=context_tokens)
         fa2_bucket.prepare_replay(context_tokens=context_tokens)
         ref_out = _decode_reference_output(
-            shared=shared,
-            page_table=b12x_bucket.current_page_table,
-            cache_seqlens=b12x_bucket.current_cache_seqlens,
-            cu_seqlens_q=b12x_bucket.cu_seqlens_q,
+            read_only_snapshot=b12x_bucket.read_only_snapshot,
         )
 
-        b12x_bucket.graph.replay()
-        fa2_bucket.graph.replay()
-        torch.cuda.synchronize()
+        _strict_backend_replay_for_correctness(b12x_bucket)
+        _strict_guarded_replay_for_correctness(
+            backend="flashinfer-fa2",
+            graph=fa2_bucket.graph,
+            guarded_output=fa2_bucket.guarded_output,
+            read_only_snapshot=fa2_bucket.read_only_snapshot,
+            read_only_inputs=fa2_bucket.read_only_inputs,
+        )
 
         assert id(b12x_bucket.graph) == b12x_graph_id
         assert id(fa2_bucket.graph) == fa2_graph_id

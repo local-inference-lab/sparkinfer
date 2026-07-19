@@ -13,11 +13,11 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
+from cutlass import Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Int64, dsl_user_op
 
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
@@ -91,7 +91,9 @@ class CutePlaneProbe:
         self.internal_type = self.transport_dtype if use_internal_type else None
 
     @cute.jit
-    def __call__(self, mSrc: cute.Tensor, mOutWords: cute.Tensor, stream: cuda.CUstream):
+    def __call__(
+        self, mSrc: cute.Tensor, mOutWords: cute.Tensor, stream: cuda.CUstream
+    ):
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             mSrc,
@@ -100,11 +102,9 @@ class CutePlaneProbe:
             1,
             internal_type=self.internal_type,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(tma_tensor, mOutWords, tma_atom).launch(
             grid=(1, 1, 1),
             block=[32, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -153,7 +153,9 @@ class CutePlaneProbe:
         if lane == 0:
             cpasync.prefetch_descriptor(tma_atom)
 
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((_ROWS * _PLANE_COLS,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((_ROWS * _PLANE_COLS,), stride=(1,))
+        )
         mbar_ptr = storage.mbar_ptr.data_ptr()
 
         plane_layout = self._get_plane_layout()
@@ -172,7 +174,9 @@ class CutePlaneProbe:
         consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, 1
         )
-        producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+        producer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread
+        )
         pipe = cute_pipeline.PipelineTmaAsync.create(
             barrier_storage=mbar_ptr,
             num_stages=1,
@@ -223,12 +227,12 @@ class RawPtxPlaneProbe:
         self.plane_bytes = _ROWS * _PLANE_COLS
 
     @cute.jit
-    def __call__(self, mDescWords: cute.Tensor, mOutWords: cute.Tensor, stream: cuda.CUstream):
-        SharedStorage = self._get_shared_storage_cls()
+    def __call__(
+        self, mDescWords: cute.Tensor, mOutWords: cute.Tensor, stream: cuda.CUstream
+    ):
         self.kernel(mDescWords, mOutWords).launch(
             grid=(1, 1, 1),
             block=[32, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -256,7 +260,9 @@ class RawPtxPlaneProbe:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         mbar_ptr = storage.mbar_ptr.data_ptr()
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((_ROWS * _PLANE_COLS,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((_ROWS * _PLANE_COLS,), stride=(1,))
+        )
 
         if lane == 0:
             cute.arch.mbarrier_init(mbar_ptr, Int32(1))

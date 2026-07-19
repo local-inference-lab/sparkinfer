@@ -13,6 +13,9 @@ from b12x.attention.indexer.kernel import (
     run_paged_tiled_logits_kernel,
     run_paged_supertile_logits_kernel,
 )
+from b12x.attention.indexer.contiguous_kernel import (
+    build_indexer_contiguous_logits_kernel_binding,
+)
 from b12x.attention.indexer.tiled_topk import run_row_topk
 from b12x.attention.indexer.reference import (
     contiguous_logits_reference,
@@ -158,6 +161,72 @@ def _bind_contiguous_topk(
         scratch.k_quant[: int(k_quant.shape[0])],
         scratch.k_scale[: int(k_scale.shape[0])],
     )
+
+
+def _bind_staged_contiguous_logits(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    prefill_block_k: int | None,
+):
+    k_quant, k_scale = kv_fp8
+    q_rows = int(k_start.shape[0])
+    k_rows = int(k_quant.shape[0])
+    plan = plan_indexer_contiguous_scratch(
+        B12XIndexerContiguousScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=int(q_fp8.shape[1]),
+            max_q_rows=q_rows,
+            max_k_rows=k_rows,
+            topk=1,
+            supertile_k=max(k_rows, 256),
+        )
+    )
+    plan_binding = plan.bind(
+        scratch=_one_scratch(plan),
+        k_start=k_start,
+        k_end=k_end,
+        gather_rows=k_rows,
+        topk=1,
+    )
+    scratch = plan_binding.scratch
+    scratch.k_quant[:k_rows].copy_(k_quant)
+    scratch.k_scale[:k_rows].copy_(k_scale)
+    scratch.prepare_k_padding(k_rows=k_rows)
+    scratch_k_quant = scratch.k_quant[:k_rows]
+    scratch_k_scale = scratch.k_scale[:k_rows]
+    q_bytes = q_fp8.view(torch.uint8)
+    q_u32 = q_bytes.view(torch.uint32).view(
+        int(q_fp8.shape[0]),
+        int(q_fp8.shape[1]),
+        128 // 4,
+    )
+    out = torch.empty((q_rows, k_rows), dtype=torch.float32, device=q_fp8.device)
+    kernel_binding = build_indexer_contiguous_logits_kernel_binding(
+        q_fp8=q_fp8,
+        weights=weights,
+        k_quant=scratch_k_quant,
+        k_scale=scratch_k_scale,
+        k_start=k_start,
+        k_end=k_end,
+        preinitialize_invalid_logits=False,
+        prefill_block_k=prefill_block_k,
+        q_u32=q_u32,
+        q_bytes=q_bytes,
+        weights_kernel=weights,
+        k_quant_bytes=scratch.k_quant.view(torch.uint8),
+        k_scale_kernel=scratch.k_scale,
+        k_start_kernel=k_start,
+        k_end_kernel=k_end,
+        out_kernel=out,
+        out_view=out,
+        k_tma_desc_ptrs=scratch.k_tma_desc_ptrs,
+        k_tma_prefill_desc_ptrs=scratch.k_tma_prefill_desc_ptrs,
+    )
+    return kernel_binding, out, (scratch_k_quant, scratch_k_scale)
 
 
 def _paged_mqa_schedule_reference(
@@ -336,58 +405,6 @@ def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> Non
             valid_q_rows=2048,
             k_rows=65536,
             num_heads=64,
-        )
-
-
-def test_paged_decode_logits_cpu_hard_fails_without_fallback() -> None:
-    device = torch.device("cpu")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(72_100)
-
-    q_rows = 3
-    num_heads = 4
-    page_starts = [1, 3, 5]
-    width_blocks = 3
-    num_tokens = (max(page_starts) + width_blocks) * 64
-    seqlens = torch.tensor([65, 128, 150], dtype=torch.int32, device=device)
-    real_page_table = _make_real_page_table(
-        page_starts=page_starts,
-        seqlens=seqlens.tolist(),
-        width_blocks=width_blocks,
-        device=device,
-    )
-    q_fp8 = (
-        torch.randn(
-            (q_rows + 1, num_heads, 128),
-            generator=gen,
-            dtype=torch.float32,
-            device=device,
-        )
-        / 2
-    ).to(torch.float8_e4m3fn)
-    weights = torch.randn(
-        (q_rows + 1, num_heads), generator=gen, dtype=torch.float32, device=device
-    )
-    index_k_cache = pack_index_k_cache_reference(
-        torch.randn(
-            (num_tokens, 128), generator=gen, dtype=torch.float32, device=device
-        )
-        / 3
-    )
-
-    binding = _bind_paged_decode(
-        real_page_table=real_page_table,
-        cache_seqlens_int32=seqlens,
-        num_q_heads=num_heads,
-        schedule_metadata=build_paged_mqa_schedule_metadata(seqlens, 64, 8),
-    )
-
-    with pytest.raises(NotImplementedError, match="refusing to run the reference fallback"):
-        paged_decode_logits(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            binding=binding,
         )
 
 
@@ -571,7 +588,9 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
         graph_real_page_table[:, :live_width_blocks].copy_(page_table)
         graph_seqlens.copy_(seqlens)
         graph_active_width.copy_(
-            torch.clamp(graph_seqlens.amax().reshape(1), min=0, max=graph_width_blocks * 64)
+            torch.clamp(
+                graph_seqlens.amax().reshape(1), min=0, max=graph_width_blocks * 64
+            )
         )
         build_paged_mqa_schedule_metadata(
             graph_seqlens, 64, 8, out=graph_schedule_metadata
@@ -636,12 +655,11 @@ def test_paged_decode_logits_cuda_graph_replay_tracks_live_width_without_stale_o
     assert torch.isneginf(actual1[:, 65:]).all()
 
 
-@pytest.mark.parametrize(
-    "device",
-    [torch.device("cpu")]
-    + ([torch.device("cuda")] if torch.cuda.is_available() else []),
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for contiguous kernel coverage"
 )
-def test_contiguous_logits_matches_reference(device: torch.device) -> None:
+def test_contiguous_logits_matches_reference() -> None:
+    device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(72_103)
 
@@ -686,14 +704,11 @@ def test_contiguous_logits_matches_reference(device: torch.device) -> None:
     assert torch.isneginf(actual[-1]).all()
 
 
-@pytest.mark.parametrize(
-    "device",
-    [torch.device("cpu")]
-    + ([torch.device("cuda")] if torch.cuda.is_available() else []),
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for contiguous kernel coverage"
 )
-def test_contiguous_logits_matches_reference_for_sparse_tile_ranges(
-    device: torch.device,
-) -> None:
+def test_contiguous_logits_matches_reference_for_sparse_tile_ranges() -> None:
+    device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(72_104)
 
@@ -737,6 +752,144 @@ def test_contiguous_logits_matches_reference_for_sparse_tile_ranges(
     _assert_logits_close(actual, expected)
     assert torch.isneginf(actual[:32, 32:]).all()
     assert torch.isneginf(actual[32:, :128]).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture coverage"
+)
+@pytest.mark.parametrize(
+    "q_rows,num_heads,k_rows,prefill_block_k",
+    [
+        pytest.param(5, 3, 64, None, id="decode"),
+        pytest.param(256, 8, 512, 256, id="prefill256"),
+        pytest.param(1024, 32, 4096, 512, id="prefill512-h32"),
+    ],
+)
+def test_contiguous_logits_staged_binding_graph_replay_tracks_live_weights(
+    monkeypatch,
+    q_rows: int,
+    num_heads: int,
+    k_rows: int,
+    prefill_block_k: int | None,
+) -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(73_000 + q_rows * 31 + num_heads * 17 + k_rows)
+
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
+        / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    live_weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32
+    ).to(device=device)
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 3
+    )
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
+    binding, out, bound_kv_fp8 = _bind_staged_contiguous_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+        prefill_block_k=prefill_block_k,
+    )
+    k_quant, k_scale = bound_kv_fp8
+    sampled_q = torch.tensor(
+        sorted({0, q_rows // 2, q_rows - 1}), dtype=torch.long, device=device
+    )
+    sampled_k = torch.tensor(
+        sorted({0, 1, k_rows // 2, k_rows - 1}), dtype=torch.long, device=device
+    )
+
+    def sampled_reference() -> torch.Tensor:
+        scores = torch.einsum(
+            "qhd,kd->qhk",
+            q_fp8[sampled_q].to(torch.float32),
+            k_quant[sampled_k].to(torch.float32),
+        )
+        return (torch.relu(scores) * weights[sampled_q, :, None]).sum(dim=1) * k_scale[
+            sampled_k
+        ][None, :]
+
+    clear_indexer_caches()
+    binding.run()
+    torch.cuda.synchronize(device)
+    warm_compile_misses = compile_cache_info()["compile_misses"]
+
+    # A staged replay must not manufacture the historical 1x1/1x1x1 CUDA
+    # placeholder tensors. This guard makes the regression observable even
+    # though CUDA graph pools can otherwise hide a capture-time allocation.
+    real_empty = torch.empty
+
+    def reject_cuda_dummy_empty(*args, **kwargs):
+        requested_shape = (
+            tuple(args[0]) if args and isinstance(args[0], tuple) else None
+        )
+        requested_device = torch.device(kwargs.get("device", "cpu"))
+        if requested_device.type == "cuda" and requested_shape in ((1, 1), (1, 1, 1)):
+            raise AssertionError(
+                f"staged contiguous replay allocated CUDA dummy {requested_shape}"
+            )
+        return real_empty(*args, **kwargs)
+
+    freeze_kernel_resolution("staged contiguous graph replay must use warmed kernels")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", reject_cuda_dummy_empty)
+            guarded_out = binding.run()
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_out = binding.run()
+    finally:
+        unfreeze_kernel_resolution()
+
+    assert guarded_out.data_ptr() == out.data_ptr()
+    assert captured_out.data_ptr() == out.data_ptr()
+    input_ptrs = (
+        q_fp8.data_ptr(),
+        weights.data_ptr(),
+        k_quant.data_ptr(),
+        k_scale.data_ptr(),
+        k_start.data_ptr(),
+        k_end.data_ptr(),
+        out.data_ptr(),
+    )
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+    actual0 = out[sampled_q[:, None], sampled_k[None, :]].clone()
+    expected0 = sampled_reference()
+    _assert_logits_close(actual0, expected0)
+
+    weights.copy_(live_weights)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    actual1 = out[sampled_q[:, None], sampled_k[None, :]].clone()
+    expected1 = sampled_reference()
+    _assert_logits_close(actual1, expected1)
+    assert not torch.equal(actual0, actual1)
+    assert compile_cache_info()["compile_misses"] == warm_compile_misses
+    assert input_ptrs == (
+        q_fp8.data_ptr(),
+        weights.data_ptr(),
+        k_quant.data_ptr(),
+        k_scale.data_ptr(),
+        k_start.data_ptr(),
+        k_end.data_ptr(),
+        out.data_ptr(),
+    )
 
 
 @pytest.mark.skipif(
@@ -943,23 +1096,37 @@ def test_contiguous_logits_cuda_matches_reference_for_dense_long_prefill(
     assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
 
 
-def test_contiguous_tiled_topk_cpu_matches_reference() -> None:
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
+)
+def test_contiguous_tiled_topk_graph_replay_tracks_live_weights(monkeypatch) -> None:
+    device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
-    gen.manual_seed(72_610)
+    gen.manual_seed(73_620)
 
-    q_rows = 4
-    num_heads = 3
-    k_rows = 17
-    topk = 6
+    q_rows = 32
+    num_heads = 8
+    k_rows = 1024
+    topk = 512
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32) / 2
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
+        / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32)
-    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32) / 3
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    live_weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32
+    ).to(device=device)
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 3
+    )
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
-    k_start = torch.tensor([0, 2, 7, 16], dtype=torch.int32)
-    k_end = torch.tensor([9, 12, 17, 17], dtype=torch.int32)
-    metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
     binding, bound_kv_fp8 = _bind_contiguous_topk(
         kv_fp8=kv_fp8,
         k_start=k_start,
@@ -967,34 +1134,94 @@ def test_contiguous_tiled_topk_cpu_matches_reference() -> None:
         num_q_heads=num_heads,
         topk=topk,
         q_rows=q_rows,
-        strict=False,
+        supertile_k=k_rows,
     )
 
-    actual = contiguous_tiled_topk(
+    def expected_topk_values() -> torch.Tensor:
+        logits = contiguous_logits_reference(
+            q_fp8=q_fp8,
+            weights=weights,
+            kv_fp8=bound_kv_fp8,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        return torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).values
+
+    clear_indexer_caches()
+    contiguous_tiled_topk(
         q_fp8=q_fp8,
         weights=weights,
         kv_fp8=bound_kv_fp8,
         binding=binding,
     )
-    logits = contiguous_logits(
-        q_fp8=q_fp8,
-        weights=weights,
-        kv_fp8=kv_fp8,
-        metadata=metadata,
-    )
-    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :topk]
-    topk_values = torch.gather(logits, 1, topk_pos)
-    expected = torch.where(
-        torch.isfinite(topk_values),
-        topk_pos.to(torch.int32),
-        torch.full_like(topk_pos, -1, dtype=torch.int32),
-    )
+    torch.cuda.synchronize(device)
+    warm_compile_misses = compile_cache_info()["compile_misses"]
+
+    real_empty = torch.empty
+
+    def reject_cuda_dummy_empty(*args, **kwargs):
+        requested_shape = (
+            tuple(args[0]) if args and isinstance(args[0], tuple) else None
+        )
+        requested_device = torch.device(kwargs.get("device", "cpu"))
+        if requested_device.type == "cuda" and requested_shape in ((1, 1), (1, 1, 1)):
+            raise AssertionError(
+                f"staged tiled-topk replay allocated CUDA dummy {requested_shape}"
+            )
+        return real_empty(*args, **kwargs)
+
+    freeze_kernel_resolution("staged tiled top-k graph replay must use warmed kernels")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", reject_cuda_dummy_empty)
+            guarded_out = contiguous_tiled_topk(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=bound_kv_fp8,
+                binding=binding,
+            )
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_out = contiguous_tiled_topk(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=bound_kv_fp8,
+                binding=binding,
+            )
+    finally:
+        unfreeze_kernel_resolution()
 
     assert binding.output_indices is not None
-    assert binding.lengths is not None
-    assert actual.data_ptr() == binding.output_indices.data_ptr()
-    assert torch.equal(actual, expected)
-    assert torch.equal(binding.lengths[:q_rows], k_end - k_start)
+    assert binding.output_values is not None
+    assert guarded_out.data_ptr() == binding.output_indices.data_ptr()
+    assert captured_out.data_ptr() == binding.output_indices.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+    actual0 = binding.output_values.clone()
+    expected0 = expected_topk_values()
+    torch.testing.assert_close(
+        torch.sort(actual0, dim=1).values,
+        torch.sort(expected0, dim=1).values,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+    weights.copy_(live_weights)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    actual1 = binding.output_values.clone()
+    expected1 = expected_topk_values()
+    torch.testing.assert_close(
+        torch.sort(actual1, dim=1).values,
+        torch.sort(expected1, dim=1).values,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert not torch.equal(actual0, actual1)
+    assert compile_cache_info()["compile_misses"] == warm_compile_misses
 
 
 @pytest.mark.skipif(
@@ -1135,9 +1362,7 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     # tie-robust check is that the selected logit-VALUE multiset matches the
     # reference per row — that proves the fold returned a valid exact top-k.
     actual_values = torch.sort(torch.gather(logits, 1, actual.long()), dim=1).values
-    expected_values = torch.sort(
-        torch.gather(logits, 1, expected.long()), dim=1
-    ).values
+    expected_values = torch.sort(torch.gather(logits, 1, expected.long()), dim=1).values
     assert torch.equal(actual_values, expected_values)
 
 
@@ -1218,6 +1443,96 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
 
     assert actual.shape == (1536, topk)
     assert compile_cache_info()["compile_misses"] == warm_misses
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for indexer compile-cache coverage",
+)
+def test_row_topk_graph_replay_tracks_live_logits_and_lengths() -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(73_622)
+
+    rows = 17
+    width = 1024
+    topk = 512
+    row_logits = torch.randn((rows, width), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    live_logits = torch.randn((rows, width), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    lengths = torch.linspace(topk, width, rows, dtype=torch.float32, device=device).to(
+        torch.int32
+    )
+    live_lengths = torch.flip(lengths, dims=(0,)).contiguous()
+    output_values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    def expected_topk() -> torch.return_types.topk:
+        columns = torch.arange(width, dtype=torch.int32, device=device)
+        masked = torch.where(
+            columns[None, :] < lengths[:, None],
+            row_logits,
+            torch.full_like(row_logits, float("-inf")),
+        )
+        return torch.topk(masked, k=topk, dim=1, largest=True, sorted=False)
+
+    clear_indexer_caches()
+    run_row_topk(
+        row_logits=row_logits,
+        lengths=lengths,
+        topk=topk,
+        output_values=output_values,
+        output_indices=output_indices,
+    )
+    torch.cuda.synchronize(device)
+    warm_compile_misses = compile_cache_info()["compile_misses"]
+
+    freeze_kernel_resolution("row top-k graph replay must use the warmed kernel")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_values, captured_indices = run_row_topk(
+                row_logits=row_logits,
+                lengths=lengths,
+                topk=topk,
+                output_values=output_values,
+                output_indices=output_indices,
+            )
+    finally:
+        unfreeze_kernel_resolution()
+
+    assert captured_values.data_ptr() == output_values.data_ptr()
+    assert captured_indices.data_ptr() == output_indices.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+    expected0 = expected_topk()
+    assert torch.equal(
+        torch.sort(output_values, dim=1).values,
+        torch.sort(expected0.values, dim=1).values,
+    )
+    assert torch.equal(
+        torch.sort(output_indices, dim=1).values.to(torch.long),
+        torch.sort(expected0.indices, dim=1).values,
+    )
+
+    row_logits.copy_(live_logits)
+    lengths.copy_(live_lengths)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    expected1 = expected_topk()
+    assert torch.equal(
+        torch.sort(output_values, dim=1).values,
+        torch.sort(expected1.values, dim=1).values,
+    )
+    assert torch.equal(
+        torch.sort(output_indices, dim=1).values.to(torch.long),
+        torch.sort(expected1.indices, dim=1).values,
+    )
+    assert compile_cache_info()["compile_misses"] == warm_compile_misses
 
 
 @pytest.mark.skipif(

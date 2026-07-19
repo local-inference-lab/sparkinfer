@@ -72,7 +72,14 @@ class W4A8MaterializedPhase1Kernel:
     shared_bytes = max(pipeline_bytes, epilogue_bytes)
     shared_words = (shared_bytes + 3) // 4
 
-    def __init__(self, *, fast_math: bool = False, source_tile_m: int = 128):
+    def __init__(
+        self,
+        *,
+        fast_math: bool = False,
+        source_tile_m: int = 128,
+        deterministic_output: bool = False,
+        num_topk: int = 1,
+    ):
         if source_tile_m not in (64, 128):
             raise ValueError(
                 f"materialized phase 1 source_tile_m must be 64 or 128, got {source_tile_m}"
@@ -80,6 +87,10 @@ class W4A8MaterializedPhase1Kernel:
         self.fast_math = bool(fast_math)
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
+        self.deterministic_output = bool(deterministic_output)
+        if int(num_topk) <= 0:
+            raise ValueError(f"num_topk must be positive, got {num_topk}")
+        self.num_topk = int(num_topk)
 
     @cute.jit
     def __call__(
@@ -233,6 +244,8 @@ class W4A8MaterializedPhase1Kernel:
                 tok = Int32(0)
                 if row < valid_rows:
                     tok = token_map[physical_row_base + row].to(Int32)
+                    if cutlass.const_expr(self.deterministic_output):
+                        tok = tok // Int32(self.num_topk)
                 physical_vec = vec ^ (row & Int32(7))
                 src_word = (
                     tok * words_per_token
@@ -250,6 +263,8 @@ class W4A8MaterializedPhase1Kernel:
             tok = Int32(0)
             if tid < valid_rows:
                 tok = token_map[physical_row_base + tid].to(Int32)
+                if cutlass.const_expr(self.deterministic_output):
+                    tok = tok // Int32(self.num_topk)
             sf_src = (
                 tok * input_k128_tiles * Int32(4)
                 + (k64_slice >> Int32(1)) * Int32(4)
@@ -374,10 +389,28 @@ class W4A8MaterializedPhase1Kernel:
         )
         cute.arch.cp_async_commit_group()
 
-        gate_acc = cute.make_rmem_tensor((4, 4, 4), cutlass.Float32)
-        up_acc = cute.make_rmem_tensor((4, 4, 4), cutlass.Float32)
-        gate_acc.fill(0.0)
-        up_acc.fill(0.0)
+        # Keep each MMA's four accumulator registers as an independent
+        # fragment.  A single 4x4x4 mutable tensor makes the 4.6 lowering pack
+        # and unpack the complete live accumulator set around loop-carried
+        # values even though every MMA consumes exactly four adjacent values.
+        gate_acc = tuple(
+            tuple(
+                cute.make_rmem_tensor((4,), cutlass.Float32)
+                for _nt in range(4)
+            )
+            for _blk in range(4)
+        )
+        up_acc = tuple(
+            tuple(
+                cute.make_rmem_tensor((4,), cutlass.Float32)
+                for _nt in range(4)
+            )
+            for _blk in range(4)
+        )
+        for blk in cutlass.range_constexpr(4):
+            for nt in cutlass.range_constexpr(4):
+                gate_acc[blk][nt].fill(0.0)
+                up_acc[blk][nt].fill(0.0)
 
         input_k64_tiles = input_k128_tiles * Int32(2)
         k64_slice = Int32(0)
@@ -477,11 +510,12 @@ class W4A8MaterializedPhase1Kernel:
                         up_sfb_base + ((n8 * Int32(8) + q) << Int32(2))
                     ) >> scale_shift
                     for blk in cutlass.range_constexpr(4):
+                        gate_fragment = gate_acc[blk][nt]
                         g0, g1, g2, g3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                            gate_acc[blk, nt, 0],
-                            gate_acc[blk, nt, 1],
-                            gate_acc[blk, nt, 2],
-                            gate_acc[blk, nt, 3],
+                            gate_fragment[0],
+                            gate_fragment[1],
+                            gate_fragment[2],
+                            gate_fragment[3],
                             a_frag[blk, 0],
                             a_frag[blk, 1],
                             a_frag[blk, 2],
@@ -493,15 +527,16 @@ class W4A8MaterializedPhase1Kernel:
                             bid_a=kb,
                             bid_b=kb,
                         )
-                        gate_acc[blk, nt, 0] = g0
-                        gate_acc[blk, nt, 1] = g1
-                        gate_acc[blk, nt, 2] = g2
-                        gate_acc[blk, nt, 3] = g3
+                        gate_fragment[0] = g0
+                        gate_fragment[1] = g1
+                        gate_fragment[2] = g2
+                        gate_fragment[3] = g3
+                        up_fragment = up_acc[blk][nt]
                         u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                            up_acc[blk, nt, 0],
-                            up_acc[blk, nt, 1],
-                            up_acc[blk, nt, 2],
-                            up_acc[blk, nt, 3],
+                            up_fragment[0],
+                            up_fragment[1],
+                            up_fragment[2],
+                            up_fragment[3],
                             a_frag[blk, 0],
                             a_frag[blk, 1],
                             a_frag[blk, 2],
@@ -513,10 +548,10 @@ class W4A8MaterializedPhase1Kernel:
                             bid_a=kb,
                             bid_b=kb,
                         )
-                        up_acc[blk, nt, 0] = u0
-                        up_acc[blk, nt, 1] = u1
-                        up_acc[blk, nt, 2] = u2
-                        up_acc[blk, nt, 3] = u3
+                        up_fragment[0] = u0
+                        up_fragment[1] = u1
+                        up_fragment[2] = u2
+                        up_fragment[3] = u3
 
             cute.arch.sync_threads()
             k64_slice += Int32(1)
@@ -538,19 +573,21 @@ class W4A8MaterializedPhase1Kernel:
         for nt in cutlass.range_constexpr(4):
             col = col_base + Int32(nt * 8)
             for blk in cutlass.range_constexpr(4):
+                gate_fragment = gate_acc[blk][nt]
+                up_fragment = up_acc[blk][nt]
                 row_lo = Int32(blk * 16) + q
                 row_hi = row_lo + Int32(8)
                 act0 = self._activated_value(
-                    gate_acc[blk, nt, 0], up_acc[blk, nt, 0], alpha_value
+                    gate_fragment[0], up_fragment[0], alpha_value
                 )
                 act1 = self._activated_value(
-                    gate_acc[blk, nt, 1], up_acc[blk, nt, 1], alpha_value
+                    gate_fragment[1], up_fragment[1], alpha_value
                 )
                 act2 = self._activated_value(
-                    gate_acc[blk, nt, 2], up_acc[blk, nt, 2], alpha_value
+                    gate_fragment[2], up_fragment[2], alpha_value
                 )
                 act3 = self._activated_value(
-                    gate_acc[blk, nt, 3], up_acc[blk, nt, 3], alpha_value
+                    gate_fragment[3], up_fragment[3], alpha_value
                 )
                 st_shared_u32(
                     epilogue_base

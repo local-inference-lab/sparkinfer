@@ -3,8 +3,7 @@
 The ``run_unified_decode`` entrypoint builds views, plans split-K chunk ranges,
 launches the warp-specialized decode grid, and runs the shared base-2 split merge
 to produce final output. DSV4 compressed MLA and GLM_NSA use the same promoted
-SM120 runtime; the legacy kernels live under ``b12x.attention.mla.legacy`` and
-are no longer wired into public sparse-MLA dispatch.
+SM120 runtime; the retired pre-unification kernels have been removed.
 """
 
 from __future__ import annotations
@@ -657,7 +656,10 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        if cutlass.const_expr(t.has_extra_cache):
+            kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        else:
+            kv_sc_addr = Int32(0)
         kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
@@ -1282,7 +1284,10 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        if cutlass.const_expr(t.has_extra_cache):
+            kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        else:
+            kv_sc_addr = Int32(0)
         kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)

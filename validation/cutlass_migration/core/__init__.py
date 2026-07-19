@@ -1,0 +1,1 @@
+"""Shared migration qualification primitives."""

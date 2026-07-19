@@ -12,6 +12,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Float32, Int32, Uint32
+from cutlass.base_dsl.compiler import OptLevel, PtxasOptions
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.core import make_swizzle
 from cutlass.cute.nvgpu import cpasync
@@ -829,12 +830,31 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     warp_q_idx,
     warp_kv_idx,
     row_base,
-    num_mma_q,
     num_mma_kv,
     num_mma_d_qk,
     upcast_stride_k,
 ):
+    # This helper is decode-only: its sole call site maps one 16-row Q MMA
+    # tile per warp.  Keeping that invariant structural lets the two Q-row
+    # pointers stay materialized across the unrolled K dimension without
+    # silently aliasing a future second Q tile.
+    num_mma_q = 1
     unit_scale = Uint32(0x7F7F7F7F)
+    group_id = lane // Int32(4)
+    thread_id_in_group = lane % Int32(4)
+    row_base_q = warp_q_idx * Int32(16)
+    abs_row_0 = q_tile_base + row_base_q + group_id
+    abs_row_8 = abs_row_0 + Int32(8)
+    q_row_0 = cute.make_tensor(
+        q_u32.iterator
+        + cute.crd2idx((abs_row_0, head_idx, Int32(0)), q_u32.layout),
+        cute.make_layout((_FP8_ROW_U32,), stride=(1,)),
+    )
+    q_row_8 = cute.make_tensor(
+        q_u32.iterator
+        + cute.crd2idx((abs_row_8, head_idx, Int32(0)), q_u32.layout),
+        cute.make_layout((_FP8_ROW_U32,), stride=(1,)),
+    )
     k_offset = _permuted_offset_128b(
         row_base
         + warp_kv_idx * num_mma_kv * Int32(16)
@@ -851,31 +871,26 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         # RAW fragment order on BOTH operands: each Q fragment register is one
         # aligned u32 read (bytes {4t..4t+3} of the k-half), so the byte
         # gather + shift chain and the K-side 16b->8b swizzles both vanish.
-        group_id = lane // Int32(4)
-        thread_id_in_group = lane % Int32(4)
         u32_lo = Int32(mma_pair * 8) + thread_id_in_group
         u32_hi = u32_lo + Int32(4)
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
-            abs_row_0 = q_tile_base + row_base_q + group_id
-            abs_row_8 = abs_row_0 + Int32(8)
             q_regs[mma_q, 0] = (
-                Uint32(q_u32[abs_row_0, head_idx, u32_lo])
+                Uint32(q_row_0[u32_lo])
                 if abs_row_0 < valid_q_rows
                 else Uint32(0)
             )
             q_regs[mma_q, 1] = (
-                Uint32(q_u32[abs_row_8, head_idx, u32_lo])
+                Uint32(q_row_8[u32_lo])
                 if abs_row_8 < valid_q_rows
                 else Uint32(0)
             )
             q_regs[mma_q, 2] = (
-                Uint32(q_u32[abs_row_0, head_idx, u32_hi])
+                Uint32(q_row_0[u32_hi])
                 if abs_row_0 < valid_q_rows
                 else Uint32(0)
             )
             q_regs[mma_q, 3] = (
-                Uint32(q_u32[abs_row_8, head_idx, u32_hi])
+                Uint32(q_row_8[u32_hi])
                 if abs_row_8 < valid_q_rows
                 else Uint32(0)
             )
@@ -977,7 +992,6 @@ class SparseNSAContiguousLogitsKernel:
             (_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = get_sparse_nsa_contiguous_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
@@ -1002,7 +1016,6 @@ class SparseNSAContiguousLogitsKernel:
                 1,
             ),
             block=[_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1144,20 +1157,27 @@ class SparseNSAContiguousLogitsKernel:
                     warp_k_idx,
                     Int32(0),
                     Int32(1),
-                    Int32(1),
                     Int32(_INDEX_HEAD_DIM // 16),
                     Int32(_FP8_ROW_VECS),
                 )
                 lane_group = lane // Int32(4)
+                q_local_0 = warp_q_idx * Int32(16) + lane_group
+                q_local_8 = q_local_0 + Int32(8)
+                w_val_0 = (
+                    Float32(weights[q_tile_base + q_local_0, head_idx])
+                    if q_tile_base + q_local_0 < valid_q_rows
+                    else Float32(0.0)
+                )
+                w_val_8 = (
+                    Float32(weights[q_tile_base + q_local_8, head_idx])
+                    if q_tile_base + q_local_8 < valid_q_rows
+                    else Float32(0.0)
+                )
                 for reg_id in cutlass.range_constexpr(8):
                     row_slot = (reg_id % 4) // 2
                     q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
                     if q_local < Int32(_BLOCK_Q):
-                        w_val = (
-                            Float32(weights[q_tile_base + q_local, head_idx])
-                            if q_tile_base + q_local < valid_q_rows
-                            else Float32(0.0)
-                        )
+                        w_val = w_val_0 if row_slot == 0 else w_val_8
                         if cutlass.const_expr(self._score_mode == IndexerScoreMode.MSA_BILINEAR):
                             acc_frag[0, 0, reg_id] = Float32(
                                 acc_frag[0, 0, reg_id] + score_frag[0, 0, reg_id] * w_val
@@ -1527,7 +1547,6 @@ class SparseNSAContiguousLogitsPrefillKernel:
             (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = get_sparse_nsa_contiguous_prefill_shared_storage_cls()
         self.kernel(
             q_u32,
             weights,
@@ -1554,7 +1573,6 @@ class SparseNSAContiguousLogitsPrefillKernel:
                 1,
             ),
             block=[_PREFILL_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -2015,6 +2033,18 @@ class SparseNSAContiguousLogitsPrefillKernel:
                             logits_out[q_row, k_row] = Float32(-Float32.inf)
 
 
+class SparseNSAContiguousLogitsPrefillKernelBlockScores(
+    SparseNSAContiguousLogitsPrefillKernel
+):
+    """Distinct compile identity for the MSA block-score specialization.
+
+    The implementation and ABI intentionally remain inherited from the
+    prefill logits kernel.  A concrete type prevents two semantically distinct
+    compile specs from collapsing onto one generated CUDA entry-point symbol,
+    which is required for exact per-launch resource accounting.
+    """
+
+
 class SparseNSAContiguousLogitsPrefill512Kernel:
     """Experimental prefill scorer with _PREFILL512_BLOCK_K=512.
 
@@ -2061,9 +2091,6 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
             (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM),
             1,
         )
-        SharedStorage = get_sparse_nsa_prefill512_shared_storage_cls(
-            self._q_heads_batch,
-        )
         self.kernel(
             q_u32,
             weights,
@@ -2088,7 +2115,6 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
                 1,
             ),
             block=[_PREFILL512_THREADS_PER_CTA, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -2557,7 +2583,12 @@ def _build_sparse_nsa_contiguous_prefill_kernel(
     score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
     block_score_output: bool = False,
 ) -> SparseNSAContiguousLogitsPrefillKernel:
-    return SparseNSAContiguousLogitsPrefillKernel(
+    kernel_type = (
+        SparseNSAContiguousLogitsPrefillKernelBlockScores
+        if block_score_output
+        else SparseNSAContiguousLogitsPrefillKernel
+    )
+    return kernel_type(
         tiled_output=tiled_output,
         score_mode=score_mode,
         block_score_output=block_score_output,
@@ -2993,13 +3024,25 @@ def run_contiguous_logits_kernel(
 
     if tile_logits is not None and _tiled_output:
         tile_logits_kernel = tile_logits
+    elif staged_binding is not None:
+        # TILED_OUTPUT is a compile-time false branch for this launch, so the
+        # kernel cannot dereference tile_logits.  Preserve the historical 1x1
+        # argument layout with a storage-aliasing view instead of allocating a
+        # throwaway CUDA tensor on every staged replay.
+        tile_logits_kernel = out_kernel.as_strided((1, 1), (1, 1))
     else:
         tile_logits_kernel = torch.empty(
             (1, 1), dtype=torch.float32, device=q_fp8.device
         )
-    block_scores_kernel = torch.empty(
-        (1, 1, 1), dtype=torch.float32, device=q_fp8.device
-    )
+    if staged_binding is not None:
+        # run_contiguous_logits_kernel always compiles BLOCK_SCORE_OUTPUT=False;
+        # this argument is therefore constexpr-dead.  Keep its rank/strides
+        # stable while aliasing caller-owned output storage for graph replay.
+        block_scores_kernel = out_kernel.as_strided((1, 1, 1), (1, 1, 1))
+    else:
+        block_scores_kernel = torch.empty(
+            (1, 1, 1), dtype=torch.float32, device=q_fp8.device
+        )
 
     if _use_prefill and _prefill_block_k == _PREFILL_BLOCK_K:
         write_invalid_logits = 0 if preinitialize_invalid_logits else 1
@@ -3120,6 +3163,16 @@ def run_contiguous_logits_kernel(
         compile_spec=compile_spec,
         compile_args=args,
         runtime_args=args,
+        compile_kwargs=(
+            {
+                "dsl_compile_options": (
+                    OptLevel(2),
+                    PtxasOptions("--register-usage-level=4"),
+                )
+            }
+            if not _use_prefill
+            else None
+        ),
     )
     if _tiled_output and _use_prefill:
         return tile_logits

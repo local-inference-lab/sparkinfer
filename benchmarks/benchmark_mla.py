@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.mla.legacy.split import select_sparse_mla_split_decode_config
+from b12x.attention.workspace import default_sparse_mla_split_decode_config_for_width
 from b12x.attention.indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
@@ -1409,12 +1409,9 @@ def _run_decode_case(
         nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
     mla_workspace = mla_binding.scratch
-    split_cfg = select_sparse_mla_split_decode_config(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=actual_topk,
-        output_dtype=q_all.dtype,
-        v_head_dim=cfg.kv_lora_rank,
+    split_cfg = default_sparse_mla_split_decode_config_for_width(
+        int(actual_topk.shape[1]),
+        max_chunks=int(mla_workspace.max_chunks_per_row),
     )
 
     def run_mla():

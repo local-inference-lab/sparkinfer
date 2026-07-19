@@ -88,11 +88,9 @@ class RawPtxPagedFp8Probe:
         page_row_base: Int32,
         stream: cuda.CUstream,
     ):
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(mDescPtrs, mOutWords, page_row_base).launch(
             grid=(1, 1, 1),
             block=[32, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -103,7 +101,9 @@ class RawPtxPagedFp8Probe:
         SharedStorage.__annotations__ = {
             "mbar_ptr": cute.struct.MemRange[cutlass.Int64, self.stages],
             "payload": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, int(_ROWS * _HEAD_DIM * self.stages)],
+                cute.struct.MemRange[
+                    cutlass.Uint8, int(_ROWS * _HEAD_DIM * self.stages)
+                ],
                 1024,
             ],
         }
@@ -121,13 +121,17 @@ class RawPtxPagedFp8Probe:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         mbar_ptr = storage.mbar_ptr.data_ptr()
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((_ROWS * _HEAD_DIM * self.stages,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((_ROWS * _HEAD_DIM * self.stages,), stride=(1,))
+        )
 
         if const_expr(self.mode == "pipeline"):
             consumer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, 1
             )
-            producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+            producer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            )
             pipe = cute_pipeline.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr,
                 num_stages=1,
@@ -186,7 +190,9 @@ class RawPtxPagedFp8Probe:
                     shared_ptr_to_u32(mbar_ptr + producer_state.index),
                 )
                 _cp_async_bulk_tensor_2d(
-                    shared_ptr_to_u32(payload_u8.iterator + stage_offset + Int32(_ROWS * _PLANE_COLS)),
+                    shared_ptr_to_u32(
+                        payload_u8.iterator + stage_offset + Int32(_ROWS * _PLANE_COLS)
+                    ),
                     desc_ptr,
                     Int32(_PLANE_COLS),
                     page_row_base,
@@ -273,11 +279,15 @@ def _build_desc_ptrs(src_u8: torch.Tensor, *, swizzle: str) -> torch.Tensor:
     )
     if result != cuda.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
-    desc_words = torch.tensor([int(word) for word in tensor_map.opaque], dtype=torch.uint64, device="cuda")
+    desc_words = torch.tensor(
+        [int(word) for word in tensor_map.opaque], dtype=torch.uint64, device="cuda"
+    )
     return torch.tensor([int(desc_words.data_ptr())], dtype=torch.int64, device="cuda")
 
 
-def _expected_words(src_u8: torch.Tensor, *, page_index: int, swizzle: str) -> torch.Tensor:
+def _expected_words(
+    src_u8: torch.Tensor, *, page_index: int, swizzle: str
+) -> torch.Tensor:
     page = src_u8[page_index * _ROWS : (page_index + 1) * _ROWS].cpu()
     slabs = []
     for plane in range(2):
@@ -294,7 +304,9 @@ def _expected_words(src_u8: torch.Tensor, *, page_index: int, swizzle: str) -> t
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Raw PTX paged FP8 row-offset TMA probe.")
+    parser = argparse.ArgumentParser(
+        description="Raw PTX paged FP8 row-offset TMA probe."
+    )
     parser.add_argument("--pages", type=int, default=4)
     parser.add_argument("--page-index", type=int, default=2)
     parser.add_argument("--mode", choices=("bare", "pipeline", "state"), default="bare")
@@ -323,7 +335,12 @@ def main() -> None:
     torch.cuda.synchronize()
 
     got = out_words.cpu().to(torch.int64) & 0xFFFFFFFF
-    exp = _expected_words(src_u8, page_index=args.page_index, swizzle=args.swizzle).to(torch.int64) & 0xFFFFFFFF
+    exp = (
+        _expected_words(src_u8, page_index=args.page_index, swizzle=args.swizzle).to(
+            torch.int64
+        )
+        & 0xFFFFFFFF
+    )
     mismatches = (got != exp).nonzero(as_tuple=False).reshape(-1)
     first = int(mismatches[0].item()) if mismatches.numel() else -1
     report = {

@@ -1,0 +1,54 @@
+status	path	qualified_name	kernel_symbol_glob	reason
+production	b12x/attention/contiguous/forward.py	ContiguousAttentionForwardKernel.kernel	*b12xattentioncontiguousforwardContiguousAttentionForwardKernel*
+production	b12x/attention/indexer/contiguous_kernel.py	SparseNSAContiguousLogitsKernel.kernel	*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsKernel*
+production	b12x/attention/indexer/contiguous_kernel.py	SparseNSAContiguousLogitsPrefillKernel.kernel	*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefillKernel*
+production	b12x/attention/indexer/contiguous_kernel.py	SparseNSAContiguousLogitsPrefill512Kernel.kernel	*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefill512Kernel*
+production	b12x/attention/indexer/fused_indexer.py	SparseNSAFusedIndexerKernel.kernel	*b12xattentionindexerfused_indexerSparseNSAFusedIndexerKernel*
+production	b12x/attention/indexer/kernel.py	SparseNSAPagedLogitsKernel.kernel	*b12xattentionindexerkernelSparseNSAPagedLogitsKernel*
+production	b12x/attention/indexer/kernel.py	SparseNSAScheduledSingleRowLogitsKernel.kernel	*b12xattentionindexerkernelSparseNSAScheduledSingleRowLogitsKernel*
+production	b12x/attention/indexer/kernel.py	SparseNSAScheduledMultiRowLogitsKernel.kernel	*b12xattentionindexerkernelSparseNSAScheduledMultiRowLogitsKernel*
+production	b12x/attention/indexer/kernel.py	SparseNSAPagedStreamLogitsKernel.kernel	*b12xattentionindexerkernelSparseNSAPagedStreamLogitsKernel*
+production	b12x/attention/indexer/persistent_topk.py	SparseNSAPersistentTopK2048Kernel.kernel	*b12xattentionindexerpersistent_topkSparseNSAPersistentTopK2048Kernel*
+production	b12x/attention/indexer/tiled_topk.py	SparseNSATiledTopkKernel.kernel	*b12xattentionindexertiled_topkSparseNSATiledTopkKernel*
+production	b12x/attention/mla/kernel.py	UnifiedDecodeKernel.kernel	kernel_cutlass_kernel_b12xattentionmlakernelUnifiedDecodeKernel*
+production	b12x/attention/mla/kernel.py	UnifiedDecodeKernel.kernel_extra	kernel_cutlass_kernel_extra_b12xattentionmlakernelUnifiedDecodeKernel*
+production	b12x/attention/mla/kernel.py	UnifiedDecodeKernel.kernel_pertok	kernel_cutlass_kernel_pertok_b12xattentionmlakernelUnifiedDecodeKernel*
+production	b12x/attention/mla/kernel.py	UnifiedDecodeKernel.kernel_extra_pertok	kernel_cutlass_kernel_extra_pertok_b12xattentionmlakernelUnifiedDecodeKernel*
+production	b12x/attention/mla/merge.py	SparseMLASplitDecodeMergeKernel.kernel	*b12xattentionmlamergeSparseMLASplitDecodeMergeKernel*
+production	b12x/attention/mla/merge.py	SparseMLASplitDecodeSinkMergeKernel.kernel	*b12xattentionmlamergeSparseMLASplitDecodeSinkMergeKernel*
+production	b12x/attention/mla/prefill_mg.py	UnifiedPrefillMGKernel.kernel	kernel_cutlass_kernel_b12xattentionmlaprefill_mgUnifiedPrefillMGKernel*
+production	b12x/attention/mla/prefill_mg.py	UnifiedPrefillMGKernel.kernel_dual	kernel_cutlass_kernel_dual_b12xattentionmlaprefill_mgUnifiedPrefillMGKernel*
+production	b12x/attention/paged/forward_extend_generic.py	PagedForwardKernel.kernel	kernel_cutlass_kernel_b12xattentionpagedforward_extend_genericPagedForwardKernel*
+production	b12x/attention/paged/forward_paged.py	PagedForwardKernel.kernel	*b12xattentionpagedforward_pagedPagedForwardKernel*
+diagnostic	b12x/attention/paged/forward_paged.py	PagedFp8DecodeRawForwardKernel.kernel	*b12xattentionpagedforward_pagedPagedFp8DecodeRawForwardKernel*	Definition-only migration specialization with zero serving instantiation or call sites; direct GPU oracle/graph coverage is diagnostic resource evidence only.
+diagnostic	b12x/attention/paged/forward_paged.py	PagedBf16ExtendRawForwardKernel.kernel	*b12xattentionpagedforward_pagedPagedBf16ExtendRawForwardKernel*	Definition-only migration specialization with zero serving instantiation or call sites; direct GPU oracle/graph coverage is diagnostic resource evidence only.
+diagnostic	b12x/attention/paged/forward_paged.py	PagedFp8ExtendRawForwardKernel.kernel	*b12xattentionpagedforward_pagedPagedFp8ExtendRawForwardKernel*	Definition-only migration specialization with zero serving instantiation or call sites; direct GPU oracle/graph coverage is diagnostic resource evidence only.
+production	b12x/attention/paged/merge.py	PagedPersistentMergeKernel.kernel	*b12xattentionpagedmergePagedPersistentMergeKernel*
+production	b12x/gemm/dense.py	DenseGemmKernel.kernel	*b12xgemmdenseDenseGemmKernel*
+production	b12x/gemm/mxfp8_quant_cute.py	_MXFP8RowsQuantLaunch.kernel	*b12xgemmmxfp8_quant_cute_MXFP8RowsQuantLaunch*
+diagnostic	b12x/gemm/wo_quant_cute.py	_WOQuantCuTeLaunch.kernel	*b12xgemmwo_quant_cute_WOQuantCuTeLaunch*	Direct GPU oracle/graph/resource coverage only; production WO quantization remains routed to the faster Triton kernels.
+archaeology	b12x/attention/mla/legacy/kernel.py	SparseMLAKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+archaeology	b12x/attention/mla/legacy/kernel_onepass.py	SparseMLAKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+archaeology	b12x/attention/mla/legacy/split.py	CompressedMLASplitDecodeForwardKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+archaeology	b12x/attention/mla/legacy/split.py	SparseMLASplitDecodeForwardKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+archaeology	b12x/attention/mla/legacy/split.py	SparseMLASplitDecodeMergeKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+archaeology	b12x/attention/mla/legacy/split.py	SparseMLASplitDecodeSinkMergeKernel.kernel		Retired sparse MLA source archaeology; no public import, dispatch, serving route, or migration performance claim.
+production	b12x/integration/residual_kernels.py	MHCPostPrePartialKernel.kernel	*b12xintegrationresidual_kernelsMHCPostPrePartialKernel*
+production	b12x/integration/residual_kernels.py	MHCPostPreDecodeSplitNPartialKernel.kernel	*b12xintegrationresidual_kernelsMHCPostPreDecodeSplitNPartialKernel*
+production	b12x/integration/residual_kernels.py	MHCPostPrePrefillPartialKernel.kernel	*b12xintegrationresidual_kernelsMHCPostPrePrefillPartialKernel*
+production	b12x/integration/residual_kernels.py	MHCPostPrePrefillBlockMPartialKernel.kernel	*b12xintegrationresidual_kernelsMHCPostPrePrefillBlockMPartialKernel*
+production	b12x/integration/residual_kernels.py	MHCPostPrePrefillGramKernel.kernel	*b12xintegrationresidual_kernelsMHCPostPrePrefillGramKernel*
+production	b12x/integration/residual_kernels.py	MHCPrefillBf16ProjectTmaKernel.kernel	*b12xintegrationresidual_kernelsMHCPrefillBf16ProjectTmaKernel*
+production	b12x/integration/residual_kernels.py	MHCPrefillTf32ProjectTmaKernel.kernel	*b12xintegrationresidual_kernelsMHCPrefillTf32ProjectTmaKernel*
+production	b12x/integration/residual_kernels.py	MHCPrefillBf16ProjectKernel.kernel	*b12xintegrationresidual_kernelsMHCPrefillBf16ProjectKernel*
+production	b12x/integration/residual_kernels.py	MHCFinalizeGramKernel.kernel	*b12xintegrationresidual_kernelsMHCFinalizeGramKernel*
+production	b12x/moe/fused/dynamic.py	MoEDynamicKernelBackend.kernel	*MoEDynamicKernel*
+production	b12x/moe/fused/micro.py	MoEMicroKernelBackend.kernel	*MoEMicroKernel*
+production	b12x/moe/fused/tiny_decode.py	MoETinyDecodeKernelBackend.kernel	*MoETinyDecodeKernel*
+production	b12x/moe/fused/w4a16/kernel.py	W4A16GemmKernel.kernel	*b12xmoefusedw4a16kernelW4A16GemmKernel*
+production	b12x/moe/fused/w4a16/kernel.py	W4A16FusedMoeKernel.kernel	*b12xmoefusedw4a16kernelW4A16FusedMoeKernel*
+production	b12x/moe/fused/w4a16/kernel.py	W4A16ActivationKernel.kernel	*b12xmoefusedw4a16kernelW4A16ActivationKernel*
+production	b12x/moe/fused/w4a16/kernel.py	W4A16TopKSumKernel.kernel	*b12xmoefusedw4a16kernelW4A16TopKSumKernel*
+production	b12x/moe/fused/w4a8_phase1.py	W4A8MaterializedPhase1Kernel.kernel	*b12xmoefusedw4a8_phase1W4A8MaterializedPhase1Kernel*
+production	b12x/moe/fused/w4a8_phase2.py	W4A8MaterializedPhase2Kernel.kernel	*b12xmoefusedw4a8_phase2W4A8MaterializedPhase2Kernel*
+production	b12x/quantization/bf16_to_fp4_tma.py	TestKernel.kernel	*b12xquantizationbf16_to_fp4_tmaTestKernel*

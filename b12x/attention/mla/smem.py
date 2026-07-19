@@ -3,8 +3,7 @@
 Given a :class:`UnifiedMLATraits`, compute ``const_expr`` byte offsets for the
 FlashInfer DSV4 ``DecodeDsv4Smem`` layout and build a ``cute.struct``
 ``SharedStorage`` allocatable via ``cutlass.utils.SmemAllocator`` (idiom:
-``kernel_onepass.get_sparse_mla_shared_storage_cls`` +
-``SmemAllocator``).
+one typed ``cute.struct`` allocation through ``SmemAllocator``).
 
 The byte offsets are pinned to the AUTHORITATIVE FlashInfer DSV4 kernel
 (``decode_dsv4_kernel.cuh:47`` ``DecodeDsv4Smem`` + ``common/fp8_quant.cuh`` +
@@ -362,31 +361,48 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
     """Build the ``cute.struct`` ``SharedStorage`` for one specialization.
 
-    Mirrors ``kernel_onepass.get_sparse_mla_shared_storage_cls``: each region is
-    a typed ``cute.struct.MemRange`` (128B/16B-aligned where the math/ldmatrix
-    needs it) so a single ``SmemAllocator().allocate(SharedStorage)`` reserves
-    the whole layout. Sub-regions are NAMED typed fields -- the kernel obtains a
-    flat-linear ``cute.Tensor`` view via ``<field>.get_tensor(layout)`` (or a u32
-    smem address via ``shared_ptr_to_u32(<field>.data_ptr())`` for the
+    Each region is a typed ``cute.struct.MemRange`` (128B/16B-aligned where the
+    math/ldmatrix needs it) so a single
+    ``SmemAllocator().allocate(SharedStorage)`` reserves the whole layout.
+    Sub-regions are NAMED typed fields -- the kernel obtains a flat-linear
+    ``cute.Tensor`` view via ``<field>.get_tensor(layout)`` (or a u32 smem
+    address via ``shared_ptr_to_u32(<field>.data_ptr())`` for the
     ldmatrix/st.shared.v4 path). See the ``*_view`` / ``*_addr`` helpers below.
 
     Buffers that are double-buffered in the layout (``kv_fp8`` / ``kv_sc`` /
     ``kv_rope`` / ``w_fp8`` / ``token_idx``) are allocated as a single MemRange
     of ``bufs * buf_bytes``; the kernel selects buffer ``b`` via the const_expr
-    ``*_buf_bytes`` offset. ``kv_sc`` is allocated 1-byte (placeholder) for GLM
-    where scales are inline; the const_expr ``has_extra_cache`` gate keeps the
-    DSV4-only footer reads out of the GLM specialization.
+    ``*_buf_bytes`` offset. DSV4-only fields are omitted from GLM entirely so
+    CUTLASS DSL 4.6's typed-allocation size and offsets remain byte-identical to
+    :func:`make_smem_layout`.
     """
     layout = make_smem_layout(traits)
-
-    # GLM inline-scale path: no separate footer buffer. Allocate a 1-byte stub so
-    # the struct field exists uniformly; never read under the const_expr gate.
-    kv_sc_total = layout.kv_sc_buf_bytes * layout.kv_bufs
-    kv_sc_alloc = kv_sc_total if kv_sc_total > 0 else 1
 
     class SharedStorage:
         pass
 
+    kv_sc_field = (
+        {
+            "kv_sc": cute.struct.MemRange[
+                cutlass.Uint8,
+                int(layout.kv_sc_buf_bytes * layout.kv_bufs),
+            ]
+        }
+        if traits.has_extra_cache
+        else {}
+    )
+    w_head_sc2_field = (
+        {
+            "w_head_sc2": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, int(layout.w_head_sc2_bytes // 4)
+                ],
+                16,
+            ]
+        }
+        if traits.has_extra_cache
+        else {}
+    )
     SharedStorage.__annotations__ = {
         # Q staging (single buffer). q_rope first (FlashInfer OFF_Q_ROPE = 0).
         "q_rope": cute.struct.Align[
@@ -400,12 +416,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
             cute.struct.MemRange[cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)],
             128,
         ],
-        "kv_sc": cute.struct.MemRange[cutlass.Uint8, int(kv_sc_alloc)],
-        # 16B-align kv_rope so the cp.async.bulk RoPE dst (16B granularity) and the
-        # ldmatrix reads are aligned regardless of the preceding kv_sc size (GLM's
-        # 1-byte inline-scale stub would otherwise leave kv_rope at a 2-byte-
-        # misaligned address). For DSV4 kv_sc is BI*8*2=1024 (already 128-aligned),
-        # so this Align is a no-op there -> DSV4 layout stays byte-identical.
+        **kv_sc_field,
+        # 16B-align kv_rope for cp.async.bulk and ldmatrix. DSV4's footer is
+        # already 128B-sized; GLM has no footer field at all.
         "kv_rope": cute.struct.Align[
             cute.struct.MemRange[
                 cutlass.BFloat16, int(layout.kv_rope_buf_bytes * layout.kv_bufs // 2)
@@ -435,16 +448,41 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
             cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
             128,
         ],
-        # native H16 group-1 w_head_sc (tail region; 16B-aligned). 1-word stub
-        # for GLM (never read; the DSV4-only gate keeps it out of that trace).
-        "w_head_sc2": cute.struct.Align[
-            cute.struct.MemRange[
-                cutlass.Float32, max(1, int(layout.w_head_sc2_bytes // 4))
-            ],
-            16,
-        ],
+        # Native DSV4 H16 group-1 w_head_sc tail (16B-aligned). GLM has no
+        # two-group H16 mode, so it has no placeholder field or tail padding.
+        **w_head_sc2_field,
     }
-    return cute.struct(SharedStorage)
+    storage_cls = cute.struct(SharedStorage)
+
+    expected_offsets = {
+        "q_rope": layout.q_rope_off,
+        "q_fp8": layout.q_fp8_off,
+        "q_sc": layout.q_sc_off,
+        "kv_fp8": layout.kv_fp8_off,
+        "kv_rope": layout.kv_rope_off,
+        "mbar": layout.mbar_off,
+        "reduce": layout.reduce_off,
+        "w_head_sc": layout.w_head_sc_off,
+        "w_fp8": layout.w_fp8_off,
+        "token_idx": layout.token_idx_off,
+        "sm_p_full": layout.sm_p_full_off,
+    }
+    if traits.has_extra_cache:
+        expected_offsets["kv_sc"] = layout.kv_sc_off
+        expected_offsets["w_head_sc2"] = layout.w_head_sc2_off
+    actual_offsets = dict(storage_cls._offsets)
+    if actual_offsets != expected_offsets:
+        raise ValueError(
+            "typed MLA SharedStorage offsets diverge from SmemLayout: "
+            f"typed={actual_offsets}, logical={expected_offsets}"
+        )
+    typed_bytes = int(storage_cls.size_in_bytes())
+    if typed_bytes != layout.total_bytes:
+        raise ValueError(
+            "typed MLA SharedStorage size diverges from SmemLayout: "
+            f"typed={typed_bytes}, logical={layout.total_bytes}"
+        )
+    return storage_cls
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +496,9 @@ def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
 
     traits = make_unified_traits(model_type, compute_mode, scale_format)
     layout = make_smem_layout(traits)
+    # This constructor validates every typed field offset and the exact total
+    # that CUTLASS DSL 4.6 infers for the launch's dynamic shared memory.
+    get_unified_shared_storage_cls(traits)
     assert layout.kv_smem_stride == traits.kv_smem_stride, (
         f"KV_SMEM_STRIDE mismatch: layout={layout.kv_smem_stride} "
         f"traits={traits.kv_smem_stride}"
@@ -491,7 +532,10 @@ def _run_module_asserts() -> None:
     from .traits import ComputeMode, ModelType, ScaleFormat
 
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
+    _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
+    _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
+    _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"

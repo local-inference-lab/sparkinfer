@@ -396,8 +396,15 @@ class PagedPersistentMergeKernel:
         return True
 
     def _get_shared_storage_cls(self):
-        stage_partial_storage = cute.struct.MemRange[
-            self.dtype_partial, int(self.num_smem_stages * self.bdy * self.head_dim)
+        # The staged path issues 16-byte cp.async transactions into this field.
+        # Encode that requirement in the typed 4.6 allocation contract instead
+        # of relying only on the dynamic-SMEM root's implicit alignment.
+        stage_partial_storage = cute.struct.Align[
+            cute.struct.MemRange[
+                self.dtype_partial,
+                int(self.num_smem_stages * self.bdy * self.head_dim),
+            ],
+            16,
         ]
         stage_lse_storage = cute.struct.MemRange[cutlass.Float32, int(self.bdx * self.bdy)]
         partial_storage = cute.struct.MemRange[cutlass.Float32, int(self.bdy * self.head_dim)]
@@ -465,7 +472,6 @@ class PagedPersistentMergeKernel:
         ):
             raise TypeError("paged merge kernel configuration is not supported")
 
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             mV_partial,
             mLSE_partial,
@@ -478,7 +484,6 @@ class PagedPersistentMergeKernel:
         ).launch(
             grid=((mO.shape[1], mO.shape[0], 1) if self.direct_grid else (self.persistent_ctas, 1, 1)),
             block=[self.bdx, self.bdy, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 

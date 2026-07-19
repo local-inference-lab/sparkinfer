@@ -13,6 +13,8 @@ import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
 from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
@@ -212,6 +214,24 @@ _GRAM_PAIRS = 10
 _GRAM_ROW0 = 32  # gram[tile] stored at partials[token, 32 + tile, 0:10]
 # 1024 threads cover one hidden tile per loop iteration.
 _GRAM_BLOCK_H = 1024
+
+
+@dsl_user_op
+def _materialize_residual_gram_f32(value, *, loc=None, ip=None):
+    """Keep rounded BF16 residual values in the F32 arithmetic domain."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _source_tiles_for_hidden(hidden_size: int) -> int:
@@ -1811,18 +1831,23 @@ class MHCPostPrePrefillBlockMPartialKernel:
                         out[token, Int32(1), h] = o1
                         out[token, Int32(2), h] = o2
                         out[token, Int32(3), h] = o3
-                        sqr[mi] += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+                        g0 = _materialize_residual_gram_f32(r0)
+                        g1 = _materialize_residual_gram_f32(r1)
+                        g2 = _materialize_residual_gram_f32(r2)
+                        g3 = _materialize_residual_gram_f32(r3)
                         if const_expr(self.compute_gram):
-                            gvals[mi, 0] += r0 * r0
-                            gvals[mi, 1] += r1 * r1
-                            gvals[mi, 2] += r2 * r2
-                            gvals[mi, 3] += r3 * r3
-                            gvals[mi, 4] += r0 * r1
-                            gvals[mi, 5] += r0 * r2
-                            gvals[mi, 6] += r0 * r3
-                            gvals[mi, 7] += r1 * r2
-                            gvals[mi, 8] += r1 * r3
-                            gvals[mi, 9] += r2 * r3
+                            gvals[mi, 0] += g0 * g0
+                            gvals[mi, 1] += g1 * g1
+                            gvals[mi, 2] += g2 * g2
+                            gvals[mi, 3] += g3 * g3
+                            gvals[mi, 4] += g0 * g1
+                            gvals[mi, 5] += g0 * g2
+                            gvals[mi, 6] += g0 * g3
+                            gvals[mi, 7] += g1 * g2
+                            gvals[mi, 8] += g1 * g3
+                            gvals[mi, 9] += g2 * g3
+                        else:
+                            sqr[mi] += g0 * g0 + g1 * g1 + g2 * g2 + g3 * g3
 
             for ni in cutlass.range_constexpr(self.tile_n):
                 mix = mix0 + Int32(ni)
@@ -1844,6 +1869,15 @@ class MHCPostPrePrefillBlockMPartialKernel:
                             + f2 * oval[mi, 2]
                             + f3 * oval[mi, 3]
                         )
+
+        if const_expr(self.compute_gram):
+            for mi in cutlass.range_constexpr(self.block_m):
+                sqr[mi] = (
+                    gvals[mi, 0]
+                    + gvals[mi, 1]
+                    + gvals[mi, 2]
+                    + gvals[mi, 3]
+                )
 
         for mi in cutlass.range_constexpr(self.block_m):
             for ni in cutlass.range_constexpr(self.tile_n):
@@ -2331,7 +2365,6 @@ class MHCPrefillBf16ProjectTmaKernel:
         ).launch(
             grid=(grid_m, self.n_tiles, 1),
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -2416,7 +2449,7 @@ class MHCPrefillBf16ProjectTmaKernel:
             tCrA = thr_mma.make_fragment_A(tCsA[None, None, None, 0])
             tCrB = thr_mma.make_fragment_B(tCsB[None, None, None, 0])
             acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
-            acc = cute.make_fragment(acc_shape, Float32)
+            acc = cute.make_rmem_tensor(acc_shape, Float32)
             acc.fill(0.0)
             smem_copy_atom_A = cute.make_copy_atom(
                 warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
@@ -2703,7 +2736,6 @@ class MHCPrefillTf32ProjectTmaKernel:
         ).launch(
             grid=(grid_m, self.n_tiles, self.k_splits),
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=_MHC_PDL,
@@ -3315,7 +3347,7 @@ class MHCFinalizeGramKernel:
                         gvalue = Float32(0.0)
                         if tidx < Int32(self.active_source_splits):
                             gvalue = Float32(
-                                partials[token, Int32(_GRAM_ROW0) + tidx, gp]
+                                partials[token, Int32(self.gram_row0) + tidx, gp]
                             )
                         gram[gp] = _warp_allreduce_sum(gvalue)
         elif const_expr(self.source_warps == 2):

@@ -25,8 +25,10 @@ from b12x.cute.fp4 import (
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     mxfp8_mma_m16n8k32_f32_e2m1,
+    pack_f32x2_to_bfloat2,
     scatter_add_bf16x2,
     shared_ptr_to_u32,
+    st_global_u32,
 )
 
 
@@ -57,13 +59,19 @@ class W4A8MaterializedPhase2Kernel:
     shared_bytes = sfb_storage_offset + stages * sfb_stage_bytes
     shared_words = (shared_bytes + 3) // 4
 
-    def __init__(self, *, source_tile_m: int = 128):
+    def __init__(
+        self,
+        *,
+        source_tile_m: int = 128,
+        deterministic_output: bool = False,
+    ):
         if source_tile_m not in (64, 128):
             raise ValueError(
                 f"materialized phase 2 source_tile_m must be 64 or 128, got {source_tile_m}"
             )
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
+        self.deterministic_output = bool(deterministic_output)
 
     @cute.jit
     def __call__(
@@ -277,8 +285,16 @@ class W4A8MaterializedPhase2Kernel:
 
         # Each of four warps owns M64xN32: four M16 blocks by four N8
         # fragments.  This is 64 FP32 accumulator registers per thread.
-        facc = cute.make_rmem_tensor((4, 4, 4), cutlass.Float32)
-        facc.fill(0.0)
+        facc = tuple(
+            tuple(
+                cute.make_rmem_tensor((4,), cutlass.Float32)
+                for _nt in range(4)
+            )
+            for _blk in range(4)
+        )
+        for blk in cutlass.range_constexpr(4):
+            for nt in cutlass.range_constexpr(4):
+                facc[blk][nt].fill(0.0)
 
         intermediate_slice = Int32(0)
         while intermediate_slice < intermediate_tiles:
@@ -362,11 +378,12 @@ class W4A8MaterializedPhase2Kernel:
                         sfb_base + ((n8 * Int32(8) + q) << Int32(2))
                     )
                     for blk in cutlass.range_constexpr(4):
+                        fragment = facc[blk][nt]
                         d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                            facc[blk, nt, 0],
-                            facc[blk, nt, 1],
-                            facc[blk, nt, 2],
-                            facc[blk, nt, 3],
+                            fragment[0],
+                            fragment[1],
+                            fragment[2],
+                            fragment[3],
                             a_frag[blk, 0],
                             a_frag[blk, 1],
                             a_frag[blk, 2],
@@ -378,10 +395,10 @@ class W4A8MaterializedPhase2Kernel:
                             bid_a=kb,
                             bid_b=kb,
                         )
-                        facc[blk, nt, 0] = d0
-                        facc[blk, nt, 1] = d1
-                        facc[blk, nt, 2] = d2
-                        facc[blk, nt, 3] = d3
+                        fragment[0] = d0
+                        fragment[1] = d1
+                        fragment[2] = d2
+                        fragment[3] = d3
 
             # No thread can recycle this parity until all four compute warps
             # have consumed it.
@@ -405,6 +422,7 @@ class W4A8MaterializedPhase2Kernel:
         for nt in cutlass.range_constexpr(4):
             col = col_base + Int32(nt * 8)
             for blk in cutlass.range_constexpr(4):
+                fragment = facc[blk][nt]
                 row_lo = Int32(blk * 16) + q
                 row_hi = row_lo + Int32(8)
                 if row_lo < valid_rows:
@@ -414,13 +432,28 @@ class W4A8MaterializedPhase2Kernel:
                         down_scale
                         * token_weights[physical_row].to(cutlass.Float32)
                     )
-                    scatter_add_bf16x2(
-                        get_ptr_as_int64(
-                            scatter_output, tok * scatter_n + col
-                        ),
-                        scale * facc[blk, nt, 0],
-                        scale * facc[blk, nt, 1],
-                    )
+                    if cutlass.const_expr(self.deterministic_output):
+                        # The routing front-end stores the token-major pair
+                        # index in token_map for deterministic specializations.
+                        # Each pair/output-column location has one producer, so
+                        # phase 2 can write it exactly once; the caller then
+                        # reduces routes in fixed top-k order.
+                        st_global_u32(
+                            get_ptr_as_int64(
+                                scatter_output, tok * scatter_n + col
+                            ),
+                            pack_f32x2_to_bfloat2(
+                                scale * fragment[0], scale * fragment[1]
+                            ),
+                        )
+                    else:
+                        scatter_add_bf16x2(
+                            get_ptr_as_int64(
+                                scatter_output, tok * scatter_n + col
+                            ),
+                            scale * fragment[0],
+                            scale * fragment[1],
+                        )
                 if row_hi < valid_rows:
                     physical_row = physical_row_base + row_hi
                     tok = token_map[physical_row].to(Int32)
@@ -428,13 +461,23 @@ class W4A8MaterializedPhase2Kernel:
                         down_scale
                         * token_weights[physical_row].to(cutlass.Float32)
                     )
-                    scatter_add_bf16x2(
-                        get_ptr_as_int64(
-                            scatter_output, tok * scatter_n + col
-                        ),
-                        scale * facc[blk, nt, 2],
-                        scale * facc[blk, nt, 3],
-                    )
+                    if cutlass.const_expr(self.deterministic_output):
+                        st_global_u32(
+                            get_ptr_as_int64(
+                                scatter_output, tok * scatter_n + col
+                            ),
+                            pack_f32x2_to_bfloat2(
+                                scale * fragment[2], scale * fragment[3]
+                            ),
+                        )
+                    else:
+                        scatter_add_bf16x2(
+                            get_ptr_as_int64(
+                                scatter_output, tok * scatter_n + col
+                            ),
+                            scale * fragment[2],
+                            scale * fragment[3],
+                        )
 
     @cute.kernel
     def kernel(

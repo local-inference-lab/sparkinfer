@@ -89,6 +89,7 @@ from b12x.cute.fp4 import (
     st_global_v4_u32,
     warp_reduce,
 )
+from b12x.cute.smem import make_smem_memrange_alias
 from b12x.gemm.dense import (
     DenseGemmKernel,
     _reshape_acc_to_mn,
@@ -646,6 +647,7 @@ class MoEDynamicKernelBackend:
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         deterministic_output: bool = False,
+        num_topk: int = 1,
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
@@ -727,15 +729,21 @@ class MoEDynamicKernelBackend:
         # capacity and no host value is read between launches.
         self.external_materialized_fc1 = self.w4a8_split_materialized
         self.external_materialized_fc2 = self.w4a8_split_materialized
+        if int(num_topk) <= 0:
+            raise ValueError(f"num_topk must be positive, got {num_topk}")
+        self.num_topk = int(num_topk)
         materialized_source_tile_m = (
             mma_tiler_mn[0] if self.w4a8_split_materialized else 128
         )
         self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
             fast_math=self.fast_math,
             source_tile_m=materialized_source_tile_m,
+            deterministic_output=bool(deterministic_output),
+            num_topk=self.num_topk,
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
+            deterministic_output=bool(deterministic_output),
         )
         if self.w4a8_repacked and quant_recipe != "w4a8_mx":
             raise ValueError("repacked W4A8 weights are only valid for w4a8_mx")
@@ -2318,7 +2326,7 @@ class MoEDynamicKernelBackend:
                 ).align(16),
                 dtype=cutlass.BFloat16,
             )
-            sC_alias = cute.struct._MemRangeData(
+            sC_alias = make_smem_memrange_alias(
                 cutlass.BFloat16,
                 cute.cosize(epi_smem_staged),
                 sC_alias_ptr,
@@ -2330,26 +2338,34 @@ class MoEDynamicKernelBackend:
             sC = storage.sC.get_tensor(
                 epi_smem_staged.outer, swizzle=epi_smem_staged.inner,
             )
-        if cutlass.const_expr(self.w4a8_repacked):
-            sC_base_addr = shared_ptr_to_u32(sC_alias_ptr)
-        sfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
-        reduce_scratch_addr = shared_ptr_to_u32(storage.reduce_scratch.data_ptr())
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
         if cutlass.const_expr(self.w4a8_repacked):
-            route_phys_rows_addr = shared_ptr_to_u32(storage.sA.data_ptr())
+            sC_base_addr = ctrl_base_addr + Int32(Storage._offsets["sA"]) + Int32(
+                self.tile_shape_mnk[0] * self.tile_shape_mnk[2]
+            )
+        sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
+        reduce_scratch_addr = ctrl_base_addr + Int32(
+            Storage._offsets["reduce_scratch"]
+        )
+        if cutlass.const_expr(self.w4a8_repacked):
+            route_phys_rows_addr = ctrl_base_addr + Int32(Storage._offsets["sA"])
             route_expert_ids_addr = (
                 route_phys_rows_addr
                 + Int32(self.num_route_warps * 32 * 4)
             )
         else:
-            route_phys_rows_addr = shared_ptr_to_u32(
-                storage.route_phys_rows.data_ptr()
+            route_phys_rows_addr = ctrl_base_addr + Int32(
+                Storage._offsets["route_phys_rows"]
             )
-            route_expert_ids_addr = shared_ptr_to_u32(
-                storage.route_expert_ids.data_ptr()
+            route_expert_ids_addr = ctrl_base_addr + Int32(
+                Storage._offsets["route_expert_ids"]
             )
-        scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
-        scatter_weight_base_addr = shared_ptr_to_u32(storage.scatter_weight_cache.data_ptr())
+        scatter_tok_base_addr = ctrl_base_addr + Int32(
+            Storage._offsets["scatter_tok_cache"]
+        )
+        scatter_weight_base_addr = ctrl_base_addr + Int32(
+            Storage._offsets["scatter_weight_cache"]
+        )
 
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
@@ -2373,7 +2389,13 @@ class MoEDynamicKernelBackend:
         num_k_tiles = (cols + Int32(63)) // Int32(64)
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
-        if cutlass.const_expr(self.deterministic_output):
+        # Split materialized FC1 indexes deferred metadata as
+        # ``m_tile * gate_tile_cnt`` and therefore needs one metadata slot per
+        # intermediate tile.  Fused deterministic consumers can collapse the
+        # same domain to one all-slices slot per M tile.
+        if cutlass.const_expr(
+            self.deterministic_output and not self.external_materialized_fc1
+        ):
             task_slice_chunk = route_gate_tile_cnt
         materialized_num_groups = (
             route_gate_tile_cnt + task_slice_chunk - Int32(1)
@@ -2391,22 +2413,31 @@ class MoEDynamicKernelBackend:
             if flat_tid < num_experts + Int32(1):
                 expert_tile_base[flat_tid] = Int32(0)
 
-        scatter_rows = Int32(scatter_output.shape[0])
-        scatter_total_u32 = scatter_rows * cols_u32
-        scatter_vecs = scatter_total_u32 // Int32(4)
-        zero_u32 = Uint32(0)
-        zv = flat_tid
-        while zv < scatter_vecs:
-            st_global_v4_u32(
-                scatter_base + Int64(zv) * Int64(16),
-                zero_u32, zero_u32, zero_u32, zero_u32,
-            )
-            zv += flat_stride
+        # Atomic scatter accumulates into the caller output and must start at
+        # zero.  Deterministic split phase 2 instead has exactly one producer
+        # for every real (route, output-column) location, and the fixed-order
+        # top-k kernel overwrites every caller-output location afterward.  Its
+        # routed scratch therefore needs no 4x-output clear; poison/replay
+        # coverage verifies that phase 2 really overwrites the full domain.
+        if cutlass.const_expr(
+            not (self.deterministic_output and self.external_materialized_fc2)
+        ):
+            scatter_rows = Int32(scatter_output.shape[0])
+            scatter_total_u32 = scatter_rows * cols_u32
+            scatter_vecs = scatter_total_u32 // Int32(4)
+            zero_u32 = Uint32(0)
+            zv = flat_tid
+            while zv < scatter_vecs:
+                st_global_v4_u32(
+                    scatter_base + Int64(zv) * Int64(16),
+                    zero_u32, zero_u32, zero_u32, zero_u32,
+                )
+                zv += flat_stride
 
-        j = scatter_vecs * Int32(4) + flat_tid
-        while j < scatter_total_u32:
-            scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
-            j += flat_stride
+            j = scatter_vecs * Int32(4) + flat_tid
+            while j < scatter_total_u32:
+                scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
+                j += flat_stride
 
         # Materialized slots are overwritten before the second grid barrier;
         # only a true ready queue needs generation flags cleared up front.
@@ -3442,39 +3473,57 @@ class MoEDynamicKernelBackend:
             # consumer loop (loop state must be purely dynamic expressions).
             lane_c = Int32(tidx) & Int32(3)
             lane_g = (Int32(tidx) & Int32(31)) >> Int32(2)
-            # Closed form of the tiled-MMA C-coordinate map.  CuTe's N
-            # permutation orders four N coordinates as N8 bases
-            # {0, 16, 8, 24}.  The small (1,4,1) atom takes the N coordinate
-            # from warp bits 0:1. M128's (2,4,1) atom is M-major, so warp bit
-            # 0 selects the interleaved M16 coordinate and bits 1:2 select N.
-            # Keep these rows/columns identical to gate_acc/up_acc; the cold
-            # layout-native epilogue consumes those fragments.
+            # Pin the logical m16n8 fragment coordinates in closed form.  A
+            # layout-tensor implementation is tempting here, but carrying the
+            # identity tensor through both GEMMs makes ptxas materialize large
+            # amounts of address state (and caused local-memory spills under
+            # CUTLASS DSL 4.6).  These expressions are the measured CuTe MMA
+            # V-map for each atom shape used by this kernel.
+            w4a8_m_warp_offset = Int32(0)
+            w4a8_m_block_stride = Int32(16)
             if cutlass.const_expr(self.w4a8_m128_materialized):
+                # atom (2,4,1): two M warps, four permuted N warps.
                 w4a8_n8_thread_base = (
                     ((Int32(tidx) & Int32(64)) >> Int32(2))
                     | ((Int32(tidx) & Int32(128)) >> Int32(4))
                     | lane_g
                 )
-            else:
+                w4a8_m_warp_offset = (warp_idx & Int32(1)) * Int32(16)
+                w4a8_m_block_stride = Int32(32)
+            elif cutlass.const_expr(self.w4a8_small):
+                # atom (1,4,1): one M warp, four permuted N warps.
                 w4a8_n8_thread_base = (
                     ((Int32(tidx) & Int32(32)) >> Int32(1))
                     | ((Int32(tidx) & Int32(64)) >> Int32(3))
                     | lane_g
                 )
-            w4a8_m_warp_offset = Int32(0)
-            w4a8_m_block_stride = Int32(16)
-            if cutlass.const_expr(self.w4a8_m128_materialized):
-                w4a8_m_warp_offset = (warp_idx & Int32(1)) * Int32(16)
+            elif cutlass.const_expr(self.tile_shape_mnk[0] == 64):
+                # atom (4,2,1): four M warps, two N warps.
+                w4a8_n8_thread_base = (
+                    ((Int32(tidx) & Int32(128)) >> Int32(3)) | lane_g
+                )
+                w4a8_m_warp_offset = (
+                    (Int32(tidx) & Int32(96)) >> Int32(1)
+                )
+                w4a8_m_block_stride = Int32(64)
+            else:
+                # Generic M128 atom (2,2,1): two M warps, two N warps.
+                w4a8_n8_thread_base = (
+                    ((Int32(tidx) & Int32(64)) >> Int32(2)) | lane_g
+                )
+                w4a8_m_warp_offset = (
+                    (Int32(tidx) & Int32(32)) >> Int32(1)
+                )
                 w4a8_m_block_stride = Int32(32)
             n_k32_per_tile = self.tile_shape_mnk[2] // 32
             a_u32_per_row = cols // Int32(4)
             a_mx_per_row = cols // Int32(32)
             pa_u32 = cute.recast_tensor(packed_a_storage, cutlass.Uint32)
-            sa_flat_addr = shared_ptr_to_u32(storage.sA.data_ptr())
+            sa_flat_addr = ctrl_base_addr + Int32(Storage._offsets["sA"])
             # Double-buffered staging regions (repurposed; TMA is off under
             # w4a8): B tiles in sB/sB_up, SFB byte rows in sSFB, residual
             # byte rows in sSFB_up, A-scale byte rows in sSFA.
-            w4a8_sb0 = shared_ptr_to_u32(storage.sB.data_ptr())
+            w4a8_sb0 = ctrl_base_addr + Int32(Storage._offsets["sB"])
             # FC1 A tiles double-buffer through the sC region (32KB, provably
             # free during the FC1 mainloop: the epilogue writes it afterwards).
             # Staging depth: 4 buffers for small tiles (the DRAM-bound bands
@@ -3485,26 +3534,28 @@ class MoEDynamicKernelBackend:
             # residual bufs alias the (FC1-only) A-buf region.
             if cutlass.const_expr(self.w4a8_repacked):
                 w4a8_sa0 = (
-                    shared_ptr_to_u32(storage.sA.data_ptr())
+                    ctrl_base_addr
+                    + Int32(Storage._offsets["sA"])
                     + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
                 )
-                w4a8_res0 = shared_ptr_to_u32(storage.sC.data_ptr())
+                w4a8_res0 = ctrl_base_addr + Int32(Storage._offsets["sC"])
                 w4a8_res2 = w4a8_sa0
             elif cutlass.const_expr(self.w4a8_small):
                 w4a8_sa0 = (
-                    shared_ptr_to_u32(storage.sA.data_ptr())
+                    ctrl_base_addr
+                    + Int32(Storage._offsets["sA"])
                     + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
                 )
-                w4a8_res0 = shared_ptr_to_u32(storage.sC.data_ptr())
+                w4a8_res0 = ctrl_base_addr + Int32(Storage._offsets["sC"])
                 w4a8_res2 = w4a8_sa0
             else:
-                w4a8_sa0 = shared_ptr_to_u32(storage.sC.data_ptr())
-                w4a8_res0 = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
-                w4a8_res2 = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
-            w4a8_pipe_addr = shared_ptr_to_u32(storage.w4a8_pipe.data_ptr())
-            w4a8_sb1 = shared_ptr_to_u32(storage.sB_up.data_ptr())
-            w4a8_sfbb = shared_ptr_to_u32(storage.sSFB.data_ptr())
-            w4a8_resb = shared_ptr_to_u32(storage.sSFB_up.data_ptr())
+                w4a8_sa0 = ctrl_base_addr + Int32(Storage._offsets["sC"])
+                w4a8_res0 = ctrl_base_addr + Int32(Storage._offsets["sSFB_up"])
+                w4a8_res2 = ctrl_base_addr + Int32(Storage._offsets["sSFB_up"])
+            w4a8_pipe_addr = ctrl_base_addr + Int32(Storage._offsets["w4a8_pipe"])
+            w4a8_sb1 = ctrl_base_addr + Int32(Storage._offsets["sB_up"])
+            w4a8_sfbb = ctrl_base_addr + Int32(Storage._offsets["sSFB"])
+            w4a8_resb = ctrl_base_addr + Int32(Storage._offsets["sSFB_up"])
 
         # w4a8 TMA-B: per-mbarrier phase bits, owned by producer warps.
         # Persist across tasks (mbarriers are init'd once; epochs reset per
@@ -4136,10 +4187,20 @@ class MoEDynamicKernelBackend:
                                     res_w0_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
                                     res_w1_u = cute.make_rmem_tensor((fc1_n_tiles,), Uint32)
                                 for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                    n_in = (
-                                        w4a8_n8_thread_base
-                                        + Int32(_nt * 32)
-                                    )
+                                    if cutlass.const_expr(
+                                        not self.w4a8_small
+                                        and not self.w4a8_split_materialized
+                                    ):
+                                        # The two-N-warp V-map alternates N8
+                                        # fragments inside each N32 group.
+                                        n_in = w4a8_n8_thread_base + Int32(
+                                            (_nt >> 1) * 32 + (_nt & 1) * 8
+                                        )
+                                    else:
+                                        n_in = (
+                                            w4a8_n8_thread_base
+                                            + Int32(_nt * 32)
+                                        )
                                     n_in_arr[_nt] = n_in
                                     sfb_words[_nt] = ld_shared_u32(sfb_buf + (n_in << Int32(2)))
                                     if cutlass.const_expr(self.w4a8_fused):
@@ -4839,6 +4900,8 @@ class MoEDynamicKernelBackend:
                     a2 = Uint32(0)
                     a3 = Uint32(0)
                     sfa_w = Uint32(0)
+                    row_lo = Int32(0)
+                    row_hi = Int32(0)
                     if cutlass.const_expr(self.is_w4a8):
                         # FC2 contracts the same quantized intermediate tile
                         # against every output-N tile. Small M16/M32 kernels
@@ -4982,10 +5045,18 @@ class MoEDynamicKernelBackend:
                                 Uint32,
                             )
                             for _nt in cutlass.range_constexpr(fc2_n_tiles):
-                                n_in = (
-                                    w4a8_n8_thread_base
-                                    + Int32(_nt * 32)
-                                )
+                                if cutlass.const_expr(
+                                    not self.w4a8_small
+                                    and not self.w4a8_split_materialized
+                                ):
+                                    n_in = w4a8_n8_thread_base + Int32(
+                                        (_nt >> 1) * 32 + (_nt & 1) * 8
+                                    )
+                                else:
+                                    n_in = (
+                                        w4a8_n8_thread_base
+                                        + Int32(_nt * 32)
+                                    )
                                 n_in_arr2[_nt] = n_in
                                 for _ot in cutlass.range_constexpr(
                                     self.w4a8_fc2_compute_width
@@ -5109,22 +5180,23 @@ class MoEDynamicKernelBackend:
                                             a3 = w4a8_a2_regs[_mt, _kb, 3]
                                             sfa_w = w4a8_sfa2_regs[_mt]
                                         else:
+                                            row_lo = (
+                                                w4a8_m_warp_offset
+                                                + lane_g
+                                                + Int32(_mt)
+                                                * w4a8_m_block_stride
+                                            )
+                                            row_hi = row_lo + Int32(8)
                                             a0, a2 = ld_shared_v2_u32(
                                                 sa_flat_addr
-                                                + (
-                                                    lane_g
-                                                    + Int32(_mt * 16)
-                                                )
+                                                + row_lo
                                                 * Int32(self.tile_shape_mnk[2])
                                                 + Int32(_kb * 32)
                                                 + Int32(8) * lane_c
                                             )
                                             a1, a3 = ld_shared_v2_u32(
                                                 sa_flat_addr
-                                                + (
-                                                    lane_g
-                                                    + Int32(_mt * 16 + 8)
-                                                )
+                                                + row_hi
                                                 * Int32(self.tile_shape_mnk[2])
                                                 + Int32(_kb * 32)
                                                 + Int32(8) * lane_c
@@ -5134,8 +5206,7 @@ class MoEDynamicKernelBackend:
                                                 sfa_w = ld_shared_u32(
                                                     sfa_base_addr
                                                     + (
-                                                        lane_g
-                                                        + Int32(_mt * 16)
+                                                        row_lo
                                                         + (lane_c << Int32(3))
                                                     )
                                                     * mx_blocks_tile_p2
@@ -5888,9 +5959,37 @@ class MoEDynamicKernelBackend:
                                                 )
                                         w4a8_pend_par = par
                                         w4a8_pend_epoch = epoch
-                            # (The original pass_gate wait below still pairs
-                            # with the MMA warps' arrive; buffer reuse across
-                            # passes is ordered by the done-count epochs.)
+                        # The small NVFP4 path aliases FC2 residual staging
+                        # onto the FC1-A payload range.  Publish the final
+                        # deferred FC1 window before waiting for every MMA
+                        # warp to finish its FC1 reads; only then may FC2
+                        # enter the aliased range.  Per-parity done counts
+                        # cannot express this cross-parity lifetime edge.
+                        if cutlass.const_expr(
+                            self.w4a8_residual and self.w4a8_small
+                        ):
+                            if cutlass.const_expr(self.w4a8_b_tma):
+                                if w4a8_pend_epoch > Int32(0):
+                                    cute.arch.mbarrier_wait(
+                                        w4a8_tma_mbar_ptr + w4a8_pend_par,
+                                        phase=(
+                                            w4a8_mbar_phase >> w4a8_pend_par
+                                        ) & Int32(1),
+                                    )
+                                    w4a8_mbar_phase = w4a8_mbar_phase ^ (
+                                        Int32(1) << w4a8_pend_par
+                                    )
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            if lane_id == Int32(0):
+                                if w4a8_pend_epoch > Int32(0):
+                                    _st_shared_release_i32(
+                                        w4a8_pipe_addr
+                                        + (w4a8_pend_par << Int32(2)),
+                                        w4a8_pend_epoch,
+                                    )
+                            w4a8_pend_epoch = Int32(0)
+                            self.pass_gate_barrier.wait_unaligned()
                         # ---- FC2 B_down staging (per output tile) ----
                         dn_row_u32p = b_down_u32.shape[1]
                         dn_base_p = (
@@ -6172,14 +6271,15 @@ class MoEDynamicKernelBackend:
                         ml_pipeline.producer_commit(prod_state)
                         prod_state.advance()
 
-                    # Wait for the MMA warps to finish the FC1 gate/only pass
-                    # before reusing sA/sB/sSFA/sSFB for up/FC2 staging. Under
-                    # w4a8 the staging-flag epochs order every buffer reuse, so
-                    # the producer only contributes its arrival and keeps
-                    # streaming the up/FC2 tiles (the wait would idle it for
-                    # the MMA warps' whole gate pass).
+                    # Pair with the MMA warps' FC1 completion arrival before
+                    # generic shared-buffer reuse.  Small NVFP4 completed this
+                    # handoff inside its specialized producer path, before its
+                    # first aliased FC2 residual write.
                     if cutlass.const_expr(self.is_w4a8):
-                        self.pass_gate_barrier.arrive_unaligned()
+                        if cutlass.const_expr(
+                            not (self.w4a8_residual and self.w4a8_small)
+                        ):
+                            self.pass_gate_barrier.arrive_unaligned()
                     else:
                         self.pass_gate_barrier.wait_unaligned()
 

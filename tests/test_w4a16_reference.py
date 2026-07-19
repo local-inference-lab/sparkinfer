@@ -371,6 +371,7 @@ def test_flashinfer_trtllm_fp4_e8m0_k32_prep_matches_vllm_deepseek_style() -> No
 def test_flashinfer_fp4_e8m0_k32_oracle_matches_python_oracle_on_deepseek_v4_flash_layer() -> None:
     _require_flashinfer_trtllm_cuda()
     from benchmarks.benchmark_moe import (
+        ActivationParams,
         MODEL_PROFILES,
         _cached_snapshot_path,
         build_model_spec,
@@ -423,6 +424,9 @@ def test_flashinfer_fp4_e8m0_k32_oracle_matches_python_oracle_on_deepseek_v4_fla
     )
     assert topk_ids.shape == (1, spec.top_k)
     assert topk_weights.shape == (1, spec.top_k)
+    activation_params = ActivationParams(
+        swiglu_limit=profile.default_swiglu_limit,
+    )
 
     expected = make_oracle_reference(
         "w4a16",
@@ -433,7 +437,7 @@ def test_flashinfer_fp4_e8m0_k32_oracle_matches_python_oracle_on_deepseek_v4_fla
         topk_ids,
         topk_weights,
         activation=profile.default_activation,
-        swiglu_limit=profile.default_swiglu_limit,
+        activation_params=activation_params,
     )
     try:
         actual = make_oracle_reference(
@@ -445,7 +449,7 @@ def test_flashinfer_fp4_e8m0_k32_oracle_matches_python_oracle_on_deepseek_v4_fla
             topk_ids,
             topk_weights,
             activation=profile.default_activation,
-            swiglu_limit=profile.default_swiglu_limit,
+            activation_params=activation_params,
         )
     except RuntimeError as exc:
         msg = str(exc).lower()

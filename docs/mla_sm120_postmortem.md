@@ -25,8 +25,8 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
   dual-cache trio) **RAISE** — no silent legacy fallback.
 - **Faster than legacy** at batch=1 decode: DSV4 **3.2–4.1×**, GLM **1.2–1.6×** (after
   replicating FlashInfer's wave-balanced split-K launch tuning).
-- **Legacy kernels are archived under `b12x/attention/mla/legacy/`** for source history and
-  direct legacy tests only; public sparse-MLA dispatch no longer routes to them.
+- **Legacy kernels remain available in git history only.** Their in-tree implementation and
+  direct legacy tests were removed; public sparse-MLA dispatch no longer routes to them.
 - **Tests:** full MLA surface 157 passed, 0 real failures (6 benign env/diagnostic skips).
 
 ### Files

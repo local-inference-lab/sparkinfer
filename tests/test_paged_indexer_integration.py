@@ -171,49 +171,6 @@ def test_resolve_replicated_num_q_heads_for_tensor_parallel() -> None:
         resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=0)
 
 
-def test_index_topk_fp8_hard_fails_on_cpu() -> None:
-    device = torch.device("cpu")
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(91_001)
-
-    rows = 3
-    num_heads = 4
-    page_starts = [1, 4, 8]
-    seqlens = torch.tensor([65, 128, 150], dtype=torch.int32, device=device)
-    width_blocks = 3
-    real_page_table = _make_real_page_table(
-        page_starts=page_starts,
-        seqlens=seqlens.tolist(),
-        width_blocks=width_blocks,
-        device=device,
-    )
-    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
-    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32, device=device)
-    index_k_cache = pack_paged_index_k_cache_reference(
-        torch.randn((12 * 64, 128), generator=gen, dtype=torch.float32, device=device) / 3
-    )
-
-    schedule = torch.empty((5, 2), dtype=torch.int32, device=device)
-    binding = _bind_paged_indexer(
-        device=device,
-        num_heads=num_heads,
-        rows=rows,
-        width_blocks=width_blocks,
-        topk=512,
-        real_page_table=real_page_table,
-        seqlens=seqlens,
-        schedule_metadata=schedule,
-    )
-    with pytest.raises(NotImplementedError, match="requires CUDA"):
-        index_topk_fp8(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            topk=512,
-            binding=binding,
-        )
-
-
 def test_paged_index_decode_rejects_sharded_selector_heads() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")

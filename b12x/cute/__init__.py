@@ -7,6 +7,7 @@ from .compiler import (
     KeyField,
     KernelCompileSpec,
     TensorKey,
+    b12x_package_fingerprint,
     clear_compile_cache,
     compile,
     compile_cache_info,

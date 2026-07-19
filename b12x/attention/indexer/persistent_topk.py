@@ -873,12 +873,21 @@ def run_persistent_topk2048(
         page_table = page_table_1
         page_table_stride = int(page_table_1.shape[1])
 
+    # The kernel intentionally addresses these row-major matrices with flat
+    # scalar offsets.  CUTLASS DSL 4.6 preserves the rank-2 CuTe layout for a
+    # one-coordinate access instead of implicitly flattening it as 4.5 did,
+    # which aliases rows when rows > 1.  Keep the public tensors (and their
+    # semantic compile facts) rank-2, but make the launch ABI explicitly 1-D.
+    logits_runtime = logits.view(-1)
+    page_table_runtime = page_table.view(-1)
+    output_indices_runtime = output_indices.view(-1)
+
     kernel = _build_persistent_topk_kernel(paged_output=paged_output, topk=int(topk))
     args = (
-        _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(logits_runtime, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(page_table, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(output_indices, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(page_table_runtime, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(output_indices_runtime, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(state, cutlass.Int32, assumed_align=4),
         Int32(rows),
         Int32(stride),
@@ -895,17 +904,18 @@ def run_persistent_topk2048(
         _tensor_meta_key(output_indices, dynamic_dims=(0,)),
         _tensor_meta_key(state, dynamic_dims=(0,)),
         (
-            "persistent_topk2048_v1",
+            "persistent_topk2048_v2",
             int(topk),
             launch.chunk_size,
             launch.ctas_per_group,
             launch.num_groups,
             paged_output,
+            ("runtime_layout", "flat_1d"),
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.persistent_topk",
-        1,
+        2,
         cache_key,
         labels=(
             "logits",

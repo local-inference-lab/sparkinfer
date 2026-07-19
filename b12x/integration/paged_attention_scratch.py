@@ -1464,6 +1464,84 @@ class B12XPagedAttentionScratchPlan:
         del total_q_capacity
         return torch.arange(0, batch + 1, dtype=torch.int32, device=device)
 
+    def prepare_graph_replay_state(
+        self,
+        *,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        active_total_q: int | None = None,
+        fixed_split_size: int = -1,
+        disable_split_kv: bool = False,
+        window_left: int = -1,
+    ) -> "B12XPagedAttentionScratchPlan":
+        """Prepare non-decode graph metadata before CUDA capture.
+
+        A scratch plan is rematerialized on every bind.  Installing the plan
+        and its device metadata cache on this caller-owned object ensures that
+        the first bind performed during capture starts from prepared state.
+        """
+        if not self.caps.use_cuda_graph:
+            raise RuntimeError(
+                "prepare_graph_replay_state is only valid for graph-mode "
+                "paged scratch plans"
+            )
+        if self.caps.mode == "decode":
+            raise RuntimeError(
+                "decode plans require prepare_decode_graph_replay_state"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "prepare_graph_replay_state must be called before CUDA graph capture"
+            )
+        if window_left < -1:
+            raise ValueError(
+                "window_left must be -1 for full attention or a non-negative token count"
+            )
+        if active_total_q is None:
+            active_total_q = int(cu_seqlens_q[-1].item())
+        else:
+            active_total_q = int(active_total_q)
+        inferred_mode = _infer_mode_from_host_total(cu_seqlens_q, active_total_q)
+        if (
+            inferred_mode != self.caps.mode
+            and not (self.caps.mode == "verify" and inferred_mode == "extend")
+        ):
+            raise ValueError(
+                f"scratch mode {self.caps.mode} does not match prepared mode "
+                f"{inferred_mode}"
+            )
+        if active_total_q <= 0 or active_total_q > int(self._plan_q.shape[0]):
+            raise ValueError(
+                f"active_total_q={active_total_q} exceeds scratch capacity "
+                f"{int(self._plan_q.shape[0])}"
+            )
+
+        plan = create_paged_plan(
+            self._plan_q[:active_total_q],
+            self._plan_k_cache,
+            self._plan_v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode=self.caps.mode,
+            fixed_split_size=int(fixed_split_size),
+            disable_split_kv=bool(disable_split_kv),
+            window_left=int(window_left),
+            enable_cuda_graph=True,
+            graph_chunk_policy=True,
+            plan_budget=None,
+            msa_block_sparse=self.caps.msa_block_sparse,
+            msa_union_tile=bool(self.caps.msa_union_tile),
+        )
+        self._ensure_capacity(plan)
+        self._plan = plan
+        self._plan_metadata_cache = _make_plan_metadata_cache(
+            plan,
+            device=self.caps.device,
+        )
+        return self
+
     def prepare_decode_graph_replay_state(
         self,
         *,

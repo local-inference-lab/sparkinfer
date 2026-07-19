@@ -14,7 +14,7 @@ import torch
 from cutlass.cute.runtime import make_ptr
 
 from b12x.cute.fp4 import _fp4_encode_nibbles, fp4_quantize_values_torch
-from b12x.cute.compiler import compile as b12x_compile
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
@@ -85,7 +85,17 @@ def _run_w4a8_dynamic(
     seed: int,
     tile_m: int = _TILE_M,
     return_launcher: bool = False,
+    return_state: bool = False,
+    return_debug: bool = False,
+    route_weight_slot: int | None = None,
+    capture_intermediate: bool = False,
+    capture_fc1_raw: bool = False,
+    capture_fc1_staged: bool = False,
+    topk_ids_override: torch.Tensor | None = None,
+    compiled_override=None,
 ):
+    if return_state and not return_launcher:
+        raise ValueError("return_state requires return_launcher=True")
     device = torch.device("cuda")
     torch.manual_seed(seed)
     is_gated = activation == "silu"
@@ -94,10 +104,28 @@ def _run_w4a8_dynamic(
     x = (torch.randn(m, K, device=device) * 2.0).to(torch.bfloat16)
     w13_full = torch.randn(E, w1_n, K, device=device) * 0.05
     w2_full = torch.randn(E, K, n, device=device) * 0.05
-    topk_ids = torch.stack(
-        [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
-    ).to(torch.int32)
+    if topk_ids_override is None:
+        topk_ids = torch.stack(
+            [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
+        ).to(torch.int32)
+    else:
+        if tuple(topk_ids_override.shape) != (m, top_k):
+            raise ValueError(
+                "topk_ids_override must have shape "
+                f"{(m, top_k)}, got {tuple(topk_ids_override.shape)}"
+            )
+        topk_ids = topk_ids_override.to(device=device, dtype=torch.int32).contiguous()
+        if int(topk_ids.min().item()) < 0 or int(topk_ids.max().item()) >= E:
+            raise ValueError("topk_ids_override contains an out-of-range expert")
     topk_weights = torch.softmax(torch.randn(m, top_k, device=device), dim=-1).float()
+    if route_weight_slot is not None:
+        if not 0 <= route_weight_slot < top_k:
+            raise ValueError(
+                f"route_weight_slot must be in [0, {top_k}), got "
+                f"{route_weight_slot}"
+            )
+        topk_weights.zero_()
+        topk_weights[:, route_weight_slot] = 1.0
 
     if recipe == "w4a8_mx":
         w13_q = [_quantize_weight_mxfp4(w13_full[e]) for e in range(E)]
@@ -146,6 +174,17 @@ def _run_w4a8_dynamic(
     packed_a = torch.zeros(rows_padded * K, dtype=torch.uint8, device=device)
     # Sized for the (unused) vec16 SF TMA descriptor view: rows * K/8 bytes.
     scale_flat = torch.zeros(rows_padded * (K // 8), dtype=torch.uint8, device=device)
+    intermediate_words = rows_padded * (n + n // 32) // 4
+    if capture_fc1_staged:
+        intermediate_words = max(
+            intermediate_words,
+            rows_padded * (K + K // 32) // 4,
+        )
+    intermediate_u32 = torch.zeros(
+        intermediate_words,
+        dtype=torch.int32,
+        device=device,
+    )
     def z1():
         return torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -164,6 +203,11 @@ def _run_w4a8_dynamic(
     expert_tile_base = torch.zeros(E + 1, dtype=torch.int32, device=device)
     token_map = torch.zeros(rows_padded, dtype=torch.int32, device=device)
     token_weights = torch.zeros(rows_padded, dtype=torch.float32, device=device)
+    # The repacked-weight arguments are part of the launch ABI even when this
+    # test exercises the ordinary (non-repacked) W4A8 path.  The kernel does
+    # not dereference them in that specialization, so one aligned sentinel is
+    # sufficient while keeping the compile and runtime argument lists exact.
+    repacked_sentinel = torch.zeros(1, dtype=torch.uint32, device=device)
     scatter_output = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
     flat_ids = topk_ids.reshape(-1).contiguous()
     flat_weights = topk_weights.reshape(-1).contiguous()
@@ -191,7 +235,15 @@ def _run_w4a8_dynamic(
     def fake_ptr_i32():
         return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
 
-    compiled = b12x_compile(
+    def fake_ptr_u32():
+        return make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    def _compile_or_override(*args, **kwargs):
+        if compiled_override is not None:
+            return compiled_override
+        return b12x_compile(*args, **kwargs)
+
+    compiled = _compile_or_override(
         launch,
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
@@ -200,6 +252,7 @@ def _run_w4a8_dynamic(
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_u8(),
         fake_ptr_u8(),
+        fake_ptr_u32(),
         _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
         _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
         fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
@@ -209,6 +262,7 @@ def _run_w4a8_dynamic(
         b_down_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
+        fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
         _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
         _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -216,6 +270,17 @@ def _run_w4a8_dynamic(
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         1, 1, 1, 1, 1, 1, 1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_fields(
+            "tests.w4a8_dynamic.direct",
+            1,
+            ("recipe", recipe),
+            ("activation", activation),
+            ("tile_m", tile_m),
+            ("experts", E),
+            ("hidden", K),
+            ("intermediate", n),
+            ("top_k", top_k),
+        ),
         dsl_compile_options=_OPT_LEVEL_2,
     )
 
@@ -227,6 +292,7 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Float8E4M3FN, scale_flat),
         _gptr(cutlass.Uint8, packed_a),
         _gptr(cutlass.Uint8, scale_flat),
+        _gptr(cutlass.Uint32, intermediate_u32),
         barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
         task_head, task_tail,
         _gptr(cutlass.Int32, task_ready, 4),
@@ -244,6 +310,10 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Uint8, w2_mx),
         _gptr(cutlass.Uint8, w13_res),
         _gptr(cutlass.Uint8, w2_res),
+        _gptr(cutlass.Uint32, repacked_sentinel),
+        _gptr(cutlass.Uint32, repacked_sentinel),
+        _gptr(cutlass.Uint32, repacked_sentinel),
+        _gptr(cutlass.Uint32, repacked_sentinel),
         row_counts, expert_write_rows, expert_tile_base,
         ones, ones, ones, ones,
         _gptr(cutlass.BFloat16, scatter_output),
@@ -259,9 +329,285 @@ def _run_w4a8_dynamic(
         current_cuda_stream(),
     )
     torch.cuda.synchronize()
+    if sum(
+        int(enabled)
+        for enabled in (
+            capture_intermediate,
+            capture_fc1_raw,
+            capture_fc1_staged,
+        )
+    ) > 1:
+        raise ValueError(
+            "intermediate, raw-FC1, and staged-FC1 captures are mutually exclusive"
+        )
+    intermediate_debug = {}
+    if capture_intermediate:
+        if not return_debug:
+            raise ValueError("capture_intermediate requires return_debug=True")
+        from b12x.cute.fp4 import (
+            _ue8m0_output_scale_torch,
+            pow2_ceil_ue8m0_torch,
+        )
+        from b12x.moe.fused.reference import (
+            _make_fp4_lut,
+            _quant_dequant_mxfp8_rows,
+            _w4a8_effective_weight,
+        )
+
+        words_per_row = n // 4
+        payload_words = rows_padded * words_per_row
+        scale_words = rows_padded * (n // 128)
+        raw_bytes = intermediate_u32.view(torch.uint8)
+        device_payload = raw_bytes[: payload_words * 4].view(rows_padded, n)
+        device_scale = (
+            raw_bytes[payload_words * 4 : (payload_words + scale_words) * 4]
+            .view(n // 128, rows_padded, 4)
+            .permute(1, 0, 2)
+            .reshape(rows_padded, n // 32)
+        )
+
+        reference_activated = torch.zeros(
+            rows_padded, n, dtype=torch.float32, device=device
+        )
+        physical_expert = torch.full(
+            (rows_padded,), -1, dtype=torch.int32, device=device
+        )
+        physical_expert_local = torch.full_like(physical_expert, -1)
+        x_qd = _quant_dequant_mxfp8_rows(x.float())
+        fp4_lut = _make_fp4_lut(device)
+        expert_bases = expert_tile_base.tolist()
+        expert_counts = row_counts.tolist()
+        for expert in range(E):
+            count = int(expert_counts[expert])
+            if count == 0:
+                continue
+            physical_begin = int(expert_bases[expert]) * tile_m
+            physical_rows = torch.arange(
+                physical_begin,
+                physical_begin + count,
+                dtype=torch.long,
+                device=device,
+            )
+            token_rows = token_map[physical_rows].long()
+            w13_eff = _w4a8_effective_weight(
+                w13_packed[expert],
+                w13_mx[expert],
+                None if ref_res_w13 is None else ref_res_w13[expert],
+                w1_n,
+                K,
+                fp4_lut,
+            ).view(w1_n, K)
+            fc1 = x_qd[token_rows] @ w13_eff.T
+            activated = torch.square(torch.relu(fc1)).to(torch.bfloat16).float()
+            reference_activated[physical_rows] = activated
+            physical_expert[physical_rows] = expert
+            physical_expert_local[physical_rows] = torch.arange(
+                count, dtype=torch.int32, device=device
+            )
+
+        ref_blocks = reference_activated.view(rows_padded, n // 32, 32)
+        ref_block_max = ref_blocks.abs().amax(dim=-1, keepdim=True)
+        _, reference_scale = pow2_ceil_ue8m0_torch(ref_block_max / 448.0)
+        ref_inv_scale = _ue8m0_output_scale_torch(reference_scale)
+        reference_payload = (
+            (ref_blocks * ref_inv_scale)
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .view(rows_padded, n)
+        )
+        reference_scale = reference_scale.squeeze(-1)
+        device_dequant = (
+            device_payload.view(torch.float8_e4m3fn)
+            .float()
+            .view(rows_padded, n // 32, 32)
+            * _ue8m0_output_scale_torch(device_scale).reciprocal().unsqueeze(-1)
+        ).view(rows_padded, n)
+        reference_dequant = (
+            reference_payload.view(torch.float8_e4m3fn)
+            .float()
+            .view(rows_padded, n // 32, 32)
+            * _ue8m0_output_scale_torch(reference_scale).reciprocal().unsqueeze(-1)
+        ).view(rows_padded, n)
+        # reciprocal(0) is inf for byte-zero blocks, but the payload is also
+        # zero. Replace those products explicitly so zero blocks remain finite.
+        device_dequant = torch.where(
+            device_scale.repeat_interleave(32, dim=1) == 0,
+            torch.zeros_like(device_dequant),
+            device_dequant,
+        )
+        reference_dequant = torch.where(
+            reference_scale.repeat_interleave(32, dim=1) == 0,
+            torch.zeros_like(reference_dequant),
+            reference_dequant,
+        )
+        intermediate_debug = {
+            "intermediate_device_payload": device_payload.detach().cpu(),
+            "intermediate_device_scale": device_scale.detach().cpu(),
+            "intermediate_device_dequant": device_dequant.detach().cpu(),
+            "intermediate_reference_activated": reference_activated.detach().cpu(),
+            "intermediate_reference_payload": reference_payload.detach().cpu(),
+            "intermediate_reference_scale": reference_scale.detach().cpu(),
+            "intermediate_reference_dequant": reference_dequant.detach().cpu(),
+            "intermediate_physical_expert": physical_expert.detach().cpu(),
+            "intermediate_physical_expert_local": physical_expert_local.detach().cpu(),
+        }
+    fc1_raw_debug = {}
+    if capture_fc1_raw:
+        if not return_debug:
+            raise ValueError("capture_fc1_raw requires return_debug=True")
+        from b12x.moe.fused.reference import (
+            _make_fp4_lut,
+            _quant_dequant_mxfp8_rows,
+            _w4a8_effective_weight,
+        )
+
+        device_fc1_raw = (
+            intermediate_u32[: rows_padded * 32]
+            .view(torch.float32)
+            .view(rows_padded, 32)
+        )
+        reference_fc1_raw = torch.zeros_like(device_fc1_raw)
+        physical_expert = torch.full(
+            (rows_padded,), -1, dtype=torch.int32, device=device
+        )
+        physical_expert_local = torch.full_like(physical_expert, -1)
+        x_qd = _quant_dequant_mxfp8_rows(x.float())
+        fp4_lut = _make_fp4_lut(device)
+        expert_bases = expert_tile_base.tolist()
+        expert_counts = row_counts.tolist()
+        for expert in range(E):
+            count = int(expert_counts[expert])
+            if count == 0:
+                continue
+            physical_begin = int(expert_bases[expert]) * tile_m
+            physical_rows = torch.arange(
+                physical_begin,
+                physical_begin + count,
+                dtype=torch.long,
+                device=device,
+            )
+            token_rows = token_map[physical_rows].long()
+            w13_eff = _w4a8_effective_weight(
+                w13_packed[expert],
+                w13_mx[expert],
+                None if ref_res_w13 is None else ref_res_w13[expert],
+                w1_n,
+                K,
+                fp4_lut,
+            ).view(w1_n, K)
+            reference_fc1_raw[physical_rows] = (
+                x_qd[token_rows] @ w13_eff[:32].T
+            )
+            physical_expert[physical_rows] = expert
+            physical_expert_local[physical_rows] = torch.arange(
+                count, dtype=torch.int32, device=device
+            )
+        fc1_raw_debug = {
+            "fc1_raw_device": device_fc1_raw.detach().cpu(),
+            "fc1_raw_reference": reference_fc1_raw.detach().cpu(),
+            "fc1_raw_physical_expert": physical_expert.detach().cpu(),
+            "fc1_raw_physical_expert_local": physical_expert_local.detach().cpu(),
+        }
+    fc1_staged_debug = {}
+    if capture_fc1_staged:
+        if not return_debug:
+            raise ValueError("capture_fc1_staged requires return_debug=True")
+        staged_tiles = K // 128
+        payload_words_per_row = staged_tiles * 32
+        payload_words = rows_padded * payload_words_per_row
+        raw_bytes = intermediate_u32.view(torch.uint8)
+        device_payload = raw_bytes[: payload_words * 4].view(rows_padded, K)
+        device_scale = (
+            raw_bytes[
+                payload_words * 4 :
+                (payload_words + staged_tiles * rows_padded) * 4
+            ]
+            .view(staged_tiles, rows_padded, 4)
+            .permute(1, 0, 2)
+            .reshape(rows_padded, K // 32)
+        )
+        source_payload = packed_a.view(rows_padded, K)
+        source_scale = scale_flat[: rows_padded * (K // 32)].view(
+            rows_padded, K // 32
+        )
+        physical_expert = torch.full(
+            (rows_padded,), -1, dtype=torch.int32, device=device
+        )
+        physical_expert_local = torch.full_like(physical_expert, -1)
+        expert_bases = expert_tile_base.tolist()
+        expert_counts = row_counts.tolist()
+        for expert in range(E):
+            count = int(expert_counts[expert])
+            if count == 0:
+                continue
+            physical_begin = int(expert_bases[expert]) * tile_m
+            physical_rows = torch.arange(
+                physical_begin,
+                physical_begin + count,
+                dtype=torch.long,
+                device=device,
+            )
+            physical_expert[physical_rows] = expert
+            physical_expert_local[physical_rows] = torch.arange(
+                count, dtype=torch.int32, device=device
+            )
+        fc1_staged_debug = {
+            "fc1_staged_device_payload": device_payload.detach().cpu(),
+            "fc1_staged_source_payload": source_payload.detach().cpu(),
+            "fc1_staged_device_scale": device_scale.detach().cpu(),
+            "fc1_staged_source_scale": source_scale.detach().cpu(),
+            "fc1_staged_down_residual": w2_res.detach().cpu(),
+            "fc1_staged_physical_expert": physical_expert.detach().cpu(),
+            "fc1_staged_physical_expert_local": physical_expert_local.detach().cpu(),
+        }
+    if return_debug:
+        debug = {
+            "topk_ids": topk_ids.detach().cpu(),
+            "topk_weights": topk_weights.detach().cpu(),
+            "row_counts": row_counts.detach().cpu(),
+            "expert_write_rows": expert_write_rows.detach().cpu(),
+            "expert_tile_base": expert_tile_base.detach().cpu(),
+            "token_map": token_map.detach().cpu(),
+            "token_weights": token_weights.detach().cpu(),
+            "task_ready": task_ready.detach().cpu(),
+            "task_expert": task_expert.detach().cpu(),
+            "task_m_tile": task_m_tile.detach().cpu(),
+            "task_slice_begin": task_slice_begin.detach().cpu(),
+            "task_slice_count": task_slice_count.detach().cpu(),
+            "task_valid_rows": task_valid_rows.detach().cpu(),
+            "tile_write_count": tile_write_count.detach().cpu(),
+            **intermediate_debug,
+            **fc1_raw_debug,
+            **fc1_staged_debug,
+        }
+        if ref_res_w13 is not None and ref_res_w2 is not None:
+            for variant, fc1_residual, fc2_residual in (
+                ("no_fc1_residual", None, ref_res_w2),
+                ("no_fc2_residual", ref_res_w13, None),
+                ("no_residual", None, None),
+            ):
+                debug[f"reference_{variant}"] = moe_reference_w4a8_mx(
+                    x.float(),
+                    w13_packed,
+                    w13_mx,
+                    fc1_residual,
+                    ones,
+                    w2_packed,
+                    w2_mx,
+                    fc2_residual,
+                    ones,
+                    topk_ids,
+                    topk_weights,
+                    E,
+                    K,
+                    n,
+                    activation=activation,
+                )
+        return scatter_output, reference, debug
     if return_launcher:
-        def _relaunch():
-            compiled(
+        def _relaunch_with(compiled_kernel):
+            compiled_kernel(
                 _gptr(cutlass.BFloat16, x),
                 _gptr(cutlass.Int32, flat_ids, 4),
                 _gptr(cutlass.Float32, flat_weights, 4),
@@ -269,6 +615,7 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.Float8E4M3FN, scale_flat),
                 _gptr(cutlass.Uint8, packed_a),
                 _gptr(cutlass.Uint8, scale_flat),
+                _gptr(cutlass.Uint32, intermediate_u32),
                 barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
                 task_head, task_tail,
                 _gptr(cutlass.Int32, task_ready, 4),
@@ -286,6 +633,10 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.Uint8, w2_mx),
                 _gptr(cutlass.Uint8, w13_res),
                 _gptr(cutlass.Uint8, w2_res),
+                _gptr(cutlass.Uint32, repacked_sentinel),
+                _gptr(cutlass.Uint32, repacked_sentinel),
+                _gptr(cutlass.Uint32, repacked_sentinel),
+                _gptr(cutlass.Uint32, repacked_sentinel),
                 row_counts, expert_write_rows, expert_tile_base,
                 ones, ones, ones, ones,
                 _gptr(cutlass.BFloat16, scatter_output),
@@ -294,6 +645,75 @@ def _run_w4a8_dynamic(
                 m, m * top_k, m, rows_padded, max_tasks, phys_tiles, mac,
                 current_cuda_stream(),
             )
+
+        def _relaunch():
+            _relaunch_with(compiled)
+
+        if return_state:
+            def _current_reference():
+                return moe_reference_w4a8_mx(
+                    x.float(),
+                    w13_packed,
+                    w13_mx,
+                    ref_res_w13,
+                    ones,
+                    w2_packed,
+                    w2_mx,
+                    ref_res_w2,
+                    ones,
+                    flat_ids.view(m, top_k),
+                    flat_weights.view(m, top_k),
+                    E,
+                    K,
+                    n,
+                    activation=activation,
+                )
+
+            state = {
+                "live_inputs": {
+                    "x": x,
+                    "topk_ids": flat_ids.view(m, top_k),
+                    "topk_weights": flat_weights.view(m, top_k),
+                },
+                "read_only_inputs": {
+                    "w13_packed": w13_packed,
+                    "w2_packed": w2_packed,
+                    "w13_mx": w13_mx,
+                    "w2_mx": w2_mx,
+                    "w13_res": w13_res,
+                    "w2_res": w2_res,
+                    "ones": ones,
+                    "repacked_sentinel": repacked_sentinel,
+                },
+                "mutable_allocations": {
+                    "packed_a": packed_a,
+                    "scale_flat": scale_flat,
+                    "intermediate_u32": intermediate_u32,
+                    "barrier_count": barrier_count,
+                    "barrier_epoch": barrier_epoch,
+                    "pair_head": pair_head,
+                    "producers_done": producers_done,
+                    "all_pub": all_pub,
+                    "task_head": task_head,
+                    "task_tail": task_tail,
+                    "task_ready": task_ready,
+                    "task_expert": task_expert,
+                    "task_m_tile": task_m_tile,
+                    "task_slice_begin": task_slice_begin,
+                    "task_slice_count": task_slice_count,
+                    "task_valid_rows": task_valid_rows,
+                    "tile_write_count": tile_write_count,
+                    "row_counts": row_counts,
+                    "expert_write_rows": expert_write_rows,
+                    "expert_tile_base": expert_tile_base,
+                    "token_map": token_map,
+                    "token_weights": token_weights,
+                    "scatter_output": scatter_output,
+                },
+                "current_reference": _current_reference,
+                "relaunch_with": _relaunch_with,
+            }
+            return scatter_output, reference, _relaunch, state
         return scatter_output, reference, _relaunch
     return scatter_output, reference
 
@@ -346,6 +766,53 @@ def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_w4a8_nvfp4_relu2_m32_rows_16_17_match_oracle() -> None:
+    """Guard the FC1-A/FC2-residual alias handoff at the first M16 boundary."""
+    require_sm120()
+    m = 18
+    topk_ids = torch.tensor(
+        [[0, 1 + token % 3] for token in range(m)],
+        dtype=torch.int32,
+    )
+    out, ref, debug = _run_w4a8_dynamic(
+        recipe="w4a8_nvfp4",
+        activation="relu2",
+        E=4,
+        m=m,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=1032,
+        tile_m=32,
+        route_weight_slot=0,
+        return_debug=True,
+        topk_ids_override=topk_ids,
+    )
+
+    expert_zero_base = int(debug["expert_tile_base"][0].item()) * 32
+    assert int(debug["row_counts"][0].item()) == m
+    target_rows = torch.tensor(
+        [expert_zero_base + 16, expert_zero_base + 17], dtype=torch.long
+    )
+    target_tokens = debug["token_map"][target_rows].long()
+    assert len(set(target_tokens.tolist())) == 2
+    assert all(0 <= token < m for token in target_tokens.tolist())
+    assert debug["token_weights"][target_rows].tolist() == [1.0, 1.0]
+
+    for local, token in zip((16, 17), target_tokens.tolist(), strict=True):
+        metrics = compare_to_reference(
+            out[token : token + 1].float(), ref[token : token + 1]
+        )
+        ref_rms = ref[token].float().square().mean().sqrt().item()
+        assert metrics.cos > 0.999, (local, metrics)
+        assert metrics.rmse <= max(0.03 * ref_rms, 5e-3), (
+            local,
+            metrics,
+            ref_rms,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_boundary_m_sizes() -> None:
     require_sm120()
     for m in (1, 3, 127, 129):
@@ -392,6 +859,12 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     max_tasks = phys_tiles
     packed_a = torch.zeros(rows_padded * K, dtype=torch.uint8, device=device)
     scale_flat = torch.zeros(rows_padded * (K // 8), dtype=torch.uint8, device=device)
+    intermediate_u32 = torch.zeros(
+        rows_padded * (n + n // 32) // 4,
+        dtype=torch.int32,
+        device=device,
+    )
+    repacked_sentinel = torch.zeros(1, dtype=torch.uint32, device=device)
     def z1():
         return torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -431,6 +904,9 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     def fake_ptr_i32():
         return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
 
+    def fake_ptr_u32():
+        return make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+
     compiled = b12x_compile(
         launch,
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -438,7 +914,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(weight_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
-        fake_ptr_u8(), fake_ptr_u8(),
+        fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u32(),
         _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
         _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
         fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
@@ -448,6 +924,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         b_down_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
+        fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
         _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
         _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -467,6 +944,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.Float8E4M3FN, scale_flat),
             _gptr(cutlass.Uint8, packed_a),
             _gptr(cutlass.Uint8, scale_flat),
+            _gptr(cutlass.Uint32, intermediate_u32),
             barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
             task_head, task_tail,
             _gptr(cutlass.Int32, task_ready, 4),
@@ -484,6 +962,10 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.Uint8, w2_mx),
             _gptr(cutlass.Uint8, w13_res),
             _gptr(cutlass.Uint8, w2_res),
+            _gptr(cutlass.Uint32, repacked_sentinel),
+            _gptr(cutlass.Uint32, repacked_sentinel),
+            _gptr(cutlass.Uint32, repacked_sentinel),
+            _gptr(cutlass.Uint32, repacked_sentinel),
             row_counts, expert_write_rows, expert_tile_base,
             ones, ones, ones, ones,
             _gptr(cutlass.BFloat16, scatter_output),

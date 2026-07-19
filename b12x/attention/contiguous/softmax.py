@@ -55,7 +55,7 @@ class Softmax(ParamsBase):
         check_inf: cutlass.Constexpr[bool] = True,
     ) -> cute.Tensor:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        row_scale = cute.make_fragment(self._row_layout(), Float32)
+        row_scale = cute.make_rmem_tensor(self._row_layout(), Float32)
 
         for r in range(int(self.num_rows)):
             acc_S_row = acc_S_mn[r, None].load()
@@ -101,7 +101,7 @@ class Softmax(ParamsBase):
         if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
             assert cute.size(sink_val) == self.num_rows
         self.row_sum.store(cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4))
-        row_scale = cute.make_fragment(self._row_layout(), Float32)
+        row_scale = cute.make_rmem_tensor(self._row_layout(), Float32)
 
         for r in range(int(self.num_rows)):
             if cutlass.const_expr(sink_val is not None):

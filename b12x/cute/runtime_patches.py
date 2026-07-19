@@ -27,6 +27,15 @@ def apply_cutlass_runtime_patches() -> None:
     _apply_direct_frameinfo_patch()
 
 
+def cutlass_runtime_patch_status() -> tuple[tuple[str, bool], ...]:
+    """Return effective patch state for compile-manifest provenance."""
+    return (
+        ("compile_only_warning", _WARNING_PATCHED),
+        ("memory_debug", _MEMORY_DEBUG_PATCHED),
+        ("direct_frameinfo", _DIRECT_FRAMEINFO_PATCHED),
+    )
+
+
 def _env_flag(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -166,7 +175,8 @@ def _apply_direct_frameinfo_patch() -> None:
         return
 
     try:
-        from cutlass.base_dsl._mlir_helpers import op as op_helpers
+        # CUTLASS DSL 4.6 promotes the MLIR helpers to the top-level package.
+        from cutlass._mlir_helpers import op as op_helpers
     except Exception:
         return
 

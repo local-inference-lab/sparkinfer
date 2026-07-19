@@ -16,7 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.core import make_swizzle
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
@@ -26,6 +26,7 @@ from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
+from b12x.cute.smem import make_smem_memrange_alias, make_tma_aligned_payload_storage
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bf16_rowsum_m16k16_f32,
@@ -125,7 +126,11 @@ def _make_payload_tensor(payload_u8: cute.Tensor, dtype, offset_bytes: int, layo
 
 
 def _make_payload_memrange(payload_u8: cute.Tensor, dtype, offset_bytes: int, num_elems: int):
-            return cute.struct._MemRangeData(dtype, num_elems, _make_payload_ptr(payload_u8, dtype, offset_bytes))
+    return make_smem_memrange_alias(
+        dtype,
+        num_elems,
+        _make_payload_ptr(payload_u8, dtype, offset_bytes),
+    )
 
 
 def _get_memrange_tensor(memrange, layout):
@@ -2622,6 +2627,28 @@ class PagedForwardKernel:
             int(traits.shared_storage_bytes),
             q_stage_bytes + self.num_stages * kv_stage_bytes,
         )
+        SharedStorage = self._get_shared_storage_cls()
+        self.launch_smem_bytes = int(SharedStorage.size_in_bytes())
+        if self.launch_smem_bytes > traits.max_smem_per_threadblock:
+            raise ValueError(
+                f"paged typed shared storage requires {self.launch_smem_bytes} B per CTA, "
+                f"but the selected residency permits {traits.max_smem_per_threadblock} B"
+            )
+        exact_num_ctas_per_sm = (
+            2 if 2 * self.launch_smem_bytes <= traits.max_smem_per_sm else 1
+        )
+        if exact_num_ctas_per_sm != traits.num_ctas_per_sm:
+            raise AssertionError(
+                "paged trait residency does not match its instantiated typed shared storage: "
+                f"traits={traits.num_ctas_per_sm}, exact={exact_num_ctas_per_sm}, "
+                f"bytes={self.launch_smem_bytes}"
+            )
+        if self.num_stages == 1 and self.launch_smem_bytes != traits.launch_smem_bytes:
+            raise AssertionError(
+                "paged trait launch bytes do not match the instantiated shared storage: "
+                f"traits={traits.launch_smem_bytes}, exact={self.launch_smem_bytes}"
+            )
+        self.num_ctas_per_sm = exact_num_ctas_per_sm
         bf16_plane_decode_dims_supported = (
             not self.kv_is_fp8
             and traits.head_dim_qk % 64 == 0
@@ -2738,23 +2765,10 @@ class PagedForwardKernel:
         self.inverse_softmax_scale = Float32(traits.head_dim_qk**0.5)
 
     def _get_shared_storage_cls(self):
-        class SharedStorage:
-            pass
-
-        mbar_struct = cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
-        SharedStorage.__annotations__ = {
-            "mbar_ptr_K": mbar_struct,
-            "mbar_ptr_V": mbar_struct,
-            "payload": cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Uint8,
-                    int(self.shared_storage_bytes),
-                ],
-                1024,
-            ],
-        }
-
-        return cute.struct(SharedStorage)
+        return make_tma_aligned_payload_storage(
+            payload_bytes=self.shared_storage_bytes,
+            num_stages=self.num_stages,
+        )
 
     def _get_paged_kv_tma_plane_layout(self):
         plane_swizzle = os.environ.get("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
@@ -3266,7 +3280,6 @@ class PagedForwardKernel:
             internal_type=self.kv_tma_internal_type,
         )
 
-        SharedStorage = self._get_shared_storage_cls()
         grid = (
             (
                 mO.shape[0] // mPageTable.shape[0],
@@ -3303,10 +3316,9 @@ class PagedForwardKernel:
         ).launch(
             grid=grid,
             block=[32, self.traits.num_warps_q, self.launch_warps_kv],
-            smem=SharedStorage.size_in_bytes(),
-            # Trait selection already budgets shared memory for exactly one
-            # or two resident CTAs.  Carry the same contract into ptxas.
-            min_blocks_per_mp=self.traits.num_ctas_per_sm,
+            # The instantiated typed CUTLASS allocation is the launch and
+            # residency authority; carry that same contract into ptxas.
+            min_blocks_per_mp=self.num_ctas_per_sm,
             stream=stream,
         )
 
@@ -3476,13 +3488,32 @@ class PagedForwardKernel:
 
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = self._get_shared_storage_cls()
-        storage = smem.allocate(SharedStorage)
-        if warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
-            cpasync.prefetch_descriptor(tma_atom_K)
-            cpasync.prefetch_descriptor(tma_atom_V)
-        mbar_ptr_K = storage.mbar_ptr_K.data_ptr()
-        mbar_ptr_V = storage.mbar_ptr_V.data_ptr()
-        payload_u8 = storage.payload.get_tensor(
+        # CUTLASS DSL 4.6 uses the typed alloca below to infer the launch's
+        # dynamic-SMEM size.  Its lowered field pointers, however, are kept as
+        # per-thread address registers on SM120 instead of folding their static
+        # offsets into shared-memory instructions.  Keep the typed allocation
+        # for exact size/accounting, but form every view from one symbolic
+        # dynamic-SMEM root so those compile-time offsets remain foldable.
+        _smem_allocation = smem.allocate(SharedStorage)
+        smem_base = cute.arch.get_dyn_smem(
+            cutlass.Uint8, alignment=SharedStorage.__alignof__()
+        )
+        mbar_ptr_K = cute.recast_ptr(
+            smem_base + SharedStorage._offsets["mbar_ptr_K"],
+            dtype=cutlass.Int64,
+        )
+        mbar_ptr_V = cute.recast_ptr(
+            smem_base + SharedStorage._offsets["mbar_ptr_V"],
+            dtype=cutlass.Int64,
+        )
+        payload_ptr = smem_base + SharedStorage._offsets["payload"]
+        # TMA descriptor prefetch is a uniform, idempotent hint.  Issuing it
+        # without a warp-role branch matches the pre-4.6 lowering and avoids a
+        # new live uniform predicate in every warp.
+        cpasync.prefetch_descriptor(tma_atom_K)
+        cpasync.prefetch_descriptor(tma_atom_V)
+        payload_u8 = cute.make_tensor(
+            payload_ptr,
             cute.make_layout((self.shared_storage_bytes,), stride=(1,))
         )
         sQ = _make_payload_tensor(
@@ -4620,8 +4651,14 @@ class PagedForwardKernel:
                                                     Int32(0),
                                                 )
                                                 valid = valid and key_pos >= window_start
-                                        if not valid:
-                                            frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        # Keep each score selection scalar.  NVVM 23
+                                        # otherwise combines adjacent values into
+                                        # dependent b64 selects on SM120.
+                                        frag_S[mma_q, mma_kv, reg_id] = cutlass.select_(
+                                            valid,
+                                            frag_S[mma_q, mma_kv, reg_id],
+                                            Float32(-Float32.inf),
+                                        )
                                     else:
                                         frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
                             else:
@@ -6102,7 +6139,6 @@ class PagedFp8DecodeRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             mQ,
             tma_tensor_K,
@@ -6122,7 +6158,6 @@ class PagedFp8DecodeRawForwardKernel:
         ).launch(
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 1, 4],
-            smem=SharedStorage.size_in_bytes(),
             # 67,584 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
             stream=stream,
@@ -6738,7 +6773,6 @@ class PagedBf16ExtendRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             mQ,
             tma_tensor_K,
@@ -6759,7 +6793,6 @@ class PagedBf16ExtendRawForwardKernel:
         ).launch(
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 4, 1],
-            smem=SharedStorage.size_in_bytes(),
             # 99,328 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
             stream=stream,
@@ -7463,7 +7496,6 @@ class PagedFp8ExtendRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             1,
         )
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             mQ,
             tma_tensor_K,
@@ -7486,7 +7518,6 @@ class PagedFp8ExtendRawForwardKernel:
         ).launch(
             grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, self.num_warps_q, 1],
-            smem=SharedStorage.size_in_bytes(),
             # Q48 consumes 58,368 B and is one-CTA; Q32 consumes 50,176 B
             # and deliberately fits two CTAs in the 102,400-B SM budget.
             min_blocks_per_mp=1 if self.use_q48_long_form else 2,

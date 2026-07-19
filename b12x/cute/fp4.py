@@ -133,6 +133,11 @@ def pack_grouped_fp4_values(values: torch.Tensor) -> torch.Tensor:
     return packed.permute(1, 2, 0).contiguous()
 
 
+def _reciprocal_or_zero_torch(value: torch.Tensor) -> torch.Tensor:
+    """Match device quantizers, which map an unrepresentable zero scale to zero."""
+    return torch.where(value == 0, torch.zeros_like(value), 1.0 / value)
+
+
 def quantize_grouped_nvfp4_torch(
     input_tensor: torch.Tensor,
     row_counts: torch.Tensor,
@@ -155,7 +160,9 @@ def quantize_grouped_nvfp4_torch(
         sliced = x.view(valid_rows, cols // SF_VEC_SIZE, SF_VEC_SIZE)
         block_max = sliced.abs().amax(dim=-1, keepdim=True).to(torch.float32)
         scale = (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX)).to(torch.float8_e4m3fn).to(torch.float32)
-        output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx]))
+        output_scale = _reciprocal_or_zero_torch(
+            scale * _reciprocal_or_zero_torch(global_scale[group_idx])
+        )
         clipped = torch.clamp(sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).view(valid_rows, cols)
         quantized[group_idx, :valid_rows] = _fp4_quantize_values(clipped)
         scales[group_idx, :valid_rows] = scale.squeeze(-1)

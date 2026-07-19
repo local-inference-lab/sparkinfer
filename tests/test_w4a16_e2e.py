@@ -22,7 +22,7 @@ from b12x.moe.fused.reference import (
 from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
 from b12x.moe.fused.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
-    _W4A16SmallMDirectKernel,
+    MoEMicroKernelW4A16SmallMDirect,
     _small_m_direct_supported,
     compile_w4a16_fused_moe,
     compile_w4a16_topk_sum,
@@ -313,23 +313,26 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
     )
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
 
-    actual = run_w4a16_moe(
-        x,
-        prepared,
-        topk_weights,
-        topk_ids,
-        activation=activation,
-        intermediate_cache13=buffers.intermediate_cache13,
-        intermediate_cache2=buffers.intermediate_cache2,
-        output=buffers.output,
-        fc1_c_tmp=buffers.fc1_c_tmp,
-        fc2_c_tmp=buffers.fc2_c_tmp,
-        packed_route_indices=buffers.packed_route_indices,
-        block_expert_ids=buffers.block_expert_ids,
-        packed_route_count=buffers.packed_route_count,
-        expert_offsets=buffers.expert_offsets,
-        swiglu_limit=10.0 if activation == "silu" else None,
-    )
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            swiglu_limit=10.0 if activation == "silu" else None,
+        )
+
+    actual = launch()
     expected = moe_reference_w4a16_fp4_e8m0_k32(
         x,
         w13,
@@ -351,6 +354,17 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
 
     assert bool((actual != 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
+    if activation == "relu2":
+        eager = actual.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        buffers.output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(buffers.output).all().item())
+        assert torch.equal(buffers.output, eager)
+        _assert_matches_oracle(buffers.output, expected, activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -368,6 +382,21 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
     """Small-M micro decode path with native MXFP4 (E8M0 K/32) scales."""
     if swiglu_limit is not None and activation != "silu":
         pytest.skip("swiglu_limit only applies to gated (silu) activation")
+    if (activation, m, swiglu_limit, w13_layout) == ("silu", 1, None, "w13"):
+        common = dict(
+            activation="silu",
+            fast_math=True,
+            share_input_across_experts=True,
+            share_expert_scales=True,
+            single_token=True,
+        )
+        e4m3 = MoEMicroKernelW4A16SmallMDirect(
+            scale_format="e4m3_k16", **common
+        )
+        e8m0 = MoEMicroKernelW4A16SmallMDirect(
+            scale_format="e8m0_k32", **common
+        )
+        assert e4m3.__cache_key__ != e8m0.__cache_key__
     experts, hidden_size, intermediate_size = 4, 128, 128
     rows = intermediate_size * (2 if activation == "silu" else 1)
     topk = 2
@@ -431,23 +460,26 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
     )
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
 
-    actual = run_w4a16_moe(
-        x,
-        prepared,
-        topk_weights,
-        topk_ids,
-        activation=activation,
-        intermediate_cache13=buffers.intermediate_cache13,
-        intermediate_cache2=intermediate_cache2,
-        output=buffers.output,
-        fc1_c_tmp=buffers.fc1_c_tmp,
-        fc2_c_tmp=buffers.fc2_c_tmp,
-        packed_route_indices=buffers.packed_route_indices,
-        block_expert_ids=buffers.block_expert_ids,
-        packed_route_count=buffers.packed_route_count,
-        expert_offsets=buffers.expert_offsets,
-        swiglu_limit=swiglu_limit,
-    )
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            swiglu_limit=swiglu_limit,
+        )
+
+    actual = launch()
     expected = moe_reference_w4a16_fp4_e8m0_k32(
         x,
         w13,
@@ -469,6 +501,17 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
     assert bool((actual != 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
+    if (activation, m, swiglu_limit, w13_layout) == ("silu", 1, None, "w13"):
+        eager = actual.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        buffers.output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(buffers.output).all().item())
+        assert torch.equal(buffers.output, eager)
+        _assert_matches_oracle(buffers.output, expected, activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -693,20 +736,6 @@ def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
     assert bool(torch.isfinite(actual).all().item())
     assert bool((actual != 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
-
-
-def test_micro_scale_format_distinguishes_compile_cache_key() -> None:
-    """E8M0 vs E4M3 micro kernels must not collide in the compile cache."""
-    common = dict(
-        activation="silu",
-        fast_math=True,
-        share_input_across_experts=True,
-        share_expert_scales=True,
-        single_token=True,
-    )
-    e4m3 = _W4A16SmallMDirectKernel(scale_format="e4m3_k16", **common)
-    e8m0 = _W4A16SmallMDirectKernel(scale_format="e8m0_k32", **common)
-    assert e4m3.__cache_key__ != e8m0.__cache_key__
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

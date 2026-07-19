@@ -41,6 +41,40 @@ from b12x.attention.contiguous.tile_scheduler import (
     TileSchedulerArguments,
 )
 
+
+def _make_contiguous_shared_storage_cls(
+    dtype,
+    *,
+    q_numel: int,
+    k_numel: int,
+    v_numel: int,
+    num_stages: int,
+    buffer_align_bytes: int = 1024,
+):
+    """Build the allocation type used for both fit policy and the kernel."""
+    sQ_struct, sK_struct, sV_struct = [
+        cute.struct.Align[
+            cute.struct.MemRange[dtype, int(numel)],
+            buffer_align_bytes,
+        ]
+        for numel in (q_numel, k_numel, v_numel)
+    ]
+    mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1]
+    mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, num_stages * 2]
+    mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, num_stages * 2]
+
+    @cute.struct
+    class SharedStorageQKV:
+        mbar_ptr: mbar_ptr_Q_struct
+        mbar_ptr_K: mbar_ptr_K_struct
+        mbar_ptr_V: mbar_ptr_V_struct
+        sV: sV_struct
+        sQ: sQ_struct
+        sK: sK_struct
+
+    return SharedStorageQKV
+
+
 @cute.jit
 def warp_mma_gemm(
     tiled_mma: cute.TiledMma,
@@ -240,6 +274,26 @@ class ContiguousAttentionForwardKernel:
         self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
     @staticmethod
+    def shared_storage_bytes(
+        dtype,
+        head_dim,
+        head_dim_v,
+        tile_m,
+        tile_n,
+        num_stages,
+    ) -> int:
+        tile_hdim = int(math.ceil(head_dim / 16) * 16)
+        tile_hdimv = int(math.ceil(head_dim_v / 16) * 16)
+        SharedStorage = _make_contiguous_shared_storage_cls(
+            dtype,
+            q_numel=tile_m * tile_hdim,
+            k_numel=tile_n * tile_hdim * num_stages,
+            v_numel=tile_n * tile_hdimv * num_stages,
+            num_stages=num_stages,
+        )
+        return int(SharedStorage.size_in_bytes())
+
+    @staticmethod
     def can_implement(
         dtype,
         head_dim,
@@ -268,11 +322,14 @@ class ContiguousAttentionForwardKernel:
             return False
         if num_threads != (num_compute_warps + 1) * 32:
             return False
-        q_elem_bytes = dtype.width // 8
-        smem_usage_Q = tile_m * head_dim * q_elem_bytes
-        smem_usage_K = tile_n * head_dim * num_stages * q_elem_bytes
-        smem_usage_V = tile_n * head_dim_v * num_stages * q_elem_bytes
-        smem_usage = smem_usage_Q + smem_usage_K + smem_usage_V
+        smem_usage = ContiguousAttentionForwardKernel.shared_storage_bytes(
+            dtype,
+            head_dim,
+            head_dim_v,
+            tile_m,
+            tile_n,
+            num_stages,
+        )
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
         if smem_usage > smem_capacity:
             return False
@@ -308,26 +365,14 @@ class ContiguousAttentionForwardKernel:
         return tiled_mma_qk, tiled_mma_pv
 
     def _get_shared_storage_cls(self):
-        sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes
-            ]
-            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
-        ]
-        mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1]
-        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-
-        @cute.struct
-        class SharedStorageQKV:
-            mbar_ptr: mbar_ptr_Q_struct
-            mbar_ptr_K: mbar_ptr_K_struct
-            mbar_ptr_V: mbar_ptr_V_struct
-            sV: sV_struct
-            sQ: sQ_struct
-            sK: sK_struct
-
-        return SharedStorageQKV
+        return _make_contiguous_shared_storage_cls(
+            self.dtype,
+            q_numel=cute.cosize(self.sQ_layout),
+            k_numel=cute.cosize(self.sK_layout),
+            v_numel=cute.cosize(self.sV_layout),
+            num_stages=self.num_stages,
+            buffer_align_bytes=self.buffer_align_bytes,
+        )
 
     @cute.jit
     def epilogue(
@@ -443,9 +488,9 @@ class ContiguousAttentionForwardKernel:
         has_attention_sink_bias: cutlass.Constexpr = False,
         blocksparse_tensors=None,
         aux_tensors=None,
-        logical_num_batch_static: Int32 = 1,
-        logical_seqlen_q_static: Int32 = 0,
-        logical_seqlen_k_static: Int32 = 0,
+        logical_num_batch_static: cutlass.Constexpr = 1,
+        logical_seqlen_q_static: cutlass.Constexpr = 0,
+        logical_seqlen_k_static: cutlass.Constexpr = 0,
         stream: cuda.CUstream = None,
     ):
         assert blocksparse_tensors is None
@@ -506,6 +551,26 @@ class ContiguousAttentionForwardKernel:
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
+        self.launch_smem_bytes = int(SharedStorage.size_in_bytes())
+        expected_launch_smem_bytes = self.shared_storage_bytes(
+            self.dtype,
+            self.tile_hdim,
+            self.tile_hdimv,
+            self.tile_m,
+            self.tile_n,
+            self.num_stages,
+        )
+        if const_expr(self.launch_smem_bytes != expected_launch_smem_bytes):
+            raise AssertionError(
+                "contiguous typed shared-memory policy/allocation mismatch: "
+                f"policy={expected_launch_smem_bytes}, allocation={self.launch_smem_bytes}"
+            )
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        if const_expr(self.launch_smem_bytes > smem_capacity):
+            raise ValueError(
+                f"contiguous typed shared storage requires {self.launch_smem_bytes} B, "
+                f"but SM120 permits {smem_capacity} B per CTA"
+            )
 
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
@@ -613,7 +678,6 @@ class ContiguousAttentionForwardKernel:
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -649,8 +713,8 @@ class ContiguousAttentionForwardKernel:
         tile_sched_params,
         TileScheduler: cutlass.Constexpr,
         SharedStorage: cutlass.Constexpr,
-        logical_seqlen_q_static: Int32,
-        logical_seqlen_k_static: Int32,
+        logical_seqlen_q_static: cutlass.Constexpr,
+        logical_seqlen_k_static: cutlass.Constexpr,
         aux_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -856,8 +920,8 @@ class ContiguousAttentionForwardKernel:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-        pipeline_k.producer_tail(kv_producer_state)
-        pipeline_v.producer_tail(kv_producer_state)
+        pipeline_k.producer_tail(kv_producer_state.clone())
+        pipeline_v.producer_tail(kv_producer_state.clone())
 
     @cute.jit
     def mma_one_n_block(
@@ -890,7 +954,7 @@ class ContiguousAttentionForwardKernel:
     ):
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         warp_mma_gemm(
             thr_mma_qk,
@@ -964,7 +1028,7 @@ class ContiguousAttentionForwardKernel:
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         taccOcO = thr_mma_pv.partition_C(cO)
         taccOcO_mn = layout_utils.reshape_acc_to_mn(taccOcO)
@@ -1152,10 +1216,9 @@ class ContiguousAttentionForwardKernel:
                             partial(mask_fn, mask_seqlen=False),
                             aux_tensors=aux_tensors,
                         )
-
             sink_val = None
             if const_expr(has_attention_sink_bias):
-                sink_val = cute.make_fragment(softmax.num_rows, Float32)
+                sink_val = cute.make_rmem_tensor(softmax.num_rows, Float32)
                 for r in cutlass.range_constexpr(softmax.num_rows):
                     if const_expr(self.pack_gqa):
                         row_idx = m_block * self.tile_m + taccOcO_mn[r, 0][0]

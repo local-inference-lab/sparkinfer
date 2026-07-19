@@ -438,7 +438,6 @@ class MoETinyDecodeKernelBackend:
         ).launch(
             grid=(Int32(self.grid_x), Int32(1), Int32(1)),
             block=(_BLOCK_THREADS, 1, 1),
-            smem=0,
             stream=stream,
         )
 
@@ -479,3 +478,25 @@ class MoETinyDecodeKernelBackend:
         )
         compiled_fc1(*args)
         compiled_fc2(*args)
+
+
+class MoETinyDecodeKernelBackendPhase1(MoETinyDecodeKernelBackend):
+    """Phase-1 compile identity for exact launch/resource attribution."""
+
+    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31"):
+        super().__init__(
+            activation=activation,
+            w13_layout=w13_layout,
+            compile_time_phase=1,
+        )
+
+
+class MoETinyDecodeKernelBackendPhase2(MoETinyDecodeKernelBackend):
+    """Phase-2 compile identity for exact launch/resource attribution."""
+
+    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31"):
+        super().__init__(
+            activation=activation,
+            w13_layout=w13_layout,
+            compile_time_phase=2,
+        )

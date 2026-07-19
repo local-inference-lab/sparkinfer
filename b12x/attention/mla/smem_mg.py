@@ -102,14 +102,18 @@ class SmemLayoutMG:
     total_bytes: int
 
 
-def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> SmemLayoutMG:
+def make_smem_layout_mg(
+    traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG
+) -> SmemLayoutMG:
     # DSV4 (has_extra_cache) staged the 448B NoPE only (rope from global, UE8M0
     # footer in kv_sc). GLM (ARBITRARY_FP32, no extra cache) stages the 528B
     # NoPE+inline-fp32-scales row (scales inline, NO footer) PLUS a kv_rope buffer
     # (GLM has no global-rope path in MG). Both share the rest of the MG layout.
     is_glm = not traits.has_extra_cache
     if mg_n_hg not in (1, 2):
-        raise ValueError(f"MG prefill layout supports mg_n_hg in {{1, 2}}, got {mg_n_hg}")
+        raise ValueError(
+            f"MG prefill layout supports mg_n_hg in {{1, 2}}, got {mg_n_hg}"
+        )
 
     bi = traits.bi
     hpb = traits.hpb
@@ -319,7 +323,9 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
     )
 
 
-def get_prefill_mg_shared_storage_cls(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG):
+def get_prefill_mg_shared_storage_cls(
+    traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG
+):
     layout = make_smem_layout_mg(traits, mg_n_hg)
 
     class SharedStorageMG:
@@ -347,7 +353,9 @@ def get_prefill_mg_shared_storage_cls(traits: UnifiedMLATraits, mg_n_hg: int = _
     # W_FP8 region (no separate q_rope field).
     tail = {
         "kv_fp8": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)],
+            cute.struct.MemRange[
+                cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)
+            ],
             128,
         ],
         **kv_scale_field,
@@ -393,13 +401,54 @@ def get_prefill_mg_shared_storage_cls(traits: UnifiedMLATraits, mg_n_hg: int = _
             "q_sc": cute.struct.MemRange[cutlass.Float32, int(layout.q_sc_bytes // 4)],
             **tail,
         }
-    return cute.struct(SharedStorageMG)
+
+    storage_cls = cute.struct(SharedStorageMG)
+    if layout.bf16_qk:
+        expected_offsets = {"q_nope_bf16": layout.q_nope_bf16_off}
+    elif is_glm:
+        expected_offsets = {
+            "q_fp8": layout.q_fp8_off,
+            "q_sc": layout.q_sc_off,
+        }
+    else:
+        expected_offsets = {
+            "q_rope": layout.q_rope_off,
+            "q_fp8": layout.q_fp8_off,
+            "q_sc": layout.q_sc_off,
+        }
+    expected_offsets["kv_fp8"] = layout.kv_fp8_off
+    if not is_glm:
+        expected_offsets["kv_sc"] = layout.kv_sc_off
+    expected_offsets.update(
+        {
+            "mbar": layout.mbar_off,
+            "reduce": layout.reduce_off,
+            "w_head_sc": layout.w_head_sc_off,
+            "w_fp8": layout.w_fp8_off,
+        }
+    )
+
+    actual_offsets = dict(storage_cls._offsets)
+    if actual_offsets != expected_offsets:
+        raise ValueError(
+            "typed MLA MG SharedStorage offsets diverge from SmemLayoutMG: "
+            f"typed={actual_offsets}, logical={expected_offsets}"
+        )
+    typed_bytes = int(storage_cls.size_in_bytes())
+    if typed_bytes != layout.total_bytes:
+        raise ValueError(
+            "typed MLA MG SharedStorage size diverges from SmemLayoutMG: "
+            f"typed={typed_bytes}, logical={layout.total_bytes}"
+        )
+    return storage_cls
 
 
 def _run_module_asserts() -> None:
     from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
-    traits = make_unified_traits(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
+    traits = make_unified_traits(
+        ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE
+    )
     layout = make_smem_layout_mg(traits)
     assert not layout.bf16_qk
     assert layout.kv_smem_stride == 464
@@ -440,6 +489,8 @@ def _run_module_asserts() -> None:
     assert fp8_1.sm_p_full_bytes == layout.sm_p_full_bytes // 2
     assert fp8_1.total_bytes <= layout.total_bytes
     assert fp8_1.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+    get_prefill_mg_shared_storage_cls(traits, mg_n_hg=1)
+    get_prefill_mg_shared_storage_cls(traits, mg_n_hg=2)
 
     bf16_1 = make_smem_layout_mg(bf16, mg_n_hg=1)
     assert bf16_1.mg_n_hg == 1 and bf16_1.bf16_qk
@@ -447,11 +498,15 @@ def _run_module_asserts() -> None:
     assert bf16_1.q_nope_bf16_bytes == bl.q_nope_bf16_bytes // 2
     assert bf16_1.q_rope_off == bf16_1.w_fp8_off
     assert bf16_1.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+    get_prefill_mg_shared_storage_cls(bf16, mg_n_hg=1)
+    get_prefill_mg_shared_storage_cls(bf16, mg_n_hg=2)
 
     # GLM (ARBITRARY_FP32, no extra cache): kv_smem_stride 528 (512 nope + 16
     # inline fp32 scales), NO kv_sc footer (inline scales), NO kv_rope (rope read
     # from global/L2), Q-rope aliased onto W_FP8 -- so mg_n_hg==2 fits the carveout.
-    glm = make_unified_traits(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
+    glm = make_unified_traits(
+        ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )
     for nhg in (1, 2):
         gl = make_smem_layout_mg(glm, mg_n_hg=nhg)
         assert not gl.bf16_qk
@@ -465,6 +520,7 @@ def _run_module_asserts() -> None:
             f"GLM MG prefill smem {gl.total_bytes}B exceeds SM120 carveout "
             f"{SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
         )
+        get_prefill_mg_shared_storage_cls(glm, mg_n_hg=nhg)
 
 
 _run_module_asserts()

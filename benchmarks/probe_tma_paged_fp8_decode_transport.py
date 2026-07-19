@@ -101,11 +101,18 @@ class RawPtxPagedFp8DecodeTransportProbe:
         page_index: Int32,
         stream: cuda.CUstream,
     ):
-        SharedStorage = self._get_shared_storage_cls()
-        self.kernel(mQ, mPageTable, mKDescPtrs, mVDescPtrs, mOutWords, request_idx, kv_head_idx, page_index).launch(
+        self.kernel(
+            mQ,
+            mPageTable,
+            mKDescPtrs,
+            mVDescPtrs,
+            mOutWords,
+            request_idx,
+            kv_head_idx,
+            page_index,
+        ).launch(
             grid=(1, 1, 1),
             block=[32, 1, self.warps_kv],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -128,7 +135,9 @@ class RawPtxPagedFp8DecodeTransportProbe:
         storage = smem.allocate(SharedStorage)
         mbar_ptr_K = storage.mbar_ptr_K.data_ptr()
         mbar_ptr_V = storage.mbar_ptr_V.data_ptr()
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((_PAYLOAD_BYTES,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((_PAYLOAD_BYTES,), stride=(1,))
+        )
         sQ = cute.make_tensor(
             cute.recast_ptr(payload_u8.iterator.align(16), dtype=cutlass.BFloat16),
             cute.make_layout((16, 256), stride=(256, 1)),
@@ -202,14 +211,21 @@ class RawPtxPagedFp8DecodeTransportProbe:
         if const_expr(self.wait_mode != "none"):
             if const_expr(self.wait_mode == "all") or warp_kv_idx == Int32(0):
                 if const_expr(self.issue_k):
-                    cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr_K + consumer_state.index, phase=consumer_state.phase
+                    )
                 if const_expr(self.issue_v):
-                    cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr_V + consumer_state.index, phase=consumer_state.phase
+                    )
         cute.arch.sync_threads()
 
         payload_u32 = cute.flatten(
             cute.recast_tensor(
-                cute.make_tensor(payload_u8.iterator, cute.make_layout((_PAYLOAD_BYTES,), stride=(1,))),
+                cute.make_tensor(
+                    payload_u8.iterator,
+                    cute.make_layout((_PAYLOAD_BYTES,), stride=(1,)),
+                ),
                 cutlass.Uint32,
             )
         )
@@ -225,7 +241,9 @@ class RawPtxPagedFp8DecodeTransportProbe:
             dst_base = Int32(_OUT_WORDS)
             word_offset = tidx
             while word_offset < _OUT_WORDS:
-                out_words[dst_base + word_offset] = payload_u32[v_src_word + word_offset]
+                out_words[dst_base + word_offset] = payload_u32[
+                    v_src_word + word_offset
+                ]
                 word_offset += 128
 
 
@@ -260,14 +278,20 @@ def _build_desc_words(src_u8: torch.Tensor, *, swizzle: str) -> torch.Tensor:
     )
     if result != cuda.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
-    return torch.tensor([int(word) for word in tensor_map.opaque], dtype=torch.uint64, device="cuda")
+    return torch.tensor(
+        [int(word) for word in tensor_map.opaque], dtype=torch.uint64, device="cuda"
+    )
 
 
 def _descriptor_row_ptrs(desc_words: torch.Tensor) -> torch.Tensor:
-    return torch.tensor([int(desc_words.data_ptr())], dtype=torch.int64, device=desc_words.device)
+    return torch.tensor(
+        [int(desc_words.data_ptr())], dtype=torch.int64, device=desc_words.device
+    )
 
 
-def _expected_words(src_u8: torch.Tensor, *, page_index: int, swizzle: str) -> torch.Tensor:
+def _expected_words(
+    src_u8: torch.Tensor, *, page_index: int, swizzle: str
+) -> torch.Tensor:
     if src_u8.ndim == 3:
         src_u8 = src_u8.reshape(-1, src_u8.shape[-1])
     page = src_u8[page_index * _ROWS : (page_index + 1) * _ROWS].cpu()
@@ -317,7 +341,9 @@ def _compare(got: torch.Tensor, exp: torch.Tensor) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="128-thread raw PTX paged FP8 decode transport probe.")
+    parser = argparse.ArgumentParser(
+        description="128-thread raw PTX paged FP8 decode transport probe."
+    )
     parser.add_argument("--pages", type=int, default=4)
     parser.add_argument("--page-index", type=int, default=0)
     parser.add_argument("--swizzle", choices=("none", "128b"), default="128b")
@@ -325,7 +351,9 @@ def main() -> None:
     parser.add_argument("--k-dst-offset", default="q")
     parser.add_argument("--v-dst-offset", default="qk")
     parser.add_argument("--warps-kv", type=int, default=4)
-    parser.add_argument("--wait-mode", choices=("warp0", "all", "none"), default="warp0")
+    parser.add_argument(
+        "--wait-mode", choices=("warp0", "all", "none"), default="warp0"
+    )
     parser.add_argument("--with-qcopy", action="store_true")
     parser.add_argument("--request-idx", type=int, default=0)
     parser.add_argument("--kv-head-idx", type=int, default=0)
@@ -336,13 +364,28 @@ def main() -> None:
     k_dst_offset = _offset_value(args.k_dst_offset)
     v_dst_offset = _offset_value(args.v_dst_offset)
 
-    src_k_u8 = _build_src_bytes(args.pages, salt=0).view(args.pages, _ROWS, 1, _HEAD_DIM).repeat(1, 1, 8, 1)
-    src_v_u8 = _build_src_bytes(args.pages, salt=17).view(args.pages, _ROWS, 1, _HEAD_DIM).repeat(1, 1, 8, 1)
+    src_k_u8 = (
+        _build_src_bytes(args.pages, salt=0)
+        .view(args.pages, _ROWS, 1, _HEAD_DIM)
+        .repeat(1, 1, 8, 1)
+    )
+    src_v_u8 = (
+        _build_src_bytes(args.pages, salt=17)
+        .view(args.pages, _ROWS, 1, _HEAD_DIM)
+        .repeat(1, 1, 8, 1)
+    )
     src_k = src_k_u8.to(torch.float8_e4m3fn)
     src_v = src_v_u8.to(torch.float8_e4m3fn)
-    page_table = torch.arange(args.pages, dtype=torch.int32, device="cuda").view(1, -1).repeat(8, 1)
-    from b12x.attention.paged.api import _descriptor_row_ptrs as _api_descriptor_row_ptrs
+    page_table = (
+        torch.arange(args.pages, dtype=torch.int32, device="cuda")
+        .view(1, -1)
+        .repeat(8, 1)
+    )
+    from b12x.attention.paged.api import (
+        _descriptor_row_ptrs as _api_descriptor_row_ptrs,
+    )
     from b12x.attention.paged.api import _encode_fp8_plane_tma_descriptors
+
     desc_words_k = _encode_fp8_plane_tma_descriptors(src_k, plane_cols=_PLANE_COLS)
     desc_words_v = _encode_fp8_plane_tma_descriptors(src_v, plane_cols=_PLANE_COLS)
     desc_k = _api_descriptor_row_ptrs(desc_words_k)
@@ -401,9 +444,19 @@ def main() -> None:
     src_k_head = src_k.view(torch.uint8)[:, :, args.kv_head_idx, :].contiguous()
     src_v_head = src_v.view(torch.uint8)[:, :, args.kv_head_idx, :].contiguous()
     if issue_k:
-        report["k"] = _compare(got[:_OUT_WORDS], _expected_words(src_k_head, page_index=args.page_index, swizzle=args.swizzle))
+        report["k"] = _compare(
+            got[:_OUT_WORDS],
+            _expected_words(
+                src_k_head, page_index=args.page_index, swizzle=args.swizzle
+            ),
+        )
     if issue_v:
-        report["v"] = _compare(got[_OUT_WORDS:], _expected_words(src_v_head, page_index=args.page_index, swizzle=args.swizzle))
+        report["v"] = _compare(
+            got[_OUT_WORDS:],
+            _expected_words(
+                src_v_head, page_index=args.page_index, swizzle=args.swizzle
+            ),
+        )
     print(json.dumps(report, indent=2))
 
 

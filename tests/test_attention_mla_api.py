@@ -11,8 +11,7 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.attention.mla.legacy import kernel as mla_kernel
-from b12x.attention.mla.legacy import split as mla_split
+from b12x.attention.mla.packed import extract_packed_kv_runtime_views
 
 
 class _FakeMLAWorkspace:
@@ -144,7 +143,7 @@ class _FakeMLAWorkspace:
     def _refresh_ragged_kv_contracts(self) -> None:
         assert self.ragged_kv_cache is not None
         self._contract_kv_rows, self._contract_kv_scales = (
-            mla_kernel._extract_packed_kv_runtime_views(self.ragged_kv_cache)
+            extract_packed_kv_runtime_views(self.ragged_kv_cache)
         )
 
 
@@ -444,107 +443,6 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
     )
 
 
-def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
-    workspace = _make_workspace(
-        mode="extend",
-        topk=2048,
-        max_total_q=8,
-        max_batch=4,
-        max_kv_rows=16,
-    )
-    full_kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
-    ragged_kv_cache = workspace.gather_ragged_kv_rows(
-        kv_cache=full_kv_cache,
-        row_ids=torch.tensor([2, 5, 7, 11], dtype=torch.int32),
-    )
-    q_all = torch.zeros((5, 8, 256), dtype=torch.bfloat16)
-    page_table_1 = torch.zeros((5, 2048), dtype=torch.int32)
-    active_token_counts = torch.full((5,), 12, dtype=torch.int32)
-    sm_scale = torch.ones((1,), dtype=torch.float32)
-    assert workspace.tmp_output is not None
-    assert workspace.tmp_lse is not None
-    workspace.set_split_chunk_config(kv_chunk_size=32, num_chunks=64)
-
-    captured_cache_keys: list[tuple[object, ...]] = []
-
-    def fake_b12x_launch(
-        kernel,
-        *,
-        compile_spec,
-        compile_args,
-        runtime_args,
-        compile_kwargs=None,
-    ):
-        del kernel, compile_args, runtime_args, compile_kwargs
-        captured_cache_keys.append(tuple(field.value for field in compile_spec.fields))
-
-    def identity_to_kernel_tensor(tensor, dtype, *, assumed_align=16):
-        del dtype, assumed_align
-        return tensor
-
-    def fake_build_sparse_mla_split_forward_kernel(
-        traits, launch_num_chunks, head_tiles, identity_page_table
-    ):
-        del traits, launch_num_chunks, head_tiles, identity_page_table
-        return object()
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(mla_split, "b12x_launch", fake_b12x_launch)
-    monkeypatch.setattr(mla_split, "_to_kernel_tensor", identity_to_kernel_tensor)
-    monkeypatch.setattr(
-        mla_split, "select_sparse_mla_traits", lambda **kwargs: object()
-    )
-    monkeypatch.setattr(
-        mla_split,
-        "_build_sparse_mla_split_forward_kernel",
-        fake_build_sparse_mla_split_forward_kernel,
-    )
-    monkeypatch.setattr(mla_split, "current_cuda_stream", lambda: None)
-    try:
-        mla_split.run_sparse_mla_split_decode_forward(
-            q_all=q_all,
-            kv_cache=full_kv_cache,
-            page_table_1=page_table_1,
-            active_token_counts=active_token_counts,
-            sm_scale=sm_scale,
-            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
-            num_chunks_ptr=workspace.num_chunks_ptr,
-            tmp_output=workspace.tmp_output,
-            tmp_lse=workspace.tmp_lse,
-            launch_num_chunks=64,
-            workspace=workspace,
-        )
-        mla_split.run_sparse_mla_split_decode_forward(
-            q_all=q_all,
-            kv_cache=ragged_kv_cache,
-            page_table_1=page_table_1,
-            active_token_counts=active_token_counts,
-            sm_scale=sm_scale,
-            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
-            num_chunks_ptr=workspace.num_chunks_ptr,
-            tmp_output=workspace.tmp_output,
-            tmp_lse=workspace.tmp_lse,
-            launch_num_chunks=64,
-            workspace=workspace,
-        )
-    finally:
-        monkeypatch.undo()
-
-    full_kv_rows_u32, full_kv_scales = mla_kernel._extract_packed_kv_runtime_views(
-        full_kv_cache
-    )
-    assert len(captured_cache_keys) == 2
-    assert captured_cache_keys[0][1] == mla_kernel._tensor_meta_key(full_kv_rows_u32)
-    assert captured_cache_keys[0][2] == mla_kernel._tensor_meta_key(full_kv_scales)
-    assert workspace._contract_kv_rows is not None
-    assert workspace._contract_kv_scales is not None
-    assert captured_cache_keys[1][1] == mla_kernel._tensor_meta_key(
-        workspace._contract_kv_rows
-    )
-    assert captured_cache_keys[1][2] == mla_kernel._tensor_meta_key(
-        workspace._contract_kv_scales
-    )
-
 
 def test_sparse_mla_verify_uses_reference_when_sm120_unavailable(monkeypatch) -> None:
     workspace = _make_workspace(mode="verify", topk=2048)
@@ -751,15 +649,6 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     assert workspace.num_chunks_ptr is not None
     assert int(workspace.kv_chunk_size_ptr[0].item()) == 256
     assert int(workspace.num_chunks_ptr[0].item()) == 8
-
-
-def test_sparse_mla_split_config_supports_wide_compressed_contexts() -> None:
-    cfg = mla_split.default_sparse_mla_split_decode_config_for_width(36224)
-
-    assert cfg is not None
-    assert cfg.chunk_size == 256
-    assert cfg.num_chunks == math.ceil(36224 / 256)
-    assert cfg.num_chunks <= 256
 
 
 def test_mla_workspace_enforces_capacity_limits() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.gemm.wo_projection import (
@@ -402,8 +403,7 @@ def test_wo_b_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
     tokens, rank, groups, hidden = 1, 1024, 4, 128
     width = rank * groups
     source = (
-        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16)
-        / 4
+        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16) / 4
     ).contiguous()
     quantized = []
     bases = []
@@ -664,7 +664,9 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
 
 
-def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding() -> None:
+def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding() -> (
+    None
+):
     require_sm120()
     torch.manual_seed(31007)
 
@@ -688,15 +690,11 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     cos_sin_cache = torch.zeros((4, rope_dim), device="cuda", dtype=torch.float32)
     cos_sin_cache[:, : rope_dim // 2] = 1
     wo_a = (
-        torch.randn(
-            (groups, rank, group_width), device="cuda", dtype=torch.bfloat16
-        )
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
     )
     wo_b = (
-        torch.randn(
-            (hidden, groups * rank), device="cuda", dtype=torch.bfloat16
-        )
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
         / (groups * rank) ** 0.5
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
@@ -927,9 +925,7 @@ def test_wo_b_fused_quant_matches_unfused_small_shapes() -> None:
     torch.manual_seed(31008)
 
     for tokens in (1, 3, 8):
-        fused, unfused = _wo_b_fused_vs_unfused(
-            tokens, rank=128, groups=2, hidden=256
-        )
+        fused, unfused = _wo_b_fused_vs_unfused(tokens, rank=128, groups=2, hidden=256)
         torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
     # Singleton group takes the contiguous-source path.
     fused, unfused = _wo_b_fused_vs_unfused(2, rank=256, groups=1, hidden=256)
@@ -1005,10 +1001,7 @@ def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
     max_pos = 64
     inv_freq = 1.0 / (
         10000.0
-        ** (
-            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
-            / rope_dim
-        )
+        ** (torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32) / rope_dim)
     )
     t = torch.arange(max_pos, device="cuda", dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
@@ -1068,10 +1061,7 @@ def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
     positions = torch.randint(0, 4096, (tokens,), device="cuda", dtype=torch.int64)
     inv_freq = 1.0 / (
         10000.0
-        ** (
-            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
-            / rope_dim
-        )
+        ** (torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32) / rope_dim)
     )
     t = torch.arange(4096, device="cuda", dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
@@ -1112,7 +1102,19 @@ def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
 
 
-def test_wo_quant_cute_paths_match_triton_bit_exact() -> None:
+@pytest.mark.parametrize(
+    "quant_path",
+    ("grouped", "inv-rope-fp32", "inv-rope-bf16", "group-major"),
+)
+def test_wo_quant_cute_paths_match_triton_bit_exact(quant_path: str) -> None:
+    """Give every compiled WO-quant specialization its own launch range.
+
+    The grouped specializations intentionally share one generated CUDA symbol.
+    Keeping them in separate parametrized tests lets the migration corpus bind
+    each compile-spec hash to an unambiguous Nsight range instead of pretending
+    that a symbol name alone identifies a specialization.
+    """
+
     require_sm120()
     torch.manual_seed(31013)
 
@@ -1141,100 +1143,129 @@ def test_wo_quant_cute_paths_match_triton_bit_exact() -> None:
             atol=0,
         )
 
-    # Plain grouped: the (unrouted) CuTe grouped kernel vs the Triton path.
-    from b12x.gemm.wo_quant_cute import quantize_wo_grouped_rows_cute
+    from b12x.gemm.wo_quant_cute import (
+        quantize_wo_group_major_rows_cute,
+        quantize_wo_grouped_rows_cute,
+    )
 
-    src_contig = (
-        torch.randn(
-            (tokens, groups, group_width), device="cuda", dtype=torch.bfloat16
+    if quant_path == "group-major":
+        source = empty_dense_gemm_mnl_view(
+            tokens, rank, groups, device="cuda", dtype=torch.bfloat16
         )
-        / 4
-    ).contiguous()
-    cute_out = empty_mxfp8_rows_for_dense_gemm(
-        tokens, group_width, num_groups=groups, device="cuda"
-    )
-    quantize_wo_grouped_rows_cute(
-        src_contig.reshape(tokens, groups * group_width),
-        cute_out.values,
-        cute_out.scale_rows.view(torch.uint8),
-        cute_out.scale_mma.view(torch.uint8),
-        m=tokens,
-        groups=groups,
-        group_width=group_width,
-    )
-    _assert_rows_equal(cute_out, quantize_wo_a_input_mxfp8(src_contig))
+        source.copy_(torch.randn_like(source) / 4)
+        output = empty_mxfp8_rows_for_dense_gemm(
+            tokens, rank * groups, num_groups=1, device="cuda"
+        )
 
-    # Inverse-RoPE: real rotation, the (unrouted) CuTe kernel vs Triton.
-    o_contig = (
-        torch.randn(
-            (tokens, groups * heads_per_group, head_dim),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        / 8
-    ).contiguous()
-    positions = torch.randint(0, 512, (tokens,), device="cuda", dtype=torch.int64)
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
-            / rope_dim
-        )
-    )
-    freqs = torch.outer(
-        torch.arange(512, device="cuda", dtype=torch.float32), inv_freq
-    )
-    for cos_sin_dtype in (torch.float32, torch.bfloat16):
-        cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(cos_sin_dtype)
-        cute_rope = empty_mxfp8_rows_for_dense_gemm(
+        def launch() -> None:
+            quantize_wo_group_major_rows_cute(
+                source,
+                output.values,
+                output.scale_rows.view(torch.uint8),
+                output.scale_mma.view(torch.uint8),
+                m=tokens,
+                groups=groups,
+                rank=rank,
+            )
+
+        def reference() -> MXFP8Rows:
+            return quantize_wo_b_input_mxfp8(source)
+
+    else:
+        output = empty_mxfp8_rows_for_dense_gemm(
             tokens, group_width, num_groups=groups, device="cuda"
         )
-        quantize_wo_grouped_rows_cute(
-            o_contig.reshape(tokens, groups * group_width),
-            cute_rope.values,
-            cute_rope.scale_rows.view(torch.uint8),
-            cute_rope.scale_mma.view(torch.uint8),
-            m=tokens,
-            groups=groups,
-            group_width=group_width,
-            positions=positions,
-            cos_sin_cache=cos_sin,
-            head_dim=head_dim,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-        )
-        _assert_rows_equal(
-            cute_rope,
-            quantize_wo_a_input_inv_rope_mxfp8(
-                o_contig,
-                positions,
-                cos_sin,
-                groups=groups,
-                heads_per_group=heads_per_group,
-                nope_dim=nope_dim,
-                rope_dim=rope_dim,
-            ),
-        )
+        if quant_path == "grouped":
+            source = (
+                torch.randn(
+                    (tokens, groups, group_width),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                / 4
+            ).contiguous()
 
-    # Group-major: the (unrouted) CuTe regather kernel vs the Triton path.
-    from b12x.gemm.wo_quant_cute import quantize_wo_group_major_rows_cute
+            def launch() -> None:
+                quantize_wo_grouped_rows_cute(
+                    source.reshape(tokens, groups * group_width),
+                    output.values,
+                    output.scale_rows.view(torch.uint8),
+                    output.scale_mma.view(torch.uint8),
+                    m=tokens,
+                    groups=groups,
+                    group_width=group_width,
+                )
 
-    tmp_canon = empty_dense_gemm_mnl_view(
-        tokens, rank, groups, device="cuda", dtype=torch.bfloat16
-    )
-    tmp_canon.copy_(
-        torch.randn((tokens, rank, groups), device="cuda", dtype=torch.bfloat16) / 4
-    )
-    cute_gm = empty_mxfp8_rows_for_dense_gemm(
-        tokens, rank * groups, num_groups=1, device="cuda"
-    )
-    quantize_wo_group_major_rows_cute(
-        tmp_canon,
-        cute_gm.values,
-        cute_gm.scale_rows.view(torch.uint8),
-        cute_gm.scale_mma.view(torch.uint8),
-        m=tokens,
-        groups=groups,
-        rank=rank,
-    )
-    _assert_rows_equal(cute_gm, quantize_wo_b_input_mxfp8(tmp_canon))
+            def reference() -> MXFP8Rows:
+                return quantize_wo_a_input_mxfp8(source)
+
+        else:
+            source = (
+                torch.randn(
+                    (tokens, groups * heads_per_group, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                / 8
+            ).contiguous()
+            positions = torch.randint(
+                0, 512, (tokens,), device="cuda", dtype=torch.int64
+            )
+            inv_freq = 1.0 / (
+                10000.0
+                ** (
+                    torch.arange(0, rope_dim, 2, device="cuda", dtype=torch.float32)
+                    / rope_dim
+                )
+            )
+            freqs = torch.outer(
+                torch.arange(512, device="cuda", dtype=torch.float32), inv_freq
+            )
+            cos_sin_dtype = (
+                torch.float32 if quant_path == "inv-rope-fp32" else torch.bfloat16
+            )
+            cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(cos_sin_dtype)
+
+            def launch() -> None:
+                quantize_wo_grouped_rows_cute(
+                    source.reshape(tokens, groups * group_width),
+                    output.values,
+                    output.scale_rows.view(torch.uint8),
+                    output.scale_mma.view(torch.uint8),
+                    m=tokens,
+                    groups=groups,
+                    group_width=group_width,
+                    positions=positions,
+                    cos_sin_cache=cos_sin,
+                    head_dim=head_dim,
+                    nope_dim=nope_dim,
+                    rope_dim=rope_dim,
+                )
+
+            def reference() -> MXFP8Rows:
+                return quantize_wo_a_input_inv_rope_mxfp8(
+                    source,
+                    positions,
+                    cos_sin,
+                    groups=groups,
+                    heads_per_group=heads_per_group,
+                    nope_dim=nope_dim,
+                    rope_dim=rope_dim,
+                )
+
+    launch()
+    torch.cuda.synchronize()
+    _assert_rows_equal(output, reference())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    # Prove replay reads live inputs while preserving every captured address.
+    source.copy_(torch.randn_like(source) / 7)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_rows_equal(output, reference())

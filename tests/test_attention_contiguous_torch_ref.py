@@ -26,8 +26,27 @@ def _run_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    binding, _scratch = _bind_attention_with_plan(
+        plan,
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return binding.run()
+
+
+def _bind_attention_with_plan(
+    plan,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    attention_sink_bias: Optional[torch.Tensor] = None,
+):
     from b12x.attention.contiguous import (
-        b12x_attention_forward,
         plan_attention_scratch,
     )
 
@@ -42,7 +61,7 @@ def _run_attention_with_plan(
         softmax_scale=softmax_scale,
         attention_sink_bias=attention_sink_bias,
     )
-    return b12x_attention_forward(binding=binding)
+    return binding, scratch
 
 
 def _run_varlen_attention_with_plan(
@@ -59,8 +78,37 @@ def _run_varlen_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    binding, _scratch = _bind_varlen_attention_with_plan(
+        plan,
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        window_size=window_size,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return binding.run()
+
+
+def _bind_varlen_attention_with_plan(
+    plan,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: Optional[bool] = None,
+    window_size: Optional[Tuple[int, int]] = None,
+    softmax_scale: Optional[float] = None,
+    attention_sink_bias: Optional[torch.Tensor] = None,
+):
     from b12x.attention.contiguous import (
-        b12x_varlen_attention_forward,
         plan_varlen_attention_scratch,
     )
 
@@ -80,7 +128,7 @@ def _run_varlen_attention_with_plan(
         softmax_scale=softmax_scale,
         attention_sink_bias=attention_sink_bias,
     )
-    return b12x_varlen_attention_forward(binding=binding)
+    return binding, scratch
 
 
 def _vision_reference_attention_segment(
@@ -149,7 +197,7 @@ def _vision_torch_ref_attention(
 
     offsets = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
     outputs = []
-    for start, end in zip(offsets[:-1], offsets[1:]):
+    for start, end in zip(offsets[:-1], offsets[1:], strict=True):
         outputs.append(
             _vision_reference_attention_segment(
                 q[start:end],
@@ -264,15 +312,16 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
 
 
-def test_sglang_torch_ref_handles_local_window_gqa_and_sinks_on_cpu() -> None:
+def test_sglang_torch_ref_handles_local_window_gqa_and_sinks_on_gpu() -> None:
+    device = _require_contiguous_backend()
     q, k, v = _make_gqa_inputs(
         (2, 7, 4, 16),
         kv_heads=2,
         dtype=torch.float32,
-        device=torch.device("cpu"),
+        device=device,
         seed=11,
     )
-    sinks = torch.linspace(-0.5, 0.25, q.shape[2])
+    sinks = torch.linspace(-0.5, 0.25, q.shape[2], device=device)
 
     out = _contiguous_ref_from_rank4(
         q,
@@ -294,17 +343,18 @@ def test_sglang_torch_ref_handles_local_window_gqa_and_sinks_on_cpu() -> None:
     assert not torch.allclose(out, out_without_sinks)
 
 
-def test_sglang_torch_ref_handles_packed_varlen_swa_gqa_and_sinks_on_cpu() -> None:
+def test_sglang_torch_ref_handles_packed_varlen_swa_gqa_and_sinks_on_gpu() -> None:
+    device = _require_contiguous_backend()
     q, k, v, cu_seqlens = _make_varlen_gqa_inputs(
         (3, 11, 5),
         q_heads=4,
         kv_heads=2,
         head_dim=16,
         dtype=torch.float32,
-        device=torch.device("cpu"),
+        device=device,
         seed=17,
     )
-    sinks = torch.linspace(-0.25, 0.5, q.shape[1])
+    sinks = torch.linspace(-0.25, 0.5, q.shape[1], device=device)
 
     out = _vision_torch_ref_attention(
         q,
@@ -630,3 +680,283 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and
 
     assert (out - ref).abs().max().item() <= 0.003
     assert _cosine_similarity(out, ref) >= 0.9999
+
+
+@torch.inference_mode()
+def test_contiguous_attention_replays_under_cuda_graph_with_stable_workspace() -> None:
+    device = _require_contiguous_backend()
+    from b12x.attention.contiguous import (
+        clear_attention_caches,
+        create_attention_plan,
+    )
+
+    clear_attention_caches()
+    shape = (1, 48, 4, 64)
+    window_size = (8, 8)
+    q, k, v = _make_gqa_inputs(
+        shape,
+        kv_heads=2,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=47,
+    )
+    plan = create_attention_plan(
+        q,
+        k,
+        v,
+        causal=False,
+        window_size=window_size,
+    )
+    binding, scratch = _bind_attention_with_plan(plan, q, k, v)
+
+    # Compile and materialize every allocation before capture.
+    binding.run()
+    torch.cuda.synchronize()
+    scratch_ptr = scratch.data_ptr()
+    output_ptr = binding.output.data_ptr()
+    lse_ptr = binding.lse.data_ptr()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        binding.run()
+
+    q_next, k_next, v_next = _make_gqa_inputs(
+        shape,
+        kv_heads=2,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=53,
+    )
+    q.copy_(q_next)
+    k.copy_(k_next)
+    v.copy_(v_next)
+    expected = _contiguous_ref_from_rank4(
+        q,
+        k,
+        v,
+        window_size=window_size,
+    )
+    binding.output.fill_(float("nan"))
+    binding.lse.fill_(float("nan"))
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert scratch.data_ptr() == scratch_ptr
+    assert binding.output.data_ptr() == output_ptr
+    assert binding.lse.data_ptr() == lse_ptr
+    assert torch.isfinite(binding.output).all()
+    assert torch.isfinite(binding.lse).all()
+    assert (binding.output - expected).abs().max().item() <= 0.03
+    assert _cosine_similarity(binding.output, expected) >= 0.9999
+
+
+@torch.inference_mode()
+def test_contiguous_typed_smem_boundary_rejects_and_replays_graph_oracle() -> None:
+    device = _require_contiguous_backend()
+    import cutlass
+
+    from b12x.attention.contiguous import (
+        clear_attention_caches,
+        create_attention_plan,
+    )
+    from b12x.attention.contiguous.forward import ContiguousAttentionForwardKernel
+
+    tile_shape = (64, 48)
+    accepted_head_dim = 304
+    rejected_head_dim = 312
+    assert ContiguousAttentionForwardKernel.shared_storage_bytes(
+        cutlass.BFloat16,
+        accepted_head_dim,
+        accepted_head_dim,
+        *tile_shape,
+        1,
+    ) == 99328
+    assert ContiguousAttentionForwardKernel.can_implement(
+        cutlass.BFloat16,
+        accepted_head_dim,
+        accepted_head_dim,
+        *tile_shape,
+        1,
+        160,
+        False,
+    )
+    assert ContiguousAttentionForwardKernel.shared_storage_bytes(
+        cutlass.BFloat16,
+        rejected_head_dim,
+        rejected_head_dim,
+        *tile_shape,
+        1,
+    ) == 103424
+    assert not ContiguousAttentionForwardKernel.can_implement(
+        cutlass.BFloat16,
+        rejected_head_dim,
+        rejected_head_dim,
+        *tile_shape,
+        1,
+        160,
+        False,
+    )
+
+    rejected_q, rejected_k, rejected_v = _make_gqa_inputs(
+        (1, 8, 1, rejected_head_dim),
+        kv_heads=1,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=67,
+    )
+    with pytest.raises(TypeError, match="unsupported"):
+        create_attention_plan(
+            rejected_q,
+            rejected_k,
+            rejected_v,
+            causal=False,
+            tile_shape=tile_shape,
+        )
+
+    clear_attention_caches()
+    shape = (1, 8, 1, accepted_head_dim)
+    q, k, v = _make_gqa_inputs(
+        shape,
+        kv_heads=1,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=71,
+    )
+    plan = create_attention_plan(q, k, v, causal=False, tile_shape=tile_shape)
+    binding, scratch = _bind_attention_with_plan(plan, q, k, v)
+    binding.run()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        binding.run()
+
+    q_next, k_next, v_next = _make_gqa_inputs(
+        shape,
+        kv_heads=1,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=73,
+    )
+    q.copy_(q_next)
+    k.copy_(k_next)
+    v.copy_(v_next)
+    expected = _contiguous_ref_from_rank4(q, k, v, window_size=(-1, -1))
+    stable_ptrs = (
+        scratch.data_ptr(),
+        binding.output.data_ptr(),
+        binding.lse.data_ptr(),
+    )
+    binding.output.fill_(float("nan"))
+    binding.lse.fill_(float("nan"))
+    allocated_before_replay = torch.cuda.memory_allocated()
+    reserved_before_replay = torch.cuda.memory_reserved()
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.cuda.memory_allocated() == allocated_before_replay
+    assert torch.cuda.memory_reserved() == reserved_before_replay
+    assert (
+        scratch.data_ptr(),
+        binding.output.data_ptr(),
+        binding.lse.data_ptr(),
+    ) == stable_ptrs
+    assert torch.isfinite(binding.output).all()
+    assert torch.isfinite(binding.lse).all()
+    assert (binding.output - expected).abs().max().item() <= 0.03
+    assert _cosine_similarity(binding.output, expected) >= 0.9999
+
+
+@torch.inference_mode()
+def test_varlen_contiguous_attention_replays_under_cuda_graph_with_live_metadata() -> None:
+    device = _require_contiguous_backend()
+    from b12x.attention.contiguous import (
+        clear_attention_caches,
+        create_varlen_attention_plan,
+    )
+
+    clear_attention_caches()
+    initial_lengths = (33, 96)
+    replay_lengths = (64, 65)
+    max_seqlen = 129
+    window_size = (64, 64)
+    q, k, v, cu_seqlens = _make_varlen_gqa_inputs(
+        initial_lengths,
+        q_heads=4,
+        kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=59,
+    )
+    plan = create_varlen_attention_plan(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+        window_size=window_size,
+    )
+    binding, scratch = _bind_varlen_attention_with_plan(
+        plan,
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+        window_size=window_size,
+    )
+
+    # The plan, compiled launch, metadata storage, and output storage are fixed
+    # before capture. Replay may only update their contents.
+    binding.run()
+    torch.cuda.synchronize()
+    scratch_ptr = scratch.data_ptr()
+    metadata_ptr = cu_seqlens.data_ptr()
+    output_ptr = binding.output.data_ptr()
+    lse_ptr = binding.lse.data_ptr()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        binding.run()
+
+    q_next, k_next, v_next, cu_seqlens_next = _make_varlen_gqa_inputs(
+        replay_lengths,
+        q_heads=4,
+        kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=61,
+    )
+    q.copy_(q_next)
+    k.copy_(k_next)
+    v.copy_(v_next)
+    cu_seqlens.copy_(cu_seqlens_next)
+    expected = _vision_torch_ref_attention(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        window_size=window_size,
+    )
+    binding.output.fill_(float("nan"))
+    binding.lse.fill_(float("nan"))
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert scratch.data_ptr() == scratch_ptr
+    assert cu_seqlens.data_ptr() == metadata_ptr
+    assert binding.output.data_ptr() == output_ptr
+    assert binding.lse.data_ptr() == lse_ptr
+    assert torch.isfinite(binding.output).all()
+    assert torch.isfinite(binding.lse).all()
+    assert (binding.output - expected).abs().max().item() <= 0.003
+    assert _cosine_similarity(binding.output, expected) >= 0.9999

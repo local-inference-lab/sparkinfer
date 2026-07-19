@@ -69,6 +69,7 @@ from b12x.cute.fp4 import (
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_shared_f32,
+    ld_shared_u8_offset,
     ld_shared_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
@@ -651,6 +652,8 @@ def s1_qk_nope_block_scaled(
     sfa_head = gid + (lane & Int32(1)) * Int32(8)
     # sfb candidate row = warp_first_cand + gid (the N-tile base + gid). nt=0.
     sfb_cand = warp_first_cand + gid
+    if cutlass.const_expr(scale_format == 0):
+        sfb_row_addr = kv_sc_base_addr + sfb_cand * Int32(scale_bytes_per_token)
     hi = cutlass.const_expr(valid_hpb > 8)
 
     for blk in cutlass.range_constexpr(num_scales):
@@ -659,8 +662,7 @@ def s1_qk_nope_block_scaled(
         sfa = _fp32_to_ue8m0_byte(q_scale)
         if cutlass.const_expr(scale_format == 0):
             # DSV4 UE8M0_BYTE: sfb = K footer UE8M0 byte for this candidate + blk.
-            sfb_byte_off = sfb_cand * Int32(scale_bytes_per_token) + Int32(blk)
-            sfb = _ld_u8_zext(kv_sc_base_addr, sfb_byte_off)
+            sfb = ld_shared_u8_offset(sfb_row_addr, blk)
         else:
             # GLM ARBITRARY_FP32 (P10f): raw e4m3 K, UNIT block-scale; the per-group
             # arbitrary fp32 scale is applied AFTER the MMA (below).
@@ -2600,7 +2602,7 @@ def s7_epilogue(
 
     PARTIAL_WRITEBACK (DEFAULT, decode/split -- byte-identical to the prior decode
     epilogue): write this SPLIT's NORMALIZED partial O + base-2 LSE in the exact
-    rs-1 split.py merge convention (SparseMLASplitDecodeMergeKernel, split.py:1094).
+    active split merge convention (SparseMLASplitDecodeMergeKernel in merge.py).
     The merge reduces over the split axis assuming each partial is the
     PER-SPLIT-NORMALIZED output (acc / this split's softmax sum) tagged with the
     split's base-2 LSE (log2(sum) + max). inv_g = 1/global_sum (0 if empty);

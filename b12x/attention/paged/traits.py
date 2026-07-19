@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 
+from b12x.cute.smem import make_tma_aligned_payload_storage
+
 from .planner import PagedPlan
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
@@ -66,6 +68,16 @@ class PagedForwardTraits:
     def uses_fp8_kv(self) -> bool:
         return self.kv_dtype == _FP8_KV_DTYPE
 
+    @property
+    def launch_smem_bytes(self) -> int:
+        """Typed one-stage TMA allocation used by the primary decode kernel."""
+        return int(
+            make_tma_aligned_payload_storage(
+                payload_bytes=self.shared_storage_bytes,
+                num_stages=1,
+            ).size_in_bytes()
+        )
+
 
 def _paged_is_invalid(
     *,
@@ -112,9 +124,26 @@ def select_paged_forward_traits(
     if kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 48:
         device_props = torch.cuda.get_device_properties(torch.cuda.current_device() if device is None else device)
         max_smem_per_sm = int(device_props.shared_memory_per_multiprocessor)
+        max_smem_per_block = min(
+            max_smem_per_sm,
+            int(getattr(device_props, "shared_memory_per_block_optin", max_smem_per_sm)),
+        )
         kv_bytes = _dtype_num_bytes(kv_dtype)
         upcast_stride_k = _align_up(head_dim_qk // (16 // kv_bytes), 8)
         upcast_stride_v = _align_up(head_dim_vo // (16 // kv_bytes), 8)
+        shared_storage_bytes = 49152
+        launch_smem_bytes = int(
+            make_tma_aligned_payload_storage(
+                payload_bytes=shared_storage_bytes,
+                num_stages=1,
+            ).size_in_bytes()
+        )
+        if launch_smem_bytes > max_smem_per_block:
+            raise ValueError(
+                f"paged forward typed shared storage requires {launch_smem_bytes} B, "
+                f"but the device permits {max_smem_per_block} B per CTA"
+            )
+        num_ctas_per_sm = 2 if 2 * launch_smem_bytes <= max_smem_per_sm else 1
         return PagedForwardTraits(
             cta_tile_q=48,
             cta_tile_kv=32,
@@ -135,10 +164,13 @@ def select_paged_forward_traits(
             kv_dtype=kv_dtype,
             o_dtype=o_dtype,
             q_smem_bytes=48 * head_dim_qk * _dtype_num_bytes(q_dtype),
-            shared_storage_bytes=49152,
+            shared_storage_bytes=shared_storage_bytes,
             max_smem_per_sm=max_smem_per_sm,
-            num_ctas_per_sm=2 if max_smem_per_sm >= 2 * 49152 else 1,
-            max_smem_per_threadblock=max_smem_per_sm // (2 if max_smem_per_sm >= 2 * 49152 else 1),
+            num_ctas_per_sm=num_ctas_per_sm,
+            max_smem_per_threadblock=min(
+                max_smem_per_block,
+                max_smem_per_sm // num_ctas_per_sm,
+            ),
         )
 
     num_mma_d_qk = head_dim_qk // 16
@@ -149,6 +181,10 @@ def select_paged_forward_traits(
 
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device() if device is None else device)
     max_smem_per_sm = int(device_props.shared_memory_per_multiprocessor)
+    max_smem_per_block = min(
+        max_smem_per_sm,
+        int(getattr(device_props, "shared_memory_per_block_optin", max_smem_per_sm)),
+    )
 
     q_bytes = _dtype_num_bytes(q_dtype)
     kv_bytes = _dtype_num_bytes(kv_dtype)
@@ -162,34 +198,7 @@ def select_paged_forward_traits(
     upcast_stride_o = head_dim_vo // (16 // o_bytes)
     q_smem_bytes = cta_tile_q * head_dim_qk * q_bytes
     kv_bytes_per_mma = (upcast_stride_k + upcast_stride_v) * 16 * 16 * num_warps_kv
-    num_ctas_per_sm = 2 if max_smem_per_sm >= 2 * (q_smem_bytes + kv_bytes_per_mma) else 1
-    max_smem_per_threadblock = max_smem_per_sm // num_ctas_per_sm
     max_num_mma_kv_reg = 8 // num_mma_q
-    max_num_mma_kv_smem = max((max_smem_per_threadblock - q_smem_bytes) // kv_bytes_per_mma, 0)
-    num_mma_kv = min(max_num_mma_kv_smem, max_num_mma_kv_reg)
-    if (
-        kv_dtype == _FP8_KV_DTYPE
-        and cta_tile_q == 16
-        and head_dim_qk in (128, 192)
-        and head_dim_vo == 128
-    ):
-        num_mma_kv = min(num_mma_kv, 1)
-    if num_mma_kv <= 0:
-        raise ValueError("no valid NUM_MMA_KV fits the current paged forward trait constraints")
-    if _paged_is_invalid(
-        num_mma_q=num_mma_q,
-        num_mma_kv=num_mma_kv,
-        num_mma_d_vo=num_mma_d_vo,
-        num_warps_q=num_warps_q,
-        kv_dtype=kv_dtype,
-    ):
-        raise ValueError("selected paged forward traits are invalid under FlashInfer rules")
-
-    cta_tile_kv = num_mma_kv * num_warps_kv * 16
-
-    k_smem_bytes = cta_tile_kv * upcast_stride_k * 16
-    v_smem_bytes = cta_tile_kv * upcast_stride_v * 16
-    qkv_storage_bytes = q_smem_bytes + k_smem_bytes + v_smem_bytes
     sync_o_row_stride = head_dim_vo + (
         24
         if (
@@ -205,7 +214,63 @@ def select_paged_forward_traits(
     cta_sync_md_bytes = 8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
     cta_sync_storage_bytes = cta_sync_o_bytes + cta_sync_md_bytes
     smem_o_bytes = cta_tile_q * head_dim_vo * o_bytes
-    shared_storage_bytes = _align_up(max(qkv_storage_bytes, cta_sync_storage_bytes, smem_o_bytes), 16)
+
+    # Choose the MMA tile and residency together from exact CUTLASS typed
+    # allocations. This preserves the occupancy-first policy without deriving
+    # a per-CTA budget from assumed residency and feeding it back into the tile.
+    # The primary cta_q=16 backend is the exact-plane 64-row decode family; a
+    # larger KV tile disables that ingress path, so it is not a valid candidate.
+    max_candidate_mma_kv = 1 if cta_tile_q == 16 else max_num_mma_kv_reg
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for candidate_mma_kv in range(1, max_candidate_mma_kv + 1):
+        if _paged_is_invalid(
+            num_mma_q=num_mma_q,
+            num_mma_kv=candidate_mma_kv,
+            num_mma_d_vo=num_mma_d_vo,
+            num_warps_q=num_warps_q,
+            kv_dtype=kv_dtype,
+        ):
+            continue
+        candidate_cta_tile_kv = candidate_mma_kv * num_warps_kv * 16
+        candidate_qkv_bytes = q_smem_bytes + candidate_mma_kv * kv_bytes_per_mma
+        candidate_payload_bytes = _align_up(
+            max(candidate_qkv_bytes, cta_sync_storage_bytes, smem_o_bytes),
+            16,
+        )
+        candidate_launch_bytes = int(
+            make_tma_aligned_payload_storage(
+                payload_bytes=candidate_payload_bytes,
+                num_stages=1,
+            ).size_in_bytes()
+        )
+        if candidate_launch_bytes > max_smem_per_block:
+            continue
+        candidate_residency = 2 if 2 * candidate_launch_bytes <= max_smem_per_sm else 1
+        candidates.append(
+            (
+                candidate_residency,
+                candidate_mma_kv,
+                candidate_cta_tile_kv,
+                candidate_payload_bytes,
+                candidate_launch_bytes,
+            )
+        )
+
+    if not candidates:
+        raise ValueError("no valid NUM_MMA_KV typed shared-memory allocation fits the device")
+    (
+        num_ctas_per_sm,
+        num_mma_kv,
+        cta_tile_kv,
+        shared_storage_bytes,
+        launch_smem_bytes,
+    ) = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    max_smem_per_threadblock = min(
+        max_smem_per_block,
+        max_smem_per_sm // num_ctas_per_sm,
+    )
+    if launch_smem_bytes > max_smem_per_threadblock:
+        raise AssertionError("selected paged typed shared-memory allocation exceeds its residency budget")
 
     return PagedForwardTraits(
         cta_tile_q=cta_tile_q,

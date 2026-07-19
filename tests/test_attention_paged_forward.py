@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from benchmarks.benchmark_paged_attention import (
     _capture_backend_graph,
     _capture_flashinfer_fa2_graph,
@@ -12,6 +13,8 @@ from benchmarks.benchmark_paged_attention import (
     _quantize_paged_kv_cache_global_e4m3,
 )
 from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged.api import _build_extend_forward_kernel
+from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.integration.attention import (
     B12XPagedAttentionScratchCaps,
     clear_attention_caches,
@@ -23,6 +26,21 @@ from b12x.integration.attention import (
 from .helpers import require_sm120
 from .paged_attention_helpers import quantize_paged_kv_cache_e4m3
 from .test_attention_paged_planner import _make_inputs
+
+
+_ALLOCATOR_COUNTERS = (
+    "allocation.all.allocated",
+    "allocation.all.freed",
+    "segment.all.allocated",
+    "segment.all.freed",
+    "num_alloc_retries",
+    "num_ooms",
+)
+
+
+def _allocator_counters(device: torch.device) -> dict[str, int]:
+    stats = torch.cuda.memory_stats(device)
+    return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -120,6 +138,7 @@ class _PagedScratchHarness:
             page_table=self._page_table,
             cache_seqlens=self._cache_seqlens,
             cu_seqlens_q=self._cu_seqlens_q,
+            active_total_q=q.shape[0],
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
@@ -809,6 +828,177 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
+    """Replay the one-stage BF16 K/V TMA specialization as a serving graph."""
+    require_sm120()
+    device = torch.device("cuda")
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4096],
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        disable_split_kv=True,
+    )
+
+    traits = select_paged_forward_traits_from_plan(workspace.plan)
+    kernel = _build_extend_forward_kernel(
+        traits,
+        False,
+        False,
+        workspace.plan.window_left,
+        False,
+        False,
+        False,
+        False,
+        int(workspace.plan.page_size),
+    )
+    assert traits.cta_tile_q == 16
+    assert traits.cta_tile_kv == 64
+    assert traits.num_warps_q == 1
+    assert traits.num_warps_kv == 4
+    assert kernel.num_stages == 1
+    assert kernel.use_paged_k_tma is True
+    assert kernel.use_paged_v_tma is True
+    assert kernel.use_paged_kv_tma_fp8_raw_issue is False
+
+    scenario_q = (
+        q.clone(),
+        q.float().mul(-0.75).add(0.03125).to(torch.bfloat16),
+    )
+    scenario_k = (
+        k_cache.clone(),
+        k_cache.float().mul(0.5).add(0.015625).to(torch.bfloat16),
+    )
+    scenario_v = (
+        v_cache.clone(),
+        v_cache.float().mul(-0.5).add(0.0625).to(torch.bfloat16),
+    )
+    assert not torch.equal(scenario_q[0], scenario_q[1])
+    assert not torch.equal(scenario_k[0], scenario_k[1])
+    assert not torch.equal(scenario_v[0], scenario_v[1])
+
+    metadata = {
+        "page_table": page_table,
+        "cache_seqlens": cache_seqlens,
+        "cu_seqlens_q": cu_seqlens_q,
+    }
+    metadata_snapshots = {name: tensor.clone() for name, tensor in metadata.items()}
+
+    def install_scenario(index: int) -> None:
+        q.copy_(scenario_q[index])
+        k_cache.copy_(scenario_k[index])
+        v_cache.copy_(scenario_v[index])
+
+    output = torch.empty_like(q)
+    assert workspace._scratch_plan is not None
+    assert workspace._scratch is not None
+    binding = workspace._scratch_plan.bind(
+        scratch=workspace._scratch,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        active_total_q=q.shape[0],
+        disable_split_kv=True,
+    )
+    workspace.plan = binding.scratch.plan
+
+    def run_bound() -> tuple[torch.Tensor, torch.Tensor]:
+        return paged_attention_forward(binding=binding)
+
+    install_scenario(0)
+    warm_output, warm_lse = run_bound()
+    torch.cuda.synchronize(device)
+    assert warm_output.data_ptr() == output.data_ptr()
+    assert bool(torch.isfinite(warm_lse).all().item())
+
+    freeze_kernel_resolution(
+        "BF16 paged dual-TMA serving replay must use the warmed specialization"
+    )
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output, captured_lse = run_bound()
+    finally:
+        unfreeze_kernel_resolution()
+
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_lse.data_ptr() == warm_lse.data_ptr()
+    stable_tensors = {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        **metadata,
+        "output": output,
+        "lse": captured_lse,
+        **{
+            f"scratch_{index}": tensor
+            for index, tensor in enumerate(workspace._scratch)
+        },
+    }
+    stable_addresses = {
+        name: tensor.data_ptr() for name, tensor in stable_tensors.items()
+    }
+
+    scenario_outputs: list[torch.Tensor] = []
+    for index in range(2):
+        install_scenario(index)
+        ref_out, ref_lse = paged_attention_reference(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            causal=True,
+        )
+        torch.cuda.synchronize(device)
+
+        output.fill_(float("nan"))
+        captured_lse.fill_(float("nan"))
+        torch.cuda.synchronize(device)
+        allocator_before = _allocator_counters(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        allocator_after = _allocator_counters(device)
+
+        assert allocator_after == allocator_before
+        assert {
+            name: tensor.data_ptr() for name, tensor in stable_tensors.items()
+        } == stable_addresses
+        assert bool(torch.isfinite(output).all().item())
+        assert bool(torch.isfinite(captured_lse).all().item())
+        assert bool((output != 0).any().item())
+        torch.testing.assert_close(q, scenario_q[index], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(k_cache, scenario_k[index], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(v_cache, scenario_v[index], rtol=0.0, atol=0.0)
+        for name, tensor in metadata.items():
+            torch.testing.assert_close(
+                tensor,
+                metadata_snapshots[name],
+                rtol=0.0,
+                atol=0.0,
+            )
+
+        lse_natural = captured_lse * math.log(2.0)
+        assert (output - ref_out).abs().max().item() <= 0.03
+        assert (lse_natural - ref_lse).abs().max().item() <= 0.05
+        assert _cosine_similarity(output, ref_out) >= 0.99999
+        scenario_outputs.append(output.clone())
+
+    assert not torch.equal(scenario_outputs[0], scenario_outputs[1])
 
 
 @torch.inference_mode()

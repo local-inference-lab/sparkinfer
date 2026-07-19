@@ -1080,7 +1080,10 @@ def _b12x_mhc_post_pre_impl(
             and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
         )
         prefill_block_m_size = int(os.environ.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2"))
-        prefill_tile_n = int(os.environ.get("B12X_MHC_PREFILL_TILE_N", "24"))
+        prefill_tile_n_default = 12 if hidden_size == 7168 else 24
+        prefill_tile_n = int(
+            os.environ.get("B12X_MHC_PREFILL_TILE_N", str(prefill_tile_n_default))
+        )
         use_prefill_compact = (
             not use_prefill_tf32_mma
             and not use_prefill_bf16_mma

@@ -58,6 +58,7 @@ from b12x.moe.execution import (
     MoERegime,
     MoESpec,
     MoEWeightPreparationPlan,
+    OutputReduction,
     PreparedWeightLayout,
     WeightPreparationTransform,
     WorkScheduler,
@@ -70,9 +71,9 @@ from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 logger = logging.getLogger(__name__)
-_B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
-    "VLLM_B12X_TIMING", "0"
-) == "1"
+_B12X_TIMING = (
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+)
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
         "B12X_TIMING_THRESHOLD_MS",
@@ -190,6 +191,7 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     physical_tiles_capacity: int
     task_capacity: int
     route_output: torch.Tensor
+    materialized_intermediate: torch.Tensor
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
     input_gs: torch.Tensor
@@ -417,9 +419,7 @@ class B12XFP4ExpertWeights:
             value = representation.value
             prepared_w1 = getattr(value, "w13_rp", getattr(value, "w13", None))
             prepared_w2 = getattr(value, "w2_rp", getattr(value, "w2", None))
-            prepared_s1 = getattr(
-                value, "w13_sfb", getattr(value, "w13_scale", None)
-            )
+            prepared_s1 = getattr(value, "w13_sfb", getattr(value, "w13_scale", None))
             prepared_s2 = getattr(value, "w2_sfb", getattr(value, "w2_scale", None))
             if not isinstance(prepared_w1, torch.Tensor) or not isinstance(
                 prepared_w2, torch.Tensor
@@ -439,9 +439,7 @@ class B12XFP4ExpertWeights:
                 if not isinstance(prepared_s1, torch.Tensor) or not isinstance(
                     prepared_s2, torch.Tensor
                 ):
-                    raise TypeError(
-                        "prepared representation is missing FC1/FC2 scales"
-                    )
+                    raise TypeError("prepared representation is missing FC1/FC2 scales")
                 if (
                     prepared_s1.untyped_storage().data_ptr()
                     != self.w1_blockscale.untyped_storage().data_ptr()
@@ -477,9 +475,7 @@ class B12XFP4ExpertWeights:
                 f"expected={sorted((m, l.value) for m, l in expected)}, "
                 f"actual={sorted((m, l.value) for m, l in actual)}"
             )
-        source_mode_selected = bool(
-            {"nvfp4", "w4a8_nvfp4"} & self.plan.quant_modes
-        )
+        source_mode_selected = bool({"nvfp4", "w4a8_nvfp4"} & self.plan.quant_modes)
         if source_mode_selected or representation is None:
             if self.w1_fp4.ndim != 3 or self.w2_fp4.ndim != 3:
                 raise ValueError("source-native FP4 expert weights must be rank-3")
@@ -645,6 +641,7 @@ class _TPCoreWorkspacePlan:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
+    deterministic_output: bool = False
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
@@ -690,6 +687,10 @@ class TPMoEPlan:
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
 
+    @property
+    def deterministic_output(self) -> bool:
+        return self.execution.reduction is OutputReduction.ROUTE_BUFFER_TOPK_SUM
+
 
 @dataclass(frozen=True, kw_only=True)
 class TPMoEScratchCaps:
@@ -706,6 +707,7 @@ class TPMoEScratchCaps:
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     collect_activation_amax: bool = False
+    deterministic_output: bool | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -747,6 +749,10 @@ class TPMoEScratchCaps:
         object.__setattr__(
             self, "collect_activation_amax", bool(self.collect_activation_amax)
         )
+        if self.deterministic_output is not None:
+            object.__setattr__(
+                self, "deterministic_output", bool(self.deterministic_output)
+            )
         object.__setattr__(self, "frozen", bool(self.frozen))
 
     @property
@@ -824,9 +830,7 @@ class TPMoEScratchPlan:
         layer_idx: int | None = None,
     ) -> "TPMoEFP4Binding":
         if not isinstance(experts, B12XFP4ExpertWeights):
-            raise TypeError(
-                "experts must come from prepare_b12x_fp4_moe_weights"
-            )
+            raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
         if experts.plan != self.caps.weight_plan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
@@ -903,6 +907,7 @@ class TPMoEFP4Binding:
     input_scales_static: bool = False
     fast_math: bool | None = None
     quant_mode: str | None = None
+    deterministic_output: bool = False
     unit_scale_contract: bool = False
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
@@ -946,6 +951,7 @@ class TPMoEFP4Binding:
     task_valid_rows: torch.Tensor | None = None
     tile_write_count: torch.Tensor | None = None
     route_output: torch.Tensor | None = None
+    materialized_intermediate: torch.Tensor | None = None
     intermediate_cache13: torch.Tensor | None = None
     intermediate_cache2: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
@@ -1136,9 +1142,11 @@ def _dynamic_work_source() -> str:
     overlapped publisher.
     """
 
-    source = os.environ.get(
-        _DYNAMIC_WORK_SOURCE_ENV, _DYNAMIC_WORK_SOURCE_DEFAULT
-    ).strip().lower()
+    source = (
+        os.environ.get(_DYNAMIC_WORK_SOURCE_ENV, _DYNAMIC_WORK_SOURCE_DEFAULT)
+        .strip()
+        .lower()
+    )
     aliases = {
         "grid": "persistent_grid",
         "queue": "materialized_queue",
@@ -1320,7 +1328,10 @@ def _get_activation_kernel_spec(
 ) -> _ActivationKernelSpec:
     if _normalize_quant_mode(quant_mode) == "w4a16":
         raise ValueError("W4A16 dispatch uses b12x.moe.fused.w4a16.kernel directly")
-    if _is_w4a8_quant_mode(_normalize_quant_mode(quant_mode)) and activation == SWIGLUOAI_UNINTERLEAVE:
+    if (
+        _is_w4a8_quant_mode(_normalize_quant_mode(quant_mode))
+        and activation == SWIGLUOAI_UNINTERLEAVE
+    ):
         raise NotImplementedError(
             "activation='swigluoai_uninterleave' is not supported for W4A8 MoE"
         )
@@ -1484,7 +1495,6 @@ def _w4a8_dynamic_dense_candidate(
         )
         in {(32, 128), (64, 128), (128, 128)}
         and _dynamic_work_source() != "ready_queue"
-        and not deterministic_output
     )
 
 
@@ -1528,11 +1538,7 @@ def _w4a8_dynamic_direct_candidate(
     """Whether tiny prepared W4A8 can bypass grouped route compaction."""
 
     direct_limit = _DIRECT_ROUTING_MAX_ROUTED_ROWS
-    if (
-        _current_compute_capability() == (12, 1)
-        and num_experts == 256
-        and n == 1024
-    ):
+    if _current_compute_capability() == (12, 1) and num_experts == 256 and n == 1024:
         # DSV4F TP2 is bandwidth-bound in this band; grouping routes avoids
         # re-streaming weights when speculative tokens share experts.
         direct_limit = 0
@@ -1766,7 +1772,9 @@ def _arena_core_token_counts(
     if core_token_counts is None:
         normalized = (max_tokens,)
     else:
-        normalized = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        normalized = tuple(
+            max(int(token_count), 1) for token_count in core_token_counts
+        )
         if quant_mode == "w4a16":
             normalized = tuple(
                 route_pack_token_capacity(token_count, num_topk)
@@ -1859,12 +1867,7 @@ def _prepare_expert_scale_vector(
     with record_function("tp_moe.prepare_expert_scale_vector"):
         if scale.numel() == 1:
             with record_function("tp_moe.prepare_expert_scale_vector.expand_scalar"):
-                return (
-                    scale.reshape(())
-                    .expand(weight_E)
-                    .to(torch.float32)
-                    .contiguous()
-                )
+                return scale.reshape(()).expand(weight_E).to(torch.float32).contiguous()
         if scale.numel() != weight_E:
             raise ValueError(
                 f"expected {name} with {weight_E} elements, got {scale.numel()}"
@@ -2176,6 +2179,7 @@ def _build_tp_moe_fp4_binding_from_views(
         input_scales_static=bool(input_scales_static),
         fast_math=fast_math,
         quant_mode=quant_mode,
+        deterministic_output=plan.deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -2251,6 +2255,7 @@ def _build_tp_moe_fp4_binding_from_views(
             physical_tiles_capacity=plan.dynamic_physical_tiles,
             task_capacity=plan.dynamic_task_capacity,
             route_output=tensors["route_output"],
+            materialized_intermediate=tensors["materialized_intermediate"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
             input_gs=tensors["input_gs"],
@@ -2269,7 +2274,9 @@ def _build_tp_moe_fp4_binding_from_views(
             tile_write_count=tensors["tile_write_count"],
         )
 
-    raise ValueError(f"unsupported TP MoE binding implementation {plan.implementation!r}")
+    raise ValueError(
+        f"unsupported TP MoE binding implementation {plan.implementation!r}"
+    )
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -2304,6 +2311,7 @@ def _plan_core_workspace(
     w4a16_weight_layout: str | None = None,
     w4a16_scale_format: str | None = None,
     apply_router_weight_on_input: bool = False,
+    deterministic_output: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -2311,6 +2319,7 @@ def _plan_core_workspace(
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
+    deterministic_output = bool(deterministic_output and implementation == "dynamic")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -2372,25 +2381,22 @@ def _plan_core_workspace(
             )
         intermediate_cache2_elements = routed_capacity * int(n)
         direct_m = routed_capacity // max(int(num_topk), 1)
-        if (
-            routed_capacity == direct_m * int(num_topk)
-            and _small_m_direct_supported(
-                m=direct_m,
-                hidden_size=int(k),
-                intermediate_size=int(n),
-                num_experts=int(weight_E),
-                topk=int(num_topk),
-                activation=activation,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                swiglu_limit=swiglu_limit,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                element_dtype=_w4a16_element_dtype(dtype),
-                weight_layout=weight_layout,
-                w13_layout=w13_layout,
-                scale_format=scale_format,
-                expert_map=None,
-            )
+        if routed_capacity == direct_m * int(num_topk) and _small_m_direct_supported(
+            m=direct_m,
+            hidden_size=int(k),
+            intermediate_size=int(n),
+            num_experts=int(weight_E),
+            topk=int(num_topk),
+            activation=activation,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            element_dtype=_w4a16_element_dtype(dtype),
+            weight_layout=weight_layout,
+            w13_layout=w13_layout,
+            scale_format=scale_format,
+            expert_map=None,
         ):
             fc2_n_chunks = ((int(n) // 2) + 127) // 128
             direct_cache2_u32 = direct_m * fc2_n_chunks * 128 * int(num_topk)
@@ -2416,6 +2422,7 @@ def _plan_core_workspace(
             num_topk=num_topk,
             device=device,
             dtype=dtype,
+            deterministic_output=False,
             tensor_specs=(
                 _TensorAllocSpec(
                     "intermediate_cache13",
@@ -2501,6 +2508,7 @@ def _plan_core_workspace(
             num_topk=num_topk,
             device=device,
             dtype=dtype,
+            deterministic_output=False,
             tensor_specs=common_specs
             + (
                 _TensorAllocSpec(
@@ -2561,17 +2569,11 @@ def _plan_core_workspace(
         ):
             direct_groups = max(
                 1,
-                (
-                    (n + dynamic_tile_n - 1) // dynamic_tile_n
-                    + _DYNAMIC_SLICE_CHUNK
-                    - 1
-                )
+                ((n + dynamic_tile_n - 1) // dynamic_tile_n + _DYNAMIC_SLICE_CHUNK - 1)
                 // _DYNAMIC_SLICE_CHUNK,
             )
             dynamic_tiles = max(dynamic_tiles, routed_rows)
-            dynamic_max_tasks = max(
-                dynamic_max_tasks, routed_rows * direct_groups
-            )
+            dynamic_max_tasks = max(dynamic_max_tasks, routed_rows * direct_groups)
     else:
         dynamic_tiles = dynamic_physical_tiles
         dynamic_max_tasks = dynamic_task_capacity
@@ -2584,20 +2586,27 @@ def _plan_core_workspace(
     packed_input_cols = k if _is_w4a8_quant_mode(quant_mode) else k // 2
     packed_input_shape = (1, dynamic_rows_padded, packed_input_cols)
     packed_input_dtype = torch.uint8
-    route_output_rows = max(int(routed_rows), 1)
+    # Atomic scatter writes directly into the caller-owned [M, K] output and
+    # never addresses route_output.  Reserve only one ABI-compatible row for
+    # that production-default policy; the opt-in deterministic reduction owns
+    # a distinct fixed-capacity plan with one row per routed pair.
+    route_output_rows = max(int(routed_rows), 1) if deterministic_output else 1
+    # Materialized W4A8 phase 1 writes one E4M3 byte per activation plus one
+    # UE8M0 byte per K32 block.  This storage must not alias route_output:
+    # deterministic phase 2 writes one BF16 row per token-major route there
+    # before the fixed-order top-k reduction.  Keep a small aligned sentinel
+    # for non-W4A8 dynamic plans so every binding has an invariant ABI.
+    materialized_intermediate_bytes = 16
     if _is_w4a8_quant_mode(quant_mode):
-        # The materialized W4A8 backend aliases route_output as an MXFP8
-        # intermediate: one E4M3 byte per value plus one UE8M0 byte per K32
-        # block.  At TP2 (larger I/TP) and sparse batches, expert padding can
-        # make this larger than the traditional routed_rows x K bf16 buffer.
-        # Size the reusable workspace for either contract so enabling the
-        # specialization never depends on a fortuitous TP/batch shape.
-        intermediate_bytes = dynamic_rows_padded * (n + n // 32)
-        route_row_bytes = int(k) * int(dtype.itemsize)
-        route_output_rows = max(
-            route_output_rows,
-            (intermediate_bytes + route_row_bytes - 1) // route_row_bytes,
+        materialized_intermediate_bytes = max(
+            16,
+            dynamic_rows_padded * (n + n // 32),
         )
+    materialized_intermediate_rows = max(
+        1,
+        (materialized_intermediate_bytes + int(k) * int(dtype.itemsize) - 1)
+        // (int(k) * int(dtype.itemsize)),
+    )
     return _TPCoreWorkspacePlan(
         implementation=implementation,
         quant_mode=quant_mode,
@@ -2614,6 +2623,7 @@ def _plan_core_workspace(
         num_topk=num_topk,
         device=device,
         dtype=dtype,
+        deterministic_output=deterministic_output,
         dynamic_physical_tiles=dynamic_tiles,
         dynamic_task_capacity=dynamic_max_tasks,
         tensor_specs=common_specs
@@ -2624,8 +2634,11 @@ def _plan_core_workspace(
             _TensorAllocSpec(
                 "token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"
             ),
+            _TensorAllocSpec("route_output", (route_output_rows, int(k)), dtype),
             _TensorAllocSpec(
-                "route_output", (route_output_rows, int(k)), dtype
+                "materialized_intermediate",
+                (materialized_intermediate_rows, int(k)),
+                dtype,
             ),
             _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
             _TensorAllocSpec(
@@ -2697,9 +2710,9 @@ def _allocate_arena_tensor(
             tensor.zero_()
         elif spec.init == "arange":
             tensor.copy_(
-                torch.arange(tensor.numel(), dtype=tensor.dtype, device=tensor.device).view(
-                    spec.shape
-                )
+                torch.arange(
+                    tensor.numel(), dtype=tensor.dtype, device=tensor.device
+                ).view(spec.shape)
             )
         elif spec.init != "empty":
             raise ValueError(f"unsupported tensor init mode {spec.init!r}")
@@ -2875,6 +2888,7 @@ def _materialize_workspace_from_core_arena(
         physical_tiles_capacity=plan.dynamic_physical_tiles,
         task_capacity=plan.dynamic_task_capacity,
         route_output=tensors["route_output"],
+        materialized_intermediate=tensors["materialized_intermediate"],
         token_map=tensors["token_map"],
         token_weights=tensors["token_weights"],
         packed_input=tensors["packed_input"],
@@ -2923,6 +2937,7 @@ def _alloc_workspace(
     routed_rows: int,
     max_rows: int,
     input_scales_static: bool,
+    deterministic_output: bool = False,
     activation: str = "silu",
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
@@ -2944,6 +2959,7 @@ def _alloc_workspace(
         dtype,
         routed_rows=routed_rows,
         max_rows=max_rows,
+        deterministic_output=deterministic_output,
         activation=activation,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -3183,9 +3199,7 @@ def _qweight_to_w4a8_rp_kernel(
         )
         src_row = half_src_base + half_dst
         in_bounds = (
-            (dst_row < 2 * half_rows_pad)
-            & (half_dst < half_rows)
-            & (src_col < q_cols)
+            (dst_row < 2 * half_rows_pad) & (half_dst < half_rows) & (src_col < q_cols)
         )
     else:
         src_row = dst_row + row_rotation
@@ -3291,9 +3305,7 @@ def _grid_to_w4a8_sfb_kernel(
         )
         row = half_src_base + half_dst
         in_bounds = (
-            (dst_row < 2 * half_rows_pad)
-            & (half_dst < half_rows)
-            & (col < scale_cols)
+            (dst_row < 2 * half_rows_pad) & (half_dst < half_rows) & (col < scale_cols)
         )
     else:
         row = dst_row + row_rotation
@@ -3379,9 +3391,7 @@ def _decode_w4a16_packed_expert_to_qweight(
         [row * 64 + col1, row * 64 + col2],
         dim=1,
     )[:, pack_idx]
-    source_shift = (
-        torch.cat([pos, pos], dim=1)[:, pack_idx] * 4
-    ).to(torch.int32)
+    source_shift = (torch.cat([pos, pos], dim=1)[:, pack_idx] * 4).to(torch.int32)
     source_half = source_index // 64
     source_col = source_index % 64
 
@@ -3391,15 +3401,19 @@ def _decode_w4a16_packed_expert_to_qweight(
         cols_view = cols.view(n_tiles, 64, 2)
         src_tile = src[kt]
         for slot in range(8):
-            values = ((src_tile >> (slot * 4)) & 0xF) << source_shift[
-                :, slot
-            ].view(1, 128)
+            values = ((src_tile >> (slot * 4)) & 0xF) << source_shift[:, slot].view(
+                1, 128
+            )
             values = values.to(torch.int32)
             for half in (0, 1):
                 mask = source_half[:, slot] == half
-                idx = source_col[:, slot][mask].view(1, -1).expand(
-                    n_tiles,
-                    -1,
+                idx = (
+                    source_col[:, slot][mask]
+                    .view(1, -1)
+                    .expand(
+                        n_tiles,
+                        -1,
+                    )
                 )
                 cols_view[:, :, half].scatter_add_(1, idx, values[:, mask])
 
@@ -3499,9 +3513,7 @@ def _logical_weight_to_w4a8_rp_inplace(
         # Ceil-tiled tails don't fit the source storage; write a fresh
         # destination and read the (never-aliased) source directly.
         out_i32 = (
-            torch.empty(
-                (weight_E, rp_words), dtype=torch.int32, device=weight.device
-            )
+            torch.empty((weight_E, rp_words), dtype=torch.int32, device=weight.device)
             if has_tail
             else None
         )
@@ -3791,9 +3803,7 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
         source_stride = rows * scale_cols if is_logical else scale_cols * rows_pad
         # Ceil-tiled tails don't fit the source storage in place.
         out_u8 = (
-            torch.empty(
-                (weight_E, sfb_bytes), dtype=torch.uint8, device=scale.device
-            )
+            torch.empty((weight_E, sfb_bytes), dtype=torch.uint8, device=scale.device)
             if has_tail
             else None
         )
@@ -3972,9 +3982,7 @@ def _ensure_w13_kernel_order_inplace(
         grid[:, :n] = grid[:, n:]
         grid[:, n:] = tmp
     else:
-        _swap_w13_scale_halves_inplace(
-            w1_blockscale, rows=2 * n, cols_blocks=k // 16
-        )
+        _swap_w13_scale_halves_inplace(w1_blockscale, rows=2 * n, cols_blocks=k // 16)
     _W13_NORMALIZED_STORAGES[reg_key] = (w1_fp4, w1_blockscale)
 
 
@@ -4409,14 +4417,12 @@ def prepare_b12x_fp4_moe_weights(
         name="w2_global_scale",
     )
     if plan.prepares_runtime_alphas:
-        w1_runtime_alphas, w2_runtime_alphas = (
-            _prepare_modelopt_nvfp4_runtime_alphas(
-                w1_global_scale,
-                a1_gscale,
-                w2_global_scale,
-                a2_gscale,
-                weight_E=plan.num_experts,
-            )
+        w1_runtime_alphas, w2_runtime_alphas = _prepare_modelopt_nvfp4_runtime_alphas(
+            w1_global_scale,
+            a1_gscale,
+            w2_global_scale,
+            a2_gscale,
+            weight_E=plan.num_experts,
         )
 
     representation: _PreparedWeightRepresentation | None = None
@@ -4514,15 +4520,11 @@ def prepare_b12x_fp4_moe_weights(
     canonical_w2 = w2_fp4
     canonical_s2 = w2_blockscale
     canonical_a2 = w2_runtime_alphas
-    source_mode_selected = bool(
-        {"nvfp4", "w4a8_nvfp4"} & plan.quant_modes
-    )
+    source_mode_selected = bool({"nvfp4", "w4a8_nvfp4"} & plan.quant_modes)
     if representation is not None and not source_mode_selected:
         value = representation.value
         canonical_w1 = getattr(value, "w13_rp", getattr(value, "w13", None))
-        canonical_s1 = getattr(
-            value, "w13_sfb", getattr(value, "w13_scale", None)
-        )
+        canonical_s1 = getattr(value, "w13_sfb", getattr(value, "w13_scale", None))
         canonical_w2 = getattr(value, "w2_rp", getattr(value, "w2", None))
         canonical_s2 = getattr(value, "w2_sfb", getattr(value, "w2_scale", None))
         canonical_a1 = getattr(value, "w13_global_scale", canonical_a1)
@@ -4618,7 +4620,9 @@ def _resolve_workspace_layout(
         # than the w4a8 dynamic kernel at m=8/topk=10 (0.076 vs 0.169 ms), so
         # the w4a8 micro band covers all micro-capable m, not just the
         # routed-pairs cutover tuned for nvfp4.
-        if (band == "micro" or num_tokens <= _MICRO_MAX_TOKENS) and _band_runs_direct_micro(
+        if (
+            band == "micro" or num_tokens <= _MICRO_MAX_TOKENS
+        ) and _band_runs_direct_micro(
             num_tokens=num_tokens,
             k=k,
             n=n,
@@ -4690,18 +4694,14 @@ def plan_tp_moe_execution(
         weight_plan.source_format,
     )
     if quant_mode not in weight_plan.quant_modes:
-        raise ValueError(
-            f"quant_mode={quant_mode!r} is absent from the weight plan"
-        )
+        raise ValueError(f"quant_mode={quant_mode!r} is absent from the weight plan")
     try:
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
         }[weight_plan.io_dtype]
     except KeyError as exc:
-        raise TypeError(
-            f"unsupported MoE plan dtype {weight_plan.io_dtype!r}"
-        ) from exc
+        raise TypeError(f"unsupported MoE plan dtype {weight_plan.io_dtype!r}") from exc
     device = torch.device(device)
     weight_E = weight_plan.num_experts
     k = weight_plan.hidden_size
@@ -4749,12 +4749,14 @@ def plan_tp_moe_execution(
             num_experts=state_E,
             activation=activation,
         )
-        dynamic_physical_tiles, gate_tile_cnt, dynamic_task_capacity = _dynamic_task_geometry(
-            state_E,
-            n,
-            routed_rows,
-            tile_m=dynamic_tile_m,
-            tile_n=dynamic_tile_n,
+        dynamic_physical_tiles, gate_tile_cnt, dynamic_task_capacity = (
+            _dynamic_task_geometry(
+                state_E,
+                n,
+                routed_rows,
+                tile_m=dynamic_tile_m,
+                tile_n=dynamic_tile_n,
+            )
         )
         if _dynamic_direct_routing_candidate(
             quant_mode=quant_mode,
@@ -4766,8 +4768,7 @@ def plan_tp_moe_execution(
         ):
             direct_groups = max(
                 1,
-                (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1)
-                // _DYNAMIC_SLICE_CHUNK,
+                (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK,
             )
             dynamic_physical_tiles = max(dynamic_physical_tiles, routed_rows)
             dynamic_task_capacity = max(
@@ -4928,12 +4929,8 @@ def _validate_workspace(
             "workspace row capacity mismatch: "
             f"expected at least {plan.max_rows}, got {workspace.max_rows}"
         )
-    if plan.implementation == "micro" and not isinstance(
-        workspace, TPMicroWorkspace
-    ):
-        raise TypeError(
-            "expected a TPMicroWorkspace for the direct-micro backend"
-        )
+    if plan.implementation == "micro" and not isinstance(workspace, TPMicroWorkspace):
+        raise TypeError("expected a TPMicroWorkspace for the direct-micro backend")
     if plan.implementation == "dynamic" and not isinstance(
         workspace, TPDynamicWorkspace
     ):
@@ -4971,6 +4968,16 @@ def _validate_workspace(
         raise ValueError(
             "workspace task capacity mismatch: "
             f"expected at least {plan.dynamic_task_capacity}, got {workspace.task_capacity}"
+        )
+    if (
+        isinstance(workspace, TPDynamicWorkspace)
+        and plan.deterministic_output
+        and workspace.route_output.numel() < plan.routed_rows * plan.k
+    ):
+        raise ValueError(
+            "workspace deterministic route-output capacity mismatch: "
+            f"expected at least {plan.routed_rows * plan.k} elements, got "
+            f"{workspace.route_output.numel()}"
         )
 
 
@@ -5059,7 +5066,11 @@ def _validate_frozen_w4a16_launch(
     scale_format = _normalize_w4a16_scale_format(scale_format)
     token_count = int(plan.max_tokens_per_launch)
     planned_capacity = min(
-        (planned for planned in workspace.planned_token_counts if planned >= token_count),
+        (
+            planned
+            for planned in workspace.planned_token_counts
+            if planned >= token_count
+        ),
         default=None,
     )
     if planned_capacity is None:
@@ -5136,15 +5147,18 @@ def _w4a16_preplanned_launches(
 
     if (
         not collect_activation_amax
-        and
-        weight_layout == "packed"
+        and weight_layout == "packed"
         and token_count <= _TC_DECODE_MAX_M
     ):
         tc_decode = workspace.planned_tc_decode_launches.get(token_count)
         if tc_decode is not None:
             return tc_decode, workspace.planned_topk_sum_launches.get(token_count)
     planned_capacity = min(
-        (planned for planned in workspace.planned_token_counts if planned >= token_count),
+        (
+            planned
+            for planned in workspace.planned_token_counts
+            if planned >= token_count
+        ),
         default=None,
     )
     if planned_capacity is None:
@@ -5247,6 +5261,7 @@ def _resolve_workspace(
             routed_rows=plan.routed_rows,
             max_rows=plan.max_rows,
             input_scales_static=input_scales_static,
+            deterministic_output=plan.deterministic_output,
             activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
@@ -5276,6 +5291,11 @@ def _resolve_workspace(
             isinstance(resolved, TPDynamicWorkspace)
             and plan.dynamic_task_capacity is not None
             and resolved.task_capacity < plan.dynamic_task_capacity
+        )
+        or (
+            isinstance(resolved, TPDynamicWorkspace)
+            and plan.deterministic_output
+            and resolved.route_output.numel() < plan.routed_rows * plan.k
         )
     )
     if needs_growth:
@@ -5312,6 +5332,7 @@ def _resolve_workspace(
             ),
             max_rows=max(plan.max_rows, resolved.max_rows),
             input_scales_static=input_scales_static,
+            deterministic_output=plan.deterministic_output,
             activation=plan.activation,
             dynamic_physical_tiles=dynamic_tiles,
             dynamic_task_capacity=dynamic_tasks,
@@ -5360,6 +5381,7 @@ def plan_tp_moe_arena_layout(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
+    deterministic_output: bool | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     if not isinstance(weight_plan, MoEWeightPreparationPlan):
@@ -5381,9 +5403,7 @@ def plan_tp_moe_arena_layout(
             "float16": torch.float16,
         }[weight_plan.io_dtype]
     except KeyError as exc:
-        raise TypeError(
-            f"unsupported MoE plan dtype {weight_plan.io_dtype!r}"
-        ) from exc
+        raise TypeError(f"unsupported MoE plan dtype {weight_plan.io_dtype!r}") from exc
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -5391,6 +5411,13 @@ def plan_tp_moe_arena_layout(
         swiglu_beta,
     )
     device = torch.device(device)
+    if deterministic_output is None:
+        deterministic_output = _dynamic_deterministic_output_enabled(
+            quant_mode=quant_mode,
+            device=device,
+        )
+    else:
+        deterministic_output = bool(deterministic_output)
     max_tokens = max(int(max_tokens), 1)
     weight_E = max(int(weight_E), 1)
     k = max(int(k), 1)
@@ -5418,6 +5445,7 @@ def plan_tp_moe_arena_layout(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=deterministic_output,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -5439,6 +5467,7 @@ def plan_tp_moe_arena_layout(
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
@@ -5463,6 +5492,12 @@ def plan_tp_moe_arena_layout(
 
 
 def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
+    deterministic_output = caps.deterministic_output
+    if deterministic_output is None:
+        deterministic_output = _dynamic_deterministic_output_enabled(
+            quant_mode=caps.quant_mode,
+            device=torch.device(caps.device),
+        )
     layout = plan_tp_moe_arena_layout(
         max_tokens=caps.max_tokens,
         num_topk=caps.num_topk,
@@ -5477,6 +5512,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         collect_activation_amax=caps.collect_activation_amax,
+        deterministic_output=deterministic_output,
     )
     capacity_tokens = max(layout.core_token_counts or (int(caps.max_tokens),))
     launch_plan = plan_tp_moe_execution(
@@ -5489,6 +5525,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
+        deterministic_output=deterministic_output,
     )
     core_workspace_plan = _plan_core_workspace(
         launch_plan.implementation,
@@ -5510,6 +5547,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_weight_layout=caps.w4a16_weight_layout,
         w4a16_scale_format=caps.w4a16_scale_format,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
+        deterministic_output=launch_plan.deterministic_output,
         swiglu_limit=launch_plan.swiglu_limit,
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
@@ -5576,7 +5614,9 @@ def _prewarm_w4a16_planned_launches(
         pack_topk_routes_by_expert,
     )
 
-    token_counts = tuple(sorted({max(int(token_count), 1) for token_count in token_counts}))
+    token_counts = tuple(
+        sorted({max(int(token_count), 1) for token_count in token_counts})
+    )
     if not token_counts:
         raise ValueError("W4A16 launch planning requires at least one token count")
 
@@ -5771,8 +5811,7 @@ def _prewarm_w4a16_planned_launches(
         total_ms = (t_done - t0) * 1000.0
         if total_ms >= _B12X_TIMING_THRESHOLD_MS:
             logger.warning(
-                "b12x_w4a16_prewarm_total timing counts=%s capturing=%s "
-                "total=%.3fms",
+                "b12x_w4a16_prewarm_total timing counts=%s capturing=%s total=%.3fms",
                 token_counts,
                 is_capturing,
                 total_ms,
@@ -5800,6 +5839,12 @@ def materialize_tp_moe_arena_workspaces(
     swiglu_alpha = caps.swiglu_alpha
     swiglu_beta = caps.swiglu_beta
     collect_activation_amax = caps.collect_activation_amax
+    deterministic_output = caps.deterministic_output
+    if deterministic_output is None:
+        deterministic_output = _dynamic_deterministic_output_enabled(
+            quant_mode=quant_mode,
+            device=torch.device(device),
+        )
     w4a16_scale_format = caps.w4a16_scale_format or _w4a16_scale_format_for_source(
         source_format
     )
@@ -5825,6 +5870,7 @@ def materialize_tp_moe_arena_workspaces(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=deterministic_output,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -5846,6 +5892,7 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
@@ -5880,19 +5927,14 @@ def materialize_tp_moe_arena_workspaces(
                     not set(core_token_counts).issubset(existing.planned_token_counts)
                     or existing.planned_apply_router_weight_on_input
                     != bool(apply_router_weight_on_input)
-                    or existing.planned_swiglu_limit
-                    != plan.swiglu_limit
-                    or existing.planned_swiglu_alpha
-                    != plan.swiglu_alpha
-                    or existing.planned_swiglu_beta
-                    != plan.swiglu_beta
+                    or existing.planned_swiglu_limit != plan.swiglu_limit
+                    or existing.planned_swiglu_alpha != plan.swiglu_alpha
+                    or existing.planned_swiglu_beta != plan.swiglu_beta
                     or _normalize_w4a16_scale_format(
                         getattr(existing, "planned_scale_format", "e4m3_k16")
                     )
                     != w4a16_scale_format
-                    or bool(
-                        getattr(existing, "planned_collect_activation_amax", False)
-                    )
+                    or bool(getattr(existing, "planned_collect_activation_amax", False))
                     != collect_activation_amax
                 ):
                     pass
@@ -5940,8 +5982,7 @@ def materialize_tp_moe_arena_workspaces(
         if quant_mode == "w4a16":
             if not isinstance(materialized, TPW4A16Workspace):
                 raise TypeError(
-                    "expected W4A16 arena materialization to create "
-                    "TPW4A16Workspace"
+                    "expected W4A16 arena materialization to create TPW4A16Workspace"
                 )
             materialized.planned_token_counts = frozenset(core_token_counts)
             materialized.planned_apply_router_weight_on_input = bool(
@@ -6027,15 +6068,15 @@ def build_tp_moe_fp4_binding(
 ) -> TPMoEFP4Binding:
     workspace = scratch
     if not isinstance(experts, B12XFP4ExpertWeights):
-        raise TypeError(
-            "experts must come from prepare_b12x_fp4_moe_weights"
-        )
-    if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
-        raise TypeError(
-            "scratch must be a TP MoE scratch object"
-        )
+        raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+    if not isinstance(
+        workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)
+    ):
+        raise TypeError("scratch must be a TP MoE scratch object")
     if a.ndim != 2:
-        raise ValueError(f"expected input activations with rank 2, got {tuple(a.shape)}")
+        raise ValueError(
+            f"expected input activations with rank 2, got {tuple(a.shape)}"
+        )
     if topk_weights.ndim != 2 or topk_ids.ndim != 2:
         raise ValueError("topk_weights and topk_ids must be rank-2 tensors")
     if topk_weights.shape != topk_ids.shape:
@@ -6078,6 +6119,11 @@ def build_tp_moe_fp4_binding(
         hidden_size=k,
     )
     num_topk = int(topk_ids.shape[1])
+    requested_deterministic_output = _dynamic_deterministic_output_enabled(
+        quant_mode=quant_mode,
+        device=a.device,
+    )
+    deterministic_output = False
     if isinstance(workspace, TPMoEWorkspacePool):
         weight_layout = "packed"
         scale_format = "e4m3_k16"
@@ -6104,7 +6150,9 @@ def build_tp_moe_fp4_binding(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=requested_deterministic_output,
         )
+        deterministic_output = plan.deterministic_output
         workspace = _resolve_workspace(
             workspace,
             plan=plan,
@@ -6119,6 +6167,15 @@ def build_tp_moe_fp4_binding(
             scale_format=scale_format,
             collect_activation_amax=collect_activation_amax,
         )
+    elif isinstance(workspace, TPDynamicWorkspace):
+        deterministic_output = requested_deterministic_output
+        if deterministic_output and workspace.route_output.numel() < m * num_topk * k:
+            raise ValueError(
+                "dynamic workspace was planned without enough deterministic "
+                "route-output capacity: "
+                f"expected at least {m * num_topk * k} elements, got "
+                f"{workspace.route_output.numel()}"
+            )
     common_kwargs = dict(
         a=a,
         experts=experts,
@@ -6129,6 +6186,7 @@ def build_tp_moe_fp4_binding(
         input_scales_static=bool(input_scales_static),
         fast_math=fast_math,
         quant_mode=quant_mode,
+        deterministic_output=deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -6139,8 +6197,7 @@ def build_tp_moe_fp4_binding(
     if isinstance(workspace, TPW4A16Workspace):
         if quant_mode != "w4a16":
             raise ValueError(
-                "TPW4A16Workspace cannot bind non-W4A16 quant_mode "
-                f"{quant_mode!r}"
+                f"TPW4A16Workspace cannot bind non-W4A16 quant_mode {quant_mode!r}"
             )
         weight_layout = "packed"
         scale_format = "e4m3_k16"
@@ -6249,6 +6306,7 @@ def build_tp_moe_fp4_binding(
             physical_tiles_capacity=workspace.physical_tiles_capacity,
             task_capacity=workspace.task_capacity,
             route_output=workspace.route_output,
+            materialized_intermediate=workspace.materialized_intermediate,
             expert_write_rows=workspace.expert_write_rows,
             expert_tile_base=workspace.expert_tile_base,
             input_gs=workspace.input_gs,
@@ -6308,9 +6366,7 @@ def build_tp_moe_route_binding(
         scratch,
         (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
     ):
-        raise TypeError(
-            "scratch must be a TP MoE scratch object or None"
-        )
+        raise TypeError("scratch must be a TP MoE scratch object or None")
     if hidden_states.ndim != 2:
         raise ValueError(
             "expected hidden_states with rank 2, got shape "
@@ -6357,9 +6413,7 @@ def build_tp_moe_sparse_fp4_binding(
     layer_idx: int | None = None,
 ) -> TPMoESparseFP4Binding:
     if not isinstance(scratch, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
-        raise TypeError(
-            "scratch must be a TP MoE scratch object"
-        )
+        raise TypeError("scratch must be a TP MoE scratch object")
     if hidden_states.ndim != 2:
         raise ValueError(
             "expected hidden_states with rank 2, got shape "
@@ -6961,54 +7015,44 @@ class _DynamicMoEW4A8Launch:
             ),
         )
         num_experts = row_counts.shape[0]
-        w13_rp = cute.make_tensor(
-            w13_rp_ptr,
-            layout=cute.make_layout(
-                (
-                    num_experts
-                    * (self._w1_n // 256)
-                    * (self._k // 128)
-                    * 4096,
+        if cutlass.const_expr(self._kernel.w4a8_repacked):
+            w13_rp = cute.make_tensor(
+                w13_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * (self._w1_n // 256) * (self._k // 128) * 4096,),
+                    stride=(1,),
                 ),
-                stride=(1,),
-            ),
-        )
-        w13_sfb_rp = cute.make_tensor(
-            w13_sfb_rp_ptr,
-            layout=cute.make_layout(
-                (
-                    num_experts
-                    * (self._w1_n // 256)
-                    * (self._k // 128)
-                    * 256,
+            )
+            w13_sfb_rp = cute.make_tensor(
+                w13_sfb_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * (self._w1_n // 256) * (self._k // 128) * 256,),
+                    stride=(1,),
                 ),
-                stride=(1,),
-            ),
-        )
-        down_rp = cute.make_tensor(
-            down_rp_ptr,
-            layout=cute.make_layout(
-                (
-                    num_experts
-                    * (self._k // 256)
-                    * (self._n // 128)
-                    * 4096,
+            )
+            down_rp = cute.make_tensor(
+                down_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * (self._k // 256) * (self._n // 128) * 4096,),
+                    stride=(1,),
                 ),
-                stride=(1,),
-            ),
-        )
-        down_sfb_rp = cute.make_tensor(
-            down_sfb_rp_ptr,
-            layout=cute.make_layout(
-                (
-                    num_experts
-                    * (self._k // 256)
-                    * (self._n // 128)
-                    * 256,
+            )
+            down_sfb_rp = cute.make_tensor(
+                down_sfb_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * (self._k // 256) * (self._n // 128) * 256,),
+                    stride=(1,),
                 ),
-                stride=(1,),
-            ),
-        )
+            )
+        else:
+            # CUTLASS DSL 4.6 rejects zero-sized layouts.  Repacked tensors are
+            # compile-time dead in this specialization, so retain ABI-stable
+            # sentinel views instead of constructing e.g. w1_n // 256 == 0.
+            sentinel_layout = cute.make_layout((1,), stride=(1,))
+            w13_rp = cute.make_tensor(w13_rp_ptr, layout=sentinel_layout)
+            w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=sentinel_layout)
+            down_rp = cute.make_tensor(down_rp_ptr, layout=sentinel_layout)
+            down_sfb_rp = cute.make_tensor(down_sfb_rp_ptr, layout=sentinel_layout)
         token_map = cute.make_tensor(
             token_map_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
         )
@@ -7111,10 +7155,7 @@ def _get_dynamic_kernel(
     quant_mode = _normalize_quant_mode(quant_mode)
     share_input_across_experts = bool(
         share_input_across_experts
-        and (
-            quant_mode == "nvfp4"
-            or (quant_mode == "w4a8_mx" and w4a8_repacked)
-        )
+        and (quant_mode == "nvfp4" or (quant_mode == "w4a8_mx" and w4a8_repacked))
     )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
@@ -7153,8 +7194,10 @@ def _get_dynamic_kernel(
     # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
     # inside one SF atom (env override for dev: B12X_DYNAMIC_SWAP_AB=0/1).
     swap_ab = bool(
-        quant_mode == "nvfp4" and activation_spec.is_gated
-        and int(n) % 128 != 0 and int(n) % 32 == 0
+        quant_mode == "nvfp4"
+        and activation_spec.is_gated
+        and int(n) % 128 != 0
+        and int(n) % 32 == 0
     )
     _swap_env = os.environ.get("B12X_DYNAMIC_SWAP_AB")
     if _swap_env is not None:
@@ -7215,6 +7258,7 @@ def _get_dynamic_kernel(
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
+    kernel_kwargs["num_topk"] = int(num_topk)
     kernel_kwargs["swap_ab"] = swap_ab
     kernel_kwargs["work_source"] = work_source
     kernel_kwargs["materialize_intermediate"] = materialize_intermediate
@@ -7469,7 +7513,7 @@ def _launch_dynamic_flat(
     packed_a_view: torch.Tensor,
     packed_a_flat: torch.Tensor,
     scale_flat: torch.Tensor,
-    route_output: torch.Tensor,
+    materialized_intermediate: torch.Tensor,
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     pair_head: torch.Tensor,
@@ -7588,11 +7632,14 @@ def _launch_dynamic_flat(
         required_intermediate_bytes = (
             physical_tiles_capacity * selected_tile_m * (n + n // 32)
         )
-        if route_output.numel() * route_output.element_size() < required_intermediate_bytes:
+        available_intermediate_bytes = (
+            materialized_intermediate.numel() * materialized_intermediate.element_size()
+        )
+        if available_intermediate_bytes < required_intermediate_bytes:
             raise ValueError(
-                "dynamic W4A8 materialized scratch exceeds route_output capacity: "
+                "dynamic W4A8 materialized scratch exceeds preplanned capacity: "
                 f"need {required_intermediate_bytes} bytes, have "
-                f"{route_output.numel() * route_output.element_size()}"
+                f"{available_intermediate_bytes}"
             )
     if not multicta_enabled:
         effective_mac = 1
@@ -7670,7 +7717,7 @@ def _launch_dynamic_flat(
         _gptr(cutlass.Float8E4M3FN, scale_flat),
         _gptr(cutlass.Uint8, packed_a_flat),
         _gptr(cutlass.Uint8, scale_flat),
-        _gptr(cutlass.Uint32, route_output),
+        _gptr(cutlass.Uint32, materialized_intermediate),
         barrier_count,
         barrier_epoch,
         pair_head,
@@ -7739,7 +7786,7 @@ def _tp_moe_dynamic_launch_op(
     packed_a_view: torch.Tensor,
     packed_a_flat: torch.Tensor,
     scale_flat: torch.Tensor,
-    route_output: torch.Tensor,
+    materialized_intermediate: torch.Tensor,
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     pair_head: torch.Tensor,
@@ -7805,7 +7852,7 @@ def _tp_moe_dynamic_launch_op(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
         scale_flat=scale_flat,
-        route_output=route_output,
+        materialized_intermediate=materialized_intermediate,
         sfb_w13_mx=sfb_w13_mx,
         sfb_down_mx=sfb_down_mx,
         w13_residual=w13_residual,
@@ -7874,7 +7921,7 @@ def _tp_moe_dynamic_launch_fake(
     packed_a_view: torch.Tensor,
     packed_a_flat: torch.Tensor,
     scale_flat: torch.Tensor,
-    route_output: torch.Tensor,
+    materialized_intermediate: torch.Tensor,
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     pair_head: torch.Tensor,
@@ -7967,26 +8014,24 @@ def _launch_dynamic(
     swiglu_beta: float = 0.0,
 ) -> None:
     del stream
+    if deterministic_output and workspace.route_output.numel() < routed_rows * k:
+        raise RuntimeError(
+            "deterministic dynamic launch exceeds the planned route-output "
+            f"capacity: need {routed_rows * k} elements, got "
+            f"{workspace.route_output.numel()}"
+        )
     kernel_output = workspace.route_output if deterministic_output else scatter_output
     scatter_rows = routed_rows if deterministic_output else m
     w4a8_repacked = w4a8_prepared is not None
-    w13_rp = (
-        w4a8_prepared["w13_rp"] if w4a8_repacked else workspace.row_counts
-    )
-    w13_sfb_rp = (
-        w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
-    )
-    down_rp = (
-        w4a8_prepared["w2_rp"] if w4a8_repacked else workspace.row_counts
-    )
-    down_sfb_rp = (
-        w4a8_prepared["w2_sfb"] if w4a8_repacked else workspace.row_counts
-    )
+    w13_rp = w4a8_prepared["w13_rp"] if w4a8_repacked else workspace.row_counts
+    w13_sfb_rp = w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
+    down_rp = w4a8_prepared["w2_rp"] if w4a8_repacked else workspace.row_counts
+    down_sfb_rp = w4a8_prepared["w2_sfb"] if w4a8_repacked else workspace.row_counts
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
         workspace.packed_a_flat,
         workspace.scale_flat,
-        workspace.route_output,
+        workspace.materialized_intermediate,
         workspace.barrier_count,
         workspace.barrier_epoch,
         workspace.pair_head,
@@ -8013,9 +8058,15 @@ def _launch_dynamic(
         weights.down_fp4,
         weights.down_sf,
         weights.sfb_w13_mx if weights.sfb_w13_mx is not None else workspace.row_counts,
-        weights.sfb_down_mx if weights.sfb_down_mx is not None else workspace.row_counts,
-        weights.w13_residual if weights.w13_residual is not None else workspace.row_counts,
-        weights.down_residual if weights.down_residual is not None else workspace.row_counts,
+        weights.sfb_down_mx
+        if weights.sfb_down_mx is not None
+        else workspace.row_counts,
+        weights.w13_residual
+        if weights.w13_residual is not None
+        else workspace.row_counts,
+        weights.down_residual
+        if weights.down_residual is not None
+        else workspace.row_counts,
         w13_rp,
         w13_sfb_rp,
         down_rp,
@@ -8059,6 +8110,11 @@ def _launch_dynamic_topk_sum(
     k: int,
     stream,
 ) -> None:
+    if route_output.numel() < m * num_topk * k:
+        raise RuntimeError(
+            "top-k reduction exceeds the planned route-output capacity: "
+            f"need {m * num_topk * k} elements, got {route_output.numel()}"
+        )
     from b12x.moe.fused.w4a16.kernel import compile_w4a16_topk_sum
 
     element_dtype = _w4a16_element_dtype(output.dtype)
@@ -8145,12 +8201,14 @@ def _launch_compact_micro_flat(
                 compile_time_phase=phase,
             )
             split_block_dim = (
-                _DIRECT_MICRO_BLOCK_DIM // 2 if phase == 2 and m == 1 else _DIRECT_MICRO_BLOCK_DIM
+                _DIRECT_MICRO_BLOCK_DIM // 2
+                if phase == 2 and m == 1
+                else _DIRECT_MICRO_BLOCK_DIM
             )
-            if not _compiled_direct_micro_accepts_block_dim(
-                compiled, split_block_dim
-            ):
-                raise RuntimeError("compiled split NVFP4 micro MoE kernel cannot launch")
+            if not _compiled_direct_micro_accepts_block_dim(compiled, split_block_dim):
+                raise RuntimeError(
+                    "compiled split NVFP4 micro MoE kernel cannot launch"
+                )
             micro_cls.launch(
                 compiled,
                 x=a,
@@ -8258,11 +8316,17 @@ def _get_tiny_decode_kernel(
     *,
     device: torch.device | None = None,
 ):
-    from b12x.moe.fused.tiny_decode import MoETinyDecodeKernelBackend
+    from b12x.moe.fused.tiny_decode import (
+        MoETinyDecodeKernelBackendPhase1,
+        MoETinyDecodeKernelBackendPhase2,
+    )
 
     compiled_phases = []
-    for phase in (1, 2):
-        kernel = MoETinyDecodeKernelBackend(compile_time_phase=phase)
+    for kernel_cls in (
+        MoETinyDecodeKernelBackendPhase1,
+        MoETinyDecodeKernelBackendPhase2,
+    ):
+        kernel = kernel_cls()
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
         cache_key = ("tiny_decode",) + kernel.__cache_key__
         cached = _TINY_DECODE_KERNEL_CACHE.get(cache_key)
@@ -8703,17 +8767,13 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             routed_rows_capacity=_require_binding_field(
                 binding, "routed_rows_capacity"
             ),
-            active_expert_count=_require_binding_field(
-                binding, "active_expert_count"
-            ),
+            active_expert_count=_require_binding_field(binding, "active_expert_count"),
             weight_expert_ids=_require_binding_field(binding, "weight_expert_ids"),
             global_to_local_expert=_require_binding_field(
                 binding, "global_to_local_expert"
             ),
             compact_topk_ids=_require_binding_field(binding, "compact_topk_ids"),
-            micro_intermediate=_require_binding_field(
-                binding, "micro_intermediate"
-            ),
+            micro_intermediate=_require_binding_field(binding, "micro_intermediate"),
         )
     elif binding.implementation == "dynamic":
         workspace = TPDynamicWorkspace(
@@ -8751,6 +8811,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             ),
             task_capacity=_require_binding_field(binding, "task_capacity"),
             route_output=_require_binding_field(binding, "route_output"),
+            materialized_intermediate=_require_binding_field(
+                binding, "materialized_intermediate"
+            ),
             expert_write_rows=_require_binding_field(binding, "expert_write_rows"),
             expert_tile_base=_require_binding_field(binding, "expert_tile_base"),
             input_gs=_require_binding_field(binding, "input_gs"),
@@ -8759,9 +8822,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             producers_done_count=_require_binding_field(
                 binding, "producers_done_count"
             ),
-            all_work_published=_require_binding_field(
-                binding, "all_work_published"
-            ),
+            all_work_published=_require_binding_field(binding, "all_work_published"),
             task_head=_require_binding_field(binding, "task_head"),
             task_tail=_require_binding_field(binding, "task_tail"),
             task_ready=_require_binding_field(binding, "task_ready"),
@@ -8774,8 +8835,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     elif binding.implementation != "w4a16":
         raise TypeError(
-            "unsupported TP MoE FP4 binding implementation "
-            f"{binding.implementation!r}"
+            f"unsupported TP MoE FP4 binding implementation {binding.implementation!r}"
         )
 
     quant_mode_arg = quant_mode
@@ -8868,8 +8928,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         prepared = prepared_payload
         if prepared is None:
             raise RuntimeError(
-                "the W4A16 weight plan did not materialize its required "
-                "representation"
+                "the W4A16 weight plan did not materialize its required representation"
             )
         if binding.implementation != "w4a16":
             raise TypeError("expected a W4A16 TP MoE binding")
@@ -8878,9 +8937,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "W4A16 TP MoE binding capacity is too small: "
                 f"capacity={binding.routed_rows_capacity}, requested={routed_rows}"
             )
-        intermediate_cache13 = _require_binding_field(
-            binding, "intermediate_cache13"
-        )
+        intermediate_cache13 = _require_binding_field(binding, "intermediate_cache13")
         intermediate_cache2 = _require_binding_field(binding, "intermediate_cache2")
         fc1_c_tmp = _require_binding_field(binding, "fc1_c_tmp")
         fc2_c_tmp = _require_binding_field(binding, "fc2_c_tmp")
@@ -8938,6 +8995,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         apply_router_weight_on_input=apply_router_weight_on_input,
+        deterministic_output=bool(binding.deterministic_output),
     )
 
     impl = plan.implementation
@@ -9030,10 +9088,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         raise ValueError("output must be contiguous")
 
     if impl == "dynamic":
-        deterministic_output = _dynamic_deterministic_output_enabled(
-            quant_mode=quant_mode,
-            device=device,
-        )
+        deterministic_output = plan.deterministic_output
         dense_w4a8_candidate = _w4a8_dynamic_dense_candidate(
             quant_mode=quant_mode,
             activation=activation,
@@ -9091,9 +9146,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     dynamic_w4a8_prepared is not None
                     and _env_flag(
                         _DYNAMIC_W4A8_SHARE_INPUT_ENV,
-                        default=(
-                            dense_w4a8_candidate or decode_w4a8_candidate
-                        ),
+                        default=(dense_w4a8_candidate or decode_w4a8_candidate),
                     )
                 )
             ),

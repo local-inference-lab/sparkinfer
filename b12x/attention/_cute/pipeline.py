@@ -16,7 +16,7 @@ class PipelineStateSimple:
         self._stages = stages
         self._phase_index = phase_index
 
-    def clone(self) -> "PipelineStateSimple":
+    def clone(self, *, loc=None, ip=None) -> "PipelineStateSimple":
         return PipelineStateSimple(self.stages, self._phase_index)
 
     @property
@@ -31,7 +31,7 @@ class PipelineStateSimple:
     def phase(self) -> Int32:
         return self._phase_index if const_expr(self._stages == 1) else self._phase_index // self._stages
 
-    def advance(self):
+    def advance(self, *, loc=None, ip=None):
         if const_expr(self._stages == 1):
             self._phase_index ^= 1
         else:

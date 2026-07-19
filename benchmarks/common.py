@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import csv
+import io
 import statistics
+import subprocess
+import time
 
 import torch
 
@@ -16,6 +20,75 @@ _FALLBACK_L2_FLUSH_BYTES = 128 << 20
 _L2_FLUSH_BUFFER_CACHE: dict[
     tuple[int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
+
+
+_NVIDIA_SMI_GPU_MODE_FIELDS = (
+    "index",
+    "uuid",
+    "pstate",
+    "persistence_mode",
+    "compute_mode",
+    "clocks.current.sm",
+    "clocks.current.memory",
+    "clocks_throttle_reasons.active",
+    "power.draw",
+    "power.limit",
+    "temperature.gpu",
+)
+
+
+def nvidia_smi_gpu_mode_snapshot() -> dict[str, object]:
+    """Capture the physical GPU's benchmark-relevant operating state."""
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    torch_uuid = str(getattr(properties, "uuid", ""))
+    target_uuid = torch_uuid if torch_uuid.startswith("GPU-") else f"GPU-{torch_uuid}"
+    command = [
+        "nvidia-smi",
+        f"--query-gpu={','.join(_NVIDIA_SMI_GPU_MODE_FIELDS)}",
+        "--format=csv,noheader,nounits",
+    ]
+    captured_ns = time.time_ns()
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        return {
+            "captured_unix_ns": captured_ns,
+            "torch_uuid": torch_uuid,
+            "nvidia_smi_uuid": target_uuid,
+            "command": command,
+            "available": False,
+            "error": str(error),
+        }
+
+    rows = list(csv.reader(io.StringIO(completed.stdout), skipinitialspace=True))
+    matches = [
+        row
+        for row in rows
+        if len(row) == len(_NVIDIA_SMI_GPU_MODE_FIELDS) and row[1] == target_uuid
+    ]
+    if len(matches) != 1:
+        return {
+            "captured_unix_ns": captured_ns,
+            "torch_uuid": torch_uuid,
+            "nvidia_smi_uuid": target_uuid,
+            "command": command,
+            "available": False,
+            "error": f"expected one UUID match, found {len(matches)}",
+            "raw_stdout": completed.stdout,
+        }
+    return {
+        "captured_unix_ns": captured_ns,
+        "torch_uuid": torch_uuid,
+        "nvidia_smi_uuid": target_uuid,
+        "command": command,
+        "available": True,
+        "fields": dict(zip(_NVIDIA_SMI_GPU_MODE_FIELDS, matches[0], strict=True)),
+    }
 
 
 def require_sm120() -> torch.device:

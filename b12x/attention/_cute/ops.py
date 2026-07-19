@@ -35,7 +35,7 @@ def warp_reduce(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -78,7 +78,7 @@ def fmax_reduce(
     x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_max = [res[0], res[1], res[2], res[3]]
         for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -90,7 +90,7 @@ def fmax_reduce(
         local_max[2] = fmax(local_max[2], local_max[3])
         local_max[0] = fmax(local_max[0], local_max[2])
         return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
-    res = cute.make_fragment(x.shape, Float32)
+    res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
     local_max_0 = fmax(init_val, res[0], res[1]) if const_expr(init_val is not None) else fmax(res[0], res[1])
     local_max = [
@@ -116,7 +116,7 @@ def fadd_reduce(
         if const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-    res = cute.make_fragment(x.shape, Float32)
+    res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
     local_sum_0 = (
         cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
@@ -142,7 +142,7 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),

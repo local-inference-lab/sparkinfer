@@ -76,6 +76,8 @@ _PREFILL_BLOCK_THREADS = 384
 _PREFILL_IO_THREADS = 128
 _IO_REGS = 32
 _MATH_REGS = 232
+_H32_IO_REGS = 24
+_H32_MATH_REGS = 240
 _DSV4_IO_STRIDE = 576
 _DSV4_ROPE_GMEM_OFFSET = 448
 # GLM (ARBITRARY_FP32) per-token record: 512 e4m3 nope + 16 inline fp32 scales +
@@ -1773,10 +1775,12 @@ def s6_xv_nope_mg_dsv4(
     w_head_sc_lane_base = w_head_sc_base + gid * Int32(4)
     # Match the native MG schedule: each lane owns the same two candidate
     # scales for both head groups, and those scales are reused by the absmax
-    # pass and the W-quantization pass.  Keep the 2*N_V_CHUNKS values live once
-    # instead of reloading/re-expanding the shared UE8M0 bytes in each pass.
-    # The one-CTA launch bound above makes this long-lived cache part of the
-    # math-warp register budget rather than forcing it into local memory.
+    # pass and the W-quantization pass.  The dual-head-group trace keeps only
+    # the four packed words live across the intervening barriers and expands
+    # one scale pair at each use.  Keeping all 2*N_V_CHUNKS decoded Float32
+    # values live makes CUTLASS 4.6 spill the H32 trace at the safe 232-register
+    # math-warp limit.  The single-head-group trace retains the lower-work
+    # decode-once schedule.
     vsc_cache0 = []
     vsc_cache1 = []
     vsc_e0_base = kv_sc_base_addr + cand_e0 * Int32(scale_bytes_per_token)
@@ -1784,25 +1788,43 @@ def s6_xv_nope_mg_dsv4(
     # aligned 16-byte load fetches both candidates exactly as FI's
     # ``ld.shared.v4.b32`` + ``prmt`` sequence does.
     sc0_lo, sc0_hi, sc1_lo, sc1_hi = ld_shared_v4_u32(vsc_e0_base)
+    if cutlass.const_expr(n_hg == 1):
+        for vc in cutlass.range_constexpr(n_v_chunks):
+            if cutlass.const_expr(vc < 4):
+                sc0_word = sc0_lo
+                sc1_word = sc1_lo
+                sc_byte = vc
+            else:
+                sc0_word = sc0_hi
+                sc1_word = sc1_hi
+                sc_byte = vc - 4
+            selector = Int32(0x7770 + sc_byte)
+            vsc_cache0.append(
+                _ue8m0_zext_byte_to_fp32(byte_perm(sc0_word, Uint32(0), selector))
+            )
+            vsc_cache1.append(
+                _ue8m0_zext_byte_to_fp32(byte_perm(sc1_word, Uint32(0), selector))
+            )
     for vc in cutlass.range_constexpr(n_v_chunks):
-        if cutlass.const_expr(vc < 4):
-            sc0_word = sc0_lo
-            sc1_word = sc1_lo
-            sc_byte = vc
+        if cutlass.const_expr(n_hg == 2):
+            if cutlass.const_expr(vc < 4):
+                sc0_word = sc0_lo
+                sc1_word = sc1_lo
+                sc_byte = vc
+            else:
+                sc0_word = sc0_hi
+                sc1_word = sc1_hi
+                sc_byte = vc - 4
+            selector = Int32(0x7770 + sc_byte)
+            vsc0 = _ue8m0_zext_byte_to_fp32(
+                byte_perm(sc0_word, Uint32(0), selector)
+            )
+            vsc1 = _ue8m0_zext_byte_to_fp32(
+                byte_perm(sc1_word, Uint32(0), selector)
+            )
         else:
-            sc0_word = sc0_hi
-            sc1_word = sc1_hi
-            sc_byte = vc - 4
-        selector = Int32(0x7770 + sc_byte)
-        vsc_cache0.append(
-            _ue8m0_zext_byte_to_fp32(byte_perm(sc0_word, Uint32(0), selector))
-        )
-        vsc_cache1.append(
-            _ue8m0_zext_byte_to_fp32(byte_perm(sc1_word, Uint32(0), selector))
-        )
-    for vc in cutlass.range_constexpr(n_v_chunks):
-        vsc0 = vsc_cache0[vc]
-        vsc1 = vsc_cache1[vc]
+            vsc0 = vsc_cache0[vc]
+            vsc1 = vsc_cache1[vc]
         m00 = fmax_f32(w_pre0[0] * vsc0, w_pre0[1] * vsc1)
         m01 = fmax_f32(w_pre0[2] * vsc0, w_pre0[3] * vsc1)
         if cutlass.const_expr(two):
@@ -1871,8 +1893,25 @@ def s6_xv_nope_mg_dsv4(
             si10 = rcp_approx_ftz(sc10)
             si11 = rcp_approx_ftz(sc11)
 
-        vsc0 = vsc_cache0[vc]
-        vsc1 = vsc_cache1[vc]
+        if cutlass.const_expr(n_hg == 2):
+            if cutlass.const_expr(vc < 4):
+                sc0_word = sc0_lo
+                sc1_word = sc1_lo
+                sc_byte = vc
+            else:
+                sc0_word = sc0_hi
+                sc1_word = sc1_hi
+                sc_byte = vc - 4
+            selector = Int32(0x7770 + sc_byte)
+            vsc0 = _ue8m0_zext_byte_to_fp32(
+                byte_perm(sc0_word, Uint32(0), selector)
+            )
+            vsc1 = _ue8m0_zext_byte_to_fp32(
+                byte_perm(sc1_word, Uint32(0), selector)
+            )
+        else:
+            vsc0 = vsc_cache0[vc]
+            vsc1 = vsc_cache1[vc]
 
         # W (A-operand) store rows. FI stores at wrow0=gid, wrow1=gid+8 and, for
         # the dual pbs_extra==2 path, applies the bank-conflict swizzle row^(row>>3)
@@ -2022,6 +2061,41 @@ class UnifiedPrefillMGKernel:
         self.mg_n_hg = int(layout.heads_per_cta // traits.hpb)
         self.math_threads = int(traits.math_threads)
         self.block_threads = _PREFILL_BLOCK_THREADS
+        # H32 register-pool policy: give the CUTLASS 4.6 DSV4 FP8 trace eight
+        # more math-warp registers while returning the same amount from the IO
+        # warpgroup. Keep the budget pinned to the exact topk512 specialization;
+        # every other trace retains the 232/32 split.
+        self.use_h32_240_24_reg_budget = bool(
+            int(traits.model_type) == int(ModelType.DSV4)
+            and int(traits.compute_mode) == int(ComputeMode.FP8)
+            and int(traits.scale_format) == int(ScaleFormat.UE8M0_BYTE)
+            and not bool(traits.fp8_rope)
+            and self.num_heads == 32
+            and self.mg_n_hg == 2
+            and self.valid_hpb == 16
+            and self.num_tiles == 8
+            and self.page_block_size == 64
+            and self.topk == 512
+            and self.replicate_h == 1
+            and self.q_stride_row == 16384
+            and self.q_stride_head == 512
+            and self.q_stride_dim == 1
+            and self.indices_stride_row == 512
+            and self.output_stride_row == 16384
+            and self.output_stride_head == 512
+            and self.output_stride_dim == 1
+            and self.out_lse_stride_row == 32
+            and self.out_lse_stride_head == 1
+            and not self.has_sink
+            and not self.has_extra
+            and self.pbs_extra == 1
+            and self.num_main_tiles == 0
+            and self.extra_topk == 0
+            and self.extra_indices_stride_row == 512
+            and not self.row_xor
+            and self.head_offset == 0
+            and not self.pack_hilo_rows
+        )
 
     @cute.jit
     def __call__(
@@ -2390,7 +2464,10 @@ class UnifiedPrefillMGKernel:
         warp_first_cand = warp_id * Int32(8)
 
         if is_io:
-            cute.arch.setmaxregister_decrease(_IO_REGS)
+            if cutlass.const_expr(self.use_h32_240_24_reg_budget):
+                cute.arch.setmaxregister_decrease(_H32_IO_REGS)
+            else:
+                cute.arch.setmaxregister_decrease(_IO_REGS)
             io_lane = tid - Int32(self.math_threads)
             kv_l2_policy = create_l2_evict_first_policy()
 
@@ -2538,7 +2615,10 @@ class UnifiedPrefillMGKernel:
                 cute.arch.barrier(barrier_id=1, number_of_threads=self.block_threads)
 
         else:
-            cute.arch.setmaxregister_increase(_MATH_REGS)
+            if cutlass.const_expr(self.use_h32_240_24_reg_budget):
+                cute.arch.setmaxregister_increase(_H32_MATH_REGS)
+            else:
+                cute.arch.setmaxregister_increase(_MATH_REGS)
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
             if cutlass.const_expr(bf16_qk):
                 # S0 (BF16): stage Q-NoPE and Q-RoPE in shared memory.  The
@@ -3988,7 +4068,11 @@ def run_unified_prefill_mg(
     if has_sink:
         attn_sink_t = attn_sink.to(device=device, dtype=torch.float32).contiguous()
     else:
-        attn_sink_t = torch.zeros(1, dtype=torch.float32, device=device)
+        # ``has_sink=False`` const-expr-elides every device read of this
+        # argument. Reuse one caller-owned int32 length word as an f32-typed
+        # placeholder instead of allocating a CUDA tensor on every serving
+        # launch (including during graph capture).
+        attn_sink_t = topk_length.view(torch.float32)[:1]
 
     if stride_kv_block is None:
         stride_kv_block = _cache_block_stride_bytes(

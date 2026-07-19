@@ -198,23 +198,28 @@ def _run_case(m: int, *, tc_decode: bool) -> None:
         device=_DEVICE,
     )
 
-    out = run_w4a16_moe(
-        p["a"],
-        prepared,
-        p["topk_weights"],
-        p["topk_ids"],
-        activation="silu",
-        intermediate_cache13=buffers.intermediate_cache13,
-        intermediate_cache2=buffers.intermediate_cache2,
-        output=buffers.output,
-        fc1_c_tmp=buffers.fc1_c_tmp,
-        fc2_c_tmp=buffers.fc2_c_tmp,
-        packed_route_indices=buffers.packed_route_indices,
-        block_expert_ids=buffers.block_expert_ids,
-        packed_route_count=buffers.packed_route_count,
-        fused_launch=fused,
-    )
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            p["a"],
+            prepared,
+            p["topk_weights"],
+            p["topk_ids"],
+            activation="silu",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            fused_launch=fused,
+        )
+
+    out = launch()
     torch.cuda.synchronize()
+    eager = out.clone()
 
     w13_deq = _dequant(p["w13_codes"], p["w13_scale"])
     w2_deq = _dequant(p["w2_codes"], p["w2_scale"])
@@ -231,6 +236,19 @@ def _run_case(m: int, *, tc_decode: bool) -> None:
     rel = (got - ref).abs().amax() / denom
     tag = "tc_decode" if tc_decode else "packed_route"
     assert rel < 2e-2, f"NF3 {tag} m={m} rel err {float(rel):.4f} exceeds 2e-2"
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    buffers.output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(buffers.output).all().item())
+    graph_rel = (buffers.output.float() - ref).abs().amax() / denom
+    assert graph_rel < 2e-2, (
+        f"NF3 graph {tag} m={m} rel err {float(graph_rel):.4f} exceeds 2e-2"
+    )
+    assert torch.equal(buffers.output, eager)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

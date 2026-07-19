@@ -1,0 +1,118 @@
+{
+  "schema": "b12x.cute.migration.abba_producer_contract_matrix.v1",
+  "validator": "validation/cutlass_migration/acceptance/e2e/release_index.py",
+  "required_release_gates": [
+    "exact_provenance",
+    "artifact_before_after",
+    "gpu_identity_mode_before_after",
+    "independent_oracle",
+    "arm_equality",
+    "poison_overwrite",
+    "live_input_scenarios_distinct",
+    "live_input_changed_input",
+    "live_input_changed_output",
+    "read_only_input_hashes",
+    "fixed_capacity",
+    "allocator_stability",
+    "fixed_cuda_event_pool_before_target_preconditioning",
+    "balanced_target_graph_duration_preconditioning",
+    "p1_exact_requested_throttle_clock_stability",
+    "same_address",
+    "graph_replay_topology",
+    "warm_cold_l2",
+    "raw_samples"
+  ],
+  "producers": [
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/bf16_to_fp4_tma.py",
+      "schema": "b12x.bf16_to_fp4_tma.cache_abba.v4",
+      "serving_units": "artifact",
+      "evidence_keys": ["artifact_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "same_address_arms", "cuda_graph_topology_equal", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/compute_exceptions.py",
+      "schema": "b12x.compute_exceptions.cache_abba.v1",
+      "serving_units": "cases",
+      "evidence_keys": ["object_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "full_output_overwrite", "live_input_mutation_changed_output", "fixed_workspace_capacity", "zero_replay_allocations", "same_address_across_arms", "cuda_graph_topology_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/contiguous_attention.py",
+      "schema": "b12x.contiguous_attention.cache_abba.v2",
+      "serving_units": "artifact",
+      "evidence_keys": ["manifests", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable_during_timing", "zero_replay_allocations", "same_address_arms", "cuda_graph_topology_equal", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/mla_decode_merge.py",
+      "schema": "b12x.attention.mla.decode_merge.exact_cache_abba.v2",
+      "serving_units": "rows",
+      "evidence_keys": ["artifacts", "artifact_integrity", "mode_initial", "mode_final", "correctness", "output_arms_bit_exact", "poisoned_outputs_overwritten", "live_input_mutation_changed_output", "workspace", "allocator_before", "allocator_after", "same_addresses_across_arms", "topologies_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/mla_prefill_mg.py",
+      "schema": "b12x.attention.mla.prefill_mg.exact_cache_abba.v4",
+      "serving_units": "rows",
+      "evidence_keys": ["artifacts", "artifact_integrity", "mode_initial", "mode_final", "correctness", "output_arms_bit_exact", "poisoned_outputs_overwritten", "live_input_mutation_changed_output", "workspace", "allocator_before", "allocator_after", "same_addresses_across_arms", "topologies_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/nsa_indexer.py",
+      "schema": "b12x.attention.indexer.exact_cache_abba.v1",
+      "serving_units": "artifact",
+      "evidence_keys": ["artifacts", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_checked_regions_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "same_address_arms", "cuda_graph_topology_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/paged_attention.py",
+      "schema": "b12x.attention.paged.exact_cache_abba.v1",
+      "serving_units": "artifact",
+      "evidence_keys": ["artifacts", "artifact_verification_before", "artifact_verification_after", "runtime_b12x_package_fingerprint", "imported_runtime_source_sha256", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs_immutable", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "allocator_checks", "same_address_arms", "cuda_graph_topology_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/residual_prefill_partial.py",
+      "schema": "b12x.residual_prefill_partial.cache_abba.v4",
+      "serving_units": "artifact",
+      "evidence_keys": ["manifests", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "same_address_arms", "cuda_graph_topology_equal", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/residual_composite.py",
+      "schema": "b12x.residual.composite_exact_cache_abba.v1",
+      "serving_units": "shapes",
+      "evidence_keys": ["artifacts", "artifact_verification_before", "artifact_verification_after", "gpu_mode_before_timing", "gpu_mode_after_timing", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_mutation_changed_output", "fixed_workspace_capacity", "zero_replay_allocations", "same_address_arms", "cuda_graph_topology_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/tp_moe_dynamic.py",
+      "schema": "b12x.tp_moe.dynamic.cache_abba.v2",
+      "serving_units": "cases",
+      "evidence_keys": ["object_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "arm_comparison_policy", "all_arm_output_policies_passed", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace", "allocator_stable", "zero_replay_allocations", "allocator_checks", "same_address_arms", "cuda_graph_topology_equal", "warm_l2", "cold_l2", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/w4a16_serving.py",
+      "schema": "b12x.w4a16.serving.cache_abba.v2",
+      "serving_units": "cases",
+      "evidence_keys": ["object_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "timing_mode_policy", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "allocator_checks", "same_address_arms", "cuda_graph_topology_equal", "conditions", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/w4a16_topk_sum.py",
+      "schema": "b12x.w4a16.topk_sum.cache_abba.v1",
+      "serving_units": "cases",
+      "evidence_keys": ["object_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "allocator_checks", "same_address_arms", "cuda_graph_topology_equal", "conditions", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    },
+    {
+      "path": "validation/cutlass_migration/diagnostics/paired/w4a8_dynamic.py",
+      "schema": "b12x.w4a8.dynamic.cache_abba.v2",
+      "serving_units": "artifact",
+      "evidence_keys": ["object_provenance", "artifact_verification_before", "artifact_verification_after", "gpu_mode_initial", "gpu_mode_final", "correctness", "arms_bit_exact", "poisoned_outputs_overwritten", "live_input_scenarios_distinct", "live_input_mutation_changed_input", "live_input_mutation_changed_output", "read_only_inputs", "fixed_workspace_capacity", "allocator_stable", "zero_replay_allocations", "allocator_checks", "same_address_across_arms", "cuda_graph_topology_equal", "conditions", "l2_flush_bytes", "samples_us"],
+      "runtime_follow_up": []
+    }
+  ]
+}

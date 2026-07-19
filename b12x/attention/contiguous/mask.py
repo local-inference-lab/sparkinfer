@@ -66,14 +66,13 @@ class AttentionMask:
             )
             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                 col_idx = t0ScS_mn[0, c][col_dim] + thr_col_offset + n_block * self.tile_n
-                masked = q_row_idx >= self.seqlen_q or col_idx >= self.seqlen_k
+                masked = (q_row_idx >= self.seqlen_q) | (col_idx >= self.seqlen_k)
                 if const_expr(mask_causal):
-                    masked = masked or col_idx >= q_row_idx + 1 + self.seqlen_k - self.seqlen_q
+                    masked = masked | (col_idx >= q_row_idx + 1 + self.seqlen_k - self.seqlen_q)
                 if const_expr(mask_local):
                     anchor = q_row_idx + self.seqlen_k - self.seqlen_q
                     if const_expr(self.window_size_left is not None):
-                        masked = masked or col_idx < anchor - self.window_size_left
+                        masked = masked | (col_idx < anchor - self.window_size_left)
                     if const_expr(self.window_size_right is not None):
-                        masked = masked or col_idx >= anchor + self.window_size_right + 1
-                if masked:
-                    acc_S_mn[r, c] = -Float32.inf
+                        masked = masked | (col_idx >= anchor + self.window_size_right + 1)
+                acc_S_mn[r, c] = cutlass.select_(masked, -Float32.inf, acc_S_mn[r, c])

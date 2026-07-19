@@ -281,7 +281,15 @@ def _interleave_flashinfer_w1_w3_rows(
     activation = normalize_moe_activation(activation)
     if not is_gated_moe_activation(activation):
         return tensor.contiguous()
-    gate_rows, up_rows = _gated_row_slices(activation, intermediate_size)
+    # This preparation helper has a fixed checkpoint-native source contract:
+    # [w1/gate, w3/up].  Do not infer the source halves from the activation's
+    # ordinary in-kernel W13 layout; FlashInfer needs those source halves
+    # explicitly swapped into [up0, gate0, ...].
+    gate_rows, up_rows = _gated_row_slices(
+        activation,
+        intermediate_size,
+        w13_layout="w31",
+    )
     gate = tensor[:, gate_rows]
     up = tensor[:, up_rows]
     return torch.stack([up, gate], dim=2).reshape(tensor.shape).contiguous()
@@ -568,6 +576,7 @@ def _quantize_vec_to_fp4_dequant(
     *,
     block_size: int,
     fp8_e4m3_max: float,
+    scale_math: str = "direct_division",
 ) -> torch.Tensor:
     cols = vals_f32.shape[0]
     n_blocks = cols // block_size
@@ -577,8 +586,20 @@ def _quantize_vec_to_fp4_dequant(
     raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
     sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-    sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
-    scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
+    sf_times_gs = (
+        sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
+        / global_scale
+    ).clamp(min=1e-30)
+    if scale_math == "direct_division":
+        scaled = vals_f32 / sf_times_gs
+    elif scale_math == "reciprocal_multiply":
+        # The micro kernel materializes ``1 / effective_scale`` once and then
+        # multiplies each value.  This is observably different from direct
+        # division at FP4 round-to-nearest-even ties, so its oracle must retain
+        # the same floating-point evaluation order.
+        scaled = vals_f32 * sf_times_gs.reciprocal()
+    else:
+        raise ValueError(f"unsupported NVFP4 scale math {scale_math!r}")
     quant = fp4_quantize_values_torch(scaled)
     sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
     return quant * sf_only
@@ -605,6 +626,7 @@ def _trace_nvfp4_route(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    quant_scale_math: str = "direct_division",
 ) -> MoERouteTrace:
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
@@ -624,6 +646,7 @@ def _trace_nvfp4_route(
         gs_fc1,
         block_size=block_size,
         fp8_e4m3_max=fp8_e4m3_max,
+        scale_math=quant_scale_math,
     )
     w2_sf = unswizzle_block_scale(w2_blockscale_eid, K, I_tp // block_size)
 
@@ -674,6 +697,7 @@ def _trace_nvfp4_route(
         gs_fc2,
         block_size=block_size,
         fp8_e4m3_max=fp8_e4m3_max,
+        scale_math=quant_scale_math,
     )
     down_dequant = _apply_block_scales(
         _dequant_fp4(w2_fp4_eid, K, I_tp, fp4_lut),
@@ -730,6 +754,7 @@ def trace_moe_reference_nvfp4_route(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    quant_scale_math: str = "direct_division",
 ) -> MoERouteTrace:
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
@@ -773,6 +798,7 @@ def trace_moe_reference_nvfp4_route(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        quant_scale_math=quant_scale_math,
     )
 
 
@@ -1143,7 +1169,15 @@ def moe_reference_nvfp4(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    quant_scale_math: str = "direct_division",
 ) -> torch.Tensor:
+    """Evaluate the routed NVFP4 reference on the GPU.
+
+    ``quant_scale_math`` selects the floating-point evaluation order used by
+    activation quantization.  The dynamic kernel uses direct division while
+    the micro kernel computes a reciprocal once and multiplies each value;
+    callers comparing against micro must request ``"reciprocal_multiply"``.
+    """
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
             activation,
@@ -1181,6 +1215,7 @@ def moe_reference_nvfp4(
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
+                quant_scale_math=quant_scale_math,
             )
             assert trace.expert_idx == eid
             output[t] += trace.routed_out_accum

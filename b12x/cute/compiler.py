@@ -6,7 +6,10 @@ import inspect
 import json
 import math
 import os
+import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from collections import OrderedDict
@@ -430,8 +433,7 @@ def _is_json_pod(value: Any) -> bool:
         return all(_is_json_pod(item) for item in value)
     if isinstance(value, dict):
         return all(
-            isinstance(key, str) and _is_json_pod(item)
-            for key, item in value.items()
+            isinstance(key, str) and _is_json_pod(item) for key, item in value.items()
         )
     return False
 
@@ -460,13 +462,11 @@ def _json_pod(value: Any, *, path: str = "value") -> Any:
         )
     if isinstance(value, tuple):
         return [
-            _json_pod(item, path=f"{path}[{idx}]")
-            for idx, item in enumerate(value)
+            _json_pod(item, path=f"{path}[{idx}]") for idx, item in enumerate(value)
         ]
     if isinstance(value, list):
         return [
-            _json_pod(item, path=f"{path}[{idx}]")
-            for idx, item in enumerate(value)
+            _json_pod(item, path=f"{path}[{idx}]") for idx, item in enumerate(value)
         ]
     if isinstance(value, dict):
         out = {}
@@ -1245,9 +1245,7 @@ def _log_cute_compile_event(
         attrs_text = _short_repr(_compile_target_attrs(func), max_len=1200)
         args_text = ""
         if _cute_compile_arg_log_enabled():
-            args_text = (
-                f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
-            )
+            args_text = f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
         details = _format_explicit_spec_log_details(key_inputs)
         print(
             f"[b12x cute.compile] {event} "
@@ -1428,6 +1426,11 @@ def _b12x_package_fingerprint() -> str:
     return _compute_b12x_package_fingerprint()
 
 
+def b12x_package_fingerprint() -> str:
+    """Return the exact content fingerprint used by the CuTe object cache."""
+    return _b12x_package_fingerprint()
+
+
 def _distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -1437,6 +1440,8 @@ def _distribution_version(name: str) -> str:
 
 @lru_cache(maxsize=1)
 def _runtime_toolchain_key() -> tuple[object, ...]:
+    from .runtime_patches import cutlass_runtime_patch_status
+
     torch_version = _distribution_version("torch")
     torch_cuda_version = ""
     try:
@@ -1458,6 +1463,7 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
             cutlass_version = getattr(cutlass, "__version__", "")
         except Exception:
             cutlass_version = ""
+    cutlass_version = cutlass_version or "missing"
 
     return (
         ("python", sys.implementation.name, sys.version_info[:3]),
@@ -1466,20 +1472,29 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
         ("cutlass_dsl", cutlass_version),
         (
             "cutlass_dsl_libs_base",
-            _distribution_version("nvidia-cutlass-dsl-libs-base"),
+            _distribution_version("nvidia-cutlass-dsl-libs-base") or "missing",
+        ),
+        (
+            "cutlass_dsl_libs_core",
+            _distribution_version("nvidia-cutlass-dsl-libs-core") or "missing",
+        ),
+        (
+            "cutlass_dsl_libs_cu12",
+            _distribution_version("nvidia-cutlass-dsl-libs-cu12") or "missing",
         ),
         (
             "cutlass_dsl_libs_cu13",
-            _distribution_version("nvidia-cutlass-dsl-libs-cu13"),
+            _distribution_version("nvidia-cutlass-dsl-libs-cu13") or "missing",
         ),
         ("cuda_python", _distribution_version("cuda-python")),
         ("cuda_bindings", _distribution_version("cuda-bindings")),
+        ("b12x_runtime_patches", cutlass_runtime_patch_status()),
     )
 
 
 @lru_cache(maxsize=1)
 def _compile_environment_key() -> tuple[tuple[str, str], ...]:
-    compile_env_vars = (
+    compile_env_vars = {
         "CC",
         "CXX",
         "CUDA_HOME",
@@ -1489,8 +1504,28 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "CUTE_DSL_ARCH",
         "NVCC_APPEND_FLAGS",
         "NVCC_PREPEND_FLAGS",
-    )
-    return tuple((name, os.environ.get(name, "")) for name in compile_env_vars)
+    }
+    operational_env_vars = {
+        "B12X_CUTE_COMPILE_CACHE_DIR",
+        "B12X_CUTE_COMPILE_DISK_CACHE",
+        "B12X_CUTE_COMPILE_MEMORY_CACHE",
+        "B12X_CUTE_COMPILE_MEMORY_CACHE_SIZE",
+        "B12X_CUTE_COMPILE_SPEC_MEMO",
+        "B12X_LOG_CUTE_COMPILES",
+        "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START",
+        "B12X_LOG_CUTE_COMPILE_ARGS",
+        "B12X_LOG_CUTE_COMPILE_STACK",
+        "B12X_LOG_CUTE_COMPILE_STACK_DEPTH",
+        "B12X_PRINT_COMPILE_PROGRESS",
+        "B12X_TIMING",
+        "B12X_TIMING_THRESHOLD_MS",
+        "CUTE_DSL_CACHE_DIR",
+    }
+    for name in os.environ:
+        if name.startswith(("B12X_", "CUTE_", "CUTLASS_")):
+            if name not in operational_env_vars:
+                compile_env_vars.add(name)
+    return tuple((name, os.environ.get(name, "")) for name in sorted(compile_env_vars))
 
 
 @lru_cache(maxsize=16)
@@ -1859,8 +1894,479 @@ def _cache_object_path(cache_key: str) -> Path:
     return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
 
 
+def _cache_manifest_path(cache_key: str) -> Path:
+    return _cache_object_path(cache_key).with_suffix(".json")
+
+
 def _cache_lock_path(cache_key: str) -> Path:
     return _cache_object_path(cache_key).with_suffix(".lock")
+
+
+def _manifest_json_value(value: Any) -> Any:
+    """Return a lossless-enough JSON view of an already-normalized cache value.
+
+    Compile-cache payloads consist almost entirely of tuples and JSON scalar
+    values.  Keep an explicit representation for uncommon values instead of
+    allowing a sidecar write failure to discard the useful semantic fields.
+    The exact payload used to form ``cache_key`` is also stored as ``repr`` in
+    the manifest.
+    """
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {"kind": "float", "repr": repr(value)}
+    if isinstance(value, bytes):
+        return {"kind": "bytes", "hex": value.hex()}
+    if isinstance(value, Path):
+        return {"kind": "path", "value": str(value)}
+    if isinstance(value, (tuple, list)):
+        return [_manifest_json_value(item) for item in value]
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            return {
+                key: _manifest_json_value(item) for key, item in sorted(value.items())
+            }
+        return {
+            "kind": "mapping",
+            "items": [
+                [_manifest_json_value(key), _manifest_json_value(item)]
+                for key, item in sorted(value.items(), key=lambda pair: repr(pair[0]))
+            ],
+        }
+    return {
+        "kind": "repr",
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "value": repr(value),
+    }
+
+
+def _semantic_target_key(target_key: Any) -> Any:
+    """Remove source fingerprints while retaining callable semantic state."""
+
+    if not isinstance(target_key, tuple) or not target_key:
+        return _manifest_json_value(target_key)
+
+    tag = target_key[0]
+    if tag in {"method", "function"} and len(target_key) >= 2:
+        fingerprint = target_key[1]
+        if isinstance(fingerprint, tuple) and len(fingerprint) >= 2:
+            result: dict[str, Any] = {
+                "kind": tag,
+                "module": str(fingerprint[0]),
+                "qualname": str(fingerprint[1]),
+            }
+            if len(target_key) >= 3:
+                result["state"] = _semantic_structural_key(target_key[2])
+            return result
+    if tag == "callable_instance" and len(target_key) >= 4:
+        call_fingerprint = target_key[3]
+        result = {
+            "kind": tag,
+            "type": f"{target_key[1]}.{target_key[2]}",
+        }
+        if isinstance(call_fingerprint, tuple) and len(call_fingerprint) >= 2:
+            result["call"] = f"{call_fingerprint[0]}.{call_fingerprint[1]}"
+        else:
+            result["call"] = _semantic_structural_key(call_fingerprint)
+        if len(target_key) >= 5:
+            result["state"] = _semantic_structural_key(target_key[4])
+        return result
+    if tag == "callable" and len(target_key) >= 3:
+        return {
+            "kind": tag,
+            "type": f"{target_key[1]}.{target_key[2]}",
+        }
+    return _semantic_structural_key(target_key)
+
+
+def _semantic_structural_key(value: Any) -> Any:
+    if isinstance(value, tuple):
+        if value and value[0] in {
+            "method",
+            "function",
+            "callable_instance",
+            "callable",
+        }:
+            return _semantic_target_key(value)
+        return [_semantic_structural_key(item) for item in value]
+    if isinstance(value, list):
+        return [_semantic_structural_key(item) for item in value]
+    return _manifest_json_value(value)
+
+
+def _semantic_compile_manifest_payload(
+    cache_payload: tuple[object, ...],
+) -> dict[str, Any]:
+    cache_format = str(cache_payload[0]) if cache_payload else "unknown"
+    semantic: dict[str, Any] = {
+        "cache_format": cache_format,
+        "target": _semantic_target_key(cache_payload[1]),
+    }
+    if cache_format == "b12x_cute_compile_cache_v5_explicit_spec":
+        semantic["compile_spec_hash"] = cache_payload[4]
+        try:
+            semantic["compile_spec"] = json.loads(str(cache_payload[5]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            semantic["compile_spec"] = str(cache_payload[5])
+        if cache_payload[6]:
+            semantic["compile_kwargs_hash"] = cache_payload[6]
+            try:
+                semantic["compile_kwargs"] = json.loads(str(cache_payload[7]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                semantic["compile_kwargs"] = str(cache_payload[7])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[8])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[9])
+    else:
+        semantic["args"] = _semantic_structural_key(cache_payload[4])
+        semantic["kwargs"] = _semantic_structural_key(cache_payload[5])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[6])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[7])
+    return semantic
+
+
+_LLVM_SSA_NAME = r"%[-a-zA-Z$._0-9]+"
+_LLVM_I64_CONSTANT_RE = re.compile(
+    rf"^\s*(?P<result>{_LLVM_SSA_NAME}) = "
+    r"llvm\.mlir\.constant\((?P<value>[0-9]+) : i64\) : i64\s*$"
+)
+_LLVM_GEP_RE = re.compile(
+    rf"^\s*(?P<result>{_LLVM_SSA_NAME}) = llvm\.getelementptr "
+    rf"(?P<base>{_LLVM_SSA_NAME})\[(?P<indices>[^]]+)\]"
+)
+_LLVM_LOAD_RE = re.compile(
+    rf"^\s*(?P<result>{_LLVM_SSA_NAME}) = llvm\.load "
+    rf"(?P<pointer>{_LLVM_SSA_NAME})(?:\s|:)"
+)
+_LLVM_STORE_RE = re.compile(
+    rf"^\s*llvm\.store (?P<value>{_LLVM_SSA_NAME}), "
+    rf"(?P<pointer>{_LLVM_SSA_NAME})(?:\s|:)"
+)
+_LLVM_KERNEL_ADDRESS_RE = re.compile(
+    rf"^\s*(?P<result>{_LLVM_SSA_NAME}) = llvm\.mlir\.addressof "
+    r"@kernels_(?P<kernel>[^\s:]+)\s*:"
+)
+_LLVM_LAUNCH_EX_RE = re.compile(
+    r"llvm\.call @_cudaLaunchKernelEx\((?P<arguments>[^)]*)\)"
+)
+
+
+def _final_llvm_function_bodies(module_text: str) -> list[list[str]]:
+    """Return lowered LLVM function bodies without parsing the embedded cubin.
+
+    CUTLASS' final module contains the cubin as one very large LLVM global.
+    Launch configuration is emitted in host ``llvm.func`` bodies, whose closing
+    brace is at module indentation.  Keeping the scan line-oriented avoids
+    retaining or reparsing a second MLIR module during every compilation.
+    """
+
+    bodies: list[list[str]] = []
+    current: list[str] | None = None
+    for line in module_text.splitlines():
+        if current is None:
+            if line.startswith("  llvm.func @") and line.rstrip().endswith("{"):
+                current = [line]
+            continue
+        current.append(line)
+        if line == "  }":
+            bodies.append(current)
+            current = None
+    return bodies
+
+
+def _parse_launch_dynamic_smem_from_final_llvm(
+    module_text: str, expected_kernels: set[str]
+) -> dict[str, Any]:
+    """Extract exact resolved CUDA launch SMEM from CUTLASS final LLVM IR.
+
+    CUTLASS 4.5 and 4.6 lower ``cute.kernel_smem_size`` to an i64 constant
+    stored in field 2 of the CUDA launch-config struct.  The exported object
+    retains the host launcher but not the MLIR dataflow needed to identify that
+    constant, so this must run while the freshly compiled function still owns
+    ``ir_module``.  Any unrecognised lowering is reported as unknown rather
+    than guessed from the cubin's shared sections.
+    """
+
+    source = "cutlass-final-llvm-launch-config-field-2"
+    if not expected_kernels:
+        return {
+            "status": "unknown",
+            "source": source,
+            "reason": "kernel-info-unavailable",
+            "launch_dynamic_smem_bytes": {},
+        }
+
+    launches: dict[str, list[int]] = {kernel: [] for kernel in expected_kernels}
+    parsed_launches = 0
+    unparsed_launches = 0
+
+    for lines in _final_llvm_function_bodies(module_text):
+        if not any("llvm.call @_cudaLaunchKernelEx" in line for line in lines):
+            continue
+
+        constants: dict[str, int] = {}
+        geps: dict[str, tuple[str, tuple[str, ...]]] = {}
+        loads: dict[str, tuple[str, int]] = {}
+        stores: list[tuple[int, str, str]] = []
+        kernel_addresses: dict[str, str] = {}
+
+        def pointer_key(pointer: str) -> tuple[str, tuple[str, ...]]:
+            return geps.get(pointer, (pointer, ()))
+
+        def stored_value(pointer: str, before: int) -> str | None:
+            key = pointer_key(pointer)
+            for line_number, value, destination in reversed(stores):
+                if line_number < before and pointer_key(destination) == key:
+                    return value
+            return None
+
+        for line_number, line in enumerate(lines):
+            if match := _LLVM_I64_CONSTANT_RE.match(line):
+                constants[match.group("result")] = int(match.group("value"))
+                continue
+            if match := _LLVM_GEP_RE.match(line):
+                indices = tuple(
+                    item.strip() for item in match.group("indices").split(",")
+                )
+                geps[match.group("result")] = (match.group("base"), indices)
+                continue
+            if match := _LLVM_LOAD_RE.match(line):
+                loads[match.group("result")] = (
+                    match.group("pointer"),
+                    line_number,
+                )
+                continue
+            if match := _LLVM_STORE_RE.match(line):
+                stores.append(
+                    (line_number, match.group("value"), match.group("pointer"))
+                )
+                continue
+            if match := _LLVM_KERNEL_ADDRESS_RE.match(line):
+                kernel_addresses[match.group("result")] = match.group("kernel")
+                continue
+            match = _LLVM_LAUNCH_EX_RE.search(line)
+            if match is None:
+                continue
+
+            arguments = [
+                argument.strip() for argument in match.group("arguments").split(",")
+            ]
+            if len(arguments) < 2:
+                unparsed_launches += 1
+                continue
+            config_operand, kernel_operand = arguments[:2]
+
+            kernel_load = loads.get(kernel_operand)
+            kernel = (
+                kernel_addresses.get(kernel_load[0])
+                if kernel_load is not None
+                else kernel_addresses.get(kernel_operand)
+            )
+
+            config = config_operand
+            if config_load := loads.get(config_operand):
+                config = stored_value(config_load[0], config_load[1]) or ""
+
+            smem_values: list[int] = []
+            if config:
+                for pointer, (base, indices) in geps.items():
+                    if base != config or indices != ("0", "2"):
+                        continue
+                    value_name = stored_value(pointer, line_number)
+                    if value_name in constants:
+                        smem_values.append(constants[value_name])
+
+            if (
+                kernel not in expected_kernels
+                or len(smem_values) != 1
+                or smem_values[0] < 0
+            ):
+                unparsed_launches += 1
+                continue
+            launches[kernel].append(smem_values[0])
+            parsed_launches += 1
+
+    missing_kernels = sorted(
+        kernel for kernel, values in launches.items() if not values
+    )
+    if unparsed_launches or missing_kernels or parsed_launches == 0:
+        reason_parts = []
+        if unparsed_launches:
+            reason_parts.append(f"unparsed-launches={unparsed_launches}")
+        if missing_kernels:
+            reason_parts.append("missing-kernels=" + ",".join(missing_kernels))
+        if parsed_launches == 0 and not reason_parts:
+            reason_parts.append("no-launches")
+        return {
+            "status": "unknown",
+            "source": source,
+            "reason": ";".join(reason_parts),
+            "launch_dynamic_smem_bytes": {},
+        }
+    return {
+        "status": "exact",
+        "source": source,
+        "launch_dynamic_smem_bytes": {
+            kernel: values for kernel, values in sorted(launches.items())
+        },
+    }
+
+
+def _extract_launch_dynamic_smem_bytes(compiled: Any) -> dict[str, Any]:
+    module = getattr(compiled, "ir_module", None)
+    kernel_info = getattr(compiled, "kernel_info", None)
+    source = "cutlass-final-llvm-launch-config-field-2"
+    if module is None:
+        return {
+            "status": "unknown",
+            "source": source,
+            "reason": "compiled-ir-unavailable",
+            "launch_dynamic_smem_bytes": {},
+        }
+    expected_kernels = (
+        {str(kernel) for kernel in kernel_info}
+        if isinstance(kernel_info, dict)
+        else set()
+    )
+    try:
+        return _parse_launch_dynamic_smem_from_final_llvm(str(module), expected_kernels)
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "source": source,
+            "reason": f"extractor-error:{type(exc).__name__}",
+            "launch_dynamic_smem_bytes": {},
+        }
+
+
+def _build_compile_manifest(
+    cache_key: str,
+    cache_payload: tuple[object, ...],
+    func: Any,
+    object_bytes: bytes,
+    compiled: Any = None,
+) -> dict[str, Any]:
+    semantic_payload = _semantic_compile_manifest_payload(cache_payload)
+    semantic_json = json.dumps(
+        semantic_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    cache_format = str(cache_payload[0]) if cache_payload else "unknown"
+    explicit = cache_format == "b12x_cute_compile_cache_v5_explicit_spec"
+    options_index = 8 if explicit else 6
+    environment_index = 9 if explicit else 7
+    launch_metadata = (
+        _extract_launch_dynamic_smem_bytes(compiled)
+        if compiled is not None
+        else {
+            "status": "unknown",
+            "source": "cutlass-final-llvm-launch-config-field-2",
+            "reason": "compiled-ir-unavailable-on-object-reload",
+            "launch_dynamic_smem_bytes": {},
+        }
+    )
+    object_sha256 = hashlib.sha256(object_bytes).hexdigest()
+    artifact_evidence = {
+        "cache_key": cache_key,
+        "object_sha256": object_sha256,
+        "launch_metadata": launch_metadata,
+    }
+    artifact_evidence_json = json.dumps(
+        artifact_evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    manifest: dict[str, Any] = {
+        "schema": "b12x.cute.compile_manifest.v3",
+        "cache_key": cache_key,
+        "cache_format": cache_format,
+        "cache_payload_repr": repr(cache_payload),
+        "cache_payload": _manifest_json_value(cache_payload),
+        "object_sha256": object_sha256,
+        "object_bytes": len(object_bytes),
+        "semantic_key": hashlib.sha256(semantic_json.encode("utf-8")).hexdigest(),
+        "semantic_payload": semantic_payload,
+        "target": _compile_target_name(func),
+        "target_identity": _semantic_target_key(cache_payload[1]),
+        "package_fingerprint": str(cache_payload[2]),
+        "toolchain": _manifest_json_value(cache_payload[3]),
+        "compile_options": _manifest_json_value(cache_payload[options_index]),
+        "compile_environment": _manifest_json_value(cache_payload[environment_index]),
+        "launch_metadata": launch_metadata,
+        "artifact_evidence_sha256": hashlib.sha256(
+            artifact_evidence_json.encode("utf-8")
+        ).hexdigest(),
+    }
+    if explicit:
+        manifest["compile_spec_hash"] = str(cache_payload[4])
+        manifest["compile_spec_json"] = str(cache_payload[5])
+        manifest["compile_kwargs_hash"] = str(cache_payload[6])
+        manifest["compile_kwargs_json"] = str(cache_payload[7])
+        try:
+            spec = json.loads(str(cache_payload[5]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            spec = None
+        if isinstance(spec, dict):
+            manifest["kernel_id"] = str(spec.get("kernel", ""))
+            manifest["compile_spec_version"] = spec.get("version", "")
+    return manifest
+
+
+def _write_compile_manifest(
+    cache_key: str,
+    cache_payload: tuple[object, ...],
+    func: Any,
+    object_bytes: bytes,
+    compiled: Any = None,
+) -> None:
+    manifest_path = _cache_manifest_path(cache_key)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = _build_compile_manifest(
+        cache_key, cache_payload, func, object_bytes, compiled=compiled
+    )
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=manifest_path.parent,
+            prefix=f".{manifest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_name = tmp_file.name
+            json.dump(
+                manifest,
+                tmp_file,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            tmp_file.write("\n")
+        os.replace(tmp_name, manifest_path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+
+
+def _ensure_cute_compile_manifest(
+    cache_key: str,
+    cache_payload: tuple[object, ...],
+    func: Any,
+) -> None:
+    manifest_path = _cache_manifest_path(cache_key)
+    if manifest_path.exists():
+        return
+    object_bytes = _cache_object_path(cache_key).read_bytes()
+    _write_compile_manifest(cache_key, cache_payload, func, object_bytes)
 
 
 @contextmanager
@@ -1888,13 +2394,25 @@ def _load_cute_compile_from_disk(cache_key: str):
     if not object_path.exists():
         return None
     try:
-        module = ExternalBinaryModule(str(object_path))
-        return getattr(module, _cache_prefix(cache_key))
+        # CUTLASS may finalize or patch the ELF while loading it.  The cache
+        # object is content-addressed and its digest is recorded in the compile
+        # manifest, so never expose that canonical object to the loader.
+        with tempfile.TemporaryDirectory(prefix="b12x-cute-cache-load-") as raw_stage:
+            staged_object = Path(raw_stage) / object_path.name
+            shutil.copy2(object_path, staged_object)
+            module = ExternalBinaryModule(str(staged_object))
+            return getattr(module, _cache_prefix(cache_key))
     except Exception:
         return None
 
 
-def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
+def _store_cute_compile_to_disk(
+    cache_key: str,
+    compiled: Any,
+    *,
+    cache_payload: tuple[object, ...] | None = None,
+    func: Any = None,
+) -> None:
     if not hasattr(compiled, "dump_to_object"):
         return
 
@@ -1905,6 +2423,10 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
     with open(tmp_path, "wb") as f:
         f.write(object_bytes)
     os.replace(tmp_path, object_path)
+    if cache_payload is not None and func is not None:
+        _write_compile_manifest(
+            cache_key, cache_payload, func, object_bytes, compiled=compiled
+        )
 
 
 def _memory_cache_get(cache_key: object) -> Any | None:
@@ -2025,6 +2547,8 @@ def compile(
     if _cute_compile_disk_cache_enabled():
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
+            with suppress(Exception):
+                _ensure_cute_compile_manifest(cache_key, payload, func)
             with _MEMORY_CACHE_LOCK:
                 _DISK_CACHE_HITS += 1
             if post_engine_start_log:
@@ -2049,6 +2573,8 @@ def compile(
 
             compiled = _load_cute_compile_from_disk(cache_key)
             if compiled is not None:
+                with suppress(Exception):
+                    _ensure_cute_compile_manifest(cache_key, payload, func)
                 with _MEMORY_CACHE_LOCK:
                     _DISK_CACHE_HITS += 1
                 if post_engine_start_log:
@@ -2101,7 +2627,12 @@ def compile(
                 cache_key=cache_key,
             )
             with suppress(Exception):
-                _store_cute_compile_to_disk(cache_key, compiled)
+                _store_cute_compile_to_disk(
+                    cache_key,
+                    compiled,
+                    cache_payload=payload,
+                    func=func,
+                )
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
     else:
@@ -2139,7 +2670,12 @@ def compile(
     )
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
-            _store_cute_compile_to_disk(cache_key, compiled)
+            _store_cute_compile_to_disk(
+                cache_key,
+                compiled,
+                cache_payload=payload,
+                func=func,
+            )
     _memory_cache_put(memory_cache_key, compiled)
     return compiled
 

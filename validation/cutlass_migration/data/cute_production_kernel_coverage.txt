@@ -1,0 +1,67 @@
+# Production CuTe compile-family coverage for toolchain migration audits.
+#
+# Each shell-style pattern must match at least one valid semantic compile
+# manifest.  Exact specialization equality between two toolchains is enforced
+# separately by `python -m validation.cutlass_migration evidence compare-resources
+# --fail-on-unmatched`.
+
+# Attention: contiguous, indexer, MLA, and paged paths.
+attention.contiguous.forward
+attention.contiguous.varlen_forward
+attention.indexer.contiguous_logits
+attention.indexer.contiguous_block_scores
+attention.indexer.fused_indexer
+attention.indexer.paged_logits
+attention.indexer.paged_tiled_logits
+attention.indexer.persistent_topk
+attention.indexer.tiled_topk
+attention.indexer.row_topk
+attention.mla.sm120.decode
+attention.mla.sm120.prefill_mg
+attention.mla.merge
+attention.mla.sink_merge
+# Definition-only paged raw classes use diagnostic.* compile IDs and are
+# intentionally absent from production family coverage.
+attention.paged.forward
+attention.paged.merge
+
+# Dense and quantized GEMMs.
+gemm.dense
+gemm.dense_fused_quant_a
+gemm.dense_fused_quant_a_grouped
+gemm.mxfp8_quant_cute
+
+# MoE compute and auxiliary kernels.
+integration.tp_moe.micro_direct
+integration.tp_moe.dynamic
+integration.tp_moe.tiny_decode
+moe.w4a16.small_m_direct
+moe.w4a16.gemm
+moe.w4a16.fused_moe
+moe.w4a16.activation
+moe.w4a16.topk_sum
+quantization.bf16_to_fp4_tma
+
+# Residual/mHC compile-name branches.  Both supported hidden-size families are
+# required where the implementation has distinct special and generic branches.
+integration.residual.mhc_post_pre_decode_split_n_*
+integration.residual.mhc_post_pre_partial_hidden4096_hctile128_all*
+integration.residual.mhc_post_pre_partial_hidden7168_hctile128_all*
+integration.residual.mhc_post_pre_prefill_partial_hidden4096_threads*
+integration.residual.mhc_post_pre_prefill_partial_hidden7168_threads*
+integration.residual.mhc_post_pre_prefill_block_m_partial_hidden4096_*
+integration.residual.mhc_post_pre_prefill_block_m_partial_hidden7168_*
+integration.residual.mhc_post_pre_prefill_gram_hidden4096_threads*
+integration.residual.mhc_post_pre_prefill_gram_hidden7168_threads*
+integration.residual.mhc_prefill_bf16_project_tma_hidden4096_*
+integration.residual.mhc_prefill_bf16_project_tma_hidden7168_*
+integration.residual.mhc_prefill_bf16_project_hidden4096_*
+integration.residual.mhc_prefill_bf16_project_hidden7168_*
+integration.residual.mhc_prefill_tf32_project_tma_hidden4096_*
+integration.residual.mhc_prefill_tf32_project_tma_hidden7168_*
+integration.residual.mhc_post_hidden4096_hctile128_all4
+integration.residual.mhc_post_hidden7168_hctile128_all4
+integration.residual.mhc_pre_partial_hidden4096_hctile128_all*
+integration.residual.mhc_pre_partial_hidden7168_hctile128_all*
+integration.residual.mhc_finalize_gram_hidden4096*
+integration.residual.mhc_finalize_gram_hidden7168*

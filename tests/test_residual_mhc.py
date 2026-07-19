@@ -356,31 +356,77 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
-def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference() -> None:
+@pytest.mark.parametrize(
+    ("hidden_size", "split_k", "prefill_mode"),
+    [
+        (4096, 64, "compact"),
+        (4096, 64, "block"),
+        (4096, 64, "bf16_tma"),
+        (4096, 64, "bf16_vector"),
+        (4096, 64, "tf32_tma"),
+        (7168, 112, "compact"),
+        (7168, 112, "block"),
+        (7168, 112, "bf16_tma"),
+        (7168, 112, "bf16_vector"),
+        (7168, 112, "tf32_tma"),
+    ],
+    ids=lambda value: str(value),
+)
+def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
+    hidden_size: int,
+    split_k: int,
+    prefill_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     device = require_sm120()
     tokens = 33
-    hidden_size = 4096
     expected_m = 384
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_COMPACT", "1")
+    if prefill_mode == "block":
+        monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "1")
+    elif prefill_mode == "bf16_tma":
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "1")
+    elif prefill_mode == "bf16_vector":
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "0")
+    elif prefill_mode == "tf32_tma":
+        monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "1")
+    elif prefill_mode != "compact":
+        raise AssertionError(f"unknown prefill mode {prefill_mode}")
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
         hidden_size=hidden_size,
-        seed=91_469,
+        seed=91_469 + hidden_size,
         device=device,
     )
     binding = _make_mhc_binding(
         tokens=tokens,
         hidden_size=hidden_size,
+        split_k=split_k,
         device=device,
         expected_m=expected_m,
     )
     norm_gen = torch.Generator(device="cpu")
-    norm_gen.manual_seed(91_470)
+    norm_gen.manual_seed(91_470 + hidden_size)
     norm_weight = (
         torch.randn((hidden_size,), generator=norm_gen, dtype=torch.float32)
         .to(device)
         .to(torch.bfloat16)
         .contiguous()
     )
+    fn_bf16 = (
+        fn.to(torch.bfloat16).contiguous()
+        if prefill_mode.startswith("bf16_")
+        else None
+    )
+    # The BF16 projection branches intentionally consume the caller-supplied
+    # quantized function matrix.  Their oracle must model that contract rather
+    # than compare against the original FP32 matrix.
+    oracle_fn = fn if fn_bf16 is None else fn_bf16.float()
     _, prev_post, prev_comb = _mhc_pre_reference(
         residual,
         fn,
@@ -391,28 +437,42 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference() -> None:
         sinkhorn_iters=20,
     )
 
-    residual_cur, post, comb, y = b12x_mhc_post_pre(
-        x,
-        residual,
-        prev_post.contiguous(),
-        prev_comb.contiguous(),
-        fn,
-        scale,
-        bias,
-        rms_eps=1e-6,
-        hc_eps=1e-6,
-        sinkhorn_iters=20,
-        binding=binding,
-        norm_weight=norm_weight,
-        norm_eps=1e-6,
-        fn_bf16=fn.to(torch.bfloat16).contiguous(),
-    )
+    prev_post_arg = prev_post.contiguous()
+    prev_comb_arg = prev_comb.contiguous()
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return b12x_mhc_post_pre(
+            x,
+            residual,
+            prev_post_arg,
+            prev_comb_arg,
+            fn,
+            scale,
+            bias,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
+            binding=binding,
+            norm_weight=norm_weight,
+            norm_eps=1e-6,
+            fn_bf16=fn_bf16,
+        )
+
+    outputs = run()
     torch.cuda.synchronize(device)
+    residual_cur, post, comb, y = outputs
+    expected_ptrs = tuple(output.data_ptr() for output in outputs)
+    assert expected_ptrs == (
+        binding.out.data_ptr(),
+        binding.post_buffer.data_ptr(),
+        binding.comb_buffer.data_ptr(),
+        binding.y.data_ptr(),
+    )
 
     residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
     y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
         residual_ref,
-        fn,
+        oracle_fn,
         scale,
         bias,
         rms_eps=1e-6,
@@ -428,6 +488,58 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference() -> None:
     torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(post, post_ref, rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-4, atol=2e-4)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = run()
+    assert tuple(output.data_ptr() for output in graph_outputs) == expected_ptrs
+    for output in outputs:
+        output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    for output in outputs:
+        assert bool(torch.isfinite(output).all())
+        assert int(torch.count_nonzero(output)) > 0
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(post, post_ref, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-4, atol=2e-4)
+
+    # Replay must consume live serving inputs at the captured addresses; an
+    # unchanged-output replay can otherwise pass while accidentally baking a
+    # warmup value into the graph.
+    residual.mul_(-0.5).add_(0.03125)
+    x.mul_(0.75).sub_(0.015625)
+    residual_ref_live = _mhc_post_reference(x, residual, prev_post, prev_comb)
+    y_raw_ref_live, post_ref_live, comb_ref_live = _mhc_pre_reference(
+        residual_ref_live,
+        oracle_fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    rms_scale_live = torch.rsqrt(
+        y_raw_ref_live.square().mean(dim=-1, keepdim=True) + 1e-6
+    )
+    y_ref_live = (
+        y_raw_ref_live.to(torch.bfloat16).float()
+        * rms_scale_live
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    for output in outputs:
+        output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert tuple(output.data_ptr() for output in outputs) == expected_ptrs
+    torch.testing.assert_close(
+        residual_cur, residual_ref_live, rtol=0.0, atol=2e-2
+    )
+    torch.testing.assert_close(y, y_ref_live, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(post, post_ref_live, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(comb, comb_ref_live, rtol=2e-4, atol=2e-4)
 
 
 def test_b12x_mhc_pro_hidden_match_reference() -> None:
@@ -534,6 +646,252 @@ def test_b12x_mhc_pro_hidden_match_reference() -> None:
     torch.testing.assert_close(y_func, y_ref, rtol=0.0, atol=6e-3)
     torch.testing.assert_close(post_func, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb_func, comb_ref, rtol=2e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "split_k", "decode_mode"),
+    [
+        (4096, 64, "split"),
+        (4096, 64, "fused"),
+        (4096, 64, "post"),
+        (4096, 64, "pre"),
+        (7168, 112, "split"),
+        (7168, 112, "fused"),
+        (7168, 112, "post"),
+        (7168, 112, "pre"),
+    ],
+    ids=[
+        "h4096-split",
+        "h4096-fused",
+        "h4096-post",
+        "h4096-pre",
+        "h7168-split",
+        "h7168-fused",
+        "h7168-post",
+        "h7168-pre",
+    ],
+)
+def test_b12x_mhc_decode_specialization_live_graph_oracle(
+    hidden_size: int,
+    split_k: int,
+    decode_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = require_sm120()
+    monkeypatch.setenv(
+        "B12X_MHC_DECODE_SPLITS", "4" if decode_mode == "split" else "0"
+    )
+    monkeypatch.setenv("B12X_MHC_DECODE_TILE_N", "6")
+    tokens = 1
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_480 + hidden_size,
+        device=device,
+    )
+    norm_weight = torch.ones(
+        (hidden_size,), dtype=torch.bfloat16, device=device
+    )
+
+    def assert_outputs_match(
+        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        residual_ref: torch.Tensor,
+        y_ref: torch.Tensor,
+        post_ref: torch.Tensor,
+        comb_ref: torch.Tensor,
+    ) -> None:
+        residual_cur, post, comb, y = outputs
+        for output in outputs:
+            assert bool(torch.isfinite(output).all())
+            assert int(torch.count_nonzero(output)) > 0
+        torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
+        # One BF16 ULP near unit magnitude is 0.0078125.
+        torch.testing.assert_close(y, y_ref, rtol=0.0, atol=8e-3)
+        torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
+        torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
+
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
+    y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
+        residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    y_ref = (
+        y_raw_ref.to(torch.bfloat16).float()
+        * torch.rsqrt(y_raw_ref.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    if decode_mode == "post":
+        out = torch.empty_like(residual)
+
+        def run_post() -> torch.Tensor:
+            return b12x_mhc_post(
+                x, residual, prev_post, prev_comb, out=out
+            )
+
+        result = run_post()
+        torch.cuda.synchronize(device)
+        output_ptr = result.data_ptr()
+        assert output_ptr == out.data_ptr()
+        torch.testing.assert_close(result, residual_ref, rtol=0.0, atol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_result = run_post()
+        assert graph_result.data_ptr() == output_ptr
+        x.mul_(0.75).sub_(0.0078125)
+        residual.mul_(-0.375).add_(0.015625)
+        residual_ref_live = _mhc_post_reference(
+            x, residual, prev_post, prev_comb
+        )
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert result.data_ptr() == output_ptr
+        torch.testing.assert_close(
+            result, residual_ref_live, rtol=0.0, atol=2e-2
+        )
+        return
+
+    if decode_mode == "pre":
+        residual_ref = x.unsqueeze(1).expand(-1, 4, -1)
+        pre_fn = fn.view(24, 4, hidden_size).sum(dim=1).contiguous()
+        y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
+            residual_ref,
+            fn,
+            scale,
+            bias,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
+            y_dtype=torch.float32,
+        )
+        y_ref = (
+            y_raw_ref.to(torch.bfloat16).float()
+            * torch.rsqrt(y_raw_ref.square().mean(dim=-1, keepdim=True) + 1e-6)
+            * norm_weight.float()
+        ).to(torch.bfloat16)
+        binding = _make_mhc_binding(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            split_k=split_k,
+            device=device,
+        )
+
+        def run_pre() -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ]:
+            return b12x_mhc_pre(
+                x,
+                pre_fn,
+                scale,
+                bias,
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                binding=binding,
+                norm_weight=norm_weight,
+                norm_eps=1e-6,
+            )
+
+        run = run_pre
+    elif decode_mode in {"split", "fused"}:
+        binding = _make_mhc_binding(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            split_k=split_k,
+            device=device,
+        )
+
+        def run_post_pre() -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ]:
+            return b12x_mhc_post_pre(
+                x,
+                residual,
+                prev_post,
+                prev_comb,
+                fn,
+                scale,
+                bias,
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                binding=binding,
+                norm_weight=norm_weight,
+                norm_eps=1e-6,
+            )
+
+        run = run_post_pre
+    else:
+        raise AssertionError(f"unknown decode mode {decode_mode}")
+
+    outputs = run()
+    torch.cuda.synchronize(device)
+    assert_outputs_match(
+        outputs,
+        residual_ref=residual_ref,
+        y_ref=y_ref,
+        post_ref=post_ref,
+        comb_ref=comb_ref,
+    )
+    output_ptrs = tuple(output.data_ptr() for output in outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = run()
+    assert tuple(output.data_ptr() for output in graph_outputs) == output_ptrs
+
+    x.mul_(-0.5).add_(0.01171875)
+    if decode_mode == "pre":
+        residual_ref_live = x.unsqueeze(1).expand(-1, 4, -1)
+    else:
+        residual.mul_(0.625).sub_(0.01953125)
+        residual_ref_live = _mhc_post_reference(
+            x, residual, prev_post, prev_comb
+        )
+    y_raw_ref_live, post_ref_live, comb_ref_live = _mhc_pre_reference(
+        residual_ref_live,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    y_ref_live = (
+        y_raw_ref_live.to(torch.bfloat16).float()
+        * torch.rsqrt(
+            y_raw_ref_live.square().mean(dim=-1, keepdim=True) + 1e-6
+        )
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    for output in outputs:
+        output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert tuple(output.data_ptr() for output in outputs) == output_ptrs
+    assert_outputs_match(
+        outputs,
+        residual_ref=residual_ref_live,
+        y_ref=y_ref_live,
+        post_ref=post_ref_live,
+        comb_ref=comb_ref_live,
+    )
 
 
 def test_b12x_mhc_fused_post_pre_graph_capture() -> None:

@@ -1279,7 +1279,6 @@ class SparseNSAFusedIndexerKernel:
         merge_state: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -1297,7 +1296,6 @@ class SparseNSAFusedIndexerKernel:
         ).launch(
             grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
             block=[_RADIX_THREADS, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             # The 1024-thread radix CTA is architecturally limited to one
             # resident block on SM120 (1536 threads/SM).  The cooperative
             # planner also caps the default launch to one machine-wide wave.
@@ -1343,11 +1341,6 @@ class SparseNSAFusedIndexerKernel:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self._get_shared_storage_cls())
 
-        s_q = storage.q_bytes.get_tensor(
-            cute.make_layout(
-                (self.padded_q_heads, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1)
-            )
-        )
         s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
         q_smem_base_addr = shared_ptr_to_u32(storage.q_bytes.data_ptr())
         k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())

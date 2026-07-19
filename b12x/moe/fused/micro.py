@@ -2707,7 +2707,6 @@ class MoEMicroKernelBackend:
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
             block=(self.launch_block_dim, 1, 1),
-            smem=0,
             # The fused and FC1-only bodies are 512-thread cooperative CTAs;
             # the FC2-only m=1 specialization is a 256-thread independent CTA.
             # One block per SM preserves each variant's register budget.
