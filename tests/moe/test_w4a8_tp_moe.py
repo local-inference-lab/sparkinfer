@@ -130,11 +130,19 @@ def _w4a8_oracle(m: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
 
     out = moe_reference_w4a8_mx(
         x.float(),
-        weights.w13_weight.view(torch.uint8), w13_mx,
-        w13_res.view(torch.float8_e4m3fn), alpha1,
-        weights.w2_weight.view(torch.uint8), w2_mx,
-        w2_res.view(torch.float8_e4m3fn), alpha2,
-        topk_ids, topk_weights.float(), E, k, n,
+        weights.w13_weight.view(torch.uint8),
+        w13_mx,
+        w13_res.view(torch.float8_e4m3fn),
+        alpha1,
+        weights.w2_weight.view(torch.uint8),
+        w2_mx,
+        w2_res.view(torch.float8_e4m3fn),
+        alpha2,
+        topk_ids,
+        topk_weights.float(),
+        E,
+        k,
+        n,
         activation="silu",
     )
     return out, x
@@ -175,3 +183,17 @@ def test_w4a8_nvfp4_dispatch_tracks_nvfp4(m: int) -> None:
     ).item()
     assert cos > 0.97, (m, cos, n_ref, n_w4a8)
     assert 0.8 < n_w4a8 / n_ref < 1.25, (m, n_ref, n_w4a8)
+
+
+def test_native_nvfp4_split_matches_fused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The barrier-free native A4 launch preserves fused-kernel numerics."""
+    _skip_if_unavailable()
+
+    monkeypatch.setenv("SPARKINFER_NVFP4_SPLIT_DECODE", "0")
+    fused = _run_mode(4, "nvfp4", seed=113)
+    monkeypatch.setenv("SPARKINFER_NVFP4_SPLIT_DECODE", "1")
+    split = _run_mode(4, "nvfp4", seed=113)
+
+    torch.testing.assert_close(split, fused, atol=0.0, rtol=0.0)

@@ -8173,6 +8173,42 @@ def _launch_dynamic_topk_sum(
     )
 
 
+def _use_barrier_free_nvfp4_split(
+    *,
+    quant_mode: str,
+    num_tokens: int,
+    activation: str,
+) -> bool:
+    """Return whether decode uses separate FC1/FC2 launches.
+
+    The fused micro kernel synchronizes its CTAs with a software grid barrier,
+    which requires exclusive residency. Splitting FC1 and FC2 removes that
+    barrier and makes the launch safe to co-schedule with CUDA work on another
+    stream.
+    """
+    return (
+        _normalize_quant_mode(quant_mode) in {"nvfp4", "w4a8_nvfp4"}
+        and 1 <= int(num_tokens) <= _MICRO_MAX_TOKENS
+        and activation == "silu"
+        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "1") != "0"
+    )
+
+
+def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
+    """Whether a planned MoE launch can safely overlap unrelated CUDA work."""
+    if not isinstance(plan, TPMoEPlan):
+        raise TypeError("plan must be a TPMoEPlan")
+    if plan.implementation != "micro":
+        return False
+    if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
+        return False
+    return _use_barrier_free_nvfp4_split(
+        quant_mode=plan.quant_mode,
+        num_tokens=plan.routed_rows // plan.num_topk,
+        activation=plan.activation,
+    )
+
+
 def _launch_compact_micro_flat(
     *,
     barrier_count: torch.Tensor,
@@ -8208,11 +8244,10 @@ def _launch_compact_micro_flat(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
-    use_native_nvfp4_split = (
-        quant_mode == "w4a8_nvfp4"
-        and 1 <= m <= 8
-        and activation == "silu"
-        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "1") != "0"
+    use_native_nvfp4_split = _use_barrier_free_nvfp4_split(
+        quant_mode=quant_mode,
+        num_tokens=m,
+        activation=activation,
     )
     if use_native_nvfp4_split:
         # Preserve the ModelOpt NVFP4 representation and scalar math exactly.
