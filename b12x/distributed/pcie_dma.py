@@ -55,6 +55,11 @@ def _fp8_mode() -> str:
 
     "a2a": quantize-once all-to-all (two roundings, half the wire in both
     phases).
+
+    Every FP8 mode materializes the locally owned reduced shard through the
+    same FP8 payload as its peers.  An all-reduce result must be rank-identical;
+    retaining a pre-wire BF16 owner shard while peers dequantize that shard
+    gives every TP rank a different replicated activation.
     """
 
     return _normalize_fp8_mode(os.getenv("B12X_PCIE_DMA_FP8", "0"))
@@ -382,7 +387,23 @@ class PCIeDmaAllReduce:
                             ag_stage + piece_elems,
                             piece_elems,
                         )
+                # Publish the payload before the local materialization so the
+                # CE broadcast can overlap this read-only dequant kernel.
                 self._ag_ready.record(main)
+                # The owner used to retain its pre-wire BF16 shard while the
+                # other ranks materialized this same shard from FP8.  That
+                # violates the replicated-output contract of all-reduce and
+                # lets the next TP layer consume rank-dependent activations.
+                # Round-trip the owner through the exact forwarded payload so
+                # all ranks receive bit-identical BF16 values for every shard.
+                for p in range(pieces):
+                    owner_stage = fp8_stage_piece(send_chunk, p)
+                    ext.dma_dequant_store(
+                        piece_ptr(send_chunk, p),
+                        owner_stage,
+                        owner_stage + piece_elems,
+                        piece_elems,
+                    )
             for p in range(pieces):
                 if fp8_reduce:
                     send_src = fp8_stage_piece(send_chunk, p)
@@ -611,7 +632,18 @@ class PCIeDmaAllReduce:
                 stage_chunk(rank, c) + chunk_payload,
                 chunk_elems,
             )
+            # Publish the payload first so its CE broadcast can overlap the
+            # local read-only materialization below.
             self._a2a_ownq[c].record(main)
+            # Peers materialize this reduced shard from the broadcast FP8
+            # payload.  The owner must do the same or every rank enters the
+            # next TP layer with a different replicated activation.
+            ext.dma_dequant_store(
+                out_base + own,
+                stage_chunk(rank, c),
+                stage_chunk(rank, c) + chunk_payload,
+                chunk_elems,
+            )
             with torch.cuda.stream(ag_copy):
                 ag_copy.wait_event(self._a2a_ownq[c])
                 for i, j in enumerate(peers):
