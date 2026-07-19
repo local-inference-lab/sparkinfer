@@ -498,3 +498,81 @@ def test_fused_indexer_mla_matches_reference(rows):
         logit = (torch.relu(torch.einsum("hd,td->ht", qf[r], kf[a:b])) * weights[r].unsqueeze(1)).sum(0) * k_scales[a:b]
         gset = set((torch.topk(logit, topk).indices + a).tolist())  # absolute index
         assert set(idx[r].tolist()) == gset
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
+    # Regression: the direct-K score path computed K byte offsets as
+    # pid * Int32(k_quant_page_stride). Serving passes strided views of a
+    # packed per-page record (observed stride 1,077,120 B, vs 8448 for a
+    # bare [pages, 64, 128]+scales tensor), so the Int32 product wraps at
+    # pid >= ceil(2^31 / 1_077_120) = 1994 and the load lands ~GBs before
+    # the tensor -> CUDA_ERROR_ILLEGAL_ADDRESS on the first long-context
+    # request of a DSV4-Flash dspark deployment (GB10, rows>=3).
+    # ctas_per_group is forced <= 16 so the direct-K gate engages on any
+    # SM count; heads=64 gives the 4-head-tile paged decode contract.
+    device = torch.device("cuda")
+    record_bytes = 1_077_120  # packed page record: quant + scales + metadata
+    pid_lo, pages_used = 2000, 64
+    pool_pages = pid_lo + pages_used + 4
+    need = pool_pages * record_bytes + (1 << 29)
+    free, _ = torch.cuda.mem_get_info(device)
+    if free < need:
+        pytest.skip(f"needs ~{need / 2**30:.1f} GiB free device memory")
+
+    rows, heads, topk = 4, 64, 512
+    seqlen = pages_used * _PS
+    g = torch.Generator(device="cpu").manual_seed(7)
+    pool = torch.zeros(pool_pages * record_bytes, dtype=torch.uint8, device=device)
+    k_quant = pool.as_strided((pool_pages, _PS, 128), (record_bytes, 128, 1))
+    k_scales = pool.view(torch.float32).as_strided(
+        (pool_pages, _PS), (record_bytes // 4, 1), storage_offset=2048
+    )
+    k_fp8 = (torch.randn((pages_used, _PS, 128), generator=g) / 3).to(
+        torch.float8_e4m3fn
+    )
+    k_quant[pid_lo : pid_lo + pages_used] = k_fp8.view(torch.uint8).to(device)
+    k_scales[pid_lo : pid_lo + pages_used] = (
+        torch.rand((pages_used, _PS), generator=g) + 0.1
+    ).to(device)
+
+    q_fp8 = (torch.randn((rows, heads, 128), generator=g) / 3).to(
+        torch.float8_e4m3fn
+    ).to(device)
+    weights = torch.randn((rows, heads), generator=g, dtype=torch.float32).to(device)
+    page_table = (
+        torch.arange(pid_lo, pid_lo + pages_used, dtype=torch.int32, device=device)
+        .repeat(rows, 1)
+        .contiguous()
+    )
+    seqlens = torch.full((rows,), seqlen, dtype=torch.int32, device=device)
+
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_quant,
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        ctas_per_group=8,
+    )
+    torch.cuda.synchronize(device)
+
+    gold_vals, gold_idx_sets = _golden_topk(
+        q_fp8,
+        weights,
+        k_quant.view(torch.float8_e4m3fn)[pid_lo : pid_lo + pages_used],
+        k_scales[pid_lo : pid_lo + pages_used],
+        page_table - pid_lo,
+        seqlens,
+        topk,
+    )
+    assert torch.allclose(
+        torch.sort(val, dim=1, descending=True).values, gold_vals, atol=1e-2, rtol=0
+    )
+    for r in range(rows):
+        assert set(idx[r].tolist()) == gold_idx_sets[r]
+    del pool
+    torch.cuda.empty_cache()
