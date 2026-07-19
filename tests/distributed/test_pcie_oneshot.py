@@ -705,3 +705,56 @@ def test_nested_capture_reuses_its_outer_channel(monkeypatch):
     assert pool._channels[70] is target_channel
     assert pool._channels[80] is draft_channel
     assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
+    created = []
+    current_stream = [7]
+    capturing = [False]
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as target_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is target_channel
+        capturing[0] = False
+
+    # CUDA may recycle both handles for the next graph manager. Neither stale
+    # mapping may make the draft graph retain the target graph's IPC channel.
+    with pool.capture(7) as draft_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is draft_channel
+        capturing[0] = False
+
+    assert target_channel is not draft_channel
+    assert pool._channels[7] is draft_channel
+    assert pool._channels[70] is draft_channel
+    assert target_channel in pool._all_channels
+    assert draft_channel in pool._all_channels
+    assert [entry[0] for entry in created] == [7, 7]
+
+    pool.close()
+    assert target_channel._ext.dispose_calls == [12345]
+    assert draft_channel._ext.dispose_calls == [12345]
