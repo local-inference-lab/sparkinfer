@@ -512,6 +512,7 @@ class PCIeDCPA2APool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
+        self._all_channels: list[PCIeDCPA2A] = []
         self._capture_channel_stack: list[PCIeDCPA2A] = []
         self._closed = False
         if channel_factory is None and exchange_group is None:
@@ -583,6 +584,7 @@ class PCIeDCPA2APool:
                 stream_affine=not self.single_channel,
             )
         channel._bind_stream_key(stream_key)
+        self._all_channels.append(channel)
         return channel
 
     def for_stream(self, stream: object = None) -> PCIeDCPA2A:
@@ -594,6 +596,17 @@ class PCIeDCPA2APool:
         else:
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
+        if (
+            not self.single_channel
+            and _is_current_stream_capturing(self.device)
+            and self._capture_channel_stack
+        ):
+            # Independent graph managers may reuse a torch-owned nested stream
+            # key. The enclosing capture, not a stale key mapping, determines
+            # which IPC channel is safe for this graph.
+            channel = self._capture_channel_stack[-1]
+            self._channels[key] = channel
+            return channel
         channel = self._channels.get(key)
         if channel is not None:
             return channel
@@ -676,7 +689,20 @@ class PCIeDCPA2APool:
     @contextmanager
     def capture(self, stream: object = None):
         """Bind nested CUDA captures to the enclosing stream's channel."""
-        channel = self.for_stream(stream)
+        if self.single_channel:
+            channel = self.for_stream(stream)
+        else:
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "PCIe DCP A2A capture context must be entered before CUDA "
+                    "graph capture starts"
+                )
+            stream_key = _current_stream_key(self.device, stream)
+            key = 0 if stream_key is None else int(stream_key)
+            # Keep a graph-owned channel even when CUDA recycles the enclosing
+            # stream handle used by a previously captured graph manager.
+            channel = self._new_channel(stream_key)
+            self._channels[key] = channel
         self._capture_channel_stack.append(channel)
         try:
             yield channel
@@ -690,10 +716,11 @@ class PCIeDCPA2APool:
             return
         self._closed = True
         seen: set[int] = set()
-        for channel in self._channels.values():
+        for channel in (*self._all_channels, *self._channels.values()):
             if id(channel) not in seen:
                 seen.add(id(channel))
                 channel.close()
+        self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:

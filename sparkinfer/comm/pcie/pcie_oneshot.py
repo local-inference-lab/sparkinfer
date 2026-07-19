@@ -943,6 +943,7 @@ class PCIeOneshotAllReducePool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeOneshotAllReduce] = {}
+        self._all_channels: list[PCIeOneshotAllReduce] = []
         self._capture_channel_stack: list[PCIeOneshotAllReduce] = []
         self._closed = False
 
@@ -1014,6 +1015,7 @@ class PCIeOneshotAllReducePool:
             if self.single_channel:
                 channel._stream_affine = False
             channel._bind_stream_key(stream_key)
+            self._all_channels.append(channel)
             return channel
 
         if self.exchange_group is None or self._ipc is None or self._ext is None:
@@ -1053,6 +1055,7 @@ class PCIeOneshotAllReducePool:
                     self._ipc.cudaFree(shared.local_ptr)
             raise
         channel._bind_stream_key(stream_key)
+        self._all_channels.append(channel)
         return channel
 
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
@@ -1074,6 +1077,17 @@ class PCIeOneshotAllReducePool:
 
         stream_key = _current_stream_key(self.device, stream)
         channel_key = 0 if stream_key is None else int(stream_key)
+        if (
+            _is_current_stream_capturing(self.device)
+            and self._capture_channel_stack
+        ):
+            # CUDA and torch/Inductor may recycle a nested capture stream key
+            # between independent target and draft graph managers. The active
+            # enclosing capture owns the channel even if that key still maps
+            # to a channel captured by an earlier manager.
+            channel = self._capture_channel_stack[-1]
+            self._channels[channel_key] = channel
+            return channel
         channel = self._channels.get(channel_key)
         if channel is not None:
             return channel
@@ -1151,7 +1165,22 @@ class PCIeOneshotAllReducePool:
 
     @contextmanager
     def capture(self, stream: object = None):
-        channel = self.for_stream(stream)
+        if self.single_channel:
+            channel = self.for_stream(stream)
+        else:
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "PCIe oneshot capture context must be entered before CUDA "
+                    "graph capture starts"
+                )
+            stream_key = _current_stream_key(self.device, stream)
+            channel_key = 0 if stream_key is None else int(stream_key)
+            # A CUDA stream handle can be recycled after one graph manager
+            # finishes capture. Graphs retain the channel pointers, so a new
+            # manager must receive a fresh channel even when the numeric stream
+            # key is identical. _all_channels keeps replaced channels alive.
+            channel = self._new_channel(stream_key)
+            self._channels[channel_key] = channel
         with channel.capture(stream=stream):
             self._capture_channel_stack.append(channel)
             try:
@@ -1165,8 +1194,12 @@ class PCIeOneshotAllReducePool:
         if self._closed:
             return
         self._closed = True
-        for channel in self._channels.values():
-            channel.close()
+        seen: set[int] = set()
+        for channel in (*self._all_channels, *self._channels.values()):
+            if id(channel) not in seen:
+                seen.add(id(channel))
+                channel.close()
+        self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:
