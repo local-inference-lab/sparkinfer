@@ -49,7 +49,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/attention/contiguous/",),
     ),
-    test_path="tests/experimental/attention/test_varlen.py",
+    test_path="tests/attention/test_varlen.py",
     since="0.7.0",
     notes=(
         "Reduced-assurance tier: correctness-tested against a torch "

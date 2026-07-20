@@ -51,7 +51,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/gemm/block_fp8_linear.py",),
     ),
-    test_path="tests/experimental/gemm/test_block_fp8_linear.py",
+    test_path="tests/gemm/test_block_fp8_linear.py",
     since="0.7.0",
 )
 

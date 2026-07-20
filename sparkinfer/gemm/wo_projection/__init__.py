@@ -57,7 +57,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/gemm/wo_projection.py", "sparkinfer/gemm/wo_quant_cute.py"),
     ),
-    test_path="tests/experimental/gemm/test_wo_projection.py",
+    test_path="tests/gemm/test_wo_projection.py",
     since="0.7.0",
     notes=(
         "The planned run path is BF16-only; the standalone quantize_input* "

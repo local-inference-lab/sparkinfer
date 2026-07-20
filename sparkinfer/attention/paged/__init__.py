@@ -58,7 +58,7 @@ META = OpMeta(
             "sparkinfer/integration/paged_attention_scratch.py",
         ),
     ),
-    test_path="tests/experimental/attention/test_paged.py",
+    test_path="tests/attention/test_paged.py",
     since="0.7.0",
     notes=(
         "Decode CUDA-graph replay is implemented but currently untested "

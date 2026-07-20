@@ -56,7 +56,7 @@ META = OpMeta(
             "sparkinfer/integration/residual_kernels.py",
         ),
     ),
-    test_path="tests/experimental/norm/test_mhc.py",
+    test_path="tests/norm/test_mhc.py",
     since="0.7.0",
 )
 

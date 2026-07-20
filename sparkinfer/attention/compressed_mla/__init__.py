@@ -53,7 +53,7 @@ META = OpMeta(
             "sparkinfer/integration/compressed_scratch.py",
         ),
     ),
-    test_path="tests/experimental/attention/test_compressed_mla.py",
+    test_path="tests/attention/test_compressed_mla.py",
     since="0.7.0",
 )
 

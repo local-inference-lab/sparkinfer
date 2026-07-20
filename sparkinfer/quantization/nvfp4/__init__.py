@@ -40,7 +40,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/quantization/",),
     ),
-    test_path="tests/experimental/quantization/test_nvfp4.py",
+    test_path="tests/quantization/test_nvfp4.py",
     since="0.7.0",
     notes=(
         "No bind step: outputs are caller-allocated via allocate_outputs. "

@@ -58,7 +58,7 @@ META = OpMeta(
             "sparkinfer/attention/mla/",
         ),
     ),
-    test_path="tests/experimental/attention/test_sparse_mla.py",
+    test_path="tests/attention/test_sparse_mla.py",
     since="0.7.0",
 )
 

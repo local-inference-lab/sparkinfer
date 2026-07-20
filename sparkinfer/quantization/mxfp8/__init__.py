@@ -28,7 +28,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/gemm/mxfp8_quant_cute.py",),
     ),
-    test_path="tests/experimental/quantization/test_mxfp8.py",
+    test_path="tests/quantization/test_mxfp8.py",
     since="0.7.0",
 )
 

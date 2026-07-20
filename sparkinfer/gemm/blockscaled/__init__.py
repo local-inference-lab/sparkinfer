@@ -40,7 +40,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/gemm/dense.py",),
     ),
-    test_path="tests/experimental/gemm/test_blockscaled.py",
+    test_path="tests/gemm/test_blockscaled.py",
     since="0.7.0",
 )
 

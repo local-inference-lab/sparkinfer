@@ -48,7 +48,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/integration/ep_moe.py",),
     ),
-    test_path="tests/experimental/moe/test_ep_moe.py",
+    test_path="tests/moe/test_ep_moe.py",
     since="0.7.0",
 )
 

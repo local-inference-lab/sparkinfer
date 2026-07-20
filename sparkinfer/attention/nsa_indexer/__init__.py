@@ -100,7 +100,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/attention/indexer/",),
     ),
-    test_path="tests/experimental/attention/test_nsa_indexer.py",
+    test_path="tests/attention/test_nsa_indexer.py",
     since="0.7.0",
 )
 

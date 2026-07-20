@@ -45,7 +45,7 @@ META = OpMeta(
         commit="6627d342",
         paths=("sparkinfer/distributed/",),
     ),
-    test_path="tests/experimental/comm/test_pcie.py",
+    test_path="tests/comm/test_pcie.py",
     since="0.7.0",
     notes="Raw CUDA JIT-built via torch cpp_extension; needs nvcc at runtime.",
 )

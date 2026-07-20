@@ -2,7 +2,7 @@
 
 Deliberately vendored (not imported from flashinfer core): the experimental
 tree has a zero-outbound-imports rule so that core refactors can never break
-it, enforced by tests/experimental/lint/test_isolation.py.
+it, enforced by tests/lint/test_isolation.py.
 """
 
 from __future__ import annotations

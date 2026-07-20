@@ -37,7 +37,7 @@ from ._lib.runtime_control import (
 )
 
 # Static op registry: one entry per op directory, kept in lockstep by
-# tests/experimental/test_registry.py.  Grows as port phases land.
+# tests/test_registry.py.  Grows as port phases land.
 _OPS: tuple[str, ...] = (
     "attention.paged",
     "attention.sparse_mla",
