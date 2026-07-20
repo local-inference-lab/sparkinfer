@@ -1,8 +1,12 @@
 # sparkinfer
 
-`sparkinfer` (formerly `b12x`) is an SM120/SM121 CuTe DSL kernel library for LLM
-inference. It specifically targets DGX Spark, RTX Spark and the
+`sparkinfer` (formerly `b12x`) is an SM120/SM121 CuTe DSL kernel library for local
+LLM inference. It specifically targets DGX Spark, RTX Spark and the
 Blackwell-based RTX cards (RTX 6000 Pro, RTX 5090).
+
+It is *not* intended to be used in production/datacenter environments, both due to
+architecture mismatches and the fast-moving pace of the library. For mission-critical
+use cases please use FlashInfer, CUTLASS or TRTLLM.
 
 ## Install
 
