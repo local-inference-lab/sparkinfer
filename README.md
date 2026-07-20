@@ -1,13 +1,8 @@
 # sparkinfer
 
-`sparkinfer` is an SM120/SM121 CuTe DSL kernel library for (primarily) NVFP4 LLM
-inference — the Blackwell GeForce and workstation parts (RTX 50-series,
-RTX PRO) and GB10.
-
-It is intentionally narrow. This is not a generic CUDA kernel collection or a
-full model-serving stack, and it does not target any other architecture,
-including SM100. It is a focused set of high-performance kernels plus the
-runtime glue needed to launch them cleanly from `sglang`/`vllm`.
+`sparkinfer` (formerly `b12x`) is an SM120/SM121 CuTe DSL kernel library for LLM
+inference. It specifically targets DGX Spark, RTX Spark and the
+Blackwell-based RTX cards (RTX 6000 Pro, RTX 5090).
 
 ## Install
 
