@@ -103,11 +103,11 @@ from sparkinfer._lib.intrinsics import (
     threadfence,
 )
 
-# Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
+# Triage kill-switch: SPARKINFER_INDEXER_DIRECT_K=0 forces every variant back to
 # the staged pipeline (which also restores the v2 cache keys), so serving can
 # A/B the direct-L2 score in place without a checkout change.
 _DIRECT_K_SCORE_ENABLED = os.environ.get(
-    "B12X_INDEXER_DIRECT_K", "1"
+    "SPARKINFER_INDEXER_DIRECT_K", "1"
 ).lower() not in {"0", "false", "no", ""}
 
 _THREADS_PER_CTA = 1024
