@@ -19,6 +19,7 @@ from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     _align_up,
+    _coordinated_close_channels,
     _current_stream_key,
     _is_current_stream_capturing,
     _normalize_device,
@@ -205,6 +206,8 @@ class PCIeDCPA2A:
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
         self._ptr = self._ext.init_dcp_a2a(
             list(signal_ptrs),
             list(staging0_ptrs),
@@ -460,20 +463,35 @@ class PCIeDCPA2A:
         )
         return out
 
-    def close(self) -> None:
-        if self._closed:
+    def _close_ipc_imports(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
-        with suppress(Exception):
-            self._ext.dispose(self._ptr)
+        if getattr(self, "_ptr", 0):
+            with suppress(Exception):
+                self._ext.dispose(self._ptr)
+            self._ptr = 0
         if self._ipc is not None:
             for shared in self._owned_buffers:
                 for ptr in shared.remote_ptrs:
                     with suppress(Exception):
                         self._ipc.cudaIpcCloseMemHandle(ptr)
+        self._ipc_imports_closed = True
+
+    def _free_ipc_exports(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports()
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
                 with suppress(Exception):
                     self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
+        self._ipc_exports_freed = True
+
+    def close(self) -> None:
+        self._close_ipc_imports()
+        self._free_ipc_exports()
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -618,12 +636,16 @@ class PCIeDCPA2APool:
         self._all_channels = retained
         self._channels = dict(channels)
 
-        closed: set[int] = set()
-        for channel in transient:
-            channel_id = id(channel)
-            if channel_id not in retained_ids and channel_id not in closed:
-                closed.add(channel_id)
-                channel.close()
+        channels_to_close = tuple(
+            dict.fromkeys(
+                channel for channel in transient if id(channel) not in retained_ids
+            )
+        )
+        _coordinated_close_channels(
+            channels_to_close,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def for_stream(self, stream: object = None) -> PCIeDCPA2A:
         if self._closed:
