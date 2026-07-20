@@ -9,11 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.workspace import (
-    _layout_wo_projection,
-    _materialize_arena_strided_view,
-    _materialize_arena_view,
-    _wo_mxfp8_scale_physical_shape,
+from b12x.integration.scratch_layout import (
+    layout_wo_projection as _layout_wo_projection,
+    materialize_scratch_strided_view as _materialize_arena_strided_view,
+    materialize_scratch_view as _materialize_arena_view,
+    wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
 )
 from b12x.cute.utils import cuda_stream_to_int
 from b12x.gemm.dense import (

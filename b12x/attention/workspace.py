@@ -14,12 +14,18 @@ _INDEXER_PREFILL_BLOCK_K = 256
 _INDEXER_TILE_BLOCK_Q = 32
 _PAGED_INDEXER_TILE_BLOCK_K = 512
 _ARENA_ALIGN_BYTES = 1024
+
+from b12x.integration.scratch_layout import (  # noqa: E402
+    WO_MXFP8_SCALE_ROW_TILE as _WO_MXFP8_SCALE_ROW_TILE,
+    WO_MXFP8_SCALE_VEC_SIZE as _WO_MXFP8_SCALE_VEC_SIZE,
+    WOProjectionArenaLayout as _B12XWOProjectionArenaLayout,
+    check_wo_mxfp8_k as _check_wo_mxfp8_k,
+    layout_wo_projection as _layout_wo_projection,
+    wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
+)
 _MHC_MULT = 4
 _MHC_PARTIALS = 25
 _MHC_DEFAULT_SPLIT_K = 64
-_WO_MXFP8_SCALE_VEC_SIZE = 32
-_WO_MXFP8_SCALE_ROW_TILE = 128
-_WO_MXFP8_SCALE_K_TILE = 4
 _SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
 _SPLIT_MAX_CHUNKS = 256
 _SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
@@ -522,127 +528,12 @@ class B12XAttentionWorkspaceContract:
             )
 
 
-@dataclass(frozen=True, kw_only=True)
-class _B12XWOProjectionArenaLayout:
-    nbytes: int = 0
-    x_q_values_offset_bytes: int = 0
-    x_q_scale_rows_offset_bytes: int = 0
-    x_q_scale_mma_offset_bytes: int = 0
-    tmp_offset_bytes: int = 0
-    tmp_q_values_offset_bytes: int = 0
-    tmp_q_scale_rows_offset_bytes: int = 0
-    tmp_q_scale_mma_offset_bytes: int = 0
-    output_offset_bytes: int = 0
 
 
-def _check_wo_mxfp8_k(k: int) -> None:
-    if int(k) <= 0 or int(k) % 128 != 0:
-        raise ValueError(f"WO MXFP8 dense-GEMM K must be a positive multiple of 128, got {k}")
 
 
-def _wo_mxfp8_scale_physical_shape(
-    *,
-    m: int,
-    k: int,
-    num_groups: int,
-) -> tuple[int, int, int, int, int, int]:
-    sf_k = int(k) // _WO_MXFP8_SCALE_VEC_SIZE
-    return (
-        int(num_groups),
-        _ceil_div(int(m), _WO_MXFP8_SCALE_ROW_TILE),
-        _ceil_div(sf_k, _WO_MXFP8_SCALE_K_TILE),
-        32,
-        4,
-        4,
-    )
 
 
-def _layout_wo_projection(
-    *,
-    offset_bytes: int,
-    tokens: int,
-    groups: int,
-    group_width: int,
-    rank: int,
-    hidden: int,
-) -> _B12XWOProjectionArenaLayout:
-    tokens = max(int(tokens), 1)
-    groups = int(groups)
-    group_width = int(group_width)
-    rank = int(rank)
-    hidden = int(hidden)
-    if groups <= 0 or group_width <= 0 or rank <= 0 or hidden <= 0:
-        raise ValueError("WO projection arena requires positive groups, group_width, rank, and hidden")
-    _check_wo_mxfp8_k(group_width)
-    _check_wo_mxfp8_k(rank * groups)
-
-    start = int(offset_bytes)
-    cursor = _align_up(start, _ARENA_ALIGN_BYTES)
-
-    x_q_values_offset_bytes = cursor
-    cursor += tokens * group_width * groups * _dtype_nbytes(torch.float8_e4m3fn)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    x_q_scale_rows_offset_bytes = cursor
-    cursor += (
-        groups
-        * tokens
-        * (group_width // _WO_MXFP8_SCALE_VEC_SIZE)
-        * _dtype_nbytes(torch.float8_e8m0fnu)
-    )
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    x_q_scale_mma_offset_bytes = cursor
-    cursor += _shape_numel(
-        _wo_mxfp8_scale_physical_shape(
-            m=tokens,
-            k=group_width,
-            num_groups=groups,
-        )
-    ) * _dtype_nbytes(torch.uint8)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    tmp_offset_bytes = cursor
-    cursor += tokens * rank * groups * _dtype_nbytes(torch.bfloat16)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    tmp_q_width = rank * groups
-    tmp_q_values_offset_bytes = cursor
-    cursor += tokens * tmp_q_width * _dtype_nbytes(torch.float8_e4m3fn)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    tmp_q_scale_rows_offset_bytes = cursor
-    cursor += (
-        tokens
-        * (tmp_q_width // _WO_MXFP8_SCALE_VEC_SIZE)
-        * _dtype_nbytes(torch.float8_e8m0fnu)
-    )
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    tmp_q_scale_mma_offset_bytes = cursor
-    cursor += _shape_numel(
-        _wo_mxfp8_scale_physical_shape(
-            m=tokens,
-            k=tmp_q_width,
-            num_groups=1,
-        )
-    ) * _dtype_nbytes(torch.uint8)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-
-    output_offset_bytes = cursor
-    cursor += tokens * hidden * _dtype_nbytes(torch.bfloat16)
-
-    return _B12XWOProjectionArenaLayout(
-        nbytes=max(0, int(cursor) - start),
-        x_q_values_offset_bytes=x_q_values_offset_bytes,
-        x_q_scale_rows_offset_bytes=x_q_scale_rows_offset_bytes,
-        x_q_scale_mma_offset_bytes=x_q_scale_mma_offset_bytes,
-        tmp_offset_bytes=tmp_offset_bytes,
-        tmp_q_values_offset_bytes=tmp_q_values_offset_bytes,
-        tmp_q_scale_rows_offset_bytes=tmp_q_scale_rows_offset_bytes,
-        tmp_q_scale_mma_offset_bytes=tmp_q_scale_mma_offset_bytes,
-        output_offset_bytes=output_offset_bytes,
-    )
 
 
 @dataclass(frozen=True, kw_only=True)
