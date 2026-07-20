@@ -597,7 +597,7 @@ def main() -> None:
     cache_lens = _parse_csv_ints(args.cache_lens)
     decode_rows = _parse_csv_ints(args.decode_rows)
     extend_batches = _parse_csv_ints(args.extend_batches)
-    contiguous_q_lens = _parse_csv_ints(args.contiguous_q_lens)
+    contiguous_q_lens = _parse_csv_ints(args.extend_q_lens)
 
     case_seed = args.seed
     if args.mode in ("decode", "both"):
