@@ -162,6 +162,30 @@ class _OwnedSharedBuffer:
     remote_ptrs: tuple[int, ...]
 
 
+def _coordinated_close_channels(
+    channels: Sequence[object],
+    *,
+    exchange_group: Optional[ProcessGroup],
+    device: torch.device,
+) -> None:
+    """Release exported CUDA IPC allocations after every peer unmaps them."""
+    unique_channels = tuple(dict.fromkeys(channels))
+    if exchange_group is None:
+        for channel in unique_channels:
+            channel.close()
+        return
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    dist.barrier(group=exchange_group)
+    for channel in unique_channels:
+        channel._close_ipc_imports()
+    dist.barrier(group=exchange_group)
+    for channel in unique_channels:
+        channel._free_ipc_exports()
+    dist.barrier(group=exchange_group)
+
+
 @dataclass(frozen=True)
 class _ChannelSharedBuffers:
     owned_buffer: _OwnedSharedBuffer
@@ -291,6 +315,8 @@ class PCIeOneshotAllReduce:
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
         self._ext = ext_module or _load_extension()
 
         if ext_module is None and self.device.type != "cuda":
@@ -870,8 +896,8 @@ class PCIeOneshotAllReduce:
             logger.info("\n".join(lines))
         return crossover
 
-    def close(self) -> None:
-        if self._closed:
+    def _close_ipc_imports(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
         if getattr(self, "_ptr", 0):
@@ -881,10 +907,22 @@ class PCIeOneshotAllReduce:
             for ptr in shared.remote_ptrs:
                 if self._ipc is not None:
                     self._ipc.cudaIpcCloseMemHandle(ptr)
+        self._ipc_imports_closed = True
+
+    def _free_ipc_exports(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports()
+        for shared in self._owned_buffers:
             if self._ipc is not None:
                 self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
         self._registered_input_ptrs.clear()
+        self._ipc_exports_freed = True
+
+    def close(self) -> None:
+        self._close_ipc_imports()
+        self._free_ipc_exports()
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -1091,12 +1129,16 @@ class PCIeOneshotAllReducePool:
         self._all_channels = retained
         self._channels = dict(channels)
 
-        closed: set[int] = set()
-        for channel in transient:
-            channel_id = id(channel)
-            if channel_id not in retained_ids and channel_id not in closed:
-                closed.add(channel_id)
-                channel.close()
+        channels_to_close = tuple(
+            dict.fromkeys(
+                channel for channel in transient if id(channel) not in retained_ids
+            )
+        )
+        _coordinated_close_channels(
+            channels_to_close,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
         if self._closed:

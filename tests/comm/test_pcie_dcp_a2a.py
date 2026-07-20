@@ -339,6 +339,52 @@ def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
     assert eager_channel._ext.dispose_calls == []
 
 
+def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
+    events = []
+
+    class FakeChannel:
+        def _close_ipc_imports(self):
+            events.append("close-imports")
+
+        def _free_ipc_exports(self):
+            events.append("free-exports")
+
+    group = object()
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        exchange_group=group,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    retained = FakeChannel()
+    transient = FakeChannel()
+    pool._all_channels = [retained]
+    pool._channels = {3: retained}
+    checkpoint = pool.checkpoint_channels()
+    pool._all_channels.append(transient)
+    pool._channels[7] = transient
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+
+    pool.rollback_channels(checkpoint)
+
+    assert events == [
+        "barrier",
+        "close-imports",
+        "barrier",
+        "free-exports",
+        "barrier",
+    ]
+    assert pool._all_channels == [retained]
+    assert pool._channels == {3: retained}
+
+
 def test_pool_rejects_channel_rollback_during_capture():
     pool = PCIeDCPA2APool(
         rank=0,
