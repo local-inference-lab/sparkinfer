@@ -302,3 +302,54 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
     pool.close()
     assert target_channel._ext.dispose_calls == [1234]
     assert draft_channel._ext.dispose_calls == [1234]
+
+
+def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime()
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: 3 if stream is None else int(stream),
+    )
+
+    eager_channel = pool.for_stream()
+    checkpoint = pool.checkpoint_channels()
+    with pool.capture(7) as profile_channel:
+        pass
+
+    pool.rollback_channels(checkpoint)
+
+    assert pool._all_channels == [eager_channel]
+    assert pool._channels == {3: eager_channel}
+    assert profile_channel._ext.dispose_calls == [1234]
+    assert eager_channel._ext.dispose_calls == []
+
+
+def test_pool_rejects_channel_rollback_during_capture():
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    checkpoint = pool.checkpoint_channels()
+
+    with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
+        pool.rollback_channels(checkpoint)
