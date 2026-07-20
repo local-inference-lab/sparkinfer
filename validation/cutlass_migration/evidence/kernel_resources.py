@@ -405,27 +405,27 @@ def _semantic_target_key(target_key: Any) -> Any:
 
 
 def _semantic_payload_from_cache_payload(cache_payload: list[Any]) -> dict[str, Any]:
-    if len(cache_payload) != 10:
+    if len(cache_payload) != 11:
         raise ValueError(f"explicit cache payload has {len(cache_payload)} fields")
-    if cache_payload[0] != "sparkinfer_cute_compile_cache_v5_explicit_spec":
+    if cache_payload[0] != "sparkinfer_cute_compile_cache_v6_explicit_spec":
         raise ValueError(f"unsupported cache format {cache_payload[0]!r}")
     semantic: dict[str, Any] = {
         "cache_format": cache_payload[0],
         "target": _semantic_target_key(cache_payload[1]),
-        "compile_spec_hash": cache_payload[4],
+        "compile_spec_hash": cache_payload[5],
     }
     try:
-        semantic["compile_spec"] = json.loads(str(cache_payload[5]))
+        semantic["compile_spec"] = json.loads(str(cache_payload[6]))
     except (TypeError, ValueError, json.JSONDecodeError):
-        semantic["compile_spec"] = str(cache_payload[5])
-    if cache_payload[6]:
-        semantic["compile_kwargs_hash"] = cache_payload[6]
+        semantic["compile_spec"] = str(cache_payload[6])
+    if cache_payload[7]:
+        semantic["compile_kwargs_hash"] = cache_payload[7]
         try:
-            semantic["compile_kwargs"] = json.loads(str(cache_payload[7]))
+            semantic["compile_kwargs"] = json.loads(str(cache_payload[8]))
         except (TypeError, ValueError, json.JSONDecodeError):
-            semantic["compile_kwargs"] = str(cache_payload[7])
-    semantic["compile_options"] = _manifest_json_value(cache_payload[8])
-    semantic["compile_environment"] = _manifest_json_value(cache_payload[9])
+            semantic["compile_kwargs"] = str(cache_payload[8])
+    semantic["compile_options"] = _manifest_json_value(cache_payload[9])
+    semantic["compile_environment"] = _manifest_json_value(cache_payload[10])
     return semantic
 
 
@@ -496,31 +496,31 @@ def _manifest_integrity_status(
         return "invalid-package-fingerprint"
     if raw.get("toolchain") != cache_payload[3]:
         return "toolchain-payload-mismatch"
-    if raw.get("compile_spec_hash") != cache_payload[4]:
+    if raw.get("compile_spec_hash") != cache_payload[5]:
         return "compile-spec-payload-mismatch"
     compile_spec_json = raw.get("compile_spec_json")
-    if compile_spec_json != cache_payload[5] or not isinstance(compile_spec_json, str):
+    if compile_spec_json != cache_payload[6] or not isinstance(compile_spec_json, str):
         return "compile-spec-json-mismatch"
     if hashlib.sha256(compile_spec_json.encode("utf-8")).hexdigest() != raw.get(
         "compile_spec_hash"
     ):
         return "compile-spec-hash-mismatch"
     if (
-        raw.get("compile_kwargs_hash", "") != cache_payload[6]
-        or raw.get("compile_kwargs_json", "") != cache_payload[7]
+        raw.get("compile_kwargs_hash", "") != cache_payload[7]
+        or raw.get("compile_kwargs_json", "") != cache_payload[8]
     ):
         return "compile-kwargs-payload-mismatch"
-    if cache_payload[7]:
+    if cache_payload[8]:
         if (
-            hashlib.sha256(str(cache_payload[7]).encode("utf-8")).hexdigest()
-            != cache_payload[6]
+            hashlib.sha256(str(cache_payload[8]).encode("utf-8")).hexdigest()
+            != cache_payload[7]
         ):
             return "compile-kwargs-hash-mismatch"
-    elif cache_payload[6]:
+    elif cache_payload[7]:
         return "compile-kwargs-hash-without-json"
-    if raw.get("compile_options") != cache_payload[8]:
+    if raw.get("compile_options") != cache_payload[9]:
         return "compile-options-payload-mismatch"
-    if raw.get("compile_environment") != cache_payload[9]:
+    if raw.get("compile_environment") != cache_payload[10]:
         return "compile-environment-payload-mismatch"
     try:
         compile_spec = json.loads(compile_spec_json)
