@@ -274,6 +274,22 @@ def test_native_nvfp4_split_decode_is_opt_in(
     )
 
 
+def test_native_nvfp4_split_decode_rejects_aux_stream_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weights = _weight_plan("nvfp4", source_format="modelopt_nvfp4")
+    plan = plan_tp_moe_execution(
+        num_tokens=1,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode="nvfp4",
+    )
+
+    monkeypatch.setenv("B12X_NVFP4_SPLIT_DECODE", "1")
+    assert not tp_moe_plan_supports_aux_stream_overlap(plan)
+
+
 def test_workspace_plan_uses_weight_plan_source_contract() -> None:
     weights = _weight_plan(
         "w4a8_mx",
