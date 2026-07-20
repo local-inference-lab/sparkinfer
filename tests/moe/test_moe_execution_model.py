@@ -217,14 +217,16 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
 
 
 @pytest.mark.parametrize("quant_mode", ["nvfp4", "w4a8_nvfp4"])
-def test_nvfp4_split_micro_allows_aux_stream_overlap(
+@pytest.mark.parametrize("num_tokens", [1, 7])
+def test_native_nvfp4_micro_allows_aux_stream_overlap(
     monkeypatch: pytest.MonkeyPatch,
     quant_mode: str,
+    num_tokens: int,
 ) -> None:
     monkeypatch.delenv("SPARKINFER_NVFP4_SPLIT_DECODE", raising=False)
     weights = _weight_plan(quant_mode, source_format="modelopt_nvfp4")
     plan = plan_tp_moe_execution(
-        num_tokens=8,
+        num_tokens=num_tokens,
         num_topk=2,
         device=torch.device("cpu"),
         weight_plan=weights,
@@ -235,11 +237,11 @@ def test_nvfp4_split_micro_allows_aux_stream_overlap(
     assert plan_supports_aux_stream_overlap(plan)
 
 
-def test_aux_stream_overlap_rejects_barrier_launches(
+def test_aux_stream_overlap_rejects_large_resident_launches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     weights = _weight_plan("nvfp4", source_format="modelopt_nvfp4")
-    micro = plan_tp_moe_execution(
+    boundary_micro = plan_tp_moe_execution(
         num_tokens=8,
         num_topk=2,
         device=torch.device("cpu"),
@@ -255,8 +257,21 @@ def test_aux_stream_overlap_rejects_barrier_launches(
     )
 
     monkeypatch.setenv("SPARKINFER_NVFP4_SPLIT_DECODE", "0")
-    assert not plan_supports_aux_stream_overlap(micro)
+    assert not plan_supports_aux_stream_overlap(boundary_micro)
     assert not plan_supports_aux_stream_overlap(dynamic)
+
+
+def test_native_nvfp4_split_decode_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SPARKINFER_NVFP4_SPLIT_DECODE", raising=False)
+    assert not tp_moe_impl._use_barrier_free_nvfp4_split(
+        quant_mode="nvfp4", num_tokens=1, activation="silu"
+    )
+    monkeypatch.setenv("SPARKINFER_NVFP4_SPLIT_DECODE", "1")
+    assert tp_moe_impl._use_barrier_free_nvfp4_split(
+        quant_mode="nvfp4", num_tokens=1, activation="silu"
+    )
 
 
 def test_workspace_plan_uses_weight_plan_source_contract() -> None:

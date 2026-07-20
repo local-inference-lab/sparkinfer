@@ -8173,24 +8173,38 @@ def _launch_dynamic_topk_sum(
     )
 
 
+def _is_native_nvfp4_micro_decode(
+    *,
+    quant_mode: str,
+    num_tokens: int,
+    activation: str,
+) -> bool:
+    """Return whether this is the bounded native-NVFP4 micro decode band."""
+    return (
+        _normalize_quant_mode(quant_mode) in {"nvfp4", "w4a8_nvfp4"}
+        and 1 <= int(num_tokens) <= _MICRO_MAX_TOKENS
+        and activation == "silu"
+    )
+
+
 def _use_barrier_free_nvfp4_split(
     *,
     quant_mode: str,
     num_tokens: int,
     activation: str,
 ) -> bool:
-    """Return whether decode uses separate FC1/FC2 launches.
+    """Return whether native NVFP4 decode uses separate FC1/FC2 launches.
 
-    The fused micro kernel synchronizes its CTAs with a software grid barrier,
-    which requires exclusive residency. Splitting FC1 and FC2 removes that
-    barrier and makes the launch safe to co-schedule with CUDA work on another
-    stream.
+    The split path remains available for diagnostics, but it loses the serving
+    benefit of the bounded micro launch overlapping GLM shared experts.
     """
     return (
-        _normalize_quant_mode(quant_mode) in {"nvfp4", "w4a8_nvfp4"}
-        and 1 <= int(num_tokens) <= _MICRO_MAX_TOKENS
-        and activation == "silu"
-        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "1") != "0"
+        _is_native_nvfp4_micro_decode(
+            quant_mode=quant_mode,
+            num_tokens=num_tokens,
+            activation=activation,
+        )
+        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "0") == "1"
     )
 
 
@@ -8202,7 +8216,12 @@ def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
         return False
     if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
         return False
-    return _use_barrier_free_nvfp4_split(
+    # The compact native-NVFP4 micro grid is a bounded, single-wave decode
+    # launch. vLLM submits it before the auxiliary shared-expert work. M=1..7
+    # survives graph-replay concurrency stress; M=8 changes the launch geometry
+    # and corrupts output under the same stress, so that boundary and all larger
+    # resident plans must remain serialized.
+    return plan.routed_rows // plan.num_topk <= 7 and _is_native_nvfp4_micro_decode(
         quant_mode=plan.quant_mode,
         num_tokens=plan.routed_rows // plan.num_topk,
         activation=plan.activation,
