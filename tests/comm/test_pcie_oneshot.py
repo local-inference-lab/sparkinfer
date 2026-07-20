@@ -835,6 +835,60 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     assert pool._channels == {3: retained}
 
 
+def test_channel_teardown_completes_when_ipc_cleanup_raises():
+    events = []
+
+    class FailingExt:
+        def dispose(self, ptr):
+            events.append(("dispose", ptr))
+            raise RuntimeError("dispose failed")
+
+    class FailingIPC:
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append(("close", ptr))
+            raise RuntimeError("close failed")
+
+        def cudaFree(self, ptr):
+            events.append(("free", ptr))
+            raise RuntimeError("free failed")
+
+    class SharedBuffer:
+        def __init__(self, local_ptr, remote_ptrs):
+            self.local_ptr = local_ptr
+            self.remote_ptrs = remote_ptrs
+
+    channel = object.__new__(PCIeOneshotAllReduce)
+    channel._closed = False
+    channel._ipc_imports_closed = False
+    channel._ipc_exports_freed = False
+    channel._ptr = 123
+    channel._ext = FailingExt()
+    channel._ipc = FailingIPC()
+    channel._owned_buffers = [
+        SharedBuffer(1000, (2000, 3000)),
+        SharedBuffer(4000, (5000,)),
+    ]
+    channel._registered_input_ptrs = {1: (2,)}
+
+    channel.close()
+    channel.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("close", 5000),
+        ("free", 1000),
+        ("free", 4000),
+    ]
+    assert channel._ptr == 0
+    assert channel._closed
+    assert channel._ipc_imports_closed
+    assert channel._ipc_exports_freed
+    assert channel._owned_buffers == []
+    assert channel._registered_input_ptrs == {}
+
+
 def test_pool_rejects_channel_rollback_during_capture():
     pool = PCIeOneshotAllReducePool(
         rank=0,
