@@ -8,7 +8,7 @@ import torch
 
 import cutlass
 
-from sparkinfer.attention.paged.api import (
+from sparkinfer.attention.paged._forward import (
     _build_extend_forward_kernel,
     _descriptor_row_ptrs,
     _encode_plane_tma_descriptors,
@@ -23,22 +23,19 @@ from sparkinfer.attention.paged.forward_paged import (
 from sparkinfer.attention.paged.merge import PagedPersistentMergeKernel
 from sparkinfer.attention.paged.reference import paged_attention_reference
 from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
-from sparkinfer.cute.compiler import (
+from sparkinfer._lib.compiler import (
     KernelCompileSpec,
     compile as sparkinfer_compile,
     run_compiled,
 )
-from sparkinfer.cute.utils import current_cuda_stream
-from sparkinfer.integration.attention import (
-    SPARKINFERPagedAttentionScratchCaps,
-    clear_attention_caches,
-    create_paged_plan,
-    paged_attention_forward,
-    plan_paged_attention_scratch,
-)
+from sparkinfer._lib.utils import current_cuda_stream
+from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
+from sparkinfer.attention.paged._forward import paged_attention_forward
+from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
+from sparkinfer.attention.paged.planner import create_paged_plan
 
-from .helpers import require_sm12x
-from .paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
+from tests._reference.helpers import require_sparkinfer
+from tests._reference.paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
 
 
 _Q_HEADS = 8
@@ -174,7 +171,7 @@ def _make_fixed_graph_binding(
 @torch.inference_mode()
 def test_paged_fp8_prefill_size_graph_oracle(q_len: int) -> None:
     """Pin every requested generic-prefill size to an oracle and graph replay."""
-    require_sm12x()
+    require_sparkinfer()
     clear_attention_caches()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -258,7 +255,7 @@ def _run_paged_forward_graph_oracle(
     disable_split_kv: bool,
 ) -> None:
     """Exercise an API-routed PagedForward graph with live inputs."""
-    require_sm12x()
+    require_sparkinfer()
     clear_attention_caches()
     mode = "decode" if disable_split_kv else "verify"
     q_len = 1 if mode == "decode" else 4
@@ -680,7 +677,7 @@ def _launch_compiled_pair(
 @torch.inference_mode()
 def test_paged_unreachable_raw_body_graph_oracle(case: _RawCase) -> None:
     """Migration-only proof for raw bodies that have no serving call sites."""
-    require_sm12x()
+    require_sparkinfer()
     cache_len = 128 if case.split_kv else 64
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -802,7 +799,7 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
     request: pytest.FixtureRequest,
 ) -> None:
     """Check every PLANEWORDS byte through the supported CuTe-atom path."""
-    require_sm12x()
+    require_sparkinfer()
     monkeypatch.setenv("SPARKINFER_PAGED_KV_TMA", "1")
     monkeypatch.setenv("SPARKINFER_PAGED_KV_DEBUG_DUMP", "PLANEWORDS")
     monkeypatch.setenv("SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", "3,4,3")

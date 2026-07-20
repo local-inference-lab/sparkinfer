@@ -18,30 +18,27 @@ import pytest
 import torch
 
 from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
-from sparkinfer.attention.indexer import (
-    build_paged_mqa_schedule_metadata,
-    clear_indexer_caches,
-)
-from sparkinfer.attention.indexer.fused_indexer import (
+from sparkinfer.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches
+from sparkinfer.attention.nsa_indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     fused_indexer_scratch_capacity,
     run_fused_paged_indexer,
 )
-from sparkinfer.attention.indexer.kernel import (
+from sparkinfer.attention.nsa_indexer.kernel import (
     _split_index_k_cache_runtime_views,
     build_indexer_paged_logits_kernel_binding,
     build_indexer_paged_supertile_logits_kernel_binding,
     build_indexer_paged_tiled_logits_kernel_binding,
 )
-from sparkinfer.attention.indexer.persistent_topk import (
+from sparkinfer.attention.nsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from sparkinfer.attention.indexer.reference import (
+from sparkinfer.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.cute.compiler import compile_cache_info
+from sparkinfer._lib.compiler import compile_cache_info
 
 
 pytestmark = pytest.mark.skipif(

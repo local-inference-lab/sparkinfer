@@ -13,15 +13,15 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from sparkinfer.moe.fused.reference import (
+from sparkinfer.moe._shared.kernels.reference import (
     compare_to_reference,
     moe_reference_nvfp4,
     moe_reference_w4a8_mx,
 )
 
-from .helpers import (
+from tests._reference.helpers import (
     prepare_tp_moe_fp4_experts,
-    require_sm12x,
+    require_sparkinfer,
     swizzle_block_scale_reference,
 )
 
@@ -252,7 +252,7 @@ def _prepare_and_bind(
     quant_mode: str,
     source_format: str,
 ) -> _BoundCase:
-    from sparkinfer.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+    from sparkinfer.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
     experts = prepare_tp_moe_fp4_experts(
         a=inputs.a,
@@ -342,7 +342,7 @@ def _run_live_graph_check(
     min_cos: float,
     max_normalized_rmse: float,
 ) -> None:
-    from sparkinfer.integration import sparkinfer_moe_fp4
+    from sparkinfer.moe.fused_moe._impl import sparkinfer_moe_fp4
 
     binding = case.binding
     output = binding.output
@@ -407,7 +407,7 @@ def _reset_dispatch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
     monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     monkeypatch.delenv("SPARKINFER_W4A8_TINY_DECODE", raising=False)
-    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.moe.fused_moe._impl import clear_tp_moe_caches
 
     clear_tp_moe_caches()
 
@@ -417,7 +417,7 @@ def test_standard_moe_micro_live_graph_oracle(
 ) -> None:
     """Reach ``integration.tp_moe.micro_direct`` through production dispatch."""
 
-    device = require_sm12x()
+    device = require_sparkinfer()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_nvfp4_weights(device, seed=101)
     initial = _make_inputs(device, m=2, seed=102, route_shift=0)
@@ -468,7 +468,7 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
 ) -> None:
     """Reach ``integration.tp_moe.dynamic`` at a prefill-sized standard M."""
 
-    device = require_sm12x()
+    device = require_sparkinfer()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_nvfp4_weights(device, seed=201)
     initial = _make_inputs(device, m=128, seed=202, route_shift=0)
@@ -503,7 +503,7 @@ def test_standard_moe_tiny_decode_live_graph_oracle(
 ) -> None:
     """Reach both ``integration.tp_moe.tiny_decode`` production phases."""
 
-    device = require_sm12x()
+    device = require_sparkinfer()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_mxfp4_weights(device, seed=301)
     initial = _make_inputs(device, m=2, seed=302, route_shift=0)
