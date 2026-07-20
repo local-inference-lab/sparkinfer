@@ -2201,10 +2201,11 @@ def _sparse_mla_decode_grid_flat_launch(
             )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.sm120.decode",
-        # v17 adds the runtime FP8-RoPE record format specialization.  The
-        # explicit cache key does not hash source, so this ABI bump rejects
-        # cubins compiled for the 432-byte BF16-RoPE record.
-        17,
+        # v18: latent_scale == 1.0 is folded out at trace time, producing a
+        # cubin without the outer-scale multiply; the identity and dynamic
+        # variants must not share a cache entry.
+        18,
+        key_field("latent_scale_identity", int(float(latent_scale) == 1.0)),
         *spec_fields,
     )
     if per_token_len:
