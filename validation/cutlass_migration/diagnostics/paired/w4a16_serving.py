@@ -35,7 +35,7 @@ from validation.cutlass_migration.core.exact_cache_abba import (
 )
 from validation.cutlass_migration.paths import CORE_ROOT, REPO_ROOT
 import b12x.cute.compiler as cute_compiler
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.cute.runtime_control import (
     freeze_kernel_resolution,
     kernel_resolution_frozen,

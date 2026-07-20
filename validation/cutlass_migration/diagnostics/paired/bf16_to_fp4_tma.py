@@ -38,7 +38,7 @@ from validation.cutlass_migration.core.exact_cache_abba import (
 )
 from validation.cutlass_migration.paths import REPO_ROOT
 import b12x.cute.compiler as cute_compiler
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 import b12x.quantization as quantization
 
 

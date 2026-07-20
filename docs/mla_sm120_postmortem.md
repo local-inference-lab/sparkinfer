@@ -67,7 +67,7 @@ Commit-per-phase kept every checkpoint green and bisectable.
 
 - **Reusing the existing b12x kernels as idiom references.** The mbarrier producer/consumer
   pipeline (`_cute/pipeline.py`), the production-grade `const_expr` specialization style
-  (`w4a16`), the inline-PTX op vocabulary (`fp4.py`: mxfp8 MMA, ldmatrix, cvt, byte_perm), and
+  (`w4a16`), the inline-PTX op vocabulary (`intrinsics.py`: mxfp8 MMA, ldmatrix, cvt, byte_perm), and
   the base-2 split/merge (`split.py`, reused verbatim) meant most "novel" mechanisms already
   existed. Only **one** genuinely new PTX op (`cp_async_bulk_g2s_mbar`) had to be written.
 - **`cute.constexpr` for unification.** One traced kernel covers DSV4 + GLM + FP8; each

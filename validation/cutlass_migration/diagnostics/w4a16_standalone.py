@@ -22,7 +22,7 @@ from validation.cutlass_migration.core.gpu_scope import (
     add_target_gpu_argument,
     require_target_gpu,
 )
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.cute.utils import current_cuda_stream
 from b12x.moe.fused.w4a16.host import (
     packed_gemm_scratch_elements,

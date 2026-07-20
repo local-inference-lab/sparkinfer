@@ -13,10 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Common utilities for FP4 quantization kernels.
+Device-intrinsics and host quantization library shared by the SM12x kernels.
 
-This module contains shared PTX intrinsics, helper functions, and reduction
-utilities used by the fused frontend kernels.
+Inline-PTX device ops (ldmatrix variants, cp.async and TMA bulk copies,
+vectorized global/shared loads and stores, atomics and reductions, packed
+dtype conversions, swizzles) plus host-side NVFP4/MXFP8 quantization helpers
+and their torch references.
 """
 
 import functools

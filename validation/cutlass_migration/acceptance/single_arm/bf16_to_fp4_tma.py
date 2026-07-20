@@ -40,7 +40,7 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     verify_case_compile_contract,
 )
 import b12x.cute.compiler as cute_compiler
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 
 
 FAMILY = "bf16_to_fp4_tma"
