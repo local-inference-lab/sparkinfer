@@ -12,7 +12,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32, Uint64
 
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     cp_async_bulk_g2s_mbar_l2hint,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
@@ -88,7 +88,9 @@ def io_issue_gather_dsv4_nope(
                     + Int64(page_block_size) * _ios
                     + Int64(local_idx) * Int64(_foot)
                 )
-                f0, f1 = ld_global_nc_v2_u32(get_ptr_as_int64(kv_cache_u8, scale_base_off))
+                f0, f1 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(kv_cache_u8, scale_base_off)
+                )
             s_byte = entry * _foot
             st_shared_u32(kv_sc_dst_addr + s_byte, f0)
             st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
@@ -97,7 +99,9 @@ def io_issue_gather_dsv4_nope(
     cute.arch.fence_acq_rel_cta()
 
     if io_lane == Int32(0):
-        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi * _DSV4_NOPE_BYTES))
+        cute.arch.mbarrier_arrive_and_expect_tx(
+            full_mbar_ptr, Int32(bi * _DSV4_NOPE_BYTES)
+        )
 
     full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
     eo = Int32(0)
@@ -138,7 +142,7 @@ def io_issue_gather_glm_mg(
     cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
-    kv_smem_stride: cutlass.Constexpr,   # 528 GLM / 288 NVFP4 (smem nope row stride)
+    kv_smem_stride: cutlass.Constexpr,  # 528 GLM / 288 NVFP4 (smem nope row stride)
     io_threads: cutlass.Constexpr = _IO_THREADS,
     scale_format: cutlass.Constexpr = 1,
     fp8_rope: cutlass.Constexpr = False,

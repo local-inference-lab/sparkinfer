@@ -19,14 +19,16 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, T
 
-from sparkinfer.attention._cute import copy as cute_copy
-from sparkinfer.attention._cute import pipeline as cute_pipeline
-from sparkinfer.attention._cute import ops as attention_ops
-from sparkinfer.cute.compiler import (
+from sparkinfer.attention._shared.cute import copy as cute_copy
+from sparkinfer.attention._shared.cute import (
+    pipeline as cute_pipeline,
+)
+from sparkinfer.attention._shared.cute import ops as attention_ops
+from sparkinfer._lib.compiler import (
     KernelCompileSpec,
     launch as sparkinfer_launch,
 )
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
     ld_shared_v4_u32,
@@ -38,7 +40,7 @@ from sparkinfer.cute.intrinsics import (
     st_global_v2_f32,
     st_global_v4_f32,
 )
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.utils import current_cuda_stream
 from .kernel import IndexerScoreMode
 
 
@@ -85,8 +87,12 @@ _PREFILL512_Q_HEADS_BATCH = 7  # Exp29: BF16 weights free 4KB smem, 10 batches v
 _PREFILL512_H32_Q_HEADS_BATCH = 7
 _PREFILL512_H32_WEIGHT_COLS = 32
 
-_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV = "SPARKINFER_NSA_CONTIGUOUS_PREFILL_THRESHOLD"
-_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV = "SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
+_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV = (
+    "SPARKINFER_NSA_CONTIGUOUS_PREFILL_THRESHOLD"
+)
+_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV = (
+    "SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
+)
 _PREFILL512_MIN_Q_ROWS = 1024
 _PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
@@ -101,7 +107,9 @@ def _assume_contiguous_k_tma_source_aligned(t: cute.Tensor) -> cute.Tensor:
             strides.append(stride)
         else:
             strides.append(cute.assume(stride, divby=divby))
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=tuple(strides)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=tuple(strides))
+    )
 
 
 def _make_contiguous_k_tma_source(k_quant_bytes: cute.Tensor) -> cute.Tensor:
@@ -129,7 +137,9 @@ def _make_contiguous_k_tma_smem_stage_layout(block_k: int) -> cute.Layout:
 
 @lru_cache(maxsize=16)
 def _dummy_contiguous_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
-    return torch.zeros((1,), dtype=torch.int64, device=torch.device("cuda", device_index))
+    return torch.zeros(
+        (1,), dtype=torch.int64, device=torch.device("cuda", device_index)
+    )
 
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
@@ -407,9 +417,7 @@ def get_sparse_nsa_contiguous_prefill_shared_storage_cls():
         "q_bytes_smem": cute.struct.Align[
             cute.struct.MemRange[
                 cutlass.Uint8,
-                _PREFILL_Q_STAGE_ROWS
-                * _PREFILL_Q_STAGE_COLS
-                * _PREFILL_Q_HEADS_BATCH,
+                _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * _PREFILL_Q_HEADS_BATCH,
             ],
             1024,
         ],
@@ -737,7 +745,9 @@ def _issue_contiguous_k_tma_copy(
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
-    load_tma(src_idx=k_tile_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    load_tma(
+        src_idx=k_tile_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr
+    )
 
 
 @cute.jit
@@ -753,8 +763,12 @@ def _issue_contiguous_k_tma_copy_pair(
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
-    load_tma0(src_idx=k_tile_idx0, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
-    load_tma1(src_idx=k_tile_idx1, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    load_tma0(
+        src_idx=k_tile_idx0, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr
+    )
+    load_tma1(
+        src_idx=k_tile_idx1, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr
+    )
 
 
 @cute.jit
@@ -846,13 +860,11 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     abs_row_0 = q_tile_base + row_base_q + group_id
     abs_row_8 = abs_row_0 + Int32(8)
     q_row_0 = cute.make_tensor(
-        q_u32.iterator
-        + cute.crd2idx((abs_row_0, head_idx, Int32(0)), q_u32.layout),
+        q_u32.iterator + cute.crd2idx((abs_row_0, head_idx, Int32(0)), q_u32.layout),
         cute.make_layout((_FP8_ROW_U32,), stride=(1,)),
     )
     q_row_8 = cute.make_tensor(
-        q_u32.iterator
-        + cute.crd2idx((abs_row_8, head_idx, Int32(0)), q_u32.layout),
+        q_u32.iterator + cute.crd2idx((abs_row_8, head_idx, Int32(0)), q_u32.layout),
         cute.make_layout((_FP8_ROW_U32,), stride=(1,)),
     )
     k_offset = _permuted_offset_128b(
@@ -875,24 +887,16 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         u32_hi = u32_lo + Int32(4)
         for mma_q in cutlass.range_constexpr(num_mma_q):
             q_regs[mma_q, 0] = (
-                Uint32(q_row_0[u32_lo])
-                if abs_row_0 < valid_q_rows
-                else Uint32(0)
+                Uint32(q_row_0[u32_lo]) if abs_row_0 < valid_q_rows else Uint32(0)
             )
             q_regs[mma_q, 1] = (
-                Uint32(q_row_8[u32_lo])
-                if abs_row_8 < valid_q_rows
-                else Uint32(0)
+                Uint32(q_row_8[u32_lo]) if abs_row_8 < valid_q_rows else Uint32(0)
             )
             q_regs[mma_q, 2] = (
-                Uint32(q_row_0[u32_hi])
-                if abs_row_0 < valid_q_rows
-                else Uint32(0)
+                Uint32(q_row_0[u32_hi]) if abs_row_0 < valid_q_rows else Uint32(0)
             )
             q_regs[mma_q, 3] = (
-                Uint32(q_row_8[u32_hi])
-                if abs_row_8 < valid_q_rows
-                else Uint32(0)
+                Uint32(q_row_8[u32_hi]) if abs_row_8 < valid_q_rows else Uint32(0)
             )
 
         k_offset_cur = k_offset
@@ -1178,14 +1182,19 @@ class SparseNSAContiguousLogitsKernel:
                     q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
                     if q_local < Int32(_BLOCK_Q):
                         w_val = w_val_0 if row_slot == 0 else w_val_8
-                        if cutlass.const_expr(self._score_mode == IndexerScoreMode.MSA_BILINEAR):
+                        if cutlass.const_expr(
+                            self._score_mode == IndexerScoreMode.MSA_BILINEAR
+                        ):
                             acc_frag[0, 0, reg_id] = Float32(
-                                acc_frag[0, 0, reg_id] + score_frag[0, 0, reg_id] * w_val
+                                acc_frag[0, 0, reg_id]
+                                + score_frag[0, 0, reg_id] * w_val
                             )
                         else:
                             acc_frag[0, 0, reg_id] = Float32(
                                 acc_frag[0, 0, reg_id]
-                                + attention_ops.fmax(score_frag[0, 0, reg_id], Float32(0.0))
+                                + attention_ops.fmax(
+                                    score_frag[0, 0, reg_id], Float32(0.0)
+                                )
                                 * w_val
                             )
                 head_idx += Int32(1)
@@ -1631,7 +1640,9 @@ class SparseNSAContiguousLogitsPrefillKernel:
             tma_atom_k,
             0,
             cute.make_layout(1),
-            cute.local_tile(k_tma_tensor, (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM), (None, 0)),
+            cute.local_tile(
+                k_tma_tensor, (_PREFILL_BLOCK_K, _INDEX_HEAD_DIM), (None, 0)
+            ),
             s_k_tma_stage,
         )
         s_scales = storage.scales.get_tensor(
@@ -1896,10 +1907,17 @@ class SparseNSAContiguousLogitsPrefillKernel:
                                 block_idx = k_tile_idx * Int32(2) + block_local
                                 q_row_out = q_tile_base + q_local_out
                                 v = attention_ops.fmax(
-                                    s_block_partial[block_local * Int32(2), q_local_out],
-                                    s_block_partial[block_local * Int32(2) + Int32(1), q_local_out],
+                                    s_block_partial[
+                                        block_local * Int32(2), q_local_out
+                                    ],
+                                    s_block_partial[
+                                        block_local * Int32(2) + Int32(1), q_local_out
+                                    ],
                                 )
-                                if q_row_out < valid_q_rows and block_idx < num_blocks_out:
+                                if (
+                                    q_row_out < valid_q_rows
+                                    and block_idx < num_blocks_out
+                                ):
                                     block_scores[head_idx, q_row_out, block_idx] = v
                             cute.arch.sync_threads()
                         else:
@@ -1913,11 +1931,13 @@ class SparseNSAContiguousLogitsPrefillKernel:
                                     )
                                     w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                     if cutlass.const_expr(
-                                        self._score_mode == IndexerScoreMode.MSA_BILINEAR
+                                        self._score_mode
+                                        == IndexerScoreMode.MSA_BILINEAR
                                     ):
                                         acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                             acc_frag[Int32(0), mma_kv, reg_id]
-                                            + score_frag[Int32(0), mma_kv, reg_id] * w_val
+                                            + score_frag[Int32(0), mma_kv, reg_id]
+                                            * w_val
                                         )
                                     else:
                                         acc_frag[Int32(0), mma_kv, reg_id] = Float32(
@@ -2801,7 +2821,9 @@ def run_contiguous_logits_kernel(
         prefill_block_k = binding.prefill_block_k
         score_mode = binding.score_mode
 
-    q_fp8 = _require_bound_arg(q_fp8, api_name="run_contiguous_logits_kernel", name="q_fp8")
+    q_fp8 = _require_bound_arg(
+        q_fp8, api_name="run_contiguous_logits_kernel", name="q_fp8"
+    )
     weights = _require_bound_arg(
         weights, api_name="run_contiguous_logits_kernel", name="weights"
     )
@@ -2814,7 +2836,9 @@ def run_contiguous_logits_kernel(
     k_start = _require_bound_arg(
         k_start, api_name="run_contiguous_logits_kernel", name="k_start"
     )
-    k_end = _require_bound_arg(k_end, api_name="run_contiguous_logits_kernel", name="k_end")
+    k_end = _require_bound_arg(
+        k_end, api_name="run_contiguous_logits_kernel", name="k_end"
+    )
     preinitialize_invalid_logits = (
         True
         if preinitialize_invalid_logits is None
@@ -2942,8 +2966,7 @@ def run_contiguous_logits_kernel(
         missing = [name for name, value in required_staged.items() if value is None]
         if missing:
             raise ValueError(
-                "staged indexer contiguous binding is missing "
-                + ", ".join(missing)
+                "staged indexer contiguous binding is missing " + ", ".join(missing)
             )
         q_u32 = staged_binding.q_u32
         q_bytes_kernel = staged_binding.q_bytes
@@ -3212,7 +3235,9 @@ def run_contiguous_block_scores_kernel(
             "MSA contiguous block-score kernel only supports the production CUDA FP8 contract"
         )
     if int(q_fp8.shape[1]) > 8:
-        raise ValueError("MSA contiguous block-score kernel supports at most 8 index heads")
+        raise ValueError(
+            "MSA contiguous block-score kernel supports at most 8 index heads"
+        )
     if weights.dtype != torch.float32:
         raise ValueError(f"weights must have dtype torch.float32, got {weights.dtype}")
     q_rows_total = int(q_fp8.shape[0])
@@ -3236,7 +3261,9 @@ def run_contiguous_block_scores_kernel(
         )
     else:
         if block_scores.dtype != torch.float32:
-            raise ValueError(f"block_scores must have dtype torch.float32, got {block_scores.dtype}")
+            raise ValueError(
+                f"block_scores must have dtype torch.float32, got {block_scores.dtype}"
+            )
         if block_scores.device != q_fp8.device:
             raise ValueError("block_scores device must match q_fp8")
         if (
@@ -3276,7 +3303,9 @@ def run_contiguous_block_scores_kernel(
     if out_kernel is None:
         out_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
     if tile_logits_kernel is None:
-        tile_logits_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+        tile_logits_kernel = torch.empty(
+            (1, 1), dtype=torch.float32, device=q_fp8.device
+        )
     if k_tma_prefill_desc_ptrs is None:
         device_index = q_fp8.device.index or 0
         k_tma_prefill_desc_ptrs = _dummy_contiguous_k_tma_desc_ptrs(device_index)

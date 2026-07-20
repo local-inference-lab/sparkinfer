@@ -55,14 +55,15 @@ def stage_decode_cuda_graph_metadata_triton(
         tl.int64
     )
     flat_token_offsets = (
-        req_pool_idx * req_to_token_row_stride
-        + page_offsets.to(tl.int64) * PAGE_SIZE
+        req_pool_idx * req_to_token_row_stride + page_offsets.to(tl.int64) * PAGE_SIZE
     )
     flat_token_offsets = tl.minimum(
         tl.maximum(flat_token_offsets, 0),
         req_to_token_numel - 1,
     )
-    token_indices = tl.load(req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0)
+    token_indices = tl.load(
+        req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0
+    )
     tl.store(
         page_table_ptr + req_idx * page_table_row_stride + page_offsets,
         (token_indices // PAGE_SIZE).to(tl.int32),
@@ -183,14 +184,15 @@ def build_decode_graph_page_table_full_triton(
     page_offsets = page_block_idx * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
     page_mask = page_offsets < MAX_PAGES
     flat_token_offsets = (
-        req_pool_idx * req_to_token_row_stride
-        + page_offsets.to(tl.int64) * PAGE_SIZE
+        req_pool_idx * req_to_token_row_stride + page_offsets.to(tl.int64) * PAGE_SIZE
     )
     flat_token_offsets = tl.minimum(
         tl.maximum(flat_token_offsets, 0),
         req_to_token_numel - 1,
     )
-    token_indices = tl.load(req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0)
+    token_indices = tl.load(
+        req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0
+    )
     tl.store(
         page_table_ptr + req_idx * page_table_row_stride + page_offsets,
         (token_indices // PAGE_SIZE).to(tl.int32),
@@ -297,14 +299,24 @@ def build_msa_prefill_union_metadata_triton(
     union_count_offset = work_idx * NUM_KV_HEADS + kv_head_idx
     tl.store(union_counts_ptr + union_count_offset, 0, mask=work_valid)
 
-    request_idx = tl.load(request_indices_ptr + work_idx, mask=active, other=0).to(tl.int32)
-    qo_tile_idx = tl.load(qo_tile_indices_ptr + work_idx, mask=active, other=0).to(tl.int32)
+    request_idx = tl.load(request_indices_ptr + work_idx, mask=active, other=0).to(
+        tl.int32
+    )
+    qo_tile_idx = tl.load(qo_tile_indices_ptr + work_idx, mask=active, other=0).to(
+        tl.int32
+    )
     q_start = tl.load(cu_seqlens_q_ptr + request_idx, mask=active, other=0).to(tl.int32)
-    q_end = tl.load(cu_seqlens_q_ptr + request_idx + 1, mask=active, other=0).to(tl.int32)
+    q_end = tl.load(cu_seqlens_q_ptr + request_idx + 1, mask=active, other=0).to(
+        tl.int32
+    )
     qo_len = q_end - q_start
-    cache_len = tl.load(cache_seqlens_ptr + request_idx, mask=active, other=0).to(tl.int32)
+    cache_len = tl.load(cache_seqlens_ptr + request_idx, mask=active, other=0).to(
+        tl.int32
+    )
     tile_first_token = qo_tile_idx * TOKENS_PER_TILE
-    tile_token_count = tl.minimum(tl.maximum(qo_len - tile_first_token, 0), TOKENS_PER_TILE)
+    tile_token_count = tl.minimum(
+        tl.maximum(qo_len - tile_first_token, 0), TOKENS_PER_TILE
+    )
     union_count = tl.full((), 0, tl.int32)
 
     for token_idx in tl.static_range(0, TOKENS_PER_TILE):
@@ -315,8 +327,12 @@ def build_msa_prefill_union_metadata_triton(
         bit = tl.full((), 1 << token_idx, tl.int32)
         for list_idx in tl.static_range(0, TOPK):
             q2k_offset = (kv_head_idx * total_q_capacity + q_row_idx) * TOPK + list_idx
-            block_id = tl.load(q2k_indices_ptr + q2k_offset, mask=token_valid, other=-1).to(tl.int32)
-            valid_block = token_valid & (block_id >= 0) & (block_id * BLOCK_TOKENS < visible_len)
+            block_id = tl.load(
+                q2k_indices_ptr + q2k_offset, mask=token_valid, other=-1
+            ).to(tl.int32)
+            valid_block = (
+                token_valid & (block_id >= 0) & (block_id * BLOCK_TOKENS < visible_len)
+            )
             found = tl.full((), False, tl.int1)
             found_slot = tl.full((), 0, tl.int32)
             for union_idx in tl.static_range(0, MAX_UNION_BLOCKS):
@@ -336,10 +352,16 @@ def build_msa_prefill_union_metadata_triton(
                 mask=do_update,
                 other=0,
             ).to(tl.int32)
-            tl.store(union_masks_ptr + union_base + found_slot, old_mask | bit, mask=do_update)
+            tl.store(
+                union_masks_ptr + union_base + found_slot,
+                old_mask | bit,
+                mask=do_update,
+            )
 
             do_store = valid_block & ~found & (union_count < MAX_UNION_BLOCKS)
-            tl.store(union_blocks_ptr + union_base + union_count, block_id, mask=do_store)
+            tl.store(
+                union_blocks_ptr + union_base + union_count, block_id, mask=do_store
+            )
             tl.store(union_masks_ptr + union_base + union_count, bit, mask=do_store)
             union_count += tl.where(do_store, 1, 0)
 
@@ -370,7 +392,9 @@ def update_decode_graph_compact_work_metadata_triton(
     valid_mask = active & (work_offsets < block_valid_capacity)
     tl.store(request_indices_ptr + work_offsets, req_idx, mask=work_mask)
     tl.store(qo_tile_indices_ptr + work_offsets, 0, mask=work_mask)
-    tl.store(kv_tile_indices_ptr + work_offsets, chunk_offsets.to(tl.int32), mask=work_mask)
+    tl.store(
+        kv_tile_indices_ptr + work_offsets, chunk_offsets.to(tl.int32), mask=work_mask
+    )
     tl.store(block_valid_mask_ptr + work_offsets, 1, mask=valid_mask)
 
 
@@ -402,7 +426,9 @@ def update_msa_decode_graph_metadata_fused_triton(
     tail_pages = tl.minimum(
         tl.maximum((tail_tokens + PAGE_SIZE - 1) // PAGE_SIZE, 1), PAGES_PER_BLOCK
     )
-    effective_pages = tl.maximum((selected_blocks - 1) * PAGES_PER_BLOCK + tail_pages, 1)
+    effective_pages = tl.maximum(
+        (selected_blocks - 1) * PAGES_PER_BLOCK + tail_pages, 1
+    )
     selected_tokens = effective_pages * PAGE_SIZE
     num_chunks = tl.maximum((selected_tokens + kv_chunk_size - 1) // kv_chunk_size, 1)
     num_chunks = tl.where(active, num_chunks, 0)
@@ -554,9 +580,7 @@ def update_prefill_graph_work_metadata_triton(
     usable = in_block_capacity & in_work_capacity & in_batch
 
     q_start = tl.load(cu_seqlens_q_ptr + req_idx, mask=usable, other=0).to(tl.int32)
-    q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1, mask=usable, other=0).to(
-        tl.int32
-    )
+    q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1, mask=usable, other=0).to(tl.int32)
     q_len = tl.maximum(q_end - q_start, 0)
     cache_len = tl.load(cache_seqlens_ptr + req_idx, mask=usable, other=0).to(tl.int32)
 
@@ -585,10 +609,16 @@ def update_prefill_graph_work_metadata_triton(
         & (q_len > 0)
         & (cache_len > 0)
     )
-    tl.store(block_valid_mask_ptr + offsets, active.to(tl.int32), mask=in_block_capacity)
+    tl.store(
+        block_valid_mask_ptr + offsets, active.to(tl.int32), mask=in_block_capacity
+    )
     tl.store(request_indices_ptr + offsets, req_idx.to(tl.int32), mask=in_work_capacity)
-    tl.store(qo_tile_indices_ptr + offsets, q_tile_idx.to(tl.int32), mask=in_work_capacity)
-    tl.store(kv_tile_indices_ptr + offsets, kv_tile_idx.to(tl.int32), mask=in_work_capacity)
+    tl.store(
+        qo_tile_indices_ptr + offsets, q_tile_idx.to(tl.int32), mask=in_work_capacity
+    )
+    tl.store(
+        kv_tile_indices_ptr + offsets, kv_tile_idx.to(tl.int32), mask=in_work_capacity
+    )
 
     first_slot_for_req = usable & (req_local == 0)
     tl.store(
@@ -647,7 +677,10 @@ def make_decode_chunk_pages_lut_tensor(
     if any(int(chunk_pages) <= 0 for chunk_pages in decode_chunk_pages_lut):
         raise ValueError("decode chunk-pages LUT must contain only positive values")
     return torch.tensor(
-        (int(decode_chunk_pages_lut[0]), *(int(chunk_pages) for chunk_pages in decode_chunk_pages_lut)),
+        (
+            int(decode_chunk_pages_lut[0]),
+            *(int(chunk_pages) for chunk_pages in decode_chunk_pages_lut),
+        ),
         dtype=torch.int32,
         device=device,
     )
@@ -695,7 +728,9 @@ def build_msa_prefill_union_metadata(
     if tuple(union_blocks.shape) != tuple(union_masks.shape):
         raise ValueError("MSA union block and mask buffers must have matching shapes")
     if int(union_blocks.shape[1]) != int(q2k_indices.shape[0]):
-        raise ValueError("MSA union buffers must use the same kv-head count as q2k_indices")
+        raise ValueError(
+            "MSA union buffers must use the same kv-head count as q2k_indices"
+        )
     if int(union_blocks.shape[2]) < _MSA_UNION_MAX_BLOCKS:
         raise ValueError("MSA union buffers need capacity for 128 blocks per tile")
     if tuple(union_counts.shape) != tuple(union_blocks.shape[:2]):
@@ -703,8 +738,13 @@ def build_msa_prefill_union_metadata(
     work_capacity = int(block_valid_mask.shape[0])
     if int(union_blocks.shape[0]) < work_capacity:
         raise ValueError("MSA union buffers are smaller than block_valid_mask capacity")
-    if int(request_indices.shape[0]) < work_capacity or int(qo_tile_indices.shape[0]) < work_capacity:
-        raise ValueError("MSA worklist buffers are smaller than block_valid_mask capacity")
+    if (
+        int(request_indices.shape[0]) < work_capacity
+        or int(qo_tile_indices.shape[0]) < work_capacity
+    ):
+        raise ValueError(
+            "MSA worklist buffers are smaller than block_valid_mask capacity"
+        )
     device = q2k_indices.device
     tensors = (
         cache_seqlens,
@@ -757,7 +797,9 @@ def stage_decode_cuda_graph_metadata(
     if req_pool_indices.device != device:
         raise ValueError("req_pool_indices and page_table must be on the same device")
     if seq_lens.device != device or cache_seqlens.device != device:
-        raise ValueError("seq_lens/cache_seqlens and page_table must be on the same device")
+        raise ValueError(
+            "seq_lens/cache_seqlens and page_table must be on the same device"
+        )
     if cu_seqlens_q.device != device:
         raise ValueError("cu_seqlens_q and page_table must be on the same device")
     if page_size <= 0:
@@ -782,7 +824,9 @@ def stage_decode_cuda_graph_metadata(
 
     has_swa = swa_page_table is not None
     if has_swa != (swa_index_mapping is not None):
-        raise ValueError("swa_page_table and swa_index_mapping must be provided together")
+        raise ValueError(
+            "swa_page_table and swa_index_mapping must be provided together"
+        )
     if has_swa:
         assert swa_page_table is not None
         assert swa_index_mapping is not None
@@ -831,7 +875,9 @@ def patch_decode_cuda_graph_current_pages(
 ) -> None:
     device = page_table.device
     if cache_seqlens.device != device or out_cache_loc.device != device:
-        raise ValueError("cache_seqlens/out_cache_loc and page_table must share a device")
+        raise ValueError(
+            "cache_seqlens/out_cache_loc and page_table must share a device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     if page_table.ndim != 2:
@@ -916,15 +962,23 @@ def update_decode_graph_chunk_metadata_fused(
     if request_indices.device != device:
         raise ValueError("request_indices and cache_seqlens must be on the same device")
     if qo_tile_indices.device != device or kv_tile_indices.device != device:
-        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "tile index buffers and cache_seqlens must be on the same device"
+        )
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
-        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device:
-        raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
+        raise ValueError(
+            "kv_window_start_tokens and cache_seqlens must be on the same device"
+        )
     if decode_chunk_pages_lut.device != device:
-        raise ValueError("decode_chunk_pages_lut and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode_chunk_pages_lut and cache_seqlens must be on the same device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     if window_left < -1:
@@ -935,19 +989,34 @@ def update_decode_graph_chunk_metadata_fused(
         raise ValueError("decode graph replay requires bs > 0")
     work_items_capacity = int(request_indices.shape[0])
     block_valid_capacity = int(block_valid_mask.shape[0])
-    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
-        raise RuntimeError("decode graph tile index buffers must match request_indices shape")
+    if (
+        int(qo_tile_indices.shape[0]) != work_items_capacity
+        or int(kv_tile_indices.shape[0]) != work_items_capacity
+    ):
+        raise RuntimeError(
+            "decode graph tile index buffers must match request_indices shape"
+        )
     if work_items_capacity % bs != 0:
-        raise RuntimeError("decode graph workspace request_indices shape is incompatible with the batch bucket")
+        raise RuntimeError(
+            "decode graph workspace request_indices shape is incompatible with the batch bucket"
+        )
     max_chunks_per_req = work_items_capacity // bs
     if max_chunks_per_req <= 0:
-        raise RuntimeError("decode graph workspace must allocate at least one chunk per request")
+        raise RuntimeError(
+            "decode graph workspace must allocate at least one chunk per request"
+        )
     if int(merge_indptr.shape[0]) < bs + 1 or int(o_indptr.shape[0]) < bs + 1:
-        raise RuntimeError("decode graph indptr buffers are smaller than the graph batch")
+        raise RuntimeError(
+            "decode graph indptr buffers are smaller than the graph batch"
+        )
     if int(kv_window_start_tokens.shape[0]) < bs:
-        raise RuntimeError("decode graph kv_window_start_tokens is smaller than the graph batch")
+        raise RuntimeError(
+            "decode graph kv_window_start_tokens is smaller than the graph batch"
+        )
     if int(decode_chunk_pages_lut.shape[0]) < 2:
-        raise RuntimeError("decode graph chunk-pages LUT must contain at least two entries")
+        raise RuntimeError(
+            "decode graph chunk-pages LUT must contain at least two entries"
+        )
 
     update_decode_graph_metadata_fused_triton[(1,)](
         cache_seqlens,
@@ -1012,10 +1081,15 @@ def update_decode_graph_replay_metadata(
         raise ValueError("req_pool_indices and page_table must be on the same device")
     if cache_seqlens.device != page_table.device:
         raise ValueError("cache_seqlens and page_table must be on the same device")
-    if qo_tile_indices.device != page_table.device or kv_tile_indices.device != page_table.device:
+    if (
+        qo_tile_indices.device != page_table.device
+        or kv_tile_indices.device != page_table.device
+    ):
         raise ValueError("tile index buffers and page_table must be on the same device")
     if decode_chunk_pages_lut.device != page_table.device:
-        raise ValueError("decode_chunk_pages_lut and page_table must be on the same device")
+        raise ValueError(
+            "decode_chunk_pages_lut and page_table must be on the same device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
 
@@ -1025,13 +1099,22 @@ def update_decode_graph_replay_metadata(
     if int(req_pool_indices.shape[0]) != bs:
         raise ValueError("req_pool_indices shape must match cache_seqlens batch")
     work_items_capacity = int(request_indices.shape[0])
-    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
-        raise RuntimeError("decode graph tile index buffers must match request_indices shape")
+    if (
+        int(qo_tile_indices.shape[0]) != work_items_capacity
+        or int(kv_tile_indices.shape[0]) != work_items_capacity
+    ):
+        raise RuntimeError(
+            "decode graph tile index buffers must match request_indices shape"
+        )
     if work_items_capacity % bs != 0:
-        raise RuntimeError("decode graph workspace request_indices shape is incompatible with the batch bucket")
+        raise RuntimeError(
+            "decode graph workspace request_indices shape is incompatible with the batch bucket"
+        )
     max_chunks_per_req = work_items_capacity // bs
     if max_chunks_per_req <= 0:
-        raise RuntimeError("decode graph workspace must allocate at least one chunk per request")
+        raise RuntimeError(
+            "decode graph workspace must allocate at least one chunk per request"
+        )
 
     page_blocks = triton.cdiv(int(page_table.shape[1]), _DECODE_BLOCK_PAGES)
     build_decode_graph_page_table_full_triton[(bs, page_blocks)](
@@ -1081,42 +1164,65 @@ def update_msa_decode_graph_chunk_metadata(
     if request_indices.device != device:
         raise ValueError("request_indices and cache_seqlens must be on the same device")
     if qo_tile_indices.device != device or kv_tile_indices.device != device:
-        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "tile index buffers and cache_seqlens must be on the same device"
+        )
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
-        raise ValueError("MSA decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "MSA decode graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device:
-        raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
+        raise ValueError(
+            "kv_window_start_tokens and cache_seqlens must be on the same device"
+        )
     if page_size not in (64, 128):
-        raise ValueError("MSA decode graph replay requires page_size=64 or page_size=128")
+        raise ValueError(
+            "MSA decode graph replay requires page_size=64 or page_size=128"
+        )
     kv_chunk_size = int(kv_chunk_size)
     # Chunk boundaries are 64-token-tile aligned in the compacted virtual key
     # space regardless of the physical page size.
     if kv_chunk_size <= 0 or kv_chunk_size % 64 != 0:
-        raise ValueError("MSA decode graph kv_chunk_size must be a positive multiple of 64 tokens")
+        raise ValueError(
+            "MSA decode graph kv_chunk_size must be a positive multiple of 64 tokens"
+        )
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
         raise ValueError("MSA decode graph replay requires bs > 0")
     work_items_capacity = int(request_indices.shape[0])
     block_valid_capacity = int(block_valid_mask.shape[0])
-    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
-        raise RuntimeError("MSA decode graph tile index buffers must match request_indices shape")
+    if (
+        int(qo_tile_indices.shape[0]) != work_items_capacity
+        or int(kv_tile_indices.shape[0]) != work_items_capacity
+    ):
+        raise RuntimeError(
+            "MSA decode graph tile index buffers must match request_indices shape"
+        )
     if work_items_capacity % bs != 0:
-        raise RuntimeError("MSA decode graph workspace request_indices shape is incompatible with the batch bucket")
+        raise RuntimeError(
+            "MSA decode graph workspace request_indices shape is incompatible with the batch bucket"
+        )
     max_chunks_per_req = work_items_capacity // bs
     if max_chunks_per_req <= 0:
-        raise RuntimeError("MSA decode graph workspace must allocate at least one chunk per request")
+        raise RuntimeError(
+            "MSA decode graph workspace must allocate at least one chunk per request"
+        )
     max_required_chunks = triton.cdiv(16 * 128, kv_chunk_size)
     if max_chunks_per_req < max_required_chunks:
         raise RuntimeError(
             "MSA decode graph workspace request_indices capacity is too small for the chunk size"
         )
     if int(merge_indptr.shape[0]) < bs + 1 or int(o_indptr.shape[0]) < bs + 1:
-        raise RuntimeError("MSA decode graph indptr buffers are smaller than the graph batch")
+        raise RuntimeError(
+            "MSA decode graph indptr buffers are smaller than the graph batch"
+        )
     if int(kv_window_start_tokens.shape[0]) < bs:
-        raise RuntimeError("MSA decode graph kv_window_start_tokens is smaller than the graph batch")
+        raise RuntimeError(
+            "MSA decode graph kv_window_start_tokens is smaller than the graph batch"
+        )
 
     update_msa_decode_graph_metadata_fused_triton[(1,)](
         cache_seqlens,
@@ -1174,7 +1280,9 @@ def update_msa_decode_graph_replay_metadata(
     if cache_seqlens.device != page_table.device:
         raise ValueError("cache_seqlens and page_table must be on the same device")
     if page_size not in (64, 128):
-        raise ValueError("MSA decode graph replay requires page_size=64 or page_size=128")
+        raise ValueError(
+            "MSA decode graph replay requires page_size=64 or page_size=128"
+        )
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
@@ -1231,7 +1339,9 @@ def update_regular_decode_graph_replay_metadata(
     if cache_seqlens.device != page_table.device:
         raise ValueError("cache_seqlens and page_table must be on the same device")
     if decode_chunk_pages_lut.device != page_table.device:
-        raise ValueError("decode_chunk_pages_lut and page_table must be on the same device")
+        raise ValueError(
+            "decode_chunk_pages_lut and page_table must be on the same device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
 
@@ -1294,9 +1404,13 @@ def _launch_regular_decode_graph_metadata_fused(
     kv_chunk_size_tensor = kv_chunk_size_ptr
     if use_lut:
         if decode_chunk_pages_lut.device != cache_seqlens.device:
-            raise ValueError("decode_chunk_pages_lut and cache_seqlens must be on the same device")
+            raise ValueError(
+                "decode_chunk_pages_lut and cache_seqlens must be on the same device"
+            )
         if int(decode_chunk_pages_lut.shape[0]) < 2:
-            raise RuntimeError("decode graph chunk-pages LUT must contain at least two entries")
+            raise RuntimeError(
+                "decode graph chunk-pages LUT must contain at least two entries"
+            )
         lut_size = int(decode_chunk_pages_lut.shape[0])
     else:
         decode_chunk_pages_lut = kv_chunk_size_ptr
@@ -1304,13 +1418,19 @@ def _launch_regular_decode_graph_metadata_fused(
         if has_kv_chunk_size_tensor:
             assert isinstance(kv_chunk_size, torch.Tensor)
             if kv_chunk_size.device != cache_seqlens.device:
-                raise ValueError("kv_chunk_size tensor and cache_seqlens must be on the same device")
+                raise ValueError(
+                    "kv_chunk_size tensor and cache_seqlens must be on the same device"
+                )
             if kv_chunk_size.numel() != 1:
-                raise ValueError("kv_chunk_size tensor must contain exactly one element")
+                raise ValueError(
+                    "kv_chunk_size tensor must contain exactly one element"
+                )
             kv_chunk_size_tensor = kv_chunk_size.reshape(1)
         else:
             if kv_chunk_size is None:
-                raise ValueError("kv_chunk_size is required when decode_chunk_pages_lut is not provided")
+                raise ValueError(
+                    "kv_chunk_size is required when decode_chunk_pages_lut is not provided"
+                )
             fixed_kv_chunk_size = int(kv_chunk_size)
             if fixed_kv_chunk_size <= 0:
                 raise ValueError("kv_chunk_size must be positive")
@@ -1386,9 +1506,13 @@ def update_regular_decode_graph_chunk_metadata_from_lut(
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if kv_chunk_size_ptr.device != device:
-        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device:
-        raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
+        raise ValueError(
+            "kv_window_start_tokens and cache_seqlens must be on the same device"
+        )
 
     _launch_regular_decode_graph_metadata_fused(
         cache_seqlens=cache_seqlens,
@@ -1420,9 +1544,13 @@ def update_regular_decode_graph_chunk_metadata(
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if kv_chunk_size_ptr.device != device:
-        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device:
-        raise ValueError("kv_window_start_tokens and cache_seqlens must be on the same device")
+        raise ValueError(
+            "kv_window_start_tokens and cache_seqlens must be on the same device"
+        )
     if max_chunks_per_req <= 0:
         raise ValueError("max_chunks_per_req must be positive")
     if page_size <= 0:
@@ -1465,13 +1593,19 @@ def update_decode_graph_chunk_metadata(
     if request_indices.device != device:
         raise ValueError("request_indices and cache_seqlens must be on the same device")
     if qo_tile_indices.device != device or kv_tile_indices.device != device:
-        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "tile index buffers and cache_seqlens must be on the same device"
+        )
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
-        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode graph buffers and cache_seqlens must be on the same device"
+        )
     if decode_chunk_pages_lut.device != device:
-        raise ValueError("decode_chunk_pages_lut and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode_chunk_pages_lut and cache_seqlens must be on the same device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
 
@@ -1521,13 +1655,19 @@ def update_prefill_graph_chunk_metadata(
     if request_indices.device != device:
         raise ValueError("request_indices and cache_seqlens must be on the same device")
     if qo_tile_indices.device != device or kv_tile_indices.device != device:
-        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "tile index buffers and cache_seqlens must be on the same device"
+        )
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
-        raise ValueError("prefill graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "prefill graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device or total_num_rows_ptr.device != device:
-        raise ValueError("prefill graph scalar buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "prefill graph scalar buffers and cache_seqlens must be on the same device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     if cta_tile_q <= 0:
@@ -1546,8 +1686,13 @@ def update_prefill_graph_chunk_metadata(
         raise ValueError("cu_seqlens_q is smaller than the graph batch")
     work_items_capacity = int(request_indices.shape[0])
     block_valid_capacity = int(block_valid_mask.shape[0])
-    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
-        raise RuntimeError("prefill graph tile index buffers must match request_indices shape")
+    if (
+        int(qo_tile_indices.shape[0]) != work_items_capacity
+        or int(kv_tile_indices.shape[0]) != work_items_capacity
+    ):
+        raise RuntimeError(
+            "prefill graph tile index buffers must match request_indices shape"
+        )
     if max_q_tiles_per_req <= 0:
         raise ValueError("max_q_tiles_per_req must be positive")
     if max_chunks_per_q_tile <= 0:

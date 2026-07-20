@@ -9,7 +9,7 @@ import torch
 
 
 @dataclass(frozen=True, kw_only=True)
-class SPARKINFERScratchBufferSpec:
+class ScratchBufferSpec:
     name: str
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -28,8 +28,8 @@ def scratch_buffer_spec(
     *,
     nbytes: int,
     device: torch.device,
-) -> SPARKINFERScratchBufferSpec:
-    return SPARKINFERScratchBufferSpec(
+) -> ScratchBufferSpec:
+    return ScratchBufferSpec(
         name=name,
         shape=(max(int(nbytes), 1),),
         dtype=torch.uint8,
@@ -39,12 +39,14 @@ def scratch_buffer_spec(
 
 def scratch_tensor(
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-    specs: tuple[SPARKINFERScratchBufferSpec, ...],
+    specs: tuple[ScratchBufferSpec, ...],
     *,
     owner: str,
 ) -> torch.Tensor:
     if len(specs) != 1:
-        raise RuntimeError(f"{owner} scratch plans currently expect exactly one scratch buffer")
+        raise RuntimeError(
+            f"{owner} scratch plans currently expect exactly one scratch buffer"
+        )
     spec = specs[0]
     if isinstance(scratch, torch.Tensor):
         tensor = scratch
@@ -54,12 +56,18 @@ def scratch_tensor(
         tensor = scratch[spec.name]
     else:
         if len(scratch) != 1:
-            raise ValueError(f"scratch sequence must contain exactly one tensor, got {len(scratch)}")
+            raise ValueError(
+                f"scratch sequence must contain exactly one tensor, got {len(scratch)}"
+            )
         tensor = scratch[0]
     if tensor.dtype != spec.dtype:
-        raise TypeError(f"{spec.name} scratch must have dtype {spec.dtype}, got {tensor.dtype}")
+        raise TypeError(
+            f"{spec.name} scratch must have dtype {spec.dtype}, got {tensor.dtype}"
+        )
     if tensor.device != spec.device:
-        raise ValueError(f"{spec.name} scratch device {tensor.device} does not match {spec.device}")
+        raise ValueError(
+            f"{spec.name} scratch device {tensor.device} does not match {spec.device}"
+        )
     if int(tensor.numel()) < int(spec.shape[0]):
         raise ValueError(
             f"{spec.name} scratch has {int(tensor.numel())} bytes, requires {int(spec.shape[0])}"
@@ -70,7 +78,7 @@ def scratch_tensor(
 
 
 __all__ = [
-    "SPARKINFERScratchBufferSpec",
+    "ScratchBufferSpec",
     "scratch_buffer_spec",
     "scratch_tensor",
 ]

@@ -21,13 +21,13 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.cute.compiler import (
+from sparkinfer._lib.compiler import (
     DimKey,
     KernelCompileSpec,
     launch as sparkinfer_launch,
     tensor_compile_fact,
 )
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     atomic_add_shared_i32,
     ld_shared_i32,
     ld_shared_i32_relaxed,
@@ -35,7 +35,7 @@ from sparkinfer.cute.intrinsics import (
     shared_ptr_to_u32,
     st_shared_i32,
 )
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.utils import current_cuda_stream
 
 _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
@@ -416,9 +416,7 @@ class SparseNSATiledTopkKernel:
                 # A balanced extent split can round its final slice up by one
                 # tile. Clip that slice to the tiles actually present instead
                 # of reading the next scratch region as logits.
-                tiled_end = input_index_offset + (
-                    num_k_tiles - tile_k_offset
-                ) * block_k
+                tiled_end = input_index_offset + (num_k_tiles - tile_k_offset) * block_k
                 if chunk_end > tiled_end:
                     chunk_end = tiled_end
             if clipped_end > chunk_end:
@@ -618,7 +616,9 @@ class SparseNSATiledTopkKernel:
 
             if topk == Int32(0):
                 idx_base = Int32(tx)
-                full_scan_limit = total_len - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = total_len - Int32(
+                    (_SCAN_UNROLL - 1) * _THREADS_PER_CTA
+                )
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                         idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
@@ -668,7 +668,9 @@ class SparseNSATiledTopkKernel:
                 cute.arch.sync_threads()
 
                 idx_base = Int32(tx)
-                full_scan_limit = total_len - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = total_len - Int32(
+                    (_SCAN_UNROLL - 1) * _THREADS_PER_CTA
+                )
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                         idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from sparkinfer.moe.fused.dynamic import MoEDynamicKernelBackend
-from sparkinfer.moe.fused.micro import MoEMicroKernelBackend
+from sparkinfer.moe._shared.kernels.dynamic import (
+    MoEDynamicKernelBackend,
+)
+from sparkinfer.moe._shared.kernels.micro import (
+    MoEMicroKernelBackend,
+)
 
 
 class MoEMicroKernelRelu2(MoEMicroKernelBackend):

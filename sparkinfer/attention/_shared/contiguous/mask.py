@@ -5,8 +5,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from sparkinfer.attention.contiguous import layout_utils
-from sparkinfer.attention.contiguous.seqlen_info import SeqlenInfoQK
+from sparkinfer.attention._shared.contiguous import layout_utils
+from sparkinfer.attention._shared.contiguous.seqlen_info import (
+    SeqlenInfoQK,
+)
 
 
 @dataclass(frozen=True)
@@ -45,9 +47,15 @@ class AttentionMask:
     ) -> None:
         del batch_idx, head_idx, mask_seqlen, mask_mod, aux_tensors, fastdiv_mods
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
-        acc_shape = (self.tile_m, self.tile_n) if const_expr(not self.swap_AB) else (self.tile_n, self.tile_m)
+        acc_shape = (
+            (self.tile_m, self.tile_n)
+            if const_expr(not self.swap_AB)
+            else (self.tile_n, self.tile_m)
+        )
         cS = cute.make_identity_tensor(acc_shape)
-        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=self.swap_AB)
+        tScS_mn = layout_utils.reshape_acc_to_mn(
+            thr_mma.partition_C(cS), transpose=self.swap_AB
+        )
         t0ScS_mn = layout_utils.reshape_acc_to_mn(
             thr_mma.get_slice(0).partition_C(cS),
             transpose=self.swap_AB,
@@ -65,14 +73,20 @@ class AttentionMask:
                 else row_idx
             )
             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                col_idx = t0ScS_mn[0, c][col_dim] + thr_col_offset + n_block * self.tile_n
+                col_idx = (
+                    t0ScS_mn[0, c][col_dim] + thr_col_offset + n_block * self.tile_n
+                )
                 masked = (q_row_idx >= self.seqlen_q) | (col_idx >= self.seqlen_k)
                 if const_expr(mask_causal):
-                    masked = masked | (col_idx >= q_row_idx + 1 + self.seqlen_k - self.seqlen_q)
+                    masked = masked | (
+                        col_idx >= q_row_idx + 1 + self.seqlen_k - self.seqlen_q
+                    )
                 if const_expr(mask_local):
                     anchor = q_row_idx + self.seqlen_k - self.seqlen_q
                     if const_expr(self.window_size_left is not None):
                         masked = masked | (col_idx < anchor - self.window_size_left)
                     if const_expr(self.window_size_right is not None):
-                        masked = masked | (col_idx >= anchor + self.window_size_right + 1)
+                        masked = masked | (
+                            col_idx >= anchor + self.window_size_right + 1
+                        )
                 acc_S_mn[r, c] = cutlass.select_(masked, -Float32.inf, acc_S_mn[r, c])

@@ -60,7 +60,9 @@ def _normalize_device(device: torch.device | int | str) -> torch.device:
     return torch.device(device)
 
 
-def _current_stream_key(device: torch.device | int | str, stream: object = None) -> Optional[int]:
+def _current_stream_key(
+    device: torch.device | int | str, stream: object = None
+) -> Optional[int]:
     device_obj = _normalize_device(device)
     if device_obj.type != "cuda":
         return None
@@ -85,7 +87,10 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     if inp.is_contiguous():
         return True
     storage = inp.untyped_storage()
-    return storage.nbytes() - inp.storage_offset() * inp.element_size() == inp.numel() * inp.element_size()
+    return (
+        storage.nbytes() - inp.storage_offset() * inp.element_size()
+        == inp.numel() * inp.element_size()
+    )
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -96,7 +101,11 @@ def _resolve_exchange_group(
     exchange_group: Optional[ProcessGroup],
     process_group: Optional[ProcessGroup],
 ) -> Optional[ProcessGroup]:
-    if exchange_group is not None and process_group is not None and exchange_group is not process_group:
+    if (
+        exchange_group is not None
+        and process_group is not None
+        and exchange_group is not process_group
+    ):
         raise ValueError("pass only one of exchange_group or process_group")
     return exchange_group if exchange_group is not None else process_group
 
@@ -118,10 +127,14 @@ def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
         except TypeError:
             backend = dist.get_backend(group)
     except Exception as exc:
-        raise RuntimeError("PCIe oneshot IPC exchange requires a CUDA/NCCL process group") from exc
+        raise RuntimeError(
+            "PCIe oneshot IPC exchange requires a CUDA/NCCL process group"
+        ) from exc
     backend_name = str(backend).lower()
     if "nccl" not in backend_name:
-        raise RuntimeError(f"PCIe oneshot IPC exchange requires an NCCL process group, got {backend}")
+        raise RuntimeError(
+            f"PCIe oneshot IPC exchange requires an NCCL process group, got {backend}"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("PCIe oneshot IPC exchange requires CUDA")
     return torch.device("cuda", torch.cuda.current_device())
@@ -136,7 +149,9 @@ def _broadcast_gather_object(local_object: object, group: ProcessGroup) -> list[
     all_objects[rank][0] = local_object
     device = _object_broadcast_device(group)
     for index, src_rank in enumerate(_group_ranks(group)):
-        dist.broadcast_object_list(all_objects[index], src=src_rank, group=group, device=device)
+        dist.broadcast_object_list(
+            all_objects[index], src=src_rank, group=group, device=device
+        )
     return [entry[0] for entry in all_objects]
 
 
@@ -281,8 +296,12 @@ class PCIeOneshotAllReduce:
         if ext_module is None and self.device.type != "cuda":
             raise ValueError("PCIe oneshot allreduce requires a CUDA device")
 
-        self.rank_data = torch.empty(rank_data_bytes, dtype=torch.uint8, device=self.device)
-        self._ptr = self._ext.init_custom_ar(list(self._signal_ptrs), self.rank_data, self.rank)
+        self.rank_data = torch.empty(
+            rank_data_bytes, dtype=torch.uint8, device=self.device
+        )
+        self._ptr = self._ext.init_custom_ar(
+            list(self._signal_ptrs), self.rank_data, self.rank
+        )
 
         self._eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
         if eager_buffer_ptrs0 is not None and eager_buffer_ptrs1 is not None:
@@ -403,7 +422,9 @@ class PCIeOneshotAllReduce:
         return cls.from_exchange_group(
             exchange_group=process_group,
             device=device,
-            eager_buffer_bytes=max_input_bytes if eager_buffer_bytes is None else eager_buffer_bytes,
+            eager_buffer_bytes=max_input_bytes
+            if eager_buffer_bytes is None
+            else eager_buffer_bytes,
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
@@ -546,7 +567,9 @@ class PCIeOneshotAllReduce:
         existing = self._registered_input_ptrs.get(local_ptr)
         if existing is not None:
             if existing != ptrs:
-                raise ValueError("input pointer is already registered with different peer_input_ptrs")
+                raise ValueError(
+                    "input pointer is already registered with different peer_input_ptrs"
+                )
             return
         self._ext.register_buffer(self._ptr, list(ptrs))
         self._registered_input_ptrs[local_ptr] = ptrs
@@ -726,7 +749,9 @@ class PCIeOneshotAllReduce:
         all_meta = _broadcast_gather_object(local_meta, self.exchange_group)
         num_buffers = [len(entry[1]) for entry in all_meta]
         if any(count != num_buffers[0] for count in num_buffers):
-            raise RuntimeError("graph capture registered a different number of buffers across ranks")
+            raise RuntimeError(
+                "graph capture registered a different number of buffers across ranks"
+            )
         if num_buffers[0] == 0:
             return
         self.register_graph_buffers_from_ranks(
@@ -823,6 +848,7 @@ class PCIeOneshotAllReduce:
         self.max_size = crossover
 
         if self.rank == 0:
+
             def fmt_size(size_bytes: int) -> str:
                 if size_bytes >= 1024 * 1024:
                     return f"{size_bytes // (1024 * 1024)}MB"
@@ -830,7 +856,9 @@ class PCIeOneshotAllReduce:
                     return f"{size_bytes // 1024}KB"
                 return f"{size_bytes}B"
 
-            lines = [f"[PCIe oneshot allreduce] Crossover benchmark ({self.world_size} GPUs, bf16):"]
+            lines = [
+                f"[PCIe oneshot allreduce] Crossover benchmark ({self.world_size} GPUs, bf16):"
+            ]
             for result in results:
                 lines.append(
                     f"  {fmt_size(result.size_bytes):>6s}:  custom {result.custom_us:6.1f} us  "
@@ -895,7 +923,9 @@ class PCIeOneshotAllReducePool:
         ext_module=None,
         ipc: Optional[CudaRTLibrary] = None,
         single_channel: bool = False,
-        channel_factory: Optional[Callable[[Optional[int]], PCIeOneshotAllReduce]] = None,
+        channel_factory: Optional[
+            Callable[[Optional[int]], PCIeOneshotAllReduce]
+        ] = None,
     ):
         if world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
@@ -920,7 +950,9 @@ class PCIeOneshotAllReducePool:
         self._ext = ext_module
         if self._channel_factory is None:
             if self.exchange_group is None:
-                raise ValueError("exchange_group is required unless channel_factory is provided")
+                raise ValueError(
+                    "exchange_group is required unless channel_factory is provided"
+                )
             if self.device.type != "cuda":
                 raise ValueError("PCIe oneshot pool requires a CUDA device")
             self._ipc = self._ipc or CudaRTLibrary()
@@ -967,7 +999,9 @@ class PCIeOneshotAllReducePool:
         return cls.from_exchange_group(
             exchange_group=process_group,
             device=device,
-            eager_buffer_bytes=max_input_bytes if eager_buffer_bytes is None else eager_buffer_bytes,
+            eager_buffer_bytes=max_input_bytes
+            if eager_buffer_bytes is None
+            else eager_buffer_bytes,
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,

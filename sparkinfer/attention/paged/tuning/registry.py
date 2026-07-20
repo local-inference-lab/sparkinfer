@@ -67,13 +67,19 @@ def register_decode_graph_policy(
     if page_size is not None and page_size <= 0:
         raise ValueError("page_size must be positive when provided")
     _validate_ladder(ladder=chunk_ladder, value_name="chunk_pages")
-    DECODE_GRAPH_POLICY.setdefault((normalize_kv_dtype_key(kv_dtype), regime), {})[batch] = DecodeGraphPolicy(
+    DECODE_GRAPH_POLICY.setdefault((normalize_kv_dtype_key(kv_dtype), regime), {})[
+        batch
+    ] = DecodeGraphPolicy(
         graph_ctas_per_sm=int(graph_ctas_per_sm),
         chunk_ladder=tuple(chunk_ladder),
         capture_fixed_split_pages=(
-            None if capture_fixed_split_pages is None else int(capture_fixed_split_pages)
+            None
+            if capture_fixed_split_pages is None
+            else int(capture_fixed_split_pages)
         ),
-        capture_page_count=None if capture_page_count is None else int(capture_page_count),
+        capture_page_count=None
+        if capture_page_count is None
+        else int(capture_page_count),
         page_size=None if page_size is None else int(page_size),
     )
 
@@ -86,7 +92,10 @@ def get_decode_graph_policy(
 ) -> DecodeGraphPolicy:
     family = DECODE_GRAPH_POLICY[(normalize_kv_dtype_key(kv_dtype), regime)]
     available_batches = sorted(family)
-    snapped_batch = next((candidate for candidate in available_batches if candidate >= batch), available_batches[-1])
+    snapped_batch = next(
+        (candidate for candidate in available_batches if candidate >= batch),
+        available_batches[-1],
+    )
     return family[snapped_batch]
 
 
@@ -99,7 +108,9 @@ def lookup_decode_graph_chunk_pages(
 ) -> int:
     if page_count <= 0:
         raise ValueError("page_count must be positive")
-    ladder = get_decode_graph_policy(kv_dtype=kv_dtype, regime=regime, batch=batch).chunk_ladder
+    ladder = get_decode_graph_policy(
+        kv_dtype=kv_dtype, regime=regime, batch=batch
+    ).chunk_ladder
     for end_page, chunk_pages in ladder:
         if page_count <= end_page:
             return chunk_pages

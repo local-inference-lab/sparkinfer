@@ -933,7 +933,9 @@ class PagedAttentionWorkspace:
                 window_left=int(self._plan.window_left),
             )
         elif self._use_regular_decode_graph_replay:
-            from .graph_replay import update_regular_decode_graph_chunk_metadata_from_lut
+            from .graph_replay import (
+                update_regular_decode_graph_chunk_metadata_from_lut,
+            )
 
             update_regular_decode_graph_chunk_metadata_from_lut(
                 cache_seqlens=self.cache_seqlens,
@@ -1453,7 +1455,9 @@ class PagedAttentionWorkspace:
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
     ):
-        from sparkinfer.integration.paged_attention_scratch import build_paged_attention_binding
+        from sparkinfer.attention.paged._scratch import (
+            build_paged_attention_binding,
+        )
 
         return build_paged_attention_binding(
             workspace=self,
@@ -1474,9 +1478,7 @@ class PagedAttentionWorkspace:
             relative_attention_bias=relative_attention_bias,
         )
 
-    def _validate_q2k_indices_reference(
-        self, q2k_indices: torch.Tensor | None
-    ) -> None:
+    def _validate_q2k_indices_reference(self, q2k_indices: torch.Tensor | None) -> None:
         if q2k_indices is not None:
             raise ValueError(
                 "q2k_indices are only supported by MSA block-sparse scratch bindings"
@@ -1495,9 +1497,11 @@ class PagedAttentionWorkspace:
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
         prepare_decode_graph_metadata: bool | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-        from .api import paged_attention_forward
-        from sparkinfer.integration.paged_attention_scratch import SPARKINFERPagedAttentionBinding
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from ._forward import paged_attention_forward
+        from sparkinfer.attention.paged._scratch import (
+            SPARKINFERPagedAttentionBinding,
+        )
 
         if prepare_decode_graph_metadata is None:
             prepare_decode_graph_metadata = (

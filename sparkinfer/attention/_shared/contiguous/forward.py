@@ -24,18 +24,33 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils as utils_basic
 
-from sparkinfer.attention._cute import copy as cute_copy
-from sparkinfer.attention._cute import ops as cute_ops
-from sparkinfer.attention._cute import pipeline as cute_pipeline
-from sparkinfer.attention.contiguous import layout_utils
-from sparkinfer.attention.contiguous.cute_dsl_utils import assume_tensor_aligned
-from sparkinfer.attention.contiguous.mask import AttentionMask
-from sparkinfer.attention.contiguous.softmax import Softmax
-from sparkinfer.attention.contiguous.seqlen_info import SeqlenInfoQK
-from sparkinfer.attention.contiguous.block_info import BlockInfo
-from sparkinfer.attention.contiguous.pack_gqa import PackGQA, pack_gqa_layout
-from sparkinfer.attention.contiguous.named_barrier import NamedBarrierFwd
-from sparkinfer.attention.contiguous.tile_scheduler import (
+from sparkinfer.attention._shared.cute import copy as cute_copy
+from sparkinfer.attention._shared.cute import ops as cute_ops
+from sparkinfer.attention._shared.cute import (
+    pipeline as cute_pipeline,
+)
+from sparkinfer.attention._shared.contiguous import layout_utils
+from sparkinfer.attention._shared.contiguous.cute_dsl_utils import (
+    assume_tensor_aligned,
+)
+from sparkinfer.attention._shared.contiguous.mask import (
+    AttentionMask,
+)
+from sparkinfer.attention._shared.contiguous.softmax import Softmax
+from sparkinfer.attention._shared.contiguous.seqlen_info import (
+    SeqlenInfoQK,
+)
+from sparkinfer.attention._shared.contiguous.block_info import (
+    BlockInfo,
+)
+from sparkinfer.attention._shared.contiguous.pack_gqa import (
+    PackGQA,
+    pack_gqa_layout,
+)
+from sparkinfer.attention._shared.contiguous.named_barrier import (
+    NamedBarrierFwd,
+)
+from sparkinfer.attention._shared.contiguous.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
@@ -124,7 +139,11 @@ def warp_mma_gemm_rs(
     cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
-            cute.copy(smem_thr_copy_B, tCsB[None, None, k + 1], tCrB_copy_view[None, None, k + 1])
+            cute.copy(
+                smem_thr_copy_B,
+                tCsB[None, None, k + 1],
+                tCrB_copy_view[None, None, k + 1],
+            )
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
@@ -155,7 +174,9 @@ class ContiguousAttentionForwardKernel:
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         self.same_hdim_kv = head_dim == head_dim_v
-        self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.tile_hdimv = int(
+            math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
+        )
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -169,10 +190,16 @@ class ContiguousAttentionForwardKernel:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
-        assert self.score_mod is None, "score_mod is not part of the initial sparkinfer transplant"
-        assert self.mask_mod is None, "mask_mod is not part of the initial sparkinfer transplant"
+        assert self.score_mod is None, (
+            "score_mod is not part of the initial sparkinfer transplant"
+        )
+        assert self.mask_mod is None, (
+            "mask_mod is not part of the initial sparkinfer transplant"
+        )
         self.mma_pv_is_rs = mma_pv_is_rs
-        assert self.mma_pv_is_rs, "SM120 rewrite currently only supports register-sourced PV"
+        assert self.mma_pv_is_rs, (
+            "SM120 rewrite currently only supports register-sourced PV"
+        )
         self.buffer_align_bytes = 1024
         self.num_compute_warps = num_compute_warps
         assert self.num_compute_warps >= 1
@@ -211,10 +238,16 @@ class ContiguousAttentionForwardKernel:
         assert mK_type == self.dtype
 
     def _setup_attributes(self):
-        sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom = (
-            self._get_smem_layout_atom()
+        (
+            sQ_layout_atom,
+            sK_layout_atom,
+            sV_layout_atom,
+            sO_layout_atom,
+            sP_layout_atom,
+        ) = self._get_smem_layout_atom()
+        self.sQ_layout = cute.tile_to_shape(
+            sQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
         )
-        self.sQ_layout = cute.tile_to_shape(sQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1))
         self.sK_layout = cute.tile_to_shape(
             sK_layout_atom,
             (self.tile_n, self.tile_hdim, self.num_stages),
@@ -225,7 +258,9 @@ class ContiguousAttentionForwardKernel:
             (self.tile_n, self.tile_hdimv, self.num_stages),
             (0, 1, 2),
         )
-        self.sO_layout = cute.tile_to_shape(sO_layout_atom, (self.tile_m, self.tile_hdimv), (0, 1))
+        self.sO_layout = cute.tile_to_shape(
+            sO_layout_atom, (self.tile_m, self.tile_hdimv), (0, 1)
+        )
         self.sP_layout = (
             cute.tile_to_shape(sP_layout_atom, (self.tile_m, self.tile_n), (0, 1))
             if const_expr(sP_layout_atom is not None)
@@ -268,10 +303,18 @@ class ContiguousAttentionForwardKernel:
         assert self.tile_m % tO_layout.shape[0] == 0
         vQKV_layout = cute.make_layout((1, async_copy_elems))
         vO_layout = vQKV_layout
-        self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async_copy, tQ_layout, vQKV_layout)
-        self.gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async_copy, tK_layout, vQKV_layout)
-        self.gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_copy, tV_layout, vQKV_layout)
-        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
+        self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(
+            atom_async_copy, tQ_layout, vQKV_layout
+        )
+        self.gmem_tiled_copy_K = cute.make_tiled_copy_tv(
+            atom_async_copy, tK_layout, vQKV_layout
+        )
+        self.gmem_tiled_copy_V = cute.make_tiled_copy_tv(
+            atom_async_copy, tV_layout, vQKV_layout
+        )
+        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+            atom_universal_copy, tO_layout, vO_layout
+        )
 
     @staticmethod
     def shared_storage_bytes(
@@ -337,7 +380,9 @@ class ContiguousAttentionForwardKernel:
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdim),
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdim
+            ),
             self.dtype,
         )
         sK_layout_atom = sQ_layout_atom
@@ -349,7 +394,13 @@ class ContiguousAttentionForwardKernel:
         )
         sO_layout_atom = sV_layout_atom
         sP_layout_atom = None
-        return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
+        return (
+            sQ_layout_atom,
+            sK_layout_atom,
+            sV_layout_atom,
+            sO_layout_atom,
+            sP_layout_atom,
+        )
 
     def _get_tiled_mma(self):
         tiled_mma_qk = cute.make_tiled_mma(
@@ -395,14 +446,17 @@ class ContiguousAttentionForwardKernel:
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
+            barrier_id=int(NamedBarrierFwd.Epilogue),
+            number_of_threads=self.num_epilogue_threads,
         )
         smem_copy_atom_O = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.dtype,
             num_bits_per_copy=2 * self.dtype.width,
         )
-        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
+        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(
+            tidx
+        )
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
         cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
@@ -415,7 +469,11 @@ class ContiguousAttentionForwardKernel:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
             else:
-                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                offset = (
+                    seqlen.offset_q
+                    if const_expr(not self.pack_gqa)
+                    else (0, seqlen.offset_q)
+                )
                 mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
@@ -424,9 +482,13 @@ class ContiguousAttentionForwardKernel:
                 )
                 gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
                 thr_mma = tiled_mma.get_slice(tidx)
-                taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gLSE_expanded))
+                taccOgLSE = layout_utils.reshape_acc_to_mn(
+                    thr_mma.partition_C(gLSE_expanded)
+                )
                 taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
-                t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                t0accOcO = layout_utils.reshape_acc_to_mn(
+                    thr_mma.get_slice(0).partition_C(cO)
+                )
                 if taccOcO[0][1] == 0:
                     for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
                         if (
@@ -435,15 +497,22 @@ class ContiguousAttentionForwardKernel:
                         ):
                             taccOgLSE[m, 0] = lse[m]
             else:
-                pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+                pack_gqa.store_LSE(
+                    mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q
+                )
 
         if const_expr(not seqlen.has_cu_seqlens_q):
             mO_cur = mO[None, None, head_idx, batch_idx]
         else:
-            offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+            offset = (
+                seqlen.offset_q
+                if const_expr(not self.pack_gqa)
+                else (0, seqlen.offset_q)
+            )
             mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
         cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
+            barrier_id=int(NamedBarrierFwd.Epilogue),
+            number_of_threads=self.num_epilogue_threads,
         )
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_copy_O.partition_S(sO)
@@ -469,7 +538,9 @@ class ContiguousAttentionForwardKernel:
                         else None,
                     )
         else:
-            pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
+            pack_gqa.store_O(
+                mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q
+            )
 
     @cute.jit
     def __call__(
@@ -522,18 +593,34 @@ class ContiguousAttentionForwardKernel:
         self.use_tma_O = False
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        Q_layout_transpose = [1, 3, 2, 0] if const_expr(cute.rank(mQ) == 4) else [0, 2, 1]
-        O_layout_transpose = [1, 3, 2, 0] if const_expr(cute.rank(mO) == 4) else [0, 2, 1]
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
-        mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
-        KV_layout_transpose = [1, 3, 2, 0] if const_expr(cute.rank(mK) == 4) else [0, 2, 1]
+        Q_layout_transpose = (
+            [1, 3, 2, 0] if const_expr(cute.rank(mQ) == 4) else [0, 2, 1]
+        )
+        O_layout_transpose = (
+            [1, 3, 2, 0] if const_expr(cute.rank(mO) == 4) else [0, 2, 1]
+        )
+        mQ = cute.make_tensor(
+            mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose)
+        )
+        mO = cute.make_tensor(
+            mO.iterator, cute.select(mO.layout, mode=O_layout_transpose)
+        )
+        KV_layout_transpose = (
+            [1, 3, 2, 0] if const_expr(cute.rank(mK) == 4) else [0, 2, 1]
+        )
         mK, mV = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
+            cute.make_tensor(
+                t.iterator, cute.select(t.layout, mode=KV_layout_transpose)
+            )
             for t in (mK, mV)
         ]
         if const_expr(mLSE is not None):
-            LSE_layout_transpose = [2, 1, 0] if const_expr(cute.rank(mLSE) == 3) else [1, 0]
-            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+            LSE_layout_transpose = (
+                [2, 1, 0] if const_expr(cute.rank(mLSE) == 3) else [1, 0]
+            )
+            mLSE = cute.make_tensor(
+                mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)
+            )
 
         q_heads_unpacked = mQ.shape[2]
         kv_heads = mK.shape[2]
@@ -577,7 +664,9 @@ class ContiguousAttentionForwardKernel:
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
-                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                mLSE = pack_gqa_layout(
+                    mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1
+                )
 
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
@@ -596,7 +685,11 @@ class ContiguousAttentionForwardKernel:
             self.sQ_layout,
             (self.tile_m, self.tile_hdim),
         )
-        TileScheduler = SingleTileVarlenScheduler if const_expr(mCuSeqlensQ is not None) else SingleTileScheduler
+        TileScheduler = (
+            SingleTileVarlenScheduler
+            if const_expr(mCuSeqlensQ is not None)
+            else SingleTileScheduler
+        )
         tile_sched_args = TileSchedulerArguments(
             num_block=logical_num_block,
             num_head=logical_num_head,
@@ -610,14 +703,18 @@ class ContiguousAttentionForwardKernel:
             headdim_v=mV.shape[1],
             total_q=logical_total_q,
             tile_shape_mn=(self.tile_m, self.tile_n),
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead
+            if const_expr(self.pack_gqa)
+            else 1,
             mCuSeqlensQ=mCuSeqlensQ,
             element_size=self.dtype.width // 8,
             lpt=self.is_causal or self.is_local,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        softmax_scale_log2, softmax_scale = cute_ops.compute_softmax_scale_log2(softmax_scale)
+        softmax_scale_log2, softmax_scale = cute_ops.compute_softmax_scale_log2(
+            softmax_scale
+        )
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
             tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
@@ -759,7 +856,9 @@ class ContiguousAttentionForwardKernel:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sVt = layout_utils.transpose_view(sV)
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        sO = storage.sQ.get_tensor(
+            sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype
+        )
 
         block_info = BlockInfo(
             self.tile_m,
@@ -768,7 +867,9 @@ class ContiguousAttentionForwardKernel:
             self.is_local,
             window_size_left,
             window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead
+            if const_expr(self.pack_gqa)
+            else 1,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -829,8 +930,6 @@ class ContiguousAttentionForwardKernel:
                 aux_tensors,
             )
 
-
-
     @cute.jit
     def load(
         self,
@@ -871,14 +970,24 @@ class ContiguousAttentionForwardKernel:
                 tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
             )
             head_idx_kv = (
-                head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+                head_idx
+                if const_expr(self.pack_gqa)
+                else head_idx // self.qhead_per_kvhead
             )
             if const_expr(cute.rank(mK) == 4):
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
+                    None, None, head_idx_kv
+                ]
+                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
+                    None, None, head_idx_kv
+                ]
             elif const_expr(seqlen.has_cu_seqlens_k):
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=2)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=2)[None, None, head_idx_kv]
+                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=2)[
+                    None, None, head_idx_kv
+                ]
+                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=2)[
+                    None, None, head_idx_kv
+                ]
             else:
                 mK_cur = mK[None, None, head_idx_kv]
                 mV_cur = mV[None, None, head_idx_kv]
@@ -903,7 +1012,9 @@ class ContiguousAttentionForwardKernel:
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_bytes["Q"])
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    mbar_ptr_Q, self.tma_copy_bytes["Q"]
+                )
             load_Q(tma_bar_ptr=mbar_ptr_Q)
             for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                 n_block = n_block_max - 1 - n_tile
@@ -952,7 +1063,9 @@ class ContiguousAttentionForwardKernel:
         fastdiv_mods=None,
         is_first_n_block: cutlass.Constexpr = False,
     ):
-        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        pipeline_k.consumer_wait(
+            kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
+        )
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
@@ -963,7 +1076,10 @@ class ContiguousAttentionForwardKernel:
             tSrK,
             tSsQ,
             tSsK[
-                None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                None,
+                None,
+                None,
+                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
             ],
             smem_thr_copy_Q,
             smem_thr_copy_K,
@@ -971,21 +1087,28 @@ class ContiguousAttentionForwardKernel:
         pipeline_k.consumer_release(kv_consumer_state)
 
         mask_fn(acc_S, n_block=n_block)
-        row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=True)
+        row_scale = softmax.online_softmax(
+            acc_S, is_first=is_first_n_block, check_inf=True
+        )
         softmax.rescale_O(acc_O, row_scale)
 
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
 
-        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        pipeline_v.consumer_wait(
+            kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state)
+        )
         warp_mma_gemm_rs(
             thr_mma_pv,
             acc_O,
             tOrP,
             tOrVt,
             tOsVt[
-                None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                None,
+                None,
+                None,
+                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
             ],
             smem_thr_copy_V,
         )
@@ -1041,9 +1164,15 @@ class ContiguousAttentionForwardKernel:
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             self.dtype,
         )
-        smem_thr_copy_Q = cute_ops.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_K = cute_ops.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_V = cute_ops.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
+        smem_thr_copy_Q = cute_ops.make_tiled_copy_A(
+            smem_copy_atom_QK, tiled_mma_qk
+        ).get_slice(tidx)
+        smem_thr_copy_K = cute_ops.make_tiled_copy_B(
+            smem_copy_atom_QK, tiled_mma_qk
+        ).get_slice(tidx)
+        smem_thr_copy_V = cute_ops.make_tiled_copy_B(
+            smem_copy_atom_V, tiled_mma_pv
+        ).get_slice(tidx)
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSsK = smem_thr_copy_K.partition_S(sK)
         tOsVt = smem_thr_copy_V.partition_S(sVt)
@@ -1122,8 +1251,10 @@ class ContiguousAttentionForwardKernel:
                 n_block_max -= 1
 
                 if const_expr(self.is_causal or self.is_local):
-                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                        seqlen, m_block, n_block_min
+                    n_block_min_causal_local_mask = (
+                        block_info.get_n_block_min_causal_local_mask(
+                            seqlen, m_block, n_block_min
+                        )
                     )
                     for n_tile in cutlass.range(
                         n_block_max - n_block_min_causal_local_mask, unroll=1
@@ -1153,15 +1284,21 @@ class ContiguousAttentionForwardKernel:
                             partial(mask_fn, mask_seqlen=False),
                             aux_tensors=aux_tensors,
                         )
-                    n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
+                    n_block_max = cutlass.min(
+                        n_block_max, n_block_min_causal_local_mask
+                    )
 
-                n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
-                    seqlen, m_block, n_block_min
+                n_block_min_before_local_mask = (
+                    block_info.get_n_block_min_before_local_mask(
+                        seqlen, m_block, n_block_min
+                    )
                 )
                 n_block_min_before_local_mask = cutlass.min(
                     n_block_min_before_local_mask, n_block_max
                 )
-                for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
+                for n_tile in cutlass.range(
+                    n_block_max - n_block_min_before_local_mask, unroll=1
+                ):
                     kv_consumer_state = self.mma_one_n_block(
                         n_block_max - 1 - n_tile,
                         kv_consumer_state,
@@ -1189,7 +1326,9 @@ class ContiguousAttentionForwardKernel:
                     )
                 n_block_max = n_block_min_before_local_mask
 
-                if const_expr(self.is_local and block_info.window_size_left is not None):
+                if const_expr(
+                    self.is_local and block_info.window_size_left is not None
+                ):
                     for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                         kv_consumer_state = self.mma_one_n_block(
                             n_block_max - 1 - n_tile,

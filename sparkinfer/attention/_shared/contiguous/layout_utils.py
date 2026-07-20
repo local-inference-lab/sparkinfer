@@ -9,7 +9,9 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
 
 
-def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
+def convert_layout_acc_mn(
+    acc_layout: cute.Layout, transpose: bool = False
+) -> cute.Layout:
     acc_layout_col_major = cute.make_layout(acc_layout.shape)
     shape = (
         (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
@@ -36,7 +38,9 @@ def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> c
 
 
 def reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
+    return cute.make_tensor(
+        acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose)
+    )
 
 
 @cute.jit

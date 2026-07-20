@@ -6,9 +6,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from sparkinfer.attention.contiguous import layout_utils
-from sparkinfer.attention._cute import ops as cute_ops
-from sparkinfer.attention.contiguous.cute_dsl_utils import ParamsBase
+from sparkinfer.attention._shared.contiguous import layout_utils
+from sparkinfer.attention._shared.cute import ops as cute_ops
+from sparkinfer.attention._shared.contiguous.cute_dsl_utils import (
+    ParamsBase,
+)
 
 
 @dataclass
@@ -77,7 +79,9 @@ class Softmax(ParamsBase):
                 fastmath=True,
             )
             if cutlass.const_expr(is_first):
-                acc_S_row_sum = cute_ops.fadd_reduce(acc_S_row_exp, init_val=None, arch=self.arch)
+                acc_S_row_sum = cute_ops.fadd_reduce(
+                    acc_S_row_exp, init_val=None, arch=self.arch
+                )
                 row_scale[r] = 1.0
             else:
                 row_scale[r] = cute.math.exp2(
@@ -98,25 +102,35 @@ class Softmax(ParamsBase):
     def finalize(
         self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
     ) -> cute.Tensor:
-        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+        if cutlass.const_expr(
+            sink_val is not None and isinstance(sink_val, cute.Tensor)
+        ):
             assert cute.size(sink_val) == self.num_rows
-        self.row_sum.store(cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4))
+        self.row_sum.store(
+            cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4)
+        )
         row_scale = cute.make_rmem_tensor(self._row_layout(), Float32)
 
         for r in range(int(self.num_rows)):
             if cutlass.const_expr(sink_val is not None):
-                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                sink_val_cur = (
+                    sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                )
                 self.row_sum[r] += cute.math.exp2(
-                    sink_val_cur * math.log2(math.e) - self.row_max[r] * self.scale_log2,
+                    sink_val_cur * math.log2(math.e)
+                    - self.row_max[r] * self.scale_log2,
                     fastmath=True,
                 )
 
             row_sum_cur = self.row_sum[r]
             row_sum_is_zero_or_nan = (row_sum_cur == 0.0) | (row_sum_cur != row_sum_cur)
-            safe_row_sum = Float32(cutlass.select_(row_sum_is_zero_or_nan, 1.0, row_sum_cur))
+            safe_row_sum = Float32(
+                cutlass.select_(row_sum_is_zero_or_nan, 1.0, row_sum_cur)
+            )
             row_scale[r] = cute.arch.rcp_approx(safe_row_sum) * final_scale
             row_lse = (
-                self.row_max[r] * self.scale_log2 + cute.math.log2(safe_row_sum, fastmath=True)
+                self.row_max[r] * self.scale_log2
+                + cute.math.log2(safe_row_sum, fastmath=True)
             ) * math.log(2.0)
             self.row_sum[r] = Float32(
                 cutlass.select_(row_sum_is_zero_or_nan, -Float32.inf, row_lse)

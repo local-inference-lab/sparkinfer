@@ -5,10 +5,12 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 import torch
 
-from sparkinfer.cute.utils import cuda_stream_to_int
-from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from sparkinfer.gemm.dense import dense_gemm
-from sparkinfer.gemm.wo_projection import (
+from sparkinfer._lib.utils import cuda_stream_to_int
+from sparkinfer.gemm._shared.block_fp8 import (
+    quantize_block_fp8_linear_input_mxfp8,
+)
+from sparkinfer._lib.dense_gemm import dense_gemm
+from sparkinfer.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
     _check_gpu_tensor,

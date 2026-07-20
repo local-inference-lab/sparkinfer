@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 import torch
 
-from sparkinfer.moe.fused.w4a16.host import (
+from sparkinfer.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     route_pack_numel_capacity,
 )
@@ -309,9 +309,9 @@ def pack_topk_routes_by_expert(
     capacity_packed_routes = max_packed_route_slots(
         numel_capacity, int(block_size), int(num_experts)
     )
-    capacity_route_blocks = (
-        capacity_packed_routes + int(block_size) - 1
-    ) // int(block_size)
+    capacity_route_blocks = (capacity_packed_routes + int(block_size) - 1) // int(
+        block_size
+    )
     if packed_route_indices is not None and block_expert_ids is not None:
         if (
             int(packed_route_indices.numel()) < capacity_packed_routes

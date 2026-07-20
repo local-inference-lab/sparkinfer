@@ -27,17 +27,25 @@ class SeqlenInfoQK:
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
-        offset_q = Int32(0) if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        offset_k = Int32(0) if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        offset_q = (
+            Int32(0) if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
+        )
+        offset_k = (
+            Int32(0) if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        )
         padded_offset_q = (
             Int32(0)
             if const_expr(mCuSeqlensQ is None)
-            else cute.assume((offset_q + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
+            else cute.assume(
+                (offset_q + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m
+            )
         )
         padded_offset_k = (
             Int32(0)
             if const_expr(mCuSeqlensK is None)
-            else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
+            else cute.assume(
+                (offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n
+            )
         )
         seqlen_q = (
             seqlen_q_static

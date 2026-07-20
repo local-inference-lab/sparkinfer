@@ -62,10 +62,13 @@ def ceil_div(x: int, y: int) -> int:
 # ---------------------------------------------------------------------------
 # WO-projection arena layout.
 #
-# Shared by gemm/wo_projection.py and attention/workspace.py (the WO
-# projections share a serving arena with attention), so the layout lives
-# here rather than in either consumer.  Names match the
-# flashinfer.experimental port's _lib/scratch_layout.py exactly.
+# Carved from sparkinfer/attention/workspace.py @ 906d63d0: the WO projections share
+# a serving arena with attention, so the byte layout lived there upstream.
+# Both gemm.wo_projection and the attention workspace need it, which makes
+# _lib its home under the import-topology rule (op dirs and group _shared
+# trees may not import across groups).  The arena alignment (1024) matches
+# SCRATCH_ALIGN_BYTES, so the materialize helpers above are drop-ins for the
+# upstream _materialize_arena_view/_materialize_arena_strided_view.
 # ---------------------------------------------------------------------------
 
 WO_MXFP8_SCALE_VEC_SIZE = 32

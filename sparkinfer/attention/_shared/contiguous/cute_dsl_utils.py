@@ -10,9 +10,15 @@ StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None)
 
 def _partition_fields(obj):
     all_fields = {field.name: getattr(obj, field.name) for field in fields(obj)}
-    constexpr = {name: value for name, value in all_fields.items() if isinstance(value, StaticTypes)}
+    constexpr = {
+        name: value
+        for name, value in all_fields.items()
+        if isinstance(value, StaticTypes)
+    }
     non_constexpr = {
-        name: value for name, value in all_fields.items() if not isinstance(value, StaticTypes)
+        name: value
+        for name, value in all_fields.items()
+        if not isinstance(value, StaticTypes)
     }
     return constexpr, non_constexpr
 
@@ -20,7 +26,9 @@ def _partition_fields(obj):
 def _new_from_mlir_values(self, values):
     constexpr_fields, non_constexpr_fields = _partition_fields(self)
     for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-        non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
+        non_constexpr_fields[name] = cutlass.new_from_mlir_values(
+            field, values[:n_items]
+        )
         values = values[n_items:]
     return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
@@ -29,7 +37,9 @@ def _new_from_mlir_values(self, values):
 class ParamsBase(JitArgument):
     def __c_pointers__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [field for field in all_fields if not isinstance(field, StaticTypes)]
+        non_constexpr_fields = [
+            field for field in all_fields if not isinstance(field, StaticTypes)
+        ]
         c_ptrs = []
         for obj in non_constexpr_fields:
             if hasattr(obj, "__c_pointers__"):
@@ -38,7 +48,9 @@ class ParamsBase(JitArgument):
 
     def __get_mlir_types__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [field for field in all_fields if not isinstance(field, StaticTypes)]
+        non_constexpr_fields = [
+            field for field in all_fields if not isinstance(field, StaticTypes)
+        ]
         types, self._values_pos = [], []
         for obj in non_constexpr_fields:
             if hasattr(obj, "__get_mlir_types__"):
@@ -73,4 +85,6 @@ def assume_strides_aligned(t):
 def assume_tensor_aligned(t):
     if t is None:
         return None
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
+    )

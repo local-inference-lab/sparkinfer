@@ -20,19 +20,29 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.cute.intrinsics import align_up
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
-from sparkinfer.cute.utils import get_num_sm
-from sparkinfer.moe.execution import MoEWeightPreparationPlan
-from sparkinfer.moe.fused.activations import moe_activation_w1_rows
-from sparkinfer.moe.fused.w4a16.host import (
+from sparkinfer._lib.intrinsics import align_up
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
+from sparkinfer._lib.utils import get_num_sm
+from sparkinfer.moe._shared.execution import MoEWeightPreparationPlan
+from sparkinfer.moe._shared.kernels.activations import (
+    moe_activation_w1_rows,
+)
+from sparkinfer.moe._shared.kernels.w4a16.host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     route_pack_token_capacity,
 )
 
-from .tp_moe import (
+# NOTE(one-time port): upstream, ep_moe and tp_moe were siblings in
+# sparkinfer/integration/. The prepared-weights payload plumbing they share should
+# eventually hoist into moe/_shared/weights.py; until then this is the one
+# sanctioned intra-group op->op reach-through.
+from ..fused_moe._impl import (
     SPARKINFERFP4ExpertWeights,
     _normalize_swiglu_params,
     _prepared_payload_for_runtime,
@@ -160,9 +170,7 @@ class EPMoEScratchCaps:
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
-        object.__setattr__(
-            self, "global_num_experts", int(self.global_num_experts)
-        )
+        object.__setattr__(self, "global_num_experts", int(self.global_num_experts))
         object.__setattr__(self, "device", torch.device(self.device))
         object.__setattr__(
             self,
@@ -249,9 +257,9 @@ class EPMoEScratchPlan:
     caps: EPMoEScratchCaps
     _layout: tuple[_EPBufferSpec, ...]
     _nbytes: int
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -482,7 +490,9 @@ def sparkinfer_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
     if prepared is None:
         raise RuntimeError("the EP W4A16 weight representation was not materialized")
 
-    from sparkinfer.moe.fused.w4a16.kernel import run_w4a16_moe
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        run_w4a16_moe,
+    )
 
     return run_w4a16_moe(
         binding.a,

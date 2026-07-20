@@ -32,17 +32,21 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.cute.compiler import (
+from sparkinfer._lib.compiler import (
     KernelCompileSpec,
     launch as sparkinfer_launch,
     tensor_compile_fact,
 )
-from sparkinfer.cute.intrinsics import shared_ptr_to_u32
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.intrinsics import shared_ptr_to_u32
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
+from sparkinfer._lib.utils import current_cuda_stream
 
 # Kept in lock-step with the source kernels we fuse.
-from sparkinfer.attention.indexer.persistent_topk import (
+from sparkinfer.attention.nsa_indexer.persistent_topk import (
     _RADIX,
     _RADIX_THRESHOLD,
     _STATE_ARRIVAL_COUNTER,
@@ -52,7 +56,7 @@ from sparkinfer.attention.indexer.persistent_topk import (
     _group_barrier,
     _state_offset,
 )
-from sparkinfer.attention.indexer.tiled_topk import (
+from sparkinfer.attention.nsa_indexer.tiled_topk import (
     _SCAN_UNROLL,
     _SMEM_CANDS,
     _SUPPORTED_TOPK,
@@ -64,8 +68,8 @@ from sparkinfer.attention.indexer.tiled_topk import (
     _smem_st,
     _smem_xadd,
 )
-from sparkinfer.cute.intrinsics import ld_shared_f32
-from sparkinfer.attention.indexer.kernel import (
+from sparkinfer._lib.intrinsics import ld_shared_f32
+from sparkinfer.attention.nsa_indexer.kernel import (
     _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
     _PAGE_SIZE,
@@ -84,7 +88,7 @@ from sparkinfer.attention.indexer.kernel import (
     _repack_k_page_to_permuted,
     _smem_addr_from_b128_offset,
 )
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     atomic_add_global_i32,
     fmax_f32,
     get_ptr_as_int64,
@@ -125,13 +129,13 @@ KV_LAYOUT_PAGED = 1
 # both RTX-class SM120 and GB10/SM121.
 # Prefill remains packed-contiguous and never reaches this decode-only resolver.
 FUSED_MAX_ROWS = 6
-_C4_SM12X_FUSED_MAX_ROWS = 16
+_C4_SPARKINFER_FUSED_MAX_ROWS = 16
 # GLM re-measured after the two-level tiled fold landed: fused keeps rows 1-16
 # (wins/ties at 8K, dominant at 32K-131K, e.g. r1@131K 41us vs 90us tiled) but
 # loses rows 32-64 everywhere (r64@131K 1541us vs 1043us tiled, r64@8K 100 vs
 # 78) -- the 2-CTAs-per-group merge and one-resident-CTA occupancy starve it.
 _GLM32_FUSED_MAX_ROWS = 16
-FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
+FUSED_MIN_WIDTH = 20480  # (capacity-sizing only; no longer a routing gate)
 
 
 @cute.jit
@@ -208,7 +212,7 @@ def _load_permute_k_page_g2s(
     k_quant_bytes: cute.Tensor,  # [pages, 64, 128] uint8 (16B-aligned base)
     page_id: Int32,
     page_stride_bytes: Int64,  # dim-0 byte stride; 8192 for contiguous K, 8448 for
-                               # the packed paged cache (64*128 quant + 64*4 scales / page)
+    # the packed paged cache (64*128 quant + 64*4 scales / page)
     k_perm_base_addr: Int32,
     tx: Int32,
     n_threads: Int32,
@@ -287,7 +291,9 @@ def _resolve_fused_launch_config(
     """
     max_chunk = max(_MAX_CHUNK_ELEMENTS, _THREADS_PER_CTA)
     ctas_per_group = max(1, (width + max_chunk - 1) // max_chunk)
-    chunk_size = min(max_chunk, _align_up((width + ctas_per_group - 1) // ctas_per_group, 1))
+    chunk_size = min(
+        max_chunk, _align_up((width + ctas_per_group - 1) // ctas_per_group, 1)
+    )
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     num_groups = min(max(num_rows, 1), max(1, num_sms // ctas_per_group))
     total_ctas = max(1, num_groups * ctas_per_group)
@@ -344,13 +350,9 @@ def _load_q_bytes_g2s_v4(
         v2 = Uint32(0)
         v3 = Uint32(0)
         if linear_vec < real_vecs:
-            q_addr = get_ptr_as_int64(
-                q_bytes, row_base + Int64(linear_vec) * Int64(16)
-            )
+            q_addr = get_ptr_as_int64(q_bytes, row_base + Int64(linear_vec) * Int64(16))
             v0, v1, v2, v3 = ld_global_v4_u32(q_addr)
-        st_shared_v4_u32(
-            q_smem_base_addr + linear_vec * Int32(16), v0, v1, v2, v3
-        )
+        st_shared_v4_u32(q_smem_base_addr + linear_vec * Int32(16), v0, v1, v2, v3)
         linear_vec += n_threads
 
 
@@ -470,7 +472,9 @@ def fused_indexer_workspace_nbytes(
         # CPU planning fallback: assume 1 CTA/group worst case.
         return max(int(num_rows), 1) * (_STATE_WORDS_PER_GROUP * 4 + int(topk) * 8)
     launch = _resolve_fused_launch_config(int(num_rows), int(width), device)
-    return _fused_indexer_state_nbytes(launch) + _fused_indexer_carry_nbytes(launch, int(topk))
+    return _fused_indexer_state_nbytes(launch) + _fused_indexer_carry_nbytes(
+        launch, int(topk)
+    )
 
 
 def _fused_indexer_capacity_nbytes(
@@ -544,7 +548,7 @@ def resolve_fused_indexer_path(
         # favor the single-launch fused path through the measured B16 bucket.
         return (
             compute_capability in {(12, 0), (12, 1)}
-            and int(num_rows) <= _C4_SM12X_FUSED_MAX_ROWS
+            and int(num_rows) <= _C4_SPARKINFER_FUSED_MAX_ROWS
         )
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
         return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
@@ -564,7 +568,7 @@ def fused_indexer_scratch_max_rows(
         and int(num_heads) == 64
         and compute_capability in {(12, 0), (12, 1)}
     ):
-        return _C4_SM12X_FUSED_MAX_ROWS
+        return _C4_SPARKINFER_FUSED_MAX_ROWS
     if int(topk) == 2048 and int(num_heads) == 32:
         return _GLM32_FUSED_MAX_ROWS
     return FUSED_MAX_ROWS
@@ -673,9 +677,9 @@ def fused_indexer_decode_warmup_rows(
 class SPARKINFERFusedIndexerScratchPlan:
     caps: SPARKINFERFusedIndexerScratchCaps
     workspace_nbytes: int
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -744,11 +748,7 @@ def _resolve_fused_batch_slack(
 ) -> int:
     """Select the capture-static carry batching size for one fused variant."""
 
-    if (
-        int(kv_layout) == KV_LAYOUT_PAGED
-        and int(num_heads) == 64
-        and int(topk) == 512
-    ):
+    if int(kv_layout) == KV_LAYOUT_PAGED and int(num_heads) == 64 and int(topk) == 512:
         return _DSV4_BATCH_SLACK
     return _BATCH_SLACK
 
@@ -780,7 +780,8 @@ def _fused_indexer_shared_storage_cls(
         # --- scorer fields (mirror _paged_indexer_shared_storage_cls) ---
         "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
         "q_bytes": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(padded_q_heads) * _INDEX_HEAD_DIM], 16
+            cute.struct.MemRange[cutlass.Uint8, int(padded_q_heads) * _INDEX_HEAD_DIM],
+            16,
         ],
         "weights": _f32(int(padded_q_heads)),
         "k_page": _u8_page(),
@@ -960,9 +961,7 @@ def _fused_radix_select(
                     else _smem_ld(ni1, Int32(0))
                 )
                 num_input = (
-                    raw_num_input
-                    if raw_num_input < Int32(cands)
-                    else Int32(cands)
+                    raw_num_input if raw_num_input < Int32(cands) else Int32(cands)
                 )
                 for stage in cutlass.range_constexpr(8):
                     j = Int32(1 << stage)
@@ -1080,11 +1079,15 @@ def _fused_radix_select(
             while idx_base < n_total:
                 ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
                 if cutlass.const_expr(ex_round == 0):
-                    _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
+                    _smem_red_add(
+                        h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
+                    )
                 else:
                     ex_mask = Uint32(0xFFFFFFFF) << Uint32(32 - ex_round * 8)
                     if (ex_key & ex_mask) == ex_prefix:
-                        _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
+                        _smem_red_add(
+                            h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
+                        )
                 idx_base += Int32(_RADIX_THREADS)
             cute.arch.sync_threads()
             for ex_stage in cutlass.range_constexpr(8):
@@ -1199,7 +1202,9 @@ class SparseNSAFusedIndexerKernel:
         if self.paged_output and self.kv_layout != KV_LAYOUT_PAGED:
             raise ValueError("physical-slot output requires the paged K/V layout")
         if self.topk not in _SUPPORTED_TOPK:
-            raise ValueError(f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}")
+            raise ValueError(
+                f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}"
+            )
         self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
         if self.num_q_head_tiles not in (1, 2, 4):
             raise ValueError(
@@ -1352,7 +1357,9 @@ class SparseNSAFusedIndexerKernel:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self._get_shared_storage_cls())
 
-        s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
+        s_w = storage.weights.get_tensor(
+            cute.make_layout((self.padded_q_heads,), stride=(1,))
+        )
         q_smem_base_addr = shared_ptr_to_u32(storage.q_bytes.data_ptr())
         k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
         k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
@@ -1363,7 +1370,9 @@ class SparseNSAFusedIndexerKernel:
                 stride=(_INDEX_HEAD_DIM, 1, _PAGE_SIZE * _INDEX_HEAD_DIM),
             )
         )
-        s_scale = storage.scales.get_tensor(cute.make_layout((_PAGE_SIZE,), stride=(1,)))
+        s_scale = storage.scales.get_tensor(
+            cute.make_layout((_PAGE_SIZE,), stride=(1,))
+        )
         s_partial_logits = storage.partial_logits.get_tensor(
             cute.make_layout(
                 (self.tokens_per_work, self.num_q_head_tiles),
@@ -1376,19 +1385,33 @@ class SparseNSAFusedIndexerKernel:
                 stride=(self.num_q_head_tiles, 1),
             )
         )
-        s_c0_values = storage.carry0_values.get_tensor(cute.make_layout((self.carry_cap,), stride=(1,)))
-        s_c0_gindex = storage.carry0_gindex.get_tensor(cute.make_layout((self.carry_cap,), stride=(1,)))
-        s_c1_values = storage.carry1_values.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
-        s_c1_gindex = storage.carry1_gindex.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
+        s_c0_values = storage.carry0_values.get_tensor(
+            cute.make_layout((self.carry_cap,), stride=(1,))
+        )
+        s_c0_gindex = storage.carry0_gindex.get_tensor(
+            cute.make_layout((self.carry_cap,), stride=(1,))
+        )
+        s_c1_values = storage.carry1_values.get_tensor(
+            cute.make_layout((self.topk,), stride=(1,))
+        )
+        s_c1_gindex = storage.carry1_gindex.get_tensor(
+            cute.make_layout((self.topk,), stride=(1,))
+        )
         s_hist0 = storage.hist0.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_hist1 = storage.hist1.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_out = storage.out_idx.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
         s_cand0 = storage.cand0.get_tensor(cute.make_layout((self.cands,), stride=(1,)))
         s_cand1 = storage.cand1.get_tensor(cute.make_layout((self.cands,), stride=(1,)))
         s_relay = storage.relay.get_tensor(cute.make_layout((2,), stride=(1,)))
-        s_coop_suffix = storage.coop_suffix.get_tensor(cute.make_layout((_RADIX,), stride=(1,)))
-        s_coop_scalars = storage.coop_scalars.get_tensor(cute.make_layout((4,), stride=(1,)))
-        s_coop_counters = storage.coop_counters.get_tensor(cute.make_layout((2,), stride=(1,)))
+        s_coop_suffix = storage.coop_suffix.get_tensor(
+            cute.make_layout((_RADIX,), stride=(1,))
+        )
+        s_coop_scalars = storage.coop_scalars.get_tensor(
+            cute.make_layout((4,), stride=(1,))
+        )
+        s_coop_counters = storage.coop_counters.get_tensor(
+            cute.make_layout((2,), stride=(1,))
+        )
         # coop local histogram reuses hist0 (>=256); its u32 base address for atomics:
         coop_hist_addr = shared_ptr_to_u32(storage.hist0.data_ptr())
         coop_ctr_addr = shared_ptr_to_u32(storage.coop_counters.data_ptr())
@@ -1453,12 +1476,15 @@ class SparseNSAFusedIndexerKernel:
                 tile_base = q_smem_base_addr + tile_idx * Int32(
                     _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
                 )
-                dst_addr = _smem_addr_from_b128_offset(
-                    tile_base,
-                    _permuted_offset_128b(
-                        row_in_tile, vec_idx, Int32(_INDEX_HEAD_DIM // 16)
-                    ),
-                ) + byte_idx
+                dst_addr = (
+                    _smem_addr_from_b128_offset(
+                        tile_base,
+                        _permuted_offset_128b(
+                            row_in_tile, vec_idx, Int32(_INDEX_HEAD_DIM // 16)
+                        ),
+                    )
+                    + byte_idx
+                )
                 q_byte = cutlass.Uint8(0)
                 if head_idx < num_heads:
                     q_byte = q_bytes[q_idx, head_idx, col_idx]
@@ -1467,7 +1493,9 @@ class SparseNSAFusedIndexerKernel:
         w_linear = tx
         while w_linear < Int32(self.padded_q_heads):
             s_w[w_linear] = (
-                Float32(weights[q_idx, w_linear]) if w_linear < num_heads else Float32(0.0)
+                Float32(weights[q_idx, w_linear])
+                if w_linear < num_heads
+                else Float32(0.0)
             )
             w_linear += Int32(_RADIX_THREADS)
         cute.arch.sync_threads()
@@ -1498,10 +1526,25 @@ class SparseNSAFusedIndexerKernel:
                 if carry_count + Int32(256) > Int32(self.carry_cap):
                     cute.arch.sync_threads()
                     _fused_radix_select(
-                        s_c0_values, s_c0_gindex, s_c1_values, s_c1_gindex,
-                        carry_count, topk_static, self.cands, tx,
-                        s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                        h0, ctr, thr, ni0, ni1, lr,
+                        s_c0_values,
+                        s_c0_gindex,
+                        s_c1_values,
+                        s_c1_gindex,
+                        carry_count,
+                        topk_static,
+                        self.cands,
+                        tx,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        s_cand0,
+                        s_cand1,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
                     )
                     cute.arch.sync_threads()
                     ti = Int32(tx)
@@ -1568,10 +1611,25 @@ class SparseNSAFusedIndexerKernel:
             cute.arch.sync_threads()
             if carry_count > topk_static:
                 _fused_radix_select(
-                    s_c0_values, s_c0_gindex, s_c1_values, s_c1_gindex,
-                    carry_count, topk_static, self.cands, tx,
-                    s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                    h0, ctr, thr, ni0, ni1, lr,
+                    s_c0_values,
+                    s_c0_gindex,
+                    s_c1_values,
+                    s_c1_gindex,
+                    carry_count,
+                    topk_static,
+                    self.cands,
+                    tx,
+                    s_hist0,
+                    s_hist1,
+                    s_out,
+                    s_cand0,
+                    s_cand1,
+                    h0,
+                    ctr,
+                    thr,
+                    ni0,
+                    ni1,
+                    lr,
                 )
                 cute.arch.sync_threads()
                 ti = Int32(tx)
@@ -1656,9 +1714,7 @@ class SparseNSAFusedIndexerKernel:
                     if nxt < page_end:
                         if nxt < Int32(real_page_table.shape[1]):
                             pid_n = Int32(real_page_table[q_idx, nxt])
-                        if (pid_n >= Int32(0)) & (
-                            nxt * Int32(_PAGE_SIZE) < seq_len
-                        ):
+                        if (pid_n >= Int32(0)) & (nxt * Int32(_PAGE_SIZE) < seq_len):
                             nxt_valid = Int32(1)
                     # stage((p+1) % 3): perm -> k_page -> k_page3 -> perm
                     nk = k_page_base_addr
@@ -1697,22 +1753,25 @@ class SparseNSAFusedIndexerKernel:
                                 if (head_tile_slot == Int32(0)) & (
                                     lane < Int32(_PAGED_TOKENS_PER_GROUP)
                                 ):
-                                    slot_idx = token_group * Int32(
-                                        _PAGED_TOKENS_PER_GROUP
-                                    ) + lane
+                                    slot_idx = (
+                                        token_group * Int32(_PAGED_TOKENS_PER_GROUP)
+                                        + lane
+                                    )
                                     if slot_idx < prev_valid:
                                         logit = Float32(0.0)
                                         h_i = Int32(0)
                                         if prev_pl2 == Int32(0):
                                             while h_i < Int32(self.num_q_head_tiles):
                                                 logit = Float32(
-                                                    logit + s_partial_logits[slot_idx, h_i]
+                                                    logit
+                                                    + s_partial_logits[slot_idx, h_i]
                                                 )
                                                 h_i += Int32(1)
                                         else:
                                             while h_i < Int32(self.num_q_head_tiles):
                                                 logit = Float32(
-                                                    logit + s_partial_logits2[slot_idx, h_i]
+                                                    logit
+                                                    + s_partial_logits2[slot_idx, h_i]
                                                 )
                                                 h_i += Int32(1)
                                         s_c0_values[carry_count + slot_idx] = Float32(
@@ -1733,19 +1792,28 @@ class SparseNSAFusedIndexerKernel:
                     else:
                         # CONTIGUOUS_MLA: masked wide scalar load into linear staging, then repack.
                         _load_flat_k_tile_wide(
-                            k_quant_bytes, abs_start + page_base, valid_slots,
-                            s_k_page_stage, tx, Int32(_RADIX_THREADS),
+                            k_quant_bytes,
+                            abs_start + page_base,
+                            valid_slots,
+                            s_k_page_stage,
+                            tx,
+                            Int32(_RADIX_THREADS),
                         )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
                             sv = Float32(0.0)
                             if scale_idx < valid_slots:
-                                sv = Float32(k_scales[abs_start + page_base + scale_idx])
+                                sv = Float32(
+                                    k_scales[abs_start + page_base + scale_idx]
+                                )
                             s_scale[scale_idx] = sv
                             scale_idx += Int32(_RADIX_THREADS)
                         cute.arch.sync_threads()
                         _repack_k_page_wide(
-                            k_page_base_addr, k_page_perm_base_addr, tx, Int32(_RADIX_THREADS)
+                            k_page_base_addr,
+                            k_page_perm_base_addr,
+                            tx,
+                            Int32(_RADIX_THREADS),
                         )
                         cute.arch.sync_threads()
 
@@ -1799,12 +1867,14 @@ class SparseNSAFusedIndexerKernel:
                             # valid_slots runs the MMA (writing all its token columns for
                             # all head tiles), and the reduce only reads slot_idx <
                             # valid_slots -> it never consumes a stale (unwritten) partial.
-                            token_base = split_idx * Int32(self.tokens_per_work) + token_group * Int32(
-                                _PAGED_TOKENS_PER_GROUP
-                            )
+                            token_base = split_idx * Int32(
+                                self.tokens_per_work
+                            ) + token_group * Int32(_PAGED_TOKENS_PER_GROUP)
                             if tx < score_threads:
                                 if token_base < valid_slots:
-                                    head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
+                                    head_tile_base = head_tile_slot * Int32(
+                                        _PAGED_Q_HEAD_TILE
+                                    )
                                     _compute_mxfp8_tile_partials_qldm(
                                         q_smem_base_addr,
                                         s_w,
@@ -1820,14 +1890,22 @@ class SparseNSAFusedIndexerKernel:
                                     )
                             cute.arch.sync_threads()
                             if tx < score_threads:
-                                if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
+                                if (head_tile_slot == Int32(0)) & (
+                                    lane < Int32(_PAGED_TOKENS_PER_GROUP)
+                                ):
                                     slot_idx = token_base + lane
                                     if slot_idx < valid_slots:
                                         logit = Float32(0.0)
-                                        partial_row = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                                        partial_row = (
+                                            token_group * Int32(_PAGED_TOKENS_PER_GROUP)
+                                            + lane
+                                        )
                                         h_i = Int32(0)
                                         while h_i < Int32(self.num_q_head_tiles):
-                                            logit = Float32(logit + s_partial_logits[partial_row, h_i])
+                                            logit = Float32(
+                                                logit
+                                                + s_partial_logits[partial_row, h_i]
+                                            )
                                             h_i += Int32(1)
                                         s_c0_values[carry_count + slot_idx] = Float32(
                                             logit
@@ -1840,7 +1918,9 @@ class SparseNSAFusedIndexerKernel:
                                             self.kv_layout == KV_LAYOUT_PAGED
                                             and self.paged_output
                                         ):
-                                            output_idx = page_id * Int32(_PAGE_SIZE) + slot_idx
+                                            output_idx = (
+                                                page_id * Int32(_PAGE_SIZE) + slot_idx
+                                            )
                                         s_c0_gindex[carry_count + slot_idx] = output_idx
                             # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
                             # barrier — the next page's load barrier (or the trim's leading
@@ -1868,9 +1948,9 @@ class SparseNSAFusedIndexerKernel:
                     # Trim carry0 back to topk only when the next page would overflow the
                     # over-sized accumulator, or at the very end. This runs the radix once
                     # per ~(_BATCH_SLACK/_PAGE_SIZE) pages instead of every page.
-                    need_trim = (carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)) | (
-                        is_last & (carry_count > topk_static)
-                    )
+                    need_trim = (
+                        carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)
+                    ) | (is_last & (carry_count > topk_static))
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
                     pipe_stage = pipe_stage + Int32(1)
                     if pipe_stage == Int32(3):
@@ -1879,10 +1959,25 @@ class SparseNSAFusedIndexerKernel:
                 if need_trim:
                     cute.arch.sync_threads()
                     _fused_radix_select(
-                        s_c0_values, s_c0_gindex, s_c1_values, s_c1_gindex,
-                        carry_count, topk_static, self.cands, tx,
-                        s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                        h0, ctr, thr, ni0, ni1, lr,
+                        s_c0_values,
+                        s_c0_gindex,
+                        s_c1_values,
+                        s_c1_gindex,
+                        carry_count,
+                        topk_static,
+                        self.cands,
+                        tx,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        s_cand0,
+                        s_cand1,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
                     )
                     cute.arch.sync_threads()
                     i = Int32(tx)
@@ -1906,7 +2001,9 @@ class SparseNSAFusedIndexerKernel:
                         if (head_tile_slot == Int32(0)) & (
                             lane < Int32(_PAGED_TOKENS_PER_GROUP)
                         ):
-                            slot_idx = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                            slot_idx = (
+                                token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                            )
                             if slot_idx < prev_valid:
                                 logit = Float32(0.0)
                                 h_i = Int32(0)
@@ -1924,17 +2021,36 @@ class SparseNSAFusedIndexerKernel:
                                         h_i += Int32(1)
                                 s_c0_values[carry_count + slot_idx] = Float32(
                                     logit
-                                    * ld_shared_f32(prev_scale_addr + slot_idx * Int32(4))
+                                    * ld_shared_f32(
+                                        prev_scale_addr + slot_idx * Int32(4)
+                                    )
                                 )
-                                s_c0_gindex[carry_count + slot_idx] = prev_out_base + slot_idx
+                                s_c0_gindex[carry_count + slot_idx] = (
+                                    prev_out_base + slot_idx
+                                )
                     carry_count = carry_count + prev_valid
                 if carry_count > topk_static:
                     cute.arch.sync_threads()
                     _fused_radix_select(
-                        s_c0_values, s_c0_gindex, s_c1_values, s_c1_gindex,
-                        carry_count, topk_static, self.cands, tx,
-                        s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                        h0, ctr, thr, ni0, ni1, lr,
+                        s_c0_values,
+                        s_c0_gindex,
+                        s_c1_values,
+                        s_c1_gindex,
+                        carry_count,
+                        topk_static,
+                        self.cands,
+                        tx,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        s_cand0,
+                        s_cand1,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
                     )
                     cute.arch.sync_threads()
                     i = Int32(tx)
@@ -2002,9 +2118,7 @@ class SparseNSAFusedIndexerKernel:
             bucket_u32 = Uint32(0)
             c = Int32(0)
             coop_possible = Int32(1 if self.coop_merge_possible else 0)
-            if (seq_len > Int32(self.merge_threshold)) & (
-                coop_possible != Int32(0)
-            ):
+            if (seq_len > Int32(self.merge_threshold)) & (coop_possible != Int32(0)):
                 # group total candidate count (for the degenerate total <= topk path)
                 if tx == Int32(0):
                     atomic_add_global_i32(
@@ -2013,17 +2127,19 @@ class SparseNSAFusedIndexerKernel:
                         ),
                         carry_count,
                     )
-                barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                barrier_phase = _group_barrier(
+                    merge_state, group_id, barrier_phase, ctas_pg, tx
+                )
                 total = Int32(
-                    merge_state[
-                        _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
-                    ]
+                    merge_state[_state_offset(group_id, Int32(_FUSED_STATE_TOTAL))]
                 )
                 if total <= topk_static:
                     # every candidate survives: pack contiguously (atomic base) + pad -1
                     if tx == Int32(0):
                         s_coop_counters[1] = atomic_add_global_i32(
-                            _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                            _global_state_ptr(
+                                merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                            ),
                             carry_count,
                         )
                     cute.arch.sync_threads()
@@ -2033,7 +2149,9 @@ class SparseNSAFusedIndexerKernel:
                         out_values[group_id, base + i] = Float32(s_c0_values[i])
                         out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
-                    barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                    barrier_phase = _group_barrier(
+                        merge_state, group_id, barrier_phase, ctas_pg, tx
+                    )
                     # pad [total, topk) with -1 (cta0 only, to avoid duplicate writes)
                     i = Int32(tx)
                     while i < topk_static:
@@ -2043,7 +2161,7 @@ class SparseNSAFusedIndexerKernel:
                         i += Int32(_RADIX_THREADS)
                 else:
                     if tx == Int32(0):
-                        s_coop_scalars[0] = Uint32(0)            # prefix
+                        s_coop_scalars[0] = Uint32(0)  # prefix
                         s_coop_scalars[1] = Uint32(topk_static)  # remaining_k
                     cute.arch.sync_threads()
                     for round_idx in cutlass.range_constexpr(4):
@@ -2061,7 +2179,9 @@ class SparseNSAFusedIndexerKernel:
                             s_hist0[i] = Int32(0)  # local histogram (reuses hist0)
                             i += Int32(_RADIX_THREADS)
                         cute.arch.sync_threads()
-                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                        barrier_phase = _group_barrier(
+                            merge_state, group_id, barrier_phase, ctas_pg, tx
+                        )
                         # histogram this CTA's carry entries matching the running prefix
                         i = Int32(tx)
                         while i < carry_count:
@@ -2085,11 +2205,15 @@ class SparseNSAFusedIndexerKernel:
                                     _global_state_ptr(merge_state, group_id, i), c
                                 )
                             i += Int32(_RADIX_THREADS)
-                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                        barrier_phase = _group_barrier(
+                            merge_state, group_id, barrier_phase, ctas_pg, tx
+                        )
                         # read global histogram -> suffix sum (count_ge per bin)
                         i = Int32(tx)
                         while i < Int32(_RADIX):
-                            s_coop_suffix[i] = Int32(merge_state[_state_offset(group_id, i)])
+                            s_coop_suffix[i] = Int32(
+                                merge_state[_state_offset(group_id, i)]
+                            )
                             i += Int32(_RADIX_THREADS)
                         cute.arch.sync_threads()
                         for stage in cutlass.range_constexpr(8):
@@ -2098,7 +2222,9 @@ class SparseNSAFusedIndexerKernel:
                             if tx < Int32(_RADIX):
                                 scan_val = Int32(s_coop_suffix[tx])
                                 if tx < Int32(_RADIX) - stride_s:
-                                    scan_val = scan_val + Int32(s_coop_suffix[tx + stride_s])
+                                    scan_val = scan_val + Int32(
+                                        s_coop_suffix[tx + stride_s]
+                                    )
                             cute.arch.sync_threads()
                             if tx < Int32(_RADIX):
                                 s_coop_suffix[tx] = scan_val
@@ -2122,7 +2248,9 @@ class SparseNSAFusedIndexerKernel:
                             s_coop_scalars[0] = prefix | (bucket_u32 << shift)
                             s_coop_scalars[1] = Uint32(s_coop_scalars[3])
                         cute.arch.sync_threads()
-                        barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                        barrier_phase = _group_barrier(
+                            merge_state, group_id, barrier_phase, ctas_pg, tx
+                        )
                     ordered_pivot = Uint32(s_coop_scalars[0])
                     # > pivot: definite winners, written at a per-CTA atomic base
                     if tx == Int32(0):
@@ -2140,7 +2268,9 @@ class SparseNSAFusedIndexerKernel:
                         gt_base = Int32(0)
                         if local_gt > Int32(0):
                             gt_base = atomic_add_global_i32(
-                                _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                _global_state_ptr(
+                                    merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                                ),
                                 local_gt,
                             )
                         s_coop_counters[0] = Int32(0)
@@ -2155,14 +2285,18 @@ class SparseNSAFusedIndexerKernel:
                             out_values[group_id, pos] = Float32(s_c0_values[i])
                             out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
-                    barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+                    barrier_phase = _group_barrier(
+                        merge_state, group_id, barrier_phase, ctas_pg, tx
+                    )
                     # == pivot: fill the remaining slots up to topk (ties at the boundary)
                     i = Int32(tx)
                     while i < carry_count:
                         key = _convert_to_uint32(Float32(s_c0_values[i]))
                         if key == ordered_pivot:
                             pos = atomic_add_global_i32(
-                                _global_state_ptr(merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                _global_state_ptr(
+                                    merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                                ),
                                 Int32(1),
                             )
                             if pos < topk_static:
@@ -2231,14 +2365,31 @@ class SparseNSAFusedIndexerKernel:
                 if Int32(s_relay[1]) == (ctas_pg - Int32(1)):
                     threadfence()  # acquire: observe every producer's packed writes
                     total = Int32(
-                        merge_state[_state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))]
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                        ]
                     )
                     if total > topk_static:
                         _fused_radix_select(
-                            pack_v_row, pack_i_row, s_c1_values, s_c1_gindex,
-                            total, topk_static, self.cands, tx,
-                            s_hist0, s_hist1, s_out, s_cand0, s_cand1,
-                            h0, ctr, thr, ni0, ni1, lr,
+                            pack_v_row,
+                            pack_i_row,
+                            s_c1_values,
+                            s_c1_gindex,
+                            total,
+                            topk_static,
+                            self.cands,
+                            tx,
+                            s_hist0,
+                            s_hist1,
+                            s_out,
+                            s_cand0,
+                            s_cand1,
+                            h0,
+                            ctr,
+                            thr,
+                            ni0,
+                            ni1,
+                            lr,
                         )
                         cute.arch.sync_threads()
                         i = Int32(tx)
@@ -2259,8 +2410,12 @@ class SparseNSAFusedIndexerKernel:
                     # reset the group's counters so the next launch / graph replay starts clean
                     cute.arch.sync_threads()
                     if tx == Int32(0):
-                        merge_state[_state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))] = Int32(0)
-                        merge_state[_state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))
+                        ] = Int32(0)
 
 
 @lru_cache(maxsize=64)
@@ -2310,11 +2465,7 @@ def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> tuple[object, 
         "pi",
         "st",
     }
-    dynamic_dims = (
-        (0,)
-        if name in dynamic_row_names and int(tensor.ndim) >= 1
-        else ()
-    )
+    dynamic_dims = (0,) if name in dynamic_row_names and int(tensor.ndim) >= 1 else ()
     return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
@@ -2342,7 +2493,10 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
         "attention.indexer.fused_indexer", 1, cache_key, labels=labels
     )
     sparkinfer_launch(
-        kernel, compile_spec=compile_spec, compile_args=cute_args, runtime_args=cute_args
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=cute_args,
+        runtime_args=cute_args,
     )
 
 
@@ -2530,17 +2684,37 @@ def run_fused_paged_indexer(
         current_cuda_stream(),
     )
     key_tensors = [
-        ("q", q_bytes), ("w", weights), ("kq", k_quant_bytes), ("ks", k_scales),
-        ("pt", real_page_table), ("sl", seqlens),
-        ("kstart", unused_k_bounds), ("kend", unused_k_bounds),
-        ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
+        ("q", q_bytes),
+        ("w", weights),
+        ("kq", k_quant_bytes),
+        ("ks", k_scales),
+        ("pt", real_page_table),
+        ("sl", seqlens),
+        ("kstart", unused_k_bounds),
+        ("kend", unused_k_bounds),
+        ("oi", out_i),
+        ("ov", out_v),
+        ("pv", pack_v),
+        ("pi", pack_i),
+        ("st", state),
     ]
     _launch_fused(
-        kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED, int(num_heads), int(topk), bool(output_physical_slots), int(ctas_per_group),
-         int(merge_threshold), k_quant_page_stride, max_pages * _PAGE_SIZE,
-         k_scales_row_stride,
-         bool(vectorized_q_load), q_row_stride_bytes),
+        kernel,
+        args,
+        key_tensors,
+        (
+            KV_LAYOUT_PAGED,
+            int(num_heads),
+            int(topk),
+            bool(output_physical_slots),
+            int(ctas_per_group),
+            int(merge_threshold),
+            k_quant_page_stride,
+            max_pages * _PAGE_SIZE,
+            k_scales_row_stride,
+            bool(vectorized_q_load),
+            q_row_stride_bytes,
+        ),
     )
     return out_i, out_v
 
@@ -2608,9 +2782,19 @@ def run_fused_indexer_mla(
         current_cuda_stream(),
     )
     key_tensors = [
-        ("q", q_bytes), ("w", weights), ("kq", k_quant_bytes), ("ks", k_scales),
-        ("pt", dummy_pt), ("sl", dummy_sl), ("kstart", k_start), ("kend", k_end),
-        ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
+        ("q", q_bytes),
+        ("w", weights),
+        ("kq", k_quant_bytes),
+        ("ks", k_scales),
+        ("pt", dummy_pt),
+        ("sl", dummy_sl),
+        ("kstart", k_start),
+        ("kend", k_end),
+        ("oi", out_i),
+        ("ov", out_v),
+        ("pv", pack_v),
+        ("pi", pack_i),
+        ("st", state),
     ]
     _launch_fused(
         kernel,

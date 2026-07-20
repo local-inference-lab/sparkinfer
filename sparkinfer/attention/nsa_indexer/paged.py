@@ -13,17 +13,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sparkinfer.attention.indexer.api import (
+from sparkinfer.attention.nsa_indexer._impl import (
     build_paged_mqa_schedule_metadata,
     uses_paged_mqa_schedule,
 )
-from sparkinfer.attention.indexer.contiguous_kernel import run_contiguous_logits_kernel
-from sparkinfer.attention.indexer.kernel import (
+from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+    run_contiguous_logits_kernel,
+)
+from sparkinfer.attention.nsa_indexer.kernel import (
     _env_indexer_stream_scorer_enabled,
     _split_index_k_cache_runtime_views,
     run_paged_supertile_logits_kernel,
 )
-from sparkinfer.attention.indexer.tiled_topk import (
+from sparkinfer.attention.nsa_indexer.tiled_topk import (
     run_row_topk,
     run_tiled_topk,
 )
@@ -33,7 +35,7 @@ from sparkinfer.attention.indexer.tiled_topk import (
 # row) at very long contexts.
 _TWO_LEVEL_SLICE_TOKENS = 16384
 _TWO_LEVEL_MAX_SLICES = 32
-from sparkinfer.attention.indexer.reference import (
+from sparkinfer.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
     unpack_index_k_cache_reference,
@@ -127,7 +129,9 @@ def _gather_shared_paged_supertile_kernel(
     row_lengths = tl.load(seqlens_per_query + row_offsets, mask=row_mask, other=0)
     local_ends = row_lengths - source_page_offset * page_size
     local_ends = tl.minimum(tl.maximum(local_ends, 0), supertile_tokens)
-    tl.store(k_start_out + row_offsets, tl.zeros((block_tokens,), tl.int32), mask=row_mask)
+    tl.store(
+        k_start_out + row_offsets, tl.zeros((block_tokens,), tl.int32), mask=row_mask
+    )
     tl.store(k_end_out + row_offsets, local_ends, mask=row_mask)
 
 
@@ -157,7 +161,9 @@ def resolve_replicated_num_q_heads(
 
     global_num_q_heads = int(global_num_q_heads)
     if global_num_q_heads <= 0:
-        raise ValueError(f"global_num_q_heads must be positive, got {global_num_q_heads}")
+        raise ValueError(
+            f"global_num_q_heads must be positive, got {global_num_q_heads}"
+        )
     if tensor_parallel_size is not None and int(tensor_parallel_size) <= 0:
         raise ValueError(
             f"tensor_parallel_size must be positive, got {int(tensor_parallel_size)}"
@@ -175,7 +181,9 @@ def resolve_local_num_q_heads(
     global_num_q_heads = int(global_num_q_heads)
     tensor_parallel_size = int(tensor_parallel_size)
     if global_num_q_heads <= 0:
-        raise ValueError(f"global_num_q_heads must be positive, got {global_num_q_heads}")
+        raise ValueError(
+            f"global_num_q_heads must be positive, got {global_num_q_heads}"
+        )
     if tensor_parallel_size <= 0:
         raise ValueError(
             f"tensor_parallel_size must be positive, got {tensor_parallel_size}"
@@ -224,10 +232,14 @@ def _validate_raw_page_lengths(
     """Reject positive lengths whose active page-table entries are missing."""
 
     if _is_cuda_graph_capture_active(real_page_table.device):
-        raise RuntimeError("paged-index metadata prep must run outside CUDA graph capture")
-    if real_page_table.device.type == "cuda" and os.getenv(
-        "SPARKINFER_VALIDATE_PAGED_INDEXER_CUDA_VALUES", "0"
-    ) != "1":
+        raise RuntimeError(
+            "paged-index metadata prep must run outside CUDA graph capture"
+        )
+    if (
+        real_page_table.device.type == "cuda"
+        and os.getenv("SPARKINFER_VALIDATE_PAGED_INDEXER_CUDA_VALUES", "0")
+        != "1"
+    ):
         return
     if cache_seqlens_int32.numel() == 0:
         return
@@ -344,9 +356,7 @@ def prepare_paged_indexer_metadata(
         )
     if build_schedule:
         if schedule_metadata is not None and schedule_out is not None:
-            raise ValueError(
-                "pass only one of schedule_metadata or schedule_out"
-            )
+            raise ValueError("pass only one of schedule_metadata or schedule_out")
         if schedule_metadata is None:
             if _is_cuda_graph_capture_active(real_page_table.device):
                 raise RuntimeError(
@@ -467,7 +477,9 @@ def _prepare_shared_paged_supertile(
 
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     if fp8_dtype is None:
-        raise RuntimeError("torch.float8_e4m3fn is required for shared paged-index scoring")
+        raise RuntimeError(
+            "torch.float8_e4m3fn is required for shared paged-index scoring"
+        )
     return (
         k_quant_bytes.view(fp8_dtype),
         k_scale_bytes.view(torch.float32).view(-1),
@@ -487,7 +499,9 @@ def _validate_q_head_contract(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     if expected_num_q_heads is not None and metadata.expected_num_q_heads is not None:
         if int(expected_num_q_heads) != int(metadata.expected_num_q_heads):
             raise ValueError(
@@ -513,7 +527,9 @@ def _validate_q_head_contract(
     elif weights.ndim == 2:
         weight_shape = tuple(weights.shape)
     else:
-        raise ValueError(f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}")
+        raise ValueError(
+            f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}"
+        )
     if weight_shape != (q_fp8.shape[0], q_fp8.shape[1]):
         raise ValueError(
             f"weights must have shape {(q_fp8.shape[0], q_fp8.shape[1])}, got "
@@ -655,14 +671,16 @@ def index_topk_fp8(
     output_physical_slots = bool(getattr(binding, "output_physical_slots", False))
     # Fused score+top-k route: single launch, no logits blob. Route selection is
     # owned by the scratch plan; launch only carries it out.
-    from sparkinfer.attention.indexer.fused_indexer import (
+    from sparkinfer.attention.nsa_indexer.fused_indexer import (
         run_fused_paged_indexer,
     )
 
     indexer_heads = int(q_fp8.shape[1])
     if route == "paged_fused":
         if bool(metadata.shared_page_table):
-            raise RuntimeError("fused paged indexer route cannot consume a shared page table")
+            raise RuntimeError(
+                "fused paged indexer route cannot consume a shared page table"
+            )
         cache = scratch.get_fused_indexer_scratch(topk=topk)
         quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
         idx, _ = run_fused_paged_indexer(
@@ -700,12 +718,17 @@ def index_topk_fp8(
         )
     use_shared_prefill_scorer = route == "packed_contiguous"
     topk_block_k = (
-        int(getattr(binding, "prefill_block_k", 0) or getattr(scratch, "prefill_block_k", 0))
+        int(
+            getattr(binding, "prefill_block_k", 0)
+            or getattr(scratch, "prefill_block_k", 0)
+        )
         if use_shared_prefill_scorer
         else _PAGED_INDEX_TILE_BLOCK_K
     )
     if topk_block_k <= 0:
-        raise RuntimeError("packed-contiguous paged indexer binding is missing prefill_block_k")
+        raise RuntimeError(
+            "packed-contiguous paged indexer binding is missing prefill_block_k"
+        )
     if supertile_tokens % topk_block_k != 0:
         raise RuntimeError(
             "paged indexer supertile width must be divisible by route block_k: "
@@ -724,8 +747,13 @@ def index_topk_fp8(
         row_count=q_rows,
     )
     final_values = out_scores if out_scores is not None else scratch_values[:, :topk]
-    final_raw_indices = out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
-    if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (q_rows, topk):
+    final_raw_indices = (
+        out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
+    )
+    if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (
+        q_rows,
+        topk,
+    ):
         raise ValueError(
             f"paged indexer scratch buffers are smaller than requested paged top-k {topk}"
         )
@@ -734,8 +762,13 @@ def index_topk_fp8(
             "paged indexer top-k values must be a CUDA torch.float32 tensor "
             "on the q_fp8 device"
         )
-    if final_raw_indices.dtype != torch.int32 or final_raw_indices.device != q_fp8.device:
-        raise ValueError("out_indices must be a CUDA torch.int32 tensor on the q_fp8 device")
+    if (
+        final_raw_indices.dtype != torch.int32
+        or final_raw_indices.device != q_fp8.device
+    ):
+        raise ValueError(
+            "out_indices must be a CUDA torch.int32 tensor on the q_fp8 device"
+        )
     if not final_values.is_contiguous() or not final_raw_indices.is_contiguous():
         raise ValueError("paged indexer top-k buffers must be contiguous")
     # Streaming-fold carry double-buffer (2, M, topk): chunk j reads the running top-k
@@ -759,7 +792,9 @@ def index_topk_fp8(
             slice_tokens = -(-min_slice // page_size) * page_size
         base = 0
         for c in range(num_chunks):
-            c_pages = min((c + 1) * supertile_pages, page_table_width) - c * supertile_pages
+            c_pages = (
+                min((c + 1) * supertile_pages, page_table_width) - c * supertile_pages
+            )
             c_tokens = c_pages * page_size
             splits_c = max(1, -(-c_tokens // slice_tokens))
             two_level_slices.append((splits_c, base))
@@ -778,7 +813,9 @@ def index_topk_fp8(
     carry_buf_values = None
     carry_buf_indices = None
     if num_chunks > 1 and not two_level_slices:
-        carry_buf_values, carry_buf_indices = scratch.get_indexer_contiguous_candidate_buffers()
+        carry_buf_values, carry_buf_indices = (
+            scratch.get_indexer_contiguous_candidate_buffers()
+        )
         if carry_buf_values.shape[0] < 2 or carry_buf_indices.shape[0] < 2:
             raise RuntimeError(
                 "paged indexer scratch carry buffers need a first dim of at least 2: "
@@ -786,17 +823,26 @@ def index_topk_fp8(
             )
         carry_buf_values = carry_buf_values[:2, :q_rows, :topk]
         carry_buf_indices = carry_buf_indices[:2, :q_rows, :topk]
-        if carry_buf_values.dtype != torch.float32 or carry_buf_values.device != q_fp8.device:
+        if (
+            carry_buf_values.dtype != torch.float32
+            or carry_buf_values.device != q_fp8.device
+        ):
             raise ValueError(
                 "paged indexer carry values must be a CUDA torch.float32 "
                 "tensor on the q_fp8 device"
             )
-        if carry_buf_indices.dtype != torch.int32 or carry_buf_indices.device != q_fp8.device:
+        if (
+            carry_buf_indices.dtype != torch.int32
+            or carry_buf_indices.device != q_fp8.device
+        ):
             raise ValueError(
                 "paged indexer carry indices must be a CUDA torch.int32 "
                 "tensor on the q_fp8 device"
             )
-        if not carry_buf_values.is_contiguous() or not carry_buf_indices.is_contiguous():
+        if (
+            not carry_buf_values.is_contiguous()
+            or not carry_buf_indices.is_contiguous()
+        ):
             raise ValueError("paged indexer carry buffers must be contiguous")
 
     active_width = (
@@ -808,7 +854,9 @@ def index_topk_fp8(
     lengths_for_kernel = metadata.cache_seqlens_int32
     if use_shared_prefill_scorer:
         if not bool(metadata.shared_page_table):
-            raise RuntimeError("packed-contiguous paged indexer route requires a shared page table")
+            raise RuntimeError(
+                "packed-contiguous paged indexer route requires a shared page table"
+            )
         indexer_q_capacity = max(
             int(getattr(scratch, "max_total_q", 0)),
             int(getattr(scratch, "max_paged_q_rows", 0)),
@@ -825,9 +873,8 @@ def index_topk_fp8(
         chunk_pages = page_end - page_begin
         chunk_width_tokens = chunk_pages * page_size
         chunk_start_token = page_begin * page_size
-        if (
-            not _env_indexer_stream_scorer_enabled()
-            and uses_paged_mqa_schedule(q_rows=q_rows, max_pages=chunk_pages)
+        if not _env_indexer_stream_scorer_enabled() and uses_paged_mqa_schedule(
+            q_rows=q_rows, max_pages=chunk_pages
         ):
             # The streamed scorer schedules its own persistent grid over the
             # whole supertile; only the legacy tiled scorer needs the
@@ -882,7 +929,9 @@ def index_topk_fp8(
             )
             topk_lengths = lengths_for_kernel
         if not logits.is_contiguous():
-            raise RuntimeError("paged supertile scorer returned non-contiguous tiled logits")
+            raise RuntimeError(
+                "paged supertile scorer returned non-contiguous tiled logits"
+            )
 
         is_first = chunk_idx == 0
         is_last = chunk_idx == num_chunks - 1
@@ -950,7 +999,9 @@ def index_topk_fp8(
                 carry_indices=carry_indices,
                 is_first=is_first,
                 output_page_table=(
-                    metadata.real_page_table if is_last and output_physical_slots else None
+                    metadata.real_page_table
+                    if is_last and output_physical_slots
+                    else None
                 ),
                 output_page_size=page_size,
             )

@@ -26,8 +26,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
-from sparkinfer.attention._cute import ops as attention_ops
-from sparkinfer.cute.intrinsics import get_ptr_as_int64, pack_f32x2_to_bfloat2, shared_ptr_to_u32
+from sparkinfer.attention._shared.cute import ops as attention_ops
+from sparkinfer._lib.intrinsics import (
+    get_ptr_as_int64,
+    pack_f32x2_to_bfloat2,
+    shared_ptr_to_u32,
+)
 
 
 @dsl_user_op
@@ -168,7 +172,9 @@ def _state_merge(
         other_scale = _exp2_approx_ftz_f32(other_m - state_m)
         state_d = Float32(prev_d * prev_scale + other_d * other_scale)
         for vec_idx in cutlass.range_constexpr(cute.size(state_o.shape)):
-            state_o[vec_idx] = state_o[vec_idx] * prev_scale + other_o[vec_idx] * other_scale
+            state_o[vec_idx] = (
+                state_o[vec_idx] * prev_scale + other_o[vec_idx] * other_scale
+            )
     return Float32(state_m), state_d
 
 
@@ -221,7 +227,9 @@ def _threadblock_sync_state(
     cute.arch.sync_threads()
 
     for iter_idx in cutlass.range_constexpr(bdy):
-        other_o = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), Float32)
+        other_o = cute.make_rmem_tensor(
+            cute.make_layout((vec_size,), stride=(1,)), Float32
+        )
         for vec_idx in cutlass.range_constexpr(vec_size):
             other_o[vec_idx] = s_partial[iter_idx, base_k + vec_idx]
         state_m, state_d = _state_merge_normalized_lse_base2(
@@ -298,15 +306,15 @@ def _merge_async_slot(
             smem_addr = shared_ptr_to_u32(
                 s_stage_partial.iterator
                 + Int32(
-                    ((cur_iter % num_smem_stages) * bdy + ty) * head_dim
-                    + load_base_k
+                    ((cur_iter % num_smem_stages) * bdy + ty) * head_dim + load_base_k
                 )
             )
             if tx < bdx // 2 and next_linear_idx < num_index_sets:
                 partial_idx = start_idx + next_linear_idx
                 gmem_addr = get_ptr_as_int64(
                     mV_partial,
-                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
+                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                    * Int64(head_dim)
                     + Int64(load_base_k),
                 )
                 _cp_async_load_128b(smem_addr, gmem_addr)
@@ -319,7 +327,8 @@ def _merge_async_slot(
                 partial_idx = start_idx + next_linear_idx
                 gmem_addr = get_ptr_as_int64(
                     mV_partial,
-                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
+                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                    * Int64(head_dim)
                     + Int64(base_k),
                 )
                 _cp_async_load_128b(smem_addr, gmem_addr)
@@ -385,7 +394,13 @@ class PagedPersistentMergeKernel:
             return False
         if dtype_partial not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
             return False
-        if head_dim <= 0 or vec_size <= 0 or bdx <= 0 or bdy <= 0 or num_smem_stages <= 0:
+        if (
+            head_dim <= 0
+            or vec_size <= 0
+            or bdx <= 0
+            or bdy <= 0
+            or num_smem_stages <= 0
+        ):
             return False
         if head_dim != bdx * vec_size:
             return False
@@ -406,8 +421,12 @@ class PagedPersistentMergeKernel:
             ],
             16,
         ]
-        stage_lse_storage = cute.struct.MemRange[cutlass.Float32, int(self.bdx * self.bdy)]
-        partial_storage = cute.struct.MemRange[cutlass.Float32, int(self.bdy * self.head_dim)]
+        stage_lse_storage = cute.struct.MemRange[
+            cutlass.Float32, int(self.bdx * self.bdy)
+        ]
+        partial_storage = cute.struct.MemRange[
+            cutlass.Float32, int(self.bdy * self.head_dim)
+        ]
         lse_storage = cute.struct.MemRange[cutlass.Float32, int(self.bdy)]
 
         class SharedStorage:
@@ -436,9 +455,13 @@ class PagedPersistentMergeKernel:
         stream: cuda.CUstream,
     ):
         if const_expr(len(mV_partial.shape) != 3):
-            raise ValueError("mV_partial must have shape (nnz_partial_rows, num_heads, head_dim)")
+            raise ValueError(
+                "mV_partial must have shape (nnz_partial_rows, num_heads, head_dim)"
+            )
         if const_expr(len(mLSE_partial.shape) != 2):
-            raise ValueError("mLSE_partial must have shape (nnz_partial_rows, num_heads)")
+            raise ValueError(
+                "mLSE_partial must have shape (nnz_partial_rows, num_heads)"
+            )
         if const_expr(len(mMergeIndptr.shape) != 1):
             raise ValueError("mMergeIndptr must have shape (max_total_rows + 1,)")
         if const_expr(len(mCacheSeqlens.shape) != 1):
@@ -455,7 +478,9 @@ class PagedPersistentMergeKernel:
             raise TypeError("mV_partial dtype must match dtype_partial")
         if const_expr(mO.element_type != self.dtype):
             raise TypeError("mO dtype must match dtype")
-        if const_expr(mLSE_partial.element_type != Float32 or mLSE.element_type != Float32):
+        if const_expr(
+            mLSE_partial.element_type != Float32 or mLSE.element_type != Float32
+        ):
             raise TypeError("mLSE tensors must be Float32")
         if const_expr(
             not self.can_implement(
@@ -482,7 +507,11 @@ class PagedPersistentMergeKernel:
             mLSE,
             mTotalRowsPtr,
         ).launch(
-            grid=((mO.shape[1], mO.shape[0], 1) if self.direct_grid else (self.persistent_ctas, 1, 1)),
+            grid=(
+                (mO.shape[1], mO.shape[0], 1)
+                if self.direct_grid
+                else (self.persistent_ctas, 1, 1)
+            ),
             block=[self.bdx, self.bdy, 1],
             stream=stream,
         )
@@ -506,7 +535,11 @@ class PagedPersistentMergeKernel:
         max_total_rows = mO.shape[0]
         num_heads = mO.shape[1]
         head_dim = self.head_dim
-        total_rows = mTotalRowsPtr[0] if const_expr(mTotalRowsPtr is not None) else max_total_rows
+        total_rows = (
+            mTotalRowsPtr[0]
+            if const_expr(mTotalRowsPtr is not None)
+            else max_total_rows
+        )
 
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = self._get_shared_storage_cls()
@@ -602,15 +635,20 @@ class PagedPersistentMergeKernel:
                             smem_addr = shared_ptr_to_u32(
                                 s_stage_partial.iterator
                                 + Int32(
-                                    (stage_idx * self.bdy + ty) * head_dim
-                                    + load_base_k
+                                    (stage_idx * self.bdy + ty) * head_dim + load_base_k
                                 )
                             )
-                            if tx < self.bdx // 2 and staged_linear_idx < num_index_sets:
+                            if (
+                                tx < self.bdx // 2
+                                and staged_linear_idx < num_index_sets
+                            ):
                                 partial_idx = start_idx + staged_linear_idx
                                 gmem_addr = get_ptr_as_int64(
                                     mV_partial,
-                                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                                    (
+                                        Int64(partial_idx) * Int64(num_heads)
+                                        + Int64(head_idx)
+                                    )
                                     * Int64(head_dim)
                                     + Int64(load_base_k),
                                 )
@@ -624,7 +662,10 @@ class PagedPersistentMergeKernel:
                                 partial_idx = start_idx + staged_linear_idx
                                 gmem_addr = get_ptr_as_int64(
                                     mV_partial,
-                                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                                    (
+                                        Int64(partial_idx) * Int64(num_heads)
+                                        + Int64(head_idx)
+                                    )
                                     * Int64(head_dim)
                                     + Int64(base_k),
                                 )
@@ -738,9 +779,9 @@ class PagedPersistentMergeKernel:
                             Float32,
                         )
                         for vec_idx in cutlass.range_constexpr(self.vec_size):
-                            other_o[vec_idx] = mV_partial[partial_idx, head_idx, base_k + vec_idx].to(
-                                Float32
-                            )
+                            other_o[vec_idx] = mV_partial[
+                                partial_idx, head_idx, base_k + vec_idx
+                            ].to(Float32)
                         state_m, state_d = _state_merge_normalized_lse_base2(
                             state_o,
                             state_m,
@@ -773,7 +814,9 @@ class PagedPersistentMergeKernel:
                     )
                 else:
                     for vec_idx in cutlass.range_constexpr(self.vec_size):
-                        mO[row_idx, head_idx, base_k + vec_idx] = state_o[vec_idx].to(self.dtype)
+                        mO[row_idx, head_idx, base_k + vec_idx] = state_o[vec_idx].to(
+                            self.dtype
+                        )
                 if tx == 0 and ty == 0:
                     mLSE[head_idx, row_idx] = _state_get_lse_base2(state_m, state_d)
             if const_expr(self.direct_grid):

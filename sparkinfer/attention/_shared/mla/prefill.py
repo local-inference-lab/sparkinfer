@@ -47,7 +47,9 @@ def _cache_block_stride_bytes(
     model_type: ModelType,
     record_bytes: int | None = None,
 ) -> int:
-    from sparkinfer.attention.mla.compressed_reference import compressed_mla_page_nbytes
+    from sparkinfer.attention._shared.mla.compressed_reference import (
+        compressed_mla_page_nbytes,
+    )
 
     if model_type == ModelType.GLM_NSA:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
@@ -240,7 +242,9 @@ def run_unified_prefill(
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()
     if output is None:
-        output = torch.empty((num_tokens, heads, d_v), dtype=torch.bfloat16, device=device)
+        output = torch.empty(
+            (num_tokens, heads, d_v), dtype=torch.bfloat16, device=device
+        )
     if lse_out is None:
         lse_out = torch.empty((num_tokens, heads), dtype=torch.float32, device=device)
 
@@ -259,7 +263,9 @@ def run_unified_prefill(
 
         partitions = _mg_head_partitions(heads, hpb)
         if not partitions:
-            raise ValueError(f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}")
+            raise ValueError(
+                f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
+            )
         for mg_n_hg, active_heads, head_offset in partitions:
             kwargs = dict(
                 q=q,

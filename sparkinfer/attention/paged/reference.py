@@ -60,7 +60,7 @@ def attention_reference(
         raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
 
     if softmax_scale is None:
-        softmax_scale = head_dim_qk ** -0.5
+        softmax_scale = head_dim_qk**-0.5
 
     q_per_kv = q_heads // kv_heads
     if q_per_kv != 1:
@@ -76,21 +76,22 @@ def attention_reference(
         if relative_attention_bias.ndim == 3:
             relative_attention_bias = relative_attention_bias.unsqueeze(0)
         expected_prefix = (batch, seqlen_q, q_heads)
-        if relative_attention_bias.ndim != 4 or tuple(
-            relative_attention_bias.shape[:3]
-        ) != expected_prefix:
+        if (
+            relative_attention_bias.ndim != 4
+            or tuple(relative_attention_bias.shape[:3]) != expected_prefix
+        ):
             raise ValueError(
                 "relative_attention_bias must have shape "
                 f"{expected_prefix} + (relative_extent,), got "
                 f"{tuple(relative_attention_bias.shape)}"
             )
         relative_extent = int(relative_attention_bias.shape[3])
-        q_idx = torch.arange(
-            seqlen_q, device=scores.device, dtype=torch.int64
-        ).view(seqlen_q, 1)
-        k_idx = torch.arange(
-            seqlen_k, device=scores.device, dtype=torch.int64
-        ).view(1, seqlen_k)
+        q_idx = torch.arange(seqlen_q, device=scores.device, dtype=torch.int64).view(
+            seqlen_q, 1
+        )
+        k_idx = torch.arange(seqlen_k, device=scores.device, dtype=torch.int64).view(
+            1, seqlen_k
+        )
         distance = q_idx + seqlen_k - seqlen_q - k_idx
         in_extent = (distance >= 0) & (distance < relative_extent)
         distance = distance.clamp(min=0, max=relative_extent - 1)
@@ -105,25 +106,44 @@ def attention_reference(
             ~in_extent.view(1, 1, seqlen_q, seqlen_k), 0.0
         )
     if causal:
-        causal_mask = _causal_mask_right_aligned(seqlen_q, seqlen_k, device=scores.device)
-        scores = scores.masked_fill(causal_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
+        causal_mask = _causal_mask_right_aligned(
+            seqlen_q, seqlen_k, device=scores.device
+        )
+        scores = scores.masked_fill(
+            causal_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf")
+        )
     if window_left >= 0:
-        q_idx = torch.arange(seqlen_q, device=scores.device, dtype=torch.int32).view(seqlen_q, 1)
-        k_idx = torch.arange(seqlen_k, device=scores.device, dtype=torch.int32).view(1, seqlen_k)
+        q_idx = torch.arange(seqlen_q, device=scores.device, dtype=torch.int32).view(
+            seqlen_q, 1
+        )
+        k_idx = torch.arange(seqlen_k, device=scores.device, dtype=torch.int32).view(
+            1, seqlen_k
+        )
         causal_limit = q_idx + seqlen_k - seqlen_q
         window_mask = k_idx < (causal_limit - int(window_left))
-        scores = scores.masked_fill(window_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
+        scores = scores.masked_fill(
+            window_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf")
+        )
     if attention_sink_bias is not None:
-        if attention_sink_bias.ndim != 1 or int(attention_sink_bias.shape[0]) != q_heads:
+        if (
+            attention_sink_bias.ndim != 1
+            or int(attention_sink_bias.shape[0]) != q_heads
+        ):
             raise ValueError("attention_sink_bias must have shape [q_heads]")
-        sink = attention_sink_bias.to(device=scores.device, dtype=scores.dtype).view(1, q_heads, 1, 1)
-        scores_for_lse = torch.cat((scores, sink.expand(batch, q_heads, seqlen_q, 1)), dim=-1)
+        sink = attention_sink_bias.to(device=scores.device, dtype=scores.dtype).view(
+            1, q_heads, 1, 1
+        )
+        scores_for_lse = torch.cat(
+            (scores, sink.expand(batch, q_heads, seqlen_q, 1)), dim=-1
+        )
     else:
         scores_for_lse = scores
     probs = torch.softmax(scores, dim=-1)
     out = torch.matmul(probs, v_f).permute(0, 2, 1, 3).to(q.dtype)
     if attention_sink_bias is not None:
-        denom = torch.exp(scores_for_lse - torch.logsumexp(scores_for_lse, dim=-1, keepdim=True))
+        denom = torch.exp(
+            scores_for_lse - torch.logsumexp(scores_for_lse, dim=-1, keepdim=True)
+        )
         value_probs = denom[..., :seqlen_k]
         out = torch.matmul(value_probs, v_f).permute(0, 2, 1, 3).to(q.dtype)
     lse = torch.logsumexp(scores_for_lse, dim=-1).to(torch.float32)
@@ -145,17 +165,23 @@ def materialize_paged_kv_cache(
     v_descale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_cache.ndim != 4 or v_cache.ndim != 4:
-        raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
+        raise ValueError(
+            "expected paged K/V caches with shape [num_pages, page_size, heads, dim]"
+        )
     page_size = int(k_cache.shape[1])
     cache_len = int(cache_seqlens[request_idx].item())
     if cache_len == 0:
-        return k_cache[:0].reshape(0, k_cache.shape[2], k_cache.shape[3]), v_cache[:0].reshape(
-            0, v_cache.shape[2], v_cache.shape[3]
-        )
+        return k_cache[:0].reshape(0, k_cache.shape[2], k_cache.shape[3]), v_cache[
+            :0
+        ].reshape(0, v_cache.shape[2], v_cache.shape[3])
     num_pages = (cache_len + page_size - 1) // page_size
     page_ids = page_table[request_idx, :num_pages].to(torch.long)
-    k = k_cache.index_select(0, page_ids).reshape(num_pages * page_size, k_cache.shape[2], k_cache.shape[3])
-    v = v_cache.index_select(0, page_ids).reshape(num_pages * page_size, v_cache.shape[2], v_cache.shape[3])
+    k = k_cache.index_select(0, page_ids).reshape(
+        num_pages * page_size, k_cache.shape[2], k_cache.shape[3]
+    )
+    v = v_cache.index_select(0, page_ids).reshape(
+        num_pages * page_size, v_cache.shape[2], v_cache.shape[3]
+    )
     k = k[:cache_len]
     v = v[:cache_len]
     if k.dtype == torch.float8_e4m3fn:
@@ -203,7 +229,7 @@ def paged_attention_reference(
     total_q, q_heads, head_dim_qk = q.shape
     head_dim_vo = int(v_cache.shape[-1])
     if softmax_scale is None:
-        softmax_scale = head_dim_qk ** -0.5
+        softmax_scale = head_dim_qk**-0.5
 
     out = torch.empty((total_q, q_heads, head_dim_vo), dtype=q.dtype, device=q.device)
     lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)
@@ -267,8 +293,12 @@ def msa_attention_reference(
             f"q2k_indices must be rank-3 [kv_heads, total_q_capacity, topk], got {tuple(q2k_indices.shape)}"
         )
     if k_cache.ndim != 4 or v_cache.ndim != 4:
-        raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
-    if int(k_cache.shape[1]) not in (64, 128) or int(v_cache.shape[1]) != int(k_cache.shape[1]):
+        raise ValueError(
+            "expected paged K/V caches with shape [num_pages, page_size, heads, dim]"
+        )
+    if int(k_cache.shape[1]) not in (64, 128) or int(v_cache.shape[1]) != int(
+        k_cache.shape[1]
+    ):
         raise ValueError("MSA reference expects matching page_size 64 or 128")
     if int(block_tokens) != 128:
         raise ValueError("MSA reference currently expects block_tokens=128")
@@ -287,7 +317,7 @@ def msa_attention_reference(
     if int(q2k_indices.shape[1]) < total_q:
         raise ValueError("q2k_indices total_q_capacity is smaller than q")
     if softmax_scale is None:
-        softmax_scale = head_dim_qk ** -0.5
+        softmax_scale = head_dim_qk**-0.5
 
     out = torch.empty((total_q, q_heads, head_dim_vo), dtype=q.dtype, device=q.device)
     lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)

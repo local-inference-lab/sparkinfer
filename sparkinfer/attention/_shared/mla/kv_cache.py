@@ -45,12 +45,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from sparkinfer.cute.compiler import (
+from sparkinfer._lib.compiler import (
     KernelCompileSpec,
     launch as sparkinfer_launch,
     tensor_compile_fact,
 )
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     cvt_e4m3_to_f32_via_f16,
     cvt_f32_to_e4m3,
     cvt_f32x4_to_e4m3x4,
@@ -65,7 +65,7 @@ from sparkinfer.cute.intrinsics import (
     st_global_u64,
     st_global_u8,
 )
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.utils import current_cuda_stream
 
 _KV_LORA_RANK = 512
 _PE_DIM = 64

@@ -148,24 +148,40 @@ def compressed_mla_decode_forward(
     if swa_topk_lengths.device != q3.device:
         raise ValueError("swa_topk_lengths must be on the same device as q_all")
 
-    has_indexed = indexed_k_cache is not None or indexed_indices is not None or indexed_topk_lengths is not None
+    has_indexed = (
+        indexed_k_cache is not None
+        or indexed_indices is not None
+        or indexed_topk_lengths is not None
+    )
     if has_indexed:
-        if indexed_k_cache is None or indexed_indices is None or indexed_topk_lengths is None:
-            raise ValueError("indexed_k_cache, indexed_indices, and indexed_topk_lengths must be provided together")
+        if (
+            indexed_k_cache is None
+            or indexed_indices is None
+            or indexed_topk_lengths is None
+        ):
+            raise ValueError(
+                "indexed_k_cache, indexed_indices, and indexed_topk_lengths must be provided together"
+            )
         if indexed_page_size is None:
-            raise ValueError("indexed_page_size is required when indexed_k_cache is provided")
+            raise ValueError(
+                "indexed_page_size is required when indexed_k_cache is provided"
+            )
         if indexed_page_table is not None:
             raise ValueError(
                 "SM120 sparse-MLA decode does not support a mapped indexed_page_table; "
                 "the extra cache is addressed by raw slot id"
             )
-        indexed_k_cache = _compressed_mla_cache_byte_view(indexed_k_cache, name="indexed_k_cache")
+        indexed_k_cache = _compressed_mla_cache_byte_view(
+            indexed_k_cache, name="indexed_k_cache"
+        )
         _validate_compressed_cache_layout(
             indexed_k_cache,
             page_size=int(indexed_page_size),
             name="indexed_k_cache",
         )
-        indexed_indices_2d = _normalize_index_matrix(indexed_indices, name="indexed_indices")
+        indexed_indices_2d = _normalize_index_matrix(
+            indexed_indices, name="indexed_indices"
+        )
         if indexed_indices_2d.device != q3.device:
             raise ValueError("indexed_indices must be on the same device as q_all")
         if indexed_indices_2d.shape[0] != rows:
@@ -180,16 +196,24 @@ def compressed_mla_decode_forward(
     else:
         indexed_indices_2d = None
         if indexed_page_table is not None:
-            raise ValueError("indexed_page_table requires indexed_k_cache/indices/lengths")
+            raise ValueError(
+                "indexed_page_table requires indexed_k_cache/indices/lengths"
+            )
 
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if attn_sink.shape != (heads,):
-            raise ValueError(f"attn_sink must have shape [{heads}], got {tuple(attn_sink.shape)}")
+            raise ValueError(
+                f"attn_sink must have shape [{heads}], got {tuple(attn_sink.shape)}"
+            )
         if attn_sink.device != q3.device:
-            raise ValueError(f"attn_sink device {attn_sink.device} does not match q_all device {q3.device}")
+            raise ValueError(
+                f"attn_sink device {attn_sink.device} does not match q_all device {q3.device}"
+            )
         if attn_sink.dtype != torch.float32:
-            raise TypeError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+            raise TypeError(
+                f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}"
+            )
         if not attn_sink.is_contiguous():
             raise ValueError("attn_sink must be contiguous")
 
@@ -197,7 +221,8 @@ def compressed_mla_decode_forward(
         scratch=scratch,
         rows=rows,
         heads=heads,
-        width=swa_indices_2d.shape[1] + (indexed_indices_2d.shape[1] if has_indexed else 0),
+        width=swa_indices_2d.shape[1]
+        + (indexed_indices_2d.shape[1] if has_indexed else 0),
     )
 
     if out is not None:
@@ -363,7 +388,9 @@ def _stage_fixed_compressed_mla_inputs(
     indexed_indices: torch.Tensor,
     indexed_lengths: torch.Tensor,
     indexed_page_table: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     q_stage = workspace.compressed_mla_q_stage
     swa_indices_stage = workspace.compressed_mla_swa_indices_stage
     swa_lengths_stage = workspace.compressed_mla_swa_lengths_stage
@@ -386,7 +413,9 @@ def _stage_fixed_compressed_mla_inputs(
     rows = int(q_all.shape[0])
     cap_rows = int(workspace.max_total_q)
     if rows > cap_rows:
-        raise ValueError(f"q rows {rows} exceed fixed compressed MLA staging capacity {cap_rows}")
+        raise ValueError(
+            f"q rows {rows} exceed fixed compressed MLA staging capacity {cap_rows}"
+        )
     if q_stage.shape != (cap_rows, int(workspace.num_q_heads), COMPRESSED_MLA_HEAD_DIM):
         raise ValueError(
             "compressed MLA q staging buffer shape mismatch: "
@@ -403,9 +432,13 @@ def _stage_fixed_compressed_mla_inputs(
                 f"got {tuple(stage.shape)}, expected ({cap_rows},)"
             )
         if stage.dtype != torch.int32:
-            raise TypeError(f"compressed MLA {name} staging buffer must be int32, got {stage.dtype}")
+            raise TypeError(
+                f"compressed MLA {name} staging buffer must be int32, got {stage.dtype}"
+            )
         if stage.device != q_all.device:
-            raise ValueError(f"compressed MLA {name} staging buffer must be on {q_all.device}")
+            raise ValueError(
+                f"compressed MLA {name} staging buffer must be on {q_all.device}"
+            )
     q_stage[:rows].copy_(q_all.detach())
 
     swa_indices_view = _stage_fixed_int_matrix(
@@ -471,7 +504,9 @@ def _normalize_compressed_q(q: torch.Tensor) -> torch.Tensor:
     if q.ndim == 4 and q.shape[1] == 1:
         q = q[:, 0]
     if q.ndim != 3 or q.shape[-1] != COMPRESSED_MLA_HEAD_DIM:
-        raise ValueError(f"q_all must have shape [rows, heads, {COMPRESSED_MLA_HEAD_DIM}], got {tuple(q.shape)}")
+        raise ValueError(
+            f"q_all must have shape [rows, heads, {COMPRESSED_MLA_HEAD_DIM}], got {tuple(q.shape)}"
+        )
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q_all must have dtype torch.bfloat16, got {q.dtype}")
     if not q.is_contiguous():
@@ -506,7 +541,9 @@ def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.
             f"{name} must have dtype torch.uint8 or FP8 storage, got {cache.dtype}"
         )
     if byte_cache.ndim != 2:
-        raise ValueError(f"{name} must have shape [pages, page_bytes], got {tuple(cache.shape)}")
+        raise ValueError(
+            f"{name} must have shape [pages, page_bytes], got {tuple(cache.shape)}"
+        )
     if int(byte_cache.stride(1)) != 1:
         raise ValueError(
             f"{name} page payload must be contiguous in the last dimension, "
@@ -530,11 +567,15 @@ def _validate_compressed_launch_views(
     heads = int(heads)
     launch_num_chunks = int(launch_num_chunks)
     if tmp_output.dtype != torch.bfloat16:
-        raise TypeError(f"compressed MLA tmp_output must be BF16, got {tmp_output.dtype}")
+        raise TypeError(
+            f"compressed MLA tmp_output must be BF16, got {tmp_output.dtype}"
+        )
     if tmp_lse.dtype != torch.float32:
         raise TypeError(f"compressed MLA tmp_lse must be FP32, got {tmp_lse.dtype}")
     if tmp_output.device != tmp_lse.device:
-        raise ValueError("compressed MLA tmp_output and tmp_lse must be on the same device")
+        raise ValueError(
+            "compressed MLA tmp_output and tmp_lse must be on the same device"
+        )
     _validate_tensor_storage_bounds(tmp_output, name="compressed MLA tmp_output")
     _validate_tensor_storage_bounds(tmp_lse, name="compressed MLA tmp_lse")
     if direct_output:
@@ -569,7 +610,9 @@ def _validate_compressed_launch_views(
                 f"buffer={tuple(tmp_output.shape)} required>={required}"
             )
     if tmp_lse.ndim != 3:
-        raise ValueError(f"compressed MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}")
+        raise ValueError(
+            f"compressed MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}"
+        )
     required_lse = (q_rows, heads, max(1, launch_num_chunks))
     if (
         int(tmp_lse.shape[0]) < q_rows
@@ -583,7 +626,11 @@ def _validate_compressed_launch_views(
 
 
 def _is_row_shared_index_matrix(indices: torch.Tensor) -> bool:
-    return indices.ndim == 2 and int(indices.stride(0)) == 0 and int(indices.stride(1)) == 1
+    return (
+        indices.ndim == 2
+        and int(indices.stride(0)) == 0
+        and int(indices.stride(1)) == 1
+    )
 
 
 def _normalize_index_matrix(
@@ -595,10 +642,14 @@ def _normalize_index_matrix(
     if indices.ndim == 3 and indices.shape[1] == 1:
         indices = indices[:, 0]
     if indices.ndim != 2:
-        raise ValueError(f"{name} must have shape [rows, width] or [rows, 1, width], got {tuple(indices.shape)}")
+        raise ValueError(
+            f"{name} must have shape [rows, width] or [rows, 1, width], got {tuple(indices.shape)}"
+        )
     if indices.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32, got {indices.dtype}")
-    if not indices.is_contiguous() and not (allow_row_shared and _is_row_shared_index_matrix(indices)):
+    if not indices.is_contiguous() and not (
+        allow_row_shared and _is_row_shared_index_matrix(indices)
+    ):
         raise ValueError(f"{name} must be contiguous for compressed MLA")
     return indices
 
@@ -625,9 +676,13 @@ def _validate_compressed_mla_scratch(
     width: int,
 ) -> None:
     if rows > scratch.max_total_q:
-        raise ValueError(f"q rows {rows} exceed compressed MLA scratch max_total_q {scratch.max_total_q}")
+        raise ValueError(
+            f"q rows {rows} exceed compressed MLA scratch max_total_q {scratch.max_total_q}"
+        )
     if rows > scratch.max_batch and scratch.mode == "decode":
-        raise ValueError(f"decode rows {rows} exceed compressed MLA scratch max_batch {scratch.max_batch}")
+        raise ValueError(
+            f"decode rows {rows} exceed compressed MLA scratch max_batch {scratch.max_batch}"
+        )
     if heads != scratch.num_q_heads:
         raise ValueError(
             f"q_all num_heads {heads} does not match compressed MLA scratch num_q_heads {scratch.num_q_heads}"
@@ -641,4 +696,6 @@ def _validate_compressed_mla_scratch(
             f"compressed MLA scratch v_head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {scratch.v_head_dim}"
         )
     if width > scratch.topk:
-        raise ValueError(f"compressed MLA width {width} exceeds scratch topk {scratch.topk}")
+        raise ValueError(
+            f"compressed MLA width {width} exceeds scratch topk {scratch.topk}"
+        )

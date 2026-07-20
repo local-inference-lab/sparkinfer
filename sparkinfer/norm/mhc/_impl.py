@@ -8,14 +8,14 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.integration.scratch_layout import (
+from sparkinfer._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_view,
 )
-from sparkinfer.integration.scratch import (
-    SPARKINFERScratchBufferSpec,
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
@@ -165,7 +165,9 @@ class SPARKINFERMHCScratchCaps:
         object.__setattr__(self, "hidden_size", max(int(self.hidden_size), 1))
         object.__setattr__(self, "split_k", max(int(self.split_k), 1))
         if self.dtype != torch.bfloat16:
-            raise ValueError(f"mHC scratch currently supports torch.bfloat16 outputs, got {self.dtype}")
+            raise ValueError(
+                f"mHC scratch currently supports torch.bfloat16 outputs, got {self.dtype}"
+            )
 
 
 @dataclass(frozen=True)
@@ -178,9 +180,9 @@ class _MHCScratchLayout:
 class SPARKINFERMHCScratchPlan:
     caps: SPARKINFERMHCScratchCaps
     layout: _MHCScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -313,9 +315,13 @@ def _use_mhc_prefill_tf32_project(
     norm_weight: torch.Tensor | None,
     policy_m: int,
 ) -> bool:
-    prefill_bf16_min_tokens = os.environ.get("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "384")
+    prefill_bf16_min_tokens = os.environ.get(
+        "SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "384"
+    )
     prefill_tf32_min_tokens = int(
-        os.environ.get("SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS", prefill_bf16_min_tokens)
+        os.environ.get(
+            "SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS", prefill_bf16_min_tokens
+        )
     )
     prefill_tf32_enabled = os.environ.get(
         "SPARKINFER_MHC_PREFILL_TF32_MMA",
@@ -466,8 +472,7 @@ def _validate_pre_inputs(
         raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
     if residual.ndim != 2:
         raise ValueError(
-            "residual must be rank-2 [tokens, hidden], got "
-            f"{tuple(residual.shape)}"
+            f"residual must be rank-2 [tokens, hidden], got {tuple(residual.shape)}"
         )
     tokens, hidden_size = map(int, residual.shape)
     if hidden_size <= 0:
@@ -479,12 +484,18 @@ def _validate_pre_inputs(
             f"fn must have shape {(MHC_MIXES, hidden_size)}, got {tuple(fn.shape)}"
         )
     if hc_scale.dtype != torch.float32 or tuple(hc_scale.shape) != (3,):
-        raise ValueError(f"hc_scale must be float32 shape [3], got {hc_scale.dtype} {tuple(hc_scale.shape)}")
+        raise ValueError(
+            f"hc_scale must be float32 shape [3], got {hc_scale.dtype} {tuple(hc_scale.shape)}"
+        )
     if hc_base.dtype != torch.float32 or tuple(hc_base.shape) != (MHC_MIXES,):
         raise ValueError(
             f"hc_base must be float32 shape [{MHC_MIXES}], got {hc_base.dtype} {tuple(hc_base.shape)}"
         )
-    if fn.device != residual.device or hc_scale.device != residual.device or hc_base.device != residual.device:
+    if (
+        fn.device != residual.device
+        or hc_scale.device != residual.device
+        or hc_base.device != residual.device
+    ):
         raise ValueError("fn, hc_scale, and hc_base must be on the residual device")
     _require_contiguous(residual, name="residual")
     _require_contiguous(fn, name="fn")
@@ -505,14 +516,11 @@ def _validate_post_pre_inputs(
         raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
     if residual.ndim != 3:
         raise ValueError(
-            "residual must be rank-3 [tokens, 4, hidden], got "
-            f"{tuple(residual.shape)}"
+            f"residual must be rank-3 [tokens, 4, hidden], got {tuple(residual.shape)}"
         )
     tokens, hc_mult, hidden_size = map(int, residual.shape)
     if hc_mult != MHC_MULT:
-        raise ValueError(
-            f"residual hc dimension must be {MHC_MULT}, got {hc_mult}"
-        )
+        raise ValueError(f"residual hc dimension must be {MHC_MULT}, got {hc_mult}")
     if hidden_size <= 0:
         raise ValueError("hidden_size must be positive")
     if fn.dtype != torch.float32:
@@ -640,9 +648,7 @@ def _sparkinfer_mhc_pre_impl(
         comb_out = binding.comb_buffer
         split_k = int(binding.split_k)
 
-    tokens, hidden_size, _ = _validate_pre_inputs(
-        residual, fn, hc_scale, hc_base
-    )
+    tokens, hidden_size, _ = _validate_pre_inputs(residual, fn, hc_scale, hc_base)
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
 
     split_k = int(split_k)
@@ -695,7 +701,9 @@ def _sparkinfer_mhc_pre_impl(
         )
 
     if y_out is None:
-        y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
+        y_out = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
     else:
         y_out = _slice_capacity_view(
             y_out,
@@ -706,7 +714,9 @@ def _sparkinfer_mhc_pre_impl(
             name="y_out",
         )
     if post_out is None:
-        post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
+        post_out = torch.empty(
+            (tokens, MHC_MULT), dtype=torch.float32, device=residual.device
+        )
     else:
         post_out = _slice_capacity_view(
             post_out,
@@ -717,7 +727,9 @@ def _sparkinfer_mhc_pre_impl(
             name="post_out",
         )
     if comb_out is None:
-        comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
+        comb_out = torch.empty(
+            (tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device
+        )
     else:
         comb_out = _slice_capacity_view(
             comb_out,
@@ -732,12 +744,30 @@ def _sparkinfer_mhc_pre_impl(
         raise ValueError("residual_out must have shape [tokens, 4, hidden_size]")
     if residual_out.dtype != residual.dtype or residual_out.device != residual.device:
         raise ValueError("residual_out must match the residual dtype and device")
-    if y_out.shape != (tokens, hidden_size) or y_out.dtype != residual.dtype or y_out.device != residual.device:
-        raise ValueError("y_out must match shape [tokens, hidden_size], residual dtype, and residual device")
-    if post_out.shape != (tokens, MHC_MULT) or post_out.dtype != torch.float32 or post_out.device != residual.device:
-        raise ValueError("post_out must match shape [tokens, 4], dtype float32, and residual device")
-    if comb_out.shape != (tokens, MHC_MULT, MHC_MULT) or comb_out.dtype != torch.float32 or comb_out.device != residual.device:
-        raise ValueError("comb_out must match shape [tokens, 4, 4], dtype float32, and residual device")
+    if (
+        y_out.shape != (tokens, hidden_size)
+        or y_out.dtype != residual.dtype
+        or y_out.device != residual.device
+    ):
+        raise ValueError(
+            "y_out must match shape [tokens, hidden_size], residual dtype, and residual device"
+        )
+    if (
+        post_out.shape != (tokens, MHC_MULT)
+        or post_out.dtype != torch.float32
+        or post_out.device != residual.device
+    ):
+        raise ValueError(
+            "post_out must match shape [tokens, 4], dtype float32, and residual device"
+        )
+    if (
+        comb_out.shape != (tokens, MHC_MULT, MHC_MULT)
+        or comb_out.dtype != torch.float32
+        or comb_out.device != residual.device
+    ):
+        raise ValueError(
+            "comb_out must match shape [tokens, 4, 4], dtype float32, and residual device"
+        )
     _require_contiguous(residual_out, name="residual_out")
     _require_contiguous(y_out, name="y_out")
     _require_contiguous(post_out, name="post_out")
@@ -758,7 +788,7 @@ def _sparkinfer_mhc_pre_impl(
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
     ):
-        from sparkinfer.integration.residual_kernels import (
+        from sparkinfer.norm.mhc._kernels import (
             run_mhc_finalize_gram,
             run_mhc_pre_functional,
             run_mhc_pre_partial,
@@ -888,25 +918,33 @@ def _sparkinfer_mhc_post_pre_impl(
         if expected_m is None:
             expected_m = binding.expected_m
 
-    tokens, hidden_size, _ = _validate_post_pre_inputs(
-        residual, fn, hc_scale, hc_base
-    )
+    tokens, hidden_size, _ = _validate_post_pre_inputs(residual, fn, hc_scale, hc_base)
     expected_m = _canonicalize_mhc_expected_m(expected_m, min_tokens=tokens)
     policy_m = tokens if expected_m is None else expected_m
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
     if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
-        raise ValueError(f"x and residual must both be torch.bfloat16, got {x.dtype} and {residual.dtype}")
+        raise ValueError(
+            f"x and residual must both be torch.bfloat16, got {x.dtype} and {residual.dtype}"
+        )
     if x.ndim != 2 or tuple(x.shape) != (tokens, hidden_size):
-        raise ValueError(f"x must have shape {(tokens, hidden_size)}, got {tuple(x.shape)}")
+        raise ValueError(
+            f"x must have shape {(tokens, hidden_size)}, got {tuple(x.shape)}"
+        )
     if x.device != residual.device:
-        raise ValueError("x, residual, fn, hc_scale, and hc_base must be on the same device")
+        raise ValueError(
+            "x, residual, fn, hc_scale, and hc_base must be on the same device"
+        )
     prev_post = _canonicalize_post_mix_input(
         prev_post,
         tokens=tokens,
         device=residual.device,
         name="prev_post",
     )
-    if prev_comb.dtype != torch.float32 or tuple(prev_comb.shape) != (tokens, MHC_MULT, MHC_MULT):
+    if prev_comb.dtype != torch.float32 or tuple(prev_comb.shape) != (
+        tokens,
+        MHC_MULT,
+        MHC_MULT,
+    ):
         raise ValueError(
             f"prev_comb must be float32 shape {(tokens, MHC_MULT, MHC_MULT)}, "
             f"got {prev_comb.dtype} {tuple(prev_comb.shape)}"
@@ -962,7 +1000,9 @@ def _sparkinfer_mhc_post_pre_impl(
             name="residual_out",
         )
     if y_out is None:
-        y_out = torch.empty((tokens, hidden_size), dtype=residual.dtype, device=residual.device)
+        y_out = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
     else:
         y_out = _slice_capacity_view(
             y_out,
@@ -973,7 +1013,9 @@ def _sparkinfer_mhc_post_pre_impl(
             name="y_out",
         )
     if post_out is None:
-        post_out = torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device)
+        post_out = torch.empty(
+            (tokens, MHC_MULT), dtype=torch.float32, device=residual.device
+        )
     else:
         post_out = _slice_capacity_view(
             post_out,
@@ -984,7 +1026,9 @@ def _sparkinfer_mhc_post_pre_impl(
             name="post_out",
         )
     if comb_out is None:
-        comb_out = torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device)
+        comb_out = torch.empty(
+            (tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device
+        )
     else:
         comb_out = _slice_capacity_view(
             comb_out,
@@ -995,14 +1039,36 @@ def _sparkinfer_mhc_post_pre_impl(
             name="comb_out",
         )
 
-    if residual_out.shape != residual.shape or residual_out.dtype != residual.dtype or residual_out.device != residual.device:
+    if (
+        residual_out.shape != residual.shape
+        or residual_out.dtype != residual.dtype
+        or residual_out.device != residual.device
+    ):
         raise ValueError("residual_out must match residual shape, dtype, and device")
-    if y_out.shape != (tokens, hidden_size) or y_out.dtype != residual.dtype or y_out.device != residual.device:
-        raise ValueError("y_out must match shape [tokens, hidden_size], residual dtype, and residual device")
-    if post_out.shape != (tokens, MHC_MULT) or post_out.dtype != torch.float32 or post_out.device != residual.device:
-        raise ValueError("post_out must match shape [tokens, 4], dtype float32, and residual device")
-    if comb_out.shape != (tokens, MHC_MULT, MHC_MULT) or comb_out.dtype != torch.float32 or comb_out.device != residual.device:
-        raise ValueError("comb_out must match shape [tokens, 4, 4], dtype float32, and residual device")
+    if (
+        y_out.shape != (tokens, hidden_size)
+        or y_out.dtype != residual.dtype
+        or y_out.device != residual.device
+    ):
+        raise ValueError(
+            "y_out must match shape [tokens, hidden_size], residual dtype, and residual device"
+        )
+    if (
+        post_out.shape != (tokens, MHC_MULT)
+        or post_out.dtype != torch.float32
+        or post_out.device != residual.device
+    ):
+        raise ValueError(
+            "post_out must match shape [tokens, 4], dtype float32, and residual device"
+        )
+    if (
+        comb_out.shape != (tokens, MHC_MULT, MHC_MULT)
+        or comb_out.dtype != torch.float32
+        or comb_out.device != residual.device
+    ):
+        raise ValueError(
+            "comb_out must match shape [tokens, 4, 4], dtype float32, and residual device"
+        )
     _require_contiguous(residual_out, name="residual_out")
     _require_contiguous(y_out, name="y_out")
     _require_contiguous(post_out, name="post_out")
@@ -1030,7 +1096,7 @@ def _sparkinfer_mhc_post_pre_impl(
         # the caller's iteration count (the full 20, matching vLLM and the
         # reference; Sinkhorn is ~0.015us/iter so the cost is negligible). The
         # Gram + RMSNorm are skipped when there is no fused norm_weight.
-        from sparkinfer.integration.residual_kernels import (
+        from sparkinfer.norm.mhc._kernels import (
             run_mhc_finalize_gram,
             _selected_post_pre_decode_split_n,
             run_mhc_post_pre_functional,
@@ -1062,16 +1128,21 @@ def _sparkinfer_mhc_post_pre_impl(
                 norm_eps=float(norm_eps),
             )
 
-        prefill_min_tokens = int(os.environ.get("SPARKINFER_MHC_PREFILL_MIN_TOKENS", "96"))
+        prefill_min_tokens = int(
+            os.environ.get("SPARKINFER_MHC_PREFILL_MIN_TOKENS", "96")
+        )
         use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
             norm_weight=norm_weight,
             policy_m=policy_m,
         )
-        use_prefill_bf16_mma = _use_mhc_prefill_bf16_project(
-            norm_weight=norm_weight,
-            policy_m=policy_m,
-            fn_bf16=fn_bf16,
-        ) and not use_prefill_tf32_mma
+        use_prefill_bf16_mma = (
+            _use_mhc_prefill_bf16_project(
+                norm_weight=norm_weight,
+                policy_m=policy_m,
+                fn_bf16=fn_bf16,
+            )
+            and not use_prefill_tf32_mma
+        )
         use_prefill_block_m = (
             not use_prefill_tf32_mma
             and not use_prefill_bf16_mma
@@ -1079,10 +1150,14 @@ def _sparkinfer_mhc_post_pre_impl(
             and policy_m >= prefill_min_tokens
             and os.environ.get("SPARKINFER_MHC_PREFILL_BLOCK_M", "1") != "0"
         )
-        prefill_block_m_size = int(os.environ.get("SPARKINFER_MHC_PREFILL_BLOCK_M_SIZE", "2"))
+        prefill_block_m_size = int(
+            os.environ.get("SPARKINFER_MHC_PREFILL_BLOCK_M_SIZE", "2")
+        )
         prefill_tile_n_default = 12 if hidden_size == 7168 else 24
         prefill_tile_n = int(
-            os.environ.get("SPARKINFER_MHC_PREFILL_TILE_N", str(prefill_tile_n_default))
+            os.environ.get(
+                "SPARKINFER_MHC_PREFILL_TILE_N", str(prefill_tile_n_default)
+            )
         )
         use_prefill_compact = (
             not use_prefill_tf32_mma
@@ -1226,7 +1301,9 @@ def _sparkinfer_mhc_post_impl(
             f"{residual.dtype}"
         )
     if x.ndim != 2 or tuple(x.shape) != (tokens, hidden_size):
-        raise ValueError(f"x must have shape {(tokens, hidden_size)}, got {tuple(x.shape)}")
+        raise ValueError(
+            f"x must have shape {(tokens, hidden_size)}, got {tuple(x.shape)}"
+        )
     if x.device != residual.device:
         raise ValueError("x and residual must be on the same device")
     prev_post = _canonicalize_post_mix_input(
@@ -1235,9 +1312,10 @@ def _sparkinfer_mhc_post_impl(
         device=residual.device,
         name="prev_post",
     )
-    if (
-        prev_comb.dtype != torch.float32
-        or tuple(prev_comb.shape) != (tokens, MHC_MULT, MHC_MULT)
+    if prev_comb.dtype != torch.float32 or tuple(prev_comb.shape) != (
+        tokens,
+        MHC_MULT,
+        MHC_MULT,
     ):
         raise ValueError(
             f"prev_comb must be float32 shape {(tokens, MHC_MULT, MHC_MULT)}, "
@@ -1259,7 +1337,9 @@ def _sparkinfer_mhc_post_impl(
                 f"supports hidden_size in {MHC_SUPPORTED_HIDDEN_SIZES}; "
                 f"got hidden_size={hidden_size}"
             )
-        from sparkinfer.integration.residual_kernels import run_mhc_post_functional
+        from sparkinfer.norm.mhc._kernels import (
+            run_mhc_post_functional,
+        )
 
         return run_mhc_post_functional(
             x=x,
@@ -1276,14 +1356,18 @@ def _sparkinfer_mhc_post_impl(
         device=residual.device,
         name="out",
     )
-    if out.shape != residual.shape or out.dtype != residual.dtype or out.device != residual.device:
+    if (
+        out.shape != residual.shape
+        or out.dtype != residual.dtype
+        or out.device != residual.device
+    ):
         raise ValueError("out must match residual shape, dtype, and device")
     _require_contiguous(out, name="out")
 
     if tokens == 0:
         return out
     if _supports_mhc_post_hidden(hidden_size):
-        from sparkinfer.integration.residual_kernels import run_mhc_post
+        from sparkinfer.norm.mhc._kernels import run_mhc_post
 
         run_mhc_post(
             x=x,

@@ -8,19 +8,21 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.attention.indexer.api import (
+from sparkinfer.attention.nsa_indexer._impl import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
 )
-from sparkinfer.attention.indexer.msa_reference import MSA_BLOCK_TOKENS
-from sparkinfer.integration.scratch_layout import (
+from sparkinfer.attention.nsa_indexer.msa_reference import (
+    MSA_BLOCK_TOKENS,
+)
+from sparkinfer._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_view,
 )
-from sparkinfer.integration.scratch import (
-    SPARKINFERScratchBufferSpec,
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
@@ -110,7 +112,9 @@ class SPARKINFERIndexerScratchCaps:
 
         mode = str(self.mode)
         if mode not in ("decode", "prefill"):
-            raise ValueError(f"indexer scratch mode must be decode or prefill, got {mode!r}")
+            raise ValueError(
+                f"indexer scratch mode must be decode or prefill, got {mode!r}"
+            )
         object.__setattr__(self, "mode", mode)
 
         route = str(self.route)
@@ -122,7 +126,9 @@ class SPARKINFERIndexerScratchCaps:
         object.__setattr__(self, "route", route)
         score_mode = str(self.score_mode).lower()
         if score_mode not in ("nsa", "msa"):
-            raise ValueError(f"indexer scratch score_mode must be nsa or msa, got {score_mode!r}")
+            raise ValueError(
+                f"indexer scratch score_mode must be nsa or msa, got {score_mode!r}"
+            )
         object.__setattr__(self, "score_mode", score_mode)
 
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
@@ -132,8 +138,12 @@ class SPARKINFERIndexerScratchCaps:
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
         object.__setattr__(self, "supertile_k", max(int(self.supertile_k), 0))
         object.__setattr__(self, "shared_page_table", bool(self.shared_page_table))
-        object.__setattr__(self, "reserve_paged_logits", bool(self.reserve_paged_logits))
-        object.__setattr__(self, "paged_logits_k_rows", max(int(self.paged_logits_k_rows), 0))
+        object.__setattr__(
+            self, "reserve_paged_logits", bool(self.reserve_paged_logits)
+        )
+        object.__setattr__(
+            self, "paged_logits_k_rows", max(int(self.paged_logits_k_rows), 0)
+        )
         object.__setattr__(self, "prefill_block_k", max(int(self.prefill_block_k), 1))
         max_batch = self.max_q_rows if self.max_batch is None else self.max_batch
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
@@ -151,14 +161,16 @@ class SPARKINFERIndexerScratchCaps:
                         "paged indexer scratch planning requires max_page_table_width "
                         "or max_k_rows"
                     )
-                max_page_table_width = (
-                    max_k_rows + int(self.page_size) - 1
-                ) // int(self.page_size)
+                max_page_table_width = (max_k_rows + int(self.page_size) - 1) // int(
+                    self.page_size
+                )
             object.__setattr__(self, "max_page_table_width", max_page_table_width)
             object.__setattr__(self, "max_k_rows", max_k_rows)
         else:
             if max_k_rows is None:
-                raise ValueError("contiguous indexer scratch planning requires max_k_rows")
+                raise ValueError(
+                    "contiguous indexer scratch planning requires max_k_rows"
+                )
             object.__setattr__(self, "max_k_rows", max_k_rows)
             object.__setattr__(self, "max_page_table_width", max_page_table_width)
 
@@ -209,8 +221,12 @@ class SPARKINFERIndexerPagedScratchCaps:
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
         object.__setattr__(self, "max_k_rows", max(int(self.max_k_rows), 0))
-        object.__setattr__(self, "reserve_paged_logits", bool(self.reserve_paged_logits))
-        object.__setattr__(self, "paged_logits_k_rows", max(int(self.paged_logits_k_rows), 0))
+        object.__setattr__(
+            self, "reserve_paged_logits", bool(self.reserve_paged_logits)
+        )
+        object.__setattr__(
+            self, "paged_logits_k_rows", max(int(self.paged_logits_k_rows), 0)
+        )
         object.__setattr__(
             self,
             "paged_tile_logits_k_rows",
@@ -218,7 +234,9 @@ class SPARKINFERIndexerPagedScratchCaps:
         )
         mode = str(self.mode)
         if mode not in ("decode", "prefill"):
-            raise ValueError(f"indexer paged scratch mode must be decode or prefill, got {mode!r}")
+            raise ValueError(
+                f"indexer paged scratch mode must be decode or prefill, got {mode!r}"
+            )
         route = str(self.route)
         if route not in _INDEXER_PAGED_ROUTES:
             raise ValueError(
@@ -230,7 +248,9 @@ class SPARKINFERIndexerPagedScratchCaps:
         object.__setattr__(self, "route", route)
         score_mode = str(self.score_mode).lower()
         if score_mode not in ("nsa", "msa"):
-            raise ValueError(f"indexer paged scratch score_mode must be nsa or msa, got {score_mode!r}")
+            raise ValueError(
+                f"indexer paged scratch score_mode must be nsa or msa, got {score_mode!r}"
+            )
         object.__setattr__(self, "score_mode", score_mode)
 
 
@@ -277,8 +297,11 @@ class SPARKINFERIndexerContiguousScratchCaps:
         object.__setattr__(self, "prefill_block_k", prefill_block_k)
         score_mode = str(self.score_mode).lower()
         if score_mode not in ("nsa", "msa"):
-            raise ValueError(f"indexer contiguous scratch score_mode must be nsa or msa, got {score_mode!r}")
+            raise ValueError(
+                f"indexer contiguous scratch score_mode must be nsa or msa, got {score_mode!r}"
+            )
         object.__setattr__(self, "score_mode", score_mode)
+
 
 @dataclass(frozen=True, kw_only=True)
 class _SPARKINFERIndexerPagedScratchLayout:
@@ -345,6 +368,7 @@ class _SPARKINFERIndexerContiguousScratchLayout:
     msa_topk_indices_offset_bytes: int
     msa_sort_values_offset_bytes: int
     msa_sort_indices_offset_bytes: int
+
 
 @dataclass(kw_only=True)
 class SPARKINFERIndexerPagedScratch:
@@ -465,15 +489,22 @@ class SPARKINFERIndexerPagedScratch:
             self.indexer_contiguous_topk_indices[:row_count],
         )
 
-    def get_indexer_contiguous_candidate_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_indexer_contiguous_candidate_buffers(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self.indexer_contiguous_candidate_values is None
             or self.indexer_contiguous_candidate_indices is None
         ):
             raise RuntimeError("paged indexer scratch is missing candidate buffers")
-        return self.indexer_contiguous_candidate_values, self.indexer_contiguous_candidate_indices
+        return (
+            self.indexer_contiguous_candidate_values,
+            self.indexer_contiguous_candidate_indices,
+        )
 
-    def get_indexer_contiguous_topk_position_buffer(self, *, row_count: int) -> torch.Tensor:
+    def get_indexer_contiguous_topk_position_buffer(
+        self, *, row_count: int
+    ) -> torch.Tensor:
         if self.indexer_contiguous_topk_positions is None:
             raise SPARKINFERIndexerTopKPositionBufferUnavailable(
                 "paged indexer scratch is missing top-k position buffer"
@@ -522,7 +553,9 @@ class SPARKINFERIndexerPagedScratch:
         row_count: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.indexer_k_quant_bytes is None or self.indexer_k_scales_bytes is None:
-            raise RuntimeError("paged indexer scratch is missing packed-contiguous gather buffers")
+            raise RuntimeError(
+                "paged indexer scratch is missing packed-contiguous gather buffers"
+            )
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -538,7 +571,9 @@ class SPARKINFERIndexerPagedScratch:
 
     def get_indexer_contiguous_lengths(self, *, row_count: int) -> torch.Tensor:
         if self.indexer_contiguous_lengths is None:
-            raise RuntimeError("paged indexer scratch is missing packed-contiguous k_start")
+            raise RuntimeError(
+                "paged indexer scratch is missing packed-contiguous k_start"
+            )
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -551,7 +586,9 @@ class SPARKINFERIndexerPagedScratch:
 
     def get_paged_indexer_runtime_lengths(self, *, row_count: int) -> torch.Tensor:
         if self.paged_indexer_runtime_lengths is None:
-            raise RuntimeError("paged indexer scratch is missing packed-contiguous k_end")
+            raise RuntimeError(
+                "paged indexer scratch is missing packed-contiguous k_end"
+            )
         row_count = int(row_count)
         if row_count < 0:
             raise ValueError(f"row_count must be non-negative, got {row_count}")
@@ -628,6 +665,7 @@ class SPARKINFERIndexerContiguousScratch:
             topk=topk,
         )
 
+
 @dataclass(frozen=True, kw_only=True)
 class SPARKINFERIndexerPagedBinding:
     scratch: object
@@ -699,6 +737,7 @@ class SPARKINFERIndexerMSAContiguousBinding:
     num_idx_heads: int | None = None
     strict: bool = True
 
+
 def _resolve_indexer_paged_supertile_tokens(
     raw_tokens: int,
     *,
@@ -719,8 +758,7 @@ def _resolve_indexer_paged_supertile_tokens(
                 ) from exc
     tokens = max(int(raw_tokens), _PAGED_INDEX_TILE_BLOCK_K)
     tokens = (
-        (tokens + _PAGED_INDEX_TILE_BLOCK_K - 1)
-        // _PAGED_INDEX_TILE_BLOCK_K
+        (tokens + _PAGED_INDEX_TILE_BLOCK_K - 1) // _PAGED_INDEX_TILE_BLOCK_K
     ) * _PAGED_INDEX_TILE_BLOCK_K
     # The default is a chunk-size ceiling, not a request to reserve beyond the
     # caller's fixed cache capacity. Keeping the explicit argument and env knob
@@ -729,8 +767,7 @@ def _resolve_indexer_paged_supertile_tokens(
     if use_capacity_default and capacity_tokens is not None:
         capacity = max(int(capacity_tokens), 1)
         capacity = (
-            (capacity + _PAGED_INDEX_TILE_BLOCK_K - 1)
-            // _PAGED_INDEX_TILE_BLOCK_K
+            (capacity + _PAGED_INDEX_TILE_BLOCK_K - 1) // _PAGED_INDEX_TILE_BLOCK_K
         ) * _PAGED_INDEX_TILE_BLOCK_K
         tokens = min(tokens, max(capacity, _PAGED_INDEX_TILE_BLOCK_K))
     return tokens
@@ -754,23 +791,24 @@ def _resolve_indexer_paged_route(
         else:
             route = INDEXER_PAGED_ROUTE_TILED
             if os.getenv("SPARKINFER_FUSED_INDEXER", "1") != "0":
-                from sparkinfer.attention.indexer.fused_indexer import resolve_fused_indexer_path
-                from sparkinfer.attention.indexer.kernel import _num_q_head_tiles
+                from sparkinfer.attention.nsa_indexer.fused_indexer import (
+                    resolve_fused_indexer_path,
+                )
+                from sparkinfer.attention.nsa_indexer.kernel import (
+                    _num_q_head_tiles,
+                )
 
                 width = int(caps.max_page_table_width) * int(caps.page_size)
-                if (
-                    resolve_fused_indexer_path(
-                        topk=int(caps.topk),
-                        num_rows=int(caps.max_q_rows),
-                        width=int(width),
-                        num_heads=int(caps.num_q_heads),
-                        compute_capability=compute_capability,
-                    )
-                    and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
-                ):
+                if resolve_fused_indexer_path(
+                    topk=int(caps.topk),
+                    num_rows=int(caps.max_q_rows),
+                    width=int(width),
+                    num_heads=int(caps.num_q_heads),
+                    compute_capability=compute_capability,
+                ) and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4):
                     route = INDEXER_PAGED_ROUTE_FUSED
     if route == INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS:
-        from sparkinfer.attention.indexer.contiguous_kernel import (
+        from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
             resolve_contiguous_prefill_block_k,
         )
 
@@ -790,8 +828,12 @@ def _resolve_indexer_paged_route(
     elif route == INDEXER_PAGED_ROUTE_FUSED:
         if bool(caps.shared_page_table) or str(caps.mode) == "prefill":
             raise ValueError("fused paged indexer route is decode-only")
-        from sparkinfer.attention.indexer.fused_indexer import resolve_fused_indexer_path
-        from sparkinfer.attention.indexer.kernel import _num_q_head_tiles
+        from sparkinfer.attention.nsa_indexer.fused_indexer import (
+            resolve_fused_indexer_path,
+        )
+        from sparkinfer.attention.nsa_indexer.kernel import (
+            _num_q_head_tiles,
+        )
 
         width = int(caps.max_page_table_width) * int(caps.page_size)
         if not (
@@ -838,7 +880,9 @@ def _indexer_paged_scratch_layout(
         1,
         (int(caps.max_page_table_width) + supertile_pages - 1) // supertile_pages,
     )
-    num_q_tiles = (max_q_rows + _PAGED_INDEX_TILE_BLOCK_Q - 1) // _PAGED_INDEX_TILE_BLOCK_Q
+    num_q_tiles = (
+        max_q_rows + _PAGED_INDEX_TILE_BLOCK_Q - 1
+    ) // _PAGED_INDEX_TILE_BLOCK_Q
     num_k_tiles = supertile_tokens // _PAGED_INDEX_TILE_BLOCK_K
     tile_logits_elements = max(
         1,
@@ -855,7 +899,9 @@ def _indexer_paged_scratch_layout(
     fused_pack_elements = 0
     fused_state_words = 0
     if route == INDEXER_PAGED_ROUTE_FUSED:
-        from sparkinfer.attention.indexer.fused_indexer import fused_indexer_scratch_capacity
+        from sparkinfer.attention.nsa_indexer.fused_indexer import (
+            fused_indexer_scratch_capacity,
+        )
 
         fused_pack_elements, fused_state_words = fused_indexer_scratch_capacity(
             max_q_rows,
@@ -863,9 +909,7 @@ def _indexer_paged_scratch_layout(
             int(num_sms),
         )
     gather_k_rows = (
-        int(supertile_tokens)
-        if route == INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS
-        else 0
+        int(supertile_tokens) if route == INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS else 0
     )
 
     cursor = 0
@@ -875,7 +919,9 @@ def _indexer_paged_scratch_layout(
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     gather_k_scale_offset_bytes = cursor
-    cursor += gather_k_rows * _INDEXER_CONTIGUOUS_SCALE_BYTES * dtype_nbytes(torch.uint8)
+    cursor += (
+        gather_k_rows * _INDEXER_CONTIGUOUS_SCALE_BYTES * dtype_nbytes(torch.uint8)
+    )
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     contiguous_lengths_offset_bytes = cursor
@@ -905,11 +951,15 @@ def _indexer_paged_scratch_layout(
     fold_carry_chunks = 2 if int(max_chunks) > 1 else 0
 
     candidate_values_offset_bytes = cursor
-    cursor += fold_carry_chunks * max_q_rows * int(caps.topk) * dtype_nbytes(torch.float32)
+    cursor += (
+        fold_carry_chunks * max_q_rows * int(caps.topk) * dtype_nbytes(torch.float32)
+    )
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     candidate_indices_offset_bytes = cursor
-    cursor += fold_carry_chunks * max_q_rows * int(caps.topk) * dtype_nbytes(torch.int32)
+    cursor += (
+        fold_carry_chunks * max_q_rows * int(caps.topk) * dtype_nbytes(torch.int32)
+    )
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     # merge_positions is gone with the merge step; keep the offset for layout
@@ -1045,28 +1095,17 @@ def _indexer_contiguous_scratch_layout(
     max_chunk_tiles = min(supertile_tiles, num_k_tiles)
     tile_logits_elements = max(
         1,
-        num_q_tiles
-        * max_chunk_tiles
-        * _INDEXER_CONTIGUOUS_BLOCK_Q
-        * prefill_block_k,
+        num_q_tiles * max_chunk_tiles * _INDEXER_CONTIGUOUS_BLOCK_Q * prefill_block_k,
     )
 
     cursor = 0
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
     k_quant_offset_bytes = cursor
-    cursor += (
-        max_k_rows
-        * _INDEXER_CONTIGUOUS_HEAD_DIM
-        * dtype_nbytes(caps.k_dtype)
-    )
+    cursor += max_k_rows * _INDEXER_CONTIGUOUS_HEAD_DIM * dtype_nbytes(caps.k_dtype)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     k_scale_offset_bytes = cursor
-    cursor += (
-        max_k_rows
-        * _INDEXER_CONTIGUOUS_SCALE_BYTES
-        * dtype_nbytes(torch.uint8)
-    )
+    cursor += max_k_rows * _INDEXER_CONTIGUOUS_SCALE_BYTES * dtype_nbytes(torch.uint8)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     dummy_logits_offset_bytes = cursor
@@ -1308,7 +1347,11 @@ def _materialize_indexer_paged_scratch(
             max_pages_even += 1
         max_blocks = max(
             1,
-            (int(caps.max_page_table_width) * int(caps.page_size) + MSA_BLOCK_TOKENS - 1)
+            (
+                int(caps.max_page_table_width) * int(caps.page_size)
+                + MSA_BLOCK_TOKENS
+                - 1
+            )
             // MSA_BLOCK_TOKENS,
         )
         msa_page_scores, _ = materialize_scratch_view(
@@ -1530,7 +1573,7 @@ def _materialize_indexer_contiguous_scratch(
     )
     k_quant_bytes = k_quant.view(torch.uint8)
     if k_quant.device.type == "cuda":
-        from sparkinfer.attention.indexer.contiguous_kernel import (
+        from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
             _encode_contiguous_k_tma_descriptor_into,
         )
 
@@ -1636,6 +1679,7 @@ def _materialize_indexer_contiguous_scratch(
         msa_sort_indices=msa_sort_indices,
     )
 
+
 def _validate_device(
     tensor: torch.Tensor,
     *,
@@ -1645,10 +1689,16 @@ def _validate_device(
     if scratch is None:
         raise TypeError("_validate_device requires scratch")
     if tensor.device != scratch.device:
-        raise ValueError(f"{name} device {tensor.device} does not match resource device {scratch.device}")
+        raise ValueError(
+            f"{name} device {tensor.device} does not match resource device {scratch.device}"
+        )
+
 
 def _is_row_shared_i32_matrix(tensor: torch.Tensor) -> bool:
-    return tensor.ndim == 2 and int(tensor.stride(0)) == 0 and int(tensor.stride(1)) == 1
+    return (
+        tensor.ndim == 2 and int(tensor.stride(0)) == 0 and int(tensor.stride(1)) == 1
+    )
+
 
 def _validate_i32_contiguous(
     tensor: torch.Tensor,
@@ -1664,6 +1714,7 @@ def _validate_i32_contiguous(
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
     _validate_device(tensor, scratch=scratch, name=name)
+
 
 def build_indexer_paged_binding(
     *,
@@ -1707,7 +1758,9 @@ def build_indexer_paged_binding(
         ndim=1,
     )
     if active_width.shape != (1,):
-        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+        raise ValueError(
+            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+        )
     if int(real_page_table.shape[0]) != int(cache_seqlens_int32.shape[0]):
         raise ValueError(
             f"real_page_table rows {int(real_page_table.shape[0])} do not match "
@@ -1723,7 +1776,9 @@ def build_indexer_paged_binding(
             f"real_page_table width {int(real_page_table.shape[1])} exceeds paged indexer capacity "
             f"{scratch.max_page_table_width}"
         )
-    if bool(shared_page_table) != bool(getattr(scratch, "shared_page_table", bool(shared_page_table))):
+    if bool(shared_page_table) != bool(
+        getattr(scratch, "shared_page_table", bool(shared_page_table))
+    ):
         raise ValueError(
             "shared_page_table does not match the paged indexer scratch plan: "
             f"launch={bool(shared_page_table)}, plan={bool(getattr(scratch, 'shared_page_table'))}"
@@ -1736,11 +1791,15 @@ def build_indexer_paged_binding(
             ndim=2,
         )
         if int(schedule_metadata.shape[1]) != 2:
-            raise ValueError(f"schedule_metadata must have shape (num_sms + 1, 2), got {tuple(schedule_metadata.shape)}")
+            raise ValueError(
+                f"schedule_metadata must have shape (num_sms + 1, 2), got {tuple(schedule_metadata.shape)}"
+            )
     if expected_num_q_heads is not None:
         expected_num_q_heads = int(expected_num_q_heads)
         if expected_num_q_heads <= 0:
-            raise ValueError(f"expected_num_q_heads must be positive, got {expected_num_q_heads}")
+            raise ValueError(
+                f"expected_num_q_heads must be positive, got {expected_num_q_heads}"
+            )
     return SPARKINFERIndexerPagedBinding(
         scratch=scratch,
         metadata=IndexerPagedDecodeMetadata(
@@ -1795,7 +1854,9 @@ def build_indexer_contiguous_binding(
             f"{tuple(k_start.shape)} and {tuple(k_end.shape)}"
         )
     row_count = int(k_start.shape[0])
-    max_rows = int(getattr(scratch, "max_q_rows", getattr(scratch, "max_total_q", row_count)))
+    max_rows = int(
+        getattr(scratch, "max_q_rows", getattr(scratch, "max_total_q", row_count))
+    )
     if row_count > max_rows:
         raise ValueError(
             f"k_start rows {row_count} exceed indexer contiguous capacity {max_rows}"
@@ -1839,11 +1900,15 @@ def build_indexer_contiguous_binding(
     candidate_values = None
     candidate_indices = None
     if include_candidate_buffers:
-        if hasattr(scratch, "candidate_values") and hasattr(scratch, "candidate_indices"):
+        if hasattr(scratch, "candidate_values") and hasattr(
+            scratch, "candidate_indices"
+        ):
             candidate_values = scratch.candidate_values[:, :row_count, :topk]
             candidate_indices = scratch.candidate_indices[:, :row_count, :topk]
         else:
-            candidate_values, candidate_indices = scratch.get_indexer_contiguous_candidate_buffers()
+            candidate_values, candidate_indices = (
+                scratch.get_indexer_contiguous_candidate_buffers()
+            )
             candidate_values = candidate_values[:, :row_count, :topk]
             candidate_indices = candidate_indices[:, :row_count, :topk]
 
@@ -1863,7 +1928,9 @@ def build_indexer_contiguous_binding(
         except SPARKINFERIndexerTopKPositionBufferUnavailable:
             merge_positions = None
         except AttributeError:
-            merge_positions = getattr(scratch, "indexer_contiguous_topk_positions", None)
+            merge_positions = getattr(
+                scratch, "indexer_contiguous_topk_positions", None
+            )
             if merge_positions is not None:
                 merge_positions = merge_positions[:row_count, :topk]
 
@@ -1923,7 +1990,9 @@ def build_indexer_msa_paged_binding(
         active_width = scratch.get_paged_indexer_active_width_cap()
     _validate_i32_contiguous(active_width, scratch=scratch, name="active_width", ndim=1)
     if active_width.shape != (1,):
-        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+        raise ValueError(
+            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+        )
     if schedule_metadata is not None:
         _validate_i32_contiguous(
             schedule_metadata,
@@ -1933,9 +2002,13 @@ def build_indexer_msa_paged_binding(
         )
         if int(schedule_metadata.shape[1]) != 2:
             raise ValueError("schedule_metadata must have trailing dimension 2")
-    if int(real_page_table.shape[0]) > int(getattr(scratch, "max_total_q", real_page_table.shape[0])):
+    if int(real_page_table.shape[0]) > int(
+        getattr(scratch, "max_total_q", real_page_table.shape[0])
+    ):
         raise ValueError("real_page_table rows exceed MSA paged scratch capacity")
-    if int(real_page_table.shape[1]) > int(getattr(scratch, "max_page_table_width", real_page_table.shape[1])):
+    if int(real_page_table.shape[1]) > int(
+        getattr(scratch, "max_page_table_width", real_page_table.shape[1])
+    ):
         raise ValueError("real_page_table width exceeds MSA paged scratch capacity")
 
     block_scores = _require_msa_scratch_tensor(scratch, "msa_block_scores")
@@ -1943,7 +2016,9 @@ def build_indexer_msa_paged_binding(
     page_scores = _require_msa_scratch_tensor(scratch, "msa_page_scores")
     topk = int(getattr(scratch, "topk", q2k_indices.shape[2]) if topk is None else topk)
     if topk <= 0 or topk > int(q2k_indices.shape[2]):
-        raise ValueError(f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}")
+        raise ValueError(
+            f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}"
+        )
     num_idx_heads = int(block_scores.shape[0])
     return SPARKINFERIndexerMSAPagedBinding(
         scratch=scratch,
@@ -1959,12 +2034,16 @@ def build_indexer_msa_paged_binding(
         page_scores=page_scores,
         block_scores=block_scores,
         q2k_indices=q2k_indices,
-        topk_score_scratch=_require_msa_scratch_tensor(scratch, "msa_topk_score_scratch"),
+        topk_score_scratch=_require_msa_scratch_tensor(
+            scratch, "msa_topk_score_scratch"
+        ),
         topk_values=_require_msa_scratch_tensor(scratch, "msa_topk_values"),
         topk_indices=_require_msa_scratch_tensor(scratch, "msa_topk_indices"),
         sort_values=_require_msa_scratch_tensor(scratch, "msa_sort_values"),
         sort_indices=_require_msa_scratch_tensor(scratch, "msa_sort_indices"),
-        expanded_page_table=_require_msa_scratch_tensor(scratch, "msa_expanded_page_table"),
+        expanded_page_table=_require_msa_scratch_tensor(
+            scratch, "msa_expanded_page_table"
+        ),
         expanded_seqlens=_require_msa_scratch_tensor(scratch, "msa_expanded_seqlens"),
         topk=topk,
         num_idx_heads=num_idx_heads,
@@ -1991,13 +2070,17 @@ def build_indexer_msa_contiguous_binding(
     q2k_indices = _require_msa_scratch_tensor(scratch, "msa_q2k_indices")
     topk = int(getattr(scratch, "topk", q2k_indices.shape[2]) if topk is None else topk)
     if topk <= 0 or topk > int(q2k_indices.shape[2]):
-        raise ValueError(f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}")
+        raise ValueError(
+            f"topk must be in [1, {int(q2k_indices.shape[2])}], got {topk}"
+        )
     return SPARKINFERIndexerMSAContiguousBinding(
         scratch=scratch,
         metadata=IndexerContiguousMetadata(k_start=k_start, k_end=k_end),
         block_scores=block_scores,
         q2k_indices=q2k_indices,
-        topk_score_scratch=_require_msa_scratch_tensor(scratch, "msa_topk_score_scratch"),
+        topk_score_scratch=_require_msa_scratch_tensor(
+            scratch, "msa_topk_score_scratch"
+        ),
         topk_values=_require_msa_scratch_tensor(scratch, "msa_topk_values"),
         topk_indices=_require_msa_scratch_tensor(scratch, "msa_topk_indices"),
         sort_values=_require_msa_scratch_tensor(scratch, "msa_sort_values"),
@@ -2012,9 +2095,9 @@ def build_indexer_msa_contiguous_binding(
 class SPARKINFERIndexerPagedScratchPlan:
     caps: SPARKINFERIndexerPagedScratchCaps
     layout: _SPARKINFERIndexerPagedScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -2089,9 +2172,9 @@ class SPARKINFERIndexerPagedScratchPlan:
 class SPARKINFERIndexerContiguousScratchPlan:
     caps: SPARKINFERIndexerContiguousScratchCaps
     layout: _SPARKINFERIndexerContiguousScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -2162,6 +2245,7 @@ class SPARKINFERIndexerContiguousScratchPlan:
             topk=self.caps.topk if topk is None else topk,
         )
 
+
 def plan_indexer_paged_scratch(
     caps: SPARKINFERIndexerPagedScratchCaps,
 ) -> SPARKINFERIndexerPagedScratchPlan:
@@ -2209,7 +2293,7 @@ class SPARKINFERIndexerScratchPlan:
     def source_layout(self) -> str:
         return self.caps.source_layout
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self.inner.scratch_specs()
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -2273,7 +2357,7 @@ def plan_indexer_scratch(
 
 
 __all__ = [
-    "SPARKINFERScratchBufferSpec",
+    "ScratchBufferSpec",
     "SPARKINFERIndexerScratchCaps",
     "SPARKINFERIndexerScratchPlan",
     "SPARKINFERIndexerPagedBinding",

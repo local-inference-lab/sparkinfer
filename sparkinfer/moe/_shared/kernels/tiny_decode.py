@@ -33,8 +33,8 @@ import torch
 from cutlass import Float32
 from cutlass.cutlass_dsl import Int32, Int64
 
-from sparkinfer.cute.utils import current_cuda_stream, make_ptr
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.utils import current_cuda_stream, make_ptr
+from sparkinfer._lib.intrinsics import (
     cvt_bf16x2_to_f16x2,
     cvt_e8m0x4_to_f32x4,
     fp4_dot4_sum_f32acc,
@@ -102,9 +102,7 @@ class MoETinyDecodeKernelBackend:
         # tile counts (e.g. n=384 -> 3 tiles from GLM 2048/TP6 padded shards)
         # drop to one tile per task; partials are scatter-added, so the task
         # split does not change results.
-        fc2_kt_per_task = (
-            _FC2_KT_PER_TASK if kt2 % _FC2_KT_PER_TASK == 0 else 1
-        )
+        fc2_kt_per_task = _FC2_KT_PER_TASK if kt2 % _FC2_KT_PER_TASK == 0 else 1
         cfg = dict(
             m=m,
             k=k,
@@ -158,10 +156,22 @@ class MoETinyDecodeKernelBackend:
         n8c: Int32,
         r8: Int32,
         cgrp: Int32,
-        x0_0: cutlass.Uint32, x1_0: cutlass.Uint32, x2_0: cutlass.Uint32, x3_0: cutlass.Uint32,
-        x0_1: cutlass.Uint32, x1_1: cutlass.Uint32, x2_1: cutlass.Uint32, x3_1: cutlass.Uint32,
-        x0_2: cutlass.Uint32, x1_2: cutlass.Uint32, x2_2: cutlass.Uint32, x3_2: cutlass.Uint32,
-        x0_3: cutlass.Uint32, x1_3: cutlass.Uint32, x2_3: cutlass.Uint32, x3_3: cutlass.Uint32,
+        x0_0: cutlass.Uint32,
+        x1_0: cutlass.Uint32,
+        x2_0: cutlass.Uint32,
+        x3_0: cutlass.Uint32,
+        x0_1: cutlass.Uint32,
+        x1_1: cutlass.Uint32,
+        x2_1: cutlass.Uint32,
+        x3_1: cutlass.Uint32,
+        x0_2: cutlass.Uint32,
+        x1_2: cutlass.Uint32,
+        x2_2: cutlass.Uint32,
+        x3_2: cutlass.Uint32,
+        x0_3: cutlass.Uint32,
+        x1_3: cutlass.Uint32,
+        x2_3: cutlass.Uint32,
+        x3_3: cutlass.Uint32,
     ):
         """Dot 4 n8i rows (v=0..3) x 128 k window against packed activations.
 
@@ -189,15 +199,15 @@ class MoETinyDecodeKernelBackend:
     @cute.kernel
     def kernel(
         self,
-        a_input: cute.Tensor,       # bf16 [m*k]
-        w13: cute.Tensor,           # u8 rp bytes, expert-major
-        sfb13: cute.Tensor,         # u8 sfb bytes, expert-major
-        inter: cute.Tensor,         # f32 [rt * 2n] (pre-zeroed for phase 1)
-        w2: cute.Tensor,            # u8 rp bytes
-        sfb2: cute.Tensor,          # u8 sfb bytes
-        topk_ids: cute.Tensor,      # i32 [rt]
+        a_input: cute.Tensor,  # bf16 [m*k]
+        w13: cute.Tensor,  # u8 rp bytes, expert-major
+        sfb13: cute.Tensor,  # u8 sfb bytes, expert-major
+        inter: cute.Tensor,  # f32 [rt * 2n] (pre-zeroed for phase 1)
+        w2: cute.Tensor,  # u8 rp bytes
+        sfb2: cute.Tensor,  # u8 sfb bytes
+        topk_ids: cute.Tensor,  # i32 [rt]
         topk_weights: cute.Tensor,  # f32 [rt]
-        out: cute.Tensor,           # bf16 [m*k] (pre-zeroed for phase 2)
+        out: cute.Tensor,  # bf16 [m*k] (pre-zeroed for phase 2)
     ):
         c = self._c
         tidx, _, _ = cute.arch.thread_idx()
@@ -252,11 +262,27 @@ class MoETinyDecodeKernelBackend:
                         )
                     )
                 d0, d1, d2, d3 = self._row_block_dot(
-                    tile_word, srow, n8c, r8, cgrp,
-                    xs[0][0], xs[0][1], xs[0][2], xs[0][3],
-                    xs[1][0], xs[1][1], xs[1][2], xs[1][3],
-                    xs[2][0], xs[2][1], xs[2][2], xs[2][3],
-                    xs[3][0], xs[3][1], xs[3][2], xs[3][3],
+                    tile_word,
+                    srow,
+                    n8c,
+                    r8,
+                    cgrp,
+                    xs[0][0],
+                    xs[0][1],
+                    xs[0][2],
+                    xs[0][3],
+                    xs[1][0],
+                    xs[1][1],
+                    xs[1][2],
+                    xs[1][3],
+                    xs[2][0],
+                    xs[2][1],
+                    xs[2][2],
+                    xs[2][3],
+                    xs[3][0],
+                    xs[3][1],
+                    xs[3][2],
+                    xs[3][3],
                 )
                 acc0 += d0
                 acc1 += d1
@@ -291,9 +317,7 @@ class MoETinyDecodeKernelBackend:
                         r_log = p + Int32(c["n"])
                         if r_log >= Int32(c["two_n"]):
                             r_log -= Int32(c["two_n"])
-                        red_add_global_f32(
-                            ibase_rt + Int64(r_log) * Int64(4), accs[v]
-                        )
+                        red_add_global_f32(ibase_rt + Int64(r_log) * Int64(4), accs[v])
 
         if cutlass.const_expr(self.compile_time_phase == 2):
             # ---- FC2: block = (rt, nt2, ktg2) ----
@@ -328,7 +352,9 @@ class MoETinyDecodeKernelBackend:
                     if kt == Int32(c["kt2_full"]):
                         kt_valid_g32 = Int32(c["k2_tail_g32"])
                     for k32 in cutlass.range_constexpr(4):
-                        ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        ich = (
+                            ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        )
                         quads = []
                         for jp in cutlass.range_constexpr(4):
                             a0 = Float32(0.0)
@@ -337,7 +363,9 @@ class MoETinyDecodeKernelBackend:
                                 g0 = Float32(inter[ich + Int32(2 * jp)])
                                 g1 = Float32(inter[ich + Int32(2 * jp + 1)])
                                 u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
-                                u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
+                                u1 = Float32(
+                                    inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)]
+                                )
                                 s0 = Float32(1.0) / (
                                     Float32(1.0) + cute.math.exp(-g0, fastmath=False)
                                 )
@@ -350,7 +378,9 @@ class MoETinyDecodeKernelBackend:
                         xs.append((quads[0], quads[1], quads[2], quads[3]))
                 else:
                     for k32 in cutlass.range_constexpr(4):
-                        ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        ich = (
+                            ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                        )
                         quads = []
                         for jp in cutlass.range_constexpr(4):
                             g0 = Float32(inter[ich + Int32(2 * jp)])
@@ -368,11 +398,27 @@ class MoETinyDecodeKernelBackend:
                             quads.append(pack_f32x2_to_f16x2(a0, a1))
                         xs.append((quads[0], quads[1], quads[2], quads[3]))
                 d0, d1, d2, d3 = self._row_block_dot(
-                    tile_word, srow, n8c, r8, cgrp,
-                    xs[0][0], xs[0][1], xs[0][2], xs[0][3],
-                    xs[1][0], xs[1][1], xs[1][2], xs[1][3],
-                    xs[2][0], xs[2][1], xs[2][2], xs[2][3],
-                    xs[3][0], xs[3][1], xs[3][2], xs[3][3],
+                    tile_word,
+                    srow,
+                    n8c,
+                    r8,
+                    cgrp,
+                    xs[0][0],
+                    xs[0][1],
+                    xs[0][2],
+                    xs[0][3],
+                    xs[1][0],
+                    xs[1][1],
+                    xs[1][2],
+                    xs[1][3],
+                    xs[2][0],
+                    xs[2][1],
+                    xs[2][2],
+                    xs[2][3],
+                    xs[3][0],
+                    xs[3][1],
+                    xs[3][2],
+                    xs[3][3],
                 )
                 acc0 += d0
                 acc1 += d1
@@ -434,7 +480,15 @@ class MoETinyDecodeKernelBackend:
         out = cute.make_tensor(out_ptr, cute.make_layout(Int32(c["m"] * c["k"])))
 
         self.kernel(
-            a_input, w13, sfb13, inter, w2, sfb2, topk_ids, topk_weights, out,
+            a_input,
+            w13,
+            sfb13,
+            inter,
+            w2,
+            sfb2,
+            topk_ids,
+            topk_weights,
+            out,
         ).launch(
             grid=(Int32(self.grid_x), Int32(1), Int32(1)),
             block=(_BLOCK_THREADS, 1, 1),

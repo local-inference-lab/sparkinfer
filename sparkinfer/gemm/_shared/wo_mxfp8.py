@@ -9,20 +9,24 @@ import torch
 import triton
 import triton.language as tl
 
-from sparkinfer.integration.scratch_layout import (
+from ..._lib.scratch_layout import (
     layout_wo_projection as _layout_wo_projection,
     materialize_scratch_strided_view as _materialize_arena_strided_view,
     materialize_scratch_view as _materialize_arena_view,
     wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
 )
-from sparkinfer.cute.utils import cuda_stream_to_int
-from sparkinfer.gemm.dense import (
+from sparkinfer._lib.utils import cuda_stream_to_int
+from sparkinfer._lib.dense_gemm import (
     _WO_SPARK_MAX_SMS,
     dense_gemm,
     dense_gemm_fused_quant_a,
     dense_gemm_fused_quant_a_grouped,
 )
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 MXFP8_SCALE_VEC_SIZE = 32
@@ -163,9 +167,9 @@ class WOProjectionScratchCaps:
 class WOProjectionScratchPlan:
     caps: WOProjectionScratchCaps
     layout: object
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -603,11 +607,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         max_bits = max_abs.to(tl.uint32, bitcast=True)
         biased_exp = (max_bits >> 23) & 0xFF
         mantissa = max_bits & 0x7FFFFF
-        scale_exp = (
-            biased_exp.to(tl.int32)
-            - 135
-            + (mantissa > 0x600000).to(tl.int32)
-        )
+        scale_exp = biased_exp.to(tl.int32) - 135 + (mantissa > 0x600000).to(tl.int32)
         scale_exp = tl.minimum(tl.maximum(scale_exp, -127), 127)
         scale_exp = tl.where(max_abs > 0.0, scale_exp, 0)
         inv_scale_bits = tl.where(
@@ -619,9 +619,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
         scaled_src = src * inv_scale[:, None]
     else:
         quant_scale = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
-        scale_exp = tl.minimum(
-            tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0
-        )
+        scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(quant_scale)), -127.0), 127.0)
         scale = tl.exp2(scale_exp)
         scaled_src = src / scale[:, None]
     scale_u8 = (scale_exp + 127.0).to(tl.uint8)
@@ -1175,13 +1173,9 @@ def pack_fp8_block_scaled_weight_mxfp8(
         # Physical [L, Ntile, Ktile, Ninner, Kinner], specialized for the
         # production decode WO Ntile/BK128 GEMMs. Keep `values` in its logical
         # layout for all other schedules and callers.
-        values_lnk = (
-            values.permute(2, 0, 1) if num_groups > 1 else values.unsqueeze(0)
-        )
+        values_lnk = values.permute(2, 0, 1) if num_groups > 1 else values.unsqueeze(0)
         values_tiled = (
-            values_lnk.reshape(
-                num_groups, m // tile_n, tile_n, k // 128, 128
-            )
+            values_lnk.reshape(num_groups, m // tile_n, tile_n, k // 128, 128)
             .permute(0, 1, 3, 2, 4)
             .contiguous()
         )
@@ -1255,17 +1249,17 @@ def _check_mxfp8_rows_storage(
         _check_gpu_tensor("out.values_tiled", out.values_tiled)
         if out.values_tiled.dtype != torch.float8_e4m3fn:
             raise ValueError(
-                "out.values_tiled must be float8_e4m3fn, "
-                f"got {out.values_tiled.dtype}"
+                f"out.values_tiled must be float8_e4m3fn, got {out.values_tiled.dtype}"
             )
         expected_tiled_shapes = {
             (4, 1024, 4096): (4, 16, 32, 64, 128),
             (1, 4096, 4096): (1, 32, 32, 128, 128),
         }
         expected_tiled_shape = expected_tiled_shapes.get((num_groups, m, k))
-        if expected_tiled_shape is None or tuple(
-            out.values_tiled.shape
-        ) != expected_tiled_shape:
+        if (
+            expected_tiled_shape is None
+            or tuple(out.values_tiled.shape) != expected_tiled_shape
+        ):
             raise ValueError(
                 "out.values_tiled is only supported for production WO-A/WO-B; "
                 f"got dimensions {(num_groups, m, k)} and shape "
@@ -1403,9 +1397,7 @@ def _run_wo_a_quant_kernel(
         and rope_dim == 64
         and chunks_per_program == 16
     )
-    clear_programs = (
-        groups * group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program
-    )
+    clear_programs = groups * group_width // MXFP8_SCALE_VEC_SIZE // chunks_per_program
     if clear_output is None:
         clear_output_arg = out_values
         clear_output_stride_t = 0
@@ -2441,9 +2433,7 @@ def wo_b_dense_gemm_mxfp8(
             ),
             wo_b_hgr.scale_mma,
         ),
-        rhs_values_tiled=(
-            wo_b_hgr.values_tiled if use_decode_tile else None
-        ),
+        rhs_values_tiled=(wo_b_hgr.values_tiled if use_decode_tile else None),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
@@ -2457,9 +2447,7 @@ def wo_b_dense_gemm_mxfp8(
     )
 
 
-def _wo_a_fused_mma_tiler(
-    expected_m: int | None, rank: int
-) -> tuple[int, int] | None:
+def _wo_a_fused_mma_tiler(expected_m: int | None, rank: int) -> tuple[int, int] | None:
     if expected_m is not None and 1 <= expected_m <= 8 and rank <= 1536:
         return (16, 64)
     return None
@@ -2744,9 +2732,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     atomic_output_precleared = tokens <= 8
     output = None
     if atomic_output_precleared:
-        output = torch.empty(
-            (tokens, hidden, 1), dtype=torch.bfloat16, device=o.device
-        )
+        output = torch.empty((tokens, hidden, 1), dtype=torch.bfloat16, device=o.device)
         values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
             tokens,
             group_width,

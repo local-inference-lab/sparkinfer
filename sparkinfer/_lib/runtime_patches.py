@@ -22,6 +22,8 @@ _MEMORY_DEBUG_SNAPSHOT = {
 
 
 def apply_cutlass_runtime_patches() -> None:
+    if _env_flag("SPARKINFER_DISABLE_CUTLASS_RUNTIME_PATCHES", default=False):
+        return
     _apply_compile_only_warning_patch()
     _apply_memory_debug_patch()
     _apply_direct_frameinfo_patch()

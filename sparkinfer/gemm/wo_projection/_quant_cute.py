@@ -9,8 +9,11 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Uint8, Uint32
 
-from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    compile as sparkinfer_compile,
+)
+from sparkinfer._lib.intrinsics import (
     FLOAT8_E4M3_MAX,
     bfloat2_to_float2_scaled,
     cvt_f32x4_to_e4m3x4,
@@ -21,8 +24,10 @@ from sparkinfer.cute.intrinsics import (
     pow2_ceil_ue8m0,
     ue8m0_to_output_scale,
 )
-from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
-from sparkinfer.cute.utils import current_cuda_stream, make_ptr
+from sparkinfer._lib.runtime_control import (
+    raise_if_kernel_resolution_frozen,
+)
+from sparkinfer._lib.utils import current_cuda_stream, make_ptr
 
 _THREADS = 256
 _GRID_CTAS_PER_SM = 4
@@ -105,9 +110,7 @@ class _WOQuantCuTeLaunch:
             cute.make_layout((m * self._total_k,)),
         )
         positions = cute.make_tensor(positions_ptr, cute.make_layout((m,)))
-        cos_sin = cute.make_tensor(
-            cos_sin_ptr, cute.make_layout((cos_sin_len,))
-        )
+        cos_sin = cute.make_tensor(cos_sin_ptr, cute.make_layout((cos_sin_len,)))
         values_u32 = cute.make_tensor(
             values_ptr,
             cute.make_layout((m * (self._total_k // 4),)),
@@ -163,11 +166,7 @@ class _WOQuantCuTeLaunch:
 
             if cutlass.const_expr(self._mode == "group_major"):
                 # Source physical [g, m, span]: regather group-major flat k.
-                src0 = (
-                    g * (m * Int32(self._span))
-                    + row * Int32(self._span)
-                    + inner0
-                )
+                src0 = g * (m * Int32(self._span)) + row * Int32(self._span) + inner0
             else:
                 src0 = row * Int32(self._total_k) + k0
 
@@ -200,17 +199,11 @@ class _WOQuantCuTeLaunch:
                     sin_w = ld_global_nc_u32(
                         get_ptr_as_int64(cos_sin, cs_base + rl_half0 + half_rope)
                     )
-                    cos0, cos1 = bfloat2_to_float2_scaled(
-                        cos_w, cutlass.Float32(1.0)
-                    )
-                    sin0, sin1 = bfloat2_to_float2_scaled(
-                        sin_w, cutlass.Float32(1.0)
-                    )
+                    cos0, cos1 = bfloat2_to_float2_scaled(cos_w, cutlass.Float32(1.0))
+                    sin0, sin1 = bfloat2_to_float2_scaled(sin_w, cutlass.Float32(1.0))
                 else:
                     cos0 = cutlass.Float32(cos_sin[cs_base + rl_half0])
-                    sin0 = cutlass.Float32(
-                        cos_sin[cs_base + rl_half0 + half_rope]
-                    )
+                    sin0 = cutlass.Float32(cos_sin[cs_base + rl_half0 + half_rope])
                     cos1 = cutlass.Float32(cos_sin[cs_base + rl_half0 + Int32(1)])
                     sin1 = cutlass.Float32(
                         cos_sin[cs_base + rl_half0 + Int32(1) + half_rope]
@@ -272,9 +265,9 @@ class _WOQuantCuTeLaunch:
                 if cutlass.const_expr(self._mode == "grouped"):
                     chunk = inner0 // Int32(32)
                     span_gk = Int32(self._span_groups_k)
-                    scale_rows[
-                        g * (m * span_gk) + row * span_gk + chunk
-                    ] = Uint8(scale_byte)
+                    scale_rows[g * (m * span_gk) + row * span_gk + chunk] = Uint8(
+                        scale_byte
+                    )
                     span_tiles_k = Int32((self._span_groups_k + 3) // 4)
                     m_tiles = (m + Int32(127)) // Int32(128)
                     self._store_scale_mma(
@@ -287,9 +280,7 @@ class _WOQuantCuTeLaunch:
                     )
                 else:
                     chunk = block
-                    scale_rows[
-                        row * Int32(self._groups_k) + chunk
-                    ] = Uint8(scale_byte)
+                    scale_rows[row * Int32(self._groups_k) + chunk] = Uint8(scale_byte)
                     self._store_scale_mma(
                         scale_mma,
                         Int32(0),
@@ -429,9 +420,7 @@ def _get_compiled_wo_quant(
         total_tasks = m * (total_k // 32 // groups_per_warp_tile)
         warps_per_cta = _THREADS // 32
         natural_grid = max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta)
-        sm_count = torch.cuda.get_device_properties(
-            source.device
-        ).multi_processor_count
+        sm_count = torch.cuda.get_device_properties(source.device).multi_processor_count
         grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
         raw(
             make_ptr(

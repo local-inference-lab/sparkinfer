@@ -38,16 +38,36 @@ class CudaRTLibrary:
     _FUNCTIONS = [
         _Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
         _Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
-        _Function("cudaMalloc", cudaError_t, [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]),
+        _Function(
+            "cudaMalloc",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t],
+        ),
         _Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
-        _Function("cudaMemset", cudaError_t, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]),
+        _Function(
+            "cudaMemset", cudaError_t, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        ),
         _Function(
             "cudaMemcpyAsync",
             cudaError_t,
-            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind, cudaStream_t],
+            [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                cudaMemcpyKind,
+                cudaStream_t,
+            ],
         ),
-        _Function("cudaIpcGetMemHandle", cudaError_t, [ctypes.POINTER(cudaIpcMemHandle_t), ctypes.c_void_p]),
-        _Function("cudaIpcOpenMemHandle", cudaError_t, [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint]),
+        _Function(
+            "cudaIpcGetMemHandle",
+            cudaError_t,
+            [ctypes.POINTER(cudaIpcMemHandle_t), ctypes.c_void_p],
+        ),
+        _Function(
+            "cudaIpcOpenMemHandle",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
+        ),
         _Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
     ]
 
@@ -111,7 +131,9 @@ class CudaRTLibrary:
 
     def cudaIpcGetMemHandleBytes(self, ptr: int | ctypes.c_void_p) -> bytes:
         handle = cudaIpcMemHandle_t()
-        self._check(self.funcs["cudaIpcGetMemHandle"](ctypes.byref(handle), self._void_p(ptr)))
+        self._check(
+            self.funcs["cudaIpcGetMemHandle"](ctypes.byref(handle), self._void_p(ptr))
+        )
         return bytes(handle)
 
     def cudaIpcOpenMemHandleBytes(self, handle_bytes: bytes) -> int:
@@ -120,7 +142,11 @@ class CudaRTLibrary:
         handle = cudaIpcMemHandle_t.from_buffer_copy(handle_bytes)
         cudaIpcMemLazyEnablePeerAccess = 1
         ptr = ctypes.c_void_p()
-        self._check(self.funcs["cudaIpcOpenMemHandle"](ctypes.byref(ptr), handle, cudaIpcMemLazyEnablePeerAccess))
+        self._check(
+            self.funcs["cudaIpcOpenMemHandle"](
+                ctypes.byref(ptr), handle, cudaIpcMemLazyEnablePeerAccess
+            )
+        )
         return int(ptr.value)
 
     def cudaIpcCloseMemHandle(self, ptr: int | ctypes.c_void_p) -> None:

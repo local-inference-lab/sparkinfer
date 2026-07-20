@@ -155,7 +155,7 @@ def _use_sm120_sparse_mla(*, backend: str | None, device: torch.device) -> bool:
         )
     if device.type != "cuda":
         return False
-    from sparkinfer.cute.intrinsics import get_sm_version
+    from sparkinfer._lib.intrinsics import get_sm_version
 
     return get_sm_version(device) >= 120
 
@@ -291,11 +291,17 @@ def _validate_split_workspace_views(
             f"split MLA tmp_output dtype {tmp_output.dtype} does not match workspace dtype {workspace.dtype}"
         )
     if tmp_lse.dtype != torch.float32:
-        raise TypeError(f"split MLA tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}")
+        raise TypeError(
+            f"split MLA tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}"
+        )
     if tmp_output.ndim != 4:
-        raise ValueError(f"split MLA tmp_output must be rank-4, got {tuple(tmp_output.shape)}")
+        raise ValueError(
+            f"split MLA tmp_output must be rank-4, got {tuple(tmp_output.shape)}"
+        )
     if tmp_lse.ndim != 3:
-        raise ValueError(f"split MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}")
+        raise ValueError(
+            f"split MLA tmp_lse must be rank-3, got {tuple(tmp_lse.shape)}"
+        )
     _validate_tensor_storage_bounds(tmp_output, name="split MLA tmp_output")
     _validate_tensor_storage_bounds(tmp_lse, name="split MLA tmp_lse")
     required_output = (q_rows, num_heads, launch_num_chunks, v_head_dim)
@@ -433,15 +439,19 @@ def sparse_mla_extend_forward(
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    q_all, selected_token_offsets, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
-        _resolve_sparse_mla_binding(
-            binding=binding,
-            q_all=q_all,
-            selected_indices=selected_token_offsets,
-            cache_seqlens_int32=cache_seqlens_int32,
-            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            selected_name="selected_token_offsets",
-        )
+    (
+        q_all,
+        selected_token_offsets,
+        cache_seqlens_int32,
+        nsa_cache_seqlens_int32,
+        workspace,
+    ) = _resolve_sparse_mla_binding(
+        binding=binding,
+        q_all=q_all,
+        selected_indices=selected_token_offsets,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        selected_name="selected_token_offsets",
     )
     if v_head_dim is None:
         v_head_dim = workspace.v_head_dim
@@ -573,7 +583,9 @@ def _run_sparse_mla(
     # scratch/workspace planned kv_cache_dtype supplies it. None -> inferred
     # from q_head_dim inside the kernel launchers (fp8 GLM default).
     scale_format_for_call = (
-        scale_format if scale_format is not None else getattr(workspace, "scale_format", None)
+        scale_format
+        if scale_format is not None
+        else getattr(workspace, "scale_format", None)
     )
     if int(scale_format_for_call or -1) == 2 and fp8_rope is None:
         # Normal vLLM calls arrive through sparkinfer.integration.mla, whose stable
@@ -604,7 +616,9 @@ def _run_sparse_mla(
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
-            raise ValueError("sparse MLA attn_sink requires the active SM120 kernel path")
+            raise ValueError(
+                "sparse MLA attn_sink requires the active SM120 kernel path"
+            )
         if attn_sink.ndim != 1 or int(attn_sink.shape[0]) != int(q_all.shape[1]):
             raise ValueError(
                 f"attn_sink must have shape ({int(q_all.shape[1])},), got {tuple(attn_sink.shape)}"
@@ -614,7 +628,9 @@ def _run_sparse_mla(
                 f"attn_sink device {attn_sink.device} does not match workspace device {workspace.device}"
             )
         if attn_sink.dtype != torch.float32:
-            raise ValueError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+            raise ValueError(
+                f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}"
+            )
         if not attn_sink.is_contiguous():
             raise ValueError("attn_sink must be contiguous for fused sparse MLA")
     if q_all.shape[0] > workspace.max_total_q:
@@ -695,7 +711,9 @@ def _run_sparse_mla(
             "the active SM120 sparse MLA kernel path is unavailable for this device"
         )
     if identity_page_table:
-        raise RuntimeError("identity page-table sparse MLA requires the active SM120 kernel path")
+        raise RuntimeError(
+            "identity page-table sparse MLA requires the active SM120 kernel path"
+        )
     reference_kwargs = dict(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -777,8 +795,12 @@ def _final_lse_from_split_workspace(
     if chunk_count <= 0:
         raise ValueError(f"launch_num_chunks must be positive, got {chunk_count}")
     if workspace.tmp_lse.ndim != 3:
-        raise ValueError(f"workspace split MLA LSE buffer must be rank-3, got {tuple(workspace.tmp_lse.shape)}")
-    _validate_tensor_storage_bounds(workspace.tmp_lse, name="workspace split MLA LSE buffer")
+        raise ValueError(
+            f"workspace split MLA LSE buffer must be rank-3, got {tuple(workspace.tmp_lse.shape)}"
+        )
+    _validate_tensor_storage_bounds(
+        workspace.tmp_lse, name="workspace split MLA LSE buffer"
+    )
     if (
         int(workspace.tmp_lse.shape[0]) < q_rows
         or int(workspace.tmp_lse.shape[1]) < num_heads
@@ -789,9 +811,16 @@ def _final_lse_from_split_workspace(
             f"buffer={tuple(workspace.tmp_lse.shape)} required>=({q_rows}, {num_heads}, {chunk_count})"
         )
     if workspace.final_lse.ndim != 2:
-        raise ValueError(f"workspace final MLA LSE buffer must be rank-2, got {tuple(workspace.final_lse.shape)}")
-    _validate_tensor_storage_bounds(workspace.final_lse, name="workspace final MLA LSE buffer")
-    if int(workspace.final_lse.shape[0]) < q_rows or int(workspace.final_lse.shape[1]) < num_heads:
+        raise ValueError(
+            f"workspace final MLA LSE buffer must be rank-2, got {tuple(workspace.final_lse.shape)}"
+        )
+    _validate_tensor_storage_bounds(
+        workspace.final_lse, name="workspace final MLA LSE buffer"
+    )
+    if (
+        int(workspace.final_lse.shape[0]) < q_rows
+        or int(workspace.final_lse.shape[1]) < num_heads
+    ):
         raise ValueError(
             "workspace final MLA LSE buffer is too small: "
             f"buffer={tuple(workspace.final_lse.shape)} required>=({q_rows}, {num_heads})"

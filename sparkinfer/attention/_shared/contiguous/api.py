@@ -11,10 +11,19 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32
 
-from sparkinfer.attention.contiguous.forward import ContiguousAttentionForwardKernel
-from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
-from sparkinfer.cute.utils import current_cuda_stream, make_ptr
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from sparkinfer.attention._shared.contiguous.forward import (
+    ContiguousAttentionForwardKernel,
+)
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    compile as sparkinfer_compile,
+)
+from sparkinfer._lib.utils import current_cuda_stream, make_ptr
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 
 
 _ARENA_ALIGN_BYTES = 1024
@@ -25,7 +34,9 @@ def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
         return cutlass.BFloat16
     if dtype == torch.float16:
         return cutlass.Float16
-    raise TypeError(f"unsupported dtype {dtype}; expected torch.bfloat16 or torch.float16")
+    raise TypeError(
+        f"unsupported dtype {dtype}; expected torch.bfloat16 or torch.float16"
+    )
 
 
 def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -74,7 +85,9 @@ def _seq_dims(shape: tuple[int, ...]) -> tuple[tuple[int, ...], int, int, int]:
     raise ValueError(f"expected rank-3 or rank-4 tensor shape, got {shape}")
 
 
-def _normalize_window_size(window_size: int | tuple[int, int] | None) -> tuple[int, int]:
+def _normalize_window_size(
+    window_size: int | tuple[int, int] | None,
+) -> tuple[int, int]:
     if window_size is None:
         return (-1, -1)
     if isinstance(window_size, int):
@@ -159,7 +172,9 @@ def _select_tile_shape(head_dim: int, *, causal: bool) -> tuple[int, int]:
         return (128, 64)
     if head_dim == 256:
         return (64, 32 if causal else 48)
-    raise ValueError(f"unsupported head_dim={head_dim} for the current sparkinfer attention path")
+    raise ValueError(
+        f"unsupported head_dim={head_dim} for the current sparkinfer attention path"
+    )
 
 
 def _normalize_tensor_shape(t: torch.Tensor) -> tuple[int, ...]:
@@ -174,14 +189,18 @@ def _cuda_device_index(device: torch.device) -> int:
 
 @functools.cache
 def _attention_sink_placeholder(device_index: int) -> torch.Tensor:
-    return torch.empty((1,), dtype=torch.float32, device=torch.device("cuda", device_index))
+    return torch.empty(
+        (1,), dtype=torch.float32, device=torch.device("cuda", device_index)
+    )
 
 
 def _validate_forward_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.device, torch.dtype]:
+) -> tuple[
+    tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.device, torch.dtype
+]:
     if q.ndim not in (3, 4):
         raise ValueError(f"q must be rank-3 or rank-4, got rank {q.ndim}")
     if q.ndim != k.ndim or q.ndim != v.ndim:
@@ -191,7 +210,9 @@ def _validate_forward_inputs(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q, k, and v must have the same dtype")
     if q.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(f"unsupported dtype {q.dtype}; expected torch.bfloat16 or torch.float16")
+        raise TypeError(
+            f"unsupported dtype {q.dtype}; expected torch.bfloat16 or torch.float16"
+        )
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("q, k, and v must all be contiguous")
 
@@ -204,7 +225,9 @@ def _validate_forward_inputs(
     if batch_q != batch_k or batch_q != batch_v:
         raise ValueError("q, k, and v must have matching batch dimensions")
     if q_head_dim != k_head_dim or q_head_dim != v_head_dim:
-        raise ValueError("q, k, and v must have matching head dimensions in the initial path")
+        raise ValueError(
+            "q, k, and v must have matching head dimensions in the initial path"
+        )
     if kv_heads != v_heads:
         raise ValueError("k and v must have the same number of KV heads")
     if q_heads % kv_heads != 0:
@@ -285,7 +308,9 @@ def _validate_varlen_inputs(
     if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be rank-1 tensors")
     if cu_seqlens_q.device != device or cu_seqlens_k.device != device:
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must be CUDA tensors on the input device")
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must be CUDA tensors on the input device"
+        )
     if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
         raise TypeError("cu_seqlens_q and cu_seqlens_k must be torch.int32")
     if not cu_seqlens_q.is_contiguous() or not cu_seqlens_k.is_contiguous():
@@ -342,7 +367,6 @@ def _validate_varlen_inputs_against_plan(
         )
 
 
-
 @dataclass(frozen=True, kw_only=True)
 class AttentionPlanKey:
     q_shape: tuple[int, ...]
@@ -391,7 +415,6 @@ class VarlenAttentionPlanKey:
     logical_total_q_rows: int
 
 
-
 @dataclass(frozen=True, kw_only=True)
 class AttentionPlan:
     """Exact-shape launch contract for one contiguous attention shape."""
@@ -422,7 +445,6 @@ class VarlenAttentionPlan:
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.key.device_index)
-
 
 
 @dataclass(kw_only=True)
@@ -521,12 +543,13 @@ class VarlenAttentionWorkspace:
         )
 
 
-
 @dataclass
 class AttentionWorkspacePool:
     """Caller-owned exact-shape workspace cache partitioned by CUDA stream."""
 
-    workspaces: dict[tuple[int, AttentionPlanKey], AttentionWorkspace] = field(default_factory=dict)
+    workspaces: dict[tuple[int, AttentionPlanKey], AttentionWorkspace] = field(
+        default_factory=dict
+    )
 
     def clear(self) -> None:
         self.workspaces.clear()
@@ -604,10 +627,10 @@ class _AttentionScratchViews:
 @dataclass(frozen=True)
 class AttentionScratchPlan:
     plan: AttentionPlan
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
     _layout: _AttentionScratchLayout
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -642,10 +665,10 @@ class AttentionScratchPlan:
 @dataclass(frozen=True)
 class VarlenAttentionScratchPlan:
     plan: VarlenAttentionPlan
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
     _layout: _AttentionScratchLayout
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -689,7 +712,6 @@ class VarlenAttentionScratchPlan:
         )
 
 
-
 class _AttentionForwardLaunch:
     def __init__(
         self,
@@ -716,7 +738,9 @@ class _AttentionForwardLaunch:
         self._v_stride = _contiguous_stride(v_shape)
         self._o_stride = _contiguous_stride(q_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
-        self._attention_sink_bias_stride = _contiguous_stride(self._attention_sink_bias_shape)
+        self._attention_sink_bias_stride = _contiguous_stride(
+            self._attention_sink_bias_shape
+        )
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._window_size_left = window_size_left
         self._window_size_right = window_size_right
@@ -775,10 +799,18 @@ class _AttentionForwardLaunch:
         softmax_scale: float,
         current_stream: cuda.CUstream,
     ):
-        q_tensor = cute.make_tensor(q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride))
-        k_tensor = cute.make_tensor(k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride))
-        v_tensor = cute.make_tensor(v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride))
-        o_tensor = cute.make_tensor(o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride))
+        q_tensor = cute.make_tensor(
+            q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride)
+        )
+        k_tensor = cute.make_tensor(
+            k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride)
+        )
+        v_tensor = cute.make_tensor(
+            v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride)
+        )
+        o_tensor = cute.make_tensor(
+            o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride)
+        )
         lse_tensor = cute.make_tensor(
             lse_ptr,
             layout=cute.make_layout(self._lse_shape, stride=self._lse_stride),
@@ -806,7 +838,9 @@ class _AttentionForwardLaunch:
                 None if self._window_size_left == -1 else Int32(self._window_size_left)
             ),
             window_size_right=(
-                None if self._window_size_right == -1 else Int32(self._window_size_right)
+                None
+                if self._window_size_right == -1
+                else Int32(self._window_size_right)
             ),
             stream=current_stream,
         )
@@ -846,7 +880,9 @@ class _VarlenAttentionForwardLaunch:
         self._cu_seqlens_k_stride = _contiguous_stride(cu_seqlens_k_shape)
         self._o_stride = _contiguous_stride(q_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
-        self._attention_sink_bias_stride = _contiguous_stride(self._attention_sink_bias_shape)
+        self._attention_sink_bias_stride = _contiguous_stride(
+            self._attention_sink_bias_shape
+        )
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._window_size_left = window_size_left
         self._window_size_right = window_size_right
@@ -914,10 +950,18 @@ class _VarlenAttentionForwardLaunch:
         softmax_scale: float,
         current_stream: cuda.CUstream,
     ):
-        q_tensor = cute.make_tensor(q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride))
-        k_tensor = cute.make_tensor(k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride))
-        v_tensor = cute.make_tensor(v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride))
-        o_tensor = cute.make_tensor(o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride))
+        q_tensor = cute.make_tensor(
+            q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride)
+        )
+        k_tensor = cute.make_tensor(
+            k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride)
+        )
+        v_tensor = cute.make_tensor(
+            v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride)
+        )
+        o_tensor = cute.make_tensor(
+            o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride)
+        )
         lse_tensor = cute.make_tensor(
             lse_ptr,
             layout=cute.make_layout(self._lse_shape, stride=self._lse_stride),
@@ -961,12 +1005,12 @@ class _VarlenAttentionForwardLaunch:
                 None if self._window_size_left == -1 else Int32(self._window_size_left)
             ),
             window_size_right=(
-                None if self._window_size_right == -1 else Int32(self._window_size_right)
+                None
+                if self._window_size_right == -1
+                else Int32(self._window_size_right)
             ),
             stream=current_stream,
         )
-
-
 
 
 @functools.cache
@@ -1091,8 +1135,6 @@ def _compile_varlen_attention(
             ),
         ),
     )
-
-
 
 
 @functools.cache
@@ -1233,7 +1275,6 @@ def _get_varlen_attention_plan(
     )
 
 
-
 def clear_attention_caches() -> None:
     """Clear global compile caches owned by the sparkinfer attention integration."""
     _compile_attention.cache_clear()
@@ -1281,8 +1322,7 @@ def _validate_workspace(
         )
     if workspace.plan_key is not None and workspace.plan_key != plan.key:
         raise ValueError(
-            "workspace plan mismatch: "
-            f"expected {workspace.plan_key}, got {plan.key}"
+            f"workspace plan mismatch: expected {workspace.plan_key}, got {plan.key}"
         )
 
 
@@ -1366,7 +1406,9 @@ def _validate_attention_output_lse(
             f"attention lse device {lse.device} does not match plan device {plan.device}"
         )
     if lse.dtype != torch.float32:
-        raise ValueError(f"attention lse must have dtype torch.float32, got {lse.dtype}")
+        raise ValueError(
+            f"attention lse must have dtype torch.float32, got {lse.dtype}"
+        )
 
 
 def _attention_scratch_layout(
@@ -1395,7 +1437,9 @@ def _arena_view(
     shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    offset_bytes = _align_up(offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    offset_bytes = _align_up(
+        offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype))
+    )
     nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
     return arena.narrow(0, offset_bytes, nbytes).view(dtype).view(shape)
 
@@ -1772,7 +1816,10 @@ def build_varlen_attention_binding(
         raise ValueError(f"causal mismatch: plan has {plan.causal}, got {causal}")
     if window_size is not None:
         window_size_left, window_size_right = _normalize_window_size(window_size)
-        if window_size_left != plan.window_size_left or window_size_right != plan.window_size_right:
+        if (
+            window_size_left != plan.window_size_left
+            or window_size_right != plan.window_size_right
+        ):
             raise ValueError(
                 "window_size mismatch: "
                 f"plan has {(plan.window_size_left, plan.window_size_right)}, "
@@ -1789,7 +1836,9 @@ def build_varlen_attention_binding(
         plan=plan,
     )
     _validate_varlen_workspace(workspace, plan=plan)
-    _validate_attention_output_lse(output=workspace.output, lse=workspace.lse, plan=plan)
+    _validate_attention_output_lse(
+        output=workspace.output, lse=workspace.lse, plan=plan
+    )
     return _build_varlen_attention_binding_from_views(
         output=workspace.output,
         lse=workspace.lse,
@@ -1912,7 +1961,9 @@ def plan_attention_scratch(plan: AttentionPlan) -> AttentionScratchPlan:
     )
 
 
-def plan_varlen_attention_scratch(plan: VarlenAttentionPlan) -> VarlenAttentionScratchPlan:
+def plan_varlen_attention_scratch(
+    plan: VarlenAttentionPlan,
+) -> VarlenAttentionScratchPlan:
     layout = _attention_scratch_layout(q_shape=plan.q_shape, dtype=plan.dtype)
     return VarlenAttentionScratchPlan(
         plan=plan,
@@ -1977,11 +2028,9 @@ def allocate_varlen_attention_workspace_for_plan(
     )
 
 
-
 def allocate_attention_workspace_pool() -> AttentionWorkspacePool:
     """Allocate an explicit caller-owned workspace pool for contiguous attention."""
     return AttentionWorkspacePool()
-
 
 
 def _resolve_attention_workspace(
@@ -1993,7 +2042,9 @@ def _resolve_attention_workspace(
         _validate_workspace(workspace, plan=plan)
         return workspace
     if not isinstance(workspace, AttentionWorkspacePool):
-        raise TypeError("workspace must be an AttentionWorkspace or AttentionWorkspacePool")
+        raise TypeError(
+            "workspace must be an AttentionWorkspace or AttentionWorkspacePool"
+        )
 
     stream_key = int(torch.cuda.current_stream(plan.device).cuda_stream)
     key = (stream_key, plan.key)
@@ -2002,7 +2053,6 @@ def _resolve_attention_workspace(
         resolved = allocate_attention_workspace_for_plan(plan)
         workspace.workspaces[key] = resolved
     return resolved
-
 
 
 def create_attention_plan(
@@ -2103,7 +2153,6 @@ def create_varlen_attention_plan(
     )
 
 
-
 def allocate_attention_workspace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2156,8 +2205,6 @@ def allocate_varlen_attention_workspace(
         tile_shape=tile_shape,
     )
     return allocate_varlen_attention_workspace_for_plan(plan)
-
-
 
 
 def sparkinfer_attention_forward(
@@ -2246,14 +2293,29 @@ def sparkinfer_attention_forward(
         _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, _, head_dim = _seq_dims(q_shape)
     if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
+        softmax_scale = head_dim**-0.5
     if attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
 
     resolved_plan.compiled(
-        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            q.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            k.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            v.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         make_ptr(
             resolved_plan.cutlass_dtype,
             output.data_ptr(),
@@ -2339,9 +2401,7 @@ def sparkinfer_varlen_attention_forward(
     else:
         raise TypeError("sparkinfer_varlen_attention_forward requires binding")
     if q is None or k is None or v is None or cu_seqlens_q is None:
-        raise TypeError(
-            "varlen attention binding is missing q, k, v, or cu_seqlens_q"
-        )
+        raise TypeError("varlen attention binding is missing q, k, v, or cu_seqlens_q")
     if cu_seqlens_k is None:
         cu_seqlens_k = cu_seqlens_q
     (
@@ -2376,7 +2436,9 @@ def sparkinfer_varlen_attention_forward(
             f"max_seqlen_k mismatch: plan has {resolved_plan.max_seqlen_k}, got {max_seqlen_k}"
         )
     if causal is not None and bool(causal) != resolved_plan.causal:
-        raise ValueError(f"causal mismatch: plan has {resolved_plan.causal}, got {causal}")
+        raise ValueError(
+            f"causal mismatch: plan has {resolved_plan.causal}, got {causal}"
+        )
     if window_size is not None:
         window_size_left, window_size_right = _normalize_window_size(window_size)
         if (
@@ -2404,14 +2466,29 @@ def sparkinfer_varlen_attention_forward(
         _validate_attention_output_lse(output=output, lse=lse, plan=resolved_plan)
     _, _, head_dim = q_shape
     if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
+        softmax_scale = head_dim**-0.5
     if attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
 
     resolved_plan.compiled(
-        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            q.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            k.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            v.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         make_ptr(
             resolved_plan.cutlass_dtype,
             output.data_ptr(),
@@ -2447,20 +2524,21 @@ def sparkinfer_varlen_attention_forward(
     )
     return output, lse
 
+
 __all__ = [
-    'AttentionBinding',
-    'AttentionPlan',
-    'AttentionPlanKey',
-    'AttentionScratchPlan',
-    'VarlenAttentionBinding',
-    'VarlenAttentionPlan',
-    'VarlenAttentionPlanKey',
-    'VarlenAttentionScratchPlan',
-    'sparkinfer_attention_forward',
-    'sparkinfer_varlen_attention_forward',
-    'clear_attention_caches',
-    'create_attention_plan',
-    'create_varlen_attention_plan',
-    'plan_attention_scratch',
-    'plan_varlen_attention_scratch',
+    "AttentionBinding",
+    "AttentionPlan",
+    "AttentionPlanKey",
+    "AttentionScratchPlan",
+    "VarlenAttentionBinding",
+    "VarlenAttentionPlan",
+    "VarlenAttentionPlanKey",
+    "VarlenAttentionScratchPlan",
+    "sparkinfer_attention_forward",
+    "sparkinfer_varlen_attention_forward",
+    "clear_attention_caches",
+    "create_attention_plan",
+    "create_varlen_attention_plan",
+    "plan_attention_scratch",
+    "plan_varlen_attention_scratch",
 ]

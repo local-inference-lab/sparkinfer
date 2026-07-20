@@ -7,23 +7,25 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.attention.mla.compressed_config import (
+from sparkinfer.attention._shared.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
-from sparkinfer.attention.mla.compressed_reference import COMPRESSED_MLA_HEAD_DIM
-from sparkinfer.attention.workspace import (
+from sparkinfer.attention._shared.mla.compressed_reference import (
+    COMPRESSED_MLA_HEAD_DIM,
+)
+from sparkinfer.attention._shared.workspace import (
     _split_output_buffer_from_tmp,
     _split_tmp_output_stride,
 )
-from sparkinfer.integration.scratch_layout import (
+from sparkinfer._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_strided_view,
     materialize_scratch_view,
 )
-from sparkinfer.integration.scratch import (
-    SPARKINFERScratchBufferSpec,
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
@@ -54,18 +56,25 @@ class SPARKINFERCompressedMLAScratchCaps:
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
-        max_page_table_width = self.max_width if self.max_page_table_width is None else self.max_page_table_width
-        object.__setattr__(self, "max_page_table_width", max(int(max_page_table_width), 1))
+        max_page_table_width = (
+            self.max_width
+            if self.max_page_table_width is None
+            else self.max_page_table_width
+        )
+        object.__setattr__(
+            self, "max_page_table_width", max(int(max_page_table_width), 1)
+        )
         object.__setattr__(self, "head_dim", max(int(self.head_dim), 1))
         object.__setattr__(self, "v_head_dim", max(int(self.v_head_dim), 1))
         max_batch = self.max_q_rows if self.max_batch is None else self.max_batch
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "max_kv_rows", max(int(self.max_kv_rows), 0))
-        object.__setattr__(self, "max_chunks_per_row", max(int(self.max_chunks_per_row), 1))
+        object.__setattr__(
+            self, "max_chunks_per_row", max(int(self.max_chunks_per_row), 1)
+        )
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
-
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -78,7 +87,6 @@ class _SPARKINFERCompressedMLAScratchLayout:
     kv_chunk_size_offset_bytes: int
     num_chunks_offset_bytes: int
     sm_scale_offset_bytes: int
-
 
 
 @dataclass(kw_only=True)
@@ -127,7 +135,9 @@ class SPARKINFERCompressedMLAScratch:
         if kv_chunk_size <= 0:
             raise ValueError(f"kv_chunk_size must be positive, got {kv_chunk_size}")
         if self.kv_chunk_size_ptr is None or self.num_chunks_ptr is None:
-            raise RuntimeError("compressed MLA scratch is missing split-control tensors")
+            raise RuntimeError(
+                "compressed MLA scratch is missing split-control tensors"
+            )
         if self.kv_chunk_size_value != int(kv_chunk_size):
             self.kv_chunk_size_ptr.fill_(int(kv_chunk_size))
             self.kv_chunk_size_value = int(kv_chunk_size)
@@ -156,7 +166,6 @@ class SPARKINFERCompressedMLAScratch:
         )
 
 
-
 @dataclass(frozen=True, kw_only=True)
 class SPARKINFERCompressedMLABinding:
     scratch: object
@@ -166,7 +175,6 @@ class SPARKINFERCompressedMLABinding:
     indexed_indices: torch.Tensor | None = None
     indexed_lengths: torch.Tensor | None = None
     indexed_page_table: torch.Tensor | None = None
-
 
 
 def _compressed_mla_scratch_layout(
@@ -193,19 +201,11 @@ def _compressed_mla_scratch_layout(
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     tmp_lse_offset_bytes = cursor
-    cursor += (
-        max_q_chunks
-        * int(caps.num_q_heads)
-        * dtype_nbytes(torch.float32)
-    )
+    cursor += max_q_chunks * int(caps.num_q_heads) * dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     final_lse_offset_bytes = cursor
-    cursor += (
-        max_total_q
-        * int(caps.num_q_heads)
-        * dtype_nbytes(torch.float32)
-    )
+    cursor += max_total_q * int(caps.num_q_heads) * dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     kv_chunk_size_offset_bytes = cursor
@@ -293,7 +293,6 @@ def _install_compressed_mla_contract_phantoms(
         ),
         dtype=torch.float32,
     )
-
 
 
 def _materialize_compressed_mla_scratch(
@@ -394,30 +393,42 @@ def _validate_device(
     if scratch is None:
         raise TypeError("_validate_device requires scratch")
     if tensor.device != scratch.device:
-        raise ValueError(f"{name} device {tensor.device} does not match scratch device {scratch.device}")
+        raise ValueError(
+            f"{name} device {tensor.device} does not match scratch device {scratch.device}"
+        )
 
 
 def _normalize_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
     if q.ndim == 4 and q.shape[1] == 1:
         q = q[:, 0]
     if q.ndim != 3:
-        raise ValueError(f"q must be rank-3 or [rows, 1, heads, dim], got {tuple(q.shape)}")
+        raise ValueError(
+            f"q must be rank-3 or [rows, 1, heads, dim], got {tuple(q.shape)}"
+        )
     if int(q.shape[1]) != int(scratch.num_q_heads):
-        raise ValueError(f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}")
+        raise ValueError(
+            f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}"
+        )
     if int(q.shape[2]) != COMPRESSED_MLA_HEAD_DIM:
-        raise ValueError(f"q head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {int(q.shape[2])}")
+        raise ValueError(
+            f"q head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {int(q.shape[2])}"
+        )
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q must have dtype torch.bfloat16, got {q.dtype}")
     if not q.is_contiguous():
         raise ValueError("q must be contiguous")
     _validate_device(q, scratch=scratch, name="q")
     if int(q.shape[0]) > int(scratch.max_total_q):
-        raise ValueError(f"q rows {int(q.shape[0])} exceed scratch capacity {scratch.max_total_q}")
+        raise ValueError(
+            f"q rows {int(q.shape[0])} exceed scratch capacity {scratch.max_total_q}"
+        )
     return q.detach()
 
 
 def _is_row_shared_i32_matrix(tensor: torch.Tensor) -> bool:
-    return tensor.ndim == 2 and int(tensor.stride(0)) == 0 and int(tensor.stride(1)) == 1
+    return (
+        tensor.ndim == 2 and int(tensor.stride(0)) == 0 and int(tensor.stride(1)) == 1
+    )
 
 
 def _normalize_i32_matrix(
@@ -431,18 +442,26 @@ def _normalize_i32_matrix(
     if tensor.ndim == 3 and tensor.shape[1] == 1:
         tensor = tensor[:, 0]
     if tensor.ndim != 2:
-        raise ValueError(f"{name} must be rank-2 or [rows, 1, width], got {tuple(tensor.shape)}")
+        raise ValueError(
+            f"{name} must be rank-2 or [rows, 1, width], got {tuple(tensor.shape)}"
+        )
     if tensor.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
-    if not tensor.is_contiguous() and not (allow_row_shared and _is_row_shared_i32_matrix(tensor)):
+    if not tensor.is_contiguous() and not (
+        allow_row_shared and _is_row_shared_i32_matrix(tensor)
+    ):
         raise ValueError(f"{name} must be contiguous")
     _validate_device(tensor, scratch=scratch, name=name)
     if int(tensor.shape[0]) != int(rows):
-        raise ValueError(f"{name} rows {int(tensor.shape[0])} do not match q rows {rows}")
+        raise ValueError(
+            f"{name} rows {int(tensor.shape[0])} do not match q rows {rows}"
+        )
     return tensor
 
 
-def _validate_i32_vector(tensor: torch.Tensor, *, scratch: object, rows: int, name: str) -> torch.Tensor:
+def _validate_i32_vector(
+    tensor: torch.Tensor, *, scratch: object, rows: int, name: str
+) -> torch.Tensor:
     if tensor.shape != (int(rows),):
         raise ValueError(f"{name} must have shape ({rows},), got {tuple(tensor.shape)}")
     if tensor.dtype != torch.int32:
@@ -472,7 +491,9 @@ def build_compressed_mla_binding(
         name="swa_indices",
     )
     if int(swa_indices.shape[1]) > int(scratch.topk):
-        raise ValueError(f"swa_indices width {int(swa_indices.shape[1])} exceeds scratch topk {scratch.topk}")
+        raise ValueError(
+            f"swa_indices width {int(swa_indices.shape[1])} exceeds scratch topk {scratch.topk}"
+        )
     swa_lengths = _validate_i32_vector(
         swa_lengths,
         scratch=scratch,
@@ -480,7 +501,9 @@ def build_compressed_mla_binding(
         name="swa_lengths",
     )
     if (indexed_indices is None) != (indexed_lengths is None):
-        raise ValueError("indexed_indices and indexed_lengths must be provided together")
+        raise ValueError(
+            "indexed_indices and indexed_lengths must be provided together"
+        )
     indexed_width = 0
     if indexed_indices is not None:
         indexed_indices = _normalize_i32_matrix(
@@ -511,7 +534,9 @@ def build_compressed_mla_binding(
             )
     total_width = int(swa_indices.shape[1]) + indexed_width
     if total_width > int(scratch.topk):
-        raise ValueError(f"compressed MLA width {total_width} exceeds scratch topk {scratch.topk}")
+        raise ValueError(
+            f"compressed MLA width {total_width} exceeds scratch topk {scratch.topk}"
+        )
     return SPARKINFERCompressedMLABinding(
         scratch=scratch,
         q=q,
@@ -539,14 +564,13 @@ def _validate_i32_contiguous(
     _validate_device(tensor, scratch=scratch, name=name)
 
 
-
 @dataclass(frozen=True)
 class SPARKINFERCompressedMLAScratchPlan:
     caps: SPARKINFERCompressedMLAScratchCaps
     layout: _SPARKINFERCompressedMLAScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -584,7 +608,6 @@ class SPARKINFERCompressedMLAScratchPlan:
         )
 
 
-
 def plan_compressed_mla_scratch(
     caps: SPARKINFERCompressedMLAScratchCaps,
 ) -> SPARKINFERCompressedMLAScratchPlan:
@@ -602,9 +625,8 @@ def plan_compressed_mla_scratch(
     )
 
 
-
 __all__ = [
-    "SPARKINFERScratchBufferSpec",
+    "ScratchBufferSpec",
     "SPARKINFERCompressedMLABinding",
     "SPARKINFERCompressedMLAScratch",
     "SPARKINFERCompressedMLAScratchCaps",

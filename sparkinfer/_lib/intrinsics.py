@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025 by the sparkinfer authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Device-intrinsics and host quantization library shared by the SM12x kernels.
+Common utilities for FP4 quantization kernels.
 
-Inline-PTX device ops (ldmatrix variants, cp.async and TMA bulk copies,
-vectorized global/shared loads and stores, atomics and reductions, packed
-dtype conversions, swizzles) plus host-side NVFP4/MXFP8 quantization helpers
-and their torch references.
+This module contains shared PTX intrinsics, helper functions, and reduction
+utilities used by the fused frontend kernels.
 """
 
 import functools
@@ -51,7 +49,9 @@ def align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def make_swizzle_indices(rows_padded: int, cols_padded: int, device: torch.device) -> torch.Tensor:
+def make_swizzle_indices(
+    rows_padded: int, cols_padded: int, device: torch.device
+) -> torch.Tensor:
     """Pre-compute swizzle gather indices for FP8 block-scale factors."""
     numel = rows_padded * cols_padded
     idx = torch.arange(numel, device=device)
@@ -72,7 +72,9 @@ def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
     rows_padded = align_up(rows, 128)
     cols_padded = align_up(cols, 4)
 
-    padded = torch.zeros((batch, rows_padded, cols_padded), dtype=scale.dtype, device=scale.device)
+    padded = torch.zeros(
+        (batch, rows_padded, cols_padded), dtype=scale.dtype, device=scale.device
+    )
     padded[:, :rows, :cols] = scale
     swizzled = padded.reshape(batch, rows_padded // 128, 4, 32, cols_padded // 4, 4)
     swizzled = swizzled.permute(0, 1, 4, 3, 2, 5).contiguous()
@@ -80,7 +82,9 @@ def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
     return swizzled[0] if squeeze_batch else swizzled
 
 
-def as_grouped_scale_view(scale_storage: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+def as_grouped_scale_view(
+    scale_storage: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
     batch = scale_storage.shape[0]
     rows_padded = align_up(rows, 128)
     cols_padded = align_up(cols // SF_VEC_SIZE, 4)
@@ -89,7 +93,9 @@ def as_grouped_scale_view(scale_storage: torch.Tensor, rows: int, cols: int) -> 
     return sf.permute(3, 4, 1, 5, 2, 0)
 
 
-def as_grouped_scale_view_mx(scale_storage: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+def as_grouped_scale_view_mx(
+    scale_storage: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
     """Grouped UE8M0 scale view for vec32 (MXFP8 w4a8) block scales."""
     batch = scale_storage.shape[0]
     rows_padded = align_up(rows, 128)
@@ -152,8 +158,14 @@ def quantize_grouped_nvfp4_torch(
     if global_scale.numel() == 1:
         global_scale = global_scale.expand(num_groups).contiguous()
 
-    quantized = torch.zeros((num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device)
-    scales = torch.zeros((num_groups, rows, cols // SF_VEC_SIZE), dtype=torch.float32, device=input_tensor.device)
+    quantized = torch.zeros(
+        (num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device
+    )
+    scales = torch.zeros(
+        (num_groups, rows, cols // SF_VEC_SIZE),
+        dtype=torch.float32,
+        device=input_tensor.device,
+    )
     for group_idx in range(num_groups):
         valid_rows = int(row_counts[group_idx].item())
         if valid_rows == 0:
@@ -161,11 +173,17 @@ def quantize_grouped_nvfp4_torch(
         x = input_tensor[group_idx, :valid_rows].float()
         sliced = x.view(valid_rows, cols // SF_VEC_SIZE, SF_VEC_SIZE)
         block_max = sliced.abs().amax(dim=-1, keepdim=True).to(torch.float32)
-        scale = (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX)).to(torch.float8_e4m3fn).to(torch.float32)
+        scale = (
+            (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX))
+            .to(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
         output_scale = _reciprocal_or_zero_torch(
             scale * _reciprocal_or_zero_torch(global_scale[group_idx])
         )
-        clipped = torch.clamp(sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).view(valid_rows, cols)
+        clipped = torch.clamp(
+            sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX
+        ).view(valid_rows, cols)
         quantized[group_idx, :valid_rows] = _fp4_quantize_values(clipped)
         scales[group_idx, :valid_rows] = scale.squeeze(-1)
 
@@ -262,9 +280,13 @@ def quantize_grouped_mxfp8_torch(
     if cols % MX_SF_VEC_SIZE != 0:
         raise ValueError(f"cols must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
 
-    payload = torch.zeros((num_groups, rows, cols), dtype=torch.uint8, device=input_tensor.device)
+    payload = torch.zeros(
+        (num_groups, rows, cols), dtype=torch.uint8, device=input_tensor.device
+    )
     scales = torch.zeros(
-        (num_groups, rows, cols // MX_SF_VEC_SIZE), dtype=torch.uint8, device=input_tensor.device
+        (num_groups, rows, cols // MX_SF_VEC_SIZE),
+        dtype=torch.uint8,
+        device=input_tensor.device,
     )
     for group_idx in range(num_groups):
         valid_rows = int(row_counts[group_idx].item())
@@ -506,9 +528,7 @@ def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def ld_global_nc_v2_u32(
-    base_ptr: Int64, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
+def ld_global_nc_v2_u32(base_ptr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
     """Load 64 bits (2 x uint32) from global memory via non-coherent cache (.nc)."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -755,7 +775,9 @@ def shared_ptr_to_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
-def ldmatrix_m8n8x4_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+def ldmatrix_m8n8x4_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
     """Issue `ldmatrix.sync.aligned.m8n8.x4.shared.b16` from a shared-memory byte address."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
@@ -839,7 +861,9 @@ def ld_shared_u8_offset(
 
 
 @dsl_user_op
-def ldmatrix_m8n8x2_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def ldmatrix_m8n8x2_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Issue `ldmatrix.sync.aligned.m8n8.x2.shared.b16` from a shared-memory byte address."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -858,7 +882,9 @@ def ldmatrix_m8n8x2_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32,
 
 
 @dsl_user_op
-def ldmatrix_m8n8x4_left_half_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def ldmatrix_m8n8x4_left_half_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Issue `ldmatrix.sync.aligned.m8n8.x4.shared.b16` and return the left half fragment pair."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -877,7 +903,9 @@ def ldmatrix_m8n8x4_left_half_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tup
 
 
 @dsl_user_op
-def ldmatrix_m8n8x4_right_half_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def ldmatrix_m8n8x4_right_half_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Issue `ldmatrix.sync.aligned.m8n8.x4.shared.b16` and return the right half fragment pair."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -919,7 +947,9 @@ def ldmatrix_m8n8x4_trans_b16(
 
 
 @dsl_user_op
-def ldmatrix_m8n8x4_trans_left_half_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def ldmatrix_m8n8x4_trans_left_half_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Issue transposed `ldmatrix` and return the left half fragment pair."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -938,7 +968,9 @@ def ldmatrix_m8n8x4_trans_left_half_b16(smem_addr: Int32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
-def ldmatrix_m8n8x4_trans_right_half_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def ldmatrix_m8n8x4_trans_right_half_b16(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Issue transposed `ldmatrix` and return the right half fragment pair."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -957,7 +989,9 @@ def ldmatrix_m8n8x4_trans_right_half_b16(smem_addr: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
-def ld_shared_v4_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+def ld_shared_v4_u32(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
     """Load 128 bits (4 x uint32) from shared memory. smem_addr is a u32 shared-memory address."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
@@ -1215,7 +1249,9 @@ def quantize_scaled_store_shared_v2_e4m3(
 
 
 @dsl_user_op
-def cp_async_u32_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+def cp_async_u32_shared_global(
+    smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None
+):
     """4-byte `cp.async.ca.shared.global` copy."""
     llvm.inline_asm(
         None,
@@ -1234,7 +1270,9 @@ def cp_async_u32_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, 
 
 
 @dsl_user_op
-def cp_async_u64_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+def cp_async_u64_shared_global(
+    smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None
+):
     """8-byte `cp.async.ca.shared.global` copy."""
     llvm.inline_asm(
         None,
@@ -1356,8 +1394,7 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
             Int64(addr).ir_value(loc=loc, ip=ip),
             Int32(val).ir_value(loc=loc, ip=ip),
         ],
-        "fence.acq_rel.gpu;\n"
-        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "fence.acq_rel.gpu;\nred.relaxed.gpu.global.add.s32 [$0], $1;",
         "l,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -1464,7 +1501,9 @@ def red_max_global_f32_nonnegative(addr: Int64, val: Float32, *, loc=None, ip=No
 
 
 @dsl_user_op
-def atomic_cas_global_i32(addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
+def atomic_cas_global_i32(
+    addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None
+) -> Int32:
     """Global memory int32 atomic compare-and-swap. Returns old value."""
     return Int32(
         llvm.inline_asm(
@@ -1741,7 +1780,6 @@ def ld_shared_v4_f32(
     r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
     return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
-
 
 
 @dsl_user_op
@@ -2055,7 +2093,9 @@ def scatter_add_bf16(addr: Int64, val_f32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def scatter_add_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
+def scatter_add_v4_bf16x2(
+    addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None
+):
     """Vectorized BF16x2 atomic reduction: 8 bf16 values (16 bytes) in one go.
 
     red.global.add.noftz.v4.bf16x2 [addr], {packed0, packed1, packed2, packed3}
@@ -2065,10 +2105,14 @@ def scatter_add_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=No
         None,
         [
             Int64(addr).ir_value(loc=loc, ip=ip),
-            v0.ir_value(loc=loc, ip=ip), v1.ir_value(loc=loc, ip=ip),
-            v2.ir_value(loc=loc, ip=ip), v3.ir_value(loc=loc, ip=ip),
-            v4.ir_value(loc=loc, ip=ip), v5.ir_value(loc=loc, ip=ip),
-            v6.ir_value(loc=loc, ip=ip), v7.ir_value(loc=loc, ip=ip),
+            v0.ir_value(loc=loc, ip=ip),
+            v1.ir_value(loc=loc, ip=ip),
+            v2.ir_value(loc=loc, ip=ip),
+            v3.ir_value(loc=loc, ip=ip),
+            v4.ir_value(loc=loc, ip=ip),
+            v5.ir_value(loc=loc, ip=ip),
+            v6.ir_value(loc=loc, ip=ip),
+            v7.ir_value(loc=loc, ip=ip),
         ],
         "{ .reg .b32 p0,p1,p2,p3;"
         " cvt.rn.satfinite.bf16x2.f32 p0, $2, $1;"
@@ -2371,7 +2415,10 @@ def pack_f32x2_to_bfloat2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uin
     return Uint32(
         llvm.inline_asm(
             T.i32(),
-            [Float32(x0).ir_value(loc=loc, ip=ip), Float32(x1).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(x0).ir_value(loc=loc, ip=ip),
+                Float32(x1).ir_value(loc=loc, ip=ip),
+            ],
             "cvt.rn.satfinite.bf16x2.f32 $0, $2, $1;",
             "=r,f,f",
             has_side_effects=False,
@@ -2448,7 +2495,9 @@ def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+def fp8x4_e4m3_to_bfloat2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
     """Widen 4 packed E4M3 bytes into 2 packed bf16x2 registers exactly."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -3650,7 +3699,9 @@ def cvt_f32x4_to_e4m3x4(
 
 
 @dsl_user_op
-def nvfp4_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc=None, ip=None) -> Float32:
+def nvfp4_scale_from_amax(
+    block_amax: Float32, global_scale: Float32, *, loc=None, ip=None
+) -> Float32:
     """Compute block_amax * reciprocal_global_scale / 6 with CUDA tensor-scalar semantics."""
     return Float32(
         llvm.inline_asm(
@@ -3793,9 +3844,7 @@ def cvt_e4m3x2_to_f16x2_pair(
 
 
 @dsl_user_op
-def f16x2_to_f32x2(
-    packed_h2: Uint32, *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
+def f16x2_to_f32x2(packed_h2: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     """Unpack f16x2 (u32) to two f32 values."""
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(f32, f32)>"),
@@ -3833,9 +3882,7 @@ def cvt_e4m3x4_to_f32x4(
 
 
 @dsl_user_op
-def cvt_e4m3_to_f32_via_f16(
-    fp8_val: Uint32, *, loc=None, ip=None
-) -> Float32:
+def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert single E4M3 byte to f32 via hw-native cvt.rn.f16x2.e4m3x2."""
     return Float32(
         llvm.inline_asm(
@@ -4147,9 +4194,7 @@ def e2m1x8_to_qmma_e2m1x8(
 
 
 @dsl_user_op
-def e2m1x8_to_e4m3x8(
-    packed_u32: Uint32, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
+def e2m1x8_to_e4m3x8(packed_u32: Uint32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
     """Expand 8 packed E2M1 nibbles into 8 E4M3 bytes, losslessly.
 
     Every E2M1 value is exactly representable in E4M3, so this is a pure
@@ -4294,20 +4339,30 @@ def quant_dequant_2(
 
 @dsl_user_op
 def hfma2_4(
-    w0: Uint32, x0: Uint32,
-    w1: Uint32, x1: Uint32,
-    w2: Uint32, x2: Uint32,
-    w3: Uint32, x3: Uint32,
-    *, loc=None, ip=None
+    w0: Uint32,
+    x0: Uint32,
+    w1: Uint32,
+    x1: Uint32,
+    w2: Uint32,
+    x2: Uint32,
+    w3: Uint32,
+    x3: Uint32,
+    *,
+    loc=None,
+    ip=None,
 ) -> Tuple[Float32, Float32]:
     """4-element half2 FMA dot product returning (lo, hi) f32."""
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(f32, f32)>"),
         [
-            Uint32(w0).ir_value(loc=loc, ip=ip), Uint32(x0).ir_value(loc=loc, ip=ip),
-            Uint32(w1).ir_value(loc=loc, ip=ip), Uint32(x1).ir_value(loc=loc, ip=ip),
-            Uint32(w2).ir_value(loc=loc, ip=ip), Uint32(x2).ir_value(loc=loc, ip=ip),
-            Uint32(w3).ir_value(loc=loc, ip=ip), Uint32(x3).ir_value(loc=loc, ip=ip),
+            Uint32(w0).ir_value(loc=loc, ip=ip),
+            Uint32(x0).ir_value(loc=loc, ip=ip),
+            Uint32(w1).ir_value(loc=loc, ip=ip),
+            Uint32(x1).ir_value(loc=loc, ip=ip),
+            Uint32(w2).ir_value(loc=loc, ip=ip),
+            Uint32(x2).ir_value(loc=loc, ip=ip),
+            Uint32(w3).ir_value(loc=loc, ip=ip),
+            Uint32(x3).ir_value(loc=loc, ip=ip),
         ],
         """
         {
@@ -4338,21 +4393,31 @@ def hfma2_4(
 
 @dsl_user_op
 def hfma2_4_sum(
-    w0: Uint32, x0: Uint32,
-    w1: Uint32, x1: Uint32,
-    w2: Uint32, x2: Uint32,
-    w3: Uint32, x3: Uint32,
-    *, loc=None, ip=None
+    w0: Uint32,
+    x0: Uint32,
+    w1: Uint32,
+    x1: Uint32,
+    w2: Uint32,
+    x2: Uint32,
+    w3: Uint32,
+    x3: Uint32,
+    *,
+    loc=None,
+    ip=None,
 ) -> Float32:
     """4-element half2 FMA dot product returning lane sum."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [
-                Uint32(w0).ir_value(loc=loc, ip=ip), Uint32(x0).ir_value(loc=loc, ip=ip),
-                Uint32(w1).ir_value(loc=loc, ip=ip), Uint32(x1).ir_value(loc=loc, ip=ip),
-                Uint32(w2).ir_value(loc=loc, ip=ip), Uint32(x2).ir_value(loc=loc, ip=ip),
-                Uint32(w3).ir_value(loc=loc, ip=ip), Uint32(x3).ir_value(loc=loc, ip=ip),
+                Uint32(w0).ir_value(loc=loc, ip=ip),
+                Uint32(x0).ir_value(loc=loc, ip=ip),
+                Uint32(w1).ir_value(loc=loc, ip=ip),
+                Uint32(x1).ir_value(loc=loc, ip=ip),
+                Uint32(w2).ir_value(loc=loc, ip=ip),
+                Uint32(x2).ir_value(loc=loc, ip=ip),
+                Uint32(w3).ir_value(loc=loc, ip=ip),
+                Uint32(x3).ir_value(loc=loc, ip=ip),
             ],
             """
             {
@@ -4382,28 +4447,46 @@ def hfma2_4_sum(
 
 @dsl_user_op
 def hfma2_8(
-    w0: Uint32, x0: Uint32,
-    w1: Uint32, x1: Uint32,
-    w2: Uint32, x2: Uint32,
-    w3: Uint32, x3: Uint32,
-    w4: Uint32, x4: Uint32,
-    w5: Uint32, x5: Uint32,
-    w6: Uint32, x6: Uint32,
-    w7: Uint32, x7: Uint32,
-    *, loc=None, ip=None
+    w0: Uint32,
+    x0: Uint32,
+    w1: Uint32,
+    x1: Uint32,
+    w2: Uint32,
+    x2: Uint32,
+    w3: Uint32,
+    x3: Uint32,
+    w4: Uint32,
+    x4: Uint32,
+    w5: Uint32,
+    x5: Uint32,
+    w6: Uint32,
+    x6: Uint32,
+    w7: Uint32,
+    x7: Uint32,
+    *,
+    loc=None,
+    ip=None,
 ) -> Tuple[Float32, Float32]:
     """8-element half2 FMA dot product returning (lo, hi) f32."""
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(f32, f32)>"),
         [
-            Uint32(w0).ir_value(loc=loc, ip=ip), Uint32(x0).ir_value(loc=loc, ip=ip),
-            Uint32(w1).ir_value(loc=loc, ip=ip), Uint32(x1).ir_value(loc=loc, ip=ip),
-            Uint32(w2).ir_value(loc=loc, ip=ip), Uint32(x2).ir_value(loc=loc, ip=ip),
-            Uint32(w3).ir_value(loc=loc, ip=ip), Uint32(x3).ir_value(loc=loc, ip=ip),
-            Uint32(w4).ir_value(loc=loc, ip=ip), Uint32(x4).ir_value(loc=loc, ip=ip),
-            Uint32(w5).ir_value(loc=loc, ip=ip), Uint32(x5).ir_value(loc=loc, ip=ip),
-            Uint32(w6).ir_value(loc=loc, ip=ip), Uint32(x6).ir_value(loc=loc, ip=ip),
-            Uint32(w7).ir_value(loc=loc, ip=ip), Uint32(x7).ir_value(loc=loc, ip=ip),
+            Uint32(w0).ir_value(loc=loc, ip=ip),
+            Uint32(x0).ir_value(loc=loc, ip=ip),
+            Uint32(w1).ir_value(loc=loc, ip=ip),
+            Uint32(x1).ir_value(loc=loc, ip=ip),
+            Uint32(w2).ir_value(loc=loc, ip=ip),
+            Uint32(x2).ir_value(loc=loc, ip=ip),
+            Uint32(w3).ir_value(loc=loc, ip=ip),
+            Uint32(x3).ir_value(loc=loc, ip=ip),
+            Uint32(w4).ir_value(loc=loc, ip=ip),
+            Uint32(x4).ir_value(loc=loc, ip=ip),
+            Uint32(w5).ir_value(loc=loc, ip=ip),
+            Uint32(x5).ir_value(loc=loc, ip=ip),
+            Uint32(w6).ir_value(loc=loc, ip=ip),
+            Uint32(x6).ir_value(loc=loc, ip=ip),
+            Uint32(w7).ir_value(loc=loc, ip=ip),
+            Uint32(x7).ir_value(loc=loc, ip=ip),
         ],
         """
         {
@@ -4438,29 +4521,47 @@ def hfma2_8(
 
 @dsl_user_op
 def hfma2_8_sum(
-    w0: Uint32, x0: Uint32,
-    w1: Uint32, x1: Uint32,
-    w2: Uint32, x2: Uint32,
-    w3: Uint32, x3: Uint32,
-    w4: Uint32, x4: Uint32,
-    w5: Uint32, x5: Uint32,
-    w6: Uint32, x6: Uint32,
-    w7: Uint32, x7: Uint32,
-    *, loc=None, ip=None
+    w0: Uint32,
+    x0: Uint32,
+    w1: Uint32,
+    x1: Uint32,
+    w2: Uint32,
+    x2: Uint32,
+    w3: Uint32,
+    x3: Uint32,
+    w4: Uint32,
+    x4: Uint32,
+    w5: Uint32,
+    x5: Uint32,
+    w6: Uint32,
+    x6: Uint32,
+    w7: Uint32,
+    x7: Uint32,
+    *,
+    loc=None,
+    ip=None,
 ) -> Float32:
     """8-element half2 FMA dot product returning lane sum."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [
-                Uint32(w0).ir_value(loc=loc, ip=ip), Uint32(x0).ir_value(loc=loc, ip=ip),
-                Uint32(w1).ir_value(loc=loc, ip=ip), Uint32(x1).ir_value(loc=loc, ip=ip),
-                Uint32(w2).ir_value(loc=loc, ip=ip), Uint32(x2).ir_value(loc=loc, ip=ip),
-                Uint32(w3).ir_value(loc=loc, ip=ip), Uint32(x3).ir_value(loc=loc, ip=ip),
-                Uint32(w4).ir_value(loc=loc, ip=ip), Uint32(x4).ir_value(loc=loc, ip=ip),
-                Uint32(w5).ir_value(loc=loc, ip=ip), Uint32(x5).ir_value(loc=loc, ip=ip),
-                Uint32(w6).ir_value(loc=loc, ip=ip), Uint32(x6).ir_value(loc=loc, ip=ip),
-                Uint32(w7).ir_value(loc=loc, ip=ip), Uint32(x7).ir_value(loc=loc, ip=ip),
+                Uint32(w0).ir_value(loc=loc, ip=ip),
+                Uint32(x0).ir_value(loc=loc, ip=ip),
+                Uint32(w1).ir_value(loc=loc, ip=ip),
+                Uint32(x1).ir_value(loc=loc, ip=ip),
+                Uint32(w2).ir_value(loc=loc, ip=ip),
+                Uint32(x2).ir_value(loc=loc, ip=ip),
+                Uint32(w3).ir_value(loc=loc, ip=ip),
+                Uint32(x3).ir_value(loc=loc, ip=ip),
+                Uint32(w4).ir_value(loc=loc, ip=ip),
+                Uint32(x4).ir_value(loc=loc, ip=ip),
+                Uint32(w5).ir_value(loc=loc, ip=ip),
+                Uint32(x5).ir_value(loc=loc, ip=ip),
+                Uint32(w6).ir_value(loc=loc, ip=ip),
+                Uint32(x6).ir_value(loc=loc, ip=ip),
+                Uint32(w7).ir_value(loc=loc, ip=ip),
+                Uint32(x7).ir_value(loc=loc, ip=ip),
             ],
             """
             {
@@ -4796,9 +4897,7 @@ def fp4_dot8_sum_f32acc(
 
 
 @dsl_user_op
-def pack_f32x2_to_f16x2(
-    a: Float32, b: Float32, *, loc=None, ip=None
-) -> Uint32:
+def pack_f32x2_to_f16x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
     """Pack two f32 values into one f16x2 u32."""
     return Uint32(
         llvm.inline_asm(
@@ -5325,7 +5424,9 @@ def quantize_and_pack_16_fast(y_f32: cute.Tensor, inv_scale: Float32) -> Uint64:
 
 @cute.jit
 def quantize_block_fp4(
-    values: cute.Tensor, max_abs: Float32, global_scale_val: Float32,
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, cutlass.Uint8]:
     """Quantize 16 float32 values to packed FP4 + e4m3 scale byte.
 
@@ -5346,7 +5447,9 @@ def quantize_block_fp4(
 
 @cute.jit
 def quantize_block_fp4_fast(
-    values: cute.Tensor, max_abs: Float32, global_scale_val: Float32,
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, cutlass.Uint8]:
     """Fast approximate FP4 block quantization using reciprocal/vector path."""
     scale_u32 = Uint32(0)
@@ -5360,7 +5463,9 @@ def quantize_block_fp4_fast(
         scale_byte = cutlass.Uint8(scale_u32 & Uint32(0xFF))
         inv_quantized_scale = fp8_e4m3_to_f32_and_rcp(scale_u32)
         if inv_quantized_scale != Float32(0.0):
-            packed64 = quantize_and_pack_16_fast(values, inv_quantized_scale * global_scale_val)
+            packed64 = quantize_and_pack_16_fast(
+                values, inv_quantized_scale * global_scale_val
+            )
     return packed64, scale_byte
 
 
@@ -5375,7 +5480,8 @@ def max_abs_16(values: cute.Tensor) -> Float32:
 
 @cute.jit
 def silu_mul_16(
-    gate: cute.Tensor, up: cute.Tensor,
+    gate: cute.Tensor,
+    up: cute.Tensor,
 ) -> cute.Tensor:
     """Fused SiLU(gate) * up for 16 float32 element pairs.
 
@@ -5394,7 +5500,9 @@ def silu_mul_16(
 
 @cute.jit
 def silu_mul_quantize_block_fp4(
-    gate: cute.Tensor, up: cute.Tensor, global_scale_val: Float32,
+    gate: cute.Tensor,
+    up: cute.Tensor,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, cutlass.Uint8]:
     """Fused SiLU(gate)*up + FP4 quantize for 16 element pairs.
 
@@ -5418,7 +5526,8 @@ def relu2_16(x: cute.Tensor) -> cute.Tensor:
 
 @cute.jit
 def relu2_quantize_block_fp4(
-    x: cute.Tensor, global_scale_val: Float32,
+    x: cute.Tensor,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, cutlass.Uint8]:
     """Fuse ReLU^2 and FP4 quantization for 16 float32 values."""
     activated = relu2_16(x)
@@ -5442,7 +5551,8 @@ def max_abs_32(values: cute.Tensor) -> Float32:
 
 @cute.jit
 def quantize_block_fp8_mx(
-    values: cute.Tensor, max_abs: Float32,
+    values: cute.Tensor,
+    max_abs: Float32,
 ) -> Tuple[cute.Tensor, Uint32]:
     """Quantize 32 float32 values to E4M3 payload bytes + UE8M0 scale byte.
 
@@ -5470,7 +5580,8 @@ def quantize_block_fp8_mx(
 
 @cute.jit
 def silu_mul_32(
-    gate: cute.Tensor, up: cute.Tensor,
+    gate: cute.Tensor,
+    up: cute.Tensor,
 ) -> cute.Tensor:
     """Fused SiLU(gate) * up for 32 float32 element pairs."""
     out = cute.make_rmem_tensor((32,), Float32)
@@ -5485,7 +5596,8 @@ def silu_mul_32(
 
 @cute.jit
 def silu_mul_quantize_block_fp8_mx(
-    gate: cute.Tensor, up: cute.Tensor,
+    gate: cute.Tensor,
+    up: cute.Tensor,
 ) -> Tuple[cute.Tensor, Uint32]:
     """Fused SiLU(gate)*up + MXFP8 quantize for 32 element pairs."""
     activated = silu_mul_32(gate, up)
@@ -5528,7 +5640,10 @@ def mx_scale_from_amax32(amax: Float32) -> Tuple[Float32, Float32]:
 
 @cute.jit
 def quant_dequant_e4m3_2(
-    v0: Float32, v1: Float32, inv_scale: Float32, scale: Float32,
+    v0: Float32,
+    v1: Float32,
+    inv_scale: Float32,
+    scale: Float32,
 ) -> Tuple[Float32, Float32]:
     """Quantize-dequantize a pair through E4M3 with a power-of-two block scale.
 

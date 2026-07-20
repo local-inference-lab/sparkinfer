@@ -20,7 +20,7 @@ def repack_w4a8_weights(
     lane-major layouts consumed by :class:`MoEDynamicKernelBackend`.
 
     This is a representation transform, not a standalone GEMM contract.  The
-    CUDA preparation path in :mod:`sparkinfer.integration.tp_moe` performs the same
+    CUDA preparation path in :mod:`sparkinfer.moe.fused_moe._impl` performs the same
     permutation in-place so serving can reuse checkpoint storage.
     """
 

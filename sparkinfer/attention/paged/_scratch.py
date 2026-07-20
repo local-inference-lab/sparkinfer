@@ -3,7 +3,7 @@
 Eager PLAN -> BIND -> KERNEL. The scratch plan owns only shape/capacity policy
 and tiny shape-only planning tensors. Each bind maps caller-owned uint8 scratch
 into plain tensor views, prepares/copies metadata into those views, and returns
-a binding consumed by ``sparkinfer.attention.paged.api.paged_attention_forward``.
+a binding consumed by ``sparkinfer.attention.paged._forward.paged_attention_forward``.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from sparkinfer.attention.paged.planner import (
     infer_paged_mode,
     resolve_decode_graph_ctas_per_sm,
 )
-from sparkinfer.integration.scratch import (
-    SPARKINFERScratchBufferSpec,
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-from sparkinfer.integration.scratch_layout import (
+from sparkinfer._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
@@ -116,18 +116,26 @@ class SPARKINFERPagedAttentionScratchCaps:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "msa_block_sparse", bool(self.msa_block_sparse))
-        if self.msa_block_sparse and os.environ.get("SPARKINFER_PAGED_MSA") == "0":
-            raise RuntimeError("SPARKINFER_PAGED_MSA=0 disables MSA block-sparse paged attention")
+        if (
+            self.msa_block_sparse
+            and os.environ.get("SPARKINFER_PAGED_MSA") == "0"
+        ):
+            raise RuntimeError(
+                "SPARKINFER_PAGED_MSA=0 disables MSA block-sparse paged attention"
+            )
         if self.msa_union_tile is None:
             msa_union_tile = (
                 self.msa_block_sparse
                 and self.mode == "extend"
-                and os.environ.get("SPARKINFER_PAGED_MSA_UNION_PREFILL", "1") != "0"
+                and os.environ.get("SPARKINFER_PAGED_MSA_UNION_PREFILL", "1")
+                != "0"
             )
         else:
             msa_union_tile = bool(self.msa_union_tile)
         if msa_union_tile and not (self.msa_block_sparse and self.mode == "extend"):
-            raise ValueError("msa_union_tile requires mode='extend' and msa_block_sparse=True")
+            raise ValueError(
+                "msa_union_tile requires mode='extend' and msa_block_sparse=True"
+            )
         object.__setattr__(self, "msa_union_tile", msa_union_tile)
         object.__setattr__(self, "device", _canonical_device(self.device))
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
@@ -485,7 +493,7 @@ class SPARKINFERPagedAttentionScratch:
                         "decode graph replay scratch was prepared with "
                         f"window_left={self._plan.window_left}, got "
                         f"window_left={int(window_left)}"
-                )
+                    )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 if self._plan_metadata_cache is None:
                     raise RuntimeError(
@@ -704,7 +712,9 @@ class SPARKINFERPagedAttentionScratch:
             return
 
         page_table_i32 = (
-            page_table if page_table.dtype == torch.int32 else page_table.to(torch.int32)
+            page_table
+            if page_table.dtype == torch.int32
+            else page_table.to(torch.int32)
         )
         cache_seqlens_i32 = (
             cache_seqlens
@@ -841,9 +851,7 @@ class SPARKINFERPagedAttentionScratch:
         if self.block_valid_mask is None:
             raise RuntimeError("decode graph scratch is missing block_valid_mask")
         if self.kv_window_start_tokens is None:
-            raise RuntimeError(
-                "decode graph scratch is missing kv_window_start_tokens"
-            )
+            raise RuntimeError("decode graph scratch is missing kv_window_start_tokens")
         if self._plan is None:
             raise RuntimeError("decode graph scratch has not been prepared")
 
@@ -892,9 +900,7 @@ class SPARKINFERPagedAttentionScratch:
                 raise RuntimeError(
                     "decode graph cu_seqlens_q is smaller than the graph batch"
                 )
-            self.total_num_rows_ptr[:1].copy_(
-                self.cu_seqlens_q[batch : batch + 1]
-            )
+            self.total_num_rows_ptr[:1].copy_(self.cu_seqlens_q[batch : batch + 1])
         elif self._use_regular_decode_graph_replay:
             from sparkinfer.attention.paged.graph_replay import (
                 update_regular_decode_graph_chunk_metadata_from_lut,
@@ -912,7 +918,9 @@ class SPARKINFERPagedAttentionScratch:
                 window_left=int(self._plan.window_left),
             )
         else:
-            from sparkinfer.attention.paged.graph_replay import update_decode_graph_chunk_metadata
+            from sparkinfer.attention.paged.graph_replay import (
+                update_decode_graph_chunk_metadata,
+            )
 
             update_decode_graph_chunk_metadata(
                 cache_seqlens=self.cache_seqlens,
@@ -949,7 +957,9 @@ class SPARKINFERPagedAttentionScratch:
         ):
             raise ValueError("paged scratch inputs must stay on the scratch device")
         if q.dtype != self.dtype:
-            raise TypeError(f"paged scratch expects q dtype {self.dtype}, got {q.dtype}")
+            raise TypeError(
+                f"paged scratch expects q dtype {self.dtype}, got {q.dtype}"
+            )
         if k_cache.dtype != self.kv_dtype or v_cache.dtype != self.kv_dtype:
             raise TypeError(
                 "paged scratch expects kv dtype "
@@ -987,7 +997,9 @@ class SPARKINFERPagedAttentionScratch:
             self.q2k_indices = None
             return
         if os.environ.get("SPARKINFER_PAGED_MSA") == "0":
-            raise RuntimeError("SPARKINFER_PAGED_MSA=0 disables MSA block-sparse paged attention")
+            raise RuntimeError(
+                "SPARKINFER_PAGED_MSA=0 disables MSA block-sparse paged attention"
+            )
         if q2k_indices is None:
             raise ValueError("MSA block-sparse paged attention requires q2k_indices")
         if q2k_indices.device != self.device:
@@ -995,10 +1007,15 @@ class SPARKINFERPagedAttentionScratch:
         if q2k_indices.dtype != torch.int32:
             raise TypeError("q2k_indices must be a torch.int32 tensor")
         if q2k_indices.ndim != 3:
-            raise ValueError("q2k_indices must have shape [kv_heads, total_q_capacity, 16]")
+            raise ValueError(
+                "q2k_indices must have shape [kv_heads, total_q_capacity, 16]"
+            )
         if not q2k_indices.is_contiguous():
             raise ValueError("q2k_indices must be contiguous")
-        if int(q2k_indices.shape[0]) != self.num_kv_heads or int(q2k_indices.shape[2]) != 16:
+        if (
+            int(q2k_indices.shape[0]) != self.num_kv_heads
+            or int(q2k_indices.shape[2]) != 16
+        ):
             raise ValueError(
                 "q2k_indices must have shape "
                 f"({self.num_kv_heads}, >=total_q_capacity, 16), got {tuple(q2k_indices.shape)}"
@@ -1032,7 +1049,9 @@ class SPARKINFERPagedAttentionBinding:
     relative_attention_bias: torch.Tensor | None = None
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
-        from sparkinfer.attention.paged.api import paged_attention_forward
+        from sparkinfer.attention.paged._forward import (
+            paged_attention_forward,
+        )
 
         return paged_attention_forward(binding=self)
 
@@ -1355,7 +1374,7 @@ def _materialize_paged_attention_scratch(
 class SPARKINFERPagedAttentionScratchPlan:
     caps: SPARKINFERPagedAttentionScratchCaps
     layout: _SPARKINFERPagedAttentionScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
     _plan_q: torch.Tensor
     _plan_output: torch.Tensor
     _plan_k_cache: torch.Tensor
@@ -1368,7 +1387,7 @@ class SPARKINFERPagedAttentionScratchPlan:
     _use_regular_decode_graph_replay: bool = False
     _q2k_indices_data_ptr: int | None = None
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -1487,9 +1506,7 @@ class SPARKINFERPagedAttentionScratchPlan:
                 "paged scratch plans"
             )
         if self.caps.mode == "decode":
-            raise RuntimeError(
-                "decode plans require prepare_decode_graph_replay_state"
-            )
+            raise RuntimeError("decode plans require prepare_decode_graph_replay_state")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "prepare_graph_replay_state must be called before CUDA graph capture"
@@ -1503,9 +1520,8 @@ class SPARKINFERPagedAttentionScratchPlan:
         else:
             active_total_q = int(active_total_q)
         inferred_mode = _infer_mode_from_host_total(cu_seqlens_q, active_total_q)
-        if (
-            inferred_mode != self.caps.mode
-            and not (self.caps.mode == "verify" and inferred_mode == "extend")
+        if inferred_mode != self.caps.mode and not (
+            self.caps.mode == "verify" and inferred_mode == "extend"
         ):
             raise ValueError(
                 f"scratch mode {self.caps.mode} does not match prepared mode "
@@ -1585,15 +1601,21 @@ class SPARKINFERPagedAttentionScratchPlan:
 
         if self.caps.msa_block_sparse:
             if window_left != -1:
-                raise ValueError("MSA block-sparse decode graph replay does not support window_left/SWA")
+                raise ValueError(
+                    "MSA block-sparse decode graph replay does not support window_left/SWA"
+                )
             if self.caps.page_size not in (64, 128):
                 raise ValueError(
                     "MSA block-sparse decode graph replay requires page_size=64 or page_size=128"
                 )
             if self.caps.head_dim_qk != 128 or self.caps.head_dim_vo != 128:
-                raise ValueError("MSA block-sparse decode graph replay requires head_dim_qk=head_dim_vo=128")
+                raise ValueError(
+                    "MSA block-sparse decode graph replay requires head_dim_qk=head_dim_vo=128"
+                )
             if self.caps.num_q_heads // self.caps.num_kv_heads != 16:
-                raise ValueError("MSA block-sparse decode graph replay requires gqa_group_size=16")
+                raise ValueError(
+                    "MSA block-sparse decode graph replay requires gqa_group_size=16"
+                )
             max_page_ids = torch.arange(
                 max_page_table_width, dtype=torch.int32, device=self.caps.device
             )
@@ -1640,8 +1662,7 @@ class SPARKINFERPagedAttentionScratchPlan:
                 (1,), dtype=torch.int32, device=self.caps.device
             )
             self._decode_graph_max_chunks_per_req = max(
-                int(plan.o_indptr[idx + 1] - plan.o_indptr[idx])
-                for idx in range(batch)
+                int(plan.o_indptr[idx + 1] - plan.o_indptr[idx]) for idx in range(batch)
             )
             self._use_regular_decode_graph_replay = False
             return self
@@ -1738,10 +1759,9 @@ class SPARKINFERPagedAttentionScratchPlan:
             device=self.caps.device,
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
-        self._use_regular_decode_graph_replay = (
-            int(plan.gqa_group_size) <= int(plan.cta_tile_q)
-            and self._plan_has_regular_decode_graph_grid(plan)
-        )
+        self._use_regular_decode_graph_replay = int(plan.gqa_group_size) <= int(
+            plan.cta_tile_q
+        ) and self._plan_has_regular_decode_graph_grid(plan)
         return self
 
     def bind(

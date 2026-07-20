@@ -16,7 +16,7 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     e2m1x8_to_qmma_e2m1x8,
@@ -49,9 +49,7 @@ class W4A8MaterializedPhase2Kernel:
     a_scale_bytes = tile_m * 4
     a_stage_bytes = a_payload_bytes + a_scale_bytes
     a_storage_bytes = stages * a_stage_bytes
-    b_storage_offset = (
-        (a_storage_bytes + 1023) // 1024
-    ) * 1024
+    b_storage_offset = ((a_storage_bytes + 1023) // 1024) * 1024
     b_stage_bytes = tile_n * tile_k // 2
     b_storage_bytes = stages * b_stage_bytes
     sfb_storage_offset = b_storage_offset + b_storage_bytes
@@ -137,9 +135,7 @@ class W4A8MaterializedPhase2Kernel:
         a_base = smem_base + stage * Int32(self.a_stage_bytes)
         sfa_base = a_base + Int32(self.a_payload_bytes)
         b_base = (
-            smem_base
-            + Int32(self.b_storage_offset)
-            + stage * Int32(self.b_stage_bytes)
+            smem_base + Int32(self.b_storage_offset) + stage * Int32(self.b_stage_bytes)
         )
         sfb_base = (
             smem_base
@@ -148,16 +144,14 @@ class W4A8MaterializedPhase2Kernel:
         )
 
         words_per_row = intermediate_tiles * Int32(32)
-        physical_row_base = (
-            source_m_tile * Int32(self.source_tile_m)
-            + m_half * Int32(self.tile_m)
+        physical_row_base = source_m_tile * Int32(self.source_tile_m) + m_half * Int32(
+            self.tile_m
         )
 
         # A payload: 64 rows x eight 16-byte vectors.  Materialization is
         # row-major; shared memory XORs vectors by row to match QMMA loads.
         for i in cutlass.range_constexpr(
-            (self.tile_m * 8 + self.threads_per_cta - 1)
-            // self.threads_per_cta
+            (self.tile_m * 8 + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
             if idx < Int32(self.tile_m * 8):
@@ -170,9 +164,7 @@ class W4A8MaterializedPhase2Kernel:
                     + (vec << Int32(2))
                 )
                 cp_async4_shared_global(
-                    a_base
-                    + row * Int32(self.tile_k)
-                    + (physical_vec << Int32(4)),
+                    a_base + row * Int32(self.tile_k) + (physical_vec << Int32(4)),
                     get_ptr_as_int64(intermediate_u32, src_word),
                 )
 
@@ -194,14 +186,11 @@ class W4A8MaterializedPhase2Kernel:
         packed_tile = output_tile >> Int32(1)
         packed_half = output_tile & Int32(1)
         b_tile = (
-            (expert_idx * packed_output_tiles + packed_tile)
-            * intermediate_tiles
-            + intermediate_slice
-        )
+            expert_idx * packed_output_tiles + packed_tile
+        ) * intermediate_tiles + intermediate_slice
         b_word_base = Int64(b_tile) * Int64(4096)
         for i in cutlass.range_constexpr(
-            (4 * 4 * 32 + self.threads_per_cta - 1)
-            // self.threads_per_cta
+            (4 * 4 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
             if idx < Int32(4 * 4 * 32):
@@ -212,9 +201,7 @@ class W4A8MaterializedPhase2Kernel:
                 src_word = (
                     b_word_base
                     + Int64(kb * 8 * 32 * 4)
-                    + Int64(
-                        (packed_half * Int32(4) + chunk) * Int32(32 * 4)
-                    )
+                    + Int64((packed_half * Int32(4) + chunk) * Int32(32 * 4))
                     + Int64(lane * Int32(4))
                 )
                 cp_async4_shared_global(
@@ -225,15 +212,11 @@ class W4A8MaterializedPhase2Kernel:
         # The N128 half contains 16 n8 scale rows, eight u32 words each.
         sfb_word_base = Int64(b_tile) * Int64(256)
         for i in cutlass.range_constexpr(
-            ((16 * 8) // 4 + self.threads_per_cta - 1)
-            // self.threads_per_cta
+            ((16 * 8) // 4 + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
             if idx < Int32((16 * 8) // 4):
-                src_word = (
-                    sfb_word_base
-                    + Int64(packed_half * Int32(16 * 8) + idx * 4)
-                )
+                src_word = sfb_word_base + Int64(packed_half * Int32(16 * 8) + idx * 4)
                 cp_async4_shared_global(
                     sfb_base + (idx << Int32(4)),
                     get_ptr_as_int64(down_sfb_rp, src_word),
@@ -286,10 +269,7 @@ class W4A8MaterializedPhase2Kernel:
         # Each of four warps owns M64xN32: four M16 blocks by four N8
         # fragments.  This is 64 FP32 accumulator registers per thread.
         facc = tuple(
-            tuple(
-                cute.make_rmem_tensor((4,), cutlass.Float32)
-                for _nt in range(4)
-            )
+            tuple(cute.make_rmem_tensor((4,), cutlass.Float32) for _nt in range(4))
             for _blk in range(4)
         )
         for blk in cutlass.range_constexpr(4):
@@ -336,9 +316,7 @@ class W4A8MaterializedPhase2Kernel:
 
             asc = cute.make_rmem_tensor((4,), Uint32)
             for blk in cutlass.range_constexpr(4):
-                sf_row = Int32(blk * 16) + q + (
-                    (lane & Int32(1)) << Int32(3)
-                )
+                sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
                 asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
 
             for kb in cutlass.range_constexpr(4):
@@ -353,9 +331,7 @@ class W4A8MaterializedPhase2Kernel:
                         + ((c & Int32(1)) << Int32(3))
                     )
                     a0, a2 = ld_shared_v2_u32(a_lo)
-                    a1, a3 = ld_shared_v2_u32(
-                        a_lo + Int32(8 * self.tile_k)
-                    )
+                    a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * self.tile_k))
                     a_frag[blk, 0] = a0
                     a_frag[blk, 1] = a1
                     a_frag[blk, 2] = a2
@@ -363,8 +339,7 @@ class W4A8MaterializedPhase2Kernel:
 
                 w0, w1, w2, w3 = ld_shared_v4_u32(
                     b_base
-                    + (((Int32(kb * 4) + warp_idx) * Int32(32) + lane)
-                       << Int32(4))
+                    + (((Int32(kb * 4) + warp_idx) * Int32(32) + lane) << Int32(4))
                 )
                 words = cute.make_rmem_tensor((4,), Uint32)
                 words[0] = w0
@@ -406,18 +381,14 @@ class W4A8MaterializedPhase2Kernel:
             intermediate_slice += Int32(1)
 
         scatter_n = Int32(scatter_output.shape[1])
-        physical_row_base = (
-            source_m_tile * Int32(self.source_tile_m)
-            + m_half * Int32(self.tile_m)
+        physical_row_base = source_m_tile * Int32(self.source_tile_m) + m_half * Int32(
+            self.tile_m
         )
-        down_scale = (
-            down_alpha[expert_idx].to(cutlass.Float32)
-            * global_scale[expert_idx].to(cutlass.Float32)
-        )
+        down_scale = down_alpha[expert_idx].to(cutlass.Float32) * global_scale[
+            expert_idx
+        ].to(cutlass.Float32)
         col_base = (
-            output_tile * Int32(self.tile_n)
-            + warp_idx * Int32(32)
-            + (c << Int32(1))
+            output_tile * Int32(self.tile_n) + warp_idx * Int32(32) + (c << Int32(1))
         )
         for nt in cutlass.range_constexpr(4):
             col = col_base + Int32(nt * 8)
@@ -428,10 +399,7 @@ class W4A8MaterializedPhase2Kernel:
                 if row_lo < valid_rows:
                     physical_row = physical_row_base + row_lo
                     tok = token_map[physical_row].to(Int32)
-                    scale = (
-                        down_scale
-                        * token_weights[physical_row].to(cutlass.Float32)
-                    )
+                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         # The routing front-end stores the token-major pair
                         # index in token_map for deterministic specializations.
@@ -439,42 +407,31 @@ class W4A8MaterializedPhase2Kernel:
                         # phase 2 can write it exactly once; the caller then
                         # reduces routes in fixed top-k order.
                         st_global_u32(
-                            get_ptr_as_int64(
-                                scatter_output, tok * scatter_n + col
-                            ),
+                            get_ptr_as_int64(scatter_output, tok * scatter_n + col),
                             pack_f32x2_to_bfloat2(
                                 scale * fragment[0], scale * fragment[1]
                             ),
                         )
                     else:
                         scatter_add_bf16x2(
-                            get_ptr_as_int64(
-                                scatter_output, tok * scatter_n + col
-                            ),
+                            get_ptr_as_int64(scatter_output, tok * scatter_n + col),
                             scale * fragment[0],
                             scale * fragment[1],
                         )
                 if row_hi < valid_rows:
                     physical_row = physical_row_base + row_hi
                     tok = token_map[physical_row].to(Int32)
-                    scale = (
-                        down_scale
-                        * token_weights[physical_row].to(cutlass.Float32)
-                    )
+                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
-                            get_ptr_as_int64(
-                                scatter_output, tok * scatter_n + col
-                            ),
+                            get_ptr_as_int64(scatter_output, tok * scatter_n + col),
                             pack_f32x2_to_bfloat2(
                                 scale * fragment[2], scale * fragment[3]
                             ),
                         )
                     else:
                         scatter_add_bf16x2(
-                            get_ptr_as_int64(
-                                scatter_output, tok * scatter_n + col
-                            ),
+                            get_ptr_as_int64(scatter_output, tok * scatter_n + col),
                             scale * fragment[2],
                             scale * fragment[3],
                         )
@@ -531,9 +488,8 @@ class W4A8MaterializedPhase2Kernel:
                 source_m_tile = source_half
             phase1_meta = source_m_tile * intermediate_tiles
             expert_idx = task_expert[phase1_meta].to(Int32)
-            valid_rows = (
-                task_valid_rows[phase1_meta].to(Int32)
-                - m_half * Int32(self.tile_m)
+            valid_rows = task_valid_rows[phase1_meta].to(Int32) - m_half * Int32(
+                self.tile_m
             )
             valid_rows = cutlass.min(valid_rows, Int32(self.tile_m))
             valid_rows = cutlass.max(valid_rows, Int32(0))

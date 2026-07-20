@@ -19,10 +19,15 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.attention._cute.ops import LOG2_E
-from sparkinfer.cute.compiler import DimKey, KernelCompileSpec, key_field, tensor_key
-from sparkinfer.cute.compiler import launch as sparkinfer_launch
-from sparkinfer.cute.intrinsics import (
+from sparkinfer.attention._shared.cute.ops import LOG2_E
+from sparkinfer._lib.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    key_field,
+    tensor_key,
+)
+from sparkinfer._lib.compiler import launch as sparkinfer_launch
+from sparkinfer._lib.intrinsics import (
     atomic_max_shared_f32_offset,
     byte_perm,
     create_l2_evict_first_policy,
@@ -96,14 +101,10 @@ _NVFP4_SCALE_OFFSET = 256
 _NVFP4_SCALE_GROUP = 16
 
 
-
-
 @cute.jit
 def _ld_global_index_i32(index_base_ptr: Int64, entry: Int32) -> Int32:
     """Load one selected-token index directly from the tile's global row."""
-    return Int32(
-        ld_global_nc_u32(index_base_ptr + entry.to(Int64) * Int64(4))
-    )
+    return Int32(ld_global_nc_u32(index_base_ptr + entry.to(Int64) * Int64(4)))
 
 
 @cute.jit
@@ -196,7 +197,9 @@ def _cache_block_stride_bytes(
     is_glm: bool,
     record_bytes: int | None = None,
 ) -> int:
-    from sparkinfer.attention.mla.compressed_reference import compressed_mla_page_nbytes
+    from sparkinfer.attention._shared.mla.compressed_reference import (
+        compressed_mla_page_nbytes,
+    )
 
     if is_glm:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
@@ -230,12 +233,13 @@ def _smem_byte(base_addr: Int32, byte_off) -> Int32:
 
 
 @cute.jit
-def _dsv4_record_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int64) -> Int64:
+def _dsv4_record_off(
+    idx: Int32, page_block_size: Int32, stride_kv_block: Int64
+) -> Int64:
     block_idx = idx // page_block_size
     local_idx = idx - block_idx * page_block_size
-    return (
-        Int64(block_idx) * stride_kv_block
-        + Int64(local_idx) * Int64(_DSV4_IO_STRIDE)
+    return Int64(block_idx) * stride_kv_block + Int64(local_idx) * Int64(
+        _DSV4_IO_STRIDE
     )
 
 
@@ -246,9 +250,8 @@ def _dsv4_rope_base_off(
     """Full DSV4 RoPE-record offset used by the QK prefetch paths."""
     if idx < Int32(0):
         idx = Int32(0)
-    return (
-        _dsv4_record_off(idx, page_block_size, stride_kv_block)
-        + Int64(_DSV4_ROPE_GMEM_OFFSET)
+    return _dsv4_record_off(idx, page_block_size, stride_kv_block) + Int64(
+        _DSV4_ROPE_GMEM_OFFSET
     )
 
 
@@ -292,7 +295,9 @@ def s2_qk_rope_global_dsv4(
         a_byte = a_row * Int32(d_rope * 2) + (ko + a_col) * Int32(2)
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_base_addr, a_byte))
         b0 = ld_global_nc_u32(
-            get_ptr_as_int64(kv_cache_u8, rope_base + Int64(ko + tid * Int32(2)) * Int64(2))
+            get_ptr_as_int64(
+                kv_cache_u8, rope_base + Int64(ko + tid * Int32(2)) * Int64(2)
+            )
         )
         b1 = ld_global_nc_u32(
             get_ptr_as_int64(
@@ -347,7 +352,9 @@ def s2_qk_rope_global_mg_dsv4(
         ko = Int32(ks) * Int32(16)
         # KV-RoPE B operand: loaded once, shared across both head groups.
         b0 = ld_global_nc_u32(
-            get_ptr_as_int64(kv_cache_u8, rope_base + Int64(ko + tid * Int32(2)) * Int64(2))
+            get_ptr_as_int64(
+                kv_cache_u8, rope_base + Int64(ko + tid * Int32(2)) * Int64(2)
+            )
         )
         b1 = ld_global_nc_u32(
             get_ptr_as_int64(
@@ -355,9 +362,7 @@ def s2_qk_rope_global_mg_dsv4(
                 rope_base + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
             )
         )
-        a_byte = (
-            a_row * Int32(q_rope_stride) + (ko + a_col)
-        ) * Int32(2)
+        a_byte = (a_row * Int32(q_rope_stride) + (ko + a_col)) * Int32(2)
         a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_g0_addr, a_byte))
         qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
             qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
@@ -381,7 +386,9 @@ def s2_qk_rope_global_mg_dsv4(
 # values, same per-lane scalar packing into the bf16 m16n8k16 MMA B operand.
 # =============================================================================
 @cute.jit
-def _glm_rope_base_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int64) -> Int64:
+def _glm_rope_base_off(
+    idx: Int32, page_block_size: Int32, stride_kv_block: Int64
+) -> Int64:
     if idx < Int32(0):
         idx = Int32(0)
     block_idx = idx // page_block_size
@@ -424,7 +431,9 @@ def _ld_global_glm_rope_u32(
 ) -> Uint32:
     """Load two consecutive bf16 rope elems (one u32) from global at rope_base +
     elem*2 bytes. ``elem`` is even (the lane reads bf16 pairs)."""
-    return ld_global_nc_u32(get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem) * Int64(2)))
+    return ld_global_nc_u32(
+        get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem) * Int64(2))
+    )
 
 
 @cute.jit
@@ -435,9 +444,7 @@ def _ld_global_nvfp4_fp8_rope_bfloat2(
     scale: Float32,
 ) -> Uint32:
     """Load/dequant two adjacent E4M3 post-RoPE values to packed BF16."""
-    pair = ld_global_b16(
-        get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem_even))
-    )
+    pair = ld_global_b16(get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem_even)))
     v0 = cvt_e4m3_to_f32_via_f16(pair & Uint32(0xFF)) * scale
     v1 = cvt_e4m3_to_f32_via_f16((pair >> Uint32(8)) & Uint32(0xFF)) * scale
     return pack_f32x2_to_bfloat2(v0, v1)
@@ -493,9 +500,7 @@ def s2_qk_rope_regs_mg_glm(
             get_ptr_as_int64(
                 kv_cache_u8,
                 rope_base
-                + Int64(
-                    _NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET
-                ),
+                + Int64(_NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET),
             )
         )
     else:
@@ -516,18 +521,22 @@ def s2_qk_rope_regs_mg_glm(
                 rope_scale,
             )
         else:
-            b0 = _ld_global_glm_rope_u32(
-                kv_cache_u8, rope_base, ko + tid * Int32(2)
-            )
+            b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
             b1 = _ld_global_glm_rope_u32(
                 kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8)
             )
         base = Int32(ks) * Int32(4)
         d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
-            qk0[0], qk0[1], qk0[2], qk0[3],
-            q_rope_regs0[base + 0], q_rope_regs0[base + 1],
-            q_rope_regs0[base + 2], q_rope_regs0[base + 3],
-            b0, b1,
+            qk0[0],
+            qk0[1],
+            qk0[2],
+            qk0[3],
+            q_rope_regs0[base + 0],
+            q_rope_regs0[base + 1],
+            q_rope_regs0[base + 2],
+            q_rope_regs0[base + 3],
+            b0,
+            b1,
         )
         qk0[0] = d0
         qk0[1] = d1
@@ -536,10 +545,16 @@ def s2_qk_rope_regs_mg_glm(
             qk0[3] = d3
         if cutlass.const_expr(n_hg == 2):
             qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-                qk1[0], qk1[1], qk1[2], qk1[3],
-                q_rope_regs1[base + 0], q_rope_regs1[base + 1],
-                q_rope_regs1[base + 2], q_rope_regs1[base + 3],
-                b0, b1,
+                qk1[0],
+                qk1[1],
+                qk1[2],
+                qk1[3],
+                q_rope_regs1[base + 0],
+                q_rope_regs1[base + 1],
+                q_rope_regs1[base + 2],
+                q_rope_regs1[base + 3],
+                b0,
+                b1,
             )
     return qk0, qk1
 
@@ -556,17 +571,17 @@ def s2_qk_rope_regs_mg_glm(
 # =============================================================================
 @cute.jit
 def s0_load_q_bf16_to_smem_mg(
-    q_token: cute.Tensor,            # (NUM_HEADS, D_QK) bf16 view for this token
-    q_nope_bf16_g0_addr: Int32,      # smem addr of group-0 Q-NoPE bf16 buffer
-    q_nope_bf16_g1_addr: Int32,      # smem addr of group-1 Q-NoPE bf16 buffer
-    q_rope_g0_addr: Int32,           # smem addr of group-0 Q-rope bf16 scratch
-    q_rope_g1_addr: Int32,           # smem addr of group-1 Q-rope bf16 scratch
-    head_base: Int32,                # first head index of this CTA (h_start)
+    q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token
+    q_nope_bf16_g0_addr: Int32,  # smem addr of group-0 Q-NoPE bf16 buffer
+    q_nope_bf16_g1_addr: Int32,  # smem addr of group-1 Q-NoPE bf16 buffer
+    q_rope_g0_addr: Int32,  # smem addr of group-0 Q-rope bf16 scratch
+    q_rope_g1_addr: Int32,  # smem addr of group-1 Q-rope bf16 scratch
+    head_base: Int32,  # first head index of this CTA (h_start)
     tid: Int32,
     *,
-    d_nope: cutlass.Constexpr,       # 448
-    d_rope: cutlass.Constexpr,       # 64
-    hpb: cutlass.Constexpr,          # 16
+    d_nope: cutlass.Constexpr,  # 448
+    d_rope: cutlass.Constexpr,  # 64
+    hpb: cutlass.Constexpr,  # 16
     q_nope_bf16_stride: cutlass.Constexpr,  # D_NOPE + 8
     q_rope_stride: cutlass.Constexpr,
     num_threads: cutlass.Constexpr,  # 256
@@ -603,7 +618,9 @@ def s0_load_q_bf16_to_smem_mg(
             val = Float32(0.0)
             if h < valid_hpb:
                 val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
-        st_shared_bf16_from_f32(dst + (h * Int32(q_nope_bf16_stride) + d) * Int32(2), val)
+        st_shared_bf16_from_f32(
+            dst + (h * Int32(q_nope_bf16_stride) + d) * Int32(2), val
+        )
         i += Int32(num_threads)
 
     # Q-rope -> bf16 smem scratch (all groups), with a bank-layout row pad.
@@ -622,10 +639,10 @@ def s0_load_q_bf16_to_smem_mg(
         else:
             val = Float32(0.0)
             if h < valid_hpb:
-                val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
-        st_shared_bf16_from_f32(
-            dst + (h * Int32(q_rope_stride) + d) * Int32(2), val
-        )
+                val = Float32(
+                    q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d]
+                )
+        st_shared_bf16_from_f32(dst + (h * Int32(q_rope_stride) + d) * Int32(2), val)
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
@@ -666,9 +683,7 @@ def reload_q_rope_bf16_to_smem_mg(
                 val = Float32(
                     q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d]
                 )
-        st_shared_bf16_from_f32(
-            dst + (h * Int32(q_rope_stride) + d) * Int32(2), val
-        )
+        st_shared_bf16_from_f32(dst + (h * Int32(q_rope_stride) + d) * Int32(2), val)
         i += Int32(num_threads)
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
 
@@ -678,7 +693,7 @@ def preload_q_rope_regs_mg(
     q_rope_base_addr: Int32,
     lane: Int32,
     *,
-    d_rope: cutlass.Constexpr,        # 64
+    d_rope: cutlass.Constexpr,  # 64
     q_rope_stride: cutlass.Constexpr,
 ):
     """Preload one head group's Q-rope (bf16) A operands into registers, ONCE
@@ -694,9 +709,7 @@ def preload_q_rope_regs_mg(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     a_byte = a_row * Int32(q_rope_stride * 2) + a_col * Int32(2)
-    a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
-        _smem_byte(q_rope_base_addr, a_byte)
-    )
+    a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_base_addr, a_byte))
     a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
         _smem_byte(q_rope_base_addr, a_byte + Int32(32))
     )
@@ -737,8 +750,8 @@ def s1_qk_nope_bf16_mg2(
     warp_first_cand: Int32,
     lane: Int32,
     *,
-    num_scales: cutlass.Constexpr,    # 7
-    quant_tile: cutlass.Constexpr,    # 64
+    num_scales: cutlass.Constexpr,  # 7
+    quant_tile: cutlass.Constexpr,  # 64
     q_nope_bf16_stride: cutlass.Constexpr,  # D_NOPE + 8
     kv_smem_stride: cutlass.Constexpr,  # 448 (BF16 layout)
     scale_bytes_per_token: cutlass.Constexpr,  # 8
@@ -762,27 +775,19 @@ def s1_qk_nope_bf16_mg2(
     # The K row this lane group reads for the dequant B operand.
     kv_gid_row = warp_first_cand + gid
     kv_lane_base = (
-        kv_fp8_base_addr
-        + kv_gid_row * Int32(kv_smem_stride)
-        + tid * Int32(2)
+        kv_fp8_base_addr + kv_gid_row * Int32(kv_smem_stride) + tid * Int32(2)
     )
-    kv_sc_row_base = (
-        kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
-    )
+    kv_sc_row_base = kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
 
     for blk in cutlass.range_constexpr(num_scales):
         # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
-        scale_f = _ue8m0_zext_byte_to_fp32(
-            ld_shared_u8_offset(kv_sc_row_base, blk)
-        )
+        scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
             # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
             # _ld_u16_zext handles the 2-byte (non-4-aligned) offsets safely.
             p0 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
-            p1 = ld_shared_u16_offset(
-                kv_lane_base, blk * quant_tile + ks * 16 + 8
-            )
+            p1 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
             b0, b1 = dequant_kv_e4m3_pair_to_bf16x2(p0, p1, scale_f)
             # Group 0 A operand + MMA.
             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
@@ -822,9 +827,7 @@ def _nvfp4_pair_bfloat2_mg(
     scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
     scale_byte = _ld_u8_zext(
         kv_fp4_base_addr,
-        entry * Int32(kv_smem_stride)
-        + Int32(_NVFP4_SCALE_OFFSET)
-        + scale_group,
+        entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
     )
     scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
     # Prefill QK has its own MG B-operand loader.  Restore s_l here, before
@@ -880,10 +883,7 @@ def s1_qk_nope_nvfp4_bf16_mg2(
                 latent_scale,
                 kv_smem_stride=kv_smem_stride,
             )
-            a_byte = (
-                a_row * Int32(q_nope_bf16_stride * 2)
-                + (ko + a_col) * Int32(2)
-            )
+            a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
             a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
                 _smem_byte(q_nope_bf16_g0_addr, a_byte)
             )
@@ -982,8 +982,7 @@ def prefetch_kv_rope_regs_dsv4(
             rope_base_ptr + Int64(ko + tid * Int32(2)) * Int64(2)
         )
         regs[base + 1] = ld_global_nc_u32(
-            rope_base_ptr
-            + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2)
+            rope_base_ptr + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2)
         )
     return regs
 
@@ -1038,37 +1037,101 @@ def s2_qk_rope_prefetched_mg_dsv4_scalar(
     boundary for LLVM/ptxas without adding any capture-time state.
     """
     qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-        qk0[0], qk0[1], qk0[2], qk0[3], q000, q001, q002, q003,
-        kv_rope_regs[0], kv_rope_regs[1],
+        qk0[0],
+        qk0[1],
+        qk0[2],
+        qk0[3],
+        q000,
+        q001,
+        q002,
+        q003,
+        kv_rope_regs[0],
+        kv_rope_regs[1],
     )
     qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-        qk0[0], qk0[1], qk0[2], qk0[3], q010, q011, q012, q013,
-        kv_rope_regs[2], kv_rope_regs[3],
+        qk0[0],
+        qk0[1],
+        qk0[2],
+        qk0[3],
+        q010,
+        q011,
+        q012,
+        q013,
+        kv_rope_regs[2],
+        kv_rope_regs[3],
     )
     qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-        qk0[0], qk0[1], qk0[2], qk0[3], q020, q021, q022, q023,
-        kv_rope_regs[4], kv_rope_regs[5],
+        qk0[0],
+        qk0[1],
+        qk0[2],
+        qk0[3],
+        q020,
+        q021,
+        q022,
+        q023,
+        kv_rope_regs[4],
+        kv_rope_regs[5],
     )
     qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-        qk0[0], qk0[1], qk0[2], qk0[3], q030, q031, q032, q033,
-        kv_rope_regs[6], kv_rope_regs[7],
+        qk0[0],
+        qk0[1],
+        qk0[2],
+        qk0[3],
+        q030,
+        q031,
+        q032,
+        q033,
+        kv_rope_regs[6],
+        kv_rope_regs[7],
     )
     if cutlass.const_expr(n_hg == 2):
         qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-            qk1[0], qk1[1], qk1[2], qk1[3], q100, q101, q102, q103,
-            kv_rope_regs[0], kv_rope_regs[1],
+            qk1[0],
+            qk1[1],
+            qk1[2],
+            qk1[3],
+            q100,
+            q101,
+            q102,
+            q103,
+            kv_rope_regs[0],
+            kv_rope_regs[1],
         )
         qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-            qk1[0], qk1[1], qk1[2], qk1[3], q110, q111, q112, q113,
-            kv_rope_regs[2], kv_rope_regs[3],
+            qk1[0],
+            qk1[1],
+            qk1[2],
+            qk1[3],
+            q110,
+            q111,
+            q112,
+            q113,
+            kv_rope_regs[2],
+            kv_rope_regs[3],
         )
         qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-            qk1[0], qk1[1], qk1[2], qk1[3], q120, q121, q122, q123,
-            kv_rope_regs[4], kv_rope_regs[5],
+            qk1[0],
+            qk1[1],
+            qk1[2],
+            qk1[3],
+            q120,
+            q121,
+            q122,
+            q123,
+            kv_rope_regs[4],
+            kv_rope_regs[5],
         )
         qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-            qk1[0], qk1[1], qk1[2], qk1[3], q130, q131, q132, q133,
-            kv_rope_regs[6], kv_rope_regs[7],
+            qk1[0],
+            qk1[1],
+            qk1[2],
+            qk1[3],
+            q130,
+            q131,
+            q132,
+            q133,
+            kv_rope_regs[6],
+            kv_rope_regs[7],
         )
     return qk0, qk1
 
@@ -1091,9 +1154,7 @@ def s2_qk_rope_shared_prefetched_mg_dsv4(
     a_col = (lane >> Int32(4)) * Int32(8)
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
-        a_byte = (
-            a_row * Int32(q_rope_stride) + (ko + a_col)
-        ) * Int32(2)
+        a_byte = (a_row * Int32(q_rope_stride) + (ko + a_col)) * Int32(2)
         bbase = ks * 2
         a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(q_rope_g0_addr + a_byte)
         qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
@@ -1159,8 +1220,7 @@ def s2_qk_rope_regs_mg_dsv4(
         b1 = ld_global_nc_u32(
             get_ptr_as_int64(
                 kv_cache_u8,
-                rope_base
-                + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
+                rope_base + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
             )
         )
         base = Int32(ks) * Int32(4)
@@ -1302,34 +1362,28 @@ def s6b_xv_rope_global_mg_dsv4(
         sm_p_g0_addr + (gid * Int32(sm_p_stride) + cand_e1) * Int32(2), w_pre0[1]
     )
     st_shared_bf16_from_f32(
-        sm_p_g0_addr
-        + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
+        sm_p_g0_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
         w_pre0[2],
     )
     st_shared_bf16_from_f32(
-        sm_p_g0_addr
-        + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
+        sm_p_g0_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
         w_pre0[3],
     )
     if cutlass.const_expr(two):
         st_shared_bf16_from_f32(
-            sm_p_g1_addr
-            + (gid * Int32(sm_p_stride) + cand_e0) * Int32(2),
+            sm_p_g1_addr + (gid * Int32(sm_p_stride) + cand_e0) * Int32(2),
             w_pre1[0],
         )
         st_shared_bf16_from_f32(
-            sm_p_g1_addr
-            + (gid * Int32(sm_p_stride) + cand_e1) * Int32(2),
+            sm_p_g1_addr + (gid * Int32(sm_p_stride) + cand_e1) * Int32(2),
             w_pre1[1],
         )
         st_shared_bf16_from_f32(
-            sm_p_g1_addr
-            + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
+            sm_p_g1_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
             w_pre1[2],
         )
         st_shared_bf16_from_f32(
-            sm_p_g1_addr
-            + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
+            sm_p_g1_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
             w_pre1[3],
         )
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -1356,23 +1410,19 @@ def s6b_xv_rope_global_mg_dsv4(
         b0 = v0 | (v1 << Uint32(16))
         b1 = v8 | (v9 << Uint32(16))
 
-        a_byte = (
-            a_row * Int32(sm_p_stride) + (k_base + a_col)
-        ) * Int32(2)
+        a_byte = (a_row * Int32(sm_p_stride) + (k_base + a_col)) * Int32(2)
         a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(sm_p_g0_addr + a_byte)
-        acc_rope0[0], acc_rope0[1], acc_rope0[2], acc_rope0[3] = (
-            mma_m16n8k16_f32_bf16(
-                acc_rope0[0],
-                acc_rope0[1],
-                acc_rope0[2],
-                acc_rope0[3],
-                a00,
-                a01,
-                a02,
-                a03,
-                b0,
-                b1,
-            )
+        acc_rope0[0], acc_rope0[1], acc_rope0[2], acc_rope0[3] = mma_m16n8k16_f32_bf16(
+            acc_rope0[0],
+            acc_rope0[1],
+            acc_rope0[2],
+            acc_rope0[3],
+            a00,
+            a01,
+            a02,
+            a03,
+            b0,
+            b1,
         )
         if cutlass.const_expr(two):
             a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(sm_p_g1_addr + a_byte)
@@ -1458,17 +1508,13 @@ def s4_online_softmax_mg2(
         lm10 = fmax_f32(lm10, cute.arch.shuffle_sync_bfly(lm10, offset=1))
         lm11 = fmax_f32(lm11, cute.arch.shuffle_sync_bfly(lm11, offset=1))
 
-    reduce_warp_head_addr = (
-        reduce_addr + (warp_id * Int32(hpb) + gid) * Int32(4)
-    )
+    reduce_warp_head_addr = reduce_addr + (warp_id * Int32(hpb) + gid) * Int32(4)
     if tid == Int32(0):
         st_shared_f32_offset(reduce_warp_head_addr, 0, lm00)
         if cutlass.const_expr(hi0):
             st_shared_f32_offset(reduce_warp_head_addr, 8 * 4, lm01)
         if cutlass.const_expr(two):
-            st_shared_f32_offset(
-                reduce_warp_head_addr, reduce_group_bytes, lm10
-            )
+            st_shared_f32_offset(reduce_warp_head_addr, reduce_group_bytes, lm10)
             st_shared_f32_offset(
                 reduce_warp_head_addr, reduce_group_bytes + 8 * 4, lm11
             )
@@ -1482,16 +1528,12 @@ def s4_online_softmax_mg2(
             group = Int32(0)
             h = tid_flat
         reduce_head_addr = (
-            reduce_addr
-            + group * Int32(reduce_group_bytes)
-            + h * Int32(4)
+            reduce_addr + group * Int32(reduce_group_bytes) + h * Int32(4)
         )
         old_m = ld_shared_f32_offset(reduce_head_addr, reduce_sum_off)
         bmax = Float32(-1e30)
         for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32_offset(
-                reduce_head_addr, w * hpb * 4
-            )
+            wm = ld_shared_f32_offset(reduce_head_addr, w * hpb * 4)
             bmax = fmax_f32(bmax, wm)
         new_m = fmax_f32(old_m, bmax)
         alpha = _exp2_approx_ftz_f32(old_m - new_m)
@@ -1509,13 +1551,9 @@ def s4_online_softmax_mg2(
     ngm00 = ld_shared_f32_offset(reduce_lane_head_addr, hpb * 4)
     if cutlass.const_expr(hi0):
         alpha01 = ld_shared_f32_offset(reduce_lane_head_addr, 8 * 4)
-        ngm01 = ld_shared_f32_offset(
-            reduce_lane_head_addr, hpb * 4 + 8 * 4
-        )
+        ngm01 = ld_shared_f32_offset(reduce_lane_head_addr, hpb * 4 + 8 * 4)
     if cutlass.const_expr(two):
-        alpha10 = ld_shared_f32_offset(
-            reduce_lane_head_addr, reduce_group_bytes
-        )
+        alpha10 = ld_shared_f32_offset(reduce_lane_head_addr, reduce_group_bytes)
         alpha11 = ld_shared_f32_offset(
             reduce_lane_head_addr, reduce_group_bytes + 8 * 4
         )
@@ -1677,14 +1715,18 @@ def s4_finalize_row_sum_mg2(
     cute.arch.barrier(**bar_kw)
 
     if tid == Int32(0):
-        st_shared_f32(reduce0_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs0[0])
+        st_shared_f32(
+            reduce0_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs0[0]
+        )
         if cutlass.const_expr(hi0):
             st_shared_f32(
                 reduce0_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
                 gs0[1],
             )
         if cutlass.const_expr(two):
-            st_shared_f32(reduce1_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs1[0])
+            st_shared_f32(
+                reduce1_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs1[0]
+            )
             st_shared_f32(
                 reduce1_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
                 gs1[1],
@@ -1704,9 +1746,7 @@ def s4_finalize_row_sum_mg2(
                 rsum = reduce1_sum_addr
         total = Float32(0.0)
         for w in cutlass.range_constexpr(n_warps):
-            total = total + ld_shared_f32(
-                rsum + (Int32(w) * Int32(hpb) + h) * Int32(4)
-            )
+            total = total + ld_shared_f32(rsum + (Int32(w) * Int32(hpb) + h) * Int32(4))
         st_shared_f32(rsum + h * Int32(4), total)
     cute.arch.barrier(**bar_kw)
 
@@ -1816,12 +1856,8 @@ def s6_xv_nope_mg_dsv4(
                 sc1_word = sc1_hi
                 sc_byte = vc - 4
             selector = Int32(0x7770 + sc_byte)
-            vsc0 = _ue8m0_zext_byte_to_fp32(
-                byte_perm(sc0_word, Uint32(0), selector)
-            )
-            vsc1 = _ue8m0_zext_byte_to_fp32(
-                byte_perm(sc1_word, Uint32(0), selector)
-            )
+            vsc0 = _ue8m0_zext_byte_to_fp32(byte_perm(sc0_word, Uint32(0), selector))
+            vsc1 = _ue8m0_zext_byte_to_fp32(byte_perm(sc1_word, Uint32(0), selector))
         else:
             vsc0 = vsc_cache0[vc]
             vsc1 = vsc_cache1[vc]
@@ -1830,12 +1866,8 @@ def s6_xv_nope_mg_dsv4(
         if cutlass.const_expr(two):
             m10 = fmax_f32(w_pre1[0] * vsc0, w_pre1[1] * vsc1)
             m11 = fmax_f32(w_pre1[2] * vsc0, w_pre1[3] * vsc1)
-        atomic_max_shared_f32_offset(
-            w_head_sc_lane_base, vc * hpb * 4, m00
-        )
-        atomic_max_shared_f32_offset(
-            w_head_sc_lane_base, (vc * hpb + 8) * 4, m01
-        )
+        atomic_max_shared_f32_offset(w_head_sc_lane_base, vc * hpb * 4, m00)
+        atomic_max_shared_f32_offset(w_head_sc_lane_base, (vc * hpb + 8) * 4, m01)
         if cutlass.const_expr(two):
             atomic_max_shared_f32_offset(
                 w_head_sc_lane_base,
@@ -1868,16 +1900,12 @@ def s6_xv_nope_mg_dsv4(
         a_row_eff = a_row
     a_col = (lane >> Int32(4)) * Int32(16)
     for vc in cutlass.range_constexpr(n_v_chunks):
-        w_fp8_parity_addr = (
-            w_fp8_base_addr + Int32(vc & 1) * Int32(w_fp8_parity_stride)
-        )
+        w_fp8_parity_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(w_fp8_parity_stride)
         w_fp8_g0 = w_fp8_parity_addr
         w_fp8_g1 = w_fp8_parity_addr + Int32(w_fp8_group_stride)
 
         sc00 = ld_shared_f32_offset(w_head_sc_lane_base, vc * hpb * 4)
-        sc01 = ld_shared_f32_offset(
-            w_head_sc_lane_base, (vc * hpb + 8) * 4
-        )
+        sc01 = ld_shared_f32_offset(w_head_sc_lane_base, (vc * hpb + 8) * 4)
         if cutlass.const_expr(two):
             sc10 = ld_shared_f32_offset(
                 w_head_sc_lane_base,
@@ -1903,12 +1931,8 @@ def s6_xv_nope_mg_dsv4(
                 sc1_word = sc1_hi
                 sc_byte = vc - 4
             selector = Int32(0x7770 + sc_byte)
-            vsc0 = _ue8m0_zext_byte_to_fp32(
-                byte_perm(sc0_word, Uint32(0), selector)
-            )
-            vsc1 = _ue8m0_zext_byte_to_fp32(
-                byte_perm(sc1_word, Uint32(0), selector)
-            )
+            vsc0 = _ue8m0_zext_byte_to_fp32(byte_perm(sc0_word, Uint32(0), selector))
+            vsc1 = _ue8m0_zext_byte_to_fp32(byte_perm(sc1_word, Uint32(0), selector))
         else:
             vsc0 = vsc_cache0[vc]
             vsc1 = vsc_cache1[vc]
@@ -1955,10 +1979,9 @@ def s6_xv_nope_mg_dsv4(
 
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
             at = vc * nt_per_warp_xv + nt
-            dim = (
-                Int32(vc) * Int32(v_chunk)
-                + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
-            )
+            dim = Int32(vc) * Int32(v_chunk) + (
+                Int32(nt) * Int32(n_warps) + warp_id
+            ) * Int32(8)
             xv00 = Float32(0.0)
             xv01 = Float32(0.0)
             xv02 = Float32(0.0)
@@ -2140,20 +2163,20 @@ class UnifiedPrefillMGKernel:
     @cute.jit
     def call_dual(
         self,
-        q_all: cute.Tensor,          # (T, heads, D_QK) bf16
-        kv_cache_u8: cute.Tensor,    # flat u8 MAIN cache
-        indices: cute.Tensor,        # (T, topk) int32 MAIN indices
-        topk_length: cute.Tensor,    # (T,) int32 per-token MAIN valid length
-        attn_sink: cute.Tensor,      # (heads,) f32 (dummy 1-elem when no sink)
-        output: cute.Tensor,         # (T, heads, D_V) bf16
-        out_lse: cute.Tensor,        # (T, heads) f32 base-2 LSE
+        q_all: cute.Tensor,  # (T, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,  # flat u8 MAIN cache
+        indices: cute.Tensor,  # (T, topk) int32 MAIN indices
+        topk_length: cute.Tensor,  # (T,) int32 per-token MAIN valid length
+        attn_sink: cute.Tensor,  # (heads,) f32 (dummy 1-elem when no sink)
+        output: cute.Tensor,  # (T, heads, D_V) bf16
+        out_lse: cute.Tensor,  # (T, heads) f32 base-2 LSE
         sm_scale_log2: Float32,
         latent_scale: Float32,
-        stride_kv_block: Int64,      # MAIN per-block byte stride
+        stride_kv_block: Int64,  # MAIN per-block byte stride
         extra_kv_cache_u8: cute.Tensor,  # flat u8 EXTRA cache (DSV4 dual-cache)
-        extra_indices: cute.Tensor,      # (T, extra_topk) int32
+        extra_indices: cute.Tensor,  # (T, extra_topk) int32
         extra_topk_length: cute.Tensor,  # (T,) int32 per-token EXTRA valid length
-        stride_extra_kv_block: Int64,    # EXTRA per-block byte stride
+        stride_extra_kv_block: Int64,  # EXTRA per-block byte stride
         num_tokens: Int32,
         stream: cuda.CUstream,
     ):
@@ -2348,7 +2371,9 @@ class UnifiedPrefillMGKernel:
                 q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
             q_sc_view_all = st.q_sc.get_tensor(cute.make_layout(int(L.q_sc_bytes // 4)))
 
-        amax_view = st.reduce.get_tensor(cute.make_layout(int(L.reduce_group_bytes // 4)))
+        amax_view = st.reduce.get_tensor(
+            cute.make_layout(int(L.reduce_group_bytes // 4))
+        )
         w_head_sc_view_all = st.w_head_sc.get_tensor(
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
@@ -2383,7 +2408,8 @@ class UnifiedPrefillMGKernel:
                 cute.make_layout(int(L.q_sc_group_bytes // 4)),
             )
         w_head_sc_g0 = cute.make_tensor(
-            w_head_sc_view_all.iterator, cute.make_layout(int(L.w_head_sc_group_bytes // 4))
+            w_head_sc_view_all.iterator,
+            cute.make_layout(int(L.w_head_sc_group_bytes // 4)),
         )
         w_head_sc_g1 = cute.make_tensor(
             w_head_sc_view_all.iterator + Int32(L.w_head_sc_group_bytes // 4),
@@ -2414,9 +2440,7 @@ class UnifiedPrefillMGKernel:
         if section_len > Int32(self.topk):
             section_len = Int32(self.topk)
         is_empty_row = section_len == Int32(0)
-        actual_tiles = (
-            section_len + Int32(_CAND_WINDOW - 1)
-        ) // Int32(_CAND_WINDOW)
+        actual_tiles = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(_CAND_WINDOW)
 
         # DSV4 dual-cache (has_extra) union. main occupies COMPILE-TIME
         # num_main_tiles slots (= ceil(topk/64)); extra runs ceil(extra_section_len
@@ -2432,9 +2456,9 @@ class UnifiedPrefillMGKernel:
             if extra_section_len > extra_total:
                 extra_section_len = extra_total
             is_empty_row = is_empty_row and (extra_section_len == Int32(0))
-            num_extra_tiles = (
-                extra_section_len + Int32(_CAND_WINDOW - 1)
-            ) // Int32(_CAND_WINDOW)
+            num_extra_tiles = (extra_section_len + Int32(_CAND_WINDOW - 1)) // Int32(
+                _CAND_WINDOW
+            )
             loop_tiles = num_main_tiles + num_extra_tiles
         else:
             extra_section_len = section_len
@@ -2663,15 +2687,25 @@ class UnifiedPrefillMGKernel:
                         )
                     else:
                         q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
-                    cute.arch.barrier(
-                        barrier_id=2, number_of_threads=self.math_threads
-                    )
+                    cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
                 elif cutlass.const_expr(not reload_bf16_qrope):
                     (
-                        q000, q001, q002, q003,
-                        q010, q011, q012, q013,
-                        q020, q021, q022, q023,
-                        q030, q031, q032, q033,
+                        q000,
+                        q001,
+                        q002,
+                        q003,
+                        q010,
+                        q011,
+                        q012,
+                        q013,
+                        q020,
+                        q021,
+                        q022,
+                        q023,
+                        q030,
+                        q031,
+                        q032,
+                        q033,
                     ) = preload_q_rope_regs_mg(
                         q_rope_g0,
                         lane,
@@ -2680,10 +2714,22 @@ class UnifiedPrefillMGKernel:
                     )
                     if cutlass.const_expr(n_hg == 2):
                         (
-                            q100, q101, q102, q103,
-                            q110, q111, q112, q113,
-                            q120, q121, q122, q123,
-                            q130, q131, q132, q133,
+                            q100,
+                            q101,
+                            q102,
+                            q103,
+                            q110,
+                            q111,
+                            q112,
+                            q113,
+                            q120,
+                            q121,
+                            q122,
+                            q123,
+                            q130,
+                            q131,
+                            q132,
+                            q133,
                         ) = preload_q_rope_regs_mg(
                             q_rope_g1,
                             lane,
@@ -2697,9 +2743,7 @@ class UnifiedPrefillMGKernel:
                         q110, q111, q112, q113 = q010, q011, q012, q013
                         q120, q121, q122, q123 = q020, q021, q022, q023
                         q130, q131, q132, q133 = q030, q031, q032, q033
-                    cute.arch.barrier(
-                        barrier_id=2, number_of_threads=self.math_threads
-                    )
+                    cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
             else:
                 s0_quantize_q_to_smem(
                     q_token,
@@ -2819,9 +2863,7 @@ class UnifiedPrefillMGKernel:
                 index_base_ptr = get_ptr_as_int64(topk_row, split_cand_start)
                 if cutlass.const_expr(has_extra):
                     if ci >= num_main_tiles:
-                        index_base_ptr = get_ptr_as_int64(
-                            extra_row, split_cand_start
-                        )
+                        index_base_ptr = get_ptr_as_int64(extra_row, split_cand_start)
 
                 # MAIN rope geometry used by the non-dual FP8 / GLM arms.
                 rope_cache = kv_cache_u8
@@ -2968,14 +3010,38 @@ class UnifiedPrefillMGKernel:
                         qk0, qk1 = s2_qk_rope_prefetched_mg_dsv4_scalar(
                             qk0,
                             qk1,
-                            q000, q001, q002, q003,
-                            q010, q011, q012, q013,
-                            q020, q021, q022, q023,
-                            q030, q031, q032, q033,
-                            q100, q101, q102, q103,
-                            q110, q111, q112, q113,
-                            q120, q121, q122, q123,
-                            q130, q131, q132, q133,
+                            q000,
+                            q001,
+                            q002,
+                            q003,
+                            q010,
+                            q011,
+                            q012,
+                            q013,
+                            q020,
+                            q021,
+                            q022,
+                            q023,
+                            q030,
+                            q031,
+                            q032,
+                            q033,
+                            q100,
+                            q101,
+                            q102,
+                            q103,
+                            q110,
+                            q111,
+                            q112,
+                            q113,
+                            q120,
+                            q121,
+                            q122,
+                            q123,
+                            q130,
+                            q131,
+                            q132,
+                            q133,
                             kv_rope_regs,
                             n_hg=n_hg,
                         )
@@ -3218,9 +3284,7 @@ class UnifiedPrefillMGKernel:
                         )
                         w_head_sc_view_all[slot_hs] = Float32(0.0)
                         i_hs += Int32(self.math_threads)
-                    cute.arch.barrier(
-                        barrier_id=3, number_of_threads=self.math_threads
-                    )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                     acc0 = s6_xv_nope(
                         w_pre0,
                         acc0,
@@ -3401,7 +3465,9 @@ class UnifiedPrefillMGKernel:
                 next_lc = ci + Int32(1)
                 if next_lc < loop_tiles:
                     next_phase = (next_lc >> Int32(1)) & Int32(1)
-                    cute.arch.mbarrier_wait(mbar_base + (next_lc & Int32(1)), phase=next_phase)
+                    cute.arch.mbarrier_wait(
+                        mbar_base + (next_lc & Int32(1)), phase=next_phase
+                    )
 
             final_gid = lane >> Int32(2)
             final_gmax0 = [
@@ -3513,8 +3579,7 @@ class UnifiedPrefillMGKernel:
                 num_threads=self.math_threads,
                 barrier_id=3,
                 coalesced_output=cutlass.const_expr(
-                    self.output_stride_dim == 1
-                    and self.output_stride_head == t.d_v
+                    self.output_stride_dim == 1 and self.output_stride_head == t.d_v
                 ),
             )
 
@@ -3578,8 +3643,7 @@ class UnifiedPrefillMGKernel:
                     num_threads=self.math_threads,
                     barrier_id=3,
                     coalesced_output=cutlass.const_expr(
-                        self.output_stride_dim == 1
-                        and self.output_stride_head == t.d_v
+                        self.output_stride_dim == 1 and self.output_stride_head == t.d_v
                     ),
                 )
 
@@ -3629,7 +3693,9 @@ def _sparse_mla_prefill_mg_flat_launch(
     head_offset = int(head_offset)
     heads_per_cta = int(layout.heads_per_cta)
     if active_heads <= 0:
-        raise ValueError(f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}")
+        raise ValueError(
+            f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}"
+        )
     if head_offset < 0 or head_offset + active_heads > total_heads:
         raise ValueError(
             "SM120 sparse MLA MG prefill head range out of bounds: "
@@ -3729,15 +3795,23 @@ def _sparse_mla_prefill_mg_flat_launch(
         tensor_key(
             "q",
             q,
-            dims=(DimKey.dynamic(), DimKey.exact(total_heads), DimKey.exact(q_head_dim)),
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(total_heads),
+                DimKey.exact(q_head_dim),
+            ),
         ),
-        tensor_key("topk_indices", topk_indices, dims=(DimKey.dynamic(), DimKey.bucket(topk))),
+        tensor_key(
+            "topk_indices", topk_indices, dims=(DimKey.dynamic(), DimKey.bucket(topk))
+        ),
         tensor_key(
             "output",
             output,
             dims=(DimKey.dynamic(), DimKey.exact(total_heads), DimKey.exact(512)),
         ),
-        tensor_key("out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))),
+        tensor_key(
+            "out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))
+        ),
     ]
     if active_heads != total_heads or head_offset != 0:
         spec_fields.extend(
@@ -3811,9 +3885,9 @@ def _sparse_mla_prefill_mg_op(
         attn_sink_t,
         output,
         lse_out,
-        kv_flat,        # extra_kv_flat alias (never read)
-        topk_indices,   # extra_indices alias (never read)
-        topk_length,    # extra_len alias (never read)
+        kv_flat,  # extra_kv_flat alias (never read)
+        topk_indices,  # extra_indices alias (never read)
+        topk_length,  # extra_len alias (never read)
         sm_scale,
         latent_scale,
         page_block_size,
@@ -3827,10 +3901,10 @@ def _sparse_mla_prefill_mg_op(
         scale_format,
         fp8_rope,
         False,  # has_extra
-        0,      # extra_topk
-        0,      # num_main_tiles
-        1,      # pbs_extra
-        0,      # stride_extra_kv_block
+        0,  # extra_topk
+        0,  # num_main_tiles
+        1,  # pbs_extra
+        0,  # stride_extra_kv_block
         False,  # row_xor
     )
 
@@ -4011,7 +4085,9 @@ def run_unified_prefill_mg(
             f"q_head_dim={expected_qdim}, got {int(q.shape[-1])}"
         )
     if int(mg_n_hg) not in (1, 2):
-        raise ValueError(f"SM120 sparse MLA MG prefill supports mg_n_hg in {{1, 2}}, got {mg_n_hg}")
+        raise ValueError(
+            f"SM120 sparse MLA MG prefill supports mg_n_hg in {{1, 2}}, got {mg_n_hg}"
+        )
     num_tokens, heads, _ = q.shape
     total_heads = int(heads)
     if active_heads is None:
@@ -4019,7 +4095,9 @@ def run_unified_prefill_mg(
     active_heads = int(active_heads)
     head_offset = int(head_offset)
     if active_heads <= 0:
-        raise ValueError(f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}")
+        raise ValueError(
+            f"SM120 sparse MLA MG prefill requires active_heads>0, got {active_heads}"
+        )
     if head_offset < 0 or head_offset + active_heads > total_heads:
         raise ValueError(
             "SM120 sparse MLA MG prefill head range out of bounds: "
@@ -4085,7 +4163,9 @@ def run_unified_prefill_mg(
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()
     if output is None:
-        output = torch.empty((num_tokens, heads, int(traits.d_v)), dtype=torch.bfloat16, device=device)
+        output = torch.empty(
+            (num_tokens, heads, int(traits.d_v)), dtype=torch.bfloat16, device=device
+        )
     if lse_out is None:
         lse_out = torch.empty((num_tokens, heads), dtype=torch.float32, device=device)
 
@@ -4209,8 +4289,8 @@ def run_unified_prefill_mg(
             output,
             lse_out,
             _cache_base_tensor(kv_cache),  # extra_kv_flat alias (never read)
-            topk_indices,          # extra_indices alias (never read)
-            topk_length,           # extra_len alias (never read)
+            topk_indices,  # extra_indices alias (never read)
+            topk_length,  # extra_len alias (never read)
             float(sm_scale),
             float(latent_scale),
             int(page_block_size),
@@ -4224,10 +4304,10 @@ def run_unified_prefill_mg(
             scale_format,
             bool(traits.fp8_rope),
             False,  # has_extra
-            0,      # extra_topk
-            0,      # num_main_tiles
-            1,      # pbs_extra
-            0,      # stride_extra_kv_block
+            0,  # extra_topk
+            0,  # num_main_tiles
+            1,  # pbs_extra
+            0,  # stride_extra_kv_block
             False,  # row_xor
             active_heads=active_heads,
             head_offset=head_offset,

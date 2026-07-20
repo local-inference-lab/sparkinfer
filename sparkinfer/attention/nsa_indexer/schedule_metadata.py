@@ -27,7 +27,9 @@ def _build_paged_mqa_schedule_triton(
 ):
     q_offsets = tl.arange(0, BLOCK_BATCH)
     if IS_CONTEXT_LENS_2D:
-        lens_ptrs = context_lens_ptr + q_offsets * context_lens_row_stride + (next_n - 1)
+        lens_ptrs = (
+            context_lens_ptr + q_offsets * context_lens_row_stride + (next_n - 1)
+        )
     else:
         lens_ptrs = context_lens_ptr + q_offsets
 
@@ -42,7 +44,9 @@ def _build_paged_mqa_schedule_triton(
     sm_mask = sm_offsets <= num_sms
     segments_per_sm = total_segments // num_sms
     segment_remainder = total_segments % num_sms
-    segment_starts = sm_offsets * segments_per_sm + tl.minimum(sm_offsets, segment_remainder)
+    segment_starts = sm_offsets * segments_per_sm + tl.minimum(
+        sm_offsets, segment_remainder
+    )
 
     completed_rows = (prefix_sum[None, :] <= segment_starts[:, None]) & q_mask[None, :]
     q_idx = tl.sum(completed_rows.to(tl.int32), axis=1)
@@ -54,7 +58,9 @@ def _build_paged_mqa_schedule_triton(
     kv_split_idx = segment_starts - prev_prefix_sum
 
     tl.store(schedule_ptr + sm_offsets * schedule_row_stride, q_idx, mask=sm_mask)
-    tl.store(schedule_ptr + sm_offsets * schedule_row_stride + 1, kv_split_idx, mask=sm_mask)
+    tl.store(
+        schedule_ptr + sm_offsets * schedule_row_stride + 1, kv_split_idx, mask=sm_mask
+    )
 
 
 def supports_triton_paged_mqa_schedule_metadata(
@@ -87,11 +93,15 @@ def build_paged_mqa_schedule_metadata_torch(
         return out
 
     split_kv = int(block_kv) * int(pages_per_split)
-    num_segments = torch.div(schedule_lens + (split_kv - 1), split_kv, rounding_mode="floor")
+    num_segments = torch.div(
+        schedule_lens + (split_kv - 1), split_kv, rounding_mode="floor"
+    )
     prefix_sum = torch.cumsum(num_segments, dim=0, dtype=torch.int64)
     total_segments = prefix_sum[-1]
 
-    sm_indices = torch.arange(num_sms + 1, dtype=torch.int64, device=context_lens.device)
+    sm_indices = torch.arange(
+        num_sms + 1, dtype=torch.int64, device=context_lens.device
+    )
     segments_per_sm = torch.div(total_segments, num_sms, rounding_mode="floor")
     segment_remainder = torch.remainder(total_segments, num_sms)
     segment_starts = sm_indices * segments_per_sm + torch.minimum(

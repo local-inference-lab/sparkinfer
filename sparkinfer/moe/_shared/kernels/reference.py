@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from sparkinfer.cute.intrinsics import fp4_quantize_values_torch
-from sparkinfer.moe.fused.activations import (
+
+# The flashinfer-TRTLLM cross-kernel oracle helpers live alongside in
+# reference_flashinfer.py, kept separate so this module stays pure-torch.
+from sparkinfer._lib.intrinsics import fp4_quantize_values_torch
+from sparkinfer.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
@@ -45,12 +48,12 @@ class MoERouteTrace:
     routed_out_accum: torch.Tensor
 
 
-
-
 _E8M0_K32_BF16_MAX_SCALE_BYTE = 247
 
 
-def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> OracleMetrics:
+def compare_to_reference(
+    actual: torch.Tensor, reference: torch.Tensor
+) -> OracleMetrics:
     actual_fp32 = actual.float()
     reference_fp32 = reference.float()
     diff = actual_fp32 - reference_fp32
@@ -75,19 +78,21 @@ def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> Oracl
     )
 
 
-def unswizzle_block_scale(swizzled_scale: torch.Tensor, rows: int, cols_blocks: int) -> torch.Tensor:
+def unswizzle_block_scale(
+    swizzled_scale: torch.Tensor, rows: int, cols_blocks: int
+) -> torch.Tensor:
     cols_padded = ((cols_blocks + 3) // 4) * 4
     rows_padded = ((rows + 127) // 128) * 128
     unswizzled = swizzled_scale.view(torch.float8_e4m3fn).reshape(
-        rows_padded // 128, cols_padded // 4, 32, 4, 4,
+        rows_padded // 128,
+        cols_padded // 4,
+        32,
+        4,
+        4,
     )
     unswizzled = unswizzled.permute(0, 3, 2, 1, 4).contiguous()
     unswizzled = unswizzled.reshape(rows_padded, cols_padded)
     return unswizzled[:rows, :cols_blocks].to(torch.float32)
-
-
-
-
 
 
 def _validate_reference_inputs(
@@ -149,15 +154,31 @@ def _apply_gated_activation(
         gate = torch.clamp(gate, max=float(swiglu_limit))
         up = torch.clamp(up, min=-float(swiglu_limit), max=float(swiglu_limit))
     if activation == SWIGLUOAI_UNINTERLEAVE:
-        return gate * torch.sigmoid(float(swiglu_alpha) * gate) * (up + float(swiglu_beta))
+        return (
+            gate * torch.sigmoid(float(swiglu_alpha) * gate) * (up + float(swiglu_beta))
+        )
     return gate * torch.sigmoid(gate) * up
 
 
 def _make_fp4_lut(device: torch.device) -> torch.Tensor:
     return torch.tensor(
         [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
         ],
         dtype=torch.float32,
         device=device,
@@ -232,18 +253,6 @@ def _normalize_w13_layout(w13_layout: str) -> str:
     return layout
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def _quantize_vec_to_fp4_dequant(
     vals_f32: torch.Tensor,
     global_scale: float,
@@ -261,8 +270,7 @@ def _quantize_vec_to_fp4_dequant(
     sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
     sf_times_gs = (
-        sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
-        / global_scale
+        sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
     ).clamp(min=1e-30)
     if scale_math == "direct_division":
         scaled = vals_f32 / sf_times_gs
@@ -346,14 +354,18 @@ def _trace_nvfp4_route(
         )
         gate_out = (gate_dequant @ x_dequant) * alpha_fc1
         up_out = (up_dequant @ x_dequant) * alpha_fc1
-        intermediate = _apply_gated_activation(
-            gate_out,
-            up_out,
-            activation=activation,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        ).to(torch.bfloat16).float()
+        intermediate = (
+            _apply_gated_activation(
+                gate_out,
+                up_out,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
         fc1_dequant = _apply_block_scales(
@@ -441,17 +453,29 @@ def trace_moe_reference_nvfp4_route(
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if token_idx < 0 or token_idx >= x.shape[0]:
-        raise IndexError(f"token_idx {token_idx} is out of range for batch {x.shape[0]}")
+        raise IndexError(
+            f"token_idx {token_idx} is out of range for batch {x.shape[0]}"
+        )
     if route_idx < 0 or route_idx >= topk_ids.shape[1]:
-        raise IndexError(f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}")
+        raise IndexError(
+            f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}"
+        )
 
     x_f32 = x[token_idx].float()
     expert_idx = int(topk_ids[token_idx, route_idx].item())
     router_weight = float(topk_weights[token_idx, route_idx].item())
     alpha_fc1 = float(w1_alphas[expert_idx].item())
     alpha_fc2 = float(w2_alphas[expert_idx].item())
-    gs_fc1 = float(a1_gscale[expert_idx].item()) if a1_gscale.numel() > 1 else float(a1_gscale.item())
-    gs_fc2 = float(a2_gscale[expert_idx].item()) if a2_gscale.numel() > 1 else float(a2_gscale.item())
+    gs_fc1 = (
+        float(a1_gscale[expert_idx].item())
+        if a1_gscale.numel() > 1
+        else float(a1_gscale.item())
+    )
+    gs_fc2 = (
+        float(a2_gscale[expert_idx].item())
+        if a2_gscale.numel() > 1
+        else float(a2_gscale.item())
+    )
     return _trace_nvfp4_route(
         x_f32=x_f32,
         w1_fp4_eid=w1_fp4[expert_idx],
@@ -513,23 +537,44 @@ def moe_reference_f32(
 
     fp4_lut = torch.tensor(
         [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
         ],
         dtype=torch.float32,
         device=x.device,
     )
+
     def dequant_fp4(packed_u8: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
         lo = (packed_u8 & 0x0F).to(torch.int64)
         hi = ((packed_u8 >> 4) & 0x0F).to(torch.int64)
         return torch.stack([fp4_lut[lo], fp4_lut[hi]], dim=-1).reshape(rows, cols)
 
-    def apply_block_scales(raw: torch.Tensor, sf_f32: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    def apply_block_scales(
+        raw: torch.Tensor, sf_f32: torch.Tensor, rows: int, cols: int
+    ) -> torch.Tensor:
         n_blocks = cols // block_size
         sf = sf_f32[:rows, :n_blocks]
-        return raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(rows, cols)
+        return raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(
+            rows, cols
+        )
 
-    def quantize_vec_to_fp4_dequant(vals_f32: torch.Tensor, global_scale: float) -> torch.Tensor:
+    def quantize_vec_to_fp4_dequant(
+        vals_f32: torch.Tensor, global_scale: float
+    ) -> torch.Tensor:
         cols = vals_f32.shape[0]
         n_blocks = cols // block_size
         blocked = vals_f32.reshape(n_blocks, block_size)
@@ -538,7 +583,10 @@ def moe_reference_f32(
         raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
         sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
+        sf_times_gs = (
+            sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
+            / global_scale
+        )
         scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
         quant = fp4_quantize_values_torch(scaled)
         sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -557,21 +605,37 @@ def moe_reference_f32(
             alpha_fc1 = float(w1_alphas[eid].item())
             alpha_fc2 = float(w2_alphas[eid].item())
 
-            gs_fc1 = float(a1_gscale[eid].item()) if a1_gscale.numel() > 1 else float(a1_gscale.item())
-            gs_fc2 = float(a2_gscale[eid].item()) if a2_gscale.numel() > 1 else float(a2_gscale.item())
+            gs_fc1 = (
+                float(a1_gscale[eid].item())
+                if a1_gscale.numel() > 1
+                else float(a1_gscale.item())
+            )
+            gs_fc2 = (
+                float(a2_gscale[eid].item())
+                if a2_gscale.numel() > 1
+                else float(a2_gscale.item())
+            )
 
             x_dequant = quantize_vec_to_fp4_dequant(x_f32, gs_fc1)
 
             w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
 
             if is_gated:
-                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                w13_sf = unswizzle_block_scale(
+                    w1_blockscale[eid], 2 * I_tp, K // block_size
+                )
                 gate_rows, up_rows = _gated_row_slices(activation, I_tp)
                 up_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, up_rows], I_tp, K), w13_sf[up_rows], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, up_rows], I_tp, K),
+                    w13_sf[up_rows],
+                    I_tp,
+                    K,
                 )
                 gate_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, gate_rows], I_tp, K), w13_sf[gate_rows], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, gate_rows], I_tp, K),
+                    w13_sf[gate_rows],
+                    I_tp,
+                    K,
                 )
                 gate_out = (gate_dequant @ x_dequant) * alpha_fc1
                 up_out = (up_dequant @ x_dequant) * alpha_fc1
@@ -586,14 +650,20 @@ def moe_reference_f32(
             else:
                 w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
                 fc1_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w1_sf[:I_tp], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K),
+                    w1_sf[:I_tp],
+                    I_tp,
+                    K,
                 )
                 fc1_out = (fc1_dequant @ x_dequant) * alpha_fc1
                 intermediate = torch.square(torch.relu(fc1_out))
 
             int_dequant = quantize_vec_to_fp4_dequant(intermediate, gs_fc2)
             down_dequant = apply_block_scales(
-                dequant_fp4(w2_fp4[eid], K, I_tp), w2_sf, K, I_tp,
+                dequant_fp4(w2_fp4[eid], K, I_tp),
+                w2_sf,
+                K,
+                I_tp,
             )
             down_out = (down_dequant @ int_dequant) * alpha_fc2
             output[t] += router_w * down_out
@@ -650,7 +720,9 @@ def moe_reference_w4a16_f32(
             w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
 
             if is_gated:
-                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                w13_sf = unswizzle_block_scale(
+                    w1_blockscale[eid], 2 * I_tp, K // block_size
+                )
                 gate_rows, up_rows = _gated_row_slices(activation, I_tp)
                 up_dequant = _apply_block_scales(
                     _dequant_fp4(w1_fp4[eid, up_rows], I_tp, K, fp4_lut),
@@ -763,8 +835,16 @@ def moe_reference_w4a16_fp4_e8m0_k32(
         for k_idx in range(top_k):
             eid = int(topk_ids[t, k_idx].item())
             router_w = float(topk_weights[t, k_idx].item())
-            alpha_fc1 = float(w1_alphas[eid].item()) if w1_alphas.numel() > 1 else float(w1_alphas.item())
-            alpha_fc2 = float(w2_alphas[eid].item()) if w2_alphas.numel() > 1 else float(w2_alphas.item())
+            alpha_fc1 = (
+                float(w1_alphas[eid].item())
+                if w1_alphas.numel() > 1
+                else float(w1_alphas.item())
+            )
+            alpha_fc2 = (
+                float(w2_alphas[eid].item())
+                if w2_alphas.numel() > 1
+                else float(w2_alphas.item())
+            )
 
             w2_sf = _e8m0_scales_to_float(w2_e8m0_scale[eid])
             if is_gated:
@@ -928,9 +1008,7 @@ def decompose_nvfp4_scales_to_mx_residual(
     _ZERO_SENTINEL = -(2**30)
     mant, exp = torch.frexp(pairs)
     del mant
-    floor_log2 = torch.where(
-        pairs > 0, exp - 1, torch.full_like(exp, _ZERO_SENTINEL)
-    )
+    floor_log2 = torch.where(pairs > 0, exp - 1, torch.full_like(exp, _ZERO_SENTINEL))
     e_shared = floor_log2.amax(dim=-1)
     both_zero = e_shared <= _ZERO_SENTINEL // 2
     e_shared = torch.where(both_zero, torch.zeros_like(e_shared), e_shared)
@@ -963,9 +1041,13 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
         (floor_log2[:, 0] - floor_log2[:, 1]).abs(),
         torch.zeros(pairs.shape[0], dtype=exp.dtype, device=s.device),
     )
-    e_shared = torch.where(nonzero, floor_log2, torch.full_like(exp, -(2**30))).amax(dim=-1)
+    e_shared = torch.where(nonzero, floor_log2, torch.full_like(exp, -(2**30))).amax(
+        dim=-1
+    )
     residual_exact = torch.where(
-        nonzero, pairs / torch.exp2(e_shared.to(torch.float32)).unsqueeze(-1), torch.zeros_like(pairs)
+        nonzero,
+        pairs / torch.exp2(e_shared.to(torch.float32)).unsqueeze(-1),
+        torch.zeros_like(pairs),
     )
     residual_stored = residual_e4m3.to(torch.float32).reshape(-1, 2)
 
@@ -974,7 +1056,9 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
     stored = residual_stored.reshape(-1)[nz]
     flushed = (stored == 0) & (exact > 0)
     subnormal = (exact > 0) & (exact < 2.0**-6)
-    rel_err = torch.where(exact > 0, (stored - exact).abs() / exact, torch.zeros_like(exact))
+    rel_err = torch.where(
+        exact > 0, (stored - exact).abs() / exact, torch.zeros_like(exact)
+    )
     total = max(int(nz.sum().item()), 1)
     return {
         "nonzero_scales": float(total),
@@ -987,7 +1071,7 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
 
 
 def _quant_dequant_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
-    from sparkinfer.cute.intrinsics import quant_dequant_mxfp8_torch
+    from sparkinfer._lib.intrinsics import quant_dequant_mxfp8_torch
 
     return quant_dequant_mxfp8_torch(x)
 
@@ -1117,12 +1201,20 @@ def moe_reference_w4a8_mx(
         alpha_fc2 = float(w2_alphas[eid].item())
         fc1_rows = w1_fp4.shape[1]
         w13_eff = _w4a8_effective_weight(
-            w1_fp4[eid], w1_mx_scales[eid], None if w1_residual is None else w1_residual[eid],
-            fc1_rows, K, fp4_lut,
+            w1_fp4[eid],
+            w1_mx_scales[eid],
+            None if w1_residual is None else w1_residual[eid],
+            fc1_rows,
+            K,
+            fp4_lut,
         )
         w2_eff = _w4a8_effective_weight(
-            w2_fp4[eid], w2_mx_scales[eid], None if w2_residual is None else w2_residual[eid],
-            K, I_tp, fp4_lut,
+            w2_fp4[eid],
+            w2_mx_scales[eid],
+            None if w2_residual is None else w2_residual[eid],
+            K,
+            I_tp,
+            fp4_lut,
         )
         xs = x_qd[token_mask]
         if is_gated:
@@ -1146,7 +1238,9 @@ def moe_reference_w4a8_mx(
             intermediate = torch.square(torch.relu(fc1_out))
         int_qd = _quant_dequant_mxfp8_rows(intermediate)
         down_out = (int_qd @ w2_eff.T) * alpha_fc2
-        route_weight = (topk_weights.float() * route_mask.float()).sum(dim=1)[token_mask]
+        route_weight = (topk_weights.float() * route_mask.float()).sum(dim=1)[
+            token_mask
+        ]
         output[token_mask] += route_weight.unsqueeze(1) * down_out
 
     return output
@@ -1207,13 +1301,17 @@ def trace_moe_reference_w4a8_route(
         w1_fp4[expert_idx],
         w1_mx_scales[expert_idx],
         None if w1_residual is None else w1_residual[expert_idx],
-        fc1_rows, K, fp4_lut,
+        fc1_rows,
+        K,
+        fp4_lut,
     )
     w2_eff = _w4a8_effective_weight(
         w2_fp4[expert_idx],
         w2_mx_scales[expert_idx],
         None if w2_residual is None else w2_residual[expert_idx],
-        K, I_tp, fp4_lut,
+        K,
+        I_tp,
+        fp4_lut,
     )
     fc1_out = None
     gate_out = None

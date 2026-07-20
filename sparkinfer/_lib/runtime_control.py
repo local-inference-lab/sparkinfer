@@ -58,7 +58,9 @@ def raise_if_kernel_resolution_frozen(
         details.append(f"key={_summarize_cache_key(cache_key)}")
     if reason is not None:
         details.append(f"reason={reason}")
-    details.append("warm up this kernel shape before calling sparkinfer.freeze_kernel_resolution()")
+    details.append(
+        "warm up this kernel shape before calling sparkinfer.freeze_kernel_resolution()"
+    )
     raise KernelResolutionFrozenError("; ".join(details))
 
 
@@ -67,7 +69,9 @@ def _describe_target(target: object | None) -> str | None:
         return None
     if inspect.ismethod(target):
         module = getattr(target.__func__, "__module__", "")
-        qualname = getattr(target.__func__, "__qualname__", getattr(target.__func__, "__name__", ""))
+        qualname = getattr(
+            target.__func__, "__qualname__", getattr(target.__func__, "__name__", "")
+        )
         return f"{module}.{qualname}" if module else qualname
     if inspect.isfunction(target):
         module = getattr(target, "__module__", "")

@@ -212,7 +212,8 @@ class PCIeDmaAllReduce:
         with torch.cuda.stream(stream):
             for _ in range(3):
                 self._ext.dma_copy(
-                    self._scratch_ptr(nxt, 1), self._scratch_ptr(self.rank, 0),
+                    self._scratch_ptr(nxt, 1),
+                    self._scratch_ptr(self.rank, 0),
                     probe_bytes,
                 )
             start = torch.cuda.Event(enable_timing=True)
@@ -220,7 +221,8 @@ class PCIeDmaAllReduce:
             start.record(stream)
             for _ in range(iters):
                 self._ext.dma_copy(
-                    self._scratch_ptr(nxt, 1), self._scratch_ptr(self.rank, 0),
+                    self._scratch_ptr(nxt, 1),
+                    self._scratch_ptr(self.rank, 0),
                     probe_bytes,
                 )
             end.record(stream)
@@ -230,7 +232,11 @@ class PCIeDmaAllReduce:
         logger.debug(
             "[PCIe DMA allreduce] rank %d -> %d raw peer copy: %.1f GB/s "
             "(%d bytes x %d iters)",
-            self.rank, nxt, gbps, probe_bytes, iters,
+            self.rank,
+            nxt,
+            gbps,
+            probe_bytes,
+            iters,
         )
 
     def _flag_ptr(self, rank: int, slot: int) -> int:
@@ -247,16 +253,9 @@ class PCIeDmaAllReduce:
         override = int(os.getenv("SPARKINFER_PCIE_DMA_PIECES", "0"))
         # pieces=2 measured best at every size (deeper chunking pays an
         # extra wait+add launch chain per piece on the main stream).
-        candidates = (
-            (override,)
-            if 1 <= override <= MAX_PIECES
-            else (2,)
-        )
+        candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
         for pieces in candidates:
-            if (
-                shard_elems % (pieces * 8) == 0
-                and shard_bytes // pieces >= 512 << 10
-            ):
+            if shard_elems % (pieces * 8) == 0 and shard_bytes // pieces >= 512 << 10:
                 return pieces
         return 1
 
@@ -283,7 +282,9 @@ class PCIeDmaAllReduce:
             )
         if out is None:
             out = torch.empty_like(inp)
-        elif out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous():
+        elif (
+            out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous()
+        ):
             raise ValueError("output must match input shape/dtype and be contiguous")
         ext = self._ext
         world = self.world_size
@@ -419,7 +420,8 @@ class PCIeDmaAllReduce:
                     send_dst = fp8_scratch_piece(nxt, k, p)
                 elif not fp8_step:
                     send_src = (
-                        in_piece_ptr(send_chunk, p) if k == 0
+                        in_piece_ptr(send_chunk, p)
+                        if k == 0
                         else piece_ptr(send_chunk, p)
                     )
                     send_bytes = piece_bytes
@@ -514,9 +516,7 @@ class PCIeDmaAllReduce:
 
     def _pick_a2a_chunks(self, shard_elems: int) -> int:
         override = int(os.getenv("SPARKINFER_PCIE_DMA_A2A_CHUNKS", "0"))
-        candidates = (
-            (override,) if 1 <= override <= MAX_PIECES else (4, 3, 2)
-        )
+        candidates = (override,) if 1 <= override <= MAX_PIECES else (4, 3, 2)
         for chunks in candidates:
             if (
                 shard_elems % (chunks * FP8_QUANT_BLOCK) == 0
@@ -744,9 +744,7 @@ def autotune_crossovers(
         with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
             replay()
         device_index = (
-            device.index
-            if device.index is not None
-            else torch.cuda.current_device()
+            device.index if device.index is not None else torch.cuda.current_device()
         )
         dist.barrier(group=nccl_group, device_ids=[device_index])
         with torch.cuda.stream(stream):
@@ -830,8 +828,12 @@ def autotune_crossovers(
                     if rms_norm_op is None:
                         return lambda: oneshot.all_reduce(inp, out=out)
                     return lambda: oneshot.all_reduce_fused_add_rms_norm(
-                        inp, residual, weight, epsilon,
-                        out=out, residual_out=residual_out,
+                        inp,
+                        residual,
+                        weight,
+                        epsilon,
+                        out=out,
+                        residual_out=residual_out,
                     )
 
                 try:
@@ -890,9 +892,7 @@ def autotune_crossovers(
     if dma is not None:
         dma.min_bytes = dma_min if dma_min > 0 else dma.max_bytes + 1
     if dist.get_rank(group=nccl_group) == 0:
-        logger.debug(
-            "  oneshot_max_bytes=%d dma_min_bytes=%d", oneshot_max, dma_min
-        )
+        logger.debug("  oneshot_max_bytes=%d dma_min_bytes=%d", oneshot_max, dma_min)
     return oneshot_max, dma_min
 
 

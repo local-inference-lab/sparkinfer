@@ -21,7 +21,15 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import Any
 
-_SPARKINFER_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+from .env import sync_legacy_env
+from .runtime_patches import apply_cutlass_runtime_patches
+
+sync_legacy_env()
+apply_cutlass_runtime_patches()
+
+# The package fingerprint hashes every source file under this root; it is
+# part of every disk-cache key.  Must resolve to sparkinfer.
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
 _SPEC_MEMO: OrderedDict[tuple[object, ...], Any] = OrderedDict()
@@ -38,7 +46,7 @@ _COMPILE_PROGRESS_COUNT = 0
 _COMPILE_PROGRESS_TOTAL_SECONDS = 0.0
 _EXECUTOR_CACHE_LOCK = RLock()
 _EXECUTOR_CACHE_ATTR = "_sparkinfer_cached_default_executor"
-_VLLM_ENGINE_STARTED_ENV = "SPARKINFER_VLLM_ENGINE_STARTED"
+_VLLM_ENGINE_STARTED_ENV = "SPARKINFER_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "SPARKINFER_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
 _PRINT_COMPILE_PROGRESS_ENV = "SPARKINFER_PRINT_COMPILE_PROGRESS"
 
@@ -111,7 +119,7 @@ class TensorKey:
 
 
 def _spec_memo_enabled() -> bool:
-    raw = os.environ.get("SPARKINFER_CUTE_COMPILE_SPEC_MEMO", "1")
+    raw = os.environ.get("SPARKINFER_COMPILE_SPEC_MEMO", "1")
     return raw.lower() not in {"0", "false", "no", ""}
 
 
@@ -632,12 +640,12 @@ def _compile_memory_cache_key(
 
 
 def _cute_compile_memory_cache_enabled() -> bool:
-    raw = os.environ.get("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", "1")
+    raw = os.environ.get("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
     return raw.lower() not in {"0", "false", "no", ""}
 
 
 def _cute_compile_memory_cache_size() -> int:
-    raw = os.environ.get("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE_SIZE", "1024")
+    raw = os.environ.get("SPARKINFER_COMPILE_MEMORY_CACHE_SIZE", "1024")
     try:
         return max(1, int(raw))
     except ValueError:
@@ -645,21 +653,18 @@ def _cute_compile_memory_cache_size() -> int:
 
 
 def _cute_compile_disk_cache_enabled() -> bool:
-    raw = os.environ.get("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "1")
+    raw = os.environ.get("SPARKINFER_COMPILE_DISK_CACHE", "1")
     return raw.lower() not in {"0", "false", "no", ""}
 
 
 def _cute_compile_cache_dir() -> Path:
-    root = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    root = os.environ.get("SPARKINFER_COMPILE_CACHE_DIR")
     if root:
         return Path(root)
-    cute_cache_dir = os.environ.get("CUTE_DSL_CACHE_DIR")
-    if cute_cache_dir:
-        return Path(cute_cache_dir) / "sparkinfer_object_cache"
     xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
     if xdg_cache_home:
-        return Path(xdg_cache_home) / "sparkinfer" / "cute_compile"
-    return Path.home() / ".cache" / "sparkinfer" / "cute_compile"
+        return Path(xdg_cache_home) / "sparkinfer" / "compile"
+    return Path.home() / ".cache" / "sparkinfer" / "compile"
 
 
 def _cute_compile_log_enabled() -> bool:
@@ -1412,8 +1417,8 @@ def _iter_fingerprint_files(root: Path) -> list[Path]:
 
 def _compute_sparkinfer_package_fingerprint() -> str:
     digest = hashlib.sha256()
-    for path in _iter_fingerprint_files(_SPARKINFER_PACKAGE_ROOT):
-        rel_path = str(path.relative_to(_SPARKINFER_PACKAGE_ROOT))
+    for path in _iter_fingerprint_files(_PACKAGE_ROOT):
+        rel_path = str(path.relative_to(_PACKAGE_ROOT))
         digest.update(rel_path.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -1506,11 +1511,11 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "NVCC_PREPEND_FLAGS",
     }
     operational_env_vars = {
-        "SPARKINFER_CUTE_COMPILE_CACHE_DIR",
-        "SPARKINFER_CUTE_COMPILE_DISK_CACHE",
-        "SPARKINFER_CUTE_COMPILE_MEMORY_CACHE",
-        "SPARKINFER_CUTE_COMPILE_MEMORY_CACHE_SIZE",
-        "SPARKINFER_CUTE_COMPILE_SPEC_MEMO",
+        "SPARKINFER_COMPILE_CACHE_DIR",
+        "SPARKINFER_COMPILE_DISK_CACHE",
+        "SPARKINFER_COMPILE_MEMORY_CACHE",
+        "SPARKINFER_COMPILE_MEMORY_CACHE_SIZE",
+        "SPARKINFER_COMPILE_SPEC_MEMO",
         "SPARKINFER_LOG_CUTE_COMPILES",
         "SPARKINFER_LOG_CUTE_COMPILES_AFTER_ENGINE_START",
         "SPARKINFER_LOG_CUTE_COMPILE_ARGS",
@@ -1544,7 +1549,7 @@ def _function_fingerprint(func: Any) -> tuple[str, str, str]:
     qualname = getattr(
         func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)
     )
-    if module == "sparkinfer" or module.startswith("sparkinfer."):
+    if module.startswith("sparkinfer"):
         return module, qualname, f"sparkinfer:{_sparkinfer_package_fingerprint()}"
     try:
         source = inspect.getsource(func)
@@ -2282,7 +2287,7 @@ def _build_compile_manifest(
         allow_nan=False,
     )
     manifest: dict[str, Any] = {
-        "schema": "sparkinfer.cute.compile_manifest.v3",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
         "cache_key": cache_key,
         "cache_format": cache_format,
         "cache_payload_repr": repr(cache_payload),
@@ -2528,9 +2533,7 @@ def compile(
 
             compile_callable = CompileCallable(dsl_compile_options)
         kwargs = dict(kwargs)
-        kwargs["__dsl_compile_options_key"] = _structural_cache_key(
-            dsl_compile_options
-        )
+        kwargs["__dsl_compile_options_key"] = _structural_cache_key(dsl_compile_options)
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )
@@ -2608,7 +2611,9 @@ def compile(
 
             with _MEMORY_CACHE_LOCK:
                 _COMPILE_MISSES += 1
-            from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
+            from sparkinfer._lib.runtime_control import (
+                raise_if_kernel_resolution_frozen,
+            )
 
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
@@ -2652,7 +2657,9 @@ def compile(
 
     with _MEMORY_CACHE_LOCK:
         _COMPILE_MISSES += 1
-    from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
+    from sparkinfer._lib.runtime_control import (
+        raise_if_kernel_resolution_frozen,
+    )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile",

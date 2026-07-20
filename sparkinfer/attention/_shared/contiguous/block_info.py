@@ -5,7 +5,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from sparkinfer.attention.contiguous.seqlen_info import SeqlenInfoQK
+from sparkinfer.attention._shared.contiguous.seqlen_info import (
+    SeqlenInfoQK,
+)
 
 
 @dataclass(frozen=True)
@@ -25,12 +27,16 @@ class BlockInfo:
         m_block: Int32,
     ) -> Tuple[Int32, Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
-        if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
+        if const_expr(
+            self.is_causal or (self.is_local and self.window_size_right is not None)
+        ):
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
-            n_idx_right = n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
+            n_idx_right = (
+                n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
+            )
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = Int32(0)
         if const_expr(self.is_local and self.window_size_left is not None):

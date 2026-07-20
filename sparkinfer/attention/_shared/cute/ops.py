@@ -17,15 +17,27 @@ def compute_softmax_scale_log2(softmax_scale):
 
 
 def make_tiled_copy_A(
-    copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+    copy_atom: cute.CopyAtom,
+    tiled_mma: cute.TiledMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.TiledCopy:
-    return cute.make_tiled_copy_B(copy_atom, tiled_mma) if const_expr(swapAB) else cute.make_tiled_copy_A(copy_atom, tiled_mma)
+    return (
+        cute.make_tiled_copy_B(copy_atom, tiled_mma)
+        if const_expr(swapAB)
+        else cute.make_tiled_copy_A(copy_atom, tiled_mma)
+    )
 
 
 def make_tiled_copy_B(
-    copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+    copy_atom: cute.CopyAtom,
+    tiled_mma: cute.TiledMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.TiledCopy:
-    return cute.make_tiled_copy_A(copy_atom, tiled_mma) if const_expr(swapAB) else cute.make_tiled_copy_B(copy_atom, tiled_mma)
+    return (
+        cute.make_tiled_copy_A(copy_atom, tiled_mma)
+        if const_expr(swapAB)
+        else cute.make_tiled_copy_B(copy_atom, tiled_mma)
+    )
 
 
 @cute.jit
@@ -47,7 +59,12 @@ def warp_reduce(
 
 @dsl_user_op
 def fmax(
-    a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
+    a: float | Float32,
+    b: float | Float32,
+    c: float | Float32 | None = None,
+    *,
+    loc=None,
+    ip=None,
 ) -> Float32:
     from cutlass import CUDA_VERSION
 
@@ -75,7 +92,9 @@ def fmax(
 
 @cute.jit
 def fmax_reduce(
-    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
 ) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         res = cute.make_rmem_tensor(x.shape, Float32)
@@ -89,10 +108,18 @@ def fmax_reduce(
         local_max[0] = fmax(local_max[0], local_max[1])
         local_max[2] = fmax(local_max[2], local_max[3])
         local_max[0] = fmax(local_max[0], local_max[2])
-        return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
+        return (
+            local_max[0]
+            if const_expr(init_val is None)
+            else fmax(local_max[0], init_val)
+        )
     res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
-    local_max_0 = fmax(init_val, res[0], res[1]) if const_expr(init_val is not None) else fmax(res[0], res[1])
+    local_max_0 = (
+        fmax(init_val, res[0], res[1])
+        if const_expr(init_val is not None)
+        else fmax(res[0], res[1])
+    )
     local_max = [
         local_max_0,
         fmax(res[2], res[3]),
@@ -110,7 +137,9 @@ def fmax_reduce(
 
 @cute.jit
 def fadd_reduce(
-    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
 ) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         if const_expr(init_val is None):
@@ -125,10 +154,18 @@ def fadd_reduce(
     )
     local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
     for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
-        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
-        local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
-        local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
-        local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = cute.arch.add_packed_f32x2(
+            local_sum[0], (res[i + 0], res[i + 1])
+        )
+        local_sum[1] = cute.arch.add_packed_f32x2(
+            local_sum[1], (res[i + 2], res[i + 3])
+        )
+        local_sum[2] = cute.arch.add_packed_f32x2(
+            local_sum[2], (res[i + 4], res[i + 5])
+        )
+        local_sum[3] = cute.arch.add_packed_f32x2(
+            local_sum[3], (res[i + 6], res[i + 7])
+        )
     local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
     local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
     local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
@@ -136,7 +173,9 @@ def fadd_reduce(
 
 
 @dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+def elem_pointer(
+    x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
+) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -144,14 +183,20 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
-            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            (
+                cute.size(tAcA, mode=[0, 1]),
+                cute.size(tAcA, mode=[1]),
+                cute.size(tAcA, mode=[2]),
+            ),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
         ),
         cutlass.Boolean,
     )
     for rest_v in cutlass.range_constexpr(tApA.shape[0]):
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+            tApA[rest_v, 0, rest_k] = cute.elem_less(
+                tAcA[(0, rest_v), 0, rest_k][1], limit
+            )
     return tApA
 
 
@@ -169,12 +214,16 @@ def shuffle_sync(
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
-        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+        val_i32[i] = cute.arch.shuffle_sync(
+            val_i32[i], offset, mask_and_clamp=mask_and_clamp
+        )
     return val[0]
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(
+    val: cutlass.Int32, lane: Optional[cutlass.Int32] = None
+) -> cutlass.Int32:
     if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):

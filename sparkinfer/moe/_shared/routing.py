@@ -27,7 +27,9 @@ def _route_topk_kernel(
     neg_inf = float("-inf")
 
     row_ptr = logits_ptr + pid * logits_row_stride
-    logits = tl.load(row_ptr + expert_offsets, mask=expert_offsets < num_experts, other=neg_inf)
+    logits = tl.load(
+        row_ptr + expert_offsets, mask=expert_offsets < num_experts, other=neg_inf
+    )
     remaining = logits.to(tl.float32)
 
     topk_logits = tl.full((TOPK_BLOCK,), neg_inf, tl.float32)
@@ -87,14 +89,22 @@ def route_topk(
     if topk_logits.dtype != torch.float32:
         raise ValueError(f"expected topk_logits dtype float32, got {topk_logits.dtype}")
     if topk_weights.dtype != torch.float32:
-        raise ValueError(f"expected topk_weights dtype float32, got {topk_weights.dtype}")
+        raise ValueError(
+            f"expected topk_weights dtype float32, got {topk_weights.dtype}"
+        )
     if not router_logits.is_cuda:
         raise ValueError("route_topk requires CUDA tensors")
     if router_logits.shape[1] > 1024:
-        raise ValueError(f"route_topk currently supports up to 1024 experts, got {router_logits.shape[1]}")
+        raise ValueError(
+            f"route_topk currently supports up to 1024 experts, got {router_logits.shape[1]}"
+        )
     if router_logits.stride(-1) != 1:
         raise ValueError("router_logits must be contiguous in the expert dimension")
-    if topk_logits.stride(-1) != 1 or topk_ids.stride(-1) != 1 or topk_weights.stride(-1) != 1:
+    if (
+        topk_logits.stride(-1) != 1
+        or topk_ids.stride(-1) != 1
+        or topk_weights.stride(-1) != 1
+    ):
         raise ValueError("top-k outputs must be contiguous in the top-k dimension")
 
     num_tokens, num_experts = router_logits.shape

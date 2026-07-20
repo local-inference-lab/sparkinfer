@@ -1,90 +1,29 @@
-from .dense import DenseGemmKernel, dense_gemm
-from .block_fp8_linear import (
-    BlockFP8LinearBinding,
-    BlockFP8LinearScratchCaps,
-    BlockFP8LinearScratchPlan,
-    BlockFP8LinearWeight,
-    build_block_fp8_linear_binding,
-    block_fp8_linear_mxfp8,
-    pack_block_fp8_linear_weight_mxfp8,
-    plan_block_fp8_linear_scratch,
-    prewarm_block_fp8_linear_mxfp8,
-    quantize_block_fp8_linear_input_mxfp8,
-)
-from .mxfp8_linear import (
-    MXFP8LinearWeight,
-    is_mxfp8_linear_supported,
-    mxfp8_linear,
-    pack_mxfp8_linear_weight,
-)
-from .wo_projection import (
-    MXFP8Rows,
-    WOProjectionBinding,
-    WOProjectionInvRopeBinding,
-    WOProjectionMXFP8Weights,
-    WOProjectionScratchCaps,
-    WOProjectionScratchPlan,
-    build_wo_projection_binding,
-    build_wo_projection_inv_rope_binding,
-    dequantize_mxfp8_rows_torch,
-    empty_dense_gemm_mnl_view,
-    empty_mxfp8_rows_for_dense_gemm,
-    pack_fp8_block_scaled_weight_mxfp8,
-    pack_mxfp8_scales_for_dense_gemm,
-    pack_wo_projection_fp8_block_scaled_weights_mxfp8,
-    plan_wo_projection_scratch,
-    quantize_mxfp8_rows_torch,
-    quantize_wo_a_input_inv_rope_mxfp8,
-    quantize_wo_a_input_mxfp8,
-    quantize_wo_b_input_mxfp8,
-    quantize_wo_projection_weights_mxfp8_torch,
-    wo_a_dense_gemm_mxfp8,
-    wo_b_dense_gemm_fused_quant_mxfp8,
-    wo_b_dense_gemm_mxfp8,
-    wo_projection_inv_rope_mxfp8,
-    wo_projection_mxfp8,
-)
+"""GEMM ops for sparkinfer.
 
-__all__ = [
-    "DenseGemmKernel",
-    "BlockFP8LinearBinding",
-    "BlockFP8LinearScratchCaps",
-    "BlockFP8LinearScratchPlan",
-    "BlockFP8LinearWeight",
-    "MXFP8LinearWeight",
-    "MXFP8Rows",
-    "WOProjectionBinding",
-    "WOProjectionInvRopeBinding",
-    "WOProjectionMXFP8Weights",
-    "WOProjectionScratchCaps",
-    "WOProjectionScratchPlan",
-    "build_block_fp8_linear_binding",
-    "build_wo_projection_binding",
-    "build_wo_projection_inv_rope_binding",
-    "block_fp8_linear_mxfp8",
-    "dequantize_mxfp8_rows_torch",
-    "dense_gemm",
-    "empty_dense_gemm_mnl_view",
-    "empty_mxfp8_rows_for_dense_gemm",
-    "is_mxfp8_linear_supported",
-    "pack_block_fp8_linear_weight_mxfp8",
-    "pack_fp8_block_scaled_weight_mxfp8",
-    "pack_mxfp8_linear_weight",
-    "pack_mxfp8_scales_for_dense_gemm",
-    "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
-    "plan_block_fp8_linear_scratch",
-    "plan_wo_projection_scratch",
-    "prewarm_block_fp8_linear_mxfp8",
-    "quantize_block_fp8_linear_input_mxfp8",
-    "quantize_mxfp8_rows_torch",
-    "mxfp8_linear",
-    "quantize_wo_a_input_inv_rope_mxfp8",
-    "quantize_wo_a_input_mxfp8",
-    "quantize_wo_b_input_mxfp8",
-    "quantize_wo_projection_weights_mxfp8_torch",
-    "wo_a_dense_gemm_mxfp8",
-    "wo_b_dense_gemm_fused_quant_mxfp8",
-    "wo_b_dense_gemm_mxfp8",
-    "wo_projection_inv_rope_mxfp8",
-    "wo_projection_mxfp8",
-]
+- ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
+- ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
+- ``mxfp8_linear``: ModelOpt MXFP8 linear (one-shot).
+- ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
+_OP_MODULES = ("blockscaled", "block_fp8_linear", "mxfp8_linear", "wo_projection")
+
+
+def __getattr__(name: str) -> Any:
+    if name in _OP_MODULES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(_OP_MODULES)
+
+
+__all__ = list(_OP_MODULES)

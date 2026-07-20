@@ -22,12 +22,20 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
-from sparkinfer.attention._cute import copy as cute_copy
-from sparkinfer.attention._cute import pipeline as cute_pipeline
-from sparkinfer.attention._cute import ops as attention_ops
-from sparkinfer.cute.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
-from sparkinfer.cute.smem import make_smem_memrange_alias, make_tma_aligned_payload_storage
-from sparkinfer.cute.intrinsics import (
+from sparkinfer.attention._shared.cute import copy as cute_copy
+from sparkinfer.attention._shared.cute import (
+    pipeline as cute_pipeline,
+)
+from sparkinfer.attention._shared.cute import ops as attention_ops
+from sparkinfer._lib.intrinsics import (
+    get_ptr_as_int64,
+    shared_ptr_to_u32,
+)
+from sparkinfer._lib.smem import (
+    make_smem_memrange_alias,
+    make_tma_aligned_payload_storage,
+)
+from sparkinfer._lib.intrinsics import (
     bf16_mma_m16n16k16_f32,
     bf16_rowsum_m16k16_f32,
     bfloat2_mul,
@@ -64,7 +72,9 @@ def _assume_strides_aligned(t: cute.Tensor):
 def _assume_tensor_aligned(t: cute.Tensor | None):
     if t is None:
         return None
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=_assume_strides_aligned(t)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=_assume_strides_aligned(t))
+    )
 
 
 def _assume_paged_kv_tma_source_aligned(t: cute.Tensor):
@@ -75,7 +85,9 @@ def _assume_paged_kv_tma_source_aligned(t: cute.Tensor):
             strides.append(stride)
         else:
             strides.append(cute.assume(stride, divby=divby))
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=tuple(strides)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=tuple(strides))
+    )
 
 
 def _make_paged_kv_tma_source_tensor(t: cute.Tensor, stage_tile_rows: int):
@@ -88,7 +100,12 @@ def _make_paged_kv_tma_source_tensor(t: cute.Tensor, stage_tile_rows: int):
         t_pages.iterator,
         cute.make_layout(
             (stage_tile_rows, t_pages.shape[1], t_pages.shape[2], total_page_tiles),
-            stride=(t_pages.stride[0], t_pages.stride[1], t_pages.stride[2], tile_stride),
+            stride=(
+                t_pages.stride[0],
+                t_pages.stride[1],
+                t_pages.stride[2],
+                tile_stride,
+            ),
         ),
     )
 
@@ -111,13 +128,20 @@ def _make_paged_kv_tile_source_tensor(
         t_pages.iterator,
         cute.make_layout(
             (stage_tile_rows, t_pages.shape[1], t_pages.shape[2], total_page_tiles),
-            stride=(t_pages.stride[0], t_pages.stride[1], t_pages.stride[2], tile_stride),
+            stride=(
+                t_pages.stride[0],
+                t_pages.stride[1],
+                t_pages.stride[2],
+                tile_stride,
+            ),
         ),
     )
 
 
 def _make_payload_ptr(payload_u8: cute.Tensor, dtype, offset_bytes: int = 0):
-    ptr = payload_u8.iterator if offset_bytes == 0 else payload_u8.iterator + offset_bytes
+    ptr = (
+        payload_u8.iterator if offset_bytes == 0 else payload_u8.iterator + offset_bytes
+    )
     return cute.recast_ptr(ptr.align(16), dtype=dtype)
 
 
@@ -125,7 +149,9 @@ def _make_payload_tensor(payload_u8: cute.Tensor, dtype, offset_bytes: int, layo
     return cute.make_tensor(_make_payload_ptr(payload_u8, dtype, offset_bytes), layout)
 
 
-def _make_payload_memrange(payload_u8: cute.Tensor, dtype, offset_bytes: int, num_elems: int):
+def _make_payload_memrange(
+    payload_u8: cute.Tensor, dtype, offset_bytes: int, num_elems: int
+):
     return make_smem_memrange_alias(
         dtype,
         num_elems,
@@ -140,7 +166,9 @@ def _get_memrange_tensor(memrange, layout):
 
 
 def _paged_kv_tma_plane_layout(stage_tile_rows: int, kv_tma_plane_head_dim: int):
-    plane_swizzle = os.environ.get("SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+    plane_swizzle = os.environ.get(
+        "SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", ""
+    )
     if plane_swizzle == "none":
         return cute.make_layout(
             (stage_tile_rows, kv_tma_plane_head_dim),
@@ -161,7 +189,9 @@ def _paged_kv_tma_plane_layout(stage_tile_rows: int, kv_tma_plane_head_dim: int)
     )
 
 
-def _paged_kv_tma_plane_stage_layout(stage_tile_rows: int, kv_tma_plane_head_dim: int, num_stages: int):
+def _paged_kv_tma_plane_stage_layout(
+    stage_tile_rows: int, kv_tma_plane_head_dim: int, num_stages: int
+):
     return cute.tile_to_shape(
         _paged_kv_tma_plane_layout(stage_tile_rows, kv_tma_plane_head_dim),
         (stage_tile_rows, kv_tma_plane_head_dim, num_stages),
@@ -185,7 +215,9 @@ def _issue_paged_kv_tma_copy_planes_tma(
     page_idx = tile_token_base // page_size
     page_id = (
         Int32(0)
-        if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
+        if const_expr(
+            os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+        )
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
@@ -209,7 +241,9 @@ def _issue_paged_kv_tma_copy_2planes_tma(
     page_idx = tile_token_base // page_size
     page_id = (
         Int32(0)
-        if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
+        if const_expr(
+            os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+        )
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
@@ -263,7 +297,9 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
     page_tiles_per_page = page_size // stage_tile_rows
     page_id = (
         Int32(0)
-        if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
+        if const_expr(
+            os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+        )
         else mPageTable[request_idx, page_idx]
     )
     full_mbar_ptr = mbar_ptr + producer_state.index
@@ -298,7 +334,9 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
     page_tiles_per_page = page_size // stage_tile_rows
     page_id = (
         Int32(0)
-        if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
+        if const_expr(
+            os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+        )
         else mPageTable[request_idx, page_idx]
     )
     full_mbar_ptr = mbar_ptr + producer_state.index
@@ -370,7 +408,9 @@ def _dump_s_frag_tile(
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
             for reg_id in cutlass.range_constexpr(8):
                 row_slot = (reg_id % 4) // 2
-                row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane_group + 8 * row_slot
+                row = (
+                    warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane_group + 8 * row_slot
+                )
                 col = (
                     warp_kv_idx * num_mma_kv * 16
                     + mma_kv * 16
@@ -384,7 +424,9 @@ def _dump_s_frag_tile(
                     dst_rem = dst_linear - dst_q * (mDst.shape[1] * mDst.shape[2])
                     dst_h = dst_rem // mDst.shape[2]
                     dst_col = dst_rem - dst_h * mDst.shape[2]
-                    mDst[dst_q, dst_h, dst_col] = cutlass.BFloat16(s_frag[mma_q, mma_kv, reg_id])
+                    mDst[dst_q, dst_h, dst_col] = cutlass.BFloat16(
+                        s_frag[mma_q, mma_kv, reg_id]
+                    )
 
 
 @cute.jit
@@ -415,7 +457,11 @@ def _dump_flat_u32_words_offset(
     flat = cute.flatten(sSrc)
     dst_words = cute.size(mDst.shape)
     src_words = cute.size(flat.shape)
-    dump_words = cutlass.select_(src_words < (dst_words - dst_word_offset), src_words, (dst_words - dst_word_offset))
+    dump_words = cutlass.select_(
+        src_words < (dst_words - dst_word_offset),
+        src_words,
+        (dst_words - dst_word_offset),
+    )
     linear = tidx
     while linear < dump_words:
         mDst[dst_word_offset + linear] = flat[linear]
@@ -447,14 +493,15 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
             row_idx = Int32(lane_row + row_iter * 4)
             row_valid = row_idx < packed_tile_rows
             q_head_idx = Int32(q_head_base + row_idx)
-            row_byte_base = (
-                Int64(q_row_idx) * Int64(token_stride_bytes)
-                + Int64(q_head_idx) * Int64(head_stride_bytes)
-            )
+            row_byte_base = Int64(q_row_idx) * Int64(token_stride_bytes) + Int64(
+                q_head_idx
+            ) * Int64(head_stride_bytes)
             for mma_do in cutlass.range_constexpr(4):
                 vec_idx = Int32(lane_col + mma_do * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
-                dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                dst_byte_idx = (
+                    _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                )
                 _cp_async_load_128b_pred(
                     shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
                     get_ptr_as_int64(mQBytes, src_byte_idx),
@@ -468,15 +515,16 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
             q_group_lane = packed_q_idx - q_row_local * group_size
             q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
             q_row_idx = Int32(q_start + q_row_local)
-            row_byte_base = (
-                Int64(q_row_idx) * Int64(token_stride_bytes)
-                + Int64(q_head_idx) * Int64(head_stride_bytes)
-            )
+            row_byte_base = Int64(q_row_idx) * Int64(token_stride_bytes) + Int64(
+                q_head_idx
+            ) * Int64(head_stride_bytes)
             row_idx = Int32(lane_row + row_iter * 4)
             for mma_do in cutlass.range_constexpr(4):
                 vec_idx = Int32(lane_col + mma_do * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
-                dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                dst_byte_idx = (
+                    _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                )
                 _cp_async_load_128b_pred(
                     shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
                     get_ptr_as_int64(mQBytes, src_byte_idx),
@@ -508,21 +556,24 @@ def _async_copy_q_tile_permuted_128b_impl(
     warp_row_base = Int32(warp_q_idx * num_mma_q * 16)
     for mma_q in cutlass.range_constexpr(num_mma_q):
         for row_iter in cutlass.range_constexpr(4):
-            packed_q_idx = Int32(packed_tile_start + warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
+            packed_q_idx = Int32(
+                packed_tile_start + warp_row_base + mma_q * 16 + lane_row + row_iter * 4
+            )
             row_valid = packed_q_idx < (packed_tile_start + packed_tile_rows)
             q_row_local = packed_q_idx // group_size
             q_group_lane = packed_q_idx - q_row_local * group_size
             q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
             q_row_idx = Int32(q_start + q_row_local)
-            row_byte_base = (
-                Int64(q_row_idx) * Int64(token_stride_bytes)
-                + Int64(q_head_idx) * Int64(head_stride_bytes)
-            )
+            row_byte_base = Int64(q_row_idx) * Int64(token_stride_bytes) + Int64(
+                q_head_idx
+            ) * Int64(head_stride_bytes)
             row_idx = Int32(warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
             for mma_do in cutlass.range_constexpr(num_mma_d_qk // 4):
                 vec_idx = Int32(lane_col + mma_do * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
-                dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                dst_byte_idx = (
+                    _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                )
                 _cp_async_load_128b_pred(
                     shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
                     get_ptr_as_int64(mQBytes, src_byte_idx),
@@ -545,7 +596,8 @@ def _dump_plane_stage_words_u32(
     plane0_u32 = cute.make_tensor(
         cute.recast_tensor(
             cute.make_tensor(
-                sStageBytes.iterator + Int32(stage_idx * kv_plane_stage_bytes + 0 * kv_plane_total_bytes),
+                sStageBytes.iterator
+                + Int32(stage_idx * kv_plane_stage_bytes + 0 * kv_plane_total_bytes),
                 cute.make_layout((kv_plane_stage_bytes,), stride=(1,)),
             ),
             cutlass.Uint32,
@@ -555,7 +607,8 @@ def _dump_plane_stage_words_u32(
     plane1_u32 = cute.make_tensor(
         cute.recast_tensor(
             cute.make_tensor(
-                sStageBytes.iterator + Int32(stage_idx * kv_plane_stage_bytes + 1 * kv_plane_total_bytes),
+                sStageBytes.iterator
+                + Int32(stage_idx * kv_plane_stage_bytes + 1 * kv_plane_total_bytes),
                 cute.make_layout((kv_plane_stage_bytes,), stride=(1,)),
             ),
             cutlass.Uint32,
@@ -580,7 +633,10 @@ def _dump_plane_stage_words_u32(
         plane2_u32 = cute.make_tensor(
             cute.recast_tensor(
                 cute.make_tensor(
-                    sStageBytes.iterator + Int32(stage_idx * kv_plane_stage_bytes + 2 * kv_plane_total_bytes),
+                    sStageBytes.iterator
+                    + Int32(
+                        stage_idx * kv_plane_stage_bytes + 2 * kv_plane_total_bytes
+                    ),
                     cute.make_layout((kv_plane_stage_bytes,), stride=(1,)),
                 ),
                 cutlass.Uint32,
@@ -590,7 +646,10 @@ def _dump_plane_stage_words_u32(
         plane3_u32 = cute.make_tensor(
             cute.recast_tensor(
                 cute.make_tensor(
-                    sStageBytes.iterator + Int32(stage_idx * kv_plane_stage_bytes + 3 * kv_plane_total_bytes),
+                    sStageBytes.iterator
+                    + Int32(
+                        stage_idx * kv_plane_stage_bytes + 3 * kv_plane_total_bytes
+                    ),
                     cute.make_layout((kv_plane_stage_bytes,), stride=(1,)),
                 ),
                 cutlass.Uint32,
@@ -716,8 +775,12 @@ def _permute_rowmajor_tile_in_place_to_permuted_128b_vec128(
                 swap_mask = Int32(row_idx % 8)
                 partner_vec = vec_idx ^ swap_mask
                 if vec_idx < partner_vec:
-                    partner_vec_byte_idx = stage_byte_offset + (row_idx * upcast_stride + partner_vec) * 16
-                    partner_vec_addr = shared_ptr_to_u32(sStageBytes.iterator + partner_vec_byte_idx)
+                    partner_vec_byte_idx = (
+                        stage_byte_offset + (row_idx * upcast_stride + partner_vec) * 16
+                    )
+                    partner_vec_addr = shared_ptr_to_u32(
+                        sStageBytes.iterator + partner_vec_byte_idx
+                    )
                     a0, a1, a2, a3 = ld_shared_v4_u32(vec_addr)
                     b0, b1, b2, b3 = ld_shared_v4_u32(partner_vec_addr)
                     st_shared_v4_u32(vec_addr, b0, b1, b2, b3)
@@ -818,20 +881,36 @@ def _apply_attention_sink_after_lse_scale(
         sink_owner = (row_valid != Int32(0)) and (warp_kv_idx == Int32(0))
         if const_expr(split_kv):
             if sink_owner:
-                sink_owner = (chunk_start <= causal_k_limit) and (causal_k_limit < chunk_end)
+                sink_owner = (chunk_start <= causal_k_limit) and (
+                    causal_k_limit < chunk_end
+                )
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
             sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
             new_m = attention_ops.fmax(old_m, sink_m)
-            old_scale = Float32(0.0) if old_m == -Float32.inf else _exp2_approx_ftz_f32(old_m - new_m)
+            old_scale = (
+                Float32(0.0)
+                if old_m == -Float32.inf
+                else _exp2_approx_ftz_f32(old_m - new_m)
+            )
             sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
-            d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * old_scale + sink_scale)
+            d_frag[mma_q, row_slot] = Float32(
+                d_frag[mma_q, row_slot] * old_scale + sink_scale
+            )
             for mma_d in cutlass.range_constexpr(num_mma_d_vo):
                 reg_base = row_slot * 2
-                o_frag[mma_q, mma_d, reg_base + 0] = Float32(o_frag[mma_q, mma_d, reg_base + 0] * old_scale)
-                o_frag[mma_q, mma_d, reg_base + 1] = Float32(o_frag[mma_q, mma_d, reg_base + 1] * old_scale)
-                o_frag[mma_q, mma_d, reg_base + 4] = Float32(o_frag[mma_q, mma_d, reg_base + 4] * old_scale)
-                o_frag[mma_q, mma_d, reg_base + 5] = Float32(o_frag[mma_q, mma_d, reg_base + 5] * old_scale)
+                o_frag[mma_q, mma_d, reg_base + 0] = Float32(
+                    o_frag[mma_q, mma_d, reg_base + 0] * old_scale
+                )
+                o_frag[mma_q, mma_d, reg_base + 1] = Float32(
+                    o_frag[mma_q, mma_d, reg_base + 1] * old_scale
+                )
+                o_frag[mma_q, mma_d, reg_base + 4] = Float32(
+                    o_frag[mma_q, mma_d, reg_base + 4] * old_scale
+                )
+                o_frag[mma_q, mma_d, reg_base + 5] = Float32(
+                    o_frag[mma_q, mma_d, reg_base + 5] * old_scale
+                )
             m_frag[mma_q, row_slot] = Float32(new_m)
 
 
@@ -863,9 +942,7 @@ def _apply_relative_attention_bias(
                         + (reg_id % 2)
                     )
                     distance = (
-                        causal_k_limit[mma_q, row_slot]
-                        - tile_key_base
-                        - key_local
+                        causal_k_limit[mma_q, row_slot] - tile_key_base - key_local
                     )
                     if distance >= Int32(0) and distance < relative_extent:
                         bias = Float32(
@@ -875,9 +952,7 @@ def _apply_relative_attention_bias(
                                 distance,
                             ]
                         )
-                        frag_s[mma_q, mma_kv, reg_id] += (
-                            bias * inverse_softmax_scale
-                        )
+                        frag_s[mma_q, mma_kv, reg_id] += bias * inverse_softmax_scale
 
 
 @dsl_user_op
@@ -932,7 +1007,9 @@ def _smem_addr_from_split_planes_128b(
     plane_idx = col // plane_stride_128b
     local_col = col - plane_idx * plane_stride_128b
     local_offset = row * plane_stride_128b + local_col
-    plane_base_addr = cutlass.select_(plane_idx == Int32(0), plane0_base_addr, plane1_base_addr)
+    plane_base_addr = cutlass.select_(
+        plane_idx == Int32(0), plane0_base_addr, plane1_base_addr
+    )
     return _smem_addr_from_b128_offset(plane_base_addr, local_offset)
 
 
@@ -942,7 +1019,9 @@ def _transpose_view(a: cute.Tensor) -> cute.Tensor:
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
 
 
-def _convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
+def _convert_layout_acc_mn(
+    acc_layout: cute.Layout, transpose: bool = False
+) -> cute.Layout:
     acc_layout_col_major = cute.make_layout(acc_layout.shape)
     shape = (
         (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
@@ -969,7 +1048,9 @@ def _convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> 
 
 
 def _reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, _convert_layout_acc_mn(acc.layout, transpose=transpose))
+    return cute.make_tensor(
+        acc.iterator, _convert_layout_acc_mn(acc.layout, transpose=transpose)
+    )
 
 
 @cute.jit
@@ -1057,7 +1138,11 @@ def _warp_mma_gemm_rs(
     cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
-            cute.copy(smem_thr_copy_B, tCsB[None, None, k + 1], tCrB_copy_view[None, None, k + 1])
+            cute.copy(
+                smem_thr_copy_B,
+                tCsB[None, None, k + 1],
+                tCrB_copy_view[None, None, k + 1],
+            )
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
@@ -1090,7 +1175,9 @@ def _literal_qk_mma_into_sfrag_plane_bf16(
             q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
             q_col = mma_d * 2 + lane // 16
             q_offset = _permuted_offset_128b(q_row, q_col, upcast_stride_q)
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset))
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_base_addr, q_offset)
+            )
             a_regs[mma_q, 0] = a0
             a_regs[mma_q, 1] = a1
             a_regs[mma_q, 2] = a2
@@ -1106,10 +1193,18 @@ def _literal_qk_mma_into_sfrag_plane_bf16(
             k_plane_base_addr = k_plane3_base_addr
 
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            k_row = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + 8 * (lane // 16) + lane % 8
+            k_row = (
+                row_base
+                + warp_kv_idx * num_mma_kv * 16
+                + mma_kv * 16
+                + 8 * (lane // 16)
+                + lane % 8
+            )
             k_col = mma_d_local * 2 + (lane % 16) // 8
             k_offset = _permuted_offset_128b(k_row, k_col, upcast_stride_plane)
-            b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(k_plane_base_addr, k_offset))
+            b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(k_plane_base_addr, k_offset)
+            )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
@@ -1164,10 +1259,14 @@ def _literal_qk_mma_into_sfrag_plane_bf16_row0_1x1(
 
         q_col0 = mma_d0 * 2 + lane // 16
         q_offset0 = _permuted_offset_128b(q_row, q_col0, upcast_stride_q)
-        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset0))
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(q_base_addr, q_offset0)
+        )
         q_col1 = mma_d1 * 2 + lane // 16
         q_offset1 = _permuted_offset_128b(q_row, q_col1, upcast_stride_q)
-        a4, a5, a6, a7 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset1))
+        a4, a5, a6, a7 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(q_base_addr, q_offset1)
+        )
 
         plane_idx0 = mma_d0 // 4
         mma_d0_local = mma_d0 - plane_idx0 * 4
@@ -1182,7 +1281,9 @@ def _literal_qk_mma_into_sfrag_plane_bf16_row0_1x1(
 
         k_col0 = mma_d0_local * 2 + (lane % 16) // 8
         k_offset0 = _permuted_offset_128b(k_row, k_col0, upcast_stride_plane)
-        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(k_plane_base_addr, k_offset0))
+        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(k_plane_base_addr, k_offset0)
+        )
 
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
@@ -1224,7 +1325,9 @@ def _literal_qk_mma_into_sfrag_plane_bf16_row0_1x1(
 
         k_col1 = mma_d1_local * 2 + (lane % 16) // 8
         k_offset1 = _permuted_offset_128b(k_row, k_col1, upcast_stride_plane)
-        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(k_plane_base_addr, k_offset1))
+        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(k_plane_base_addr, k_offset1)
+        )
 
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
@@ -1288,13 +1391,19 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw(
         )
         q_offset_cur = q_offset
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
+            )
             a_regs[mma_q, 0] = a0
             a_regs[mma_q, 1] = a1
             a_regs[mma_q, 2] = a2
             a_regs[mma_q, 3] = a3
-            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
-        q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d) - Int32(num_mma_q * 16 * upcast_stride_q)
+            q_offset_cur = _advance_offset_by_row_128b(
+                q_offset_cur, 16, upcast_stride_q
+            )
+        q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d) - Int32(
+            num_mma_q * 16 * upcast_stride_q
+        )
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -1305,18 +1414,16 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw(
                 upcast_stride_full,
             )
             if const_expr(mma_d % 2 == 0):
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_left_half_b16(
-                    k_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_left_half_b16(k_addr)
             else:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_right_half_b16(
-                    k_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_right_half_b16(k_addr)
             b_f8_0 = frag_layout_swizzle_16b_to_8b(b_f8_0)
             b_f8_1 = frag_layout_swizzle_16b_to_8b(b_f8_1)
             b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
             b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_1)
-            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, 16, upcast_stride_full)
+            k_offset_cur = _advance_offset_by_row_128b(
+                k_offset_cur, 16, upcast_stride_full
+            )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
@@ -1347,9 +1454,9 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw(
                 s_frag[mma_q, mma_kv, 7] = d7
 
         if const_expr(mma_d % 2 == 1):
-            k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_d // 2) - Int32(
-                num_mma_kv * 16 * upcast_stride_full
-            )
+            k_offset = _advance_offset_by_column_128b_2(
+                k_offset_cur, mma_d // 2
+            ) - Int32(num_mma_kv * 16 * upcast_stride_full)
         else:
             k_offset = k_offset_cur - Int32(num_mma_kv * 16 * upcast_stride_full)
 
@@ -1384,7 +1491,9 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
         mma_d1 = mma_d0 + 1
 
         q_offset_cur = q_offset
-        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
+        )
         q_offset_mid = _advance_offset_by_column_128b_2(
             _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q),
             mma_d0,
@@ -1429,7 +1538,9 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
         s_frag[0, 0, 7] = d7
 
         q_offset_cur = q_offset_mid
-        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+            _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
+        )
         q_offset = _advance_offset_by_column_128b_2(
             _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q),
             mma_d1,
@@ -1510,12 +1621,16 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
         q_offset_cur = q_offset
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
+            )
             a_regs_k0[mma_q, 0] = a0
             a_regs_k0[mma_q, 1] = a1
             a_regs_k0[mma_q, 2] = a2
             a_regs_k0[mma_q, 3] = a3
-            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
+            q_offset_cur = _advance_offset_by_row_128b(
+                q_offset_cur, 16, upcast_stride_q
+            )
 
         mma_d0 = mma_pair * 2
         q_offset_mid = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0) - Int32(
@@ -1523,12 +1638,16 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         )
         q_offset_cur = q_offset_mid
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
+            )
             q_regs[mma_q, 0] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 0], a0)
             q_regs[mma_q, 1] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 1], a1)
             q_regs[mma_q, 2] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 2], a2)
             q_regs[mma_q, 3] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 3], a3)
-            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
+            q_offset_cur = _advance_offset_by_row_128b(
+                q_offset_cur, 16, upcast_stride_q
+            )
         q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0 + 1) - Int32(
             num_mma_q * 16 * upcast_stride_q
         )
@@ -1542,7 +1661,9 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
             b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
-            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, 16, upcast_stride_k)
+            k_offset_cur = _advance_offset_by_row_128b(
+                k_offset_cur, 16, upcast_stride_k
+            )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 qa0 = q_regs[mma_q, 0]
@@ -1835,13 +1956,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 upcast_stride_full,
             )
             if const_expr(mma_d % 2 == 0):
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(
-                    v_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(v_addr)
             else:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(
-                    v_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(v_addr)
             b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
             b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
             b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
@@ -1862,7 +1979,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
             if const_expr(mma_d % 2 == 1):
-                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
+                v_offset_cur = _advance_offset_by_column_128b_2(
+                    v_offset_cur, mma_d // 2
+                )
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -1890,7 +2009,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 o_frag[mma_q, mma_d, 5] = d5
                 o_frag[mma_q, mma_d, 6] = d6
                 o_frag[mma_q, mma_d, 7] = d7
-        v_offset = _advance_offset_by_row_128b(v_offset_cur, 16, upcast_stride_full) - Int32(num_mma_d_vo)
+        v_offset = _advance_offset_by_row_128b(
+            v_offset_cur, 16, upcast_stride_full
+        ) - Int32(num_mma_d_vo)
     v_offset -= Int32(16 * num_mma_kv * upcast_stride_full)
 
 
@@ -1937,13 +2058,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                 upcast_stride_full,
             )
             if const_expr(mma_d % 2 == 0):
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(
-                    v_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(v_addr)
             else:
-                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(
-                    v_addr
-                )
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(v_addr)
             b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
             b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
             b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
@@ -1964,7 +2081,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
             if const_expr(mma_d % 2 == 1):
-                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
+                v_offset_cur = _advance_offset_by_column_128b_2(
+                    v_offset_cur, mma_d // 2
+                )
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -1992,7 +2111,9 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                 o_frag[mma_q, mma_d, 5] = d5
                 o_frag[mma_q, mma_d, 6] = d6
                 o_frag[mma_q, mma_d, 7] = d7
-        v_offset = _advance_offset_by_row_128b(v_offset_cur, 16, upcast_stride_full) - Int32(num_mma_d_vo)
+        v_offset = _advance_offset_by_row_128b(
+            v_offset_cur, 16, upcast_stride_full
+        ) - Int32(num_mma_d_vo)
     v_offset -= Int32(16 * num_mma_kv * upcast_stride_full)
 
 
@@ -2100,17 +2221,61 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
         mma_kv0 = mma_pair * 2
         mma_kv1 = mma_kv0 + 1
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            a_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 0], v_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 0], v_scale_bf2)) & mask16) << shift16
+            a_regs[mma_q, 0] = (
+                cvt_bf16x2_to_e4m3x2(
+                    bfloat2_mul(p_frag[mma_q, mma_kv0, 0], v_scale_bf2)
+                )
+                & mask16
+            ) | (
+                (
+                    cvt_bf16x2_to_e4m3x2(
+                        bfloat2_mul(p_frag[mma_q, mma_kv1, 0], v_scale_bf2)
+                    )
+                    & mask16
+                )
+                << shift16
             )
-            a_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 1], v_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 1], v_scale_bf2)) & mask16) << shift16
+            a_regs[mma_q, 1] = (
+                cvt_bf16x2_to_e4m3x2(
+                    bfloat2_mul(p_frag[mma_q, mma_kv0, 1], v_scale_bf2)
+                )
+                & mask16
+            ) | (
+                (
+                    cvt_bf16x2_to_e4m3x2(
+                        bfloat2_mul(p_frag[mma_q, mma_kv1, 1], v_scale_bf2)
+                    )
+                    & mask16
+                )
+                << shift16
             )
-            a_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 2], v_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 2], v_scale_bf2)) & mask16) << shift16
+            a_regs[mma_q, 2] = (
+                cvt_bf16x2_to_e4m3x2(
+                    bfloat2_mul(p_frag[mma_q, mma_kv0, 2], v_scale_bf2)
+                )
+                & mask16
+            ) | (
+                (
+                    cvt_bf16x2_to_e4m3x2(
+                        bfloat2_mul(p_frag[mma_q, mma_kv1, 2], v_scale_bf2)
+                    )
+                    & mask16
+                )
+                << shift16
             )
-            a_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 3], v_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 3], v_scale_bf2)) & mask16) << shift16
+            a_regs[mma_q, 3] = (
+                cvt_bf16x2_to_e4m3x2(
+                    bfloat2_mul(p_frag[mma_q, mma_kv0, 3], v_scale_bf2)
+                )
+                & mask16
+            ) | (
+                (
+                    cvt_bf16x2_to_e4m3x2(
+                        bfloat2_mul(p_frag[mma_q, mma_kv1, 3], v_scale_bf2)
+                    )
+                    & mask16
+                )
+                << shift16
             )
 
         v_offset_k0 = v_offset
@@ -2207,8 +2372,12 @@ def _literal_update_mdo_states_fp32_pack_p(
                     ),
                 )
                 m_new = attention_ops.fmax(m_new, m_local)
-            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+            m_new = attention_ops.fmax(
+                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2)
+            )
+            m_new = attention_ops.fmax(
+                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1)
+            )
 
             scale_term = (
                 Float32(1.0)
@@ -2437,9 +2606,15 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                         s_frag1[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_ops.fmax(m_new, attention_ops.fmax(m_local0, m_local1))
-            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
-            m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+                m_new = attention_ops.fmax(
+                    m_new, attention_ops.fmax(m_local0, m_local1)
+                )
+            m_new = attention_ops.fmax(
+                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2)
+            )
+            m_new = attention_ops.fmax(
+                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1)
+            )
 
             scale_term = (
                 Float32(1.0)
@@ -2573,9 +2748,13 @@ class PagedForwardKernel:
         self.page_size = int(page_size)
         self.page_tiles_per_entry = int(page_tiles_per_entry)
         if self.page_size not in (64, 128):
-            raise ValueError(f"paged decode kernel supports page_size 64 or 128, got {self.page_size}")
+            raise ValueError(
+                f"paged decode kernel supports page_size 64 or 128, got {self.page_size}"
+            )
         if self.page_size == 64 and self.page_tiles_per_entry != 1:
-            raise ValueError("page_size=64 paged decode requires page_tiles_per_entry=1")
+            raise ValueError(
+                "page_size=64 paged decode requires page_tiles_per_entry=1"
+            )
         if self.page_tiles_per_entry < self.page_size // 64:
             raise ValueError(
                 "page_tiles_per_entry must cover at least the logical page rows: "
@@ -2588,9 +2767,11 @@ class PagedForwardKernel:
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
         self.stage_tile_rows = traits.cta_tile_kv
         q_stage_bytes = traits.cta_tile_q * traits.head_dim_qk * (dtype_q.width // 8)
-        kv_stage_bytes = self.stage_tile_rows * (
-            traits.head_dim_qk + traits.head_dim_vo
-        ) * (dtype_kv_storage.width // 8)
+        kv_stage_bytes = (
+            self.stage_tile_rows
+            * (traits.head_dim_qk + traits.head_dim_vo)
+            * (dtype_kv_storage.width // 8)
+        )
         bf16_minimax_head128_decode = (
             decode_only
             and not self.has_relative_attention_bias
@@ -2616,12 +2797,16 @@ class PagedForwardKernel:
             3
             if (
                 bf16_minimax_head128_decode
-                and q_stage_bytes + 3 * kv_stage_bytes <= traits.max_smem_per_threadblock
+                and q_stage_bytes + 3 * kv_stage_bytes
+                <= traits.max_smem_per_threadblock
             )
-            else
-            1
+            else 1
             if traits.num_warps_kv > 1 or self.kv_is_fp8
-            else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
+            else (
+                2
+                if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock
+                else 1
+            )
         )
         self.shared_storage_bytes = max(
             int(traits.shared_storage_bytes),
@@ -2684,13 +2869,19 @@ class PagedForwardKernel:
                 "extend and legacy non-TMA ingress use dedicated specialized kernels."
             )
         if self.num_stages != 1 and not bf16_minimax_head128_decode:
-            raise NotImplementedError("PagedForwardKernel cleanup assumes the single-stage decode TMA family.")
+            raise NotImplementedError(
+                "PagedForwardKernel cleanup assumes the single-stage decode TMA family."
+            )
         if traits.num_warps_kv <= 1:
             raise NotImplementedError(
                 "PagedForwardKernel is now decode-only; single-KV-warp extend paths use standalone raw kernels."
             )
-        tma_debug_dump = os.environ.get("SPARKINFER_PAGED_KV_TMA_DEBUG_DUMP", "")
-        paged_debug_dump = os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "")
+        tma_debug_dump = os.environ.get(
+            "SPARKINFER_PAGED_KV_TMA_DEBUG_DUMP", ""
+        )
+        paged_debug_dump = os.environ.get(
+            "SPARKINFER_PAGED_KV_DEBUG_DUMP", ""
+        )
         self.debug_dump_paged_kv_tma_k = self.use_paged_kv_tma and tma_debug_dump == "K"
         self.debug_dump_paged_kv_tma_s = self.use_paged_kv_tma and tma_debug_dump == "S"
         self.debug_dump_paged_kv_tma_v = self.use_paged_kv_tma and tma_debug_dump == "V"
@@ -2724,25 +2915,35 @@ class PagedForwardKernel:
             and not self.kv_is_fp8
         )
         self.kv_tma_plane_head_dim = 128 if self.kv_is_fp8 else 64
-        self.kv_tma_plane_mem_dtype = cutlass.Uint8 if self.kv_is_fp8 else self.dtype_kv_storage
+        self.kv_tma_plane_mem_dtype = (
+            cutlass.Uint8 if self.kv_is_fp8 else self.dtype_kv_storage
+        )
         self.kv_tma_internal_type = None
         self.k_tma_plane_count = (
-            (traits.head_dim_qk + self.kv_tma_plane_head_dim - 1) // self.kv_tma_plane_head_dim
+            (traits.head_dim_qk + self.kv_tma_plane_head_dim - 1)
+            // self.kv_tma_plane_head_dim
             if self.use_paged_kv_tma_exact_plane_bf16_layout
             else 1
         )
         self.v_tma_plane_count = (
-            (traits.head_dim_vo + self.kv_tma_plane_head_dim - 1) // self.kv_tma_plane_head_dim
+            (traits.head_dim_vo + self.kv_tma_plane_head_dim - 1)
+            // self.kv_tma_plane_head_dim
             if self.use_paged_kv_tma_exact_plane_bf16_layout
             else 1
         )
         self.kv_tma_plane_count = max(self.k_tma_plane_count, self.v_tma_plane_count)
         kv_storage_bytes = dtype_kv_storage.width // 8
         self.kv_tma_copy_bytes_k = (
-            self.stage_tile_rows * self.k_tma_plane_count * self.kv_tma_plane_head_dim * kv_storage_bytes
+            self.stage_tile_rows
+            * self.k_tma_plane_count
+            * self.kv_tma_plane_head_dim
+            * kv_storage_bytes
         )
         self.kv_tma_copy_bytes_v = (
-            self.stage_tile_rows * self.v_tma_plane_count * self.kv_tma_plane_head_dim * kv_storage_bytes
+            self.stage_tile_rows
+            * self.v_tma_plane_count
+            * self.kv_tma_plane_head_dim
+            * kv_storage_bytes
         )
         self.use_native_fp8_qk_mma = (
             use_native_fp8_qk
@@ -2759,9 +2960,13 @@ class PagedForwardKernel:
             and traits.num_mma_kv % 2 == 0
         )
         self.decode_native_fp8_runtime_chunk_guard = (
-            self.use_native_fp8_qk_mma and decode_only and decode_native_fp8_runtime_chunk_guard
+            self.use_native_fp8_qk_mma
+            and decode_only
+            and decode_native_fp8_runtime_chunk_guard
         )
-        self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.softmax_scale_log2 = Float32(
+            (traits.head_dim_qk**-0.5) * attention_ops.LOG2_E
+        )
         self.inverse_softmax_scale = Float32(traits.head_dim_qk**0.5)
 
     def _get_shared_storage_cls(self):
@@ -2771,7 +2976,9 @@ class PagedForwardKernel:
         )
 
     def _get_paged_kv_tma_plane_layout(self):
-        plane_swizzle = os.environ.get("SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+        plane_swizzle = os.environ.get(
+            "SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", ""
+        )
         if plane_swizzle == "none":
             return cute.make_layout(
                 (self.stage_tile_rows, self.kv_tma_plane_head_dim),
@@ -2813,7 +3020,11 @@ class PagedForwardKernel:
                 (self.stage_tile_rows, head_dim),
                 (0, 1),
             )
-        swizzle = make_swizzle(3, 4, 4) if self.dtype_kv_storage.width == 8 else make_swizzle(3, 3, 5)
+        swizzle = (
+            make_swizzle(3, 4, 4)
+            if self.dtype_kv_storage.width == 8
+            else make_swizzle(3, 3, 5)
+        )
         return cute.make_composed_layout(
             swizzle,
             0,
@@ -2838,8 +3049,12 @@ class PagedForwardKernel:
         q_row_idx,
         cache_len,
     ):
-        block_count = (cache_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(self.MSA_BLOCK_TOKENS)
-        block_count = cutlass.select_(block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK))
+        block_count = (cache_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(
+            self.MSA_BLOCK_TOKENS
+        )
+        block_count = cutlass.select_(
+            block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK)
+        )
         block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
         if const_expr(self.page_size == 128):
             # Whole-page walk: the host planner and the in-graph Triton updater
@@ -2933,8 +3148,12 @@ class PagedForwardKernel:
         page_size = Int32(self.page_size)
         lane_row = lane // 8
         lane_col = lane % 8
-        for tile_iter in cutlass.range_constexpr(self.traits.num_mma_kv * 4 // self.traits.num_warps_q):
-            row_idx = Int32(warp_linear_idx * 4 + lane_row + tile_iter * self.total_warps * 4)
+        for tile_iter in cutlass.range_constexpr(
+            self.traits.num_mma_kv * 4 // self.traits.num_warps_q
+        ):
+            row_idx = Int32(
+                warp_linear_idx * 4 + lane_row + tile_iter * self.total_warps * 4
+            )
             token_idx = Int32(tile_token_base + row_idx)
             page_iter = token_idx // page_size
             entry_idx = token_idx - page_iter * page_size
@@ -2948,7 +3167,10 @@ class PagedForwardKernel:
             for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
                 vec_idx = Int32(lane_col + vec_iter * 8)
                 src_byte_idx = row_byte_base + vec_idx * 16
-                dst_byte_idx = stage_byte_offset + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
+                dst_byte_idx = (
+                    stage_byte_offset
+                    + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
+                )
                 vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
                 if const_expr(fill_zero):
                     _cp_async_load_128b_zfill(
@@ -2983,7 +3205,14 @@ class PagedForwardKernel:
         page_idx,
         sub_tile,
     ):
-        page_id = Int32(0) if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
+        page_id = (
+            Int32(0)
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                == "1"
+            )
+            else mPageTable[request_idx, page_idx]
+        )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
@@ -3004,7 +3233,14 @@ class PagedForwardKernel:
         page_idx,
         sub_tile,
     ):
-        page_id = Int32(0) if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
+        page_id = (
+            Int32(0)
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                == "1"
+            )
+            else mPageTable[request_idx, page_idx]
+        )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
@@ -3023,7 +3259,14 @@ class PagedForwardKernel:
         page_idx,
         sub_tile,
     ):
-        page_id = Int32(0) if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
+        page_id = (
+            Int32(0)
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                == "1"
+            )
+            else mPageTable[request_idx, page_idx]
+        )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
@@ -3040,7 +3283,14 @@ class PagedForwardKernel:
         page_idx,
         sub_tile,
     ):
-        page_id = Int32(0) if const_expr(os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
+        page_id = (
+            Int32(0)
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                == "1"
+            )
+            else mPageTable[request_idx, page_idx]
+        )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
@@ -3092,21 +3342,31 @@ class PagedForwardKernel:
         warp_row_base = Int32(warp_q_idx * self.traits.num_mma_q * 16)
         for mma_q in cutlass.range_constexpr(self.traits.num_mma_q):
             for row_iter in cutlass.range_constexpr(4):
-                packed_q_idx = Int32(packed_tile_start + warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
+                packed_q_idx = Int32(
+                    packed_tile_start
+                    + warp_row_base
+                    + mma_q * 16
+                    + lane_row
+                    + row_iter * 4
+                )
                 row_valid = packed_q_idx < (packed_tile_start + packed_tile_rows)
                 q_row_local = packed_q_idx // group_size
                 q_group_lane = packed_q_idx - q_row_local * group_size
                 q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
                 q_row_idx = Int32(q_start + q_row_local)
-                row_byte_base = (
-                    Int64(q_row_idx) * Int64(token_stride_bytes)
-                    + Int64(q_head_idx) * Int64(head_stride_bytes)
-                )
+                row_byte_base = Int64(q_row_idx) * Int64(token_stride_bytes) + Int64(
+                    q_head_idx
+                ) * Int64(head_stride_bytes)
                 row_idx = Int32(warp_row_base + mma_q * 16 + lane_row + row_iter * 4)
                 for mma_do in cutlass.range_constexpr(self.traits.num_mma_d_qk // 4):
                     vec_idx = Int32(lane_col + mma_do * 8)
                     src_byte_idx = row_byte_base + vec_idx * 16
-                    dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, self.traits.upcast_stride_q) * 16
+                    dst_byte_idx = (
+                        _permuted_offset_128b(
+                            row_idx, vec_idx, self.traits.upcast_stride_q
+                        )
+                        * 16
+                    )
                     _cp_async_load_128b_pred(
                         shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mQBytes, src_byte_idx),
@@ -3168,12 +3428,18 @@ class PagedForwardKernel:
         if const_expr(len(mQ.shape) != 3):
             raise ValueError("mQ must have shape (total_q, q_heads, head_dim)")
         if const_expr(len(mKCache.shape) != 4 or len(mVCache.shape) != 4):
-            raise ValueError("mKCache and mVCache must have shape (num_pages, page_size, kv_heads, head_dim)")
+            raise ValueError(
+                "mKCache and mVCache must have shape (num_pages, page_size, kv_heads, head_dim)"
+            )
         if const_expr(len(mPageTable.shape) != 2):
             raise ValueError("mPageTable must have shape (batch, max_pages)")
         if const_expr(len(mCacheSeqlens.shape) != 1 or len(mCuSeqlensQ.shape) != 1):
             raise ValueError("mCacheSeqlens and mCuSeqlensQ must be rank-1")
-        if const_expr(len(mRequestIndices.shape) != 1 or len(mQoTileIndices.shape) != 1 or len(mKvTileIndices.shape) != 1):
+        if const_expr(
+            len(mRequestIndices.shape) != 1
+            or len(mQoTileIndices.shape) != 1
+            or len(mKvTileIndices.shape) != 1
+        ):
             raise ValueError("worklist tensors must be rank-1")
         if const_expr(
             len(mOIndptr.shape) != 1
@@ -3181,7 +3447,9 @@ class PagedForwardKernel:
             or len(mKvWindowStartTokens.shape) != 1
             or len(mBlockValidMask.shape) != 1
         ):
-            raise ValueError("mOIndptr, mKvChunkSizePtr, mKvWindowStartTokens, and mBlockValidMask must be rank-1")
+            raise ValueError(
+                "mOIndptr, mKvChunkSizePtr, mKvWindowStartTokens, and mBlockValidMask must be rank-1"
+            )
         if const_expr(len(mO.shape) != 3 or len(mLSE.shape) != 2):
             raise ValueError("mO must be rank-3 and mLSE must be rank-2")
         if const_expr(mKDescale is not None and len(mKDescale.shape) not in (1, 2)):
@@ -3191,15 +3459,16 @@ class PagedForwardKernel:
         if const_expr(self.msa_block_sparse and mQ2KIndices is None):
             raise ValueError("MSA block-sparse paged attention requires mQ2KIndices")
         if const_expr(
-            self.has_relative_attention_bias
-            and len(mRelativeAttentionBias.shape) != 3
+            self.has_relative_attention_bias and len(mRelativeAttentionBias.shape) != 3
         ):
             raise ValueError(
                 "mRelativeAttentionBias must have shape "
                 "(total_q_capacity, q_heads, relative_extent)"
             )
         if const_expr(self.msa_block_sparse and self.window_left >= 0):
-            raise ValueError("MSA block-sparse paged attention does not support window_left")
+            raise ValueError(
+                "MSA block-sparse paged attention does not support window_left"
+            )
         if const_expr(
             self.msa_block_sparse
             and (
@@ -3209,10 +3478,15 @@ class PagedForwardKernel:
                 or self.stage_tile_rows != 64
             )
         ):
-            raise ValueError("MSA block-sparse decode requires page_size in (64, 128), gqa_group_size=16, and head_dim=128")
+            raise ValueError(
+                "MSA block-sparse decode requires page_size in (64, 128), gqa_group_size=16, and head_dim=128"
+            )
         if const_expr(mQ.element_type != self.dtype_q):
             raise TypeError("mQ dtype must match dtype_q")
-        if const_expr(mKCache.element_type != self.dtype_kv_storage or mVCache.element_type != self.dtype_kv_storage):
+        if const_expr(
+            mKCache.element_type != self.dtype_kv_storage
+            or mVCache.element_type != self.dtype_kv_storage
+        ):
             raise TypeError("mKCache/mVCache dtype must match dtype_kv_storage")
         if const_expr(mO.element_type != self.dtype_o):
             raise TypeError("mO dtype must match dtype_o")
@@ -3236,8 +3510,12 @@ class PagedForwardKernel:
         mO = _assume_tensor_aligned(mO)
 
         if const_expr(self.page_size == 64):
-            mKCacheT = cute.make_tensor(mKCache.iterator, cute.select(mKCache.layout, mode=[1, 3, 2, 0]))
-            mVCacheT = cute.make_tensor(mVCache.iterator, cute.select(mVCache.layout, mode=[1, 3, 2, 0]))
+            mKCacheT = cute.make_tensor(
+                mKCache.iterator, cute.select(mKCache.layout, mode=[1, 3, 2, 0])
+            )
+            mVCacheT = cute.make_tensor(
+                mVCache.iterator, cute.select(mVCache.layout, mode=[1, 3, 2, 0])
+            )
             mKCacheT = _assume_paged_kv_tma_source_aligned(mKCacheT)
             mVCacheT = _assume_paged_kv_tma_source_aligned(mVCacheT)
         else:
@@ -3409,7 +3687,9 @@ class PagedForwardKernel:
                 request_partial_end = mOIndptr[request_idx + 1]
             cache_len = mCacheSeqlens[request_idx]
         packed_qo_len = qo_len * group_size
-        if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+        if const_expr(
+            self.single_request_decode_graph or self.single_qtile_decode_graph
+        ):
             packed_tile_start = Int32(0)
             packed_tile_end = packed_qo_len
         elif const_expr(self.decode_only):
@@ -3436,7 +3716,9 @@ class PagedForwardKernel:
                 q_start,
                 cache_len,
             )
-            chunk_start = kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+            chunk_start = (
+                kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+            )
             chunk_end = (
                 cutlass.select_(
                     (kv_tile_idx + 1) * kv_chunk_size < selected_token_count,
@@ -3447,8 +3729,16 @@ class PagedForwardKernel:
                 else selected_token_count
             )
         else:
-            kv_window_start = mKvWindowStartTokens[request_idx] if const_expr(self.window_left >= 0) else Int32(0)
-            chunk_start = kv_window_start + kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else kv_window_start
+            kv_window_start = (
+                mKvWindowStartTokens[request_idx]
+                if const_expr(self.window_left >= 0)
+                else Int32(0)
+            )
+            chunk_start = (
+                kv_window_start + kv_tile_idx * kv_chunk_size
+                if const_expr(self.split_kv)
+                else kv_window_start
+            )
             chunk_end = (
                 cutlass.select_(
                     kv_window_start + (kv_tile_idx + 1) * kv_chunk_size < cache_len,
@@ -3464,7 +3754,10 @@ class PagedForwardKernel:
                 if const_expr(self.regularized_decode_graph)
                 else (
                     request_partial_end - request_partial_start
-                    if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph)
+                    if const_expr(
+                        self.single_request_decode_graph
+                        or self.single_qtile_decode_graph
+                    )
                     else (request_partial_end - request_partial_start) // qo_len
                 )
             )
@@ -3473,10 +3766,22 @@ class PagedForwardKernel:
         page_size = mKCache.shape[1]
         stage_tile_rows = self.stage_tile_rows
         q_bytes = self.traits.q_smem_bytes
-        k_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_qk * (self.dtype_kv_storage.width // 8)
-        v_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_vo * (self.dtype_kv_storage.width // 8)
+        k_bytes = (
+            self.num_stages
+            * stage_tile_rows
+            * self.traits.head_dim_qk
+            * (self.dtype_kv_storage.width // 8)
+        )
+        v_bytes = (
+            self.num_stages
+            * stage_tile_rows
+            * self.traits.head_dim_vo
+            * (self.dtype_kv_storage.width // 8)
+        )
         kv_plane_stage_bytes = (
-            stage_tile_rows * self.kv_tma_plane_head_dim * (self.dtype_kv_storage.width // 8)
+            stage_tile_rows
+            * self.kv_tma_plane_head_dim
+            * (self.dtype_kv_storage.width // 8)
         )
         kv_plane_total_bytes = self.num_stages * kv_plane_stage_bytes
         k_payload_bytes = max(k_bytes, self.k_tma_plane_count * kv_plane_total_bytes)
@@ -3513,14 +3818,16 @@ class PagedForwardKernel:
         cpasync.prefetch_descriptor(tma_atom_K)
         cpasync.prefetch_descriptor(tma_atom_V)
         payload_u8 = cute.make_tensor(
-            payload_ptr,
-            cute.make_layout((self.shared_storage_bytes,), stride=(1,))
+            payload_ptr, cute.make_layout((self.shared_storage_bytes,), stride=(1,))
         )
         sQ = _make_payload_tensor(
             payload_u8,
             self.dtype_q,
             0,
-            cute.make_layout((self.traits.cta_tile_q, self.traits.head_dim_qk), stride=(self.traits.head_dim_qk, 1)),
+            cute.make_layout(
+                (self.traits.cta_tile_q, self.traits.head_dim_qk),
+                stride=(self.traits.head_dim_qk, 1),
+            ),
         )
         sQTile = sQ
         sK = _make_payload_tensor(
@@ -3529,8 +3836,12 @@ class PagedForwardKernel:
             q_bytes,
             cute.make_layout(
                 (stage_tile_rows, self.traits.head_dim_qk, self.num_stages),
-                stride=(self.traits.head_dim_qk, 1, stage_tile_rows * self.traits.head_dim_qk),
-            )
+                stride=(
+                    self.traits.head_dim_qk,
+                    1,
+                    stage_tile_rows * self.traits.head_dim_qk,
+                ),
+            ),
         )
         sKStageBytes = _make_payload_tensor(
             payload_u8,
@@ -3544,8 +3855,12 @@ class PagedForwardKernel:
             v_payload_offset,
             cute.make_layout(
                 (stage_tile_rows, self.traits.head_dim_vo, self.num_stages),
-                stride=(self.traits.head_dim_vo, 1, stage_tile_rows * self.traits.head_dim_vo),
-            )
+                stride=(
+                    self.traits.head_dim_vo,
+                    1,
+                    stage_tile_rows * self.traits.head_dim_vo,
+                ),
+            ),
         )
         sVStageBytes = _make_payload_tensor(
             payload_u8,
@@ -3681,7 +3996,9 @@ class PagedForwardKernel:
                 ),
                 self.dtype_q,
             ).iterator,
-            cute.make_layout((self.traits.cta_tile_q * self.traits.head_dim_qk,), stride=(1,)),
+            cute.make_layout(
+                (self.traits.cta_tile_q * self.traits.head_dim_qk,), stride=(1,)
+            ),
         )
         sKTC = None
         sVTC = None
@@ -3842,12 +4159,20 @@ class PagedForwardKernel:
         sKU8 = (
             sK
             if const_expr(self.kv_is_fp8 and self.dtype_kv_storage == cutlass.Uint8)
-            else (cute.recast_tensor(sK, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None)
+            else (
+                cute.recast_tensor(sK, cutlass.Uint8)
+                if const_expr(self.kv_is_fp8)
+                else None
+            )
         )
         sVU8 = (
             sV
             if const_expr(self.kv_is_fp8 and self.dtype_kv_storage == cutlass.Uint8)
-            else (cute.recast_tensor(sV, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None)
+            else (
+                cute.recast_tensor(sV, cutlass.Uint8)
+                if const_expr(self.kv_is_fp8)
+                else None
+            )
         )
         if const_expr(self.traits.num_warps_kv > 1):
             sync_payload = cute.recast_tensor(
@@ -3855,13 +4180,25 @@ class PagedForwardKernel:
                 Float32,
             )
             sync_o_row_stride = self.traits.head_dim_vo + (
-                24 if (not self.kv_is_fp8 and self.dtype_o == cutlass.BFloat16 and self.traits.cta_tile_q == 16) else 0
+                24
+                if (
+                    not self.kv_is_fp8
+                    and self.dtype_o == cutlass.BFloat16
+                    and self.traits.cta_tile_q == 16
+                )
+                else 0
             )
-            sync_o_elems = self.traits.num_warps_kv * self.traits.cta_tile_q * sync_o_row_stride
+            sync_o_elems = (
+                self.traits.num_warps_kv * self.traits.cta_tile_q * sync_o_row_stride
+            )
             sSyncO = cute.make_tensor(
                 sync_payload.iterator,
                 cute.make_layout(
-                    (self.traits.num_warps_kv, self.traits.cta_tile_q, self.traits.head_dim_vo),
+                    (
+                        self.traits.num_warps_kv,
+                        self.traits.cta_tile_q,
+                        self.traits.head_dim_vo,
+                    ),
                     stride=(
                         self.traits.cta_tile_q * sync_o_row_stride,
                         sync_o_row_stride,
@@ -3879,7 +4216,11 @@ class PagedForwardKernel:
             sDecodeStage = cute.make_tensor(
                 cute.recast_tensor(sync_payload, self.dtype_o).iterator,
                 cute.make_layout(
-                    (self.traits.num_warps_kv, self.traits.cta_tile_q, self.traits.head_dim_vo * 2),
+                    (
+                        self.traits.num_warps_kv,
+                        self.traits.cta_tile_q,
+                        self.traits.head_dim_vo * 2,
+                    ),
                     stride=(
                         self.traits.cta_tile_q * sync_o_row_stride * 2,
                         sync_o_row_stride * 2,
@@ -3907,10 +4248,14 @@ class PagedForwardKernel:
             and not (self.msa_block_sparse and self.split_kv)
         )
         split_store_v128 = const_expr(
-            self.split_kv and self.traits.num_warps_kv == 1 and self.dtype_o == cutlass.BFloat16
+            self.split_kv
+            and self.traits.num_warps_kv == 1
+            and self.dtype_o == cutlass.BFloat16
         )
         final_store_v128 = const_expr(
-            not self.split_kv and self.traits.num_warps_kv == 1 and self.dtype_o == cutlass.BFloat16
+            not self.split_kv
+            and self.traits.num_warps_kv == 1
+            and self.dtype_o == cutlass.BFloat16
         )
         decode_qwen_single_row_fastpath = const_expr(
             self.decode_only
@@ -4043,7 +4388,9 @@ class PagedForwardKernel:
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
             if const_expr(self.bf16_minimax_role_specialized_decode):
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.traits.num_threads)
+                cute.arch.barrier(
+                    barrier_id=1, number_of_threads=self.traits.num_threads
+                )
             else:
                 cute.arch.sync_threads()
         else:
@@ -4092,20 +4439,38 @@ class PagedForwardKernel:
         warp_kv_base = warp_kv_idx * num_mma_kv * 16
         lane_group = lane // 4
         lane_pair_base = 2 * (lane % 4)
-        row_local_idx = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        row_valid = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
+        row_local_idx = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        row_valid = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+        )
         q_token_local = None
         q_head_idx_frag = None
         q_row_idx_frag = None
         causal_k_limit = None
         if const_expr(not decode_row_metadata_fastpath):
-            q_token_local = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-            q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-            q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-            causal_k_limit = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        frag_s_layout = cute.make_layout((num_mma_q, num_mma_kv, 8), stride=(num_mma_kv * 8, 8, 1))
-        frag_p_layout = cute.make_layout((num_mma_q, num_mma_kv, 4), stride=(num_mma_kv * 4, 4, 1))
-        frag_o_layout = cute.make_layout((num_mma_q, num_mma_d_vo, 8), stride=(num_mma_d_vo * 8, 8, 1))
+            q_token_local = cute.make_rmem_tensor(
+                cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+            )
+            q_head_idx_frag = cute.make_rmem_tensor(
+                cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+            )
+            q_row_idx_frag = cute.make_rmem_tensor(
+                cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+            )
+            causal_k_limit = cute.make_rmem_tensor(
+                cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32
+            )
+        frag_s_layout = cute.make_layout(
+            (num_mma_q, num_mma_kv, 8), stride=(num_mma_kv * 8, 8, 1)
+        )
+        frag_p_layout = cute.make_layout(
+            (num_mma_q, num_mma_kv, 4), stride=(num_mma_kv * 4, 4, 1)
+        )
+        frag_o_layout = cute.make_layout(
+            (num_mma_q, num_mma_d_vo, 8), stride=(num_mma_d_vo * 8, 8, 1)
+        )
         s_frag = cute.make_rmem_tensor(
             frag_s_layout,
             Float32,
@@ -4125,15 +4490,25 @@ class PagedForwardKernel:
             frag_o_layout,
             Float32,
         )
-        m_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32)
-        d_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32)
+        m_frag = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32
+        )
+        d_frag = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32
+        )
         p_frag = cute.make_rmem_tensor(
             frag_p_layout,
             Uint32,
         )
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
-        decode_q_head_base = Int32(kv_head_idx * group_size) if const_expr(decode_row_metadata_fastpath) else Int32(0)
-        decode_q_row_idx = Int32(request_idx) if const_expr(decode_row_metadata_fastpath) else Int32(0)
+        decode_q_head_base = (
+            Int32(kv_head_idx * group_size)
+            if const_expr(decode_row_metadata_fastpath)
+            else Int32(0)
+        )
+        decode_q_row_idx = (
+            Int32(request_idx) if const_expr(decode_row_metadata_fastpath) else Int32(0)
+        )
         decode_partial_row_idx = (
             Int32(request_partial_start + kv_tile_idx)
             if const_expr(decode_row_metadata_fastpath and self.split_kv)
@@ -4142,7 +4517,9 @@ class PagedForwardKernel:
 
         for mma_q in cutlass.range_constexpr(num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
-                packed_row_local = warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                packed_row_local = (
+                    warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                )
                 row_local_idx[mma_q, row_slot] = Int32(packed_row_local)
                 if const_expr(decode_qwen_single_row_fastpath):
                     if const_expr(row_slot == 0):
@@ -4160,9 +4537,14 @@ class PagedForwardKernel:
                     valid_row = packed_row_local < packed_tile_rows
                     row_valid[mma_q, row_slot] = Int32(valid_row)
                     if valid_row:
-                        if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+                        if const_expr(
+                            self.single_request_decode_graph
+                            or self.single_qtile_decode_graph
+                        ):
                             q_token_local[mma_q, row_slot] = Int32(0)
-                            q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + packed_row_local)
+                            q_head_idx_frag[mma_q, row_slot] = Int32(
+                                kv_head_idx * group_size + packed_row_local
+                            )
                             q_row_idx_frag[mma_q, row_slot] = Int32(q_start)
                             causal_k_limit[mma_q, row_slot] = Int32(cache_len - qo_len)
                         elif const_expr(not decode_row_metadata_fastpath):
@@ -4170,9 +4552,15 @@ class PagedForwardKernel:
                             token_local = packed_q_idx // group_size
                             q_group_lane = packed_q_idx - token_local * group_size
                             q_token_local[mma_q, row_slot] = Int32(token_local)
-                            q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
-                            q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
-                            causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
+                            q_head_idx_frag[mma_q, row_slot] = Int32(
+                                kv_head_idx * group_size + q_group_lane
+                            )
+                            q_row_idx_frag[mma_q, row_slot] = Int32(
+                                q_start + token_local
+                            )
+                            causal_k_limit[mma_q, row_slot] = Int32(
+                                token_local + cache_len - qo_len
+                            )
                         else:
                             pass
                     elif const_expr(not decode_row_metadata_fastpath):
@@ -4325,7 +4713,11 @@ class PagedForwardKernel:
         consume_stage_idx = Int32(0)
         tile_base = chunk_start
         while tile_base < chunk_end:
-            tile_limit = cutlass.select_(tile_base + stage_tile_rows < chunk_end, tile_base + stage_tile_rows, chunk_end)
+            tile_limit = cutlass.select_(
+                tile_base + stage_tile_rows < chunk_end,
+                tile_base + stage_tile_rows,
+                chunk_end,
+            )
             tile_key_base = self._tile_key_base(
                 mQ2KIndices,
                 kv_head_idx,
@@ -4335,18 +4727,26 @@ class PagedForwardKernel:
             tile_tokens = tile_limit - tile_base
             if const_expr(self.msa_block_sparse):
                 live_tokens = cache_len - tile_key_base
-                live_tokens = cutlass.select_(live_tokens < Int32(0), Int32(0), live_tokens)
-                tile_tokens = cutlass.select_(live_tokens < tile_tokens, live_tokens, tile_tokens)
+                live_tokens = cutlass.select_(
+                    live_tokens < Int32(0), Int32(0), live_tokens
+                )
+                tile_tokens = cutlass.select_(
+                    live_tokens < tile_tokens, live_tokens, tile_tokens
+                )
             pipeline_k.consumer_wait(
                 k_consumer_state,
                 pipeline_k.consumer_try_wait(k_consumer_state),
             )
             if const_expr(self.bf16_minimax_role_specialized_decode):
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.traits.num_threads)
+                cute.arch.barrier(
+                    barrier_id=1, number_of_threads=self.traits.num_threads
+                )
             else:
                 cute.arch.sync_threads()
 
-            if const_expr(self.debug_dump_paged_kv_tma_k or self.debug_dump_paged_kv_tma_v):
+            if const_expr(
+                self.debug_dump_paged_kv_tma_k or self.debug_dump_paged_kv_tma_v
+            ):
                 if work_idx == Int32(0) and kv_head_idx == Int32(0):
                     _dump_tma_stage_rows(
                         mO,
@@ -4361,7 +4761,9 @@ class PagedForwardKernel:
                     )
                 _exit_thread()
 
-            subtile_base = Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
+            subtile_base = (
+                Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
+            )
             for _ in cutlass.range_constexpr(1):
                 if const_expr(self.kv_is_fp8):
                     frag_S = cute.make_rmem_tensor(
@@ -4375,11 +4777,18 @@ class PagedForwardKernel:
                     k_smem_base_addr = shared_ptr_to_u32(
                         sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     )
-                    k_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
-                    k_plane1_total_offset = Int32(
-                        kv_plane_total_bytes if const_expr(self.k_tma_plane_count > 1) else 0
+                    k_stage_plane_offset = Int32(
+                        consume_stage_idx * kv_plane_stage_bytes
                     )
-                    if const_expr(self.use_native_fp8_qk_mma and not self.decode_native_fp8_runtime_chunk_guard):
+                    k_plane1_total_offset = Int32(
+                        kv_plane_total_bytes
+                        if const_expr(self.k_tma_plane_count > 1)
+                        else 0
+                    )
+                    if const_expr(
+                        self.use_native_fp8_qk_mma
+                        and not self.decode_native_fp8_runtime_chunk_guard
+                    ):
                         _literal_qk_mma_into_sfrag_mxfp8_raw(
                             frag_S,
                             q_smem_base_addr,
@@ -4387,15 +4796,22 @@ class PagedForwardKernel:
                             lane,
                             warp_q_idx,
                             warp_kv_idx,
-                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            Int32(0)
+                            if const_expr(self.traits.num_warps_kv > 1)
+                            else subtile_base,
                             num_mma_q,
                             num_mma_kv,
                             self.traits.num_mma_d_qk,
                             tc_upcast_stride_qk,
                             self.traits.upcast_stride_k,
                         )
-                    elif const_expr(self.use_native_fp8_qk_mma and self.decode_native_fp8_runtime_chunk_guard):
-                        if kv_chunk_size >= Int32(self.DECODE_NATIVE_FP8_RUNTIME_CHUNK_THRESHOLD):
+                    elif const_expr(
+                        self.use_native_fp8_qk_mma
+                        and self.decode_native_fp8_runtime_chunk_guard
+                    ):
+                        if kv_chunk_size >= Int32(
+                            self.DECODE_NATIVE_FP8_RUNTIME_CHUNK_THRESHOLD
+                        ):
                             _literal_qk_mma_into_sfrag_mxfp8_raw(
                                 frag_S,
                                 q_smem_base_addr,
@@ -4403,7 +4819,9 @@ class PagedForwardKernel:
                                 lane,
                                 warp_q_idx,
                                 warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                Int32(0)
+                                if const_expr(self.traits.num_warps_kv > 1)
+                                else subtile_base,
                                 num_mma_q,
                                 num_mma_kv,
                                 self.traits.num_mma_d_qk,
@@ -4416,15 +4834,21 @@ class PagedForwardKernel:
                                     frag_S,
                                     q_smem_base_addr,
                                     shared_ptr_to_u32(
-                                        sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                        sKStageBytes.iterator
+                                        + k_stage_plane_offset
+                                        + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sKStageBytes.iterator + k_stage_plane_offset + k_plane1_total_offset
+                                        sKStageBytes.iterator
+                                        + k_stage_plane_offset
+                                        + k_plane1_total_offset
                                     ),
                                     lane,
                                     warp_q_idx,
                                     warp_kv_idx,
-                                    Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                    Int32(0)
+                                    if const_expr(self.traits.num_warps_kv > 1)
+                                    else subtile_base,
                                     self.traits.num_mma_d_qk,
                                     tc_upcast_stride_qk,
                                     tc_upcast_stride_plane,
@@ -4434,15 +4858,21 @@ class PagedForwardKernel:
                                     frag_S,
                                     q_smem_base_addr,
                                     shared_ptr_to_u32(
-                                        sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                        sKStageBytes.iterator
+                                        + k_stage_plane_offset
+                                        + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sKStageBytes.iterator + k_stage_plane_offset + k_plane1_total_offset
+                                        sKStageBytes.iterator
+                                        + k_stage_plane_offset
+                                        + k_plane1_total_offset
                                     ),
                                     lane,
                                     warp_q_idx,
                                     warp_kv_idx,
-                                    Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                    Int32(0)
+                                    if const_expr(self.traits.num_warps_kv > 1)
+                                    else subtile_base,
                                     num_mma_q,
                                     num_mma_kv,
                                     self.traits.num_mma_d_qk,
@@ -4455,15 +4885,21 @@ class PagedForwardKernel:
                                 frag_S,
                                 q_smem_base_addr,
                                 shared_ptr_to_u32(
-                                    sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                    sKStageBytes.iterator
+                                    + k_stage_plane_offset
+                                    + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sKStageBytes.iterator + k_stage_plane_offset + k_plane1_total_offset
+                                    sKStageBytes.iterator
+                                    + k_stage_plane_offset
+                                    + k_plane1_total_offset
                                 ),
                                 lane,
                                 warp_q_idx,
                                 warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                Int32(0)
+                                if const_expr(self.traits.num_warps_kv > 1)
+                                else subtile_base,
                                 self.traits.num_mma_d_qk,
                                 tc_upcast_stride_qk,
                                 tc_upcast_stride_plane,
@@ -4473,15 +4909,21 @@ class PagedForwardKernel:
                                 frag_S,
                                 q_smem_base_addr,
                                 shared_ptr_to_u32(
-                                    sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                    sKStageBytes.iterator
+                                    + k_stage_plane_offset
+                                    + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sKStageBytes.iterator + k_stage_plane_offset + k_plane1_total_offset
+                                    sKStageBytes.iterator
+                                    + k_stage_plane_offset
+                                    + k_plane1_total_offset
                                 ),
                                 lane,
                                 warp_q_idx,
                                 warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                Int32(0)
+                                if const_expr(self.traits.num_warps_kv > 1)
+                                else subtile_base,
                                 num_mma_q,
                                 num_mma_kv,
                                 self.traits.num_mma_d_qk,
@@ -4490,34 +4932,67 @@ class PagedForwardKernel:
                             )
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                            if const_expr(decode_row_metadata_fastpath and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                            if const_expr(
+                                decode_row_metadata_fastpath
+                                and self.traits.num_warps_q == 1
+                                and num_mma_q == 1
+                            ):
                                 if group_size == Int32(8) or group_size == Int32(6):
                                     for reg_id in cutlass.range_constexpr(8):
                                         if const_expr(((reg_id % 4) // 2) == 0):
                                             key_local = (
-                                                warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                                warp_kv_base
+                                                + mma_kv * 16
+                                                + lane_pair_base
+                                                + 8 * (reg_id // 4)
+                                                + (reg_id % 2)
                                             )
                                             valid = row_valid[mma_q, 0] != 0
                                             if valid:
-                                                valid = valid and key_local < tile_tokens
+                                                valid = (
+                                                    valid and key_local < tile_tokens
+                                                )
                                             if const_expr(self.window_left >= 0):
                                                 if valid:
                                                     key_pos = tile_key_base + key_local
-                                                    row_causal_k_limit = Int32(cache_len - qo_len)
-                                                    window_start = row_causal_k_limit - Int32(self.window_left)
-                                                    window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
-                                                    valid = valid and key_pos >= window_start
+                                                    row_causal_k_limit = Int32(
+                                                        cache_len - qo_len
+                                                    )
+                                                    window_start = (
+                                                        row_causal_k_limit
+                                                        - Int32(self.window_left)
+                                                    )
+                                                    window_start = cutlass.select_(
+                                                        window_start > Int32(0),
+                                                        window_start,
+                                                        Int32(0),
+                                                    )
+                                                    valid = (
+                                                        valid
+                                                        and key_pos >= window_start
+                                                    )
                                             if valid:
-                                                frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                                frag_S[mma_q, mma_kv, reg_id] = (
+                                                    frag_S[mma_q, mma_kv, reg_id]
+                                                    * k_scale
+                                                )
                                             else:
-                                                frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                                frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                                    -Float32.inf
+                                                )
                                         else:
-                                            frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                            frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                                -Float32.inf
+                                            )
                                 else:
                                     for reg_id in cutlass.range_constexpr(8):
                                         row_slot = (reg_id % 4) // 2
                                         key_local = (
-                                            warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                            warp_kv_base
+                                            + mma_kv * 16
+                                            + lane_pair_base
+                                            + 8 * (reg_id // 4)
+                                            + (reg_id % 2)
                                         )
                                         valid = row_valid[mma_q, row_slot] != 0
                                         if valid:
@@ -4525,19 +5000,38 @@ class PagedForwardKernel:
                                         if const_expr(self.window_left >= 0):
                                             if valid:
                                                 key_pos = tile_key_base + key_local
-                                                row_causal_k_limit = Int32(cache_len - qo_len)
-                                                window_start = row_causal_k_limit - Int32(self.window_left)
-                                                window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
-                                                valid = valid and key_pos >= window_start
+                                                row_causal_k_limit = Int32(
+                                                    cache_len - qo_len
+                                                )
+                                                window_start = (
+                                                    row_causal_k_limit
+                                                    - Int32(self.window_left)
+                                                )
+                                                window_start = cutlass.select_(
+                                                    window_start > Int32(0),
+                                                    window_start,
+                                                    Int32(0),
+                                                )
+                                                valid = (
+                                                    valid and key_pos >= window_start
+                                                )
                                         if valid:
-                                            frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                            frag_S[mma_q, mma_kv, reg_id] = (
+                                                frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                            )
                                         else:
-                                            frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                            frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                                -Float32.inf
+                                            )
                             else:
                                 for reg_id in cutlass.range_constexpr(8):
                                     row_slot = (reg_id % 4) // 2
                                     key_local = (
-                                        warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                        warp_kv_base
+                                        + mma_kv * 16
+                                        + lane_pair_base
+                                        + 8 * (reg_id // 4)
+                                        + (reg_id % 2)
                                     )
                                     valid = row_valid[mma_q, row_slot] != 0
                                     if valid:
@@ -4551,45 +5045,83 @@ class PagedForwardKernel:
                                                 + 8 * (reg_id // 4)
                                                 + (reg_id % 2)
                                             )
-                                            valid = valid and key_pos <= causal_k_limit[mma_q, row_slot]
+                                            valid = (
+                                                valid
+                                                and key_pos
+                                                <= causal_k_limit[mma_q, row_slot]
+                                            )
                                             if const_expr(self.window_left >= 0):
-                                                window_start = causal_k_limit[mma_q, row_slot] - Int32(self.window_left)
-                                                window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
-                                                valid = valid and key_pos >= window_start
+                                                window_start = causal_k_limit[
+                                                    mma_q, row_slot
+                                                ] - Int32(self.window_left)
+                                                window_start = cutlass.select_(
+                                                    window_start > Int32(0),
+                                                    window_start,
+                                                    Int32(0),
+                                                )
+                                                valid = (
+                                                    valid and key_pos >= window_start
+                                                )
                                     elif const_expr(self.window_left >= 0):
                                         if valid:
                                             key_pos = tile_key_base + key_local
-                                            row_causal_k_limit = Int32(cache_len - qo_len)
-                                            window_start = row_causal_k_limit - Int32(self.window_left)
-                                            window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                            row_causal_k_limit = Int32(
+                                                cache_len - qo_len
+                                            )
+                                            window_start = row_causal_k_limit - Int32(
+                                                self.window_left
+                                            )
+                                            window_start = cutlass.select_(
+                                                window_start > Int32(0),
+                                                window_start,
+                                                Int32(0),
+                                            )
                                             valid = valid and key_pos >= window_start
                                     if valid:
-                                        frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                        frag_S[mma_q, mma_kv, reg_id] = (
+                                            frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                        )
                                     else:
-                                        frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                            -Float32.inf
+                                        )
                 else:
-                    literal_key_base = Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base
+                    literal_key_base = (
+                        Int32(0)
+                        if const_expr(self.traits.num_warps_kv > 1)
+                        else subtile_base
+                    )
                     frag_S = cute.make_rmem_tensor(
                         frag_s_layout,
                         Float32,
                     )
                     frag_S.fill(0.0)
-                    k_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                    k_stage_plane_offset = Int32(
+                        consume_stage_idx * kv_plane_stage_bytes
+                    )
                     if const_expr(decode_bf16_row0_qk_fastpath):
                         _literal_qk_mma_into_sfrag_plane_bf16_row0_1x1(
                             frag_S,
                             q_smem_base_addr,
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(1 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(2 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(3 * kv_plane_total_bytes)
                             ),
                             lane,
                             warp_q_idx,
@@ -4604,16 +5136,24 @@ class PagedForwardKernel:
                             frag_S,
                             q_smem_base_addr,
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(1 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(2 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sKStageBytes.iterator + k_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                sKStageBytes.iterator
+                                + k_stage_plane_offset
+                                + Int32(3 * kv_plane_total_bytes)
                             ),
                             lane,
                             warp_q_idx,
@@ -4643,14 +5183,21 @@ class PagedForwardKernel:
                                         if const_expr(self.window_left >= 0):
                                             if valid:
                                                 key_pos = tile_key_base + key_local
-                                                row_causal_k_limit = Int32(cache_len - qo_len)
-                                                window_start = row_causal_k_limit - Int32(self.window_left)
+                                                row_causal_k_limit = Int32(
+                                                    cache_len - qo_len
+                                                )
+                                                window_start = (
+                                                    row_causal_k_limit
+                                                    - Int32(self.window_left)
+                                                )
                                                 window_start = cutlass.select_(
                                                     window_start > Int32(0),
                                                     window_start,
                                                     Int32(0),
                                                 )
-                                                valid = valid and key_pos >= window_start
+                                                valid = (
+                                                    valid and key_pos >= window_start
+                                                )
                                         # Keep each score selection scalar.  NVVM 23
                                         # otherwise combines adjacent values into
                                         # dependent b64 selects on SM120.
@@ -4660,12 +5207,18 @@ class PagedForwardKernel:
                                             Float32(-Float32.inf),
                                         )
                                     else:
-                                        frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                            -Float32.inf
+                                        )
                             else:
                                 for reg_id in cutlass.range_constexpr(8):
                                     row_slot = (reg_id % 4) // 2
                                     key_local = (
-                                        warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                        warp_kv_base
+                                        + mma_kv * 16
+                                        + lane_pair_base
+                                        + 8 * (reg_id // 4)
+                                        + (reg_id % 2)
                                     )
                                     valid = row_valid[mma_q, row_slot] != 0
                                     if valid:
@@ -4673,20 +5226,42 @@ class PagedForwardKernel:
                                     if const_expr(not decode_row_metadata_fastpath):
                                         if valid:
                                             key_pos = tile_key_base + key_local
-                                            valid = valid and key_pos <= causal_k_limit[mma_q, row_slot]
+                                            valid = (
+                                                valid
+                                                and key_pos
+                                                <= causal_k_limit[mma_q, row_slot]
+                                            )
                                             if const_expr(self.window_left >= 0):
-                                                window_start = causal_k_limit[mma_q, row_slot] - Int32(self.window_left)
-                                                window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
-                                                valid = valid and key_pos >= window_start
+                                                window_start = causal_k_limit[
+                                                    mma_q, row_slot
+                                                ] - Int32(self.window_left)
+                                                window_start = cutlass.select_(
+                                                    window_start > Int32(0),
+                                                    window_start,
+                                                    Int32(0),
+                                                )
+                                                valid = (
+                                                    valid and key_pos >= window_start
+                                                )
                                     elif const_expr(self.window_left >= 0):
                                         if valid:
                                             key_pos = tile_key_base + key_local
-                                            row_causal_k_limit = Int32(cache_len - qo_len)
-                                            window_start = row_causal_k_limit - Int32(self.window_left)
-                                            window_start = cutlass.select_(window_start > Int32(0), window_start, Int32(0))
+                                            row_causal_k_limit = Int32(
+                                                cache_len - qo_len
+                                            )
+                                            window_start = row_causal_k_limit - Int32(
+                                                self.window_left
+                                            )
+                                            window_start = cutlass.select_(
+                                                window_start > Int32(0),
+                                                window_start,
+                                                Int32(0),
+                                            )
                                             valid = valid and key_pos >= window_start
                                     if not valid:
-                                        frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                            -Float32.inf
+                                        )
 
                     if const_expr(self.debug_dump_paged_kv_tma_s):
                         if work_idx == Int32(0) and kv_head_idx == Int32(0):
@@ -4781,7 +5356,12 @@ class PagedForwardKernel:
                             k_producer_state.advance()
                     k_consumer_state.advance()
 
-                if const_expr(self.decode_only and self.kv_is_fp8 and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                if const_expr(
+                    self.decode_only
+                    and self.kv_is_fp8
+                    and self.traits.num_warps_q == 1
+                    and num_mma_q == 1
+                ):
                     if group_size == Int32(8) or group_size == Int32(6):
                         if const_expr(num_mma_kv == 1):
                             _literal_update_mdo_states_fp32_pack_p_row0_1x1(
@@ -4944,20 +5524,32 @@ class PagedForwardKernel:
                         and warp_kv_idx == Int32(0)
                     ):
                         mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
-                        pv_row_base = Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base
+                        pv_row_base = (
+                            Int32(0)
+                            if const_expr(self.traits.num_warps_kv > 1)
+                            else subtile_base
+                        )
                         if const_expr(self.kv_is_fp8):
-                            v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                            v_stage_plane_offset = Int32(
+                                consume_stage_idx * kv_plane_stage_bytes
+                            )
                             v_plane1_total_offset = Int32(
-                                kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                                kv_plane_total_bytes
+                                if const_expr(self.v_tma_plane_count > 1)
+                                else 0
                             )
                             _literal_pv_mma_into_ofrag_plane_fp8_raw(
                                 o_frag,
                                 p_frag,
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + v_plane1_total_offset
                                 ),
                                 lane,
                                 warp_kv_idx,
@@ -4970,24 +5562,36 @@ class PagedForwardKernel:
                                 mDebugU32,
                             )
                         else:
-                            v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                            v_stage_plane_offset = Int32(
+                                consume_stage_idx * kv_plane_stage_bytes
+                            )
                             v_plane1_total_offset = Int32(
-                                kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                                kv_plane_total_bytes
+                                if const_expr(self.v_tma_plane_count > 1)
+                                else 0
                             )
                             _literal_pv_mma_into_ofrag_plane_bf16_packed(
                                 o_frag,
                                 p_frag,
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + v_plane1_total_offset
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + Int32(2 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + Int32(3 * kv_plane_total_bytes)
                                 ),
                                 lane,
                                 warp_kv_idx,
@@ -5016,14 +5620,18 @@ class PagedForwardKernel:
                     _exit_thread()
 
                 if const_expr(self.use_native_fp8_pv_mma):
-                    v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
+                    v_smem_base_addr = shared_ptr_to_u32(
+                        sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes)
+                    )
                     _literal_pv_mma_into_ofrag_mxfp8_raw(
                         o_frag,
                         p_frag,
                         v_smem_base_addr,
                         lane,
                         warp_kv_idx,
-                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                        Int32(0)
+                        if const_expr(self.traits.num_warps_kv > 1)
+                        else subtile_base,
                         num_mma_q,
                         num_mma_kv,
                         num_mma_d_vo,
@@ -5031,25 +5639,39 @@ class PagedForwardKernel:
                         v_scale,
                     )
                 elif const_expr(self.kv_is_fp8):
-                    v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
-                    v_plane1_total_offset = Int32(
-                        kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                    v_stage_plane_offset = Int32(
+                        consume_stage_idx * kv_plane_stage_bytes
                     )
-                    if const_expr(self.decode_only and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                    v_plane1_total_offset = Int32(
+                        kv_plane_total_bytes
+                        if const_expr(self.v_tma_plane_count > 1)
+                        else 0
+                    )
+                    if const_expr(
+                        self.decode_only
+                        and self.traits.num_warps_q == 1
+                        and num_mma_q == 1
+                    ):
                         if group_size == Int32(8) or group_size == Int32(6):
                             if const_expr(num_mma_kv == 1):
                                 _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
                                     o_frag,
                                     p_frag,
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                        sVStageBytes.iterator
+                                        + v_stage_plane_offset
+                                        + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                        sVStageBytes.iterator
+                                        + v_stage_plane_offset
+                                        + v_plane1_total_offset
                                     ),
                                     lane,
                                     warp_kv_idx,
-                                    Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                    Int32(0)
+                                    if const_expr(self.traits.num_warps_kv > 1)
+                                    else subtile_base,
                                     num_mma_d_vo,
                                     tc_upcast_stride_plane,
                                     v_scale,
@@ -5059,14 +5681,20 @@ class PagedForwardKernel:
                                     o_frag,
                                     p_frag,
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                        sVStageBytes.iterator
+                                        + v_stage_plane_offset
+                                        + Int32(0 * kv_plane_total_bytes)
                                     ),
                                     shared_ptr_to_u32(
-                                        sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                        sVStageBytes.iterator
+                                        + v_stage_plane_offset
+                                        + v_plane1_total_offset
                                     ),
                                     lane,
                                     warp_kv_idx,
-                                    Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                    Int32(0)
+                                    if const_expr(self.traits.num_warps_kv > 1)
+                                    else subtile_base,
                                     num_mma_q,
                                     num_mma_kv,
                                     num_mma_d_vo,
@@ -5078,14 +5706,20 @@ class PagedForwardKernel:
                                 o_frag,
                                 p_frag,
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + Int32(0 * kv_plane_total_bytes)
                                 ),
                                 shared_ptr_to_u32(
-                                    sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                    sVStageBytes.iterator
+                                    + v_stage_plane_offset
+                                    + v_plane1_total_offset
                                 ),
                                 lane,
                                 warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                Int32(0)
+                                if const_expr(self.traits.num_warps_kv > 1)
+                                else subtile_base,
                                 num_mma_q,
                                 num_mma_kv,
                                 num_mma_d_vo,
@@ -5097,14 +5731,20 @@ class PagedForwardKernel:
                             o_frag,
                             p_frag,
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + v_plane1_total_offset
                             ),
                             lane,
                             warp_kv_idx,
-                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            Int32(0)
+                            if const_expr(self.traits.num_warps_kv > 1)
+                            else subtile_base,
                             num_mma_q,
                             num_mma_kv,
                             num_mma_d_vo,
@@ -5112,29 +5752,43 @@ class PagedForwardKernel:
                             v_scale,
                         )
                 else:
-                    v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                    v_stage_plane_offset = Int32(
+                        consume_stage_idx * kv_plane_stage_bytes
+                    )
                     v_plane1_total_offset = Int32(
-                        kv_plane_total_bytes if const_expr(self.v_tma_plane_count > 1) else 0
+                        kv_plane_total_bytes
+                        if const_expr(self.v_tma_plane_count > 1)
+                        else 0
                     )
                     if const_expr(decode_bf16_row0_fastpath):
                         _literal_pv_mma_into_ofrag_plane_bf16_row0_1x1(
                             o_frag,
                             p_frag,
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + v_plane1_total_offset
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(2 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(3 * kv_plane_total_bytes)
                             ),
                             lane,
                             warp_kv_idx,
-                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            Int32(0)
+                            if const_expr(self.traits.num_warps_kv > 1)
+                            else subtile_base,
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
@@ -5144,20 +5798,30 @@ class PagedForwardKernel:
                             o_frag,
                             p_frag,
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(0 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + v_plane1_total_offset
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + v_plane1_total_offset
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(2 * kv_plane_total_bytes)
                             ),
                             shared_ptr_to_u32(
-                                sVStageBytes.iterator + v_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                sVStageBytes.iterator
+                                + v_stage_plane_offset
+                                + Int32(3 * kv_plane_total_bytes)
                             ),
                             lane,
                             warp_kv_idx,
-                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            Int32(0)
+                            if const_expr(self.traits.num_warps_kv > 1)
+                            else subtile_base,
                             num_mma_q,
                             num_mma_kv,
                             num_mma_d_vo,
@@ -5228,7 +5892,9 @@ class PagedForwardKernel:
                         prefetch_base += stage_tile_rows
 
             if const_expr(self.bf16_minimax_role_specialized_decode):
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.traits.num_threads)
+                cute.arch.barrier(
+                    barrier_id=1, number_of_threads=self.traits.num_threads
+                )
             else:
                 cute.arch.sync_threads()
             if const_expr(self.num_stages == 2):
@@ -5246,20 +5912,31 @@ class PagedForwardKernel:
                 pipeline_k.producer_tail(k_producer_state)
                 pipeline_v.producer_tail(v_producer_state)
 
-
         if const_expr(not self.has_attention_sink_bias):
-            if const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
+            if const_expr(
+                (self.single_request_decode_graph or self.single_qtile_decode_graph)
+                and self.gqa_group_size <= 8
+            ):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     if m_frag[mma_q, 0] != -Float32.inf:
-                        m_frag[mma_q, 0] = Float32(m_frag[mma_q, 0] * self.softmax_scale_log2)
+                        m_frag[mma_q, 0] = Float32(
+                            m_frag[mma_q, 0] * self.softmax_scale_log2
+                        )
             else:
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     for row_slot in cutlass.range_constexpr(2):
                         if m_frag[mma_q, row_slot] != -Float32.inf:
-                            m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
-        elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
+                            m_frag[mma_q, row_slot] = Float32(
+                                m_frag[mma_q, row_slot] * self.softmax_scale_log2
+                            )
+        elif const_expr(
+            (self.single_request_decode_graph or self.single_qtile_decode_graph)
+            and self.gqa_group_size <= 8
+        ):
             for mma_q in cutlass.range_constexpr(num_mma_q):
-                q_head_idx_sink = Int32(kv_head_idx * group_size + row_local_idx[mma_q, 0])
+                q_head_idx_sink = Int32(
+                    kv_head_idx * group_size + row_local_idx[mma_q, 0]
+                )
                 _apply_attention_sink_after_lse_scale(
                     o_frag,
                     m_frag,
@@ -5322,11 +5999,22 @@ class PagedForwardKernel:
                     dim_low = mma_d * 16 + lane_pair_base
                     dim_high = dim_low + 8
                     if spill_qwen_partial:
-                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, 0]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, 5]
-            elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[
+                            0, mma_d, 0
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[
+                            0, mma_d, 1
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[
+                            0, mma_d, 4
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[
+                            0, mma_d, 5
+                        ]
+            elif const_expr(
+                (self.single_request_decode_graph or self.single_qtile_decode_graph)
+                and self.gqa_group_size <= 8
+            ):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     packed_row_local = row_local_idx[mma_q, 0]
                     if row_valid[mma_q, 0] != 0 and lane_pair_base == 0:
@@ -5336,10 +6024,18 @@ class PagedForwardKernel:
                         dim_low = mma_d * 16 + lane_pair_base
                         dim_high = dim_low + 8
                         if row_valid[mma_q, 0] != 0:
-                            sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[mma_q, mma_d, 0]
-                            sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[mma_q, mma_d, 1]
-                            sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[mma_q, mma_d, 4]
-                            sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[mma_q, mma_d, 5]
+                            sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[
+                                mma_q, mma_d, 0
+                            ]
+                            sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[
+                                mma_q, mma_d, 1
+                            ]
+                            sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = (
+                                o_frag[mma_q, mma_d, 4]
+                            )
+                            sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = (
+                                o_frag[mma_q, mma_d, 5]
+                            )
             elif const_expr(decode_row0_merge_fastpath):
                 packed_row_local = row_local_idx[0, 0]
                 spill_partial = warp_kv_idx != Int32(0)
@@ -5350,28 +6046,50 @@ class PagedForwardKernel:
                     dim_low = mma_d * 16 + lane_pair_base
                     dim_high = dim_low + 8
                     if row_valid[0, 0] != 0 and spill_partial:
-                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, 0]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
-                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, 5]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[
+                            0, mma_d, 0
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[
+                            0, mma_d, 1
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[
+                            0, mma_d, 4
+                        ]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[
+                            0, mma_d, 5
+                        ]
             else:
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     for row_slot in cutlass.range_constexpr(2):
                         packed_row_local = row_local_idx[mma_q, row_slot]
                         if row_valid[mma_q, row_slot] != 0 and lane_pair_base == 0:
-                            sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[mma_q, row_slot]
-                            sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[mma_q, row_slot]
+                            sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[
+                                mma_q, row_slot
+                            ]
+                            sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[
+                                mma_q, row_slot
+                            ]
                         for mma_d in cutlass.range_constexpr(num_mma_d_vo):
                             dim_low = mma_d * 16 + lane_pair_base
                             dim_high = dim_low + 8
                             reg_base = row_slot * 2
                             if row_valid[mma_q, row_slot] != 0:
-                                sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[mma_q, mma_d, reg_base + 0]
-                                sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[mma_q, mma_d, reg_base + 1]
-                                sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[mma_q, mma_d, reg_base + 4]
-                                sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[mma_q, mma_d, reg_base + 5]
+                                sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = (
+                                    o_frag[mma_q, mma_d, reg_base + 0]
+                                )
+                                sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = (
+                                    o_frag[mma_q, mma_d, reg_base + 1]
+                                )
+                                sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = (
+                                    o_frag[mma_q, mma_d, reg_base + 4]
+                                )
+                                sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = (
+                                    o_frag[mma_q, mma_d, reg_base + 5]
+                                )
             if const_expr(self.bf16_minimax_role_specialized_decode):
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.traits.num_threads)
+                cute.arch.barrier(
+                    barrier_id=1, number_of_threads=self.traits.num_threads
+                )
             else:
                 cute.arch.sync_threads()
 
@@ -5422,10 +6140,26 @@ class PagedForwardKernel:
                             attention_ops.fmax(part_m2, part_m3),
                         )
                         if merged_m != -Float32.inf:
-                            scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
-                            scale1 = Float32(0.0) if part_m1 == -Float32.inf else _exp2_approx_ftz_f32(part_m1 - merged_m)
-                            scale2 = Float32(0.0) if part_m2 == -Float32.inf else _exp2_approx_ftz_f32(part_m2 - merged_m)
-                            scale3 = Float32(0.0) if part_m3 == -Float32.inf else _exp2_approx_ftz_f32(part_m3 - merged_m)
+                            scale0 = (
+                                Float32(0.0)
+                                if part_m0 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m0 - merged_m)
+                            )
+                            scale1 = (
+                                Float32(0.0)
+                                if part_m1 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m1 - merged_m)
+                            )
+                            scale2 = (
+                                Float32(0.0)
+                                if part_m2 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m2 - merged_m)
+                            )
+                            scale3 = (
+                                Float32(0.0)
+                                if part_m3 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m3 - merged_m)
+                            )
                             merged_d = Float32(
                                 part_d0 * scale0
                                 + part_d1 * scale1
@@ -5473,37 +6207,59 @@ class PagedForwardKernel:
 
                         if valid_row_store:
                             if const_expr(decode_store_v128):
-                                sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
-                                    out_low0, out_low1
+                                sDecodeStageU32[0, packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
                                 )
-                                sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sDecodeStageU32[0, packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif split_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif final_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif const_expr(self.split_kv):
-                                mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                    out_low0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                    out_low1.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                    out_high0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                    out_high1.to(self.dtype_o)
+                                )
                             else:
-                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(
+                                    self.dtype_o
+                                )
                     if valid_row_store and lane_pair_base == 0:
                         row_lse = (
                             Float32(-Float32.inf)
                             if merged_m == -Float32.inf
-                            else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            else Float32(
+                                merged_m + cute.math.log2(merged_d, fastmath=True)
+                            )
                         )
                         if const_expr(self.split_kv):
                             mLSE[partial_row_idx, q_head_idx] = row_lse
@@ -5548,10 +6304,26 @@ class PagedForwardKernel:
                             attention_ops.fmax(part_m2, part_m3),
                         )
                         if merged_m != -Float32.inf:
-                            scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
-                            scale1 = Float32(0.0) if part_m1 == -Float32.inf else _exp2_approx_ftz_f32(part_m1 - merged_m)
-                            scale2 = Float32(0.0) if part_m2 == -Float32.inf else _exp2_approx_ftz_f32(part_m2 - merged_m)
-                            scale3 = Float32(0.0) if part_m3 == -Float32.inf else _exp2_approx_ftz_f32(part_m3 - merged_m)
+                            scale0 = (
+                                Float32(0.0)
+                                if part_m0 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m0 - merged_m)
+                            )
+                            scale1 = (
+                                Float32(0.0)
+                                if part_m1 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m1 - merged_m)
+                            )
+                            scale2 = (
+                                Float32(0.0)
+                                if part_m2 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m2 - merged_m)
+                            )
+                            scale3 = (
+                                Float32(0.0)
+                                if part_m3 == -Float32.inf
+                                else _exp2_approx_ftz_f32(part_m3 - merged_m)
+                            )
                             merged_d = Float32(
                                 part_d0 * scale0
                                 + part_d1 * scale1
@@ -5599,43 +6371,68 @@ class PagedForwardKernel:
 
                         if valid_row_store:
                             if const_expr(decode_store_v128):
-                                sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
-                                    out_low0, out_low1
+                                sDecodeStageU32[0, packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
                                 )
-                                sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sDecodeStageU32[0, packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif split_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif final_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif const_expr(self.split_kv):
-                                mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                    out_low0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                    out_low1.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                    out_high0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                    out_high1.to(self.dtype_o)
+                                )
                             else:
-                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(
+                                    self.dtype_o
+                                )
                     if valid_row_store and lane_pair_base == 0:
                         row_lse = (
                             Float32(-Float32.inf)
                             if merged_m == -Float32.inf
-                            else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            else Float32(
+                                merged_m + cute.math.log2(merged_d, fastmath=True)
+                            )
                         )
                         if const_expr(self.split_kv):
                             mLSE[partial_row_idx, q_head_idx] = row_lse
                         else:
                             mLSE[q_head_idx, q_row_idx] = row_lse
-                elif const_expr((self.single_request_decode_graph or self.single_qtile_decode_graph) and self.gqa_group_size <= 8):
+                elif const_expr(
+                    (self.single_request_decode_graph or self.single_qtile_decode_graph)
+                    and self.gqa_group_size <= 8
+                ):
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         packed_row_local = row_local_idx[mma_q, 0]
                         q_head_idx = q_head_idx_frag[mma_q, 0]
@@ -5651,7 +6448,9 @@ class PagedForwardKernel:
                         )
                         merge_scale.fill(0.0)
                         if valid_row_store:
-                            for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                            for kv_warp in cutlass.range_constexpr(
+                                self.traits.num_warps_kv
+                            ):
                                 part_m = sSyncMD[kv_warp, packed_row_local, 0]
                                 part_d = sSyncMD[kv_warp, packed_row_local, 1]
                                 if merged_m == -Float32.inf:
@@ -5660,13 +6459,16 @@ class PagedForwardKernel:
                                 elif part_m != -Float32.inf:
                                     new_m = attention_ops.fmax(merged_m, part_m)
                                     merged_d = Float32(
-                                        merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
+                                        merged_d
+                                        * _exp2_approx_ftz_f32(merged_m - new_m)
                                         + part_d * _exp2_approx_ftz_f32(part_m - new_m)
                                     )
                                     merged_m = new_m
                             if merged_m != -Float32.inf:
                                 inv_d = cute.arch.rcp_approx(merged_d)
-                                for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                for kv_warp in cutlass.range_constexpr(
+                                    self.traits.num_warps_kv
+                                ):
                                     part_m = sSyncMD[kv_warp, packed_row_local, 0]
                                     merge_scale[kv_warp] = (
                                         Float32(0.0)
@@ -5686,12 +6488,26 @@ class PagedForwardKernel:
                                 acc_low1 = Float32(0.0)
                                 acc_high0 = Float32(0.0)
                                 acc_high1 = Float32(0.0)
-                                for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                for kv_warp in cutlass.range_constexpr(
+                                    self.traits.num_warps_kv
+                                ):
                                     scale = merge_scale[kv_warp]
-                                    acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
-                                    acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
-                                    acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
-                                    acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                                    acc_low0 += (
+                                        sSyncO[kv_warp, packed_row_local, dim_low + 0]
+                                        * scale
+                                    )
+                                    acc_low1 += (
+                                        sSyncO[kv_warp, packed_row_local, dim_low + 1]
+                                        * scale
+                                    )
+                                    acc_high0 += (
+                                        sSyncO[kv_warp, packed_row_local, dim_high + 0]
+                                        * scale
+                                    )
+                                    acc_high1 += (
+                                        sSyncO[kv_warp, packed_row_local, dim_high + 1]
+                                        * scale
+                                    )
                                 out_low0 = acc_low0 * inv_d
                                 out_low1 = acc_low1 * inv_d
                                 out_high0 = acc_high0 * inv_d
@@ -5699,48 +6515,74 @@ class PagedForwardKernel:
 
                             if valid_row_store:
                                 if const_expr(decode_store_v128):
-                                    sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
-                                        out_low0, out_low1
-                                    )
-                                    sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                        out_high0, out_high1
-                                    )
+                                    sDecodeStageU32[
+                                        0, packed_row_local, dim_low // 2
+                                    ] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                    sDecodeStageU32[
+                                        0, packed_row_local, dim_high // 2
+                                    ] = pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 elif split_store_v128:
-                                    sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                    sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                        out_high0, out_high1
+                                    sOStageU32[packed_row_local, dim_low // 2] = (
+                                        pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                    )
+                                    sOStageU32[packed_row_local, dim_high // 2] = (
+                                        pack_f32x2_to_bfloat2(out_high0, out_high1)
                                     )
                                 elif final_store_v128:
-                                    sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                    sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                        out_high0, out_high1
+                                    sOStageU32[packed_row_local, dim_low // 2] = (
+                                        pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                    )
+                                    sOStageU32[packed_row_local, dim_high // 2] = (
+                                        pack_f32x2_to_bfloat2(out_high0, out_high1)
                                     )
                                 elif const_expr(self.split_kv):
                                     partial_row_idx = (
                                         decode_partial_row_idx
                                         if const_expr(decode_row_metadata_fastpath)
-                                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                        else request_partial_start
+                                        + token_local * num_chunks_kv
+                                        + kv_tile_idx
                                     )
-                                    mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                    mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                    mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                    mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                    mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                        out_low0.to(self.dtype_o)
+                                    )
+                                    mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                        out_low1.to(self.dtype_o)
+                                    )
+                                    mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                        out_high0.to(self.dtype_o)
+                                    )
+                                    mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                        out_high1.to(self.dtype_o)
+                                    )
                                 else:
-                                    mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                    mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                    mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                    mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                    mO[q_row_idx, q_head_idx, dim_low + 0] = (
+                                        out_low0.to(self.dtype_o)
+                                    )
+                                    mO[q_row_idx, q_head_idx, dim_low + 1] = (
+                                        out_low1.to(self.dtype_o)
+                                    )
+                                    mO[q_row_idx, q_head_idx, dim_high + 0] = (
+                                        out_high0.to(self.dtype_o)
+                                    )
+                                    mO[q_row_idx, q_head_idx, dim_high + 1] = (
+                                        out_high1.to(self.dtype_o)
+                                    )
                         if valid_row_store and lane_pair_base == 0:
                             row_lse = (
                                 Float32(-Float32.inf)
                                 if merged_m == -Float32.inf
-                                else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                                else Float32(
+                                    merged_m + cute.math.log2(merged_d, fastmath=True)
+                                )
                             )
                             if const_expr(self.split_kv):
                                 partial_row_idx = (
                                     decode_partial_row_idx
                                     if const_expr(decode_row_metadata_fastpath)
-                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    else request_partial_start
+                                    + token_local * num_chunks_kv
+                                    + kv_tile_idx
                                 )
                                 mLSE[partial_row_idx, q_head_idx] = row_lse
                             else:
@@ -5761,12 +6603,16 @@ class PagedForwardKernel:
                             merged_d = Float32(1.0)
                             inv_d = Float32(0.0)
                             merge_scale = cute.make_rmem_tensor(
-                                cute.make_layout((self.traits.num_warps_kv,), stride=(1,)),
+                                cute.make_layout(
+                                    (self.traits.num_warps_kv,), stride=(1,)
+                                ),
                                 Float32,
                             )
                             merge_scale.fill(0.0)
                             if valid_row_store:
-                                for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                for kv_warp in cutlass.range_constexpr(
+                                    self.traits.num_warps_kv
+                                ):
                                     part_m = sSyncMD[kv_warp, packed_row_local, 0]
                                     part_d = sSyncMD[kv_warp, packed_row_local, 1]
                                     if merged_m == -Float32.inf:
@@ -5775,13 +6621,17 @@ class PagedForwardKernel:
                                     elif part_m != -Float32.inf:
                                         new_m = attention_ops.fmax(merged_m, part_m)
                                         merged_d = Float32(
-                                            merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
-                                            + part_d * _exp2_approx_ftz_f32(part_m - new_m)
+                                            merged_d
+                                            * _exp2_approx_ftz_f32(merged_m - new_m)
+                                            + part_d
+                                            * _exp2_approx_ftz_f32(part_m - new_m)
                                         )
                                         merged_m = new_m
                                 if merged_m != -Float32.inf:
                                     inv_d = cute.arch.rcp_approx(merged_d)
-                                    for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                    for kv_warp in cutlass.range_constexpr(
+                                        self.traits.num_warps_kv
+                                    ):
                                         part_m = sSyncMD[kv_warp, packed_row_local, 0]
                                         merge_scale[kv_warp] = (
                                             Float32(0.0)
@@ -5801,12 +6651,34 @@ class PagedForwardKernel:
                                     acc_low1 = Float32(0.0)
                                     acc_high0 = Float32(0.0)
                                     acc_high1 = Float32(0.0)
-                                    for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                    for kv_warp in cutlass.range_constexpr(
+                                        self.traits.num_warps_kv
+                                    ):
                                         scale = merge_scale[kv_warp]
-                                        acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
-                                        acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
-                                        acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
-                                        acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                                        acc_low0 += (
+                                            sSyncO[
+                                                kv_warp, packed_row_local, dim_low + 0
+                                            ]
+                                            * scale
+                                        )
+                                        acc_low1 += (
+                                            sSyncO[
+                                                kv_warp, packed_row_local, dim_low + 1
+                                            ]
+                                            * scale
+                                        )
+                                        acc_high0 += (
+                                            sSyncO[
+                                                kv_warp, packed_row_local, dim_high + 0
+                                            ]
+                                            * scale
+                                        )
+                                        acc_high1 += (
+                                            sSyncO[
+                                                kv_warp, packed_row_local, dim_high + 1
+                                            ]
+                                            * scale
+                                        )
                                     out_low0 = acc_low0 * inv_d
                                     out_low1 = acc_low1 * inv_d
                                     out_high0 = acc_high0 * inv_d
@@ -5814,48 +6686,75 @@ class PagedForwardKernel:
 
                                 if valid_row_store:
                                     if const_expr(decode_store_v128):
-                                        sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
-                                            out_low0, out_low1
-                                        )
-                                        sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                            out_high0, out_high1
-                                        )
+                                        sDecodeStageU32[
+                                            0, packed_row_local, dim_low // 2
+                                        ] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                        sDecodeStageU32[
+                                            0, packed_row_local, dim_high // 2
+                                        ] = pack_f32x2_to_bfloat2(out_high0, out_high1)
                                     elif split_store_v128:
-                                        sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                        sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                            out_high0, out_high1
+                                        sOStageU32[packed_row_local, dim_low // 2] = (
+                                            pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                        )
+                                        sOStageU32[packed_row_local, dim_high // 2] = (
+                                            pack_f32x2_to_bfloat2(out_high0, out_high1)
                                         )
                                     elif final_store_v128:
-                                        sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                        sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                            out_high0, out_high1
+                                        sOStageU32[packed_row_local, dim_low // 2] = (
+                                            pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                        )
+                                        sOStageU32[packed_row_local, dim_high // 2] = (
+                                            pack_f32x2_to_bfloat2(out_high0, out_high1)
                                         )
                                     elif const_expr(self.split_kv):
                                         partial_row_idx = (
                                             decode_partial_row_idx
                                             if const_expr(decode_row_metadata_fastpath)
-                                            else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                            else request_partial_start
+                                            + token_local * num_chunks_kv
+                                            + kv_tile_idx
                                         )
-                                        mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                        mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                        mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                        mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                        mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                            out_low0.to(self.dtype_o)
+                                        )
+                                        mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                            out_low1.to(self.dtype_o)
+                                        )
+                                        mO[
+                                            partial_row_idx, q_head_idx, dim_high + 0
+                                        ] = out_high0.to(self.dtype_o)
+                                        mO[
+                                            partial_row_idx, q_head_idx, dim_high + 1
+                                        ] = out_high1.to(self.dtype_o)
                                     else:
-                                        mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                        mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                        mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                        mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                        mO[q_row_idx, q_head_idx, dim_low + 0] = (
+                                            out_low0.to(self.dtype_o)
+                                        )
+                                        mO[q_row_idx, q_head_idx, dim_low + 1] = (
+                                            out_low1.to(self.dtype_o)
+                                        )
+                                        mO[q_row_idx, q_head_idx, dim_high + 0] = (
+                                            out_high0.to(self.dtype_o)
+                                        )
+                                        mO[q_row_idx, q_head_idx, dim_high + 1] = (
+                                            out_high1.to(self.dtype_o)
+                                        )
                             if valid_row_store and lane_pair_base == 0:
                                 row_lse = (
                                     Float32(-Float32.inf)
                                     if merged_m == -Float32.inf
-                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                                    else Float32(
+                                        merged_m
+                                        + cute.math.log2(merged_d, fastmath=True)
+                                    )
                                 )
                                 if const_expr(self.split_kv):
                                     partial_row_idx = (
                                         decode_partial_row_idx
                                         if const_expr(decode_row_metadata_fastpath)
-                                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                        else request_partial_start
+                                        + token_local * num_chunks_kv
+                                        + kv_tile_idx
                                     )
                                     mLSE[partial_row_idx, q_head_idx] = row_lse
                                 else:
@@ -5889,7 +6788,11 @@ class PagedForwardKernel:
                         out_low1 = Float32(0.0)
                         out_high0 = Float32(0.0)
                         out_high1 = Float32(0.0)
-                        if store_enabled and valid_row_store and merged_m != -Float32.inf:
+                        if (
+                            store_enabled
+                            and valid_row_store
+                            and merged_m != -Float32.inf
+                        ):
                             out_low0 = o_frag[mma_q, mma_d, reg_base + 0] * inv_d
                             out_low1 = o_frag[mma_q, mma_d, reg_base + 1] * inv_d
                             out_high0 = o_frag[mma_q, mma_d, reg_base + 4] * inv_d
@@ -5897,41 +6800,67 @@ class PagedForwardKernel:
 
                         if store_enabled and valid_row_store:
                             if split_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif final_store_v128:
-                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                    out_high0, out_high1
+                                sOStageU32[packed_row_local, dim_low // 2] = (
+                                    pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                )
+                                sOStageU32[packed_row_local, dim_high // 2] = (
+                                    pack_f32x2_to_bfloat2(out_high0, out_high1)
                                 )
                             elif const_expr(self.split_kv):
                                 partial_row_idx = (
                                     decode_partial_row_idx
                                     if const_expr(decode_row_metadata_fastpath)
-                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    else request_partial_start
+                                    + token_local * num_chunks_kv
+                                    + kv_tile_idx
                                 )
-                                mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                    out_low0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                    out_low1.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                    out_high0.to(self.dtype_o)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                    out_high1.to(self.dtype_o)
+                                )
                             else:
-                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(
+                                    self.dtype_o
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(
+                                    self.dtype_o
+                                )
                     if store_enabled and valid_row_store and lane_pair_base == 0:
                         row_lse = (
                             Float32(-Float32.inf)
                             if merged_m == -Float32.inf
-                            else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            else Float32(
+                                merged_m + cute.math.log2(merged_d, fastmath=True)
+                            )
                         )
                         if const_expr(self.split_kv):
                             partial_row_idx = (
                                 decode_partial_row_idx
                                 if const_expr(decode_row_metadata_fastpath)
-                                else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                else request_partial_start
+                                + token_local * num_chunks_kv
+                                + kv_tile_idx
                             )
                             mLSE[partial_row_idx, q_head_idx] = row_lse
                         else:
@@ -5939,7 +6868,9 @@ class PagedForwardKernel:
 
         if const_expr(decode_store_v128):
             if const_expr(self.bf16_minimax_role_specialized_decode):
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.traits.num_threads)
+                cute.arch.barrier(
+                    barrier_id=1, number_of_threads=self.traits.num_threads
+                )
             else:
                 cute.arch.sync_threads()
             decode_chunks_per_row = self.traits.head_dim_vo // 8
@@ -5947,7 +6878,9 @@ class PagedForwardKernel:
             decode_total_chunks = packed_tile_rows * decode_chunks_per_row
             while decode_chunk_linear_idx < decode_total_chunks:
                 packed_row_local = decode_chunk_linear_idx // decode_chunks_per_row
-                chunk_idx = decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
+                chunk_idx = (
+                    decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
+                )
                 if const_expr(decode_row_metadata_fastpath):
                     q_head_idx = decode_q_head_base + packed_row_local
                     q_row_idx = decode_q_row_idx
@@ -5962,17 +6895,18 @@ class PagedForwardKernel:
                     partial_row_idx = (
                         decode_partial_row_idx
                         if const_expr(decode_row_metadata_fastpath)
-                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                        else request_partial_start
+                        + token_local * num_chunks_kv
+                        + kv_tile_idx
                     )
                     gmem_elem_offset = (
-                        ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                        + chunk_idx * 8
-                    )
+                        (partial_row_idx * mO.shape[1] + q_head_idx)
+                        * self.traits.head_dim_vo
+                    ) + chunk_idx * 8
                 else:
                     gmem_elem_offset = (
-                        ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                        + chunk_idx * 8
-                    )
+                        (q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo
+                    ) + chunk_idx * 8
                 st_global_v4_u32(
                     get_ptr_as_int64(mOFlat, gmem_elem_offset),
                     sDecodeStageU32[0, packed_row_local, u32_idx + 0],
@@ -5989,7 +6923,9 @@ class PagedForwardKernel:
             split_total_chunks = packed_tile_rows * split_chunks_per_row
             while split_chunk_linear_idx < split_total_chunks:
                 packed_row_local = split_chunk_linear_idx // split_chunks_per_row
-                chunk_idx = split_chunk_linear_idx - packed_row_local * split_chunks_per_row
+                chunk_idx = (
+                    split_chunk_linear_idx - packed_row_local * split_chunks_per_row
+                )
                 if const_expr(decode_row_metadata_fastpath):
                     q_head_idx = decode_q_head_base + packed_row_local
                     partial_row_idx = decode_partial_row_idx
@@ -5998,12 +6934,16 @@ class PagedForwardKernel:
                     token_local = packed_q_idx // group_size
                     q_group_lane = packed_q_idx - token_local * group_size
                     q_head_idx = kv_head_idx * group_size + q_group_lane
-                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    partial_row_idx = (
+                        request_partial_start
+                        + token_local * num_chunks_kv
+                        + kv_tile_idx
+                    )
                 u32_idx = chunk_idx * 4
                 gmem_elem_offset = (
-                    ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                    + chunk_idx * 8
-                )
+                    (partial_row_idx * mO.shape[1] + q_head_idx)
+                    * self.traits.head_dim_vo
+                ) + chunk_idx * 8
                 st_global_v4_u32(
                     get_ptr_as_int64(mOFlat, gmem_elem_offset),
                     sOStageU32[packed_row_local, u32_idx + 0],
@@ -6020,7 +6960,9 @@ class PagedForwardKernel:
             final_total_chunks = packed_tile_rows * final_chunks_per_row
             while final_chunk_linear_idx < final_total_chunks:
                 packed_row_local = final_chunk_linear_idx // final_chunks_per_row
-                chunk_idx = final_chunk_linear_idx - packed_row_local * final_chunks_per_row
+                chunk_idx = (
+                    final_chunk_linear_idx - packed_row_local * final_chunks_per_row
+                )
                 if const_expr(decode_row_metadata_fastpath):
                     q_head_idx = decode_q_head_base + packed_row_local
                     q_row_idx = decode_q_row_idx
@@ -6032,9 +6974,8 @@ class PagedForwardKernel:
                     q_row_idx = q_start + token_local
                 u32_idx = chunk_idx * 4
                 gmem_elem_offset = (
-                    ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                    + chunk_idx * 8
-                )
+                    (q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo
+                ) + chunk_idx * 8
                 st_global_v4_u32(
                     get_ptr_as_int64(mOFlat, gmem_elem_offset),
                     sOStageU32[packed_row_local, u32_idx + 0],
@@ -6072,11 +7013,15 @@ class PagedFp8DecodeRawForwardKernel:
         cta_sync_o_bytes = self.num_warps_kv * self.cta_tile_q * self.head_dim_vo * 4
         cta_sync_md_bytes = self.num_warps_kv * self.cta_tile_q * 8
         smem_o_bytes = self.cta_tile_q * self.head_dim_vo * 2
-        self.shared_storage_bytes = max(qkv_storage_bytes, cta_sync_o_bytes + cta_sync_md_bytes, smem_o_bytes)
+        self.shared_storage_bytes = max(
+            qkv_storage_bytes, cta_sync_o_bytes + cta_sync_md_bytes, smem_o_bytes
+        )
         self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim
         self.kv_tma_copy_bytes_k = self.k_bytes
         self.kv_tma_copy_bytes_v = self.v_bytes
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.softmax_scale_log2 = Float32(
+            (self.head_dim_qk**-0.5) * attention_ops.LOG2_E
+        )
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -6123,7 +7068,9 @@ class PagedFp8DecodeRawForwardKernel:
         mO = _assume_tensor_aligned(mO)
         mKCacheT = _make_paged_kv_tma_source_tensor(mKCache, self.stage_tile_rows)
         mVCacheT = _make_paged_kv_tma_source_tensor(mVCache, self.stage_tile_rows)
-        plane_layout = _paged_kv_tma_plane_layout(self.stage_tile_rows, self.kv_tma_plane_head_dim)
+        plane_layout = _paged_kv_tma_plane_layout(
+            self.stage_tile_rows, self.kv_tma_plane_head_dim
+        )
         gmem_tiled_copy_kv = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_kv,
@@ -6215,10 +7162,14 @@ class PagedFp8DecodeRawForwardKernel:
             cute.arch.mbarrier_init(mbar_ptr_V, Int32(1))
         cute.arch.sync_threads()
 
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((self.shared_storage_bytes,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((self.shared_storage_bytes,), stride=(1,))
+        )
         sQ = cute.make_tensor(
             cute.recast_ptr(payload_u8.iterator.align(16), dtype=self.q_dtype),
-            cute.make_layout((self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)),
+            cute.make_layout(
+                (self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)
+            ),
         )
         sKStageBytes = cute.make_tensor(
             payload_u8.iterator + Int32(self.q_bytes),
@@ -6228,14 +7179,26 @@ class PagedFp8DecodeRawForwardKernel:
             payload_u8.iterator + Int32(self.q_bytes + self.k_bytes),
             cute.make_layout((self.v_bytes,), stride=(1,)),
         )
-        plane_stage_layout = _paged_kv_tma_plane_stage_layout(self.stage_tile_rows, self.kv_tma_plane_head_dim, 1)
+        plane_stage_layout = _paged_kv_tma_plane_stage_layout(
+            self.stage_tile_rows, self.kv_tma_plane_head_dim, 1
+        )
         plane_num_elems = self.stage_tile_rows * self.kv_tma_plane_head_dim
         sKPlane0 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.Uint8, self.q_bytes + 0 * self.kv_plane_stage_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + 0 * self.kv_plane_stage_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sKPlane1 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.Uint8, self.q_bytes + 1 * self.kv_plane_stage_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + 1 * self.kv_plane_stage_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sVPlane0 = _get_memrange_tensor(
@@ -6329,32 +7292,55 @@ class PagedFp8DecodeRawForwardKernel:
         )
         sSyncMD = cute.make_tensor(
             sync_payload.iterator + Int32(sync_o_elems),
-            cute.make_layout((self.num_warps_kv, self.cta_tile_q, 2), stride=(self.cta_tile_q * 2, 2, 1)),
+            cute.make_layout(
+                (self.num_warps_kv, self.cta_tile_q, 2),
+                stride=(self.cta_tile_q * 2, 2, 1),
+            ),
         )
         sDecodeStage = cute.make_tensor(
             cute.recast_tensor(sync_payload, self.o_dtype).iterator,
             cute.make_layout(
                 (self.num_warps_kv, self.cta_tile_q, self.head_dim_vo * 2),
-                stride=(self.cta_tile_q * self.head_dim_vo * 2, self.head_dim_vo * 2, 1),
+                stride=(
+                    self.cta_tile_q * self.head_dim_vo * 2,
+                    self.head_dim_vo * 2,
+                    1,
+                ),
             ),
         )
         sDecodeStageU32 = cute.recast_tensor(sDecodeStage, cutlass.Uint32)
         mOFlat = cute.flatten(mO)
         tc_upcast_stride_qk = Int32(self.head_dim_qk // 8)
         tc_upcast_elems_plane = Int32(16 // (self.kv_storage_dtype.width // 8))
-        tc_upcast_stride_plane = Int32(self.kv_tma_plane_head_dim) // tc_upcast_elems_plane
+        tc_upcast_stride_plane = (
+            Int32(self.kv_tma_plane_head_dim) // tc_upcast_elems_plane
+        )
         warp_kv_base = warp_kv_idx * 16
         lane_group = lane // 4
         lane_pair_base = 2 * (lane % 4)
-        row_local_idx = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
-        row_valid = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
-        q_token_local = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
-        q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
-        q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
-        causal_k_limit = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Int32)
+        row_local_idx = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
+        row_valid = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
+        q_token_local = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
+        q_head_idx_frag = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
+        q_row_idx_frag = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
+        causal_k_limit = cute.make_rmem_tensor(
+            cute.make_layout((1, 2), stride=(2, 1)), Int32
+        )
         frag_s_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
         frag_p_layout = cute.make_layout((1, 1, 4), stride=(4, 4, 1))
-        frag_o_layout = cute.make_layout((1, self.num_mma_d_vo, 8), stride=(self.num_mma_d_vo * 8, 8, 1))
+        frag_o_layout = cute.make_layout(
+            (1, self.num_mma_d_vo, 8), stride=(self.num_mma_d_vo * 8, 8, 1)
+        )
         o_frag = cute.make_rmem_tensor(frag_o_layout, Float32)
         m_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Float32)
         d_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Float32)
@@ -6399,22 +7385,38 @@ class PagedFp8DecodeRawForwardKernel:
         prefetch_base = tile_base + self.stage_tile_rows
 
         while tile_base < cache_len:
-            tile_limit = cutlass.select_(tile_base + self.stage_tile_rows < cache_len, tile_base + self.stage_tile_rows, cache_len)
+            tile_limit = cutlass.select_(
+                tile_base + self.stage_tile_rows < cache_len,
+                tile_base + self.stage_tile_rows,
+                cache_len,
+            )
             tile_tokens = tile_limit - tile_base
             if warp_linear_idx == Int32(0):
-                cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
-                cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr_K + consumer_state.index, phase=consumer_state.phase
+                )
+                cute.arch.mbarrier_wait(
+                    mbar_ptr_V + consumer_state.index, phase=consumer_state.phase
+                )
             cute.arch.sync_threads()
 
             k_scale = (
                 mKDescale[request_idx]
                 if const_expr(mKDescale is not None and len(mKDescale.shape) == 1)
-                else (mKDescale[request_idx, kv_head_idx] if const_expr(mKDescale is not None) else Float32(1.0))
+                else (
+                    mKDescale[request_idx, kv_head_idx]
+                    if const_expr(mKDescale is not None)
+                    else Float32(1.0)
+                )
             )
             v_scale = (
                 mVDescale[request_idx]
                 if const_expr(mVDescale is not None and len(mVDescale.shape) == 1)
-                else (mVDescale[request_idx, kv_head_idx] if const_expr(mVDescale is not None) else Float32(1.0))
+                else (
+                    mVDescale[request_idx, kv_head_idx]
+                    if const_expr(mVDescale is not None)
+                    else Float32(1.0)
+                )
             )
             q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
 
@@ -6428,9 +7430,13 @@ class PagedFp8DecodeRawForwardKernel:
                     token_local = packed_q_idx // group_size
                     q_group_lane = packed_q_idx - token_local * group_size
                     q_token_local[0, row_slot] = Int32(token_local)
-                    q_head_idx_frag[0, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
+                    q_head_idx_frag[0, row_slot] = Int32(
+                        kv_head_idx * group_size + q_group_lane
+                    )
                     q_row_idx_frag[0, row_slot] = Int32(q_start + token_local)
-                    causal_k_limit[0, row_slot] = Int32(token_local + cache_len - qo_len)
+                    causal_k_limit[0, row_slot] = Int32(
+                        token_local + cache_len - qo_len
+                    )
                 else:
                     q_token_local[0, row_slot] = Int32(0)
                     q_head_idx_frag[0, row_slot] = Int32(0)
@@ -6442,8 +7448,12 @@ class PagedFp8DecodeRawForwardKernel:
             _literal_qk_mma_into_sfrag_plane_fp8_raw(
                 frag_S,
                 q_smem_base_addr,
-                shared_ptr_to_u32(sKStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                shared_ptr_to_u32(sKStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                shared_ptr_to_u32(
+                    sKStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)
+                ),
+                shared_ptr_to_u32(
+                    sKStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)
+                ),
                 lane,
                 warp_q_idx,
                 warp_kv_idx,
@@ -6456,12 +7466,16 @@ class PagedFp8DecodeRawForwardKernel:
             )
             for reg_id in cutlass.range_constexpr(8):
                 row_slot = (reg_id % 4) // 2
-                key_local = warp_kv_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                key_local = (
+                    warp_kv_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                )
                 valid = row_valid[0, row_slot] != 0
                 if valid:
                     valid = valid and key_local < tile_tokens
                 if valid:
-                    valid = valid and (tile_base + key_local) <= causal_k_limit[0, row_slot]
+                    valid = (
+                        valid and (tile_base + key_local) <= causal_k_limit[0, row_slot]
+                    )
                 if valid:
                     frag_S[0, 0, reg_id] = frag_S[0, 0, reg_id] * k_scale
                 else:
@@ -6478,8 +7492,15 @@ class PagedFp8DecodeRawForwardKernel:
                 1,
                 self.num_mma_d_vo,
             )
-            if const_expr(os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "") == "SREGS"):
-                if kv_head_idx == Int32(0) and warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "")
+                == "SREGS"
+            ):
+                if (
+                    kv_head_idx == Int32(0)
+                    and warp_q_idx == Int32(0)
+                    and warp_kv_idx == Int32(0)
+                ):
                     mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
                     _dump_s_frag_regs_raw(
                         mDebugU32,
@@ -6487,8 +7508,15 @@ class PagedFp8DecodeRawForwardKernel:
                         lane,
                     )
                 _exit_thread()
-            if const_expr(os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "") == "PREGS"):
-                if kv_head_idx == Int32(0) and warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "")
+                == "PREGS"
+            ):
+                if (
+                    kv_head_idx == Int32(0)
+                    and warp_q_idx == Int32(0)
+                    and warp_kv_idx == Int32(0)
+                ):
                     mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
                     _dump_p_frag_regs_raw(
                         mDebugU32,
@@ -6506,14 +7534,25 @@ class PagedFp8DecodeRawForwardKernel:
             )
             d_frag[0, 0] = d0
             d_frag[0, 1] = d1
-            if const_expr(os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "") == "PVREGS"):
-                if kv_head_idx == Int32(0) and warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
+            if const_expr(
+                os.environ.get("SPARKINFER_PAGED_KV_DEBUG_DUMP", "")
+                == "PVREGS"
+            ):
+                if (
+                    kv_head_idx == Int32(0)
+                    and warp_q_idx == Int32(0)
+                    and warp_kv_idx == Int32(0)
+                ):
                     mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
                     _literal_pv_mma_into_ofrag_plane_fp8_raw(
                         o_frag,
                         p_frag,
-                        shared_ptr_to_u32(sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                        shared_ptr_to_u32(sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                        shared_ptr_to_u32(
+                            sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)
+                        ),
+                        shared_ptr_to_u32(
+                            sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)
+                        ),
                         lane,
                         warp_kv_idx,
                         warp_kv_base,
@@ -6528,8 +7567,12 @@ class PagedFp8DecodeRawForwardKernel:
             _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 o_frag,
                 p_frag,
-                shared_ptr_to_u32(sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                shared_ptr_to_u32(sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                shared_ptr_to_u32(
+                    sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)
+                ),
+                shared_ptr_to_u32(
+                    sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)
+                ),
                 lane,
                 warp_kv_idx,
                 Int32(0),
@@ -6573,7 +7616,9 @@ class PagedFp8DecodeRawForwardKernel:
 
         for row_slot in cutlass.range_constexpr(2):
             if m_frag[0, row_slot] != -Float32.inf:
-                m_frag[0, row_slot] = Float32(m_frag[0, row_slot] * self.softmax_scale_log2)
+                m_frag[0, row_slot] = Float32(
+                    m_frag[0, row_slot] * self.softmax_scale_log2
+                )
             packed_row_local = row_local_idx[0, row_slot]
             if row_valid[0, row_slot] != 0 and lane_pair_base == 0:
                 sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[0, row_slot]
@@ -6583,10 +7628,18 @@ class PagedFp8DecodeRawForwardKernel:
                 dim_high = dim_low + 8
                 reg_base = row_slot * 2
                 if row_valid[0, row_slot] != 0:
-                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, reg_base + 0]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, reg_base + 1]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, reg_base + 4]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, reg_base + 5]
+                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[
+                        0, mma_d, reg_base + 0
+                    ]
+                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[
+                        0, mma_d, reg_base + 1
+                    ]
+                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[
+                        0, mma_d, reg_base + 4
+                    ]
+                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[
+                        0, mma_d, reg_base + 5
+                    ]
         cute.arch.sync_threads()
 
         if warp_kv_idx == 0:
@@ -6598,7 +7651,9 @@ class PagedFp8DecodeRawForwardKernel:
                 merged_m = Float32(-Float32.inf)
                 merged_d = Float32(1.0)
                 inv_d = Float32(0.0)
-                merge_scale = cute.make_rmem_tensor(cute.make_layout((self.num_warps_kv,), stride=(1,)), Float32)
+                merge_scale = cute.make_rmem_tensor(
+                    cute.make_layout((self.num_warps_kv,), stride=(1,)), Float32
+                )
                 merge_scale.fill(0.0)
                 if valid_row_store:
                     for kv_warp in cutlass.range_constexpr(self.num_warps_kv):
@@ -6637,17 +7692,29 @@ class PagedFp8DecodeRawForwardKernel:
                         acc_high1 = Float32(0.0)
                         for kv_warp in cutlass.range_constexpr(self.num_warps_kv):
                             scale = merge_scale[kv_warp]
-                            acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
-                            acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
-                            acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
-                            acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                            acc_low0 += (
+                                sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
+                            )
+                            acc_low1 += (
+                                sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
+                            )
+                            acc_high0 += (
+                                sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
+                            )
+                            acc_high1 += (
+                                sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                            )
                         out_low0 = acc_low0 * inv_d
                         out_low1 = acc_low1 * inv_d
                         out_high0 = acc_high0 * inv_d
                         out_high1 = acc_high1 * inv_d
                     if valid_row_store:
-                        sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                        sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(out_high0, out_high1)
+                        sDecodeStageU32[0, packed_row_local, dim_low // 2] = (
+                            pack_f32x2_to_bfloat2(out_low0, out_low1)
+                        )
+                        sDecodeStageU32[0, packed_row_local, dim_high // 2] = (
+                            pack_f32x2_to_bfloat2(out_high0, out_high1)
+                        )
                 if valid_row_store and lane_pair_base == 0:
                     mLSE[q_head_idx, q_row_idx] = (
                         Float32(-Float32.inf)
@@ -6661,14 +7728,18 @@ class PagedFp8DecodeRawForwardKernel:
         decode_total_chunks = packed_tile_rows * decode_chunks_per_row
         while decode_chunk_linear_idx < decode_total_chunks:
             packed_row_local = decode_chunk_linear_idx // decode_chunks_per_row
-            chunk_idx = decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
+            chunk_idx = (
+                decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
+            )
             packed_q_idx = packed_tile_start + packed_row_local
             token_local = packed_q_idx // group_size
             q_group_lane = packed_q_idx - token_local * group_size
             q_head_idx = kv_head_idx * group_size + q_group_lane
             q_row_idx = q_start + token_local
             u32_idx = chunk_idx * 4
-            gmem_elem_offset = ((q_row_idx * mO.shape[1] + q_head_idx) * self.head_dim_vo) + chunk_idx * 8
+            gmem_elem_offset = (
+                (q_row_idx * mO.shape[1] + q_head_idx) * self.head_dim_vo
+            ) + chunk_idx * 8
             st_global_v4_u32(
                 get_ptr_as_int64(mOFlat, gmem_elem_offset),
                 sDecodeStageU32[0, packed_row_local, u32_idx + 0],
@@ -6706,11 +7777,15 @@ class PagedBf16ExtendRawForwardKernel:
         self.k_bytes = self.num_stages * self.stage_tile_rows * self.head_dim_qk * 2
         self.v_bytes = self.num_stages * self.stage_tile_rows * self.head_dim_vo * 2
         self.shared_storage_bytes = self.q_bytes + self.k_bytes + self.v_bytes
-        self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim * 2
+        self.kv_plane_stage_bytes = (
+            self.stage_tile_rows * self.kv_tma_plane_head_dim * 2
+        )
         self.kv_plane_total_bytes = self.num_stages * self.kv_plane_stage_bytes
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * self.head_dim_qk * 2
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * self.head_dim_vo * 2
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.softmax_scale_log2 = Float32(
+            (self.head_dim_qk**-0.5) * attention_ops.LOG2_E
+        )
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -6757,7 +7832,9 @@ class PagedBf16ExtendRawForwardKernel:
         mO = _assume_tensor_aligned(mO)
         mKCacheT = _make_paged_kv_tma_source_tensor(mKCache, self.stage_tile_rows)
         mVCacheT = _make_paged_kv_tma_source_tensor(mVCache, self.stage_tile_rows)
-        plane_layout = _paged_kv_tma_plane_layout(self.stage_tile_rows, self.kv_tma_plane_head_dim)
+        plane_layout = _paged_kv_tma_plane_layout(
+            self.stage_tile_rows, self.kv_tma_plane_head_dim
+        )
         gmem_tiled_copy_kv = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_kv,
@@ -6845,7 +7922,9 @@ class PagedBf16ExtendRawForwardKernel:
             _exit_thread()
 
         kv_chunk_size = mKvChunkSizePtr[0]
-        chunk_start = kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+        chunk_start = (
+            kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+        )
         chunk_end = (
             cutlass.select_(
                 (kv_tile_idx + 1) * kv_chunk_size < cache_len,
@@ -6855,10 +7934,16 @@ class PagedBf16ExtendRawForwardKernel:
             if const_expr(self.split_kv)
             else cache_len
         )
-        request_partial_start = mOIndptr[request_idx] if const_expr(self.split_kv) else Int32(0)
-        request_partial_end = mOIndptr[request_idx + 1] if const_expr(self.split_kv) else Int32(0)
+        request_partial_start = (
+            mOIndptr[request_idx] if const_expr(self.split_kv) else Int32(0)
+        )
+        request_partial_end = (
+            mOIndptr[request_idx + 1] if const_expr(self.split_kv) else Int32(0)
+        )
         num_chunks_kv = (
-            (request_partial_end - request_partial_start) // qo_len if const_expr(self.split_kv) else Int32(1)
+            (request_partial_end - request_partial_start) // qo_len
+            if const_expr(self.split_kv)
+            else Int32(1)
         )
         tidx = lane + warp_q_idx * Int32(32)
 
@@ -6872,15 +7957,21 @@ class PagedBf16ExtendRawForwardKernel:
             cute.arch.mbarrier_init(mbar_ptr_V + tidx, Int32(1))
         cute.arch.sync_threads()
 
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((self.shared_storage_bytes,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((self.shared_storage_bytes,), stride=(1,))
+        )
         sQ = cute.make_tensor(
             cute.recast_ptr(payload_u8.iterator.align(16), dtype=self.q_dtype),
-            cute.make_layout((self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)),
+            cute.make_layout(
+                (self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)
+            ),
         )
         sOStageU32 = cute.recast_tensor(
             cute.make_tensor(
                 cute.recast_ptr(payload_u8.iterator.align(16), dtype=cutlass.BFloat16),
-                cute.make_layout((self.cta_tile_q, self.head_dim_vo), stride=(self.head_dim_vo, 1)),
+                cute.make_layout(
+                    (self.cta_tile_q, self.head_dim_vo), stride=(self.head_dim_vo, 1)
+                ),
             ),
             cutlass.Uint32,
         )
@@ -6896,65 +7987,147 @@ class PagedBf16ExtendRawForwardKernel:
         plane_stage_layout = _paged_kv_tma_plane_stage_layout(
             self.stage_tile_rows, self.kv_tma_plane_head_dim, self.num_stages
         )
-        plane_num_elems = self.num_stages * self.stage_tile_rows * self.kv_tma_plane_head_dim
+        plane_num_elems = (
+            self.num_stages * self.stage_tile_rows * self.kv_tma_plane_head_dim
+        )
         sKPlane0 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.BFloat16, self.q_bytes + 0 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + 0 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sKPlane1 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.BFloat16, self.q_bytes + 1 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + 1 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sKPlane2 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.BFloat16, self.q_bytes + 2 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + 2 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sKPlane3 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.BFloat16, self.q_bytes + 3 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + 3 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sVPlane0 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.BFloat16, self.q_bytes + self.k_bytes + 0 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + self.k_bytes + 0 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         sVPlane1 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.BFloat16, self.q_bytes + self.k_bytes + 1 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + self.k_bytes + 1 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         sVPlane2 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.BFloat16, self.q_bytes + self.k_bytes + 2 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + self.k_bytes + 2 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         sVPlane3 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.BFloat16, self.q_bytes + self.k_bytes + 3 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.BFloat16,
+                self.q_bytes + self.k_bytes + 3 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         mKCacheTHead = mKCacheT[None, None, kv_head_idx, None]
         mVCacheTHead = mVCacheT[None, None, kv_head_idx, None]
-        gKTma0 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 0, None))
-        gKTma1 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
-        gKTma2 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 2, None))
-        gKTma3 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 3, None))
-        gVTma0 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 0, None))
-        gVTma1 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
-        gVTma2 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 2, None))
-        gVTma3 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 3, None))
-        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
-        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
-        load_K_tma2, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2)
-        load_K_tma3, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3)
-        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
-        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
-        load_V_tma2, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2)
-        load_V_tma3, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3)
+        gKTma0 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 0, None),
+        )
+        gKTma1 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 1, None),
+        )
+        gKTma2 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 2, None),
+        )
+        gKTma3 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 3, None),
+        )
+        gVTma0 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 0, None),
+        )
+        gVTma1 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 1, None),
+        )
+        gVTma2 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 2, None),
+        )
+        gVTma3 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 3, None),
+        )
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
+        )
+        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
+        )
+        load_K_tma2, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2
+        )
+        load_K_tma3, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3
+        )
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
+        )
+        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
+        )
+        load_V_tma2, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2
+        )
+        load_V_tma3, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3
+        )
         if warp_q_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
@@ -6991,26 +8164,48 @@ class PagedBf16ExtendRawForwardKernel:
         lane_group = lane // 4
         lane_pair_base = Int32(2 * (lane % 4))
         warp_row_base = Int32(warp_q_idx * self.num_mma_q * 16)
-        row_local_idx = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        row_valid = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        q_token_local = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        causal_k_limit = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        frag_s_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 8), stride=(self.num_mma_kv * 8, 8, 1))
-        frag_p_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 4), stride=(self.num_mma_kv * 4, 4, 1))
+        row_local_idx = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        row_valid = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        q_token_local = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        q_head_idx_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        q_row_idx_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        causal_k_limit = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        frag_s_layout = cute.make_layout(
+            (self.num_mma_q, self.num_mma_kv, 8), stride=(self.num_mma_kv * 8, 8, 1)
+        )
+        frag_p_layout = cute.make_layout(
+            (self.num_mma_q, self.num_mma_kv, 4), stride=(self.num_mma_kv * 4, 4, 1)
+        )
         frag_o_layout = cute.make_layout(
             (self.num_mma_q, self.num_mma_d_vo, 8), stride=(self.num_mma_d_vo * 8, 8, 1)
         )
         o_frag = cute.make_rmem_tensor(frag_o_layout, Float32)
-        m_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
-        d_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
+        m_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32
+        )
+        d_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32
+        )
         p_frag = cute.make_rmem_tensor(frag_p_layout, Uint32)
         p_frag_pair = cute.make_rmem_tensor(frag_p_layout, Uint32)
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
-                packed_row_local = warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                packed_row_local = (
+                    warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                )
                 row_local_idx[mma_q, row_slot] = Int32(packed_row_local)
                 valid_row = packed_row_local < packed_tile_rows
                 row_valid[mma_q, row_slot] = Int32(valid_row)
@@ -7019,9 +8214,13 @@ class PagedBf16ExtendRawForwardKernel:
                     token_local = packed_q_idx // group_size
                     q_group_lane = packed_q_idx - token_local * group_size
                     q_token_local[mma_q, row_slot] = Int32(token_local)
-                    q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
+                    q_head_idx_frag[mma_q, row_slot] = Int32(
+                        kv_head_idx * group_size + q_group_lane
+                    )
                     q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
-                    causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
+                    causal_k_limit[mma_q, row_slot] = Int32(
+                        token_local + cache_len - qo_len
+                    )
                 else:
                     q_token_local[mma_q, row_slot] = Int32(0)
                     q_head_idx_frag[mma_q, row_slot] = Int32(0)
@@ -7081,8 +8280,12 @@ class PagedBf16ExtendRawForwardKernel:
             )
             tile_tokens = tile_limit - tile_base
             if warp_q_idx == Int32(0):
-                cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
-                cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr_K + consumer_state.index, phase=consumer_state.phase
+                )
+                cute.arch.mbarrier_wait(
+                    mbar_ptr_V + consumer_state.index, phase=consumer_state.phase
+                )
             cute.arch.sync_threads()
             if prefetch_base < chunk_end and warp_q_idx == Int32(0):
                 _issue_paged_kv_tma_copy_4planes_tma_manual(
@@ -7115,14 +8318,46 @@ class PagedBf16ExtendRawForwardKernel:
                 )
                 producer_state.advance()
             stage_plane_offset = consumer_state.index * Int32(self.kv_plane_stage_bytes)
-            k_plane0_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes))
-            k_plane1_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes))
-            k_plane2_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(2 * self.kv_plane_total_bytes))
-            k_plane3_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(3 * self.kv_plane_total_bytes))
-            v_plane0_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes))
-            v_plane1_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes))
-            v_plane2_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(2 * self.kv_plane_total_bytes))
-            v_plane3_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(3 * self.kv_plane_total_bytes))
+            k_plane0_base_addr = shared_ptr_to_u32(
+                sKStageBytes.iterator
+                + stage_plane_offset
+                + Int32(0 * self.kv_plane_total_bytes)
+            )
+            k_plane1_base_addr = shared_ptr_to_u32(
+                sKStageBytes.iterator
+                + stage_plane_offset
+                + Int32(1 * self.kv_plane_total_bytes)
+            )
+            k_plane2_base_addr = shared_ptr_to_u32(
+                sKStageBytes.iterator
+                + stage_plane_offset
+                + Int32(2 * self.kv_plane_total_bytes)
+            )
+            k_plane3_base_addr = shared_ptr_to_u32(
+                sKStageBytes.iterator
+                + stage_plane_offset
+                + Int32(3 * self.kv_plane_total_bytes)
+            )
+            v_plane0_base_addr = shared_ptr_to_u32(
+                sVStageBytes.iterator
+                + stage_plane_offset
+                + Int32(0 * self.kv_plane_total_bytes)
+            )
+            v_plane1_base_addr = shared_ptr_to_u32(
+                sVStageBytes.iterator
+                + stage_plane_offset
+                + Int32(1 * self.kv_plane_total_bytes)
+            )
+            v_plane2_base_addr = shared_ptr_to_u32(
+                sVStageBytes.iterator
+                + stage_plane_offset
+                + Int32(2 * self.kv_plane_total_bytes)
+            )
+            v_plane3_base_addr = shared_ptr_to_u32(
+                sVStageBytes.iterator
+                + stage_plane_offset
+                + Int32(3 * self.kv_plane_total_bytes)
+            )
 
             for subtile_pair_iter in cutlass.range_constexpr(2):
                 subtile_row_base = Int32(subtile_pair_iter * 2 * self.compute_tile_rows)
@@ -7149,16 +8384,27 @@ class PagedBf16ExtendRawForwardKernel:
                     for mma_q in cutlass.range_constexpr(self.num_mma_q):
                         for reg_id in cutlass.range_constexpr(8):
                             row_slot = (reg_id % 4) // 2
-                            key_local = subtile_row_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                            key_local = (
+                                subtile_row_base
+                                + lane_pair_base
+                                + 8 * (reg_id // 4)
+                                + (reg_id % 2)
+                            )
                             valid = row_valid[mma_q, row_slot] != 0
                             if valid:
                                 valid = valid and key_local < tile_tokens
                             if valid:
-                                valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                valid = (
+                                    valid
+                                    and (tile_base + key_local)
+                                    <= causal_k_limit[mma_q, row_slot]
+                                )
                             if not valid:
                                 frag_S[mma_q, 0, reg_id] = Float32(-Float32.inf)
 
-                    next_subtile_row_base = subtile_row_base + Int32(self.compute_tile_rows)
+                    next_subtile_row_base = subtile_row_base + Int32(
+                        self.compute_tile_rows
+                    )
                     if next_subtile_row_base < tile_tokens:
                         frag_S_pair = cute.make_rmem_tensor(frag_s_layout, Float32)
                         frag_S_pair.fill(0.0)
@@ -7183,17 +8429,23 @@ class PagedBf16ExtendRawForwardKernel:
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
                                 key_local = (
-                                    next_subtile_row_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                    next_subtile_row_base
+                                    + lane_pair_base
+                                    + 8 * (reg_id // 4)
+                                    + (reg_id % 2)
                                 )
                                 valid = row_valid[mma_q, row_slot] != 0
                                 if valid:
                                     valid = valid and key_local < tile_tokens
                                 if valid:
                                     valid = valid and (
-                                        (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                        (tile_base + key_local)
+                                        <= causal_k_limit[mma_q, row_slot]
                                     )
                                 if not valid:
-                                    frag_S_pair[mma_q, 0, reg_id] = Float32(-Float32.inf)
+                                    frag_S_pair[mma_q, 0, reg_id] = Float32(
+                                        -Float32.inf
+                                    )
 
                         _literal_update_mdo_states_fp32_pack_p_pairwise(
                             frag_S,
@@ -7311,7 +8563,9 @@ class PagedBf16ExtendRawForwardKernel:
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
                 if m_frag[mma_q, row_slot] != -Float32.inf:
-                    m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
+                    m_frag[mma_q, row_slot] = Float32(
+                        m_frag[mma_q, row_slot] * self.softmax_scale_log2
+                    )
 
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
@@ -7340,17 +8594,38 @@ class PagedBf16ExtendRawForwardKernel:
                         out_high1 = o_frag[mma_q, mma_d, reg_base + 5] * inv_d
                     if valid_row_store:
                         if const_expr(
-                            self.split_kv and os.environ.get("SPARKINFER_DEBUG_BF16_EXTEND_DIRECT_STORE", "") == "1"
+                            self.split_kv
+                            and os.environ.get(
+                                "SPARKINFER_DEBUG_BF16_EXTEND_DIRECT_STORE",
+                                "",
+                            )
+                            == "1"
                         ):
-                            partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                            mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.o_dtype)
+                            partial_row_idx = (
+                                request_partial_start
+                                + token_local * num_chunks_kv
+                                + kv_tile_idx
+                            )
+                            mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(
+                                self.o_dtype
+                            )
+                            mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(
+                                self.o_dtype
+                            )
+                            mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                out_high0.to(self.o_dtype)
+                            )
+                            mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                out_high1.to(self.o_dtype)
+                            )
                         else:
                             packed_row_local = row_local_idx[mma_q, row_slot]
-                            sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                            sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(out_high0, out_high1)
+                            sOStageU32[packed_row_local, dim_low // 2] = (
+                                pack_f32x2_to_bfloat2(out_low0, out_low1)
+                            )
+                            sOStageU32[packed_row_local, dim_high // 2] = (
+                                pack_f32x2_to_bfloat2(out_high0, out_high1)
+                            )
                 if valid_row_store and lane_pair_base == 0:
                     row_lse = (
                         Float32(-Float32.inf)
@@ -7358,18 +8633,32 @@ class PagedBf16ExtendRawForwardKernel:
                         else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
                     )
                     if const_expr(self.split_kv):
-                        partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                        partial_row_idx = (
+                            request_partial_start
+                            + token_local * num_chunks_kv
+                            + kv_tile_idx
+                        )
                         mLSE[partial_row_idx, q_head_idx] = row_lse
                     else:
                         mLSE[q_head_idx, q_row_idx] = row_lse
-        if const_expr(not (self.split_kv and os.environ.get("SPARKINFER_DEBUG_BF16_EXTEND_DIRECT_STORE", "") == "1")):
+        if const_expr(
+            not (
+                self.split_kv
+                and os.environ.get(
+                    "SPARKINFER_DEBUG_BF16_EXTEND_DIRECT_STORE", ""
+                )
+                == "1"
+            )
+        ):
             cute.arch.sync_threads()
             store_chunks_per_row = self.head_dim_vo // 8
             store_chunk_linear_idx = tidx
             store_total_chunks = packed_tile_rows * store_chunks_per_row
             while store_chunk_linear_idx < store_total_chunks:
                 packed_row_local = store_chunk_linear_idx // store_chunks_per_row
-                chunk_idx = store_chunk_linear_idx - packed_row_local * store_chunks_per_row
+                chunk_idx = (
+                    store_chunk_linear_idx - packed_row_local * store_chunks_per_row
+                )
                 packed_q_idx = packed_tile_start + packed_row_local
                 token_local = packed_q_idx // group_size
                 q_group_lane = packed_q_idx - token_local * group_size
@@ -7377,7 +8666,8 @@ class PagedBf16ExtendRawForwardKernel:
                 q_row_idx = q_start + token_local
                 if const_expr(not self.split_kv):
                     gmem_elem_offset = Int64(
-                        (Int64(q_row_idx) * Int64(mO.shape[1]) + Int64(q_head_idx)) * Int64(self.head_dim_vo)
+                        (Int64(q_row_idx) * Int64(mO.shape[1]) + Int64(q_head_idx))
+                        * Int64(self.head_dim_vo)
                         + Int64(chunk_idx * 8)
                     )
                     u32_idx = chunk_idx * 4
@@ -7389,9 +8679,16 @@ class PagedBf16ExtendRawForwardKernel:
                         sOStageU32[packed_row_local, u32_idx + 3],
                     )
                 else:
-                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    partial_row_idx = (
+                        request_partial_start
+                        + token_local * num_chunks_kv
+                        + kv_tile_idx
+                    )
                     u32_idx = chunk_idx * 4
-                    gmem_u32_offset = ((partial_row_idx * mO.shape[1] + q_head_idx) * (self.head_dim_vo // 2)) + u32_idx
+                    gmem_u32_offset = (
+                        (partial_row_idx * mO.shape[1] + q_head_idx)
+                        * (self.head_dim_vo // 2)
+                    ) + u32_idx
                     st_global_v4_u32(
                         get_ptr_as_int64(mOFlatU32, gmem_u32_offset),
                         sOStageU32[packed_row_local, u32_idx + 0],
@@ -7434,7 +8731,9 @@ class PagedFp8ExtendRawForwardKernel:
         self.kv_plane_total_bytes = self.num_stages * self.kv_plane_stage_bytes
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * self.head_dim_qk
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * self.head_dim_vo
-        self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_ops.LOG2_E)
+        self.softmax_scale_log2 = Float32(
+            (self.head_dim_qk**-0.5) * attention_ops.LOG2_E
+        )
 
     def _get_shared_storage_cls(self):
         class SharedStorage:
@@ -7480,7 +8779,9 @@ class PagedFp8ExtendRawForwardKernel:
         mO = _assume_tensor_aligned(mO)
         mKCacheT = _make_paged_kv_tma_source_tensor(mKCache, self.stage_tile_rows)
         mVCacheT = _make_paged_kv_tma_source_tensor(mVCache, self.stage_tile_rows)
-        plane_layout = _paged_kv_tma_plane_layout(self.stage_tile_rows, self.kv_tma_plane_head_dim)
+        plane_layout = _paged_kv_tma_plane_layout(
+            self.stage_tile_rows, self.kv_tma_plane_head_dim
+        )
         gmem_tiled_copy_kv = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_kv,
@@ -7573,7 +8874,9 @@ class PagedFp8ExtendRawForwardKernel:
             _exit_thread()
 
         kv_chunk_size = mKvChunkSizePtr[0]
-        chunk_start = kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+        chunk_start = (
+            kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
+        )
         chunk_end = (
             cutlass.select_(
                 (kv_tile_idx + 1) * kv_chunk_size < cache_len,
@@ -7583,10 +8886,16 @@ class PagedFp8ExtendRawForwardKernel:
             if const_expr(self.split_kv)
             else cache_len
         )
-        request_partial_start = mOIndptr[request_idx] if const_expr(self.split_kv) else Int32(0)
-        request_partial_end = mOIndptr[request_idx + 1] if const_expr(self.split_kv) else Int32(0)
+        request_partial_start = (
+            mOIndptr[request_idx] if const_expr(self.split_kv) else Int32(0)
+        )
+        request_partial_end = (
+            mOIndptr[request_idx + 1] if const_expr(self.split_kv) else Int32(0)
+        )
         num_chunks_kv = (
-            (request_partial_end - request_partial_start) // qo_len if const_expr(self.split_kv) else Int32(1)
+            (request_partial_end - request_partial_start) // qo_len
+            if const_expr(self.split_kv)
+            else Int32(1)
         )
         tidx = lane + warp_q_idx * Int32(32)
 
@@ -7600,15 +8909,21 @@ class PagedFp8ExtendRawForwardKernel:
             cute.arch.mbarrier_init(mbar_ptr_V + tidx, Int32(1))
         cute.arch.sync_threads()
 
-        payload_u8 = storage.payload.get_tensor(cute.make_layout((self.shared_storage_bytes,), stride=(1,)))
+        payload_u8 = storage.payload.get_tensor(
+            cute.make_layout((self.shared_storage_bytes,), stride=(1,))
+        )
         sQ = cute.make_tensor(
             cute.recast_ptr(payload_u8.iterator.align(16), dtype=self.q_dtype),
-            cute.make_layout((self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)),
+            cute.make_layout(
+                (self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)
+            ),
         )
         sOStageU32 = cute.recast_tensor(
             cute.make_tensor(
                 cute.recast_ptr(payload_u8.iterator.align(16), dtype=cutlass.BFloat16),
-                cute.make_layout((self.cta_tile_q, self.head_dim_vo), stride=(self.head_dim_vo, 1)),
+                cute.make_layout(
+                    (self.cta_tile_q, self.head_dim_vo), stride=(self.head_dim_vo, 1)
+                ),
             ),
             cutlass.Uint32,
         )
@@ -7624,37 +8939,79 @@ class PagedFp8ExtendRawForwardKernel:
         plane_stage_layout = _paged_kv_tma_plane_stage_layout(
             self.stage_tile_rows, self.kv_tma_plane_head_dim, self.num_stages
         )
-        plane_num_elems = self.num_stages * self.stage_tile_rows * self.kv_tma_plane_head_dim
+        plane_num_elems = (
+            self.num_stages * self.stage_tile_rows * self.kv_tma_plane_head_dim
+        )
         sKPlane0 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.Uint8, self.q_bytes + 0 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + 0 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sKPlane1 = _get_memrange_tensor(
-            _make_payload_memrange(payload_u8, cutlass.Uint8, self.q_bytes + 1 * self.kv_plane_total_bytes, plane_num_elems),
+            _make_payload_memrange(
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + 1 * self.kv_plane_total_bytes,
+                plane_num_elems,
+            ),
             plane_stage_layout,
         )
         sVPlane0 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.Uint8, self.q_bytes + self.k_bytes + 0 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + self.k_bytes + 0 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         sVPlane1 = _get_memrange_tensor(
             _make_payload_memrange(
-                payload_u8, cutlass.Uint8, self.q_bytes + self.k_bytes + 1 * self.kv_plane_total_bytes, plane_num_elems
+                payload_u8,
+                cutlass.Uint8,
+                self.q_bytes + self.k_bytes + 1 * self.kv_plane_total_bytes,
+                plane_num_elems,
             ),
             plane_stage_layout,
         )
         mKCacheTHead = mKCacheT[None, None, kv_head_idx, None]
         mVCacheTHead = mVCacheT[None, None, kv_head_idx, None]
-        gKTma0 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 0, None))
-        gKTma1 = cute.local_tile(mKCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
-        gVTma0 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 0, None))
-        gVTma1 = cute.local_tile(mVCacheTHead, (self.stage_tile_rows, self.kv_tma_plane_head_dim), (0, 1, None))
-        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0)
-        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1)
-        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0)
-        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1)
+        gKTma0 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 0, None),
+        )
+        gKTma1 = cute.local_tile(
+            mKCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 1, None),
+        )
+        gVTma0 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 0, None),
+        )
+        gVTma1 = cute.local_tile(
+            mVCacheTHead,
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+            (0, 1, None),
+        )
+        load_K_tma0, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
+        )
+        load_K_tma1, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
+        )
+        load_V_tma0, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
+        )
+        load_V_tma1, _, _ = cute_copy.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
+        )
         if warp_q_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
@@ -7691,25 +9048,43 @@ class PagedFp8ExtendRawForwardKernel:
         lane_group = lane // 4
         lane_pair_base = Int32(2 * (lane % 4))
         warp_row_base = Int32(warp_q_idx * self.num_mma_q * 16)
-        row_local_idx = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        row_valid = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        q_token_local = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        causal_k_limit = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        frag_s_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 8), stride=(self.num_mma_kv * 8, 8, 1))
-        frag_p_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 4), stride=(self.num_mma_kv * 4, 4, 1))
+        row_local_idx = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        row_valid = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        q_token_local = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        causal_k_limit = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32
+        )
+        frag_s_layout = cute.make_layout(
+            (self.num_mma_q, self.num_mma_kv, 8), stride=(self.num_mma_kv * 8, 8, 1)
+        )
+        frag_p_layout = cute.make_layout(
+            (self.num_mma_q, self.num_mma_kv, 4), stride=(self.num_mma_kv * 4, 4, 1)
+        )
         frag_o_layout = cute.make_layout(
             (self.num_mma_q, self.num_mma_d_vo, 8), stride=(self.num_mma_d_vo * 8, 8, 1)
         )
         o_frag = cute.make_rmem_tensor(frag_o_layout, Float32)
-        m_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
-        d_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
+        m_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32
+        )
+        d_frag = cute.make_rmem_tensor(
+            cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32
+        )
         p_frag = cute.make_rmem_tensor(frag_p_layout, Uint32)
         p_frag_pair = cute.make_rmem_tensor(frag_p_layout, Uint32)
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
 
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
-                packed_row_local = warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                packed_row_local = (
+                    warp_row_base + mma_q * 16 + lane_group + 8 * row_slot
+                )
                 row_local_idx[mma_q, row_slot] = Int32(packed_row_local)
                 valid_row = packed_row_local < packed_tile_rows
                 row_valid[mma_q, row_slot] = Int32(valid_row)
@@ -7717,7 +9092,9 @@ class PagedFp8ExtendRawForwardKernel:
                     packed_q_idx = packed_tile_start + packed_row_local
                     token_local = packed_q_idx // group_size
                     q_token_local[mma_q, row_slot] = Int32(token_local)
-                    causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
+                    causal_k_limit[mma_q, row_slot] = Int32(
+                        token_local + cache_len - qo_len
+                    )
                 else:
                     q_token_local[mma_q, row_slot] = Int32(0)
                     causal_k_limit[mma_q, row_slot] = Int32(-1)
@@ -7733,12 +9110,20 @@ class PagedFp8ExtendRawForwardKernel:
         k_scale = (
             mKDescale[request_idx]
             if const_expr(mKDescale is not None and len(mKDescale.shape) == 1)
-            else (mKDescale[request_idx, kv_head_idx] if const_expr(mKDescale is not None) else Float32(1.0))
+            else (
+                mKDescale[request_idx, kv_head_idx]
+                if const_expr(mKDescale is not None)
+                else Float32(1.0)
+            )
         )
         v_scale = (
             mVDescale[request_idx]
             if const_expr(mVDescale is not None and len(mVDescale.shape) == 1)
-            else (mVDescale[request_idx, kv_head_idx] if const_expr(mVDescale is not None) else Float32(1.0))
+            else (
+                mVDescale[request_idx, kv_head_idx]
+                if const_expr(mVDescale is not None)
+                else Float32(1.0)
+            )
         )
         producer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
         consumer_state = cute_pipeline.PipelineStateSimple(self.num_stages, Int32(0))
@@ -7779,10 +9164,18 @@ class PagedFp8ExtendRawForwardKernel:
                 chunk_end,
             )
             tile_tokens = tile_limit - tile_base
-            cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
-            cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
+            cute.arch.mbarrier_wait(
+                mbar_ptr_K + consumer_state.index, phase=consumer_state.phase
+            )
+            cute.arch.mbarrier_wait(
+                mbar_ptr_V + consumer_state.index, phase=consumer_state.phase
+            )
             cute.arch.sync_threads()
-            if const_expr(self.num_stages > 1) and prefetch_base < chunk_end and warp_q_idx == Int32(0):
+            if (
+                const_expr(self.num_stages > 1)
+                and prefetch_base < chunk_end
+                and warp_q_idx == Int32(0)
+            ):
                 _issue_paged_kv_tma_copy_2planes_tma_manual(
                     load_K_tma0,
                     load_K_tma1,
@@ -7818,8 +9211,16 @@ class PagedFp8ExtendRawForwardKernel:
                     _literal_qk_mma_into_sfrag_plane_fp8_raw(
                         frag_S,
                         q_smem_base_addr,
-                        shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes)),
-                        shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes)),
+                        shared_ptr_to_u32(
+                            sKStageBytes.iterator
+                            + stage_plane_offset
+                            + Int32(0 * self.kv_plane_total_bytes)
+                        ),
+                        shared_ptr_to_u32(
+                            sKStageBytes.iterator
+                            + stage_plane_offset
+                            + Int32(1 * self.kv_plane_total_bytes)
+                        ),
                         lane,
                         warp_q_idx,
                         Int32(0),
@@ -7845,21 +9246,39 @@ class PagedFp8ExtendRawForwardKernel:
                                 if valid:
                                     valid = valid and key_local < tile_tokens
                                 if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    valid = (
+                                        valid
+                                        and (tile_base + key_local)
+                                        <= causal_k_limit[mma_q, row_slot]
+                                    )
                                 if valid:
-                                    frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                    frag_S[mma_q, mma_kv, reg_id] = (
+                                        frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                    )
                                 else:
-                                    frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                    frag_S[mma_q, mma_kv, reg_id] = Float32(
+                                        -Float32.inf
+                                    )
 
-                    next_subtile_row_base = subtile_row_base + Int32(self.compute_tile_rows)
+                    next_subtile_row_base = subtile_row_base + Int32(
+                        self.compute_tile_rows
+                    )
                     if subtile_iter == 0 and next_subtile_row_base < tile_tokens:
                         frag_S_pair = cute.make_rmem_tensor(frag_s_layout, Float32)
                         frag_S_pair.fill(0.0)
                         _literal_qk_mma_into_sfrag_plane_fp8_raw(
                             frag_S_pair,
                             q_smem_base_addr,
-                            shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes)),
-                            shared_ptr_to_u32(sKStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes)),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(0 * self.kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(1 * self.kv_plane_total_bytes)
+                            ),
                             lane,
                             warp_q_idx,
                             Int32(0),
@@ -7886,14 +9305,17 @@ class PagedFp8ExtendRawForwardKernel:
                                         valid = valid and key_local < tile_tokens
                                     if valid:
                                         valid = valid and (
-                                            (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                            (tile_base + key_local)
+                                            <= causal_k_limit[mma_q, row_slot]
                                         )
                                     if valid:
                                         frag_S_pair[mma_q, mma_kv, reg_id] = (
                                             frag_S_pair[mma_q, mma_kv, reg_id] * k_scale
                                         )
                                     else:
-                                        frag_S_pair[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        frag_S_pair[mma_q, mma_kv, reg_id] = Float32(
+                                            -Float32.inf
+                                        )
 
                         _literal_update_mdo_states_fp32_pack_p_pairwise(
                             frag_S,
@@ -7935,8 +9357,16 @@ class PagedFp8ExtendRawForwardKernel:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag,
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes)),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(0 * self.kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(1 * self.kv_plane_total_bytes)
+                            ),
                             lane,
                             Int32(0),
                             subtile_row_base,
@@ -7949,8 +9379,16 @@ class PagedFp8ExtendRawForwardKernel:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag_pair,
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes)),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(0 * self.kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(1 * self.kv_plane_total_bytes)
+                            ),
                             lane,
                             Int32(0),
                             next_subtile_row_base,
@@ -7988,8 +9426,16 @@ class PagedFp8ExtendRawForwardKernel:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag,
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(0 * self.kv_plane_total_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + stage_plane_offset + Int32(1 * self.kv_plane_total_bytes)),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(0 * self.kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator
+                                + stage_plane_offset
+                                + Int32(1 * self.kv_plane_total_bytes)
+                            ),
                             lane,
                             Int32(0),
                             subtile_row_base,
@@ -8002,7 +9448,11 @@ class PagedFp8ExtendRawForwardKernel:
 
             consumer_state.advance()
             tile_base += Int32(self.stage_tile_rows)
-            if const_expr(self.num_stages == 1) and tile_base < chunk_end and warp_q_idx == Int32(0):
+            if (
+                const_expr(self.num_stages == 1)
+                and tile_base < chunk_end
+                and warp_q_idx == Int32(0)
+            ):
                 _issue_paged_kv_tma_copy_2planes_tma_manual(
                     load_K_tma0,
                     load_K_tma1,
@@ -8034,7 +9484,9 @@ class PagedFp8ExtendRawForwardKernel:
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
                 if m_frag[mma_q, row_slot] != -Float32.inf:
-                    m_frag[mma_q, row_slot] = Float32(m_frag[mma_q, row_slot] * self.softmax_scale_log2)
+                    m_frag[mma_q, row_slot] = Float32(
+                        m_frag[mma_q, row_slot] * self.softmax_scale_log2
+                    )
 
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
@@ -8066,22 +9518,44 @@ class PagedFp8ExtendRawForwardKernel:
                     if valid_row_store:
                         if const_expr(self.cta_tile_q == 48):
                             packed_row_local = row_local_idx[mma_q, row_slot]
-                            sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                            sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
-                                out_high0, out_high1
+                            sOStageU32[packed_row_local, dim_low // 2] = (
+                                pack_f32x2_to_bfloat2(out_low0, out_low1)
+                            )
+                            sOStageU32[packed_row_local, dim_high // 2] = (
+                                pack_f32x2_to_bfloat2(out_high0, out_high1)
                             )
                         else:
                             if const_expr(self.split_kv):
-                                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                                mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.o_dtype)
-                                mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.o_dtype)
-                                mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.o_dtype)
-                                mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.o_dtype)
+                                partial_row_idx = (
+                                    request_partial_start
+                                    + token_local * num_chunks_kv
+                                    + kv_tile_idx
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_low + 0] = (
+                                    out_low0.to(self.o_dtype)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_low + 1] = (
+                                    out_low1.to(self.o_dtype)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 0] = (
+                                    out_high0.to(self.o_dtype)
+                                )
+                                mO[partial_row_idx, q_head_idx, dim_high + 1] = (
+                                    out_high1.to(self.o_dtype)
+                                )
                             else:
-                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.o_dtype)
-                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.o_dtype)
-                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.o_dtype)
-                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.o_dtype)
+                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(
+                                    self.o_dtype
+                                )
+                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(
+                                    self.o_dtype
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(
+                                    self.o_dtype
+                                )
+                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(
+                                    self.o_dtype
+                                )
                 if valid_row_store and lane_pair_base == 0:
                     row_lse = (
                         Float32(-Float32.inf)
@@ -8089,7 +9563,11 @@ class PagedFp8ExtendRawForwardKernel:
                         else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
                     )
                     if const_expr(self.split_kv):
-                        partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                        partial_row_idx = (
+                            request_partial_start
+                            + token_local * num_chunks_kv
+                            + kv_tile_idx
+                        )
                         mLSE[partial_row_idx, q_head_idx] = row_lse
                     else:
                         mLSE[q_head_idx, q_row_idx] = row_lse
@@ -8100,21 +9578,32 @@ class PagedFp8ExtendRawForwardKernel:
             store_total_chunks = packed_tile_rows * store_chunks_per_row
             while store_chunk_linear_idx < store_total_chunks:
                 packed_row_local = store_chunk_linear_idx // store_chunks_per_row
-                chunk_idx = store_chunk_linear_idx - packed_row_local * store_chunks_per_row
+                chunk_idx = (
+                    store_chunk_linear_idx - packed_row_local * store_chunks_per_row
+                )
                 packed_q_idx = packed_tile_start + packed_row_local
                 token_local = packed_q_idx // group_size
                 q_group_lane = packed_q_idx - token_local * group_size
                 q_head_idx = kv_head_idx * group_size + q_group_lane
                 q_row_idx = q_start + token_local
                 if const_expr(self.split_kv):
-                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    partial_row_idx = (
+                        request_partial_start
+                        + token_local * num_chunks_kv
+                        + kv_tile_idx
+                    )
                     gmem_elem_offset = Int64(
-                        (Int64(partial_row_idx) * Int64(mO.shape[1]) + Int64(q_head_idx)) * Int64(self.head_dim_vo)
+                        (
+                            Int64(partial_row_idx) * Int64(mO.shape[1])
+                            + Int64(q_head_idx)
+                        )
+                        * Int64(self.head_dim_vo)
                         + Int64(chunk_idx * 8)
                     )
                 else:
                     gmem_elem_offset = Int64(
-                        (Int64(q_row_idx) * Int64(mO.shape[1]) + Int64(q_head_idx)) * Int64(self.head_dim_vo)
+                        (Int64(q_row_idx) * Int64(mO.shape[1]) + Int64(q_head_idx))
+                        * Int64(self.head_dim_vo)
                         + Int64(chunk_idx * 8)
                     )
                 u32_idx = chunk_idx * 4

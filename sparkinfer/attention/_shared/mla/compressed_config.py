@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sparkinfer.attention.workspace import SparseMLASplitDecodeConfig
+from sparkinfer.attention._shared.workspace import (
+    SparseMLASplitDecodeConfig,
+)
 
 
 _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE = 12
@@ -30,10 +32,7 @@ def compressed_mla_split_config_for_contract(
     decode_chunks = (
         width + _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE - 1
     ) // _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE
-    if (
-        rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
-        and decode_chunks <= chunk_limit
-    ):
+    if rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS and decode_chunks <= chunk_limit:
         return SparseMLASplitDecodeConfig(
             chunk_size=_COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE,
             num_chunks=decode_chunks,
@@ -42,7 +41,10 @@ def compressed_mla_split_config_for_contract(
     wide_decode_chunks = (
         width + _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE - 1
     ) // _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE
-    if rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS and wide_decode_chunks <= chunk_limit:
+    if (
+        rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
+        and wide_decode_chunks <= chunk_limit
+    ):
         return SparseMLASplitDecodeConfig(
             chunk_size=_COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE,
             num_chunks=wide_decode_chunks,

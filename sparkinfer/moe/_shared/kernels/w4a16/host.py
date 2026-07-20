@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.moe.fused.activations import (
+from sparkinfer.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     is_gated_moe_activation,
     normalize_moe_activation,

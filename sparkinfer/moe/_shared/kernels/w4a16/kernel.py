@@ -16,8 +16,11 @@ from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
-from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    compile as sparkinfer_compile,
+)
+from sparkinfer._lib.intrinsics import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
@@ -73,11 +76,11 @@ from sparkinfer.cute.intrinsics import (
     threadfence,
     warp_reduce,
 )
-from sparkinfer.cute.utils import current_cuda_stream, make_ptr
-from sparkinfer.moe.fused.w4a16.route_pack import (
+from sparkinfer._lib.utils import current_cuda_stream, make_ptr
+from sparkinfer.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
-from sparkinfer.moe.fused.w4a16.host import (
+from sparkinfer.moe._shared.kernels.w4a16.host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
@@ -85,8 +88,10 @@ from sparkinfer.moe.fused.w4a16.host import (
     select_route_block_size_m,
     validate_activation,
 )
-from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
-from sparkinfer.moe.fused.activations import (
+from sparkinfer._lib.runtime_control import (
+    raise_if_kernel_resolution_frozen,
+)
+from sparkinfer.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
@@ -94,7 +99,9 @@ from sparkinfer.moe.fused.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from sparkinfer.moe.fused.micro import MoEMicroKernelBackend
+from sparkinfer.moe._shared.kernels.micro import (
+    MoEMicroKernelBackend,
+)
 
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
@@ -5170,9 +5177,7 @@ class W4A16FusedMoeHybridKernel:
     ):
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
-            layout=cute.make_layout(
-                (active_m * Int32(self.hidden_size),), stride=(1,)
-            ),
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -6655,9 +6660,7 @@ def compile_w4a16_fused_moe_hybrid(
         raise ValueError("hybrid W4A16 requires a gated activation")
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
-        int(v) for v in force_tile_config
-    )
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (int(v) for v in force_tile_config)
     max_m_blocks = int(size_m) * int(top_k)
 
     def _tier_kernel(
@@ -6734,9 +6737,7 @@ def compile_w4a16_fused_moe_hybrid(
             fake_dtype, (elements,), assumed_align=16
         )
 
-    def _scales_fake(
-        num_experts: int, size_n: int, size_k: int, scale_format: str
-    ):
+    def _scales_fake(num_experts: int, size_n: int, size_k: int, scale_format: str):
         return cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
             (
@@ -6766,29 +6767,21 @@ def compile_w4a16_fused_moe_hybrid(
     )
     compile_args = (
         a_fake,
-        _weight_fake(
-            tier0.num_experts, fc1_cols, hidden_size, tier0.weight_layout
-        ),
+        _weight_fake(tier0.num_experts, fc1_cols, hidden_size, tier0.weight_layout),
         _weight_fake(
             tier0.num_experts, hidden_size, intermediate_size, tier0.weight_layout
         ),
-        _scales_fake(
-            tier0.num_experts, fc1_cols, hidden_size, tier0.scale_format
-        ),
+        _scales_fake(tier0.num_experts, fc1_cols, hidden_size, tier0.scale_format),
         _scales_fake(
             tier0.num_experts, hidden_size, intermediate_size, tier0.scale_format
         ),
         _global_fake(tier0.num_experts),
         _global_fake(tier0.num_experts),
-        _weight_fake(
-            tier1.num_experts, fc1_cols, hidden_size, tier1.weight_layout
-        ),
+        _weight_fake(tier1.num_experts, fc1_cols, hidden_size, tier1.weight_layout),
         _weight_fake(
             tier1.num_experts, hidden_size, intermediate_size, tier1.weight_layout
         ),
-        _scales_fake(
-            tier1.num_experts, fc1_cols, hidden_size, tier1.scale_format
-        ),
+        _scales_fake(tier1.num_experts, fc1_cols, hidden_size, tier1.scale_format),
         _scales_fake(
             tier1.num_experts, hidden_size, intermediate_size, tier1.scale_format
         ),
@@ -8737,9 +8730,7 @@ def _w4a16_fused_moe_hybrid_launch_flat(
         schedule_whole_tiles=bool(schedule_whole_tiles),
     )
 
-    element_torch_dtype = (
-        torch.float16 if element_dtype == "fp16" else torch.bfloat16
-    )
+    element_torch_dtype = torch.float16 if element_dtype == "fp16" else torch.bfloat16
     fc1_cols = int(intermediate_size) * 2
     routed_rows = int(m) * int(topk)
     weight_dtypes = {
@@ -9216,18 +9207,12 @@ def run_w4a16_moe_hybrid(
         moe_block_size=8,
         sms=sms,
     )
-    fc1_scratch = _get_c_tmp(
-        scratch_elements, device=a_input.device, scratch=fc1_c_tmp
-    )
-    fc2_scratch = _get_c_tmp(
-        scratch_elements, device=a_input.device, scratch=fc2_c_tmp
-    )
+    fc1_scratch = _get_c_tmp(scratch_elements, device=a_input.device, scratch=fc1_c_tmp)
+    fc2_scratch = _get_c_tmp(scratch_elements, device=a_input.device, scratch=fc2_c_tmp)
     workspace = prepared_tier0.workspace
     stream = current_cuda_stream() if stream is None else stream
 
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
-        int(v) for v in force_tile_config
-    )
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (int(v) for v in force_tile_config)
     torch.ops.sparkinfer.w4a16_fused_moe_hybrid_launch(
         a_input,
         t0_w13,

@@ -12,9 +12,13 @@ _INDEX_HEAD_DIM = 128
 _SCALE_BYTES = 4
 
 
-def _as_2d_index_k_cache(index_k_cache: torch.Tensor, *, page_size: int) -> torch.Tensor:
+def _as_2d_index_k_cache(
+    index_k_cache: torch.Tensor, *, page_size: int
+) -> torch.Tensor:
     if index_k_cache.ndim != 2:
-        raise ValueError(f"index_k_cache must be rank-2, got {tuple(index_k_cache.shape)}")
+        raise ValueError(
+            f"index_k_cache must be rank-2, got {tuple(index_k_cache.shape)}"
+        )
     expected_width = page_size * (_INDEX_HEAD_DIM + _SCALE_BYTES)
     if index_k_cache.shape[1] != expected_width:
         raise ValueError(
@@ -22,7 +26,9 @@ def _as_2d_index_k_cache(index_k_cache: torch.Tensor, *, page_size: int) -> torc
             f"got {index_k_cache.shape[1]}"
         )
     if index_k_cache.dtype != torch.uint8:
-        raise ValueError(f"index_k_cache must have dtype torch.uint8, got {index_k_cache.dtype}")
+        raise ValueError(
+            f"index_k_cache must have dtype torch.uint8, got {index_k_cache.dtype}"
+        )
     return index_k_cache.contiguous()
 
 
@@ -34,11 +40,15 @@ def _as_k_matrix(k: torch.Tensor) -> torch.Tensor:
     if k.ndim != 2:
         raise ValueError(f"k must be rank-2 or rank-3, got {tuple(k.shape)}")
     if k.shape[1] != _INDEX_HEAD_DIM:
-        raise ValueError(f"k last dimension must be {_INDEX_HEAD_DIM}, got {k.shape[1]}")
+        raise ValueError(
+            f"k last dimension must be {_INDEX_HEAD_DIM}, got {k.shape[1]}"
+        )
     return k.contiguous()
 
 
-def _normalize_weights(weights: torch.Tensor, *, q_rows: int, num_heads: int) -> torch.Tensor:
+def _normalize_weights(
+    weights: torch.Tensor, *, q_rows: int, num_heads: int
+) -> torch.Tensor:
     if weights.ndim == 3:
         if weights.shape[2] != 1:
             raise ValueError(
@@ -46,7 +56,9 @@ def _normalize_weights(weights: torch.Tensor, *, q_rows: int, num_heads: int) ->
             )
         weights = weights.squeeze(2)
     if weights.ndim != 2:
-        raise ValueError(f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}")
+        raise ValueError(
+            f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}"
+        )
     if weights.shape != (q_rows, num_heads):
         raise ValueError(
             f"weights shape must be {(q_rows, num_heads)}, got {tuple(weights.shape)}"
@@ -119,9 +131,9 @@ def pack_index_k_cache_reference(
     )
     quant_padded[:num_tokens].copy_(quant.view(torch.uint8))
     scale_padded[:num_tokens].copy_(scales)
-    cache[:, :data_bytes].view(
-        num_pages, page_size, _INDEX_HEAD_DIM
-    ).copy_(quant_padded.view(num_pages, page_size, _INDEX_HEAD_DIM))
+    cache[:, :data_bytes].view(num_pages, page_size, _INDEX_HEAD_DIM).copy_(
+        quant_padded.view(num_pages, page_size, _INDEX_HEAD_DIM)
+    )
     cache[:, data_bytes:].view(torch.float32).copy_(
         scale_padded.view(num_pages, page_size)
     )
@@ -138,12 +150,16 @@ def unpack_index_k_cache_reference(
 
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
-    k_quant, k_scale = _split_index_k_cache_reference(index_k_cache, page_size=page_size)
+    k_quant, k_scale = _split_index_k_cache_reference(
+        index_k_cache, page_size=page_size
+    )
     max_tokens = k_quant.shape[0] * page_size
     if num_tokens > max_tokens:
         raise ValueError(f"num_tokens {num_tokens} exceeds cache capacity {max_tokens}")
     if num_tokens == 0:
-        return torch.empty((0, _INDEX_HEAD_DIM), dtype=torch.float32, device=index_k_cache.device)
+        return torch.empty(
+            (0, _INDEX_HEAD_DIM), dtype=torch.float32, device=index_k_cache.device
+        )
     token_ids = torch.arange(num_tokens, device=index_k_cache.device, dtype=torch.long)
     page_idx = torch.div(token_ids, page_size, rounding_mode="floor")
     slot_idx = token_ids % page_size
@@ -165,9 +181,13 @@ def paged_decode_logits_reference(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     if real_page_table.ndim != 2:
-        raise ValueError(f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}")
+        raise ValueError(
+            f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}"
+        )
     if real_page_table.dtype != torch.int32:
         raise ValueError(
             f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
@@ -202,10 +222,14 @@ def paged_decode_logits_reference(
 
     num_queries, num_heads, _ = q_fp8.shape
     weights_f = _normalize_weights(weights, q_rows=num_queries, num_heads=num_heads)
-    k_quant, k_scale = _split_index_k_cache_reference(index_k_cache, page_size=page_size)
+    k_quant, k_scale = _split_index_k_cache_reference(
+        index_k_cache, page_size=page_size
+    )
     valid_q_rows = int(query_row_to_batch.numel())
     if valid_q_rows > num_queries:
-        raise ValueError(f"metadata describes {valid_q_rows} query rows, but q_fp8 has {num_queries}")
+        raise ValueError(
+            f"metadata describes {valid_q_rows} query rows, but q_fp8 has {num_queries}"
+        )
 
     width_tokens = real_page_table.shape[1] * page_size
     logits_out = torch.full(
@@ -222,13 +246,19 @@ def paged_decode_logits_reference(
     token_pos = torch.arange(width_tokens, device=q_fp8.device, dtype=torch.long)
     page_col = torch.div(token_pos, page_size, rounding_mode="floor")
     slot_idx = token_pos % page_size
-    neg_inf = torch.full((width_tokens,), float("-inf"), dtype=torch.float32, device=q_fp8.device)
+    neg_inf = torch.full(
+        (width_tokens,), float("-inf"), dtype=torch.float32, device=q_fp8.device
+    )
     for query_row in range(valid_q_rows):
         batch_row = query_row_to_batch[query_row].to(torch.long)
         batch_valid = (batch_row >= 0) & (batch_row < real_page_table.shape[0])
         safe_batch_row = batch_row.clamp(0, real_page_table.shape[0] - 1).reshape(1)
-        page_ids = real_page_table.index_select(0, safe_batch_row)[0, page_col].to(torch.long)
-        seq_len = seqlens_per_query[query_row].to(torch.long).clamp(min=0, max=width_tokens)
+        page_ids = real_page_table.index_select(0, safe_batch_row)[0, page_col].to(
+            torch.long
+        )
+        seq_len = (
+            seqlens_per_query[query_row].to(torch.long).clamp(min=0, max=width_tokens)
+        )
         valid_mask = (
             batch_valid
             & (token_pos < seq_len)
@@ -240,7 +270,9 @@ def paged_decode_logits_reference(
         scale_selected = k_scale[safe_page_ids, slot_idx]
         score = torch.matmul(q_fp32[query_row], k_selected.transpose(0, 1))
         logits = (torch.relu(score) * weights_f[query_row].unsqueeze(1)).sum(dim=0)
-        logits_out[query_row].copy_(torch.where(valid_mask, logits * scale_selected, neg_inf))
+        logits_out[query_row].copy_(
+            torch.where(valid_mask, logits * scale_selected, neg_inf)
+        )
 
     return logits_out
 
@@ -258,7 +290,9 @@ def contiguous_logits_reference(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     if k_start.ndim != 1 or k_end.ndim != 1:
         raise ValueError(
             f"k_start and k_end must be rank-1, got {tuple(k_start.shape)} and {tuple(k_end.shape)}"
@@ -272,7 +306,9 @@ def contiguous_logits_reference(
 
     k_quant, k_scale = kv_fp8
     if k_quant.ndim != 2 or k_quant.shape[1] != _INDEX_HEAD_DIM:
-        raise ValueError(f"k_quant must have shape (K, {_INDEX_HEAD_DIM}), got {tuple(k_quant.shape)}")
+        raise ValueError(
+            f"k_quant must have shape (K, {_INDEX_HEAD_DIM}), got {tuple(k_quant.shape)}"
+        )
     if k_scale.ndim == 2 and k_scale.shape[1] == 1:
         k_scale = k_scale.squeeze(1)
     if k_scale.ndim != 1 or k_scale.shape[0] != k_quant.shape[0]:
@@ -288,7 +324,9 @@ def contiguous_logits_reference(
     weights_f = _normalize_weights(weights, q_rows=num_queries, num_heads=num_heads)
     valid_q_rows = int(k_start.numel())
     if valid_q_rows > num_queries:
-        raise ValueError(f"metadata describes {valid_q_rows} query rows, but q_fp8 has {num_queries}")
+        raise ValueError(
+            f"metadata describes {valid_q_rows} query rows, but q_fp8 has {num_queries}"
+        )
 
     q_fp32 = q_fp8.to(torch.float32)
     k_fp32 = k_quant.to(torch.float32)

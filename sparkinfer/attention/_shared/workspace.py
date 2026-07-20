@@ -14,18 +14,12 @@ _INDEXER_PREFILL_BLOCK_K = 256
 _INDEXER_TILE_BLOCK_Q = 32
 _PAGED_INDEXER_TILE_BLOCK_K = 512
 _ARENA_ALIGN_BYTES = 1024
-
-from sparkinfer.integration.scratch_layout import (  # noqa: E402
-    WO_MXFP8_SCALE_ROW_TILE as _WO_MXFP8_SCALE_ROW_TILE,
-    WO_MXFP8_SCALE_VEC_SIZE as _WO_MXFP8_SCALE_VEC_SIZE,
-    WOProjectionArenaLayout as _SPARKINFERWOProjectionArenaLayout,
-    check_wo_mxfp8_k as _check_wo_mxfp8_k,
-    layout_wo_projection as _layout_wo_projection,
-    wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
-)
 _MHC_MULT = 4
 _MHC_PARTIALS = 25
 _MHC_DEFAULT_SPLIT_K = 64
+_WO_MXFP8_SCALE_VEC_SIZE = 32
+_WO_MXFP8_SCALE_ROW_TILE = 128
+_WO_MXFP8_SCALE_K_TILE = 4
 _SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
 _SPLIT_MAX_CHUNKS = 256
 _SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
@@ -175,7 +169,9 @@ def _materialize_arena_view(
     shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, int]:
-    offset_bytes = _align_up(offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    offset_bytes = _align_up(
+        offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype))
+    )
     nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
     view_bytes = arena.narrow(0, offset_bytes, nbytes)
     typed_view = view_bytes.view(dtype).view(shape)
@@ -190,7 +186,9 @@ def _materialize_arena_strided_view(
     stride: tuple[int, ...],
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, int]:
-    offset_bytes = _align_up(offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    offset_bytes = _align_up(
+        offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype))
+    )
     nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
     view_bytes = arena.narrow(0, offset_bytes, nbytes)
     typed_storage = view_bytes.view(dtype)
@@ -260,7 +258,9 @@ def _encode_indexer_k_tma_descriptor(
             f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
         )
     if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}")
+        raise TypeError(
+            f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}"
+        )
 
     import cuda.bindings.driver as cuda
 
@@ -284,14 +284,18 @@ def _encode_indexer_k_tma_descriptor(
         cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
     )
     if result != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed for indexer K workspace: {result}")
+        raise RuntimeError(
+            f"cuTensorMapEncodeTiled failed for indexer K workspace: {result}"
+        )
 
     desc = torch.tensor(
         [int(word) for word in tensor_map.opaque],
         dtype=torch.uint64,
         device=k_quant_bytes.device,
     )
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    desc_ptrs = torch.tensor(
+        [int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device
+    )
     return desc, desc_ptrs
 
 
@@ -434,7 +438,9 @@ class SPARKINFERAttentionArenaCaps:
             raise ValueError(
                 "reserve_mhc requires positive mhc_max_tokens and mhc_hidden_size"
             )
-        object.__setattr__(self, "reserve_wo_projection", bool(self.reserve_wo_projection))
+        object.__setattr__(
+            self, "reserve_wo_projection", bool(self.reserve_wo_projection)
+        )
         object.__setattr__(self, "wo_max_tokens", max(int(self.wo_max_tokens), 0))
         object.__setattr__(self, "wo_groups", max(int(self.wo_groups), 0))
         object.__setattr__(self, "wo_group_width", max(int(self.wo_group_width), 0))
@@ -457,7 +463,9 @@ class SPARKINFERAttentionArenaCaps:
         object.__setattr__(
             self,
             "extend_indexer_tile_logits_k_rows",
-            _resolve_contiguous_topk_supertile_k(self.extend_indexer_tile_logits_k_rows),
+            _resolve_contiguous_topk_supertile_k(
+                self.extend_indexer_tile_logits_k_rows
+            ),
         )
         paged_indexer_logits_q_rows = int(self.paged_indexer_logits_q_rows)
         if paged_indexer_logits_q_rows <= 0:
@@ -528,12 +536,131 @@ class SPARKINFERAttentionWorkspaceContract:
             )
 
 
+@dataclass(frozen=True, kw_only=True)
+class _SPARKINFERWOProjectionArenaLayout:
+    nbytes: int = 0
+    x_q_values_offset_bytes: int = 0
+    x_q_scale_rows_offset_bytes: int = 0
+    x_q_scale_mma_offset_bytes: int = 0
+    tmp_offset_bytes: int = 0
+    tmp_q_values_offset_bytes: int = 0
+    tmp_q_scale_rows_offset_bytes: int = 0
+    tmp_q_scale_mma_offset_bytes: int = 0
+    output_offset_bytes: int = 0
 
 
+def _check_wo_mxfp8_k(k: int) -> None:
+    if int(k) <= 0 or int(k) % 128 != 0:
+        raise ValueError(
+            f"WO MXFP8 dense-GEMM K must be a positive multiple of 128, got {k}"
+        )
 
 
+def _wo_mxfp8_scale_physical_shape(
+    *,
+    m: int,
+    k: int,
+    num_groups: int,
+) -> tuple[int, int, int, int, int, int]:
+    sf_k = int(k) // _WO_MXFP8_SCALE_VEC_SIZE
+    return (
+        int(num_groups),
+        _ceil_div(int(m), _WO_MXFP8_SCALE_ROW_TILE),
+        _ceil_div(sf_k, _WO_MXFP8_SCALE_K_TILE),
+        32,
+        4,
+        4,
+    )
 
 
+def _layout_wo_projection(
+    *,
+    offset_bytes: int,
+    tokens: int,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+) -> _SPARKINFERWOProjectionArenaLayout:
+    tokens = max(int(tokens), 1)
+    groups = int(groups)
+    group_width = int(group_width)
+    rank = int(rank)
+    hidden = int(hidden)
+    if groups <= 0 or group_width <= 0 or rank <= 0 or hidden <= 0:
+        raise ValueError(
+            "WO projection arena requires positive groups, group_width, rank, and hidden"
+        )
+    _check_wo_mxfp8_k(group_width)
+    _check_wo_mxfp8_k(rank * groups)
+
+    start = int(offset_bytes)
+    cursor = _align_up(start, _ARENA_ALIGN_BYTES)
+
+    x_q_values_offset_bytes = cursor
+    cursor += tokens * group_width * groups * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        groups
+        * tokens
+        * (group_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=group_width,
+            num_groups=groups,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_offset_bytes = cursor
+    cursor += tokens * rank * groups * _dtype_nbytes(torch.bfloat16)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_width = rank * groups
+    tmp_q_values_offset_bytes = cursor
+    cursor += tokens * tmp_q_width * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        tokens
+        * (tmp_q_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=tmp_q_width,
+            num_groups=1,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    output_offset_bytes = cursor
+    cursor += tokens * hidden * _dtype_nbytes(torch.bfloat16)
+
+    return _SPARKINFERWOProjectionArenaLayout(
+        nbytes=max(0, int(cursor) - start),
+        x_q_values_offset_bytes=x_q_values_offset_bytes,
+        x_q_scale_rows_offset_bytes=x_q_scale_rows_offset_bytes,
+        x_q_scale_mma_offset_bytes=x_q_scale_mma_offset_bytes,
+        tmp_offset_bytes=tmp_offset_bytes,
+        tmp_q_values_offset_bytes=tmp_q_values_offset_bytes,
+        tmp_q_scale_rows_offset_bytes=tmp_q_scale_rows_offset_bytes,
+        tmp_q_scale_mma_offset_bytes=tmp_q_scale_mma_offset_bytes,
+        output_offset_bytes=output_offset_bytes,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -677,7 +804,9 @@ class SPARKINFERAttentionArena:
 
     @classmethod
     def _layout(cls, caps: SPARKINFERAttentionArenaCaps) -> _SPARKINFERAttentionArenaLayout:
-        indexer_q_rows = max(int(caps.extend_max_total_q), int(caps.paged_max_q_rows), 1)
+        indexer_q_rows = max(
+            int(caps.extend_max_total_q), int(caps.paged_max_q_rows), 1
+        )
         mla_max_total_q = max(int(caps.mla_max_total_q or indexer_q_rows), 1)
         max_paged_q_rows = max(int(caps.paged_max_q_rows), 1)
         paged_logits_q_rows = max(int(caps.paged_indexer_logits_q_rows), 1)
@@ -729,18 +858,14 @@ class SPARKINFERAttentionArena:
         mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
         tmp_lse_offset_bytes = mla_offset
         mla_offset += (
-            mla_tmp_q_chunks
-            * int(caps.num_q_heads)
-            * _dtype_nbytes(torch.float32)
+            mla_tmp_q_chunks * int(caps.num_q_heads) * _dtype_nbytes(torch.float32)
         )
         mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
         output_buffer_offset_bytes = tmp_output_offset_bytes
         output_buffer_nbytes = 0
         final_lse_offset_bytes = mla_offset
         final_lse_nbytes = (
-            mla_max_total_q
-            * int(caps.num_q_heads)
-            * _dtype_nbytes(torch.float32)
+            mla_max_total_q * int(caps.num_q_heads) * _dtype_nbytes(torch.float32)
         )
         mla_offset += final_lse_nbytes
         mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
@@ -750,8 +875,12 @@ class SPARKINFERAttentionArena:
         compressed_index_stage_nbytes = 0
         compressed_page_table_stage_nbytes = 0
         compressed_lengths_stage_nbytes = 0
-        compressed_swa_indices_stage_offset_bytes = compressed_swa_lengths_stage_offset_bytes = 0
-        compressed_indexed_indices_stage_offset_bytes = compressed_indexed_lengths_stage_offset_bytes = 0
+        compressed_swa_indices_stage_offset_bytes = (
+            compressed_swa_lengths_stage_offset_bytes
+        ) = 0
+        compressed_indexed_indices_stage_offset_bytes = (
+            compressed_indexed_lengths_stage_offset_bytes
+        ) = 0
         compressed_indexed_page_table_stage_offset_bytes = 0
         if caps.reserve_compressed_mla_staging:
             compressed_q_stage_nbytes = (
@@ -764,14 +893,14 @@ class SPARKINFERAttentionArena:
             mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
             compressed_swa_indices_stage_offset_bytes = mla_offset
             compressed_index_stage_nbytes = (
-                mla_max_total_q
-                * int(caps.topk)
-                * _dtype_nbytes(torch.int32)
+                mla_max_total_q * int(caps.topk) * _dtype_nbytes(torch.int32)
             )
             mla_offset += compressed_index_stage_nbytes
             mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
             compressed_swa_lengths_stage_offset_bytes = mla_offset
-            compressed_lengths_stage_nbytes = mla_max_total_q * _dtype_nbytes(torch.int32)
+            compressed_lengths_stage_nbytes = mla_max_total_q * _dtype_nbytes(
+                torch.int32
+            )
             mla_offset += compressed_lengths_stage_nbytes
             mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
             compressed_indexed_indices_stage_offset_bytes = mla_offset
@@ -812,7 +941,9 @@ class SPARKINFERAttentionArena:
         indexer_contiguous_tile_logits_offset_bytes = extend_offset
         contiguous_tile_logits_k_rows = min(
             indexer_k_rows,
-            _resolve_contiguous_topk_supertile_k(caps.extend_indexer_tile_logits_k_rows),
+            _resolve_contiguous_topk_supertile_k(
+                caps.extend_indexer_tile_logits_k_rows
+            ),
         )
         paged_tile_logits_k_rows = int(paged_tile_logits_width_tokens)
         contiguous_tile_logits_q_rows = _align_up(
@@ -847,33 +978,25 @@ class SPARKINFERAttentionArena:
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_contiguous_topk_indices_offset_bytes = extend_offset
         contiguous_topk_indices_nbytes = (
-            indexer_q_rows
-            * indexer_topk
-            * _dtype_nbytes(torch.int32)
+            indexer_q_rows * indexer_topk * _dtype_nbytes(torch.int32)
         )
         extend_offset += contiguous_topk_indices_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_contiguous_topk_values_offset_bytes = extend_offset
         contiguous_topk_values_nbytes = (
-            indexer_q_rows
-            * indexer_topk
-            * _dtype_nbytes(torch.float32)
+            indexer_q_rows * indexer_topk * _dtype_nbytes(torch.float32)
         )
         extend_offset += contiguous_topk_values_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_contiguous_topk_scratch_indices_offset_bytes = extend_offset
         contiguous_topk_scratch_indices_nbytes = (
-            indexer_q_rows
-            * indexer_topk
-            * _dtype_nbytes(torch.int32)
+            indexer_q_rows * indexer_topk * _dtype_nbytes(torch.int32)
         )
         extend_offset += contiguous_topk_scratch_indices_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_contiguous_topk_scratch_values_offset_bytes = extend_offset
         contiguous_topk_scratch_values_nbytes = (
-            indexer_q_rows
-            * indexer_topk
-            * _dtype_nbytes(torch.float32)
+            indexer_q_rows * indexer_topk * _dtype_nbytes(torch.float32)
         )
         extend_offset += contiguous_topk_scratch_values_nbytes
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
@@ -924,9 +1047,7 @@ class SPARKINFERAttentionArena:
         extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_contiguous_mapped_indices_offset_bytes = extend_offset
         extend_mapped_indices_nbytes = (
-            indexer_q_rows
-            * indexer_topk
-            * _dtype_nbytes(torch.int32)
+            indexer_q_rows * indexer_topk * _dtype_nbytes(torch.int32)
         )
         extend_offset += extend_mapped_indices_nbytes
 
@@ -1103,9 +1224,13 @@ class SPARKINFERAttentionArena:
                 device=caps.device,
             )
         elif shared_arena.dtype != torch.uint8:
-            raise TypeError(f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}")
+            raise TypeError(
+                f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}"
+            )
         elif shared_arena.device != caps.device:
-            raise ValueError(f"shared_arena device {shared_arena.device} does not match caps device {caps.device}")
+            raise ValueError(
+                f"shared_arena device {shared_arena.device} does not match caps device {caps.device}"
+            )
         elif shared_arena.numel() < layout.arena_nbytes:
             raise ValueError(
                 f"shared_arena has {shared_arena.numel()} bytes, but attention arena requires {layout.arena_nbytes}"
@@ -1201,8 +1326,10 @@ class SPARKINFERAttentionArena:
 
     def make_mhc_workspace(self):
         if not self.caps.reserve_mhc or self.mhc_nbytes <= 0:
-            raise RuntimeError("attention arena was allocated without mHC workspace capacity")
-        from sparkinfer.integration.residual import MHCWorkspace
+            raise RuntimeError(
+                "attention arena was allocated without mHC workspace capacity"
+            )
+        from sparkinfer.norm.mhc._impl import MHCWorkspace
 
         max_tokens = int(self.caps.mhc_max_tokens)
         hidden_size = int(self.caps.mhc_hidden_size)
@@ -1248,8 +1375,13 @@ class SPARKINFERAttentionArena:
 
     def make_wo_projection_workspace(self, tokens: int | None = None):
         if not self.caps.reserve_wo_projection or self.wo_projection_layout.nbytes <= 0:
-            raise RuntimeError("attention arena was allocated without WO projection workspace capacity")
-        from sparkinfer.gemm.wo_projection import MXFP8Rows, WOProjectionWorkspace
+            raise RuntimeError(
+                "attention arena was allocated without WO projection workspace capacity"
+            )
+        from sparkinfer.gemm._shared.wo_mxfp8 import (
+            MXFP8Rows,
+            WOProjectionWorkspace,
+        )
 
         max_tokens = int(self.caps.wo_max_tokens)
         tokens = max_tokens if tokens is None else int(tokens)
@@ -1374,18 +1506,25 @@ class SPARKINFERAttentionArena:
         *,
         use_cuda_graph: bool = False,
     ) -> "SPARKINFERAttentionWorkspace":
-        workspace_topk = int(contract.topk) if contract.topk is not None else int(self.caps.topk)
+        workspace_topk = (
+            int(contract.topk) if contract.topk is not None else int(self.caps.topk)
+        )
         workspace_indexer_topk = min(workspace_topk, int(self.caps.indexer_topk))
         if contract.v_head_dim > self.caps.max_v_head_dim:
             raise ValueError(
                 f"workspace v_head_dim {contract.v_head_dim} exceeds arena max_v_head_dim {self.caps.max_v_head_dim}"
             )
-        if contract.max_total_q > self.caps.extend_max_total_q and contract.max_total_q > self.caps.paged_max_q_rows:
+        if (
+            contract.max_total_q > self.caps.extend_max_total_q
+            and contract.max_total_q > self.caps.paged_max_q_rows
+        ):
             raise ValueError(
                 f"workspace max_total_q {contract.max_total_q} exceeds arena capacities "
                 f"(extend={self.caps.extend_max_total_q}, paged={self.caps.paged_max_q_rows})"
             )
-        if contract.max_batch > max(self.caps.extend_max_batch, self.caps.paged_max_batch):
+        if contract.max_batch > max(
+            self.caps.extend_max_batch, self.caps.paged_max_batch
+        ):
             raise ValueError(
                 f"workspace max_batch {contract.max_batch} exceeds arena capacities "
                 f"(extend={self.caps.extend_max_batch}, paged={self.caps.paged_max_batch})"
@@ -1414,7 +1553,9 @@ class SPARKINFERAttentionArena:
             raise ValueError(
                 f"workspace topk {workspace_topk} exceeds arena topk {self.caps.topk}"
             )
-        if (contract.max_kv_rows > 0 or workspace_topk > 1) and contract.max_total_q > int(self.caps.mla_max_total_q):
+        if (
+            contract.max_kv_rows > 0 or workspace_topk > 1
+        ) and contract.max_total_q > int(self.caps.mla_max_total_q):
             raise ValueError(
                 f"workspace MLA max_total_q {contract.max_total_q} exceeds arena mla_max_total_q {self.caps.mla_max_total_q}"
             )
@@ -1613,7 +1754,9 @@ class SPARKINFERAttentionWorkspace:
     # Fused-indexer cross-CTA merge scratch (pack_v, pack_i, state). Reserved EAGERLY at
     # construction at a FIXED, seq-/batch-independent architecture-policy capacity so a
     # live fused decode never allocates after lock_workspace()/graph capture.
-    _sparkinfer_fused_indexer_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    _sparkinfer_fused_indexer_scratch: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None
     _indexer_contiguous_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_prewarmed: bool = False
     _paged_indexer_tiled_topk_plan: _PagedIndexerTiledTopKPlan | None = None
@@ -1623,7 +1766,9 @@ class SPARKINFERAttentionWorkspace:
     def __post_init__(self) -> None:
         self.device = _canonical_device(self.device)
         self.num_q_heads = int(self.num_q_heads)
-        self.indexer_num_q_heads = int(self.indexer_num_q_heads) or int(self.num_q_heads)
+        self.indexer_num_q_heads = int(self.indexer_num_q_heads) or int(
+            self.num_q_heads
+        )
         self.indexer_topk = int(self.indexer_topk) or int(self.topk)
         self.max_page_table_width = max(int(self.max_page_table_width), 1)
         self.max_paged_q_rows = max(int(self.max_paged_q_rows), 1)
@@ -1634,7 +1779,9 @@ class SPARKINFERAttentionWorkspace:
             return 0
         num_sms = 1
         if self.device.type == "cuda":
-            num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+            num_sms = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
         return (
             int(self.max_paged_q_rows)
             * int(self.max_page_table_width)
@@ -1771,7 +1918,9 @@ class SPARKINFERAttentionWorkspace:
             max_page_table_width=max_page_table_width,
             extend_max_total_q=max_total_q,
             extend_max_batch=max_batch,
-            extend_max_kv_rows=max(0, int(max_kv_rows)) if max_kv_rows is not None else 0,
+            extend_max_kv_rows=max(0, int(max_kv_rows))
+            if max_kv_rows is not None
+            else 0,
             indexer_max_k_rows=(
                 None if indexer_max_k_rows is None else max(0, int(indexer_max_k_rows))
             ),
@@ -1815,7 +1964,7 @@ class SPARKINFERAttentionWorkspace:
         topk = int(self.indexer_topk)
         if topk <= 0:
             return
-        from sparkinfer.attention.indexer.fused_indexer import (
+        from sparkinfer.attention.nsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -1849,7 +1998,7 @@ class SPARKINFERAttentionWorkspace:
             raise RuntimeError(
                 "fused indexer scratch unavailable (non-CUDA workspace or topk<=0)"
             )
-        from sparkinfer.attention.indexer.fused_indexer import (
+        from sparkinfer.attention.nsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -1905,7 +2054,9 @@ class SPARKINFERAttentionWorkspace:
         if self.paged_indexer_schedule_metadata_runtime is None:
             num_sms = 1
             if self.device.type == "cuda":
-                num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+                num_sms = torch.cuda.get_device_properties(
+                    self.device
+                ).multi_processor_count
             self.paged_indexer_schedule_metadata_runtime = torch.empty(
                 (int(num_sms) + 1, 2),
                 dtype=torch.int32,
@@ -1914,7 +2065,9 @@ class SPARKINFERAttentionWorkspace:
 
     def _allocate_fixed_capacity_views(self) -> None:
         if self.arena is None:
-            raise RuntimeError("_allocate_fixed_capacity_views requires an arena-backed workspace")
+            raise RuntimeError(
+                "_allocate_fixed_capacity_views requires an arena-backed workspace"
+            )
         max_total_q = max(int(self.max_total_q), 1)
         max_paged_q_rows = max(int(self.max_paged_q_rows), 1)
         indexer_q_rows = max(max_total_q, max_paged_q_rows)
@@ -1942,20 +2095,46 @@ class SPARKINFERAttentionWorkspace:
         self.final_lse_nbytes = self.arena.final_lse_nbytes
         self.compressed_q_stage_nbytes = self.arena.compressed_q_stage_nbytes
         self.compressed_index_stage_nbytes = self.arena.compressed_index_stage_nbytes
-        self.compressed_page_table_stage_nbytes = self.arena.compressed_page_table_stage_nbytes
-        self.compressed_lengths_stage_nbytes = self.arena.compressed_lengths_stage_nbytes
+        self.compressed_page_table_stage_nbytes = (
+            self.arena.compressed_page_table_stage_nbytes
+        )
+        self.compressed_lengths_stage_nbytes = (
+            self.arena.compressed_lengths_stage_nbytes
+        )
         self.paged_logits_q_rows = self.arena.paged_logits_q_rows
-        self.indexer_contiguous_logits_nbytes = self.arena.indexer_contiguous_logits_nbytes
-        self.indexer_contiguous_tile_logits_nbytes = self.arena.indexer_contiguous_tile_logits_nbytes
-        self.indexer_contiguous_topk_indices_nbytes = self.arena.indexer_contiguous_topk_indices_nbytes
-        self.indexer_contiguous_topk_values_nbytes = self.arena.indexer_contiguous_topk_values_nbytes
-        self.indexer_contiguous_topk_scratch_indices_nbytes = self.arena.indexer_contiguous_topk_scratch_indices_nbytes
-        self.indexer_contiguous_topk_scratch_values_nbytes = self.arena.indexer_contiguous_topk_scratch_values_nbytes
-        self.indexer_contiguous_topk_position_nbytes = self.arena.indexer_contiguous_topk_position_nbytes
-        self.indexer_contiguous_candidate_values_nbytes = self.arena.indexer_contiguous_candidate_values_nbytes
-        self.indexer_contiguous_candidate_indices_nbytes = self.arena.indexer_contiguous_candidate_indices_nbytes
-        self.indexer_contiguous_lengths_nbytes = self.arena.indexer_contiguous_lengths_nbytes
-        self.indexer_contiguous_mapped_indices_nbytes = self.arena.indexer_contiguous_mapped_indices_nbytes
+        self.indexer_contiguous_logits_nbytes = (
+            self.arena.indexer_contiguous_logits_nbytes
+        )
+        self.indexer_contiguous_tile_logits_nbytes = (
+            self.arena.indexer_contiguous_tile_logits_nbytes
+        )
+        self.indexer_contiguous_topk_indices_nbytes = (
+            self.arena.indexer_contiguous_topk_indices_nbytes
+        )
+        self.indexer_contiguous_topk_values_nbytes = (
+            self.arena.indexer_contiguous_topk_values_nbytes
+        )
+        self.indexer_contiguous_topk_scratch_indices_nbytes = (
+            self.arena.indexer_contiguous_topk_scratch_indices_nbytes
+        )
+        self.indexer_contiguous_topk_scratch_values_nbytes = (
+            self.arena.indexer_contiguous_topk_scratch_values_nbytes
+        )
+        self.indexer_contiguous_topk_position_nbytes = (
+            self.arena.indexer_contiguous_topk_position_nbytes
+        )
+        self.indexer_contiguous_candidate_values_nbytes = (
+            self.arena.indexer_contiguous_candidate_values_nbytes
+        )
+        self.indexer_contiguous_candidate_indices_nbytes = (
+            self.arena.indexer_contiguous_candidate_indices_nbytes
+        )
+        self.indexer_contiguous_lengths_nbytes = (
+            self.arena.indexer_contiguous_lengths_nbytes
+        )
+        self.indexer_contiguous_mapped_indices_nbytes = (
+            self.arena.indexer_contiguous_mapped_indices_nbytes
+        )
         self.indexer_paged_logits_nbytes = self.arena.indexer_paged_logits_nbytes
         self.indexer_logits_nbytes = self.arena.indexer_logits_nbytes
 
@@ -2081,7 +2260,10 @@ class SPARKINFERAttentionWorkspace:
             self.indexer_contiguous_tile_logits, _ = _materialize_arena_view(
                 self.shared_arena,
                 offset_bytes=self.arena.indexer_contiguous_tile_logits_offset_bytes,
-                shape=(self.indexer_contiguous_tile_logits_nbytes // _dtype_nbytes(torch.float32),),
+                shape=(
+                    self.indexer_contiguous_tile_logits_nbytes
+                    // _dtype_nbytes(torch.float32),
+                ),
                 dtype=torch.float32,
             )
         else:
@@ -2173,7 +2355,9 @@ class SPARKINFERAttentionWorkspace:
             )
         else:
             self.indexer_contiguous_mapped_indices = None
-        if self.indexer_paged_logits_nbytes and max_paged_q_rows <= int(self.paged_logits_q_rows):
+        if self.indexer_paged_logits_nbytes and max_paged_q_rows <= int(
+            self.paged_logits_q_rows
+        ):
             self.indexer_paged_logits, _ = _materialize_arena_view(
                 self.shared_arena,
                 offset_bytes=self.arena.indexer_paged_logits_offset_bytes,
@@ -2215,10 +2399,14 @@ class SPARKINFERAttentionWorkspace:
                 device=self.device,
             )
         if self.kv_chunk_size_ptr is None:
-            self.kv_chunk_size_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            self.kv_chunk_size_ptr = torch.empty(
+                (1,), dtype=torch.int32, device=self.device
+            )
             self.kv_chunk_size_value = None
         if self.num_chunks_ptr is None:
-            self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            self.num_chunks_ptr = torch.empty(
+                (1,), dtype=torch.int32, device=self.device
+            )
             self.num_chunks_value = None
 
     def _initialize_split_chunk_config_if_needed(self) -> None:
@@ -2328,7 +2516,9 @@ class SPARKINFERAttentionWorkspace:
         indexed_lengths: torch.Tensor | None = None,
         indexed_page_table: torch.Tensor | None = None,
     ):
-        from sparkinfer.integration.compressed_scratch import build_compressed_mla_binding
+        from sparkinfer.attention.compressed_mla._scratch import (
+            build_compressed_mla_binding,
+        )
 
         return build_compressed_mla_binding(
             workspace=self,
@@ -2348,7 +2538,9 @@ class SPARKINFERAttentionWorkspace:
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
     ):
-        from sparkinfer.integration.sparse_mla_scratch import build_sparse_mla_binding
+        from sparkinfer.attention.sparse_mla._scratch import (
+            build_sparse_mla_binding,
+        )
 
         return build_sparse_mla_binding(
             scratch=self,
@@ -2389,7 +2581,9 @@ class SPARKINFERAttentionWorkspace:
             self._contract_kv_scales = None
             return
 
-        from sparkinfer.attention.mla.packed import _extract_packed_kv_runtime_views
+        from sparkinfer.attention._shared.mla.packed import (
+            _extract_packed_kv_runtime_views,
+        )
 
         kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(self.ragged_kv_cache)
         self._contract_kv_rows = _shape_only_cuda_tensor(
@@ -2428,7 +2622,12 @@ class SPARKINFERAttentionWorkspace:
         )
         if self.tmp_output is not None and self.tmp_lse is not None:
             self._contract_tmp_output = _shape_only_cuda_tensor(
-                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
+                (
+                    self.max_total_q,
+                    self.num_q_heads,
+                    self.max_chunks_per_row,
+                    self.v_head_dim,
+                ),
                 dtype=self.dtype,
                 device=self.device,
             )

@@ -1,6 +1,6 @@
 """Canonical MoE semantics and execution-regime descriptors.
 
-The public ``quant_mode`` names in :mod:`sparkinfer.integration.tp_moe` historically
+The public ``quant_mode`` names in :mod:`sparkinfer.moe.fused_moe._impl` historically
 identify several independent choices at once: activation encoding, weight-scale
 encoding, route materialization, work scheduling, graph fusion, and prepared
 weight layout.  That makes genuinely orthogonal implementations look like
@@ -629,7 +629,9 @@ def plan_moe_weight_preparation(
                 layout = (
                     PreparedWeightLayout.SOURCE_NATIVE
                     if source_format == "modelopt_nvfp4"
-                    or (source_format == "fp4_e8m0_k32" and intermediate_size % 128 != 0)
+                    or (
+                        source_format == "fp4_e8m0_k32" and intermediate_size % 128 != 0
+                    )
                     else PreparedWeightLayout.MMA_PACKED
                 )
             if (

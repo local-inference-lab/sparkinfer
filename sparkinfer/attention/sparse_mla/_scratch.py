@@ -18,19 +18,19 @@ from typing import Literal
 
 import torch
 
-from sparkinfer.attention.workspace import (
+from sparkinfer.attention._shared.workspace import (
     _split_output_buffer_from_tmp,
     _split_tmp_output_stride,
 )
-from sparkinfer.integration.scratch_layout import (
+from sparkinfer._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_strided_view,
     materialize_scratch_view,
 )
-from sparkinfer.integration.scratch import (
-    SPARKINFERScratchBufferSpec,
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
@@ -68,7 +68,9 @@ class SPARKINFERSparseMLAScratchCaps:
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "max_kv_rows", max(int(self.max_kv_rows), 0))
         max_page_table_width = (
-            self.max_width if self.max_page_table_width is None else self.max_page_table_width
+            self.max_width
+            if self.max_page_table_width is None
+            else self.max_page_table_width
         )
         object.__setattr__(
             self,
@@ -168,7 +170,9 @@ def _validate_device(
     name: str,
 ) -> None:
     if tensor.device != scratch.device:
-        raise ValueError(f"{name} device {tensor.device} does not match scratch device {scratch.device}")
+        raise ValueError(
+            f"{name} device {tensor.device} does not match scratch device {scratch.device}"
+        )
 
 
 def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
@@ -180,11 +184,17 @@ def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
         raise ValueError("q must be contiguous")
     _validate_device(q, scratch=scratch, name="q")
     if int(q.shape[0]) > int(scratch.max_total_q):
-        raise ValueError(f"q rows {int(q.shape[0])} exceed scratch capacity {scratch.max_total_q}")
+        raise ValueError(
+            f"q rows {int(q.shape[0])} exceed scratch capacity {scratch.max_total_q}"
+        )
     if int(q.shape[1]) != int(scratch.num_q_heads):
-        raise ValueError(f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}")
+        raise ValueError(
+            f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}"
+        )
     if int(q.shape[2]) != int(scratch.head_dim):
-        raise ValueError(f"q head_dim {int(q.shape[2])} does not match scratch head_dim {scratch.head_dim}")
+        raise ValueError(
+            f"q head_dim {int(q.shape[2])} does not match scratch head_dim {scratch.head_dim}"
+        )
     return q.detach()
 
 
@@ -195,9 +205,13 @@ def _validate_selected_indices(
     rows: int,
 ) -> torch.Tensor:
     if selected_indices.ndim != 2:
-        raise ValueError(f"selected_indices must be rank-2, got {tuple(selected_indices.shape)}")
+        raise ValueError(
+            f"selected_indices must be rank-2, got {tuple(selected_indices.shape)}"
+        )
     if selected_indices.dtype != torch.int32:
-        raise TypeError(f"selected_indices must have dtype torch.int32, got {selected_indices.dtype}")
+        raise TypeError(
+            f"selected_indices must have dtype torch.int32, got {selected_indices.dtype}"
+        )
     if not selected_indices.is_contiguous():
         raise ValueError("selected_indices must be contiguous")
     _validate_device(selected_indices, scratch=scratch, name="selected_indices")
@@ -228,9 +242,13 @@ def _validate_i32_vector(
         raise ValueError(f"{name} must be contiguous")
     _validate_device(tensor, scratch=scratch, name=name)
     if rows is not None and int(tensor.shape[0]) != int(rows):
-        raise ValueError(f"{name} rows {int(tensor.shape[0])} do not match q rows {rows}")
+        raise ValueError(
+            f"{name} rows {int(tensor.shape[0])} do not match q rows {rows}"
+        )
     if max_rows is not None and int(tensor.shape[0]) > int(max_rows):
-        raise ValueError(f"{name} rows {int(tensor.shape[0])} exceed capacity {max_rows}")
+        raise ValueError(
+            f"{name} rows {int(tensor.shape[0])} exceed capacity {max_rows}"
+        )
     return tensor
 
 
@@ -450,9 +468,9 @@ def _materialize_sparse_mla_scratch(
 class SPARKINFERSparseMLAScratchPlan:
     caps: SPARKINFERSparseMLAScratchCaps
     layout: _SPARKINFERSparseMLAScratchLayout
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:

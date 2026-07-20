@@ -27,9 +27,15 @@ def tma_get_copy_fn(
         isinstance(src_tensor.iterator, cute.Pointer)
         and src_tensor.memspace == cute.AddressSpace.smem
     )
-    smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
-    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
-    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
+    smem_tensor, gmem_tensor = (
+        (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    )
+    group_rank_smem = const_expr(
+        cute.rank(smem_tensor) - (1 if not single_stage else 0)
+    )
+    group_rank_gmem = const_expr(
+        cute.rank(gmem_tensor) - (1 if not single_stage else 0)
+    )
     s, g = cpasync.tma_partition(
         atom,
         cta_coord,

@@ -19,27 +19,35 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
-from sparkinfer.cute.intrinsics import align_up, as_grouped_scale_view
-from sparkinfer.cute.utils import (
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    compile as sparkinfer_compile,
+)
+from sparkinfer._lib.intrinsics import (
+    align_up,
+    as_grouped_scale_view,
+)
+from sparkinfer._lib.utils import (
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
 )
 from cutlass.cutlass_dsl import Int32
-from sparkinfer.integration.triton_route import route_topk as triton_route_topk
-from sparkinfer.moe.fused.relu2 import (
+from sparkinfer.moe._shared.routing import (
+    route_topk as triton_route_topk,
+)
+from sparkinfer.moe._shared.kernels.relu2 import (
     MoEDynamicKernelRelu2,
     MoEMicroKernelRelu2,
 )
-from sparkinfer.moe.fused.silu import (
+from sparkinfer.moe._shared.kernels.silu import (
     MoEDynamicKernelSilu,
     MoEDynamicKernelSwiGLUOAI,
     MoEMicroKernelSilu,
     MoEMicroKernelSwiGLUOAI,
 )
-from sparkinfer.moe.fused.activations import (
+from sparkinfer.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
@@ -48,12 +56,12 @@ from sparkinfer.moe.fused.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from sparkinfer.moe.fused.micro import (
+from sparkinfer.moe._shared.kernels.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
-from sparkinfer.moe.execution import (
+from sparkinfer.moe._shared.execution import (
     MoEExecutionPlan,
     MoERegime,
     MoESpec,
@@ -66,13 +74,20 @@ from sparkinfer.moe.execution import (
     make_moe_spec,
     plan_moe_weight_preparation,
 )
-from sparkinfer.moe.tuning import lookup_max_active_clusters
-from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from sparkinfer.moe._shared.tuning import lookup_max_active_clusters
+from sparkinfer._lib.runtime_control import (
+    raise_if_kernel_resolution_frozen,
+)
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 
 logger = logging.getLogger(__name__)
 _SPARKINFER_TIMING = (
-    os.getenv("SPARKINFER_TIMING", "0") == "1" or os.getenv("VLLM_SPARKINFER_TIMING", "0") == "1"
+    os.getenv("SPARKINFER_TIMING", "0") == "1"
+    or os.getenv("VLLM_SPARKINFER_TIMING", "0") == "1"
 )
 _SPARKINFER_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -806,9 +821,9 @@ class TPMoEScratchPlan:
     layout: TPMoEArenaLayout
     launch_plan: TPMoEPlan
     _core_workspace_plan: _TPCoreWorkspacePlan
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -1327,7 +1342,9 @@ def _get_activation_kernel_spec(
     quant_mode: str = "nvfp4",
 ) -> _ActivationKernelSpec:
     if _normalize_quant_mode(quant_mode) == "w4a16":
-        raise ValueError("W4A16 dispatch uses sparkinfer.moe.fused.w4a16.kernel directly")
+        raise ValueError(
+            "W4A16 dispatch uses sparkinfer.moe._shared.kernels.w4a16.kernel directly"
+        )
     if (
         _is_w4a8_quant_mode(_normalize_quant_mode(quant_mode))
         and activation == SWIGLUOAI_UNINTERLEAVE
@@ -1711,7 +1728,9 @@ def clear_tp_moe_caches() -> None:
     Explicit workspaces and workspace pools are caller-owned and intentionally
     unaffected by this helper.
     """
-    from sparkinfer.moe.fused.w4a16.kernel import clear_w4a16_kernel_cache
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        clear_w4a16_kernel_cache,
+    )
 
     global _LAST_WEIGHTS
     global _LAST_KERNEL
@@ -1766,7 +1785,9 @@ def _arena_core_token_counts(
     num_topk = max(int(num_topk), 1)
     quant_mode = _normalize_quant_mode(quant_mode)
     if quant_mode == "w4a16":
-        from sparkinfer.moe.fused.w4a16.host import route_pack_token_capacity
+        from sparkinfer.moe._shared.kernels.w4a16.host import (
+            route_pack_token_capacity,
+        )
 
         max_tokens = route_pack_token_capacity(max_tokens, num_topk)
     if core_token_counts is None:
@@ -2327,12 +2348,14 @@ def _plan_core_workspace(
         swiglu_beta,
     )
     if implementation == "w4a16":
-        from sparkinfer.moe.fused.w4a16.host import (
+        from sparkinfer.moe._shared.kernels.w4a16.host import (
             _W4A16_ALLOWED_ROUTED_SIZES,
             max_packed_route_slots,
             packed_gemm_scratch_elements,
         )
-        from sparkinfer.moe.fused.w4a16.kernel import _small_m_direct_supported
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+            _small_m_direct_supported,
+        )
 
         w13_layout = _normalize_w13_layout(w13_layout)
         scale_format = (
@@ -3026,7 +3049,9 @@ def _derive_w4a8_weight_grids(
     blockscale_u8: torch.Tensor, rows: int, k_dim: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """NVFP4 checkpoint scales -> (UE8M0 K/32 grid, E4M3 residual grid)."""
-    from sparkinfer.moe.fused.reference import decompose_nvfp4_scales_to_mx_residual
+    from sparkinfer.moe._shared.kernels.reference import (
+        decompose_nvfp4_scales_to_mx_residual,
+    )
 
     scales = _unswizzle_block_scales_batched(blockscale_u8, rows, k_dim // 16)
     ue8m0, residual = decompose_nvfp4_scales_to_mx_residual(scales)
@@ -4429,7 +4454,7 @@ def prepare_sparkinfer_fp4_moe_weights(
     if WeightPreparationTransform.W4A16_NATIVE in plan.transforms:
         if representation is not None:
             raise AssertionError("weight plan selected multiple prepared layouts")
-        from sparkinfer.moe.fused.w4a16.prepare import (
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
             prepare_w4a16_e8m0_native_weights,
             prepare_w4a16_modelopt_native_weights,
         )
@@ -4472,7 +4497,9 @@ def prepare_sparkinfer_fp4_moe_weights(
     if WeightPreparationTransform.W4A16_PACKED in plan.transforms:
         if representation is not None:
             raise AssertionError("weight plan selected multiple prepared layouts")
-        from sparkinfer.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+            prepare_w4a16_packed_weights,
+        )
 
         value = prepare_w4a16_packed_weights(
             w1_fp4,
@@ -4812,7 +4839,9 @@ def plan_tp_moe_execution(
         )
     route_block_rows = None
     if implementation == "w4a16":
-        from sparkinfer.moe.fused.w4a16.host import select_route_block_size_m
+        from sparkinfer.moe._shared.kernels.w4a16.host import (
+            select_route_block_size_m,
+        )
 
         route_block_rows = select_route_block_size_m(
             num_tokens,
@@ -5143,7 +5172,9 @@ def _w4a16_preplanned_launches(
     # Prefer a preplanned TC-decode launch for an exact small-M decode size. It
     # was compiled at this exact token count (its FC2 atomically sums per-route
     # partials into the output), so it only applies when m matches exactly.
-    from sparkinfer.moe.fused.w4a16.kernel import _TC_DECODE_MAX_M
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        _TC_DECODE_MAX_M,
+    )
 
     if (
         not collect_activation_amax
@@ -5602,11 +5633,11 @@ def _prewarm_w4a16_planned_launches(
     w13_layout = _normalize_w13_layout(w13_layout)
     collect_activation_amax = bool(collect_activation_amax)
 
-    from sparkinfer.moe.fused.w4a16.host import (
+    from sparkinfer.moe._shared.kernels.w4a16.host import (
         max_packed_route_slots,
         select_route_block_size_m,
     )
-    from sparkinfer.moe.fused.w4a16.kernel import (
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         _TC_DECODE_MAX_M,
         compile_w4a16_fused_moe,
@@ -6513,7 +6544,9 @@ def _select_micro_mma_tiler_mn(
     resident_clusters: int | None = None,
 ) -> tuple[int, int]:
     if os.environ.get("SPARKINFER_MOE_TILE_MN"):
-        return tuple(int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x"))
+        return tuple(
+            int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x")
+        )
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     if max_rows <= 32 and n <= 256:
@@ -6593,7 +6626,9 @@ def _get_micro_kernel(
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
         return last_kval, kernel.grid_x
-    reuse_compiled = os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
+    reuse_compiled = (
+        os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
+    )
     if reuse_compiled:
         cached = _MICRO_KERNEL_CACHE.get(cache_key)
         if cached is not None:
@@ -7233,7 +7268,8 @@ def _get_dynamic_kernel(
     if last_kkey == cache_key:
         return last_kval, mac
     reuse_compiled = _first_env(
-        "SPARKINFER_DYNAMIC_REUSE_COMPILED", "SPARKINFER_LEVEL10_REUSE_COMPILED"
+        "SPARKINFER_DYNAMIC_REUSE_COMPILED",
+        "SPARKINFER_LEVEL10_REUSE_COMPILED",
     )
     if reuse_compiled is None:
         reuse_compiled = "1"
@@ -8115,7 +8151,9 @@ def _launch_dynamic_topk_sum(
             "top-k reduction exceeds the planned route-output capacity: "
             f"need {m * num_topk * k} elements, got {route_output.numel()}"
         )
-    from sparkinfer.moe.fused.w4a16.kernel import compile_w4a16_topk_sum
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        compile_w4a16_topk_sum,
+    )
 
     element_dtype = _w4a16_element_dtype(output.dtype)
     compile_w4a16_topk_sum(
@@ -8316,7 +8354,7 @@ def _get_tiny_decode_kernel(
     *,
     device: torch.device | None = None,
 ):
-    from sparkinfer.moe.fused.tiny_decode import (
+    from sparkinfer.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackendPhase1,
         MoETinyDecodeKernelBackendPhase2,
     )
@@ -8382,7 +8420,9 @@ def _launch_tiny_decode_flat(
     n: int,
     num_topk: int,
 ) -> None:
-    from sparkinfer.moe.fused.tiny_decode import MoETinyDecodeKernelBackend
+    from sparkinfer.moe._shared.kernels.tiny_decode import (
+        MoETinyDecodeKernelBackend,
+    )
 
     del barrier_count, barrier_epoch
     compiled_fc1, compiled_fc2 = _get_tiny_decode_kernel(
@@ -8900,7 +8940,9 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     if quant_mode == "w4a16":
-        from sparkinfer.moe.fused.w4a16.kernel import run_w4a16_moe
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+            run_w4a16_moe,
+        )
 
         if output is None:
             if torch.cuda.is_current_stream_capturing():
@@ -9183,7 +9225,10 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
+                and os.environ.get(
+                    "SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1"
+                )
+                != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")

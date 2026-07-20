@@ -12,15 +12,15 @@ import torch
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.attention._cute import ops as attention_ops
-from sparkinfer.attention.workspace import _SPLIT_MAX_CHUNKS
-from sparkinfer.cute.compiler import (
+from sparkinfer.attention._shared.cute import ops as attention_ops
+from sparkinfer.attention._shared.workspace import _SPLIT_MAX_CHUNKS
+from sparkinfer._lib.compiler import (
     DimKey,
     KernelCompileSpec,
     launch as sparkinfer_launch,
     tensor_compile_fact,
 )
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.utils import current_cuda_stream
 
 from .decode_math import _exp2_approx_ftz_f32
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM
@@ -138,7 +138,9 @@ def _to_kernel_tensor(
 ) -> cute.Tensor:
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
-    leading_dim = next((idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None)
+    leading_dim = next(
+        (idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None
+    )
     if leading_dim is not None and tensor.ndim >= 2:
         cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
     return cute_tensor

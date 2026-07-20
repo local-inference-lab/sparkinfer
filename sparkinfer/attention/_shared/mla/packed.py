@@ -12,7 +12,9 @@ def view_last_dim_as_u32(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.contiguous()
     byte_width = tensor.shape[-1] * tensor.element_size()
     if byte_width % 4 != 0:
-        raise ValueError(f"last dimension byte-width must be divisible by 4, got {byte_width}")
+        raise ValueError(
+            f"last dimension byte-width must be divisible by 4, got {byte_width}"
+        )
     byte_view = tensor.view(torch.uint8).reshape(*tensor.shape[:-1], byte_width)
     return byte_view.view(torch.uint32).reshape(*tensor.shape[:-1], byte_width // 4)
 

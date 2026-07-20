@@ -19,7 +19,9 @@ def _validate_ladder(*, ladder: Ladder) -> None:
     previous_end = 0
     for end_routed_rows, max_active_clusters in ladder:
         if end_routed_rows <= previous_end:
-            raise ValueError("ladder end_routed_rows values must be strictly increasing")
+            raise ValueError(
+                "ladder end_routed_rows values must be strictly increasing"
+            )
         if max_active_clusters <= 0:
             raise ValueError("ladder max_active_clusters values must be positive")
         previous_end = end_routed_rows
@@ -37,7 +39,10 @@ def register_max_active_clusters_policy(
         raise ValueError(f"unsupported backend {backend!r}")
     _validate_ladder(ladder=ladder)
     MAX_ACTIVE_CLUSTERS_POLICY[(str(regime), str(backend))] = MaxActiveClustersPolicy(
-        ladder=tuple((int(end_routed_rows), int(max_active_clusters)) for end_routed_rows, max_active_clusters in ladder)
+        ladder=tuple(
+            (int(end_routed_rows), int(max_active_clusters))
+            for end_routed_rows, max_active_clusters in ladder
+        )
     )
 
 

@@ -53,7 +53,9 @@ from .persistent_topk import clear_persistent_topk2048_kernel_cache
 
 _INDEX_HEAD_DIM = 128
 _INT32_MAX = torch.iinfo(torch.int32).max
-_VALIDATE_PAGE_IDS = bool(int(os.getenv("SPARKINFER_NSA_VALIDATE_PAGE_IDS", "0")))
+_VALIDATE_PAGE_IDS = bool(
+    int(os.getenv("SPARKINFER_NSA_VALIDATE_PAGE_IDS", "0"))
+)
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
@@ -86,7 +88,9 @@ def build_paged_mqa_schedule_metadata(
             f"context_lens must be rank-1 or rank-2, got {tuple(context_lens.shape)}"
         )
     if context_lens.ndim == 2 and context_lens.shape[1] == 0:
-        raise ValueError("context_lens rank-2 input must have a non-empty trailing dimension")
+        raise ValueError(
+            "context_lens rank-2 input must have a non-empty trailing dimension"
+        )
     if context_lens.dtype != torch.int32:
         raise ValueError(
             f"context_lens must have dtype torch.int32, got {context_lens.dtype}"
@@ -97,7 +101,9 @@ def build_paged_mqa_schedule_metadata(
         raise ValueError(f"block_kv must be positive, got {block_kv}")
     if out is not None:
         if out.ndim != 2 or out.shape[1] != 2:
-            raise ValueError(f"out must have shape (num_sms + 1, 2), got {tuple(out.shape)}")
+            raise ValueError(
+                f"out must have shape (num_sms + 1, 2), got {tuple(out.shape)}"
+            )
         if out.dtype != torch.int32:
             raise ValueError(f"out must have dtype torch.int32, got {out.dtype}")
         if not out.is_contiguous():
@@ -110,7 +116,9 @@ def build_paged_mqa_schedule_metadata(
             num_sms = out.shape[0] - 1
     if num_sms is None:
         if context_lens.device.type == "cuda":
-            num_sms = torch.cuda.get_device_properties(context_lens.device).multi_processor_count
+            num_sms = torch.cuda.get_device_properties(
+                context_lens.device
+            ).multi_processor_count
         else:
             num_sms = 1
     if num_sms <= 0:
@@ -178,9 +186,13 @@ def _normalize_weights(
             )
         weights = weights.squeeze(2)
     if weights.ndim != 2:
-        raise ValueError(f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}")
+        raise ValueError(
+            f"weights must be rank-2 or rank-3, got {tuple(weights.shape)}"
+        )
     if weights.shape != (q_rows, num_heads):
-        raise ValueError(f"weights shape must be {(q_rows, num_heads)}, got {tuple(weights.shape)}")
+        raise ValueError(
+            f"weights shape must be {(q_rows, num_heads)}, got {tuple(weights.shape)}"
+        )
     if require_float32 and weights.dtype != torch.float32:
         raise ValueError(
             f"strict indexer contiguous requires torch.float32 weights, got {weights.dtype}"
@@ -194,7 +206,9 @@ def _cached_width_cap_tensor(
     device_type: str,
     device_index: int | None,
 ) -> torch.Tensor:
-    return torch.tensor([width], dtype=torch.int32, device=torch.device(device_type, device_index))
+    return torch.tensor(
+        [width], dtype=torch.int32, device=torch.device(device_type, device_index)
+    )
 
 
 def _make_active_width_tensor(
@@ -245,9 +259,13 @@ def msa_prefill_query_positions(
     """Return packed prefill query token positions."""
 
     if cu_seqlens_q.ndim != 1:
-        raise ValueError(f"cu_seqlens_q must be rank-1, got {tuple(cu_seqlens_q.shape)}")
+        raise ValueError(
+            f"cu_seqlens_q must be rank-1, got {tuple(cu_seqlens_q.shape)}"
+        )
     if cu_seqlens_q.dtype != torch.int32:
-        raise ValueError(f"cu_seqlens_q must have dtype torch.int32, got {cu_seqlens_q.dtype}")
+        raise ValueError(
+            f"cu_seqlens_q must have dtype torch.int32, got {cu_seqlens_q.dtype}"
+        )
     total_q = int(total_q)
     if total_q < 0:
         raise ValueError(f"total_q must be non-negative, got {total_q}")
@@ -263,31 +281,48 @@ def _validate_msa_block_scores_selection(
     out_indices: torch.Tensor | None,
 ) -> tuple[int, int, int]:
     if block_scores.ndim != 3:
-        raise ValueError(f"block_scores must be rank-3, got {tuple(block_scores.shape)}")
+        raise ValueError(
+            f"block_scores must be rank-3, got {tuple(block_scores.shape)}"
+        )
     if block_scores.dtype != torch.float32:
-        raise ValueError(f"block_scores must have dtype torch.float32, got {block_scores.dtype}")
+        raise ValueError(
+            f"block_scores must have dtype torch.float32, got {block_scores.dtype}"
+        )
     num_heads, q_rows, num_blocks = map(int, block_scores.shape)
     if query_positions.ndim != 1 or query_positions.shape[0] != q_rows:
         raise ValueError(
             f"query_positions must have shape ({q_rows},), got {tuple(query_positions.shape)}"
         )
     if query_positions.dtype != torch.int32:
-        raise ValueError(f"query_positions must have dtype torch.int32, got {query_positions.dtype}")
+        raise ValueError(
+            f"query_positions must have dtype torch.int32, got {query_positions.dtype}"
+        )
     if query_positions.device != block_scores.device:
         raise ValueError("query_positions device must match block_scores")
     if block_base is not None:
         if block_base.ndim != 1 or block_base.shape[0] != q_rows:
-            raise ValueError(f"block_base must have shape ({q_rows},), got {tuple(block_base.shape)}")
+            raise ValueError(
+                f"block_base must have shape ({q_rows},), got {tuple(block_base.shape)}"
+            )
         if block_base.dtype != torch.int32:
-            raise ValueError(f"block_base must have dtype torch.int32, got {block_base.dtype}")
+            raise ValueError(
+                f"block_base must have dtype torch.int32, got {block_base.dtype}"
+            )
         if block_base.device != block_scores.device:
             raise ValueError("block_base device must match block_scores")
     if out_indices is not None:
         if out_indices.dtype != torch.int32:
-            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+            raise ValueError(
+                f"out_indices must have dtype torch.int32, got {out_indices.dtype}"
+            )
         if out_indices.device != block_scores.device:
             raise ValueError("out_indices device must match block_scores")
-        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+        if (
+            out_indices.ndim != 3
+            or out_indices.shape[0] < num_heads
+            or out_indices.shape[1] < q_rows
+            or out_indices.shape[2] < topk
+        ):
             raise ValueError(
                 f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
                 f"got {tuple(out_indices.shape)}"
@@ -338,7 +373,10 @@ def msa_topk_blocks(
         return result
 
     if score_scratch is not None:
-        if score_scratch.dtype != torch.float32 or score_scratch.device != block_scores.device:
+        if (
+            score_scratch.dtype != torch.float32
+            or score_scratch.device != block_scores.device
+        ):
             raise ValueError("score_scratch must be float32 on the block_scores device")
         if (
             score_scratch.ndim != 3
@@ -375,9 +413,15 @@ def msa_topk_blocks(
     if top_values is not None or top_indices is not None:
         if top_values is None or top_indices is None:
             raise ValueError("top_values and top_indices must be provided together")
-        if top_values.dtype != torch.float32 or top_values.device != block_scores.device:
+        if (
+            top_values.dtype != torch.float32
+            or top_values.device != block_scores.device
+        ):
             raise ValueError("top_values must be float32 on the block_scores device")
-        if top_indices.dtype != torch.int64 or top_indices.device != block_scores.device:
+        if (
+            top_indices.dtype != torch.int64
+            or top_indices.device != block_scores.device
+        ):
             raise ValueError("top_indices must be int64 on the block_scores device")
         if (
             top_values.ndim != 3
@@ -408,7 +452,10 @@ def msa_topk_blocks(
         if block_base is not None:
             local_indices.sub_(block_base.view(1, q_rows, 1))
     elif sort_values is not None:
-        if sort_values.dtype != torch.int32 or sort_values.device != block_scores.device:
+        if (
+            sort_values.dtype != torch.int32
+            or sort_values.device != block_scores.device
+        ):
             raise ValueError("sort_values must be int32 on the block_scores device")
         if (
             sort_values.ndim != 3
@@ -429,7 +476,10 @@ def msa_topk_blocks(
     local_indices.masked_fill_(~valid, _INT32_MAX)
     sort_out = None
     if sort_values is not None and sort_indices is not None:
-        if sort_indices.dtype != torch.int64 or sort_indices.device != block_scores.device:
+        if (
+            sort_indices.dtype != torch.int64
+            or sort_indices.device != block_scores.device
+        ):
             raise ValueError("sort_indices must be int64 on the block_scores device")
         if (
             sort_indices.ndim != 3
@@ -462,9 +512,13 @@ def _validate_paged_decode_inputs(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     if real_page_table.ndim != 2:
-        raise ValueError(f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}")
+        raise ValueError(
+            f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}"
+        )
     if real_page_table.dtype != torch.int32:
         raise ValueError(
             f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
@@ -578,7 +632,9 @@ def paged_decode_logits(
 
     seqlens_valid = metadata.cache_seqlens_int32.contiguous()
     if active_width_override is None:
-        active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
+        active_width = _make_active_width_tensor(
+            seqlens_per_query=seqlens_valid, width=width_tokens
+        )
     else:
         if active_width_override.shape != (1,):
             raise ValueError(
@@ -608,11 +664,17 @@ def paged_decode_logits(
                 dtype=torch.int32,
                 device=q_fp8.device,
             ).unsqueeze(0)
-            page_cols = torch.div(positions, page_size, rounding_mode="floor").to(torch.long)
+            page_cols = torch.div(positions, page_size, rounding_mode="floor").to(
+                torch.long
+            )
             page_cols = page_cols.expand(valid_q_rows, -1)
             candidate_pages = metadata.real_page_table.gather(1, page_cols)
-            candidate_valid_mask = (positions < seqlens_valid.unsqueeze(1)) & (candidate_pages >= 0)
-            overflow_mask = candidate_valid_mask & (candidate_pages >= max_page_capacity)
+            candidate_valid_mask = (positions < seqlens_valid.unsqueeze(1)) & (
+                candidate_pages >= 0
+            )
+            overflow_mask = candidate_valid_mask & (
+                candidate_pages >= max_page_capacity
+            )
             if torch.any(overflow_mask):
                 bad = int(candidate_pages[overflow_mask].max().item())
                 raise ValueError(
@@ -652,7 +714,9 @@ def paged_decode_logits(
                     "paged_mqa_schedule_metadata must be precomputed before CUDA graph capture "
                     "for the scheduled decode path"
                 )
-            schedule_metadata = build_paged_mqa_schedule_metadata(seqlens_valid, page_size)
+            schedule_metadata = build_paged_mqa_schedule_metadata(
+                seqlens_valid, page_size
+            )
     logits_valid = run_paged_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],
@@ -686,9 +750,13 @@ def _validate_msa_q_inputs(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     if q_fp8.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}")
+        raise ValueError(
+            f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}"
+        )
     if q_scale.ndim != 2 or q_scale.shape != q_fp8.shape[:2]:
         raise ValueError(
             f"q_scale must have shape {tuple(q_fp8.shape[:2])}, got {tuple(q_scale.shape)}"
@@ -714,7 +782,12 @@ def _validate_msa_block_scores_out(
         raise ValueError(f"out must have dtype torch.float32, got {out.dtype}")
     if out.device != device:
         raise ValueError("out device must match q_fp8")
-    if out.ndim != 3 or out.shape[0] < num_heads or out.shape[1] < q_rows or out.shape[2] < num_blocks:
+    if (
+        out.ndim != 3
+        or out.shape[0] < num_heads
+        or out.shape[1] < q_rows
+        or out.shape[2] < num_blocks
+    ):
         raise ValueError(
             f"out must have shape at least ({num_heads}, {q_rows}, {num_blocks}), "
             f"got {tuple(out.shape)}"
@@ -770,7 +843,9 @@ def msa_paged_decode_block_scores(
     if metadata.cache_seqlens_int32.shape[0] != valid_q_rows:
         raise ValueError("real_page_table rows must match cache_seqlens_int32")
     if valid_q_rows > q_rows:
-        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+        raise ValueError(
+            f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}"
+        )
     width_tokens = int(metadata.real_page_table.shape[1]) * int(page_size)
     num_blocks = math.ceil(width_tokens / MSA_BLOCK_TOKENS)
     out_view = _validate_msa_block_scores_out(
@@ -806,10 +881,9 @@ def msa_paged_decode_block_scores(
         return block_scores
 
     max_pages = int(metadata.real_page_table.shape[1])
-    use_page_max = (
-        os.getenv("SPARKINFER_MSA_DECODE_PAGEMAX", "1") != "0"
-        and uses_paged_mqa_schedule(q_rows=valid_q_rows, max_pages=max_pages)
-    )
+    use_page_max = os.getenv(
+        "SPARKINFER_MSA_DECODE_PAGEMAX", "1"
+    ) != "0" and uses_paged_mqa_schedule(q_rows=valid_q_rows, max_pages=max_pages)
     if use_page_max:
         weights = q_scale[:valid_q_rows].contiguous() * MSA_SM_SCALE
         seqlens_valid = metadata.cache_seqlens_int32.contiguous()
@@ -827,7 +901,9 @@ def msa_paged_decode_block_scores(
                     "paged_mqa_schedule_metadata must be precomputed before CUDA graph capture "
                     "for MSA scheduled page-max decode"
                 )
-            schedule_metadata = build_paged_mqa_schedule_metadata(seqlens_valid, page_size)
+            schedule_metadata = build_paged_mqa_schedule_metadata(
+                seqlens_valid, page_size
+            )
         page_scores = run_paged_logits_kernel(
             q_fp8=q_fp8[:valid_q_rows],
             weights=weights,
@@ -846,10 +922,14 @@ def msa_paged_decode_block_scores(
         block_scores[:, :valid_q_rows, :].copy_(paired[:, :, :num_blocks])
         return block_scores
 
-    q_expanded = q_fp8[:valid_q_rows].contiguous().reshape(
-        valid_q_rows * num_heads,
-        1,
-        _INDEX_HEAD_DIM,
+    q_expanded = (
+        q_fp8[:valid_q_rows]
+        .contiguous()
+        .reshape(
+            valid_q_rows * num_heads,
+            1,
+            _INDEX_HEAD_DIM,
+        )
     )
     weights = (
         q_scale[:valid_q_rows].contiguous().reshape(valid_q_rows * num_heads, 1)
@@ -928,17 +1008,26 @@ def msa_q2k_indices_decode(
         raise ValueError(f"topk must be non-negative, got {topk}")
     if out_indices is not None:
         if out_indices.dtype != torch.int32:
-            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+            raise ValueError(
+                f"out_indices must have dtype torch.int32, got {out_indices.dtype}"
+            )
         if out_indices.device != q_fp8.device:
             raise ValueError("out_indices device must match q_fp8")
-        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+        if (
+            out_indices.ndim != 3
+            or out_indices.shape[0] < num_heads
+            or out_indices.shape[1] < q_rows
+            or out_indices.shape[2] < topk
+        ):
             raise ValueError(
                 f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
                 f"got {tuple(out_indices.shape)}"
             )
     valid_q_rows = int(metadata.real_page_table.shape[0])
     if valid_q_rows > q_rows:
-        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+        raise ValueError(
+            f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}"
+        )
     block_scores = msa_paged_decode_block_scores(
         q_fp8=q_fp8,
         q_scale=q_scale,
@@ -963,11 +1052,21 @@ def msa_q2k_indices_decode(
         query_positions=msa_decode_query_positions(metadata.cache_seqlens_int32),
         topk=topk,
         out_indices=result[:, :valid_q_rows, :],
-        score_scratch=getattr(binding, "topk_score_scratch", None) if binding is not None else None,
-        top_values=getattr(binding, "topk_values", None) if binding is not None else None,
-        top_indices=getattr(binding, "topk_indices", None) if binding is not None else None,
-        sort_values=getattr(binding, "sort_values", None) if binding is not None else None,
-        sort_indices=getattr(binding, "sort_indices", None) if binding is not None else None,
+        score_scratch=getattr(binding, "topk_score_scratch", None)
+        if binding is not None
+        else None,
+        top_values=getattr(binding, "topk_values", None)
+        if binding is not None
+        else None,
+        top_indices=getattr(binding, "topk_indices", None)
+        if binding is not None
+        else None,
+        sort_values=getattr(binding, "sort_values", None)
+        if binding is not None
+        else None,
+        sort_indices=getattr(binding, "sort_indices", None)
+        if binding is not None
+        else None,
     )
     if selected.data_ptr() != result[:, :valid_q_rows, :].data_ptr():
         result[:, :valid_q_rows, :].copy_(selected)
@@ -1013,7 +1112,9 @@ def contiguous_logits(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if q_fp8.shape[2] != _INDEX_HEAD_DIM:
-        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+        raise ValueError(
+            f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}"
+        )
     _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
     if k_start.ndim != 1 or k_end.ndim != 1:
         raise ValueError(
@@ -1101,9 +1202,13 @@ def msa_contiguous_block_scores(
     k_start = metadata.k_start
     k_end = metadata.k_end
     if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
-        raise ValueError("MSA contiguous metadata requires matching rank-1 k_start/k_end")
+        raise ValueError(
+            "MSA contiguous metadata requires matching rank-1 k_start/k_end"
+        )
     if k_start.shape[0] > q_rows:
-        raise ValueError(f"metadata describes {k_start.shape[0]} q rows, but q_fp8 has {q_rows}")
+        raise ValueError(
+            f"metadata describes {k_start.shape[0]} q rows, but q_fp8 has {q_rows}"
+        )
     if k_start.dtype != torch.int32 or k_end.dtype != torch.int32:
         raise ValueError("k_start and k_end must have dtype torch.int32")
     if not _is_cuda_graph_capture_active(q_fp8.device):
@@ -1150,11 +1255,15 @@ def msa_contiguous_block_scores(
     if binding is not None and bool(getattr(binding, "strict", False)):
         scratch = binding.scratch
         if not hasattr(scratch, "prepare_k_padding"):
-            raise RuntimeError("strict MSA contiguous binding requires plan-owned scratch")
+            raise RuntimeError(
+                "strict MSA contiguous binding requires plan-owned scratch"
+            )
         if not q_fp8.is_contiguous():
             raise ValueError("strict MSA contiguous binding requires contiguous q_fp8")
         if not k_quant.is_contiguous() or not k_scale.is_contiguous():
-            raise ValueError("strict MSA contiguous binding requires contiguous K tensors")
+            raise ValueError(
+                "strict MSA contiguous binding requires contiguous K tensors"
+            )
         scratch.prepare_k_padding(k_rows=k_rows)
         if k_quant.data_ptr() != scratch.k_quant.data_ptr():
             raise ValueError("strict MSA contiguous K values must be a scratch prefix")
@@ -1227,16 +1336,25 @@ def msa_q2k_indices_prefill(
     q_rows, num_heads = _validate_msa_q_inputs(q_fp8=q_fp8, q_scale=q_scale)
     valid_q_rows = int(metadata.k_start.shape[0])
     if valid_q_rows > q_rows:
-        raise ValueError(f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}")
+        raise ValueError(
+            f"metadata describes {valid_q_rows} q rows, but q_fp8 has {q_rows}"
+        )
     topk = int(topk)
     if topk < 0:
         raise ValueError(f"topk must be non-negative, got {topk}")
     if out_indices is not None:
         if out_indices.dtype != torch.int32:
-            raise ValueError(f"out_indices must have dtype torch.int32, got {out_indices.dtype}")
+            raise ValueError(
+                f"out_indices must have dtype torch.int32, got {out_indices.dtype}"
+            )
         if out_indices.device != q_fp8.device:
             raise ValueError("out_indices device must match q_fp8")
-        if out_indices.ndim != 3 or out_indices.shape[0] < num_heads or out_indices.shape[1] < q_rows or out_indices.shape[2] < topk:
+        if (
+            out_indices.ndim != 3
+            or out_indices.shape[0] < num_heads
+            or out_indices.shape[1] < q_rows
+            or out_indices.shape[2] < topk
+        ):
             raise ValueError(
                 f"out_indices must have shape at least ({num_heads}, {q_rows}, {topk}), "
                 f"got {tuple(out_indices.shape)}"
@@ -1265,7 +1383,9 @@ def msa_q2k_indices_prefill(
     else:
         query_positions = query_positions[:valid_q_rows]
     if block_base is None:
-        block_base = torch.div(metadata.k_start, MSA_BLOCK_TOKENS, rounding_mode="floor")
+        block_base = torch.div(
+            metadata.k_start, MSA_BLOCK_TOKENS, rounding_mode="floor"
+        )
     else:
         block_base = block_base[:valid_q_rows]
     selected = msa_topk_blocks(
@@ -1274,11 +1394,21 @@ def msa_q2k_indices_prefill(
         block_base=block_base,
         topk=topk,
         out_indices=result[:, :valid_q_rows, :],
-        score_scratch=getattr(binding, "topk_score_scratch", None) if binding is not None else None,
-        top_values=getattr(binding, "topk_values", None) if binding is not None else None,
-        top_indices=getattr(binding, "topk_indices", None) if binding is not None else None,
-        sort_values=getattr(binding, "sort_values", None) if binding is not None else None,
-        sort_indices=getattr(binding, "sort_indices", None) if binding is not None else None,
+        score_scratch=getattr(binding, "topk_score_scratch", None)
+        if binding is not None
+        else None,
+        top_values=getattr(binding, "topk_values", None)
+        if binding is not None
+        else None,
+        top_indices=getattr(binding, "topk_indices", None)
+        if binding is not None
+        else None,
+        sort_values=getattr(binding, "sort_values", None)
+        if binding is not None
+        else None,
+        sort_indices=getattr(binding, "sort_indices", None)
+        if binding is not None
+        else None,
     )
     if selected.data_ptr() != result[:, :valid_q_rows, :].data_ptr():
         result[:, :valid_q_rows, :].copy_(selected)
@@ -1297,10 +1427,14 @@ def _reference_topk_indices_from_logits(
         raise ValueError(f"topk must be non-negative, got {topk}")
     num_rows = int(logits.shape[0])
     result = torch.full((num_rows, topk), -1, dtype=torch.int32, device=logits.device)
-    values = torch.full((num_rows, topk), float("-inf"), dtype=torch.float32, device=logits.device)
+    values = torch.full(
+        (num_rows, topk), float("-inf"), dtype=torch.float32, device=logits.device
+    )
     gather_k = min(topk, int(logits.shape[1]))
     if gather_k:
-        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[
+            :, :gather_k
+        ]
         topk_values = torch.gather(logits, 1, topk_pos)
         result[:, :gather_k] = torch.where(
             torch.isfinite(topk_values),
@@ -1311,10 +1445,16 @@ def _reference_topk_indices_from_logits(
 
     if output_indices is not None:
         if output_indices.dtype != torch.int32:
-            raise ValueError(f"output_indices must have dtype torch.int32, got {output_indices.dtype}")
+            raise ValueError(
+                f"output_indices must have dtype torch.int32, got {output_indices.dtype}"
+            )
         if output_indices.device != logits.device:
             raise ValueError("output_indices device must match logits")
-        if output_indices.ndim != 2 or output_indices.shape[0] < num_rows or output_indices.shape[1] < topk:
+        if (
+            output_indices.ndim != 2
+            or output_indices.shape[0] < num_rows
+            or output_indices.shape[1] < topk
+        ):
             raise ValueError(
                 f"output_indices must have shape at least ({num_rows}, {topk}), got {tuple(output_indices.shape)}"
             )
@@ -1323,10 +1463,16 @@ def _reference_topk_indices_from_logits(
 
     if output_values is not None:
         if output_values.dtype != torch.float32:
-            raise ValueError(f"output_values must have dtype torch.float32, got {output_values.dtype}")
+            raise ValueError(
+                f"output_values must have dtype torch.float32, got {output_values.dtype}"
+            )
         if output_values.device != logits.device:
             raise ValueError("output_values device must match logits")
-        if output_values.ndim != 2 or output_values.shape[0] < num_rows or output_values.shape[1] < topk:
+        if (
+            output_values.ndim != 2
+            or output_values.shape[0] < num_rows
+            or output_values.shape[1] < topk
+        ):
             raise ValueError(
                 f"output_values must have shape at least ({num_rows}, {topk}), got {tuple(output_values.shape)}"
             )
@@ -1405,8 +1551,12 @@ def contiguous_tiled_topk(
     if q_fp8.ndim != 3:
         raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
     if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
-        raise ValueError("tiled topk requires matching rank-1 k_start and k_end tensors")
-    weights_f = _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
+        raise ValueError(
+            "tiled topk requires matching rank-1 k_start and k_end tensors"
+        )
+    weights_f = _normalize_weights(
+        weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1]
+    )
     k_quant, k_scale = kv_fp8
     if not supports_contiguous_logits_kernel(
         q_fp8=q_fp8,
@@ -1427,9 +1577,13 @@ def contiguous_tiled_topk(
                     f"lengths must have shape at least ({int(k_start.shape[0])},), got {tuple(lengths.shape)}"
                 )
             if lengths.dtype != torch.int32:
-                raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
+                raise ValueError(
+                    f"lengths must have dtype torch.int32, got {lengths.dtype}"
+                )
             if lengths.device != q_fp8.device:
-                raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
+                raise ValueError(
+                    f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}"
+                )
             torch.sub(k_end, k_start, out=lengths[: int(k_start.shape[0])])
         logits = contiguous_logits_reference(
             q_fp8=q_fp8,
@@ -1458,7 +1612,11 @@ def contiguous_tiled_topk(
         # The decode scorer does not produce that layout, so force the standard
         # prefill scorer for small q batches instead of failing.
         prefill_block_k = _PREFILL_BLOCK_K
-    block_q = _PREFILL512_BLOCK_Q if prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+    block_q = (
+        _PREFILL512_BLOCK_Q
+        if prefill_block_k == _PREFILL512_BLOCK_K
+        else _PREFILL_BLOCK_Q
+    )
 
     num_q_rows = int(k_start.shape[0])
     num_q_tiles = (num_q_rows + block_q - 1) // block_q
@@ -1472,7 +1630,9 @@ def contiguous_tiled_topk(
 
     if tile_logits is None:
         if strict_binding:
-            raise RuntimeError("strict indexer contiguous binding is missing tile_logits")
+            raise RuntimeError(
+                "strict indexer contiguous binding is missing tile_logits"
+            )
         tile_logits = torch.empty(
             (chunk_tile_elements,),
             dtype=torch.float32,
@@ -1494,9 +1654,13 @@ def contiguous_tiled_topk(
                 f"lengths must have shape at least ({num_q_rows},), got {tuple(lengths.shape)}"
             )
         if lengths.dtype != torch.int32:
-            raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
+            raise ValueError(
+                f"lengths must have dtype torch.int32, got {lengths.dtype}"
+            )
         if lengths.device != q_fp8.device:
-            raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
+            raise ValueError(
+                f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}"
+            )
         if not lengths.is_contiguous():
             raise ValueError("lengths must be contiguous")
         global_lengths = lengths[:num_q_rows]
@@ -1531,7 +1695,9 @@ def contiguous_tiled_topk(
             raise RuntimeError("strict indexer contiguous path requires a binding")
         scratch = binding.scratch
         if tile_logits is None:
-            raise RuntimeError("strict indexer contiguous binding is missing tile logits")
+            raise RuntimeError(
+                "strict indexer contiguous binding is missing tile logits"
+            )
         if not hasattr(scratch, "prepare_k_padding"):
             raise RuntimeError(
                 "strict indexer contiguous binding requires plan-owned scratch"
@@ -1546,9 +1712,13 @@ def contiguous_tiled_topk(
         scratch_k_quant = scratch.k_quant
         scratch_k_scale = scratch.k_scale
         if k_quant.data_ptr() != scratch_k_quant.data_ptr():
-            raise ValueError("strict indexer contiguous K values must be a scratch prefix")
+            raise ValueError(
+                "strict indexer contiguous K values must be a scratch prefix"
+            )
         if k_scale.data_ptr() != scratch_k_scale.data_ptr():
-            raise ValueError("strict indexer contiguous K scales must be a scratch prefix")
+            raise ValueError(
+                "strict indexer contiguous K scales must be a scratch prefix"
+            )
         q_bytes = q_fp8.view(torch.uint8)
         q_u32 = q_bytes.view(torch.uint32).view(
             int(q_fp8.shape[0]),
@@ -1610,7 +1780,9 @@ def contiguous_tiled_topk(
     # as a (2, M, topk) carry double-buffer (read prev half, write next half); the
     # final chunk writes the user output. No (num_chunks, ...) slab, no merge.
     if (candidate_values is None) != (candidate_indices is None):
-        raise ValueError("candidate_values and candidate_indices must be provided together")
+        raise ValueError(
+            "candidate_values and candidate_indices must be provided together"
+        )
     if candidate_values is None:
         if strict_binding:
             raise RuntimeError(
@@ -1630,8 +1802,7 @@ def contiguous_tiled_topk(
         assert candidate_indices is not None
         if candidate_values.ndim != 3 or candidate_indices.ndim != 3:
             raise ValueError(
-                "carry buffers must have shape at least "
-                f"(2, {num_q_rows}, {topk})"
+                f"carry buffers must have shape at least (2, {num_q_rows}, {topk})"
             )
         if candidate_values.shape[0] < 2 or candidate_values.shape[1] < num_q_rows:
             raise ValueError(
@@ -1651,10 +1822,17 @@ def contiguous_tiled_topk(
                 f"{topk}, got {candidate_values.shape[2]} and {candidate_indices.shape[2]}"
             )
         if candidate_values.dtype != torch.float32:
-            raise ValueError(f"candidate_values must have dtype torch.float32, got {candidate_values.dtype}")
+            raise ValueError(
+                f"candidate_values must have dtype torch.float32, got {candidate_values.dtype}"
+            )
         if candidate_indices.dtype != torch.int32:
-            raise ValueError(f"candidate_indices must have dtype torch.int32, got {candidate_indices.dtype}")
-        if candidate_values.device != q_fp8.device or candidate_indices.device != q_fp8.device:
+            raise ValueError(
+                f"candidate_indices must have dtype torch.int32, got {candidate_indices.dtype}"
+            )
+        if (
+            candidate_values.device != q_fp8.device
+            or candidate_indices.device != q_fp8.device
+        ):
             raise ValueError("carry buffer devices must match q_fp8")
     carry_buf_values = candidate_values[:2, :num_q_rows, :]
     carry_buf_indices = candidate_indices[:2, :num_q_rows, :]

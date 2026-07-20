@@ -11,7 +11,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint32
 
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     atomic_add_global_i32,
     get_ptr_as_int64,
     red_add_global_release_i32,
@@ -19,9 +19,16 @@ from sparkinfer.cute.intrinsics import (
     spin_wait_global_ge_i32,
     st_global_release_i32,
 )
-from sparkinfer.cute.compiler import KernelCompileSpec, launch as sparkinfer_launch
-from sparkinfer.cute.utils import current_cuda_stream
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    launch as sparkinfer_launch,
+)
+from sparkinfer._lib.utils import current_cuda_stream
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 
 from .tiled_topk import (
     _convert_to_uint32,
@@ -66,7 +73,9 @@ def _resolve_vec_size(stride: int) -> int:
     return 1
 
 
-def _resolve_launch_config(num_rows: int, stride: int, device: torch.device) -> _LaunchConfig:
+def _resolve_launch_config(
+    num_rows: int, stride: int, device: torch.device
+) -> _LaunchConfig:
     vec_size = _resolve_vec_size(stride)
     max_chunk = (_MAX_CHUNK_ELEMENTS // vec_size) * vec_size
     max_chunk = max(max_chunk, vec_size * _THREADS_PER_CTA)
@@ -94,9 +103,17 @@ def persistent_topk2048_scratch_nbytes(
         device = torch.device("cuda", torch.cuda.current_device())
     device = torch.device(device)
     if device.type != "cuda":
-        return max(int(num_rows), 1) * _STATE_WORDS * torch.empty((), dtype=torch.int32).element_size()
+        return (
+            max(int(num_rows), 1)
+            * _STATE_WORDS
+            * torch.empty((), dtype=torch.int32).element_size()
+        )
     launch = _resolve_launch_config(int(num_rows), int(stride), device)
-    return launch.num_groups * _STATE_WORDS * torch.empty((), dtype=torch.int32).element_size()
+    return (
+        launch.num_groups
+        * _STATE_WORDS
+        * torch.empty((), dtype=torch.int32).element_size()
+    )
 
 
 def _persistent_topk2048_capacity_nbytes(
@@ -150,9 +167,9 @@ class SPARKINFERPersistentTopK2048Binding:
 class SPARKINFERPersistentTopK2048ScratchPlan:
     caps: SPARKINFERPersistentTopK2048ScratchCaps
     scratch_nbytes: int
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -262,7 +279,9 @@ def _global_state_ptr(state: cute.Tensor, group_id: Int32, word: Int32):
 
 
 @cute.jit
-def _group_barrier(state: cute.Tensor, group_id: Int32, phase: Int32, ctas_per_group: Int32, tx: Int32) -> Int32:
+def _group_barrier(
+    state: cute.Tensor, group_id: Int32, phase: Int32, ctas_per_group: Int32, tx: Int32
+) -> Int32:
     arrival_ptr = _global_state_ptr(state, group_id, Int32(_STATE_ARRIVAL_COUNTER))
     if tx == Int32(0):
         red_add_global_release_i32(arrival_ptr, Int32(1))
@@ -356,18 +375,30 @@ class SparseNSAPersistentTopK2048Kernel:
 
         @cute.struct
         class SharedStorage:
-            local_histogram: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _RADIX], 128]
-            suffix_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _RADIX], 128]
+            local_histogram: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _RADIX], 128
+            ]
+            suffix_sum: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _RADIX], 128
+            ]
             scalars: cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, 4], 128]
             counters: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 2], 128]
-            ordered: cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, _MAX_CHUNK_ELEMENTS], 128]
+            ordered: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, _MAX_CHUNK_ELEMENTS], 128
+            ]
 
         storage = smem_alloc.allocate(SharedStorage)
-        s_hist = storage.local_histogram.get_tensor(cute.make_layout((_RADIX,), stride=(1,)))
-        s_suffix = storage.suffix_sum.get_tensor(cute.make_layout((_RADIX,), stride=(1,)))
+        s_hist = storage.local_histogram.get_tensor(
+            cute.make_layout((_RADIX,), stride=(1,))
+        )
+        s_suffix = storage.suffix_sum.get_tensor(
+            cute.make_layout((_RADIX,), stride=(1,))
+        )
         s_scalars = storage.scalars.get_tensor(cute.make_layout((4,), stride=(1,)))
         s_counters = storage.counters.get_tensor(cute.make_layout((2,), stride=(1,)))
-        s_ordered = storage.ordered.get_tensor(cute.make_layout((_MAX_CHUNK_ELEMENTS,), stride=(1,)))
+        s_ordered = storage.ordered.get_tensor(
+            cute.make_layout((_MAX_CHUNK_ELEMENTS,), stride=(1,))
+        )
         hist_ptr = shared_ptr_to_u32(storage.local_histogram.data_ptr())
         counter_ptr = shared_ptr_to_u32(storage.counters.data_ptr())
 
@@ -520,7 +551,9 @@ class SparseNSAPersistentTopK2048Kernel:
 
                     if cta_in_group == Int32(0) and tx == Int32(0):
                         st_global_release_i32(
-                            _global_state_ptr(state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                            _global_state_ptr(
+                                state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                            ),
                             Int32(0),
                         )
                     cute.arch.sync_threads()
@@ -562,7 +595,9 @@ class SparseNSAPersistentTopK2048Kernel:
                             local_count = Int32(s_hist[i])
                             if local_count > Int32(0):
                                 atomic_add_global_i32(
-                                    _global_state_ptr(state, group_id, current_hist_word + i),
+                                    _global_state_ptr(
+                                        state, group_id, current_hist_word + i
+                                    ),
                                     local_count,
                                 )
                             i = i + Int32(_THREADS_PER_CTA)
@@ -570,7 +605,9 @@ class SparseNSAPersistentTopK2048Kernel:
                         if cta_in_group == Int32(0):
                             i = tx
                             while i < Int32(_RADIX):
-                                state[_state_offset(group_id, next_hist_word + i)] = Int32(0)
+                                state[_state_offset(group_id, next_hist_word + i)] = (
+                                    Int32(0)
+                                )
                                 i = i + Int32(_THREADS_PER_CTA)
 
                         barrier_phase = _group_barrier(
@@ -579,7 +616,9 @@ class SparseNSAPersistentTopK2048Kernel:
 
                         i = tx
                         while i < Int32(_RADIX):
-                            s_suffix[i] = Int32(state[_state_offset(group_id, current_hist_word + i)])
+                            s_suffix[i] = Int32(
+                                state[_state_offset(group_id, current_hist_word + i)]
+                            )
                             i = i + Int32(_THREADS_PER_CTA)
                         cute.arch.sync_threads()
 
@@ -589,7 +628,9 @@ class SparseNSAPersistentTopK2048Kernel:
                             if tx < Int32(_RADIX):
                                 scan_val = Int32(s_suffix[tx])
                                 if tx < Int32(_RADIX) - stride_scan:
-                                    scan_val = scan_val + Int32(s_suffix[tx + stride_scan])
+                                    scan_val = scan_val + Int32(
+                                        s_suffix[tx + stride_scan]
+                                    )
                             cute.arch.sync_threads()
                             if tx < Int32(_RADIX):
                                 s_suffix[tx] = scan_val
@@ -635,7 +676,9 @@ class SparseNSAPersistentTopK2048Kernel:
                         base = Int32(0)
                         if local_gt_count > Int32(0):
                             base = atomic_add_global_i32(
-                                _global_state_ptr(state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                _global_state_ptr(
+                                    state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                                ),
                                 local_gt_count,
                             )
                         s_counters[1] = base
@@ -669,7 +712,9 @@ class SparseNSAPersistentTopK2048Kernel:
                     while i < actual_chunk_size:
                         if Uint32(s_ordered[i]) == ordered_pivot:
                             pos = atomic_add_global_i32(
-                                _global_state_ptr(state, group_id, Int32(_STATE_OUTPUT_COUNTER)),
+                                _global_state_ptr(
+                                    state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                                ),
                                 Int32(1),
                             )
                             if pos < Int32(self.topk_static):
@@ -752,9 +797,13 @@ def _fallback_topk2048(
     gather_k = min(topk, cols)
     if gather_k == 0:
         return output
-    mask = torch.arange(cols, device=logits.device).unsqueeze(0) >= lengths.reshape(-1, 1)
+    mask = torch.arange(cols, device=logits.device).unsqueeze(0) >= lengths.reshape(
+        -1, 1
+    )
     masked_logits = torch.where(mask, torch.full_like(logits, float("-inf")), logits)
-    topk_values, topk_pos = torch.topk(masked_logits, k=gather_k, dim=1, largest=True, sorted=False)
+    topk_values, topk_pos = torch.topk(
+        masked_logits, k=gather_k, dim=1, largest=True, sorted=False
+    )
     if page_table_1 is None:
         gathered = topk_pos.to(torch.int32)
     else:
@@ -839,7 +888,9 @@ def run_persistent_topk2048(
         )
 
     if output_indices is None:
-        output_indices = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+        output_indices = torch.empty(
+            (rows, topk), dtype=torch.int32, device=logits.device
+        )
     elif output_indices.shape != (rows, topk) or output_indices.dtype != torch.int32:
         raise ValueError(
             f"output_indices must have shape {(rows, topk)} and dtype int32, "

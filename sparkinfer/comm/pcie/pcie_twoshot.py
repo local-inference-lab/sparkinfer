@@ -213,7 +213,9 @@ class PCIeTwoShotSP:
                 dtype=torch.bfloat16,
                 device=self.device,
             )
-        self._ext.reduce_scatter_fp8(self._fptr, payload, scale, out, threads, block_limit)
+        self._ext.reduce_scatter_fp8(
+            self._fptr, payload, scale, out, threads, block_limit
+        )
         return out
 
     def all_gather_fp8(

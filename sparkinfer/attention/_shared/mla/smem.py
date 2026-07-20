@@ -305,9 +305,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     w_head_sc2_off = off
     w_head_sc2_bytes = (
-        n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2
-        if traits.has_extra_cache
-        else 0
+        n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2 if traits.has_extra_cache else 0
     )
     off = w_head_sc2_off + w_head_sc2_bytes
 
@@ -413,7 +411,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "q_sc": cute.struct.MemRange[cutlass.Float32, int(layout.q_sc_bytes // 4)],
         # Double-buffered KV. 128B-align the big nope region.
         "kv_fp8": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)],
+            cute.struct.MemRange[
+                cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)
+            ],
             128,
         ],
         **kv_sc_field,
@@ -433,14 +433,19 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         # cross-warp reduce scratch (warp_max | warp_sum fp32).
         "reduce": cute.struct.MemRange[cutlass.Float32, int(layout.reduce_bytes // 4)],
         # per-vc per-head output scale (fp32).
-        "w_head_sc": cute.struct.MemRange[cutlass.Float32, int(layout.w_head_sc_bytes // 4)],
+        "w_head_sc": cute.struct.MemRange[
+            cutlass.Float32, int(layout.w_head_sc_bytes // 4)
+        ],
         # re-quantized-P (fp8), double-buffered across vc.
         "w_fp8": cute.struct.MemRange[
             cutlass.Uint8, int(layout.w_fp8_buf_bytes * layout.w_fp8_bufs)
         ],
         # staged raw-token-index validity buffer (incl -1), int32, double-buffered.
         "token_idx": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Int32, int(layout.token_idx_buf_bytes * layout.token_idx_bufs // 4)],
+            cute.struct.MemRange[
+                cutlass.Int32,
+                int(layout.token_idx_buf_bytes * layout.token_idx_bufs // 4),
+            ],
             16,
         ],
         # static sm_p_full (bf16), 128B-aligned for ldmatrix.x4.
@@ -539,7 +544,9 @@ def _run_module_asserts() -> None:
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"
-    assert 88 * 1024 <= glm <= SM120_SMEM_CARVEOUT_BYTES, f"GLM smem {glm}B outside ~96KB band"
+    assert 88 * 1024 <= glm <= SM120_SMEM_CARVEOUT_BYTES, (
+        f"GLM smem {glm}B outside ~96KB band"
+    )
 
 
 _run_module_asserts()

@@ -25,11 +25,19 @@ class PipelineStateSimple:
 
     @property
     def index(self) -> Int32:
-        return Int32(0) if const_expr(self._stages == 1) else self._phase_index % self._stages
+        return (
+            Int32(0)
+            if const_expr(self._stages == 1)
+            else self._phase_index % self._stages
+        )
 
     @property
     def phase(self) -> Int32:
-        return self._phase_index if const_expr(self._stages == 1) else self._phase_index // self._stages
+        return (
+            self._phase_index
+            if const_expr(self._stages == 1)
+            else self._phase_index // self._stages
+        )
 
     def advance(self, *, loc=None, ip=None):
         if const_expr(self._stages == 1):
@@ -72,12 +80,18 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
     ):
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
+            self.sync_object_full.arrive(
+                state.index, self.producer_mask, loc=loc, ip=ip
+            )
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
+            self.sync_object_full.arrive_and_expect_tx(
+                state.index, tx_count, loc=loc, ip=ip
+            )

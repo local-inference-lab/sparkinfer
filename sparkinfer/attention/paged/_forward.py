@@ -10,8 +10,12 @@ import cutlass
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.cute.compiler import DimKey, KernelCompileSpec, launch as sparkinfer_launch
-from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer._lib.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    launch as sparkinfer_launch,
+)
+from sparkinfer._lib.utils import current_cuda_stream
 
 from .forward_paged import (
     PagedForwardKernel,
@@ -154,9 +158,13 @@ def _encode_plane_tma_descriptors(
     # combined [N, 2, page, H, D] K/V slices) keep flat row coordinates
     # `tile_idx * tile_rows` in-bounds.
     if int(cache.stride(3)) != 1:
-        raise ValueError("plane TMA cache requires contiguous head_dim (stride(3) == 1)")
+        raise ValueError(
+            "plane TMA cache requires contiguous head_dim (stride(3) == 1)"
+        )
     if int(cache.stride(2)) != head_dim:
-        raise ValueError("plane TMA cache requires contiguous kv-head rows (stride(2) == head_dim)")
+        raise ValueError(
+            "plane TMA cache requires contiguous kv-head rows (stride(2) == head_dim)"
+        )
     row_stride_elems = int(cache.stride(1))
     if row_stride_elems != kv_heads * head_dim:
         raise ValueError(
@@ -217,7 +225,9 @@ def _paged_kv_tiles_per_table_entry(
     are never addressed.
     """
     if cache.ndim != 4:
-        raise ValueError(f"{name} must be rank-4 [num_pages, page_size, kv_heads, head_dim]")
+        raise ValueError(
+            f"{name} must be rank-4 [num_pages, page_size, kv_heads, head_dim]"
+        )
     if int(cache.stride(3)) != 1:
         raise ValueError(f"{name} requires contiguous head_dim (stride(3) == 1)")
     row_stride_elems = int(cache.stride(1))
@@ -408,8 +418,15 @@ def _build_merge_kernel(
     pair_bf16_partial_loads: bool,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    merge_bdy = 3 if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph else 4
-    if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph and int(total_q) == 4:
+    merge_bdy = (
+        3 if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph else 4
+    )
+    if (
+        dtype == torch.bfloat16
+        and head_dim == 128
+        and regular_decode_graph
+        and int(total_q) == 4
+    ):
         merge_bdy = 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
@@ -537,19 +554,17 @@ def paged_attention_forward(
         v_descale,
         attention_sink_bias,
         relative_attention_bias,
-    ) = (
-        _resolve_paged_attention_binding(
-            binding=binding,
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            output=output,
-            q2k_indices=q2k_indices,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            attention_sink_bias=attention_sink_bias,
-            relative_attention_bias=relative_attention_bias,
-        )
+    ) = _resolve_paged_attention_binding(
+        binding=binding,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        output=output,
+        q2k_indices=q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        attention_sink_bias=attention_sink_bias,
+        relative_attention_bias=relative_attention_bias,
     )
     plan = workspace.plan
     page_table = workspace.page_table
@@ -683,7 +698,10 @@ def paged_attention_forward(
     page_size = int(plan.page_size)
     page_tiles_per_entry = 1
     if page_size == 128:
-        if k_cache.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn) or v_cache.dtype != k_cache.dtype:
+        if (
+            k_cache.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            or v_cache.dtype != k_cache.dtype
+        ):
             raise ValueError(
                 "page_size=128 paged attention requires matching fp16, bf16, or fp8 e4m3 K/V caches"
             )
@@ -780,7 +798,9 @@ def paged_attention_forward(
             or msa_union_masks is None
             or msa_union_counts is None
         ):
-            raise RuntimeError("MSA union-tile prefill requires union metadata scratch buffers")
+            raise RuntimeError(
+                "MSA union-tile prefill requires union metadata scratch buffers"
+            )
         assert q2k_indices is not None
         build_msa_prefill_union_metadata(
             q2k_indices=q2k_indices,
@@ -837,9 +857,7 @@ def paged_attention_forward(
     block_valid_mask_arg = _to_kernel_tensor(
         workspace.block_valid_mask, cutlass.Int32, assumed_align=4
     )
-    q2k_indices_arg = _to_kernel_tensor(
-        q2k_indices, cutlass.Int32, assumed_align=4
-    )
+    q2k_indices_arg = _to_kernel_tensor(q2k_indices, cutlass.Int32, assumed_align=4)
     msa_union_blocks_arg = _to_kernel_tensor(
         msa_union_blocks, cutlass.Int32, assumed_align=4
     )
@@ -941,9 +959,7 @@ def paged_attention_forward(
     forward_lse_dynamic_dims = (
         dynamic_first_dim if plan.split_kv else (() if cuda_graph_decode else (1,))
     )
-    forward_lse_dynamic_strides = (
-        () if plan.split_kv or cuda_graph_decode else (0,)
-    )
+    forward_lse_dynamic_strides = () if plan.split_kv or cuda_graph_decode else (0,)
     forward_cache_key = [
         _traits_compile_key(traits),
         (
@@ -1189,9 +1205,13 @@ def paged_attention_forward(
         )
         merge_dynamic_first_dim = () if cuda_graph_decode else (0,)
         merge_cache_key = (
-            _tensor_meta_key(workspace.tmp_output, dynamic_dims=merge_dynamic_first_dim),
+            _tensor_meta_key(
+                workspace.tmp_output, dynamic_dims=merge_dynamic_first_dim
+            ),
             _tensor_meta_key(workspace.tmp_lse, dynamic_dims=merge_dynamic_first_dim),
-            _tensor_meta_key(workspace.merge_indptr, dynamic_dims=merge_dynamic_first_dim),
+            _tensor_meta_key(
+                workspace.merge_indptr, dynamic_dims=merge_dynamic_first_dim
+            ),
             _tensor_meta_key(cache_seqlens, dynamic_dims=merge_dynamic_first_dim),
             _tensor_meta_key(workspace.kv_chunk_size_ptr),
             _tensor_meta_key(output, dynamic_dims=merge_dynamic_first_dim),

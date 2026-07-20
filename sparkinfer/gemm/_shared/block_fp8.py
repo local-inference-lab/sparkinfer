@@ -10,9 +10,12 @@ from typing import Iterable, Sequence
 
 import torch
 
-from sparkinfer.cute.utils import cuda_stream_to_int
-from sparkinfer.gemm.dense import dense_gemm, dense_gemm_fused_quant_a
-from sparkinfer.gemm.wo_projection import (
+from sparkinfer._lib.utils import cuda_stream_to_int
+from sparkinfer._lib.dense_gemm import (
+    dense_gemm,
+    dense_gemm_fused_quant_a,
+)
+from sparkinfer.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_K_TILE,
     MXFP8_SCALE_ROW_TILE,
@@ -25,13 +28,18 @@ from sparkinfer.gemm.wo_projection import (
     mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
 )
-from sparkinfer.cute.scratch import SPARKINFERScratchBufferSpec, scratch_buffer_spec, scratch_tensor
-from sparkinfer.gemm.mxfp8_quant_cute import quantize_mxfp8_rows_cute
+from sparkinfer._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
+from sparkinfer._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 
 logger = logging.getLogger(__name__)
-_SPARKINFER_TIMING = os.getenv("SPARKINFER_TIMING", "0") == "1" or os.getenv(
-    "VLLM_SPARKINFER_TIMING", "0"
-) == "1"
+_SPARKINFER_TIMING = (
+    os.getenv("SPARKINFER_TIMING", "0") == "1"
+    or os.getenv("VLLM_SPARKINFER_TIMING", "0") == "1"
+)
 _SPARKINFER_TIMING_THRESHOLD_MS = float(
     os.getenv(
         "SPARKINFER_TIMING_THRESHOLD_MS",
@@ -40,7 +48,6 @@ _SPARKINFER_TIMING_THRESHOLD_MS = float(
 )
 
 _SCRATCH_ALIGN_BYTES = 1024
-
 
 
 @dataclass(frozen=True)
@@ -91,9 +98,9 @@ class BlockFP8LinearScratchCaps:
 @dataclass(frozen=True)
 class BlockFP8LinearScratchPlan:
     caps: BlockFP8LinearScratchCaps
-    _scratch_specs: tuple[SPARKINFERScratchBufferSpec, ...]
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def scratch_specs(self) -> tuple[SPARKINFERScratchBufferSpec, ...]:
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -174,7 +181,9 @@ def _c_dtype_name(dtype: torch.dtype) -> str:
         return "bfloat16"
     if dtype == torch.float16:
         return "float16"
-    raise ValueError(f"sparkinfer block FP8 linear output dtype must be bf16/fp16, got {dtype}")
+    raise ValueError(
+        f"sparkinfer block FP8 linear output dtype must be bf16/fp16, got {dtype}"
+    )
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -247,7 +256,9 @@ def _scratch_view(
     shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    offset_bytes = _align_up(offset_bytes, max(_SCRATCH_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    offset_bytes = _align_up(
+        offset_bytes, max(_SCRATCH_ALIGN_BYTES, _dtype_nbytes(dtype))
+    )
     nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
     return scratch.narrow(0, offset_bytes, nbytes).view(dtype).view(shape)
 
@@ -336,7 +347,9 @@ def _check_block_fp8_linear_tensors(
             f"{(tokens, packed_weight.out_features, 1)}, got {tuple(output.shape)}"
         )
     if output.dtype != output_dtype:
-        raise ValueError(f"output dtype {output.dtype} does not match input {output_dtype}")
+        raise ValueError(
+            f"output dtype {output.dtype} does not match input {output_dtype}"
+        )
 
 
 def build_block_fp8_linear_binding(
@@ -468,8 +481,12 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
         tokens, in_features, num_groups=1, device=source_tk.device
     )
     out = mxfp8_rows_from_bases(
-        values_base, scale_rows_base, scale_physical_base,
-        tokens, in_features, num_groups=1,
+        values_base,
+        scale_rows_base,
+        scale_physical_base,
+        tokens,
+        in_features,
+        num_groups=1,
     )
     _run_block_fp8_quant_kernel(
         source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
@@ -497,7 +514,9 @@ def quantize_block_fp8_linear_input_mxfp8(
 
     _check_gpu_tensor("source_tk", source_tk)
     if source_tk.ndim != 2:
-        raise ValueError(f"source_tk must have shape [tokens,K], got {tuple(source_tk.shape)}")
+        raise ValueError(
+            f"source_tk must have shape [tokens,K], got {tuple(source_tk.shape)}"
+        )
     tokens, in_features = source_tk.shape
     if tokens <= 0:
         raise ValueError("tokens must be positive")
@@ -509,8 +528,12 @@ def quantize_block_fp8_linear_input_mxfp8(
             )
         )
         return mxfp8_rows_from_bases(
-            values_base, scale_rows_base, scale_physical_base,
-            tokens, in_features, num_groups=1,
+            values_base,
+            scale_rows_base,
+            scale_physical_base,
+            tokens,
+            in_features,
+            num_groups=1,
         )
 
     _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
@@ -626,7 +649,9 @@ def block_fp8_linear_mxfp8(
         x_q_storage = None
         output_storage = None
     if source is None or packed_weight is None:
-        raise TypeError("block_fp8_linear_mxfp8 requires source and packed_weight or binding")
+        raise TypeError(
+            "block_fp8_linear_mxfp8 requires source and packed_weight or binding"
+        )
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -660,13 +685,15 @@ def block_fp8_linear_mxfp8(
         return output.view(*source.shape[:-1], packed_weight.out_features)
 
     if x_q_storage is None or output_storage is None:
-        raise TypeError("block_fp8_linear_mxfp8 requires binding for caller-owned scratch")
+        raise TypeError(
+            "block_fp8_linear_mxfp8 requires binding for caller-owned scratch"
+        )
     _check_block_fp8_linear_tensors(
         x_q_storage,
         output_storage,
-            tokens=tokens,
-            packed_weight=packed_weight,
-            output_dtype=source_2d.dtype,
+        tokens=tokens,
+        packed_weight=packed_weight,
+        output_dtype=source_2d.dtype,
     )
 
     assert x_q_storage is not None

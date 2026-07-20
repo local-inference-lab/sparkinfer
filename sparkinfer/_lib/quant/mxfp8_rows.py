@@ -9,8 +9,11 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Uint8, Uint32
 
-from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.compiler import (
+    KernelCompileSpec,
+    compile as sparkinfer_compile,
+)
+from sparkinfer._lib.intrinsics import (
     FLOAT8_E4M3_MAX,
     cvt_f32x4_to_e4m3x4,
     fabs_f32,
@@ -20,8 +23,10 @@ from sparkinfer.cute.intrinsics import (
     quantize_block_fp8_mx,
     ue8m0_to_output_scale,
 )
-from sparkinfer.cute.runtime_control import raise_if_kernel_resolution_frozen
-from sparkinfer.cute.utils import current_cuda_stream, make_ptr
+from sparkinfer._lib.runtime_control import (
+    raise_if_kernel_resolution_frozen,
+)
+from sparkinfer._lib.utils import current_cuda_stream, make_ptr
 
 
 _THREADS = 256

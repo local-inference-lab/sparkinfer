@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer.moe.fused.w4a16.host import (
+from sparkinfer.moe._shared.kernels.w4a16.host import (
     W4A16PackedBuffers,
     make_w4a16_packed_buffers as _make_w4a16_packed_buffers,
     unswizzle_expert_scales,
@@ -44,7 +44,9 @@ _MODEL_OPT_NVFP4_FORMATS = {"modelopt_nvfp4"}
 # E4=0 arm), and the per-tensor global_scale carries the matching 2**116.
 _NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
 _NF3_SCALE_GLOBAL = 2.0**116
-_NF3_SCALE_FLOOR = 2.0 ** -10  # f16(t_s*2^-4) must stay f16-NORMAL (>=2^-14) -> t_s >= 2^-10; real early-layer scales dip below the old 2^-7
+_NF3_SCALE_FLOOR = (
+    2.0**-10
+)  # f16(t_s*2^-4) must stay f16-NORMAL (>=2^-14) -> t_s >= 2^-10; real early-layer scales dip below the old 2^-7
 
 
 @dataclass(frozen=True)
@@ -275,7 +277,9 @@ def _process_nvfp4_micro_global_scale_from_packed(
         raise TypeError(f"unsupported W4A16 activation dtype {a_dtype}")
     fp4_exponent = 2
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
-    return (packed_global_scale * (2.0 ** (-exponent_bias))).to(torch.float32).contiguous()
+    return (
+        (packed_global_scale * (2.0 ** (-exponent_bias))).to(torch.float32).contiguous()
+    )
 
 
 def _normalize_source_format(source_format: str) -> str:
@@ -329,8 +333,7 @@ def _validate_e8m0_k32_scales(
     if allow_k_tail:
         if int(cols) % 8 != 0:
             raise ValueError(
-                f"{name} compact E8M0 K-tail requires K divisible by 8, got "
-                f"{int(cols)}"
+                f"{name} compact E8M0 K-tail requires K divisible by 8, got {int(cols)}"
             )
         expected_cols = (int(cols) + 31) // 32
     elif int(cols) % 32 != 0:
@@ -459,8 +462,7 @@ def _repack_4bit_no_perm(
             f"{out.dtype} {tuple(out.shape)}"
         )
     if flat_scratch is not None and (
-        flat_scratch.dtype != torch.int32
-        or tuple(flat_scratch.shape) != packed_shape
+        flat_scratch.dtype != torch.int32 or tuple(flat_scratch.shape) != packed_shape
     ):
         raise ValueError(
             f"flat_scratch must be int32 with shape {packed_shape}, got "
@@ -520,10 +522,14 @@ def _repack_4bit_no_perm(
     )
     result.zero_()
     for slot in range(8):
-        gather_index = source_index[:, slot].view(1, 1, 128).expand(
-            k_tiles,
-            n_tiles,
-            128,
+        gather_index = (
+            source_index[:, slot]
+            .view(1, 1, 128)
+            .expand(
+                k_tiles,
+                n_tiles,
+                128,
+            )
         )
         shift = source_shift[:, slot].view(1, 1, 128)
         if gather_scratch is None:
@@ -783,9 +789,7 @@ def _process_nf3_packed_scales(packed_scales: torch.Tensor) -> torch.Tensor:
     return packed_scales[:, 1::2].contiguous()
 
 
-def _nf3_pack_scales(
-    t_s: torch.Tensor, *, size_k: int, size_n: int
-) -> torch.Tensor:
+def _nf3_pack_scales(t_s: torch.Tensor, *, size_k: int, size_n: int) -> torch.Tensor:
     """Pack one expert's [N, K//32] scales into uint8 [K//32, N] (permuted)."""
     if tuple(t_s.shape) != (int(size_n), int(size_k) // 32):
         raise ValueError(
@@ -992,8 +996,7 @@ def prepare_w4a16_modelopt_native_weights(
     source_format = _normalize_source_format(source_format)
     if source_format not in _MODEL_OPT_NVFP4_FORMATS:
         raise ValueError(
-            "native W4A16 ModelOpt weights require source_format "
-            "'modelopt_nvfp4'"
+            "native W4A16 ModelOpt weights require source_format 'modelopt_nvfp4'"
         )
     w13_layout = _normalize_w13_layout(w13_layout)
 
@@ -1033,9 +1036,7 @@ def prepare_w4a16_modelopt_native_weights(
     # Checkpoint-native ModelOpt GLM tensors are up/gate, while vLLM/FI can
     # hand over gate/up tensors after its own W13 reorder. Keep that physical
     # order explicit so source_format never implies a layout transformation.
-    w13_row_rotation = (
-        intermediate_size if is_gated and w13_layout == "w13" else None
-    )
+    w13_row_rotation = intermediate_size if is_gated and w13_layout == "w13" else None
     packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
         w13_scale,
         native_w13_global_scale,
@@ -1525,15 +1526,15 @@ def _nf3_pack_selftest() -> None:
     ]
     for size_k, size_n, tile_n, tile_k in cases:
         codes = torch.randint(0, 8, (size_n, size_k), dtype=torch.int64)
-        packed = _nf3_pack_codes(
-            codes, size_k=size_k, size_n=size_n, tile_n=tile_n
-        )
+        packed = _nf3_pack_codes(codes, size_k=size_k, size_n=size_n, tile_n=tile_n)
         w = simulate(packed, size_k, size_n, tile_n, tile_k)
         for k in range(size_k):
             for n in range(size_n):
                 expect = _NF3_CODEBOOK[int(codes[n, k])]
                 got = w[k][n]
-                assert got is not None, f"unfilled ({k},{n}) for {(size_k, size_n, tile_n, tile_k)}"
+                assert got is not None, (
+                    f"unfilled ({k},{n}) for {(size_k, size_n, tile_n, tile_k)}"
+                )
                 assert abs(got - expect) < 1e-9, (
                     f"mismatch at ({k},{n}) for {(size_k, size_n, tile_n, tile_k)}: "
                     f"{got} != {expect}"

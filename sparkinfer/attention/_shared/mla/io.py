@@ -46,7 +46,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
 
-from sparkinfer.cute.intrinsics import (
+from sparkinfer._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
@@ -68,7 +68,7 @@ _DSV4_FOOTER_BYTES = 8  # 7 UE8M0 + 1 pad; == SCALE_BYTES_PER_TOKEN.
 # rope (128B) are both 16B-aligned cp.async.bulk copies. == GLM_KV_GMEM_STRIDE.
 _GLM_GMEM_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528  # 512 e4m3 + 16 inline fp32; bulk #1 (-> kv_fp8 row).
-_GLM_ROPE_BYTES = 128        # 64 bf16; bulk #2 (-> kv_rope).
+_GLM_ROPE_BYTES = 128  # 64 bf16; bulk #2 (-> kv_rope).
 
 # NVFP4 MLA latent layout: 256B E2M1 NoPE + 32B E4M3 scales + 16B pad + 128B
 # BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
@@ -89,25 +89,25 @@ _IO_THREADS = 32
 
 @cute.jit
 def io_issue_gather(
-    kv_cache_u8: cute.Tensor,      # flat 1-D u8 view of the paged DSV4 KV cache
-    topk_indices: cute.Tensor,     # 1-D int32 topk slice for this query token
-    kv_fp8_dst_addr: Int32,        # u32 smem addr of kv_fp8[buf] (BI x KV_SMEM_STRIDE)
-    kv_rope_dst_addr: Int32,       # u32 smem addr of kv_rope[buf] (BI x D_ROPE bf16)
-    kv_sc_dst_addr: Int32,         # u32 smem addr of kv_sc[buf] (BI x 8 footer)
-    token_idx_view: cute.Tensor,   # smem int32 validity buffer (BI,) for THIS buf
-    full_mbar_ptr,                 # cute.Pointer (u64) of mbar_full[buf]
-    g_start: Int32,                # absolute candidate offset of entry 0 (chunk_in_section*CAND_WINDOW)
-    g_end: Int32,                  # min(g_start + CAND_WINDOW, section_len)
-    page_block_size: Int32,        # pbs: tokens per paged block (THIS section)
-    stride_kv_block: Int64,        # per-block byte stride in gmem (THIS section)
-    io_lane: Int32,                # lane within the IO warp [0, 32)
+    kv_cache_u8: cute.Tensor,  # flat 1-D u8 view of the paged DSV4 KV cache
+    topk_indices: cute.Tensor,  # 1-D int32 topk slice for this query token
+    kv_fp8_dst_addr: Int32,  # u32 smem addr of kv_fp8[buf] (BI x KV_SMEM_STRIDE)
+    kv_rope_dst_addr: Int32,  # u32 smem addr of kv_rope[buf] (BI x D_ROPE bf16)
+    kv_sc_dst_addr: Int32,  # u32 smem addr of kv_sc[buf] (BI x 8 footer)
+    token_idx_view: cute.Tensor,  # smem int32 validity buffer (BI,) for THIS buf
+    full_mbar_ptr,  # cute.Pointer (u64) of mbar_full[buf]
+    g_start: Int32,  # absolute candidate offset of entry 0 (chunk_in_section*CAND_WINDOW)
+    g_end: Int32,  # min(g_start + CAND_WINDOW, section_len)
+    page_block_size: Int32,  # pbs: tokens per paged block (THIS section)
+    stride_kv_block: Int64,  # per-block byte stride in gmem (THIS section)
+    io_lane: Int32,  # lane within the IO warp [0, 32)
     *,
-    bi: cutlass.Constexpr,                 # 64
-    kv_smem_stride: cutlass.Constexpr,     # 464 DSV4 / 528 GLM (smem nope row stride)
-    rope_smem_stride: cutlass.Constexpr,   # 64 (D_ROPE bf16 elems)
+    bi: cutlass.Constexpr,  # 64
+    kv_smem_stride: cutlass.Constexpr,  # 464 DSV4 / 528 GLM (smem nope row stride)
+    rope_smem_stride: cutlass.Constexpr,  # 64 (D_ROPE bf16 elems)
     scale_bytes_per_token: cutlass.Constexpr,  # 8 (DSV4 footer); unused for GLM
-    bulk_tx_bytes: cutlass.Constexpr,      # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
-    scale_format: cutlass.Constexpr = 0,   # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    bulk_tx_bytes: cutlass.Constexpr,  # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
+    scale_format: cutlass.Constexpr = 0,  # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     fp8_rope: cutlass.Constexpr = False,
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
     packed_glm: cutlass.Constexpr = False,
@@ -159,10 +159,10 @@ def io_issue_gather(
     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
     # NVFP4: 432B contiguous (288 nope+E4M3-scales+pad + 128 rope), NO footer.
     if cutlass.const_expr(scale_format == 0):
-        _IOS = Int64(_DSV4_IO_STRIDE)          # 576 per-token data stride
-        _NOPE = Int32(_DSV4_NOPE_BYTES)        # 448 -> kv_fp8 (e4m3 nope)
-        _ROPE = Int32(_DSV4_ROPE_BYTES)        # 128 -> kv_rope
-        _ROPE_SRC = Int64(_DSV4_NOPE_BYTES)    # rope follows nope in the record
+        _IOS = Int64(_DSV4_IO_STRIDE)  # 576 per-token data stride
+        _NOPE = Int32(_DSV4_NOPE_BYTES)  # 448 -> kv_fp8 (e4m3 nope)
+        _ROPE = Int32(_DSV4_ROPE_BYTES)  # 128 -> kv_rope
+        _ROPE_SRC = Int64(_DSV4_NOPE_BYTES)  # rope follows nope in the record
     elif cutlass.const_expr(scale_format == 2):
         _NOPE = Int32(_NVFP4_NOPE_SCALE_BYTES)
         if cutlass.const_expr(fp8_rope):
@@ -176,9 +176,9 @@ def io_issue_gather(
             _ROPE = Int32(_NVFP4_ROPE_BYTES)
             _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
     else:
-        _IOS = Int64(_GLM_GMEM_STRIDE)         # 656 per-token contiguous record
-        _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)   # 528 nope+inline-fp32 -> kv_fp8
-        _ROPE = Int32(_GLM_ROPE_BYTES)         # 128 -> kv_rope
+        _IOS = Int64(_GLM_GMEM_STRIDE)  # 656 per-token contiguous record
+        _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
+        _ROPE = Int32(_GLM_ROPE_BYTES)  # 128 -> kv_rope
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
     _FOOT = Int32(scale_bytes_per_token)
 
@@ -189,9 +189,7 @@ def io_issue_gather(
             idx = Int32(0)
         block_idx = idx // _section_pbs
         local_idx = idx - block_idx * _section_pbs
-        data_base_off = (
-            Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
-        )
+        data_base_off = Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
         data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
 
         if cutlass.const_expr(packed_glm):
@@ -237,8 +235,7 @@ def io_issue_gather(
                 block_idx = idx // _section_pbs
                 local_idx = idx - block_idx * _section_pbs
                 data_base_off = (
-                    Int64(block_idx) * _section_stride
-                    + Int64(local_idx) * _IOS
+                    Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
                 )
                 data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
                 full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
@@ -277,9 +274,7 @@ def io_issue_gather(
     # arriving; their post-footer arrivals remain the release condition.
     if cutlass.const_expr(overlap_footer_gather):
         if (io_lane & Int32(31)) == Int32(0):
-            cute.arch.mbarrier_expect_tx(
-                full_mbar_ptr, Int32(bulk_tx_bytes // 2)
-            )
+            cute.arch.mbarrier_expect_tx(full_mbar_ptr, Int32(bulk_tx_bytes // 2))
         # H16 has exactly one row per IO thread. Start the random footer load,
         # launch the independent payload copy, and only then consume the footer
         # result in shared stores so the two memory operations overlap.
@@ -307,9 +302,7 @@ def io_issue_gather(
         _issue_payload_entry(overlap_entry, overlap_idx_raw)
         overlap_s_byte = overlap_entry * _FOOT
         st_shared_u32(kv_sc_dst_addr + overlap_s_byte, overlap_f0)
-        st_shared_u32(
-            kv_sc_dst_addr + overlap_s_byte + Int32(4), overlap_f1
-        )
+        st_shared_u32(kv_sc_dst_addr + overlap_s_byte + Int32(4), overlap_f1)
         cute.arch.fence_acq_rel_cta()
         if (io_lane & Int32(31)) == Int32(0):
             cute.arch.mbarrier_arrive(full_mbar_ptr)
