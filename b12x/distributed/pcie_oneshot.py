@@ -873,21 +873,24 @@ class PCIeOneshotAllReduce:
             return
         self._closed = True
         if getattr(self, "_ptr", 0):
-            self._ext.dispose(self._ptr)
+            with suppress(Exception):
+                self._ext.dispose(self._ptr)
             self._ptr = 0
-        for shared in self._owned_buffers:
-            for ptr in shared.remote_ptrs:
-                if self._ipc is not None:
-                    self._ipc.cudaIpcCloseMemHandle(ptr)
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
+                for ptr in shared.remote_ptrs:
+                    with suppress(Exception):
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
         self._ipc_imports_closed = True
 
     def _free_ipc_exports(self) -> None:
         if self._ipc_exports_freed:
             return
         self._close_ipc_imports()
-        for shared in self._owned_buffers:
-            if self._ipc is not None:
-                self._ipc.cudaFree(shared.local_ptr)
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
+                with suppress(Exception):
+                    self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
         self._registered_input_ptrs.clear()
         self._ipc_exports_freed = True
