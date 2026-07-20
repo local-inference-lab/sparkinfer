@@ -1,6 +1,6 @@
 [project]
 name = "sparkinfer"
-version = "0.30.2"
+version = "1.0.1"
 description = "DGX Spark and RTX 6000-focused inference kernel library."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
