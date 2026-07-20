@@ -15,7 +15,10 @@ def test_w4a16_standalone_gemm_and_activation_match_gpu_oracles_under_graph(
 ) -> None:
     expected_physical_gpu = os.environ.get("CUDA_VISIBLE_DEVICES")
     if expected_physical_gpu not in {"4", "5"}:
-        pytest.fail("set CUDA_VISIBLE_DEVICES to physical GPU 4 or 5")
+        pytest.skip(
+            "pinned migration diagnostic: set CUDA_VISIBLE_DEVICES to "
+            "physical GPU 4 or 5 to run"
+        )
     monkeypatch.setattr(
         sys,
         "argv",

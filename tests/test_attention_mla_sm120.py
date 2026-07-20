@@ -15,24 +15,11 @@ uncompressed q=576 contract.
 from __future__ import annotations
 
 import math
-import os
-import sys
 
 import pytest
 import torch
 
-# Import the pure-PyTorch DSV4 numeric reference (.sm120port/dsv4_ref.py) -- the
-# SAME oracle the P5 single-CTA decode and the P7 launcher probe validate
-# against. It has no b12x/CuTe dependency, so a plain sys.path insert is enough
-# (mirrors .sm120port/probes/unified_decode_e2e_check.py's import dance).
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SM120PORT = os.path.join(_REPO_ROOT, ".sm120port")
-if _SM120PORT not in sys.path:
-    sys.path.insert(0, _SM120PORT)
-import dsv4_ref  # noqa: E402
-import dsv4_extra_ref  # noqa: E402
-import prefill_ref  # noqa: E402
-import glm_ref  # noqa: E402
+from tests import dsv4_extra_ref, dsv4_ref, glm_ref, prefill_ref
 
 import b12x.attention.mla.api as mla_api
 from b12x.attention.mla.api import (
