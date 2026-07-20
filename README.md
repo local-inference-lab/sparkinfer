@@ -22,40 +22,86 @@ JIT-compiled on first use and cached.
 
 ## What's in here
 
-**GEMM** (`sparkinfer/gemm/`) — a dense block-scaled GEMM (`DenseGemmKernel`,
-exposed as `sparkinfer::dense_gemm_launch`) covering NVFP4 and MXFP8 operands with
-BF16/FP16/FP32 outputs, plus fused linear layers on top of it: MXFP8
-(`sparkinfer::mxfp8_linear_fused`), 128x128 block-FP8
-(`sparkinfer::block_fp8_linear_mxfp8_fused`), and the grouped WO-projection paths
-used by MLA attention output.
+Every kernel is one op at `sparkinfer.<group>.<op>` (15 total; `list_ops()`
+enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
+kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
+`<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.
 
-**Attention** (`sparkinfer/attention/`) — contiguous (fixed-shape and packed-varlen)
-and paged attention forward kernels, with BF16/FP16 and FP8 E4M3 KV caches,
-GQA, sliding window, and attention sinks. Sparse MLA decode/prefill lives in
-`mla/`, and the NSA/MSA logits indexer plus its top-k and scheduling kernels
-in `indexer/`. Compressed MLA and GLM MLA/NSA are distinct contracts and kept
-separate on purpose. `paged/graph_replay.py` has the metadata staging kernels
-that make decode replayable under CUDA graphs.
+**`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
+out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
+(`gemm.mxfp8_linear`), 128×128 block-FP8 (`gemm.block_fp8_linear`), and the
+grouped WO-projection (`gemm.wo_projection`) used by MLA attention output.
 
-**MoE** (`sparkinfer/moe/`) — fused FP4 TP MoE in three flavors: a direct
-micro-kernel decode path, a unified dynamic path (persistent grid, dynamic M
-tiles, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4` weights), and W4A16 (BF16 activations
-with inline FP4 weight dequant — no activation-scale math). SiLU, ReLU2, and
-SwiGLU-OAI activations throughout.
+**`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
+sparse, CUDA-graph-replayable), `attention.sparse_mla` and
+`attention.compressed_mla` (top-k / compressed-page MLA — distinct contracts,
+kept separate on purpose), `attention.nsa_indexer` (the NSA/MSA quantize →
+score → select pipeline), and `attention.varlen` (contiguous batched/varlen).
 
-**Everything else** — BF16→NVFP4 TMA quantization (`sparkinfer/quantization/`), mHC
-residual/projection kernels (`sparkinfer/integration/residual*.py`), and an
-IPC-backed PCIe one-shot allreduce (`sparkinfer/distributed/`). The
-`sparkinfer/integration/` layer is the boundary serving stacks talk to: it owns
-planning, scratch layout, and policy, so integrations only supply metadata and
-capacity limits.
+**`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
+path, a unified dynamic path (persistent grid, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4`),
+and W4A16 (BF16 activations, inline FP4 weight dequant — no activation-scale
+math), with SiLU/ReLU2/SwiGLU-OAI activations; plus `moe.ep_moe` (expert
+parallel).
+
+**the rest** — `norm.mhc` (fused RMSNorm + hyper-connection residual),
+`quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
+collectives). `sparkinfer` owns planning, scratch layout, and policy, so
+serving stacks only supply metadata and capacity limits.
 
 ## Using it
 
-Kernels are registered as torch custom ops under the `sparkinfer::` namespace, so
-after `import sparkinfer` they are callable as `torch.ops.sparkinfer.*` and compose with
-`torch.compile` and CUDA graphs. Higher-level Python entry points (kernel
-classes, planners) live next to each kernel.
+Every stateful kernel lives at `sparkinfer.<group>.<op>` and shares the **same
+shape** — `plan` the work, size scratch from the plan, `bind` your tensors as
+views, `run`. The module path carries the context, so the verbs and role
+classes (`Caps`/`Plan`/`Binding`) are uniform across families:
+
+```python
+# norm — fused RMSNorm + hyper-connection residual mixing
+from sparkinfer.norm import mhc
+
+plan    = mhc.plan(mhc.Caps(...))
+spec    = plan.scratch_specs()[0]
+scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+binding = mhc.bind(plan, scratch=scratch, ...)
+residual, post, comb, y = mhc.run_post_pre(..., binding=binding)
+```
+
+```python
+# moe — fused tensor-parallel routed-expert FFN (weights prepped once per model)
+from sparkinfer.moe import fused_moe
+
+wplan   = fused_moe.plan_weights(quant_modes="nvfp4",
+                                 source_format="modelopt_nvfp4", ...)
+experts = fused_moe.prepare_weights(plan=wplan, ...)
+plan    = fused_moe.plan(fused_moe.Caps(...))
+spec    = plan.scratch_specs()[0]
+scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+binding = fused_moe.bind(plan, scratch=scratch, a=x, experts=experts,
+                         topk_weights=tw, topk_ids=ti)
+out     = fused_moe.run(binding=binding)
+```
+
+```python
+# attention — MLA decode from compressed KV pages (DeepSeek-V3.2)
+from sparkinfer.attention import compressed_mla
+
+plan    = compressed_mla.plan(compressed_mla.Caps(...))
+spec    = plan.scratch_specs()[0]
+scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+binding = compressed_mla.bind(plan, scratch=scratch, q=q,
+                              swa_indices=idx, swa_lengths=lens, ...)
+out = compressed_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
+```
+
+`plan` is host-side and may allocate; `bind` only narrows/views (never
+allocates), which is what makes captured graphs safe; `run*` executes and is
+CUDA-graph-capture safe. One-shot ops (`gemm.blockscaled.mm`,
+`quantization.mxfp8.quantize_rows`) are plain functions; `comm.pcie`
+collectives are stateful classes. `sparkinfer.list_ops()` enumerates the full
+set; every op exports `is_supported()`. Underneath, kernels register as torch
+custom ops in the private `sparkinfer::` namespace (torch.compile / CUDA-graph
+integration) — prefer the Python API.
 
 Compilation happens lazily per shape/config and is cached. For serving, warm
 up the shapes you need, then freeze:
@@ -77,8 +123,9 @@ actually covered. `SPARKINFER_TIMING=1` enables per-kernel timing logs.
 
 ## Where to look next
 
-- `tests/` is the executable spec — every kernel has API and numerical
-  reference tests showing exact tensor layouts and call sequences.
+- `tests/` is the executable spec — per-group API and numerical-reference
+  tests showing exact tensor layouts and `plan`/`bind`/`run` call sequences.
+  (`tests/_legacy/` holds the pre-namespace flat-API suite, being migrated.)
 - `benchmarks/` has tuned invocations per kernel family (and `probe_*` scripts
   from tile-sweep experiments).
 - `docs/` has design notes: the MoE execution model, the eager-plan-bind
