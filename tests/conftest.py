@@ -31,4 +31,3 @@ def _deterministic_seed():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
     yield
-collect_ignore_glob = ["_legacy/*"]

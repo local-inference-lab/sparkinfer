@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.distributed.pcie_dcp_a2a import (
+from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2APool,
     _load_extension,
     lse_reduce_scatter_reference,

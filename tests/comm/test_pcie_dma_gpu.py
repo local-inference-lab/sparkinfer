@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.distributed.pcie_dma import PCIeDmaAllReduce
+from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce
 
 
 pytestmark = pytest.mark.skipif(

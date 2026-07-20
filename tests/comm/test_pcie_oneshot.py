@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.distributed.pcie_oneshot import (
+from sparkinfer.comm.pcie.pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
@@ -308,7 +308,7 @@ def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: state["stream_key"],
     )
 
@@ -325,7 +325,7 @@ def test_runtime_can_disable_stream_affinity(monkeypatch):
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: state["stream_key"],
     )
 
@@ -392,7 +392,7 @@ def test_allocate_shared_buffer_cleans_up_on_failed_peer_open(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._broadcast_gather_object",
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: [local_object, b"remote0", b"remote1"],
     )
 
@@ -443,7 +443,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._broadcast_gather_object",
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: [local_object, b"remote0", b"remote1"],
     )
 
@@ -501,7 +501,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._broadcast_gather_object",
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: [local_object, b"remote0", b"remote1"],
     )
 
@@ -526,7 +526,7 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.distributed.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
 
     def fake_broadcast(object_list, src, group=None, device=None):
         object_list[0] = remote_meta[src]
@@ -546,7 +546,7 @@ def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatc
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.distributed.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
     monkeypatch.setattr(
         "torch.distributed.broadcast_object_list",
         lambda object_list, src, group=None, device=None: object_list.__setitem__(0, ([], [])),
@@ -602,7 +602,7 @@ def test_pool_creates_distinct_channels_per_stream_key(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
 
@@ -632,7 +632,7 @@ def test_pool_reuses_single_channel_across_stream_keys(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
 
@@ -651,8 +651,8 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(eager=True),
     )
 
-    monkeypatch.setattr("sparkinfer.distributed.pcie_oneshot._current_stream_key", lambda device, stream=None: 7)
-    monkeypatch.setattr("sparkinfer.distributed.pcie_oneshot._is_current_stream_capturing", lambda device: True)
+    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._current_stream_key", lambda device, stream=None: 7)
+    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing", lambda device: True)
 
     with pytest.raises(RuntimeError, match="before capture starts"):
         pool.for_stream()
@@ -679,13 +679,13 @@ def test_nested_capture_reuses_its_outer_channel(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.distributed.pcie_oneshot._is_current_stream_capturing",
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 

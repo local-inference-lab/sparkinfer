@@ -68,7 +68,7 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
         rank=rank,
         world_size=world,
     )
-    from sparkinfer.distributed.pcie_dma import PCIeDmaAllReduce
+    from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce
 
     ring = PCIeDmaAllReduce(
         exchange_group=dist.group.WORLD,
