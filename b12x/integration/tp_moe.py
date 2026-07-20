@@ -8179,10 +8179,9 @@ def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
     if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
         return False
     # The compact native-NVFP4 micro grid is a bounded, single-wave decode
-    # launch. vLLM submits it before the auxiliary shared-expert work. M=1..7
-    # survives graph-replay concurrency stress; M=8 changes the launch geometry
-    # and corrupts output under the same stress, so that boundary and all larger
-    # resident plans must remain serialized.
+    # launch. M=1..7 survives graph-replay concurrency stress; M=8 changes the
+    # launch geometry, so that boundary and all larger resident plans must
+    # remain serialized.
     return plan.routed_rows // plan.num_topk <= 7 and _is_native_nvfp4_micro_decode(
         quant_mode=plan.quant_mode,
         num_tokens=plan.routed_rows // plan.num_topk,

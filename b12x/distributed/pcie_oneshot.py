@@ -1024,6 +1024,46 @@ class PCIeOneshotAllReducePool:
         self._all_channels.append(channel)
         return channel
 
+    def checkpoint_channels(
+        self,
+    ) -> tuple[int, dict[int, PCIeOneshotAllReduce]]:
+        """Snapshot channel ownership before a throwaway graph capture."""
+        if self._closed:
+            raise RuntimeError("pool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot checkpoint channels during capture")
+        return len(self._all_channels), dict(self._channels)
+
+    def rollback_channels(
+        self,
+        checkpoint: tuple[int, dict[int, PCIeOneshotAllReduce]],
+    ) -> None:
+        """Close channels created after ``checkpoint`` and restore mappings.
+
+        Callers must destroy and synchronize any graphs that reference the
+        transient channels before rolling back.
+        """
+        if self._closed:
+            raise RuntimeError("pool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot roll back channels during capture")
+        all_channels_len, channels = checkpoint
+        if not 0 <= all_channels_len <= len(self._all_channels):
+            raise ValueError("channel checkpoint does not belong to this pool")
+
+        retained = self._all_channels[:all_channels_len]
+        retained_ids = {id(channel) for channel in retained}
+        transient = self._all_channels[all_channels_len:]
+        self._all_channels = retained
+        self._channels = dict(channels)
+
+        closed: set[int] = set()
+        for channel in transient:
+            channel_id = id(channel)
+            if channel_id not in retained_ids and channel_id not in closed:
+                closed.add(channel_id)
+                channel.close()
+
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
         if self._closed:
             raise RuntimeError("pool is closed")
