@@ -1,7 +1,7 @@
 """DSV4 sparse-MLA decode numeric reference + test-case harness (pure PyTorch).
 
 This module is the *ground-truth numeric reference* for the P5 SM120 DSV4 decode
-port. It has NO dependency on the CuTeDSL kernel, on sparkinfer.cute, or on FlashInfer
+port. It has NO dependency on the CuTeDSL kernel, on sparkinfer._lib, or on FlashInfer
 runtime — it is pure PyTorch so build/verification agents can compare kernel
 register state and final O/LSE against a trusted oracle at every stage.
 

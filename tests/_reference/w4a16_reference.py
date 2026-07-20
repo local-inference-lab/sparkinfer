@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from sparkinfer.cute.intrinsics import fp4_quantize_values_torch
+from sparkinfer._lib.intrinsics import fp4_quantize_values_torch
 
 
 @dataclass(frozen=True)

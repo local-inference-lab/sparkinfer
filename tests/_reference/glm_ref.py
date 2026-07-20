@@ -3,10 +3,10 @@
 This is the *ground-truth numeric oracle* for the P7b SM120 GLM_NSA decode port.
 Unlike DSV4 (which mirrors a FlashInfer kernel), GLM_NSA is rs-1's OWN model: there
 is no FlashInfer GLM reference PTX, so the correctness bar is purely NUMERICAL vs
-``sparkinfer.attention.mla.reference.sparse_mla_reference`` (the same oracle the existing
+``sparkinfer.attention._shared.mla.reference.sparse_mla_reference`` (the same oracle the existing
 GLM kernel / api.py path asserts against).
 
-This module deliberately has NO dependency on the CuTeDSL kernel, on sparkinfer.cute, or
+This module deliberately has NO dependency on the CuTeDSL kernel, on sparkinfer._lib, or
 on the real GLM-5.1 model weights. It REUSES the trusted pure-PyTorch primitives in
 ``sparkinfer/attention/mla/reference.py`` rather than reimplementing them:
 
@@ -55,7 +55,7 @@ import math
 import torch
 
 # Reuse the trusted GLM packer / sparse oracle / constants (do NOT reimplement).
-from sparkinfer.attention.mla.reference import (
+from sparkinfer.attention._shared.mla.reference import (
     _FP8_E4M3_MAX,
     _MLA_GROUP_SIZE,
     _MLA_NOPE_DIM,

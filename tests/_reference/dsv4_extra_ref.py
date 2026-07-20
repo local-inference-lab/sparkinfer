@@ -73,8 +73,8 @@ import math
 
 import torch
 
-from tests import dsv4_ref
-from tests.dsv4_ref import (  # noqa: F401  (re-exported traits used by callers/tests)
+from tests._reference import dsv4_ref
+from tests._reference.dsv4_ref import (  # noqa: F401  (re-exported traits used by callers/tests)
     DSV4_D_QK,
     DSV4_D_V,
     DSV4_DECODE_PAGE_BLOCK_SIZE,
