@@ -6,6 +6,7 @@ import torch
 
 from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
 from b12x.gemm.mxfp8_linear import (
+    _mxfp8_linear_fused_fake,
     mxfp8_linear,
     pack_mxfp8_linear_weight,
 )
@@ -76,6 +77,27 @@ def _storage_tail_bytes(tensor: torch.Tensor) -> int:
     )
     logical_end = (last_item + 1) * tensor.element_size()
     return tensor.untyped_storage().nbytes() - logical_end
+
+
+def test_mxfp8_linear_fake_models_tail_padded_storage() -> None:
+    source = torch.empty((3, 128), dtype=torch.bfloat16)
+    placeholder = torch.empty(1)
+
+    output = _mxfp8_linear_fused_fake(
+        source,
+        placeholder,
+        placeholder,
+        placeholder,
+        128,
+        128,
+        64,
+        3,
+        None,
+        8 * 1024,
+    )
+
+    assert output.shape == (3, 64)
+    assert _storage_tail_bytes(output) >= 8 * 1024
 
 
 def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
@@ -162,9 +184,7 @@ def test_mxfp8_linear_default_fused_path_captures_with_k_padding() -> None:
     weight, weight_scale = _quantize_modelopt_mxfp8_rows(weight_bf16)
     packed = pack_mxfp8_linear_weight(weight, weight_scale)
 
-    eager = mxfp8_linear(
-        source, packed, tail_padding_bytes=64 * 1024
-    ).clone()
+    eager = mxfp8_linear(source, packed, tail_padding_bytes=64 * 1024).clone()
     torch.cuda.synchronize()
 
     mxfp8_linear(source, packed, tail_padding_bytes=64 * 1024)
@@ -197,9 +217,7 @@ def test_mxfp8_linear_writes_directly_to_tail_padded_output() -> None:
     packed = pack_mxfp8_linear_weight(weight, weight_scale)
 
     expected = mxfp8_linear(source, packed, bias=bias)
-    actual = mxfp8_linear(
-        source, packed, bias=bias, tail_padding_bytes=64 * 1024
-    )
+    actual = mxfp8_linear(source, packed, bias=bias, tail_padding_bytes=64 * 1024)
     torch.cuda.synchronize()
 
     assert _storage_tail_bytes(actual) >= 64 * 1024

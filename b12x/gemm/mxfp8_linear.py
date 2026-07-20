@@ -236,9 +236,16 @@ def _mxfp8_linear_fused_fake(
     stream_int: int | None,
     tail_padding_bytes: int,
 ) -> torch.Tensor:
-    del stream_int, tail_padding_bytes
+    del stream_int
     del weight_values, weight_scale_rows, weight_scale_mma
     del in_features, padded_in_features, expected_m
+    if tail_padding_bytes > 0:
+        return _tail_padded_output(
+            (source_2d.shape[0], out_features),
+            dtype=source_2d.dtype,
+            device=source_2d.device,
+            tail_padding_bytes=tail_padding_bytes,
+        )
     return torch.empty(
         (source_2d.shape[0], out_features),
         dtype=source_2d.dtype,
