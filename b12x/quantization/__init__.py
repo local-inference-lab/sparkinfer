@@ -9,7 +9,7 @@ import torch
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.intrinsics import align_up
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
-from b12x.quantization.bf16_to_fp4_tma import TestKernel
+from b12x.quantization.bf16_to_fp4_tma import Bf16ToFp4TmaKernel
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 _TILE_M = 128
@@ -124,7 +124,7 @@ def compile_bf16_to_fp4_tma(M: int, K: int):
     if cached is not None:
         return cached
 
-    kernel = TestKernel(liveness_strategy)
+    kernel = Bf16ToFp4TmaKernel(liveness_strategy)
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     from cutlass.base_dsl.compiler import OptLevel
 

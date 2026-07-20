@@ -125,7 +125,7 @@ def quantize_scale_fp4_fast(max_abs, global_scale_val, global_scale_recip):
         )
     return effective_recip, scale_byte
 
-class TestKernel:
+class Bf16ToFp4TmaKernel:
     def __init__(self, liveness_strategy: str):
         if liveness_strategy not in {"retain", "packed"}:
             raise ValueError(
