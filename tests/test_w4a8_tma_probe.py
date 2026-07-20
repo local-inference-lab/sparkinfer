@@ -33,7 +33,7 @@ from cutlass import Int32, Uint32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     e2m1x8_to_e4m3x8,
     ld_shared_u32,
     mxfp8_mma_m16n8k32_f32_e4m3,

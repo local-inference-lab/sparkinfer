@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from b12x.cute.fp4 import fp4_quantize_values_torch
+from b12x.cute.intrinsics import fp4_quantize_values_torch
 from benchmarks.benchmark_moe import (
     MODEL_PATH,
     TP_RANK,

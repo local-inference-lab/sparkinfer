@@ -11,7 +11,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint32
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_global_i32,
     get_ptr_as_int64,
     red_add_global_release_i32,

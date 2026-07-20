@@ -37,7 +37,7 @@ from b12x.cute.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
-from b12x.cute.fp4 import shared_ptr_to_u32
+from b12x.cute.intrinsics import shared_ptr_to_u32
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from b12x.cute.utils import current_cuda_stream
 
@@ -64,7 +64,7 @@ from b12x.attention.indexer.tiled_topk import (
     _smem_st,
     _smem_xadd,
 )
-from b12x.cute.fp4 import ld_shared_f32
+from b12x.cute.intrinsics import ld_shared_f32
 from b12x.attention.indexer.kernel import (
     _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
@@ -84,7 +84,7 @@ from b12x.attention.indexer.kernel import (
     _repack_k_page_to_permuted,
     _smem_addr_from_b128_offset,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_global_i32,
     fmax_f32,
     get_ptr_as_int64,

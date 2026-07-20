@@ -21,7 +21,7 @@ from b12x.attention.workspace import (
     forced_sparse_mla_split_decode_config_for_width,  # noqa: F401
 )
 from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
-from b12x.cute.fp4 import shared_ptr_to_u32
+from b12x.cute.intrinsics import shared_ptr_to_u32
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
 from ..compressed_reference import compressed_mla_page_nbytes

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     FLOAT4_E2M1_MAX,
     fp4_quantize_values_torch,
     pack_grouped_fp4_values,

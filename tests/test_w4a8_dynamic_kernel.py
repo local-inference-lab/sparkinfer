@@ -13,7 +13,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from b12x.cute.fp4 import _fp4_encode_nibbles, fp4_quantize_values_torch
+from b12x.cute.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
@@ -344,7 +344,7 @@ def _run_w4a8_dynamic(
     if capture_intermediate:
         if not return_debug:
             raise ValueError("capture_intermediate requires return_debug=True")
-        from b12x.cute.fp4 import (
+        from b12x.cute.intrinsics import (
             _ue8m0_output_scale_torch,
             pow2_ceil_ue8m0_torch,
         )

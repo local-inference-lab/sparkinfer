@@ -12,7 +12,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32, Uint64
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     cp_async_bulk_g2s_mbar_l2hint,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,

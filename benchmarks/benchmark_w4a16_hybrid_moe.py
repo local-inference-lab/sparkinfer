@@ -25,7 +25,7 @@ import cutlass
 import cutlass.cute as cute
 
 from benchmarks.common import require_sm120
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.cute.utils import make_ptr
 from b12x.moe.fused.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe.fused.w4a16.kernel import (

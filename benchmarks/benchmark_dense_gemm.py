@@ -23,7 +23,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,

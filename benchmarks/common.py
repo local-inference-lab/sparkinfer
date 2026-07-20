@@ -9,7 +9,7 @@ import time
 
 import torch
 
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import get_hardware_info
 
 

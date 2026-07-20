@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import b12x.integration.tp_moe as tp_moe
-from b12x.cute.fp4 import pack_grouped_fp4_values, swizzle_block_scale
+from b12x.cute.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
 from b12x.moe.fused.reference import (
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,

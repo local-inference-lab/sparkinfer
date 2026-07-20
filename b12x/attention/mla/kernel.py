@@ -32,7 +32,7 @@ from b12x.cute.compiler import (
 from b12x.cute.compiler import (
     launch as b12x_launch,
 )
-from b12x.cute.fp4 import shared_ptr_to_u32
+from b12x.cute.intrinsics import shared_ptr_to_u32
 
 from .decode_math import (
     s0_load_q_bf16_to_smem,

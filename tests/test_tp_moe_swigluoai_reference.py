@@ -4,7 +4,7 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from b12x.cute.fp4 import pack_grouped_fp4_values, swizzle_block_scale
+from b12x.cute.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
 from b12x.integration.tp_moe import (
     B12XFP4ExpertWeights,
     TPMoEFP4Binding,

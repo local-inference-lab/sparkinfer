@@ -17,7 +17,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,

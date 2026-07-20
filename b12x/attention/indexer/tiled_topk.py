@@ -27,7 +27,7 @@ from b12x.cute.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_shared_i32,
     ld_shared_i32,
     ld_shared_i32_relaxed,

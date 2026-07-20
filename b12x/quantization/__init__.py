@@ -7,7 +7,7 @@ import cutlass.cute as cute
 import torch
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x.cute.fp4 import align_up
+from b12x.cute.intrinsics import align_up
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
 from b12x.quantization.bf16_to_fp4_tma import TestKernel
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen

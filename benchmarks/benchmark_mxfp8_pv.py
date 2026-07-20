@@ -37,7 +37,7 @@ from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     bf16_mma_m16n8k16_f32,
     cvt_bf16x2_to_e4m3x2,
     fp8x4_e4m3_to_bfloat2x2,

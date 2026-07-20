@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from b12x.cute.fp4 import fp4_quantize_values_torch
+from b12x.cute.intrinsics import fp4_quantize_values_torch
 from b12x.moe.fused.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
@@ -1313,7 +1313,7 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
 
 
 def _quant_dequant_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
-    from b12x.cute.fp4 import quant_dequant_mxfp8_torch
+    from b12x.cute.intrinsics import quant_dequant_mxfp8_torch
 
     return quant_dequant_mxfp8_torch(x)
 

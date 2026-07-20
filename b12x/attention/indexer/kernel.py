@@ -22,8 +22,8 @@ from b12x.cute.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
-from b12x.cute.fp4 import get_sm_version
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import get_sm_version
+from b12x.cute.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     frag_layout_swizzle_16b_to_8b,

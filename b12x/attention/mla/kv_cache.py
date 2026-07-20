@@ -50,7 +50,7 @@ from b12x.cute.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     cvt_e4m3_to_f32_via_f16,
     cvt_f32_to_e4m3,
     cvt_f32x4_to_e4m3x4,

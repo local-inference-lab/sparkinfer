@@ -35,7 +35,7 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.fp4 import mxfp8_mma_m16n8k32_f32_e4m3
+from b12x.cute.intrinsics import mxfp8_mma_m16n8k32_f32_e4m3
 
 
 def _to_cute(x, dtype):

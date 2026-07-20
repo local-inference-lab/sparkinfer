@@ -8,7 +8,7 @@ import torch
 import cutlass
 
 import b12x.gemm.dense as dense_module
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
 from b12x.gemm.dense import (
     DenseGemmKernel,

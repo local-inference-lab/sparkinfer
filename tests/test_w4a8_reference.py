@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     _fp4_encode_nibbles,
     fp4_quantize_values_torch,
     quant_dequant_mxfp8_torch,
@@ -291,7 +291,7 @@ def test_w4a8_oracle_beats_w4a4_oracle(activation: str) -> None:
     )
 
     # w4a4 oracle on the same packed weights/scales (global scales 1.0).
-    from b12x.cute.fp4 import swizzle_block_scale
+    from b12x.cute.intrinsics import swizzle_block_scale
 
     w1_swizzled = swizzle_block_scale(w1_scales.to(torch.float8_e4m3fn)).view(torch.uint8)
     w2_swizzled = swizzle_block_scale(w2_scales.to(torch.float8_e4m3fn)).view(torch.uint8)

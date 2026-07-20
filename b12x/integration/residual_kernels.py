@@ -27,7 +27,7 @@ from b12x.cute.compiler import (
 from b12x.cute.compiler import (
     launch as b12x_launch,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     bf16_mma_m16n8k16_f32,
     bfloat2_to_float2_scaled,
     f32_to_raw_bits,

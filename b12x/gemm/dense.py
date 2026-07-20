@@ -65,7 +65,7 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     FLOAT8_E4M3_MAX,
     bfloat2_to_float2_scaled,
     cp_async_bulk_g2s_mbar,

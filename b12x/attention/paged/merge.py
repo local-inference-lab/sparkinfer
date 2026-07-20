@@ -27,7 +27,7 @@ from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.fp4 import get_ptr_as_int64, pack_f32x2_to_bfloat2, shared_ptr_to_u32
+from b12x.cute.intrinsics import get_ptr_as_int64, pack_f32x2_to_bfloat2, shared_ptr_to_u32
 
 
 @dsl_user_op

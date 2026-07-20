@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.moe.fused.w4a16.kernel import (
     build_w4a16_tier_local_map,
     compile_w4a16_fused_moe,

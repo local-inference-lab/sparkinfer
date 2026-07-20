@@ -26,7 +26,7 @@ from b12x.cute.compiler import (
     KernelCompileSpec,
     launch as b12x_launch,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
     ld_shared_v4_u32,

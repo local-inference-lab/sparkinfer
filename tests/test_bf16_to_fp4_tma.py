@@ -10,7 +10,7 @@ import sys
 import pytest
 import torch
 
-from b12x.cute.fp4 import as_grouped_scale_view, quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
 from b12x.quantization import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import b12x.integration.ep_moe as ep_moe
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.integration import (
     EPMoEScratchCaps,
     b12x_ep_moe_fp4,

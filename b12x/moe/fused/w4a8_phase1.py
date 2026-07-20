@@ -19,7 +19,7 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     e2m1x8_to_qmma_e2m1x8,

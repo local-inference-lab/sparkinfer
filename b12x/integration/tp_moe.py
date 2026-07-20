@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x.cute.fp4 import align_up, as_grouped_scale_view
+from b12x.cute.intrinsics import align_up, as_grouped_scale_view
 from b12x.cute.utils import (
     current_cuda_stream,
     get_max_active_clusters,

@@ -19,7 +19,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, dsl_user_op
 
 from b12x.attention._cute import pipeline as cute_pipeline
-from b12x.cute.fp4 import shared_ptr_to_u32
+from b12x.cute.intrinsics import shared_ptr_to_u32
 
 _ROWS = 64
 _HEAD_DIM = 256

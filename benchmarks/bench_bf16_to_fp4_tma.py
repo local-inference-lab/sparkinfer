@@ -18,7 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.cute.compiler import b12x_package_fingerprint
-from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.quantization import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
 
 

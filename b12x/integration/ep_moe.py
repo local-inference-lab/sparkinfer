@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x.cute.fp4 import align_up
+from b12x.cute.intrinsics import align_up
 from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from b12x.cute.utils import get_num_sm
 from b12x.moe.execution import MoEWeightPreparationPlan

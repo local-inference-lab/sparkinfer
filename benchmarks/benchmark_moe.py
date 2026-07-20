@@ -48,7 +48,7 @@ from b12x.moe.fused.activations import (
     moe_activation_w1_rows,
     normalize_moe_activation,
 )
-from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
+from b12x.cute.intrinsics import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from tests.w4a16_reference import moe_reference_w4a16
 

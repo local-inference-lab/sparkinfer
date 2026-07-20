@@ -53,7 +53,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x.attention._cute.ops import LOG2_E
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_max_shared_f32,
     byte_perm,
     cvt_f32_to_e4m3,

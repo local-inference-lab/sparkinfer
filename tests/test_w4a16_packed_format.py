@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.integration.tp_moe import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from b12x.cute.fp4 import swizzle_block_scale
+from b12x.cute.intrinsics import swizzle_block_scale
 from b12x.moe.fused.w4a16.host import (
     plan_w4a16_buffers,
     select_route_block_size_m,

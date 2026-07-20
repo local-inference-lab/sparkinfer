@@ -22,7 +22,7 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.attention._cute.ops import LOG2_E
 from b12x.cute.compiler import DimKey, KernelCompileSpec, key_field, tensor_key
 from b12x.cute.compiler import launch as b12x_launch
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_max_shared_f32_offset,
     byte_perm,
     create_l2_evict_first_policy,

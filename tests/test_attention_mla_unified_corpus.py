@@ -19,7 +19,7 @@ from b12x.attention.mla.reference import (
     sparse_mla_reference,
 )
 from b12x.attention.mla.traits import ScaleFormat
-from b12x.cute.fp4 import pack_grouped_fp4_values
+from b12x.cute.intrinsics import pack_grouped_fp4_values
 from b12x.integration.compressed_scratch import (
     B12XCompressedMLAScratchCaps,
     _compressed_mla_scratch_layout,

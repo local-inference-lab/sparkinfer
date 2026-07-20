@@ -56,7 +56,7 @@ from b12x.attention.mla.legacy.kernel import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
-from b12x.cute.fp4 import byte_perm, ldmatrix_m8n8x4_left_half_b16, ldmatrix_m8n8x4_right_half_b16
+from b12x.cute.intrinsics import byte_perm, ldmatrix_m8n8x4_left_half_b16, ldmatrix_m8n8x4_right_half_b16
 
 from .helpers import require_sm120
 from .test_attention_mla_reference import _make_glm_case

@@ -28,5 +28,5 @@ from .runtime_control import (
     unfreeze_kernel_resolution,
 )
 from .scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
-from .fp4 import *
+from .intrinsics import *
 from .utils import *

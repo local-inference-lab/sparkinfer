@@ -18,7 +18,7 @@ from b12x.cute.utils import (
     get_max_active_clusters,
     make_ptr,
 )
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_global_i32,
     cvt_e4m3_to_f32_via_f16,
     cvt_e4m3x4_to_f32x4,

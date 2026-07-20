@@ -34,7 +34,7 @@ from cutlass import Float32
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x.cute.utils import current_cuda_stream, make_ptr
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     cvt_bf16x2_to_f16x2,
     cvt_e8m0x4_to_f32x4,
     fp4_dot4_sum_f32acc,

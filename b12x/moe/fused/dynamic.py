@@ -54,7 +54,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     atomic_add_global_i32,
     bfloat2_to_float2_scaled,
     broadcast_f32_to_half2,
@@ -96,7 +96,7 @@ from b12x.gemm.dense import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
-from b12x.cute.fp4 import scatter_add_bf16x2, scatter_add_v4_bf16x2
+from b12x.cute.intrinsics import scatter_add_bf16x2, scatter_add_v4_bf16x2
 from b12x.moe.fused.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,

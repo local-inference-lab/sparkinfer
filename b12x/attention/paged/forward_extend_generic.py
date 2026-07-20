@@ -26,9 +26,9 @@ from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
+from b12x.cute.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x.cute.smem import make_smem_memrange_alias
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     bf16_mma_m16n16k16_f32,
     bf16_rowsum_m16k16_f32,
     bfloat2_mul,

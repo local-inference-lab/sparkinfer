@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from b12x.cute.fp4 import fp4_quantize_values_torch
+from b12x.cute.intrinsics import fp4_quantize_values_torch
 
 
 @dataclass(frozen=True)

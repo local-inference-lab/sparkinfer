@@ -10,7 +10,7 @@ import torch
 from cutlass.cutlass_dsl import Int32, Uint8, Uint32
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x.cute.fp4 import (
+from b12x.cute.intrinsics import (
     FLOAT8_E4M3_MAX,
     cvt_f32x4_to_e4m3x4,
     fabs_f32,

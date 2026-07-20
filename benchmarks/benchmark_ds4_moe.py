@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from b12x.cute.fp4 import _fp4_encode_nibbles, fp4_quantize_values_torch
+from b12x.cute.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
 
 DS4_E = 256
 DS4_K = 4096
