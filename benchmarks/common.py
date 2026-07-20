@@ -9,8 +9,8 @@ import time
 
 import torch
 
-from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer.cute.utils import get_hardware_info
+from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer._lib.utils import get_hardware_info
 
 
 FLOAT4_E2M1_MAX = 6.0

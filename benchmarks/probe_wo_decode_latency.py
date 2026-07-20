@@ -19,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmark_dense_gemm import bench_events, capture_graph_replay, make_l2_flush_fn
-from sparkinfer.gemm.wo_projection import (
+from sparkinfer.gemm._shared.wo_mxfp8 import (
     empty_wo_projection_workspace,
     quantize_wo_projection_weights_mxfp8_torch,
     wo_projection_mxfp8,

@@ -13,20 +13,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn
-from sparkinfer.attention.indexer import uses_paged_mqa_schedule
-from sparkinfer.attention.indexer.kernel import (
+from sparkinfer.attention.nsa_indexer._impl import uses_paged_mqa_schedule
+from sparkinfer.attention.nsa_indexer.kernel import (
     run_paged_supertile_logits_kernel,
 )
-from sparkinfer.attention.indexer import (
-    SPARKINFERIndexerScratchCaps,
-    INDEXER_SOURCE_LAYOUT_PAGED,
-    clear_indexer_caches,
-    index_topk_fp8,
-    pack_paged_index_k_cache_reference,
-    plan_indexer_scratch,
-    prepare_paged_indexer_metadata,
-    resolve_replicated_num_q_heads,
-)
+from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
+from sparkinfer.attention.nsa_indexer.paged import index_topk_fp8, pack_paged_index_k_cache_reference, prepare_paged_indexer_metadata, resolve_replicated_num_q_heads
+from sparkinfer.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, SPARKINFERIndexerScratchCaps, plan_indexer_scratch
 
 
 def _make_page_table(
@@ -588,7 +581,7 @@ def main() -> None:
             # The benchmark can force the primitive outside the production row
             # routing gate. Keep that comparison graph-realistic with one fixed,
             # preinitialized workspace rather than per-replay allocations.
-            from sparkinfer.attention.indexer.fused_indexer import (
+            from sparkinfer.attention.nsa_indexer.fused_indexer import (
                 fused_indexer_scratch_capacity,
             )
 
@@ -622,8 +615,8 @@ def main() -> None:
                 preinitialize_tile_logits=False,
             )
         if bench_mode == "fused-topk":
-            from sparkinfer.attention.indexer.kernel import _split_index_k_cache_runtime_views
-            from sparkinfer.attention.indexer.fused_indexer import run_fused_paged_indexer
+            from sparkinfer.attention.nsa_indexer.kernel import _split_index_k_cache_runtime_views
+            from sparkinfer.attention.nsa_indexer.fused_indexer import run_fused_paged_indexer
 
             assert fused_cache is not None
             quant, scales = _split_index_k_cache_runtime_views(index_k_cache)

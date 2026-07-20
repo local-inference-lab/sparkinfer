@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from sparkinfer.cute.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
+from sparkinfer._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
 
 DS4_E = 256
 DS4_K = 4096
@@ -183,7 +183,7 @@ def _bench_sparkinfer(
     warmup: int,
     device: torch.device,
 ) -> float:
-    from sparkinfer.integration.tp_moe import (
+    from sparkinfer.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
         sparkinfer_moe_fp4,
         build_tp_moe_fp4_binding,
@@ -230,7 +230,7 @@ def _bench_sparkinfer(
 
 def _prepare_sparkinfer_experts(mode: str, source_weights: dict):
     """Transfer one private source copy into the mode's canonical owner."""
-    from sparkinfer.integration.tp_moe import (
+    from sparkinfer.moe.fused_moe._impl import (
         plan_sparkinfer_fp4_moe_weights,
         prepare_sparkinfer_fp4_moe_weights,
     )

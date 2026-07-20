@@ -42,11 +42,11 @@ import torch
 
 import benchmarks.benchmark_paged_attention as bench
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from sparkinfer.attention.paged import api as paged_api
+import sparkinfer.attention.paged._forward as paged_api
 from sparkinfer.attention.paged import merge as paged_merge
 from sparkinfer.attention.paged import planner as paged_planner
 from sparkinfer.attention.paged import workspace as paged_workspace
-from sparkinfer.integration.attention import clear_attention_caches
+from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
 
 CHUNK_PAGE_LADDER = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 LONG_FORM_CUTOFF_TOKENS_LADDER = [128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768]

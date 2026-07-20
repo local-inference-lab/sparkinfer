@@ -31,7 +31,7 @@ from benchmarks.benchmark_dense_gemm import (
     make_mxfp8_operand,
 )
 from benchmarks.common import make_l2_flush_fn
-from sparkinfer.gemm.dense import dense_gemm
+from sparkinfer._lib.dense_gemm import dense_gemm
 
 
 def cos(a, b):

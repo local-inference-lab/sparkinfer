@@ -22,7 +22,7 @@ from benchmarks.benchmark_moe import (
     prepare_sparkinfer_benchmark_weights,
     require_sm120,
 )
-from sparkinfer.integration.tp_moe import (
+from sparkinfer.moe.fused_moe._impl import (
     SPARKINFERFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
     sparkinfer_moe_fp4,

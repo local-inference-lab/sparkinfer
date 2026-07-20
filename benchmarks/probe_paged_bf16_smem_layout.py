@@ -12,7 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.integration.attention import PagedAttentionWorkspace, clear_attention_caches
+from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
+from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from tests.test_attention_paged_planner import _make_inputs
 
 _PAGE_SIZE = 64

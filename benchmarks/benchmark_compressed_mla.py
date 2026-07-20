@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention.mla.compressed_reference import (
+from sparkinfer.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
@@ -30,13 +30,10 @@ from sparkinfer.attention.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.integration.mla import (
-    SPARKINFERCompressedMLAScratchCaps,
-    clear_mla_caches,
-    compressed_mla_decode_forward,
-    compressed_mla_split_chunks_for_contract,
-    plan_compressed_mla_scratch,
-)
+from sparkinfer.attention._shared.mla.api import clear_mla_caches
+from sparkinfer.attention._shared.mla.compressed_api import compressed_mla_decode_forward
+from sparkinfer.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
+from sparkinfer.attention.compressed_mla._scratch import SPARKINFERCompressedMLAScratchCaps, plan_compressed_mla_scratch
 
 from benchmarks.common import (
     bench_cuda_graph,

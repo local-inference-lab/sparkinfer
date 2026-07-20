@@ -12,16 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention.indexer import (
-    IndexerContiguousMetadata,
-    IndexerPagedDecodeMetadata,
-    build_paged_mqa_schedule_metadata,
-    clear_indexer_caches,
-    msa_q2k_indices_decode,
-    msa_q2k_indices_prefill,
-    quantize_msa_q_fp8,
-)
-from sparkinfer.attention.indexer.reference import pack_index_k_cache_reference
+from sparkinfer.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, msa_q2k_indices_decode, msa_q2k_indices_prefill, quantize_msa_q_fp8
+from sparkinfer.attention.nsa_indexer.reference import pack_index_k_cache_reference
 
 from benchmarks.common import (
     bench_cuda_graph,

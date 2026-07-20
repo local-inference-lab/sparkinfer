@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer.attention._cute import pipeline as cute_pipeline
+import sparkinfer.attention._shared.cute.pipeline as cute_pipeline
 from sparkinfer.attention.paged.forward_paged import (
     _async_copy_q_tile_permuted_128b_fp8_decode_impl,
     _issue_paged_kv_tma_copy_2planes_fp8_raw_impl,
@@ -381,10 +381,10 @@ def main() -> None:
         .view(1, -1)
         .repeat(8, 1)
     )
-    from sparkinfer.attention.paged.api import (
+    from sparkinfer.attention.paged._forward import (
         _descriptor_row_ptrs as _api_descriptor_row_ptrs,
     )
-    from sparkinfer.attention.paged.api import _encode_fp8_plane_tma_descriptors
+    from sparkinfer.attention.paged._forward import _encode_fp8_plane_tma_descriptors
 
     desc_words_k = _encode_fp8_plane_tma_descriptors(src_k, plane_cols=_PLANE_COLS)
     desc_words_v = _encode_fp8_plane_tma_descriptors(src_v, plane_cols=_PLANE_COLS)

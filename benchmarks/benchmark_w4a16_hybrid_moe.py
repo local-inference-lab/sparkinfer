@@ -25,10 +25,10 @@ import cutlass
 import cutlass.cute as cute
 
 from benchmarks.common import require_sm120
-from sparkinfer.cute.intrinsics import swizzle_block_scale
-from sparkinfer.cute.utils import make_ptr
-from sparkinfer.moe.fused.w4a16.host import make_w4a16_packed_buffers
-from sparkinfer.moe.fused.w4a16.kernel import (
+from sparkinfer._lib.intrinsics import swizzle_block_scale
+from sparkinfer._lib.utils import make_ptr
+from sparkinfer.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
+from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     _cutlass_element_dtype,
     _w4a16_fused_persistent_grid_x,
@@ -37,7 +37,7 @@ from sparkinfer.moe.fused.w4a16.kernel import (
     compile_w4a16_fused_moe_hybrid,
     run_w4a16_moe,
 )
-from sparkinfer.moe.fused.w4a16.prepare import (
+from sparkinfer.moe._shared.kernels.w4a16.prepare import (
     prepare_nf3_moe_weights,
     prepare_w4a16_modelopt_nvfp4_weights,
 )

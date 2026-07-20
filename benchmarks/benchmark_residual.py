@@ -21,11 +21,7 @@ from benchmarks.common import (
     make_l2_flush_fn,
     require_sm120,
 )
-from sparkinfer.integration import (
-    SPARKINFERMHCScratchCaps,
-    sparkinfer_mhc_post_pre,
-    plan_mhc_scratch,
-)
+from sparkinfer.norm.mhc._impl import SPARKINFERMHCScratchCaps, plan_mhc_scratch, sparkinfer_mhc_post_pre
 
 
 def _mhc_pre_reference(

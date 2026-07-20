@@ -10,8 +10,8 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from sparkinfer.gemm.block_fp8_linear import pack_block_fp8_linear_weight_mxfp8
-from sparkinfer.gemm.wo_projection import (
+from sparkinfer.gemm._shared.block_fp8 import pack_block_fp8_linear_weight_mxfp8
+from sparkinfer.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
 )

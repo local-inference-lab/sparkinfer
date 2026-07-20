@@ -22,7 +22,7 @@ ANTI-FALLBACK PROOF.  The unified dispatch FALLS BACK to legacy for unsupported
 features, so a silent fallback would make unified==legacy (fake parity).  We do
 NOT trust the env flag.  We install TWO spies:
 
-  (1) launch counter: wrap sparkinfer.cute.compiler.launch and count every launch
+  (1) launch counter: wrap sparkinfer._lib.compiler.launch and count every launch
       whose compile_spec.kernel_id contains "sm120" (i.e. the REAL
       UnifiedDecodeKernel / UnifiedPrefillKernel cubin compile+launch).  CUDA
       graphs capture these launches during warmup+capture; replay re-issues the
@@ -59,8 +59,8 @@ from benchmarks.common import (
     resolve_l2_flush_bytes,
 )
 
-from sparkinfer.attention.workspace import SPARKINFERAttentionWorkspace
-from sparkinfer.attention.mla.compressed_reference import (
+from sparkinfer.attention._shared.workspace import SPARKINFERAttentionWorkspace
+from sparkinfer.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_NOPE_DIM,
@@ -68,12 +68,9 @@ from sparkinfer.attention.mla.compressed_reference import (
     compressed_mla_page_nbytes,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention.mla.reference import pack_mla_kv_cache_reference
-from sparkinfer.integration.mla import (
-    clear_mla_caches,
-    compressed_mla_decode_forward,
-    sparse_mla_decode_forward,
-)
+from sparkinfer.attention._shared.mla.reference import pack_mla_kv_cache_reference
+from sparkinfer.attention._shared.mla.api import clear_mla_caches, sparse_mla_decode_forward
+from sparkinfer.attention._shared.mla.compressed_api import compressed_mla_decode_forward
 
 _MLA_NOPE_DIM = 512   # GLM kv_lora_rank (nope) dim
 _MLA_ROPE_DIM = 64    # GLM qk_rope_head_dim
@@ -90,7 +87,7 @@ _UNIFIED_ENV = "SPARKINFER_MLA_SM120_ROUTE_REMOVED"
 # Spies: prove the unified kernel actually compiled + launched.
 # --------------------------------------------------------------------------- #
 class UnifiedSpy:
-    """Counts (a) real unified cubin launches via sparkinfer.cute.compiler.launch, and
+    """Counts (a) real unified cubin launches via sparkinfer._lib.compiler.launch, and
     (b) dispatch-entrypoint calls into run_unified_decode / run_unified_prefill.
 
     Both are installed as wrappers around the genuine implementations (pass-through
@@ -109,9 +106,9 @@ class UnifiedSpy:
         self.prefill_dispatch = 0
 
     def install(self) -> None:
-        import sparkinfer.cute.compiler as compiler_mod
-        import sparkinfer.attention.mla.kernel as launch_mod
-        import sparkinfer.attention.mla.prefill as prefill_mod
+        import sparkinfer._lib.compiler as compiler_mod
+        import sparkinfer.attention._shared.mla.kernel as launch_mod
+        import sparkinfer.attention._shared.mla.prefill as prefill_mod
 
         real_launch = compiler_mod.launch
 
@@ -185,7 +182,7 @@ def unified_enabled(enabled: bool):
 # warmup+capture, then time replays.
 # --------------------------------------------------------------------------- #
 def _time_graph(run, *, spy: UnifiedSpy, warmup: int, replays: int, l2_flush):
-    import sparkinfer.attention.mla.kernel as _launch_mod
+    import sparkinfer.attention._shared.mla.kernel as _launch_mod
 
     spy.reset()
     _launch_mod.LAST_DECODE_PLAN.clear()
@@ -391,12 +388,12 @@ def _import_prefill_ref():
     if sm120port not in sys.path:
         sys.path.insert(0, sm120port)
     import dsv4_ref  # noqa: F401
-    import prefill_ref
+    from tests._reference import prefill_ref
     return prefill_ref, dsv4_ref
 
 
 def _repack_prefill_to_compressed(packed_dsv4, page_size, num_blocks, dsv4_ref):
-    from sparkinfer.attention.mla import compressed_reference as cr
+    import sparkinfer.attention._shared.mla.compressed_reference as cr
     bpt = dsv4_ref.DSV4_KV_GMEM_STRIDE  # 584
     page_nbytes = cr.compressed_mla_page_nbytes(page_size)
     flat = packed_dsv4.reshape(num_blocks, page_size * bpt)
@@ -407,7 +404,7 @@ def _repack_prefill_to_compressed(packed_dsv4, page_size, num_blocks, dsv4_ref):
 
 def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, replays, l2_flush, seed):
     prefill_ref, dsv4_ref = _import_prefill_ref()
-    from sparkinfer.attention.mla.prefill import run_unified_prefill as _direct_prefill
+    from sparkinfer.attention._shared.mla.prefill import run_unified_prefill as _direct_prefill
 
     page_size = _DSV4_PREFILL_PAGE
     num_blocks = max(2, (topk + page_size - 1) // page_size + 1)
@@ -432,7 +429,7 @@ def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, repl
     #      prefill_dispatch is counted -- _direct_prefill above is only imported to
     #      assert the symbol exists.
     del _direct_prefill
-    import sparkinfer.attention.mla.prefill as prefill_mod
+    import sparkinfer.attention._shared.mla.prefill as prefill_mod
 
     def run_unified():
         return prefill_mod.run_unified_prefill(

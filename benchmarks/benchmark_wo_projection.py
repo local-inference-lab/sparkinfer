@@ -26,8 +26,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-import sparkinfer.gemm.wo_projection as wo_projection_impl
-from sparkinfer.gemm.wo_projection import (
+import sparkinfer.gemm._shared.wo_mxfp8 as wo_projection_impl
+from sparkinfer.gemm._shared.wo_mxfp8 import (
     WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,

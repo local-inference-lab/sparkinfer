@@ -18,51 +18,32 @@ import torch
 import triton
 import triton.language as tl
 
-from sparkinfer.attention.workspace import default_sparse_mla_split_decode_config_for_width
-from sparkinfer.attention.indexer.reference import (
+from sparkinfer.attention._shared.workspace import default_sparse_mla_split_decode_config_for_width
+from sparkinfer.attention.nsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.attention.mla.reference import (
+from sparkinfer.attention._shared.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
-from sparkinfer.integration.mla import (
-    SPARKINFERSparseMLAScratchCaps,
-    MLASparseDecodeMetadata,
-    MLASparseExtendMetadata,
-    clear_mla_caches,
-    plan_sparse_mla_scratch,
-    sparse_mla_decode_forward,
-    sparse_mla_extend_forward,
-)
-from sparkinfer.attention.indexer.contiguous_kernel import (
+from sparkinfer.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
+from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
+from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_Q,
 )
-from sparkinfer.attention.indexer.tiled_topk import run_tiled_supertile_topk
-from sparkinfer.attention.indexer.persistent_topk import (
+from sparkinfer.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
+from sparkinfer.attention.nsa_indexer.persistent_topk import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
-from sparkinfer.attention.indexer import (
-    SPARKINFERIndexerScratchCaps,
-    INDEXER_SOURCE_LAYOUT_PAGED,
-    IndexerContiguousMetadata,
-    IndexerPagedDecodeMetadata,
-    clear_indexer_caches,
-    build_paged_mqa_schedule_metadata,
-    index_topk_fp8,
-    plan_indexer_scratch,
-    prepare_paged_indexer_metadata,
-    resolve_contiguous_prefill_block_k,
-    paged_decode_logits,
-    contiguous_logits,
-    contiguous_tiled_topk,
-    uses_paged_mqa_schedule,
-)
+from sparkinfer.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
+from sparkinfer.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
+from sparkinfer.attention.nsa_indexer.paged import index_topk_fp8, prepare_paged_indexer_metadata
+from sparkinfer.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, SPARKINFERIndexerScratchCaps, plan_indexer_scratch
 
 from benchmarks.common import (
     bench_cuda_graph,

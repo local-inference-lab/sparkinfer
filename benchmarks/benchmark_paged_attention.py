@@ -22,7 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from sparkinfer.attention.paged.api import paged_attention_forward
+from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged.reference import paged_attention_reference
 from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from sparkinfer.attention.paged.planner import (
@@ -30,9 +30,9 @@ from sparkinfer.attention.paged.planner import (
     decode_chunk_pages_for_graph,
     resolve_decode_graph_ctas_per_sm,
 )
-from sparkinfer.integration.attention import clear_attention_caches
-from sparkinfer.integration.paged_attention_scratch import build_paged_attention_binding
-from sparkinfer.cute import sparkinfer_package_fingerprint
+from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
+from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+from sparkinfer._lib import sparkinfer_package_fingerprint
 
 
 _REFERENCE_MINIMUM_COSINE = 0.999

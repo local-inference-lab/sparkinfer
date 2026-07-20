@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -336,3 +337,13 @@ def llama_rms_norm(
     x_fp32 = x.float()
     variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
     return (x_fp32 * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+def require_sparkinfer() -> torch.device:
+    """Skip unless a real SM120/SM121 device is present (migrated-test gate)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for sparkinfer tests")
+    major, minor = torch.cuda.get_device_capability()
+    if major != 12 or minor not in (0, 1):
+        pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")
+    return torch.device("cuda")

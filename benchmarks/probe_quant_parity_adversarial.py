@@ -20,8 +20,8 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from sparkinfer.gemm.wo_projection import _scale_to_e8m0_u8, _scale_u8_from_max_abs
+from sparkinfer.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm._shared.wo_mxfp8 import _scale_to_e8m0_u8, _scale_u8_from_max_abs
 
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

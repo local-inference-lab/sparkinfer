@@ -15,7 +15,7 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
 
 
 # ---- DeepGEMM reference (verbatim from deepgemm-other/deep_gemm/utils/math.py) ----

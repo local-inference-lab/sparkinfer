@@ -23,14 +23,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer.cute.utils import (
+from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer._lib.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,
 )
-from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from sparkinfer.gemm.dense import dense_gemm
-from sparkinfer.gemm.wo_projection import empty_mxfp8_rows_for_dense_gemm
+from sparkinfer.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer._lib.dense_gemm import dense_gemm
+from sparkinfer.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
 from flashinfer import mxfp8_quantize

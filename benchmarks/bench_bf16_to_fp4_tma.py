@@ -17,9 +17,9 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from sparkinfer.cute.compiler import sparkinfer_package_fingerprint
-from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer.quantization import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
+from sparkinfer._lib.compiler import sparkinfer_package_fingerprint
+from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer.quantization.nvfp4._impl import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
 
 
 def _parse_args() -> argparse.Namespace:

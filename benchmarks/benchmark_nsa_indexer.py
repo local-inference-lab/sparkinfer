@@ -15,22 +15,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention.indexer.reference import (
+from sparkinfer.attention.nsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.attention.indexer import (
-    SPARKINFERIndexerScratchCaps,
-    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
-    INDEXER_SOURCE_LAYOUT_PAGED,
-    clear_indexer_caches,
-    build_paged_mqa_schedule_metadata,
-    paged_decode_logits,
-    contiguous_logits,
-    plan_indexer_scratch,
-    uses_paged_mqa_schedule,
-)
+from sparkinfer.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits, uses_paged_mqa_schedule
+from sparkinfer.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, SPARKINFERIndexerScratchCaps, plan_indexer_scratch
 
 from benchmarks.common import (
     bench_cuda_graph,

@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from benchmarks.checkpoint_loader import IndexedSafetensorLoader
-from sparkinfer.moe.fused.reference import (
+from sparkinfer.moe._shared.kernels.reference import (
     OracleMetrics,
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
@@ -36,12 +36,12 @@ from sparkinfer.moe.fused.reference import (
     moe_reference_w4a16_f32,
     unswizzle_block_scale,
 )
-from sparkinfer.moe.fused.reference_flashinfer import (
+from sparkinfer.moe._shared.kernels.reference_flashinfer import (
     FlashInferTrtllmFP4E8M0K32Weights,
     moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
-from sparkinfer.moe.fused.activations import (
+from sparkinfer.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     SWIGLUOAI_DEFAULT_ALPHA,
     SWIGLUOAI_DEFAULT_BETA,
@@ -50,9 +50,9 @@ from sparkinfer.moe.fused.activations import (
     moe_activation_w1_rows,
     normalize_moe_activation,
 )
-from sparkinfer.cute.intrinsics import as_grouped_scale_view, swizzle_block_scale
+from sparkinfer._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from tests.w4a16_reference import moe_reference_w4a16
+from tests._reference.w4a16_reference import moe_reference_w4a16
 
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
@@ -1505,8 +1505,8 @@ def plan_sparkinfer_benchmark_weights(
     w4a16_native: bool = False,
 ):
     """Choose the benchmark's sole authoritative weight layout."""
-    from sparkinfer.integration import plan_sparkinfer_fp4_moe_weights
-    from sparkinfer.moe.execution import PreparedWeightLayout
+    from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
+    from sparkinfer.moe._shared.execution import PreparedWeightLayout
 
     quant_mode = quant_mode.lower()
     return plan_sparkinfer_fp4_moe_weights(
@@ -1536,7 +1536,7 @@ def prepare_sparkinfer_benchmark_weights(
     plan=None,
 ):
     """Execute the benchmark's planner-selected authoritative layout."""
-    from sparkinfer.integration import prepare_sparkinfer_fp4_moe_weights
+    from sparkinfer.moe.fused_moe._impl import prepare_sparkinfer_fp4_moe_weights
 
     quant_mode = quant_mode.lower()
     if plan is None:
@@ -2371,11 +2371,11 @@ def check_oracle_metrics(
 
 
 def _clear_sparkinfer_caches() -> None:
-    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.moe.fused_moe._impl import clear_tp_moe_caches
 
     clear_tp_moe_caches()
     try:
-        from sparkinfer.moe.fused.w4a16.kernel import clear_w4a16_kernel_cache
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
     except ImportError:
         return
     clear_w4a16_kernel_cache()
@@ -2448,7 +2448,7 @@ def compare_graph_replay_outputs(
 
 
 def allocate_layer_chain_workspace():
-    from sparkinfer.integration.tp_moe import allocate_tp_moe_workspace_pool
+    from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
     return allocate_tp_moe_workspace_pool()
 
@@ -2465,7 +2465,7 @@ def run_moe_layer_chain(
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
-    from sparkinfer.integration.tp_moe import sparkinfer_moe_fp4, build_tp_moe_fp4_binding
+    from sparkinfer.moe.fused_moe._impl import sparkinfer_moe_fp4, build_tp_moe_fp4_binding
 
     if not (
         len(experts_stack) == len(topk_ids_per_layer)
@@ -2769,7 +2769,7 @@ def bench_multilayer_graph_mode(
 
 
 def bench_e2e() -> None:
-    from sparkinfer.integration.tp_moe import default_moe_quant_mode
+    from sparkinfer.moe.fused_moe._impl import default_moe_quant_mode
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
@@ -3185,7 +3185,7 @@ def bench_e2e() -> None:
     backend_w4a16_weights = None
     make_backend_w4a16_buffers = None
     if use_w4a16:
-        from sparkinfer.moe.fused.w4a16.prepare import (
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
             make_w4a16_packed_buffers as make_w4a16_buffers,
         )
 
@@ -3208,14 +3208,14 @@ def bench_e2e() -> None:
         args.activation,
     )
 
-    from sparkinfer.integration.tp_moe import (
+    from sparkinfer.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
         sparkinfer_moe_fp4,
         build_tp_moe_fp4_binding,
     )
     w4a16_moe = None
     if use_w4a16:
-        from sparkinfer.moe.fused.w4a16.kernel import run_w4a16_moe
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         w4a16_moe = run_w4a16_moe
 

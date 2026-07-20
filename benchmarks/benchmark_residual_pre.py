@@ -19,7 +19,7 @@ from benchmarks.common import (
     make_l2_flush_fn,
     require_sm120,
 )
-from sparkinfer.integration import sparkinfer_mhc_pre
+from sparkinfer.norm.mhc._impl import sparkinfer_mhc_pre
 
 
 def _reference(

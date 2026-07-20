@@ -18,8 +18,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, dsl_user_op
 
-from sparkinfer.attention._cute import pipeline as cute_pipeline
-from sparkinfer.cute.intrinsics import shared_ptr_to_u32
+import sparkinfer.attention._shared.cute.pipeline as cute_pipeline
+from sparkinfer._lib.intrinsics import shared_ptr_to_u32
 
 _ROWS = 64
 _HEAD_DIM = 256

@@ -30,7 +30,7 @@ from benchmarks.benchmark_moe import (
     make_input_activations,
     require_sm120,
 )
-from sparkinfer.integration.tp_moe import (
+from sparkinfer.moe.fused_moe._impl import (
     SPARKINFERFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
     build_tp_moe_fp4_binding,
