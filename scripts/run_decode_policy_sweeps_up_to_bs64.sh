@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 VENV_PATH="${VENV_PATH:-$HOME/projects/sglang/.venv/bin/activate}"
-OUTPUT_DIR="${OUTPUT_DIR:-./b12x_decode_policy_sweeps}"
+OUTPUT_DIR="${OUTPUT_DIR:-./sparkinfer_decode_policy_sweeps}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-8}"
 REPLAYS="${REPLAYS:-100}"
 PROBE_BATCH_REPLAYS="${PROBE_BATCH_REPLAYS:-10}"

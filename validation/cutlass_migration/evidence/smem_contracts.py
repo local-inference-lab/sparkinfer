@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Statically audit the CUTLASS DSL 4.6 shared-memory allocation contract.
 
-The CUTLASS DSL 4.6 contract used by b12x is intentionally narrow and covers
+The CUTLASS DSL 4.6 contract used by sparkinfer is intentionally narrow and covers
 both production source and every retained benchmark/test kernel:
 
 * every ``SmemAllocator`` constructor is called without arguments;
@@ -9,9 +9,9 @@ both production source and every retained benchmark/test kernel:
   public ``.allocate(...)`` or ``.allocate_tensor(...)`` call in the same
   lexical scope; and
 * private ``_MemRange*`` implementation details are confined to
-  ``b12x/cute/smem.py``.
+  ``sparkinfer/cute/smem.py``.
 
-This tool parses source only.  It does not import b12x, CUTLASS, Torch, or
+This tool parses source only.  It does not import sparkinfer, CUTLASS, Torch, or
 CUDA, so it is safe to use as a pre-compilation migration gate.
 """
 
@@ -32,10 +32,10 @@ from typing import Iterable, Sequence
 from validation.cutlass_migration.paths import REPO_ROOT
 
 
-_SCHEMA = "b12x.cute.smem_contracts.v1"
-_CENTRAL_PRIVATE_MEMRANGE_PATH = Path("b12x/cute/smem.py")
+_SCHEMA = "sparkinfer.cute.smem_contracts.v1"
+_CENTRAL_PRIVATE_MEMRANGE_PATH = Path("sparkinfer/cute/smem.py")
 _AUDITED_SOURCE_ROOTS = {
-    "production": (Path("b12x"),),
+    "production": (Path("sparkinfer"),),
     "infrastructure": (Path("benchmarks"), Path("tests"), Path("validation")),
 }
 
@@ -136,7 +136,7 @@ def _bound_name(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str | None:
 
 
 def _typed_allocation_expression(node: ast.AST | None) -> bool:
-    """Recognize only the reviewed type-producing forms used by b12x."""
+    """Recognize only the reviewed type-producing forms used by sparkinfer."""
 
     if isinstance(node, ast.Name):
         # CUTLASS struct types and local type aliases are class-style names:
@@ -415,9 +415,9 @@ def _private_memrange_rows(
 
 def audit(root: Path) -> dict[str, object]:
     root = root.resolve()
-    package = root / "b12x"
+    package = root / "sparkinfer"
     if not package.is_dir():
-        raise ValueError(f"expected a b12x package under audit root: {package}")
+        raise ValueError(f"expected a sparkinfer package under audit root: {package}")
 
     allocator_rows: list[_AllocatorRow] = []
     private_rows: list[_PrivateMemRangeRow] = []
@@ -616,20 +616,20 @@ def _violation_codes(report: dict[str, object]) -> set[str]:
 
 def self_test() -> dict[str, object]:
     cases: list[dict[str, object]] = []
-    with tempfile.TemporaryDirectory(prefix="b12x-smem-contract-selftest-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-smem-contract-selftest-") as raw:
         base = Path(raw)
 
         positive = base / "positive"
         _write_fixture(
             positive,
-            "b12x/good.py",
+            "sparkinfer/good.py",
             "def kernel():\n"
             "    smem = cutlass.utils.SmemAllocator()\n"
             "    storage = smem.allocate(SharedStorage)\n",
         )
         _write_fixture(
             positive,
-            "b12x/cute/smem.py",
+            "sparkinfer/cute/smem.py",
             "def bridge():\n    return cute.struct._MemRangeData\n",
         )
         _write_fixture(
@@ -781,8 +781,8 @@ def self_test() -> dict[str, object]:
         }
         for name, (source, expected) in negative_sources.items():
             case_root = base / name
-            _write_fixture(case_root, "b12x/cute/smem.py", "# centralized bridge\n")
-            _write_fixture(case_root, "b12x/case.py", source)
+            _write_fixture(case_root, "sparkinfer/cute/smem.py", "# centralized bridge\n")
+            _write_fixture(case_root, "sparkinfer/case.py", source)
             case_report = audit(case_root)
             codes = _violation_codes(case_report)
             cases.append(
@@ -809,7 +809,7 @@ def _parser() -> argparse.ArgumentParser:
         "--root",
         type=Path,
         default=REPO_ROOT,
-        help="repository root containing b12x (default: script repository)",
+        help="repository root containing sparkinfer (default: script repository)",
     )
     parser.add_argument("--format", choices=("json", "csv"), default="json")
     parser.add_argument("-o", "--output", type=Path)

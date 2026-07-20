@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.gemm.wo_projection as wo_impl
-from b12x.gemm import (
+import sparkinfer.gemm.wo_projection as wo_impl
+from sparkinfer.gemm import (
     WOProjectionBinding,
     WOProjectionInvRopeBinding,
     WOProjectionScratchCaps,
     empty_mxfp8_rows_for_dense_gemm,
     plan_wo_projection_scratch,
 )
-from b12x.gemm.wo_projection import WOProjectionMXFP8Weights
+from sparkinfer.gemm.wo_projection import WOProjectionMXFP8Weights
 
 
 def _weights(
@@ -219,7 +219,7 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         return torch.empty((o_arg.shape[0], hidden, 1), dtype=o_arg.dtype)
 
     monkeypatch.setattr(
-        wo_impl.torch.ops.b12x,
+        wo_impl.torch.ops.sparkinfer,
         "wo_projection_inv_rope_mxfp8_fused",
         fake_fused,
     )

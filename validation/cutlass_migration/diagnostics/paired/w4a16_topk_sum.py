@@ -34,14 +34,14 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import CORE_ROOT, REPO_ROOT
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.runtime_control import (
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.runtime_control import (
     freeze_kernel_resolution,
     kernel_resolution_frozen,
     unfreeze_kernel_resolution,
 )
-from b12x.cute.utils import current_cuda_stream, make_ptr
-from b12x.moe.fused.w4a16.kernel import W4A16TopKSumCompileResult
+from sparkinfer.cute.utils import current_cuda_stream, make_ptr
+from sparkinfer.moe.fused.w4a16.kernel import W4A16TopKSumCompileResult
 
 
 _REQUIRED_DECODE_M = (1, 2, 4, 8, 23, 33, 80)
@@ -693,13 +693,13 @@ def main() -> None:
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     source_paths = {
         "benchmark": Path(__file__).resolve(),
-        "kernel": REPO_ROOT / "b12x/moe/fused/w4a16/kernel.py",
-        "compiler": REPO_ROOT / "b12x/cute/compiler.py",
+        "kernel": REPO_ROOT / "sparkinfer/moe/fused/w4a16/kernel.py",
+        "compiler": REPO_ROOT / "sparkinfer/cute/compiler.py",
         "exact_cache_abba": CORE_ROOT / "exact_cache_abba.py",
         "gpu_scope": CORE_ROOT / "gpu_scope.py",
     }
     result = {
-        "schema": "b12x.w4a16.topk_sum.cache_abba.v1",
+        "schema": "sparkinfer.w4a16.topk_sum.cache_abba.v1",
         "evidence_status": args.evidence_status,
         "command": [sys.executable, *sys.argv],
         "labels": {"a": labels[0], "b": labels[1]},

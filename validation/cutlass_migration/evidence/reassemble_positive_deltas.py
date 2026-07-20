@@ -42,12 +42,12 @@ from validation.cutlass_migration.evidence.sass_register_sets import (
     _register_reconfiguration,
     _set_fields,
 )
-_SCHEMA = "b12x.cute.common_ptxas_positive_delta.v2"
-_SUMMARY_SCHEMA = "b12x.cute.common_ptxas_positive_delta_summary.v2"
-_RESOURCE_DELTA_SCHEMA = "b12x.cute.kernel_resource_delta.v4"
-_SASS_DELTA_SCHEMA = "b12x.cute.sass_register_set_delta.v3"
-_PTX_SIDECAR_SCHEMA = "b12x.cute.frontend_ptx.v3"
-_MANIFEST_SCHEMA = "b12x.cute.compile_manifest.v3"
+_SCHEMA = "sparkinfer.cute.common_ptxas_positive_delta.v2"
+_SUMMARY_SCHEMA = "sparkinfer.cute.common_ptxas_positive_delta_summary.v2"
+_RESOURCE_DELTA_SCHEMA = "sparkinfer.cute.kernel_resource_delta.v4"
+_SASS_DELTA_SCHEMA = "sparkinfer.cute.sass_register_set_delta.v3"
+_PTX_SIDECAR_SCHEMA = "sparkinfer.cute.frontend_ptx.v3"
+_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ARCH_RE = re.compile(r"^\s*\.target\s+(\S+)", re.MULTILINE)
 _CODE_POSITIVE_FIELDS = ("sass_instruction_delta", "code_bytes_delta")

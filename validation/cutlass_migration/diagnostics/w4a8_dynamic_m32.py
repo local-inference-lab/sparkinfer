@@ -19,7 +19,7 @@ from typing import Callable, Mapping
 
 import torch
 
-from b12x.cute import b12x_package_fingerprint
+from sparkinfer.cute import sparkinfer_package_fingerprint
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from validation.cutlass_migration.core.gpu_scope import (
     add_target_gpu_argument,
@@ -37,7 +37,7 @@ _CUTLASS_PACKAGES = (
     "nvidia-cutlass-dsl-libs-cu13",
 )
 _RUNTIME_ENVIRONMENT_PREFIXES = (
-    "B12X_",
+    "SPARKINFER_",
     "CUTE_",
     "CUTLASS_",
     "CUDA_",
@@ -131,7 +131,7 @@ def _snapshot_read_only(inputs: Mapping[str, torch.Tensor]) -> _ReadOnlySnapshot
         tensor_sha256=tensor_hashes,
         aggregate_sha256=_json_sha256(
             {
-                "schema": "b12x-read-only-inputs-v1",
+                "schema": "sparkinfer-read-only-inputs-v1",
                 "tensor_sha256": tensor_hashes,
             }
         ),
@@ -154,7 +154,7 @@ def _assert_read_only_unchanged(
 
 def _read_only_provenance(snapshot: _ReadOnlySnapshot) -> dict[str, object]:
     return {
-        "schema": "b12x-read-only-inputs-v1",
+        "schema": "sparkinfer-read-only-inputs-v1",
         "tensor_sha256": dict(snapshot.tensor_sha256),
         "aggregate_sha256": snapshot.aggregate_sha256,
     }
@@ -380,7 +380,7 @@ def _runtime_environment_provenance() -> dict[str, object]:
         for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
     }
     payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "sparkinfer-runtime-environment-v1",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -482,7 +482,7 @@ def _initialize_log(
         "commit": _git_value("rev-parse", "HEAD"),
         "branch": _git_value("branch", "--show-current"),
         "dirty_paths": _git_value("status", "--short").splitlines(),
-        "b12x_package_fingerprint": b12x_package_fingerprint(),
+        "sparkinfer_package_fingerprint": sparkinfer_package_fingerprint(),
         "benchmark_sha256": benchmark_dependencies[
             str(benchmark_path.relative_to(repo))
         ],
@@ -550,7 +550,7 @@ def _record_samples(
     samples_us = [sample * 1000.0 for sample in samples_ms]
     record = {
         "type": "graph-replay-samples",
-        "backend": "b12x",
+        "backend": "sparkinfer",
         "case": case,
         "unit": "us",
         "samples": samples_us,
@@ -729,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
         "read_only_inputs": _read_only_provenance(read_only_snapshot),
         "variant_results": correctness_results,
         "live_input_mutation": {
-            "schema": "b12x-live-input-mutation-v1",
+            "schema": "sparkinfer-live-input-mutation-v1",
             "variant_sha256": [variant.sha256 for variant in variants],
             "distinct_variants": len(set(variant.sha256 for variant in variants)),
             "timed_schedule_sha256": _json_sha256(schedule),

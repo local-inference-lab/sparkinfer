@@ -1,4 +1,4 @@
-"""End-to-end w4a8_mx dispatch through b12x_moe_fp4 on synthetic MXFP4 weights.
+"""End-to-end w4a8_mx dispatch through sparkinfer_moe_fp4 on synthetic MXFP4 weights.
 
 Gates the e8m0_k32 serving prepare: checkpoint-native per-K/32 E8M0 grids
 ([E, rows, K//32] bytes) feed the w4a8_mx kernels directly — no vec16 scale
@@ -36,9 +36,9 @@ _TOPK = 4
 def test_w4a8_mx_dynamic_tile_density_boundaries(
     monkeypatch, routed_rows: int, expected_tile_m: int
 ) -> None:
-    from b12x.integration import tp_moe
+    from sparkinfer.integration import tp_moe
 
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     assert tp_moe._select_dynamic_tile_mn(
         routed_rows,
         _N,
@@ -53,9 +53,9 @@ def test_w4a8_mx_dynamic_tile_density_boundaries(
 def test_w4a8_mx_ds4_tp2_batch_m_uses_m32(
     monkeypatch, routed_rows: int
 ) -> None:
-    from b12x.integration import tp_moe
+    from sparkinfer.integration import tp_moe
 
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     assert tp_moe._select_dynamic_tile_mn(
         routed_rows,
         1024,
@@ -69,9 +69,9 @@ def test_w4a8_mx_ds4_tp2_batch_m_uses_m32(
 def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
     monkeypatch, routed_rows: int
 ) -> None:
-    from b12x.integration import tp_moe
+    from sparkinfer.integration import tp_moe
 
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     assert tp_moe._select_dynamic_tile_mn(
         routed_rows,
         1024,
@@ -86,9 +86,9 @@ def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
 def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
     monkeypatch, m: int
 ) -> None:
-    from b12x.integration import tp_moe
+    from sparkinfer.integration import tp_moe
 
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     assert tp_moe._select_dynamic_tile_mn(
         m * 6,
         1024,
@@ -103,9 +103,9 @@ def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
 def test_w4a8_mx_ds4_tp2_sm120_prefill_keeps_coarse_tactic(
     monkeypatch, m: int
 ) -> None:
-    from b12x.integration import tp_moe
+    from sparkinfer.integration import tp_moe
 
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
     assert tp_moe._select_dynamic_tile_mn(
         m * 6,
         1024,
@@ -132,12 +132,12 @@ def _weights(*, n: int = _N, seed: int = 21):
 def _prepare(weights: dict, *, n: int = _N, w13_layout: str = "w13"):
     """Destructively turn checkpoint storage into the sole runtime layout."""
 
-    from b12x.integration import (
-        plan_b12x_fp4_moe_weights,
-        prepare_b12x_fp4_moe_weights,
+    from sparkinfer.integration import (
+        plan_sparkinfer_fp4_moe_weights,
+        prepare_sparkinfer_fp4_moe_weights,
     )
 
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -151,7 +151,7 @@ def _prepare(weights: dict, *, n: int = _N, w13_layout: str = "w13"):
         weights[name].untyped_storage().data_ptr()
         for name in ("w13_fp4", "w13_mx", "w2_fp4", "w2_mx")
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_fp4=weights["w13_fp4"],
         w1_blockscale=weights["w13_mx"],
@@ -201,7 +201,7 @@ def _run(
     *,
     seed: int = 33,
 ) -> torch.Tensor:
-    from b12x.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
     from tests.helpers import run_tp_moe_fp4
 
     clear_tp_moe_caches()
@@ -221,7 +221,7 @@ def _run(
 @pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
 def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     _skip_if_unavailable()
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
 
     weights = _weights(n=n)
     m = 16
@@ -298,11 +298,11 @@ def test_w4a8_mx_w31_layout_flip() -> None:
 @pytest.mark.parametrize("n", [_N, 384, 352, 192, 320])
 def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
-    from b12x.integration import plan_b12x_fp4_moe_weights, tp_moe
-    from b12x.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
+    from sparkinfer.integration import plan_sparkinfer_fp4_moe_weights, tp_moe
+    from sparkinfer.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
 
     weights = _weights(n=n)
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -355,7 +355,7 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
 
 
 def _oracle(m: int, weights: dict, seed: int = 33, *, n: int = _N):
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
 
     x, topk_ids, topk_weights = _routed_inputs(m, seed)
     return moe_reference_w4a8_mx(
@@ -402,7 +402,7 @@ def test_w4a8_mx_materialized_dense_override_matches_oracle(
     """The split dense-prefill specializations remain correct when forced."""
 
     _skip_if_unavailable()
-    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_TILE_MN", f"{tile_m}x128")
     weights = _weights()
     m = 1024
     ref = _oracle(m, weights)
@@ -422,11 +422,11 @@ def test_w4a8_mx_prepared_dynamic_runs_with_compacted_sources() -> None:
     """The serving representation must not retain logical checkpoint weights."""
 
     _skip_if_unavailable()
-    from b12x.integration import (
-        plan_b12x_fp4_moe_weights,
-        prepare_b12x_fp4_moe_weights,
+    from sparkinfer.integration import (
+        plan_sparkinfer_fp4_moe_weights,
+        prepare_sparkinfer_fp4_moe_weights,
     )
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
     from tests.helpers import run_tp_moe_fp4
 
     n = 256
@@ -450,7 +450,7 @@ def test_w4a8_mx_prepared_dynamic_runs_with_compacted_sources() -> None:
         n,
         activation="silu",
     )
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -460,7 +460,7 @@ def test_w4a8_mx_prepared_dynamic_runs_with_compacted_sources() -> None:
         intermediate_size=n,
         w13_layout="w13",
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=weights["w13_fp4"],
         w1_blockscale=weights["w13_mx"],
@@ -507,14 +507,14 @@ def test_w4a8_mx_dynamic_graph_replay_tracks_routing_updates() -> None:
     replay with routing/activations mutated IN PLACE must track the update
     (vs a fresh eager call on the same inputs, and vs the oracle)."""
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import sparkinfer_moe_fp4, clear_tp_moe_caches
     from tests.helpers import make_tp_moe_fp4_binding
 
     clear_tp_moe_caches()
     device = torch.device("cuda")
     weights = _weights()
     m = 256
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
 
     initial_x, initial_ids, initial_w = _routed_inputs(m, 33)
     rounds = []
@@ -560,7 +560,7 @@ def test_w4a8_mx_dynamic_graph_replay_tracks_routing_updates() -> None:
     eager_binding = _make_binding(eager_out)
 
     def _launch(binding) -> None:
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
 
     # Warm the compiled dynamic launch, then capture.
     _launch(graph_binding)
@@ -610,7 +610,7 @@ def test_w4a8_mx_m9_graph_replay_with_aux_stream_work() -> None:
     shared-expert work is active on another stream.
     """
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import sparkinfer_moe_fp4, clear_tp_moe_caches
     from tests.helpers import make_tp_moe_fp4_binding
 
     clear_tp_moe_caches()
@@ -631,7 +631,7 @@ def test_w4a8_mx_m9_graph_replay_with_aux_stream_work() -> None:
     )
 
     def _launch() -> None:
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
 
     _launch()
     torch.cuda.synchronize()
@@ -666,8 +666,8 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     """GLM per-rank shard geometry: E=16, K=4096, n=256 (FC1 N=512, FC2
     N=4096 with K=256) through unified dynamic, gated vs the oracle."""
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import clear_tp_moe_caches
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
     from tests.helpers import run_tp_moe_fp4
 
     clear_tp_moe_caches()

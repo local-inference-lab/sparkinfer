@@ -44,18 +44,18 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-from b12x.integration import (
-    B12XMHCScratchCaps,
-    b12x_mhc_post_pre,
-    b12x_mhc_pre,
+from sparkinfer.integration import (
+    SPARKINFERMHCScratchCaps,
+    sparkinfer_mhc_post_pre,
+    sparkinfer_mhc_pre,
     plan_mhc_scratch,
 )
-from b12x.integration import residual_kernels
-import b12x.cute.compiler as cute_compiler
+from sparkinfer.integration import residual_kernels
+import sparkinfer.cute.compiler as cute_compiler
 
 
 FAMILY = "residual_composite"
-INPUT_SCHEMA = "b12x.residual.composite.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.residual.composite.end_to_end_input.v1"
 DECODE_TOKENS = (1,)
 PREFILL_TOKENS = tuple(paired._PREFILL_TOKEN_DEFAULTS)
 DECODE_REPLAYS_PER_REPORTED_SAMPLE = 8
@@ -125,9 +125,9 @@ class CaseSpec:
             "specialization": {
                 "route": case.route,
                 "production_entrypoint": (
-                    "b12x_mhc_pre"
+                    "sparkinfer_mhc_pre"
                     if case.route == "decode-pre"
-                    else "b12x_mhc_post_pre"
+                    else "sparkinfer_mhc_post_pre"
                 ),
                 "environment": dict(case.environment),
                 "exact_artifacts": [
@@ -341,7 +341,7 @@ def _build_runtime(spec: CaseSpec, *, device: torch.device) -> RuntimeCase:
     expected_m = spec.expected_m
     max_tokens = tokens if expected_m is None else expected_m
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
@@ -425,7 +425,7 @@ def _build_runtime(spec: CaseSpec, *, device: torch.device) -> RuntimeCase:
 
     def launch() -> tuple[torch.Tensor, ...]:
         if case.route == "decode-pre":
-            result = b12x_mhc_pre(
+            result = sparkinfer_mhc_pre(
                 x,
                 pre_fn,
                 scale,
@@ -438,7 +438,7 @@ def _build_runtime(spec: CaseSpec, *, device: torch.device) -> RuntimeCase:
                 binding=binding,
             )
         else:
-            result = b12x_mhc_post_pre(
+            result = sparkinfer_mhc_post_pre(
                 x,
                 residual,
                 prev_post,

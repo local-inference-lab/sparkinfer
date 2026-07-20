@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
@@ -59,7 +59,7 @@ class _ForcedSplitDecodeGraphHarness:
         if self._scratch_plan is None:
             batch = page_table.shape[0]
             self._scratch_plan = plan_paged_attention_scratch(
-                B12XPagedAttentionScratchCaps(
+                SPARKINFERPagedAttentionScratchCaps(
                     device=self.q.device,
                     mode="decode",
                     dtype=self.q.dtype,

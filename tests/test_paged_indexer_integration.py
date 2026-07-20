@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.indexer import (
+from sparkinfer.attention.indexer import (
     clear_indexer_caches,
     index_topk_fp8,
     pack_paged_index_k_cache_reference,
@@ -11,8 +11,8 @@ from b12x.attention.indexer import (
     prepare_paged_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
-from b12x.attention.indexer.scratch import (
-    B12XIndexerPagedScratchCaps,
+from sparkinfer.attention.indexer.scratch import (
+    SPARKINFERIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
 )
 
@@ -132,7 +132,7 @@ def _bind_paged_indexer(
     output_physical_slots: bool = False,
 ):
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=num_heads,
             max_q_rows=rows,
@@ -253,7 +253,7 @@ def test_paged_index_plan_binding_keeps_metadata_aliases() -> None:
 def test_index_topk_fp8_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -400,7 +400,7 @@ def test_index_topk_fp8_graph_matches_reference(
 def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu").manual_seed(91_009)
@@ -487,7 +487,7 @@ def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
 def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "4096")
+    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "4096")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -658,7 +658,7 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
     assert chunk_count > 2  # this config is genuinely multi-chunk
 
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=64,
             max_q_rows=16,
@@ -693,7 +693,7 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
 def test_paged_index_supertile_plan_records_launch_contract() -> None:
     device = torch.device("cpu")
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=64,
             max_q_rows=2,
@@ -775,7 +775,7 @@ def test_paged_index_two_level_fold_clips_rounded_final_slice() -> None:
 def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "1536")
+    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "1536")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")

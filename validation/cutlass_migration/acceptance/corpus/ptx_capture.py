@@ -3,10 +3,10 @@
 CUTLASS writes retained PTX to a function-derived filename.  That filename is
 not a compile-specialization identity and can be reused by a later compile.
 The corpus therefore installs this module before collection and copies the PTX
-while :func:`b12x.cute.compiler._store_cute_compile_to_disk` still has both the
-compiled artifact and the exact b12x cache key.
+while :func:`sparkinfer.cute.compiler._store_cute_compile_to_disk` still has both the
+compiled artifact and the exact sparkinfer cache key.
 
-This module is benchmark instrumentation.  It is never imported by b12x
+This module is benchmark instrumentation.  It is never imported by sparkinfer
 production code and it does not alter a kernel, its compile options, or its
 runtime arguments.
 """
@@ -33,8 +33,8 @@ from validation.cutlass_migration.core.comparison_identity import (
 )
 
 
-_SCHEMA = "b12x.cute.frontend_ptx.v3"
-_MANIFEST_SCHEMA = "b12x.cute.compile_manifest.v3"
+_SCHEMA = "sparkinfer.cute.frontend_ptx.v3"
+_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
 _CAPTURE_ENV = "CORPUS_RETAIN_FRONTEND_PTX"
 _PTXAS_ENV = "CORPUS_COMMON_PTXAS"
 _NVDISASM_ENV = "CORPUS_NVDISASM"
@@ -599,7 +599,7 @@ def install() -> None:
         raise RuntimeError("CUTE_DSL_DUMP_DIR must be absolute for PTX capture")
     dump_dir.mkdir(parents=True, exist_ok=True)
 
-    import b12x.cute.compiler as compiler
+    import sparkinfer.cute.compiler as compiler
 
     cache_info = compiler.compile_cache_info()
     preinstall_activity = {
@@ -650,7 +650,7 @@ def install() -> None:
         try:
             _capture_one(compiler, cache_key, compiled)
         except Exception as exc:
-            # b12x deliberately suppresses disk-cache persistence failures.
+            # sparkinfer deliberately suppresses disk-cache persistence failures.
             # Retain the error here so the pytest plugin can make capture a
             # hard corpus gate at session finish.
             _record_error(cache_key, exc)
@@ -659,7 +659,7 @@ def install() -> None:
     _INSTALLED = True
     _INSTALLATION_EVIDENCE = {
         "compile_cache_activity_before_install": preinstall_activity,
-        "hook_target": "b12x.cute.compiler._store_cute_compile_to_disk",
+        "hook_target": "sparkinfer.cute.compiler._store_cute_compile_to_disk",
     }
 
 
@@ -767,7 +767,7 @@ def _semantic_target_key(target_key: Any) -> Any:
 def _semantic_payload_from_cache_payload(cache_payload: list[Any]) -> dict[str, Any]:
     if len(cache_payload) != 10:
         raise RuntimeError(f"explicit cache payload has {len(cache_payload)} fields")
-    if cache_payload[0] != "b12x_cute_compile_cache_v5_explicit_spec":
+    if cache_payload[0] != "sparkinfer_cute_compile_cache_v5_explicit_spec":
         raise RuntimeError(f"unsupported cache format {cache_payload[0]!r}")
     semantic: dict[str, Any] = {
         "cache_format": cache_payload[0],
@@ -1414,8 +1414,8 @@ def validate_cache(
     if not required and not enabled():
         return {"enabled": False, "status": "disabled", "object_count": 0}
     errors = list(_CAPTURE_ERRORS)
-    # B12X_CUTE_COMPILE_CACHE_DIR is already the object-cache root.  Only the
-    # fallback CUTE_DSL_CACHE_DIR path receives a b12x_object_cache suffix in
+    # SPARKINFER_CUTE_COMPILE_CACHE_DIR is already the object-cache root.  Only the
+    # fallback CUTE_DSL_CACHE_DIR path receives a sparkinfer_object_cache suffix in
     # production compiler code.
     root = cache_dir.resolve()
     artifacts, inventory_errors = _artifact_inventory(root)

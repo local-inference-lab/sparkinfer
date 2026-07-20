@@ -5,17 +5,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-import b12x.integration.tp_moe as tp_moe
-from b12x.integration.tp_moe import (
-    B12XFP4ExpertWeights,
-    B12XTopKRouting,
+import sparkinfer.integration.tp_moe as tp_moe
+from sparkinfer.integration.tp_moe import (
+    SPARKINFERFP4ExpertWeights,
+    SPARKINFERTopKRouting,
     TPMoEFP4Binding,
-    b12x_moe_fp4,
-    b12x_route_experts_fast,
-    b12x_sparse_moe_fp4,
+    sparkinfer_moe_fp4,
+    sparkinfer_route_experts_fast,
+    sparkinfer_sparse_moe_fp4,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
-    plan_b12x_fp4_moe_weights,
+    plan_sparkinfer_fp4_moe_weights,
     _PreparedWeightRepresentation,
 )
 
@@ -27,7 +27,7 @@ def _make_experts(
     source_format: str = "modelopt_nvfp4",
     activation: str = "silu",
     quant_mode: str | None = None,
-) -> B12XFP4ExpertWeights:
+) -> SPARKINFERFP4ExpertWeights:
     from types import SimpleNamespace
 
     quant_mode = quant_mode or (
@@ -39,7 +39,7 @@ def _make_experts(
     w2_fp4 = torch.zeros(num_experts, hidden_size, 1, dtype=torch.uint8)
     w1_alphas = torch.ones(num_experts, dtype=torch.float32)
     w2_alphas = torch.ones(num_experts, dtype=torch.float32)
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes=quant_mode,
         source_format=source_format,
         activation=activation,
@@ -69,7 +69,7 @@ def _make_experts(
             layout=layout,
             value=payload,
         )
-    return B12XFP4ExpertWeights(
+    return SPARKINFERFP4ExpertWeights(
         plan=plan,
         a1_gscale=torch.ones(num_experts, dtype=torch.float32),
         w1_fp4=w1_fp4,
@@ -122,8 +122,8 @@ def _make_fp4_binding_from_kwargs(**kwargs) -> TPMoEFP4Binding:
 
 def _make_fp4_binding(
     hidden_states: torch.Tensor,
-    experts: B12XFP4ExpertWeights,
-    routing: B12XTopKRouting,
+    experts: SPARKINFERFP4ExpertWeights,
+    routing: SPARKINFERTopKRouting,
     **kwargs,
 ) -> TPMoEFP4Binding:
     binding_kwargs = {
@@ -138,7 +138,7 @@ def _make_fp4_binding(
 
 def _make_sparse_binding(
     hidden_states: torch.Tensor,
-    experts: B12XFP4ExpertWeights,
+    experts: SPARKINFERFP4ExpertWeights,
     **kwargs,
 ):
     return build_tp_moe_sparse_fp4_binding(
@@ -171,7 +171,7 @@ def test_route_experts_fast_from_gate_weight_renormalizes() -> None:
         top_k=2,
         gate_weight=gate_weight,
     )
-    routing = b12x_route_experts_fast(binding=binding)
+    routing = sparkinfer_route_experts_fast(binding=binding)
 
     assert routing.router_logits is not None
     assert routing.topk_ids.dtype == torch.int32
@@ -203,7 +203,7 @@ def test_route_experts_fast_without_renormalize_returns_topk_logits() -> None:
         router_logits=router_logits,
         renormalize=False,
     )
-    routing = b12x_route_experts_fast(binding=binding)
+    routing = sparkinfer_route_experts_fast(binding=binding)
 
     assert routing.topk_ids.tolist() == [[1, 0]]
     torch.testing.assert_close(
@@ -229,7 +229,7 @@ def test_route_experts_fast_applies_gate_bias() -> None:
         gate_weight=gate_weight,
         gate_bias=gate_bias,
     )
-    routing = b12x_route_experts_fast(binding=binding)
+    routing = sparkinfer_route_experts_fast(binding=binding)
 
     assert routing.topk_ids.tolist() == [[0]]
     torch.testing.assert_close(routing.router_logits, torch.tensor([[5.0, 1.0]]))
@@ -243,7 +243,7 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
     def fake_build_tp_moe_fp4_binding(**kwargs):
         return _make_fp4_binding_from_kwargs(**kwargs)
 
-    def fake_b12x_moe_fp4(*, binding):
+    def fake_sparkinfer_moe_fp4(*, binding):
         captured["a"] = binding.a
         captured["topk_weights"] = binding.topk_weights
         captured["topk_ids"] = binding.topk_ids
@@ -268,9 +268,9 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
     )
     with (
         patch.object(tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding),
-        patch.object(tp_moe, "b12x_moe_fp4", fake_b12x_moe_fp4),
+        patch.object(tp_moe, "sparkinfer_moe_fp4", fake_sparkinfer_moe_fp4),
     ):
-        out, routing = b12x_sparse_moe_fp4(binding=binding)
+        out, routing = sparkinfer_sparse_moe_fp4(binding=binding)
 
     assert captured["a"] is hidden_states
     assert out.shape == hidden_states.shape
@@ -287,7 +287,7 @@ def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
         activation="swigluoai_uninterleave",
         quant_mode="w4a16",
     )
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 2, dtype=torch.float32),
         topk_ids=torch.zeros(2, 2, dtype=torch.int64),
     )
@@ -304,7 +304,7 @@ def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
         captured["swiglu_beta"] = kwargs.get("swiglu_beta")
         return _make_fp4_binding_from_kwargs(**kwargs)
 
-    def fake_b12x_moe_fp4(*, binding):
+    def fake_sparkinfer_moe_fp4(*, binding):
         if binding.output is None:
             return torch.ones_like(hidden_states)
         binding.output.fill_(1.0)
@@ -325,9 +325,9 @@ def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
     )
     with (
         patch.object(tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding),
-        patch.object(tp_moe, "b12x_moe_fp4", fake_b12x_moe_fp4),
+        patch.object(tp_moe, "sparkinfer_moe_fp4", fake_sparkinfer_moe_fp4),
     ):
-        actual = b12x_sparse_moe_fp4(binding=binding)
+        actual = sparkinfer_sparse_moe_fp4(binding=binding)
 
     assert actual is output
     assert captured["output"] is output
@@ -349,7 +349,7 @@ def test_fp4_expert_weights_default_to_modelopt_nvfp4_source_format() -> None:
 def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
@@ -360,7 +360,7 @@ def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
         quant_mode="nvfp4",
     )
     with pytest.raises(ValueError) as exc_info:
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
 
     message = str(exc_info.value)
     assert "source_format='compressed_tensors'" in message
@@ -370,7 +370,7 @@ def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
 def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
@@ -388,10 +388,10 @@ def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
 
 
 def test_sparse_moe_fp4_prepared_plan_ignores_runtime_force_env(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("SPARKINFER_MOE_FORCE_A16", "1")
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4)
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
@@ -401,18 +401,18 @@ def test_sparse_moe_fp4_prepared_plan_ignores_runtime_force_env(monkeypatch) -> 
         captured.append(kwargs.get("quant_mode"))
         return _make_fp4_binding_from_kwargs(**kwargs)
 
-    def fake_b12x_moe_fp4(*, binding):
+    def fake_sparkinfer_moe_fp4(*, binding):
         del binding
         return torch.ones_like(hidden_states)
 
     with (
         patch.object(tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding),
-        patch.object(tp_moe, "b12x_moe_fp4", fake_b12x_moe_fp4),
+        patch.object(tp_moe, "sparkinfer_moe_fp4", fake_sparkinfer_moe_fp4),
     ):
-        b12x_sparse_moe_fp4(
+        sparkinfer_sparse_moe_fp4(
             binding=_make_sparse_binding(hidden_states, experts, routing=routing)
         )
-        b12x_sparse_moe_fp4(
+        sparkinfer_sparse_moe_fp4(
             binding=_make_sparse_binding(
                 hidden_states,
                 experts,
@@ -428,7 +428,7 @@ def test_sparse_moe_fp4_scales_output_in_place() -> None:
     hidden_states = torch.randn(3, 4)
     experts = _make_experts(hidden_size=4)
     output = torch.empty_like(hidden_states)
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(3, 2, dtype=torch.float32),
         topk_ids=torch.zeros(3, 2, dtype=torch.int64),
     )
@@ -436,7 +436,7 @@ def test_sparse_moe_fp4_scales_output_in_place() -> None:
     def fake_build_tp_moe_fp4_binding(**kwargs):
         return _make_fp4_binding_from_kwargs(**kwargs)
 
-    def fake_b12x_moe_fp4(*, binding):
+    def fake_sparkinfer_moe_fp4(*, binding):
         assert binding.output is not None
         binding.output.fill_(2.0)
         return binding.output
@@ -450,9 +450,9 @@ def test_sparse_moe_fp4_scales_output_in_place() -> None:
     )
     with (
         patch.object(tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding),
-        patch.object(tp_moe, "b12x_moe_fp4", fake_b12x_moe_fp4),
+        patch.object(tp_moe, "sparkinfer_moe_fp4", fake_sparkinfer_moe_fp4),
     ):
-        actual = b12x_sparse_moe_fp4(binding=binding)
+        actual = sparkinfer_sparse_moe_fp4(binding=binding)
 
     assert actual is output
     torch.testing.assert_close(actual, torch.full_like(hidden_states, 0.5))
@@ -473,7 +473,7 @@ def test_sparse_moe_fp4_requires_topk_or_routing() -> None:
 def test_sparse_moe_fp4_keeps_routing_path_explicit() -> None:
     hidden_states = torch.randn(2, 4)
     experts = _make_experts(hidden_size=4)
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
@@ -489,14 +489,14 @@ def test_sparse_moe_fp4_keeps_routing_path_explicit() -> None:
 def test_sparse_moe_fp4_rejects_routing_batch_mismatch() -> None:
     hidden_states = torch.randn(3, 4)
     experts = _make_experts(hidden_size=4)
-    routing = B12XTopKRouting(
+    routing = SPARKINFERTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
     )
     binding = _make_sparse_binding(hidden_states, experts, routing=routing)
 
     try:
-        b12x_sparse_moe_fp4(binding=binding)
+        sparkinfer_sparse_moe_fp4(binding=binding)
     except ValueError as exc:
         assert "routing batch mismatch" in str(exc)
     else:

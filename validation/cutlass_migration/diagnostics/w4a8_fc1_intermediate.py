@@ -25,7 +25,7 @@ def _prepare_cutlass_runtime() -> str:
 
         sys.modules["cutlass._mlir_helpers"] = _mlir_helpers
 
-    from b12x.cute.runtime_patches import apply_cutlass_runtime_patches
+    from sparkinfer.cute.runtime_patches import apply_cutlass_runtime_patches
 
     apply_cutlass_runtime_patches()
     return version
@@ -229,7 +229,7 @@ def main() -> int:
             )
 
     payload = {
-        "schema": "b12x.w4a8.fc1_intermediate_diagnostic.v1",
+        "schema": "sparkinfer.w4a8.fc1_intermediate_diagnostic.v1",
         "toolchain": {
             "cutlass_dsl": version,
             "torch": torch.__version__,

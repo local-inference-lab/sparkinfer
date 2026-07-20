@@ -9,13 +9,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
-from b12x.distributed.pcie_oneshot import PCIeOneshotAllReducePool
+from sparkinfer.distributed.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
+    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
     reason=(
-        "set B12X_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
+        "set SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
         "RMSNorm GPU tests"
     ),
 )
@@ -217,7 +217,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if torch.cuda.device_count() < world_size:

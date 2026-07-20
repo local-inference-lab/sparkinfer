@@ -8,7 +8,7 @@ For each page count this script:
 - races candidates in round-robin batches with CI-based elimination,
 - picks the smallest surviving chunk-page candidate per page,
 - run-length encodes the dense winner curve,
-- emits a generated tuning module under ``b12x.attention.paged.tuning``.
+- emits a generated tuning module under ``sparkinfer.attention.paged.tuning``.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.integration.attention import PagedAttentionWorkspace
-from b12x.attention.paged.tuning.registry import normalize_kv_dtype_key
+from sparkinfer.integration.attention import PagedAttentionWorkspace
+from sparkinfer.attention.paged.tuning.registry import normalize_kv_dtype_key
 
 from benchmarks.benchmark_paged_attention import (
     _bench_graph,
@@ -182,7 +182,7 @@ def _family_module_path(*, mode: str, kv_dtype: str) -> pathlib.Path:
     dtype_key = normalize_kv_dtype_key(kv_dtype)
     return (
         pathlib.Path(__file__).resolve().parents[1]
-        / "b12x"
+        / "sparkinfer"
         / "attention"
         / "paged"
         / "tuning"

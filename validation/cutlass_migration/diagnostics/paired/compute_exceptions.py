@@ -11,7 +11,7 @@ already exercised by a family-specific ABBA adapter:
 
 Every arm is resolved from an immutable compile-cache object.  The production
 launcher is allowed to construct its normal tensor wrapper, but its module-local
-``b12x_compile`` is replaced by an exact-spec resolver; any unlisted compile
+``sparkinfer_compile`` is replaced by an exact-spec resolver; any unlisted compile
 request aborts.  Both arms capture against the same input, output, and workspace
 addresses.  GPU oracle checks, live-input mutation, full-output overwrite,
 zero-allocation replay, graph topology, warm/cold-L2 ABBA, artifact hashes, and
@@ -56,7 +56,7 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ _CASES = {
                 (
                     "gemm.dense",
                     "23b007fedc8c48cfbe86fabc93996c305e3142a66ac23730c216e316588857ba",
-                    "b12x.gemm.dense._DenseGemmLaunch",
+                    "sparkinfer.gemm.dense._DenseGemmLaunch",
                 ),
             ),
             corpus_nodeid=(
@@ -106,7 +106,7 @@ _CASES = {
                 (
                     "gemm.dense_fused_quant_a",
                     "1e11604b95ff4b527fa84ec9c8615ff62bb36169ee5956e6671848148d54ea13",
-                    "b12x.gemm.dense._DenseGemmFusedQuantALaunch",
+                    "sparkinfer.gemm.dense._DenseGemmFusedQuantALaunch",
                 ),
             ),
             corpus_nodeid=(
@@ -125,7 +125,7 @@ _CASES = {
                 (
                     "gemm.dense_fused_quant_a_grouped",
                     "55325c809bb30e4f47abf0bddff6a43a25f202c1dde4cd6738bb34ca4077560e",
-                    "b12x.gemm.dense._DenseGemmFusedQuantAGroupedLaunch",
+                    "sparkinfer.gemm.dense._DenseGemmFusedQuantAGroupedLaunch",
                 ),
             ),
             corpus_nodeid=(
@@ -144,7 +144,7 @@ _CASES = {
                 (
                     "integration.tp_moe.micro_direct",
                     "9410c16b77c3f5eaa4a4a3b2635de5cb2021ca0d69cd9a572d7a0a1eacb3b071",
-                    "b12x.moe.fused.silu.MoEMicroKernelSilu",
+                    "sparkinfer.moe.fused.silu.MoEMicroKernelSilu",
                 ),
             ),
             corpus_nodeid=(
@@ -172,12 +172,12 @@ _CASES = {
                 (
                     "integration.tp_moe.tiny_decode",
                     "d62452570aa283a5fceda983147c4cfd2d8240f20d60e6886f61b644e1d735b7",
-                    "b12x.moe.fused.tiny_decode.MoETinyDecodeKernelBackendPhase1",
+                    "sparkinfer.moe.fused.tiny_decode.MoETinyDecodeKernelBackendPhase1",
                 ),
                 (
                     "integration.tp_moe.tiny_decode",
                     "a907a087fca9ba405e4a11fe532d6b30d17088ddb6a599e58df6e049ee152738",
-                    "b12x.moe.fused.tiny_decode.MoETinyDecodeKernelBackendPhase2",
+                    "sparkinfer.moe.fused.tiny_decode.MoETinyDecodeKernelBackendPhase2",
                 ),
             ),
             corpus_nodeid=(
@@ -205,7 +205,7 @@ _CASES = {
                 (
                     "moe.w4a16.gemm",
                     "b8786f12e68d95b6436c8619812a07db2cb6f6f39dd727c85cee3415cd5df81c",
-                    "b12x.moe.fused.w4a16.kernel.W4A16GemmKernel",
+                    "sparkinfer.moe.fused.w4a16.kernel.W4A16GemmKernel",
                 ),
             ),
             corpus_nodeid=(
@@ -233,7 +233,7 @@ _CASES = {
                 (
                     "moe.w4a16.small_m_direct",
                     "5f2f4d1dc21b086d371315981ac5b5229deefa0bad4ce1dbdfb921faaef6a1d5",
-                    ("b12x.moe.fused.w4a16.kernel.MoEMicroKernelW4A16SmallMDirect"),
+                    ("sparkinfer.moe.fused.w4a16.kernel.MoEMicroKernelW4A16SmallMDirect"),
                 ),
             ),
             corpus_nodeid=(
@@ -262,12 +262,12 @@ _CASES = {
                 (
                     "moe.w4a16.fused_moe",
                     "ccfeba5ceedeac848bf224e8508f28a9ef6a90f1e53d10f9dc8812f38745c415",
-                    "b12x.moe.fused.w4a16.kernel.W4A16FusedMoeKernel",
+                    "sparkinfer.moe.fused.w4a16.kernel.W4A16FusedMoeKernel",
                 ),
                 (
                     "moe.w4a16.topk_sum",
                     "4622cf1512d6a83ed3233c7fa5254e2544067f673c3b608d197388ba9c06845a",
-                    "b12x.moe.fused.w4a16.kernel.W4A16TopKSumKernel",
+                    "sparkinfer.moe.fused.w4a16.kernel.W4A16TopKSumKernel",
                 ),
             ),
             corpus_nodeid=(
@@ -419,7 +419,7 @@ def _verify_ptx_sidecar(provenance: Mapping[str, Any]) -> dict[str, object]:
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     obj = payload.get("object")
     if (
-        payload.get("schema") != "b12x.cute.frontend_ptx.v3"
+        payload.get("schema") != "sparkinfer.cute.frontend_ptx.v3"
         or payload.get("cache_key") != provenance["cache_key"]
         or payload.get("compile_spec_hash") != provenance["compile_spec_hash"]
         or not isinstance(obj, Mapping)
@@ -545,7 +545,7 @@ def _exact_compile_resolution(
     compiled_by_spec: Mapping[str, object],
     observed_specs: list[str],
 ):
-    original = module.b12x_compile
+    original = module.sparkinfer_compile
 
     def resolve_exact(*_args, compile_spec=None, **_kwargs):
         if compile_spec is None:
@@ -560,15 +560,15 @@ def _exact_compile_resolution(
                 f"allowed={sorted(compiled_by_spec)}"
             ) from exc
 
-    module.b12x_compile = resolve_exact
+    module.sparkinfer_compile = resolve_exact
     try:
         yield
     finally:
-        module.b12x_compile = original
+        module.sparkinfer_compile = original
 
 
 def _dense_cache_clear() -> None:
-    import b12x.gemm.dense as dense
+    import sparkinfer.gemm.dense as dense
 
     dense._get_compiled_dense_gemm.cache_clear()
     dense._get_compiled_dense_gemm_fused_quant_a.cache_clear()
@@ -576,7 +576,7 @@ def _dense_cache_clear() -> None:
 
 
 def _build_dense_nvfp4() -> CaseState:
-    import b12x.gemm.dense as dense
+    import sparkinfer.gemm.dense as dense
     from tests.test_cute_migration_gemm_corpus import (
         _dequantize_nvfp4_dense_operand,
         _quantize_nvfp4_operand,
@@ -668,8 +668,8 @@ def _build_dense_nvfp4() -> CaseState:
 
 
 def _build_dense_fused(*, grouped: bool) -> CaseState:
-    import b12x.gemm.dense as dense
-    from b12x.gemm.wo_projection import quantize_mxfp8_rows_torch
+    import sparkinfer.gemm.dense as dense
+    from sparkinfer.gemm.wo_projection import quantize_mxfp8_rows_torch
     from tests.test_cute_migration_gemm_corpus import _mxfp8_gemm_reference
 
     generator = torch.Generator(device="cuda").manual_seed(
@@ -765,14 +765,14 @@ def _build_dense_fused(*, grouped: bool) -> CaseState:
 
 
 def _tp_cache_clear() -> None:
-    import b12x.integration.tp_moe as tp_moe
+    import sparkinfer.integration.tp_moe as tp_moe
 
     tp_moe.clear_tp_moe_caches()
     tp_moe._TINY_DECODE_KERNEL_CACHE.clear()
 
 
 def _build_tp_moe(*, tiny: bool) -> CaseState:
-    import b12x.integration.tp_moe as tp_moe
+    import sparkinfer.integration.tp_moe as tp_moe
     from tests.test_cute_migration_moe_standard_corpus import (
         _make_inputs,
         _make_mxfp4_weights,
@@ -824,7 +824,7 @@ def _build_tp_moe(*, tiny: bool) -> CaseState:
         live.topk_weights.copy_(template.topk_weights)
 
     def launch() -> torch.Tensor:
-        result = tp_moe.b12x_moe_fp4(binding=bound.binding)
+        result = tp_moe.sparkinfer_moe_fp4(binding=bound.binding)
         if result.data_ptr() != output.data_ptr():
             raise AssertionError("TP-MoE production route replaced bound output")
         return result
@@ -867,7 +867,7 @@ def _build_tp_moe(*, tiny: bool) -> CaseState:
 
 
 def _w4_cache_clear() -> None:
-    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
+    import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
 
     w4a16_kernel.clear_w4a16_kernel_cache()
 
@@ -877,10 +877,10 @@ def _build_w4a16_standalone() -> CaseState:
         _gemm_reference,
         _make_source_weights,
     )
-    from b12x.cute.utils import current_cuda_stream
-    from b12x.moe.fused.w4a16.host import packed_gemm_scratch_elements
-    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-    from b12x.moe.fused.w4a16.prepare import (
+    from sparkinfer.cute.utils import current_cuda_stream
+    from sparkinfer.moe.fused.w4a16.host import packed_gemm_scratch_elements
+    import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
+    from sparkinfer.moe.fused.w4a16.prepare import (
         prepare_w4a16_modelopt_nvfp4_weights,
     )
 
@@ -1023,9 +1023,9 @@ def _build_w4a16_standalone() -> CaseState:
 
 
 def _build_w4a16_small_m() -> CaseState:
-    from b12x.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
-    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-    from b12x.moe.fused.w4a16.prepare import (
+    from sparkinfer.moe.fused.reference import moe_reference_w4a16_fp4_e8m0_k32
+    import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
+    from sparkinfer.moe.fused.w4a16.prepare import (
         make_w4a16_packed_buffers,
         prepare_w4a16_e8m0_native_weights,
     )
@@ -1192,8 +1192,8 @@ def _build_w4a16_small_m() -> CaseState:
 
 
 def _build_w4a16_swiglu_limit() -> CaseState:
-    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-    from b12x.moe.fused.w4a16.prepare import (
+    import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
+    from sparkinfer.moe.fused.w4a16.prepare import (
         make_w4a16_packed_buffers,
         prepare_w4a16_modelopt_nvfp4_weights,
     )
@@ -1654,10 +1654,10 @@ def _run_case(
 @contextmanager
 def _controlled_dispatch_environment():
     controlled = {
-        "B12X_W4A8_TINY_DECODE": "1",
-        "B12X_W4A16_SMALL_M_DIRECT": "1",
+        "SPARKINFER_W4A8_TINY_DECODE": "1",
+        "SPARKINFER_W4A16_SMALL_M_DIRECT": "1",
     }
-    removed = ("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "B12X_DYNAMIC_TILE_MN")
+    removed = ("SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS", "SPARKINFER_DYNAMIC_TILE_MN")
     previous = {name: os.environ.get(name) for name in (*controlled, *removed)}
     try:
         os.environ.update(controlled)
@@ -1715,7 +1715,7 @@ def main() -> None:
         )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("this benchmark requires an SM120 CUDA GPU")
-    observed_fingerprint = cute_compiler.b12x_package_fingerprint()
+    observed_fingerprint = cute_compiler.sparkinfer_package_fingerprint()
     if observed_fingerprint != args.expected_package_fingerprint:
         raise RuntimeError(
             "host source fingerprint differs from explicit final-source pin: "
@@ -1769,7 +1769,7 @@ def main() -> None:
     final_mode = _mode_snapshot(int(args.expected_physical_gpu))
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     report = {
-        "schema": "b12x.compute_exceptions.cache_abba.v1",
+        "schema": "sparkinfer.compute_exceptions.cache_abba.v1",
         "command": [sys.executable, *sys.argv],
         "worktree": str(REPO_ROOT),
         "git_head": _git("rev-parse", "HEAD"),

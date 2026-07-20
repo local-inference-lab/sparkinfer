@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 import cutlass.cute as cute
 
-import b12x.cute.compiler as cute_compiler
-from b12x.attention.paged.api import _get_cached_plane_tma_descs
-from b12x.cute.compiler import KernelCompileSpec
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.attention.paged.api import _get_cached_plane_tma_descs
+from sparkinfer.cute.compiler import KernelCompileSpec
 
 
 class _WorkspaceStub:
@@ -79,8 +79,8 @@ def test_plane_tma_descriptor_cache_keeps_distinct_layer_bindings() -> None:
 
 def test_explicit_compile_spec_warms_compile_cache_during_capture(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
 
     class _Compiled:

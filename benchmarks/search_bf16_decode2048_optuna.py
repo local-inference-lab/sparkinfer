@@ -4,7 +4,7 @@
 This driver searches the realized plan directly rather than indirect scheduler
 knobs. Each trial:
 
-- benchmarks only b12x
+- benchmarks only sparkinfer
 - captures one fixed FlashInfer FA2 reference output for correctness
 - returns score=0 on compile/runtime failure
 - returns score=0 on non-finite / bad-cosine outputs
@@ -42,11 +42,11 @@ import torch
 
 import benchmarks.benchmark_paged_attention as bench
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.attention.paged import api as paged_api
-from b12x.attention.paged import merge as paged_merge
-from b12x.attention.paged import planner as paged_planner
-from b12x.attention.paged import workspace as paged_workspace
-from b12x.integration.attention import clear_attention_caches
+from sparkinfer.attention.paged import api as paged_api
+from sparkinfer.attention.paged import merge as paged_merge
+from sparkinfer.attention.paged import planner as paged_planner
+from sparkinfer.attention.paged import workspace as paged_workspace
+from sparkinfer.integration.attention import clear_attention_caches
 
 CHUNK_PAGE_LADDER = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 LONG_FORM_CUTOFF_TOKENS_LADDER = [128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768]
@@ -91,10 +91,10 @@ class TargetSpec:
 @dataclass(frozen=True)
 class TrialResult:
     score: float
-    b12x_mean_us: float
-    b12x_ci_low_us: float
-    b12x_ci_high_us: float
-    b12x_sem_us: float
+    sparkinfer_mean_us: float
+    sparkinfer_ci_low_us: float
+    sparkinfer_ci_high_us: float
+    sparkinfer_sem_us: float
     plan_desc: str
     cta_tile_q: int
     kv_chunk_size: int
@@ -116,7 +116,7 @@ def _study_name_for_target(spec: TargetSpec) -> str:
 
 
 def _journal_path_for_target(spec: TargetSpec) -> pathlib.Path:
-    return pathlib.Path("/tmp/b12x-optuna") / f"{_study_name_for_target(spec)}.journal"
+    return pathlib.Path("/tmp/sparkinfer-optuna") / f"{_study_name_for_target(spec)}.journal"
 
 
 def _sample_common_config(trial: optuna.Trial) -> dict[str, object]:
@@ -295,7 +295,7 @@ def _baseline_params(spec: TargetSpec, plan: paged_planner.PagedPlan) -> dict[st
     return config
 
 
-def _capture_b12x_graph(
+def _capture_sparkinfer_graph(
     *,
     spec: TargetSpec,
     q: torch.Tensor,
@@ -395,7 +395,7 @@ def _run_trial(
 ) -> TrialResult:
     with _scheduler_overrides(spec, config):
         clear_attention_caches()
-        b12x_graph, b12x_output, plan = _capture_b12x_graph(
+        sparkinfer_graph, sparkinfer_output, plan = _capture_sparkinfer_graph(
             spec=spec,
             q=q,
             k_cache=k_cache,
@@ -407,27 +407,27 @@ def _run_trial(
             v_descale=v_descale,
             warmup=warmup,
         )
-        b12x_mean_us, b12x_ci_low_us, b12x_ci_high_us, b12x_sem_us = _bench_backend_mean_us(
-            b12x_graph,
+        sparkinfer_mean_us, sparkinfer_ci_low_us, sparkinfer_ci_high_us, sparkinfer_sem_us = _bench_backend_mean_us(
+            sparkinfer_graph,
             replays=replays,
             l2_flush=l2_flush,
         )
-        max_abs = float((b12x_output - fa_output).abs().max().item())
-        cos = float(bench._cosine_similarity(b12x_output, fa_output))
+        max_abs = float((sparkinfer_output - fa_output).abs().max().item())
+        cos = float(bench._cosine_similarity(sparkinfer_output, fa_output))
         valid = (
             math.isfinite(cos)
             and math.isfinite(max_abs)
-            and math.isfinite(b12x_mean_us)
-            and b12x_mean_us > 0.0
+            and math.isfinite(sparkinfer_mean_us)
+            and sparkinfer_mean_us > 0.0
             and cos >= cos_threshold
         )
-        score = (1.0 / b12x_mean_us) if valid else 0.0
+        score = (1.0 / sparkinfer_mean_us) if valid else 0.0
         return TrialResult(
             score=score,
-            b12x_mean_us=b12x_mean_us,
-            b12x_ci_low_us=b12x_ci_low_us,
-            b12x_ci_high_us=b12x_ci_high_us,
-            b12x_sem_us=b12x_sem_us,
+            sparkinfer_mean_us=sparkinfer_mean_us,
+            sparkinfer_ci_low_us=sparkinfer_ci_low_us,
+            sparkinfer_ci_high_us=sparkinfer_ci_high_us,
+            sparkinfer_sem_us=sparkinfer_sem_us,
             plan_desc=f"chunk={plan.kv_chunk_size},{'split' if plan.split_kv else 'nosplit'}",
             cta_tile_q=int(plan.cta_tile_q),
             kv_chunk_size=int(plan.kv_chunk_size),
@@ -488,10 +488,10 @@ def _make_objective(
         trial.set_user_attr("cta_tile_q", result.cta_tile_q)
         trial.set_user_attr("kv_chunk_size", result.kv_chunk_size)
         trial.set_user_attr("split_kv", result.split_kv)
-        trial.set_user_attr("b12x_mean_us", result.b12x_mean_us)
-        trial.set_user_attr("b12x_ci_low_us", result.b12x_ci_low_us)
-        trial.set_user_attr("b12x_ci_high_us", result.b12x_ci_high_us)
-        trial.set_user_attr("b12x_sem_us", result.b12x_sem_us)
+        trial.set_user_attr("sparkinfer_mean_us", result.sparkinfer_mean_us)
+        trial.set_user_attr("sparkinfer_ci_low_us", result.sparkinfer_ci_low_us)
+        trial.set_user_attr("sparkinfer_ci_high_us", result.sparkinfer_ci_high_us)
+        trial.set_user_attr("sparkinfer_sem_us", result.sparkinfer_sem_us)
         trial.set_user_attr("max_abs", result.max_abs)
         trial.set_user_attr("cos", result.cos)
         return result.score
@@ -501,16 +501,16 @@ def _make_objective(
 
 def _print_top_trials(study: optuna.Study, *, limit: int) -> None:
     complete = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-    complete.sort(key=lambda trial: float(trial.user_attrs.get("b12x_mean_us", float("inf"))))
+    complete.sort(key=lambda trial: float(trial.user_attrs.get("sparkinfer_mean_us", float("inf"))))
     print(f"top {min(limit, len(complete))} trials:")
     for trial in complete[:limit]:
         print(
             {
                 "trial": trial.number,
                 "score": round(float(trial.value), 9),
-                "b12x_mean_us": trial.user_attrs.get("b12x_mean_us"),
-                "b12x_ci_low_us": trial.user_attrs.get("b12x_ci_low_us"),
-                "b12x_ci_high_us": trial.user_attrs.get("b12x_ci_high_us"),
+                "sparkinfer_mean_us": trial.user_attrs.get("sparkinfer_mean_us"),
+                "sparkinfer_ci_low_us": trial.user_attrs.get("sparkinfer_ci_low_us"),
+                "sparkinfer_ci_high_us": trial.user_attrs.get("sparkinfer_ci_high_us"),
                 "plan": trial.user_attrs.get("plan_desc"),
                 "cta_tile_q": trial.user_attrs.get("cta_tile_q"),
                 "kv_chunk_size": trial.user_attrs.get("kv_chunk_size"),
@@ -665,9 +665,9 @@ def main() -> None:
         {
             "trial": best.number,
             "score": round(float(best.value), 9),
-            "b12x_mean_us": best.user_attrs.get("b12x_mean_us"),
-            "b12x_ci_low_us": best.user_attrs.get("b12x_ci_low_us"),
-            "b12x_ci_high_us": best.user_attrs.get("b12x_ci_high_us"),
+            "sparkinfer_mean_us": best.user_attrs.get("sparkinfer_mean_us"),
+            "sparkinfer_ci_low_us": best.user_attrs.get("sparkinfer_ci_low_us"),
+            "sparkinfer_ci_high_us": best.user_attrs.get("sparkinfer_ci_high_us"),
             "plan": best.user_attrs.get("plan_desc"),
             "cta_tile_q": best.user_attrs.get("cta_tile_q"),
             "kv_chunk_size": best.user_attrs.get("kv_chunk_size"),

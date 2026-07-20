@@ -27,12 +27,12 @@ import sys
 from typing import Any
 
 
-PRODUCTION_SOURCE_SCHEMA = "b12x.cute.migration.production_source_snapshot.v1"
-CONTRACT_SCHEMA = "b12x.cute.migration.end_to_end_contract.v3"
-EVIDENCE_SET_SCHEMA = "b12x.cute.migration.end_to_end_evidence_set.v2"
-RUN_SCHEMA = "b12x.cute.migration.end_to_end_process_result.v4"
-INDEX_SCHEMA = "b12x.cute.migration.end_to_end_release_index.v2"
-ROW_SCHEMA = "b12x.cute.migration.end_to_end_performance_row.v3"
+PRODUCTION_SOURCE_SCHEMA = "sparkinfer.cute.migration.production_source_snapshot.v1"
+CONTRACT_SCHEMA = "sparkinfer.cute.migration.end_to_end_contract.v3"
+EVIDENCE_SET_SCHEMA = "sparkinfer.cute.migration.end_to_end_evidence_set.v2"
+RUN_SCHEMA = "sparkinfer.cute.migration.end_to_end_process_result.v4"
+INDEX_SCHEMA = "sparkinfer.cute.migration.end_to_end_release_index.v2"
+ROW_SCHEMA = "sparkinfer.cute.migration.end_to_end_performance_row.v3"
 
 # Keep this aligned with the production schemas accepted by `python -m
 # validation.cutlass_migration acceptance release-index`.  The end-to-end gate
@@ -83,8 +83,8 @@ EXPECTED_PACKAGES = {
 # production snapshot remains the pristine pre-migration package; these two
 # files are recorded separately as the reviewed runtime overlay.
 BASELINE_RUNTIME_OVERLAY_PATHS = (
-    "b12x/cute/compiler.py",
-    "b12x/cute/runtime_patches.py",
+    "sparkinfer/cute/compiler.py",
+    "sparkinfer/cute/runtime_patches.py",
 )
 
 MINIMUM_SAMPLES_PER_PROCESS_CONDITION = 1_000
@@ -93,8 +93,8 @@ MAX_MEAN_REGRESSION_PCT = 0.5
 MAX_MEDIAN_REGRESSION_PCT = 0.5
 MAX_P95_REGRESSION_PCT = 1.0
 MAX_RUN_MEAN_DRIFT_PCT = 1.0
-CUDA_EVENT_POOL_SCHEMA = "b12x.cuda_event_pool.v1"
-GPU_MODE_STABILITY_SCHEMA = "b12x.gpu_mode_stability.v1"
+CUDA_EVENT_POOL_SCHEMA = "sparkinfer.cuda_event_pool.v1"
+GPU_MODE_STABILITY_SCHEMA = "sparkinfer.gpu_mode_stability.v1"
 REQUIRED_TIMING_PSTATE = "P1"
 MINIMUM_PRECONDITION_SECONDS = 5.0
 MAXIMUM_PRECONDITION_SECONDS = 60.0
@@ -303,7 +303,7 @@ def _validate_package_tree(value: object, location: str) -> dict[str, Any]:
         {"root", "fingerprint", "records_sha256", "file_count", "files"},
         location,
     )
-    _require(package["root"] == "b12x", f"{location}: package root is not b12x")
+    _require(package["root"] == "sparkinfer", f"{location}: package root is not sparkinfer")
     _require(
         _is_sha256(package["fingerprint"]), f"{location}: invalid content fingerprint"
     )
@@ -320,7 +320,7 @@ def _validate_package_tree(value: object, location: str) -> dict[str, Any]:
 
 
 def _validate_source_endpoint(value: object, location: str) -> dict[str, Any]:
-    endpoint = _exact_keys(value, {"repo_root", "git", "b12x_package"}, location)
+    endpoint = _exact_keys(value, {"repo_root", "git", "sparkinfer_package"}, location)
     repo_root = endpoint["repo_root"]
     _require(
         isinstance(repo_root, str) and Path(repo_root).is_absolute(),
@@ -340,17 +340,17 @@ def _validate_source_endpoint(value: object, location: str) -> dict[str, Any]:
         f"{location}: git status is not sorted/unique string provenance",
     )
     package = _validate_package_tree(
-        endpoint["b12x_package"], f"{location}.b12x_package"
+        endpoint["sparkinfer_package"], f"{location}.sparkinfer_package"
     )
-    return {**endpoint, "git": git, "b12x_package": package}
+    return {**endpoint, "git": git, "sparkinfer_package": package}
 
 
 def _overlay_payload(
     production_files: list[dict[str, Any]],
     runtime_files: list[dict[str, Any]],
 ) -> tuple[list[str], dict[str, Any]]:
-    production = {f"b12x/{record['path']}": record for record in production_files}
-    runtime = {f"b12x/{record['path']}": record for record in runtime_files}
+    production = {f"sparkinfer/{record['path']}": record for record in production_files}
+    runtime = {f"sparkinfer/{record['path']}": record for record in runtime_files}
     changed_paths = sorted(
         path
         for path in set(production) | set(runtime)
@@ -410,8 +410,8 @@ def _validate_source_manifest(path: Path, side: str) -> dict[str, Any]:
         f"{path}.runtime_overlay",
     )
     changed_paths, details = _overlay_payload(
-        production["b12x_package"]["files"],
-        runtime["b12x_package"]["files"],
+        production["sparkinfer_package"]["files"],
+        runtime["sparkinfer_package"]["files"],
     )
     _require(
         overlay["changed_paths"] == changed_paths,
@@ -442,8 +442,8 @@ def _validate_source_manifest(path: Path, side: str) -> dict[str, Any]:
         "manifest": manifest,
         "manifest_sha256": computed,
         "manifest_artifact_sha256": _sha256_file(path),
-        "production_fingerprint": str(production["b12x_package"]["fingerprint"]),
-        "runtime_package_fingerprint": str(runtime["b12x_package"]["fingerprint"]),
+        "production_fingerprint": str(production["sparkinfer_package"]["fingerprint"]),
+        "runtime_package_fingerprint": str(runtime["sparkinfer_package"]["fingerprint"]),
         "artifact": _artifact(path, schema=PRODUCTION_SOURCE_SCHEMA),
     }
 

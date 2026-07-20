@@ -1,7 +1,7 @@
 """GPU-only pytest telemetry for the CUTLASS migration corpus.
 
 This plugin is loaded only by the ``python -m validation.cutlass_migration
-acceptance corpus`` runner.  It records the in-process b12x compile-cache
+acceptance corpus`` runner.  It records the in-process sparkinfer compile-cache
 counters and the exact pytest outcomes, so a passing subprocess cannot hide
 skips or a zero-kernel/reference-only run.
 """
@@ -59,7 +59,7 @@ def _telemetry_path() -> Path:
 
 def _test_nvtx_label(case_id: str, nodeid: str) -> str:
     identity = hashlib.sha256(f"{case_id}\0{nodeid}".encode()).hexdigest()
-    return f"b12x-cute-corpus-test:{case_id}:{identity}"
+    return f"sparkinfer-cute-corpus-test:{case_id}:{identity}"
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -117,7 +117,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     )
     global _SESSION_NVTX_OPEN
     case_id = os.environ["CORPUS_CASE_ID"]
-    torch.cuda.nvtx.range_push(f"b12x-cute-corpus-case:{case_id}")
+    torch.cuda.nvtx.range_push(f"sparkinfer-cute-corpus-case:{case_id}")
     _SESSION_NVTX_OPEN = True
 
 
@@ -172,7 +172,7 @@ def pytest_runtest_makereport(
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     import torch
 
-    from b12x.cute.compiler import compile_cache_info
+    from sparkinfer.cute.compiler import compile_cache_info
     from validation.cutlass_migration.acceptance.corpus.ptx_capture import validate_cache
     from validation.cutlass_migration.acceptance.corpus.source_snapshot import (
         verify_frozen_source_from_environment,
@@ -184,7 +184,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         torch.cuda.nvtx.range_pop()
         _SESSION_NVTX_OPEN = False
 
-    cache_dir = Path(os.environ["B12X_CUTE_COMPILE_CACHE_DIR"])
+    cache_dir = Path(os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"])
     # nvdisasm subprocesses launched while Nsight/CUPTI is attached can hang
     # after completing their work.  The unprofiled prewarm and final
     # coordinator perform exact cubin redisassembly; the profiled child still
@@ -205,7 +205,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     )
 
     payload = {
-        "schema": "b12x.cute.migration.pytest_telemetry.v3",
+        "schema": "sparkinfer.cute.migration.pytest_telemetry.v3",
         "exitstatus": int(exitstatus),
         "gpu": dict(_GPU),
         "compile_cache": compile_cache_info(),

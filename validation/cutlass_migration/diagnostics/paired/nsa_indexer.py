@@ -46,38 +46,38 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import CORE_ROOT, REPO_ROOT
-from b12x.attention.indexer import (
+from sparkinfer.attention.indexer import (
     MSA_SM_SCALE,
     build_paged_mqa_schedule_metadata,
     clear_indexer_caches,
     contiguous_tiled_topk,
 )
-import b12x.attention.indexer.contiguous_kernel as contiguous_kernel
-from b12x.attention.indexer.contiguous_kernel import (
+import sparkinfer.attention.indexer.contiguous_kernel as contiguous_kernel
+from sparkinfer.attention.indexer.contiguous_kernel import (
     run_contiguous_block_scores_kernel,
 )
-import b12x.attention.indexer.kernel as paged_kernel
-from b12x.attention.indexer.kernel import (
+import sparkinfer.attention.indexer.kernel as paged_kernel
+from sparkinfer.attention.indexer.kernel import (
     build_indexer_paged_logits_kernel_binding,
     build_indexer_paged_supertile_logits_kernel_binding,
     build_indexer_paged_tiled_logits_kernel_binding,
 )
-import b12x.attention.indexer.persistent_topk as persistent_topk_kernel
-from b12x.attention.indexer.persistent_topk import (
+import sparkinfer.attention.indexer.persistent_topk as persistent_topk_kernel
+from sparkinfer.attention.indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from b12x.attention.indexer.msa_reference import (
+from sparkinfer.attention.indexer.msa_reference import (
     msa_contiguous_block_scores_reference,
 )
-from b12x.attention.indexer.reference import (
+from sparkinfer.attention.indexer.reference import (
     contiguous_logits_reference,
 )
-from b12x.attention.indexer.scratch import (
-    B12XIndexerContiguousScratchCaps,
+from sparkinfer.attention.indexer.scratch import (
+    SPARKINFERIndexerContiguousScratchCaps,
     plan_indexer_contiguous_scratch,
 )
-import b12x.attention.indexer.tiled_topk as tiled_topk_kernel
+import sparkinfer.attention.indexer.tiled_topk as tiled_topk_kernel
 from tests.test_attention_msa_indexer_api import (
     _make_msa_contiguous_case,
     _one_scratch,
@@ -384,7 +384,7 @@ def _build_msa_block_scores(definition: CaseDefinition) -> RuntimeCase:
         seed=20260719,
     )
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=heads,
@@ -1363,7 +1363,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     gpu_mode_final = gpu_mode_snapshot(expected_physical_gpu)
 
     return {
-        "schema": "b12x.attention.indexer.exact_cache_abba.v1",
+        "schema": "sparkinfer.attention.indexer.exact_cache_abba.v1",
         "evidence_status": args.evidence_status,
         "case": {
             "name": definition.name,
@@ -1385,18 +1385,18 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 "benchmark": sha256_file(Path(__file__).resolve()),
                 "shared_abba": sha256_file(CORE_ROOT / "exact_cache_abba.py"),
                 "contiguous_kernel": sha256_file(
-                    REPO_ROOT / "b12x/attention/indexer/contiguous_kernel.py"
+                    REPO_ROOT / "sparkinfer/attention/indexer/contiguous_kernel.py"
                 ),
                 "paged_kernel": sha256_file(
-                    REPO_ROOT / "b12x/attention/indexer/kernel.py"
+                    REPO_ROOT / "sparkinfer/attention/indexer/kernel.py"
                 ),
                 "persistent_topk": sha256_file(
-                    REPO_ROOT / "b12x/attention/indexer/persistent_topk.py"
+                    REPO_ROOT / "sparkinfer/attention/indexer/persistent_topk.py"
                 ),
                 "tiled_topk": sha256_file(
-                    REPO_ROOT / "b12x/attention/indexer/tiled_topk.py"
+                    REPO_ROOT / "sparkinfer/attention/indexer/tiled_topk.py"
                 ),
-                "compiler": sha256_file(REPO_ROOT / "b12x/cute/compiler.py"),
+                "compiler": sha256_file(REPO_ROOT / "sparkinfer/cute/compiler.py"),
             },
             "packages": _package_versions(),
             "torch": torch.__version__,

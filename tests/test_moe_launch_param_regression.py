@@ -54,7 +54,7 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
         sys.path.insert(0, {str(repo_root)!r})
 
         from benchmarks.benchmark_moe import ModelSpec, load_expert_weights, make_routed_inputs
-        from b12x.integration.tp_moe import (
+        from sparkinfer.integration.tp_moe import (
             clear_tp_moe_caches,
         )
         from tests.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
@@ -133,7 +133,7 @@ def _direct_micro_launchable(
     k: int = 4096,
     num_topk: int = 10,
 ) -> bool:
-    from b12x.integration.tp_moe import (
+    from sparkinfer.integration.tp_moe import (
         _DIRECT_MICRO_BLOCK_DIM,
         _compiled_direct_micro_accepts_block_dim,
         _get_micro_kernel,
@@ -164,7 +164,7 @@ def test_nvfp4_direct_micro_launches_qwen_bs8_shape() -> None:
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])
-def test_b12x_moe_accepts_parameter_backed_launch_args(case: str) -> None:
+def test_sparkinfer_moe_accepts_parameter_backed_launch_args(case: str) -> None:
     """The static path should not segfault on Parameter-backed scale tensors."""
     _skip_if_unavailable()
 

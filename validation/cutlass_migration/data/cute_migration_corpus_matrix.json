@@ -1,6 +1,6 @@
 {
-  "schema": "b12x.cute.migration.corpus_matrix.v1",
-  "corpus_id": "b12x-cutlass-45-46-full-gpu-corpus",
+  "schema": "sparkinfer.cute.migration.corpus_matrix.v1",
+  "corpus_id": "sparkinfer-cutlass-45-46-full-gpu-corpus",
   "version": "1",
   "requirements": {
     "physical_gpus": [4, 5],
@@ -151,14 +151,14 @@
         "tests/test_attention_contiguous_torch_ref.py::test_varlen_contiguous_attention_replays_under_cuda_graph_with_live_metadata"
       ],
       "source_kernels": [
-        "b12x/attention/contiguous/forward.py:ContiguousAttentionForwardKernel.kernel"
+        "sparkinfer/attention/contiguous/forward.py:ContiguousAttentionForwardKernel.kernel"
       ],
       "kernel_id_patterns": [
         "attention.contiguous.forward",
         "attention.contiguous.varlen_forward"
       ],
       "kernel_symbol_patterns": [
-        "*b12xattentioncontiguousforwardContiguousAttentionForwardKernel*"
+        "*sparkinferattentioncontiguousforwardContiguousAttentionForwardKernel*"
       ],
       "shape_branches": [
         "contiguous.fixed",
@@ -246,10 +246,10 @@
         "tests/test_attention_msa_indexer_api.py::test_msa_contiguous_block_scores_graph_replay_tracks_live_weights"
       ],
       "source_kernels": [
-        "b12x/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsKernel.kernel",
-        "b12x/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsPrefillKernel.kernel",
-        "b12x/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsPrefill512Kernel.kernel",
-        "b12x/attention/indexer/tiled_topk.py:SparseNSATiledTopkKernel.kernel"
+        "sparkinfer/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsKernel.kernel",
+        "sparkinfer/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsPrefillKernel.kernel",
+        "sparkinfer/attention/indexer/contiguous_kernel.py:SparseNSAContiguousLogitsPrefill512Kernel.kernel",
+        "sparkinfer/attention/indexer/tiled_topk.py:SparseNSATiledTopkKernel.kernel"
       ],
       "kernel_id_patterns": [
         "attention.indexer.contiguous_logits",
@@ -258,11 +258,11 @@
         "attention.indexer.row_topk"
       ],
       "kernel_symbol_patterns": [
-        "*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsKernel*",
-        "*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefillKernel*",
-        "*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefillKernelBlockScores*",
-        "*b12xattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefill512Kernel*",
-        "*b12xattentionindexertiled_topkSparseNSATiledTopkKernel*"
+        "*sparkinferattentionindexercontiguous_kernelSparseNSAContiguousLogitsKernel*",
+        "*sparkinferattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefillKernel*",
+        "*sparkinferattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefillKernelBlockScores*",
+        "*sparkinferattentionindexercontiguous_kernelSparseNSAContiguousLogitsPrefill512Kernel*",
+        "*sparkinferattentionindexertiled_topkSparseNSATiledTopkKernel*"
       ],
       "shape_branches": [
         "nsa.contiguous.decode",
@@ -375,12 +375,12 @@
         "tests/test_persistent_topk_gpu.py::test_persistent_topk_multirow_eager_and_changed_graph_gpu[4]"
       ],
       "source_kernels": [
-        "b12x/attention/indexer/fused_indexer.py:SparseNSAFusedIndexerKernel.kernel",
-        "b12x/attention/indexer/kernel.py:SparseNSAPagedLogitsKernel.kernel",
-        "b12x/attention/indexer/kernel.py:SparseNSAScheduledSingleRowLogitsKernel.kernel",
-        "b12x/attention/indexer/kernel.py:SparseNSAScheduledMultiRowLogitsKernel.kernel",
-        "b12x/attention/indexer/kernel.py:SparseNSAPagedStreamLogitsKernel.kernel",
-        "b12x/attention/indexer/persistent_topk.py:SparseNSAPersistentTopK2048Kernel.kernel"
+        "sparkinfer/attention/indexer/fused_indexer.py:SparseNSAFusedIndexerKernel.kernel",
+        "sparkinfer/attention/indexer/kernel.py:SparseNSAPagedLogitsKernel.kernel",
+        "sparkinfer/attention/indexer/kernel.py:SparseNSAScheduledSingleRowLogitsKernel.kernel",
+        "sparkinfer/attention/indexer/kernel.py:SparseNSAScheduledMultiRowLogitsKernel.kernel",
+        "sparkinfer/attention/indexer/kernel.py:SparseNSAPagedStreamLogitsKernel.kernel",
+        "sparkinfer/attention/indexer/persistent_topk.py:SparseNSAPersistentTopK2048Kernel.kernel"
       ],
       "kernel_id_patterns": [
         "attention.indexer.fused_indexer",
@@ -389,12 +389,12 @@
         "attention.indexer.persistent_topk"
       ],
       "kernel_symbol_patterns": [
-        "*b12xattentionindexerfused_indexerSparseNSAFusedIndexerKernel*",
-        "*b12xattentionindexerkernelSparseNSAPagedLogitsKernel*",
-        "*b12xattentionindexerkernelSparseNSAScheduledSingleRowLogitsKernel*",
-        "*b12xattentionindexerkernelSparseNSAScheduledMultiRowLogitsKernel*",
-        "*b12xattentionindexerkernelSparseNSAPagedStreamLogitsKernel*",
-        "*b12xattentionindexerpersistent_topkSparseNSAPersistentTopK2048Kernel*"
+        "*sparkinferattentionindexerfused_indexerSparseNSAFusedIndexerKernel*",
+        "*sparkinferattentionindexerkernelSparseNSAPagedLogitsKernel*",
+        "*sparkinferattentionindexerkernelSparseNSAScheduledSingleRowLogitsKernel*",
+        "*sparkinferattentionindexerkernelSparseNSAScheduledMultiRowLogitsKernel*",
+        "*sparkinferattentionindexerkernelSparseNSAPagedStreamLogitsKernel*",
+        "*sparkinferattentionindexerpersistent_topkSparseNSAPersistentTopK2048Kernel*"
       ],
       "shape_branches": [
         "nsa.paged.base",
@@ -600,21 +600,21 @@
         "tests/test_attention_mla_unified_corpus.py::test_unified_glm_prefill_live_graph_oracle"
       ],
       "source_kernels": [
-        "b12x/attention/mla/kernel.py:UnifiedDecodeKernel.kernel",
-        "b12x/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_extra",
-        "b12x/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_pertok",
-        "b12x/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_extra_pertok",
-        "b12x/attention/mla/prefill_mg.py:UnifiedPrefillMGKernel.kernel",
-        "b12x/attention/mla/prefill_mg.py:UnifiedPrefillMGKernel.kernel_dual"
+        "sparkinfer/attention/mla/kernel.py:UnifiedDecodeKernel.kernel",
+        "sparkinfer/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_extra",
+        "sparkinfer/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_pertok",
+        "sparkinfer/attention/mla/kernel.py:UnifiedDecodeKernel.kernel_extra_pertok",
+        "sparkinfer/attention/mla/prefill_mg.py:UnifiedPrefillMGKernel.kernel",
+        "sparkinfer/attention/mla/prefill_mg.py:UnifiedPrefillMGKernel.kernel_dual"
       ],
       "kernel_id_patterns": ["attention.mla.sm120.decode", "attention.mla.sm120.prefill_mg"],
       "kernel_symbol_patterns": [
-        "kernel_cutlass_kernel_b12xattentionmlakernelUnifiedDecodeKernel*",
-        "kernel_cutlass_kernel_extra_b12xattentionmlakernelUnifiedDecodeKernel*",
-        "kernel_cutlass_kernel_pertok_b12xattentionmlakernelUnifiedDecodeKernel*",
-        "kernel_cutlass_kernel_extra_pertok_b12xattentionmlakernelUnifiedDecodeKernel*",
-        "kernel_cutlass_kernel_b12xattentionmlaprefill_mgUnifiedPrefillMGKernel*",
-        "kernel_cutlass_kernel_dual_b12xattentionmlaprefill_mgUnifiedPrefillMGKernel*"
+        "kernel_cutlass_kernel_sparkinferattentionmlakernelUnifiedDecodeKernel*",
+        "kernel_cutlass_kernel_extra_sparkinferattentionmlakernelUnifiedDecodeKernel*",
+        "kernel_cutlass_kernel_pertok_sparkinferattentionmlakernelUnifiedDecodeKernel*",
+        "kernel_cutlass_kernel_extra_pertok_sparkinferattentionmlakernelUnifiedDecodeKernel*",
+        "kernel_cutlass_kernel_sparkinferattentionmlaprefill_mgUnifiedPrefillMGKernel*",
+        "kernel_cutlass_kernel_dual_sparkinferattentionmlaprefill_mgUnifiedPrefillMGKernel*"
       ],
       "shape_branches": [
         "mla.unified.decode.main",
@@ -826,16 +826,16 @@
         "tests/test_attention_mla_merge.py::test_sparse_mla_split_decode_sink_merge_graph_replay_matches_fp32_oracle"
       ],
       "source_kernels": [
-        "b12x/attention/mla/merge.py:SparseMLASplitDecodeMergeKernel.kernel",
-        "b12x/attention/mla/merge.py:SparseMLASplitDecodeSinkMergeKernel.kernel"
+        "sparkinfer/attention/mla/merge.py:SparseMLASplitDecodeMergeKernel.kernel",
+        "sparkinfer/attention/mla/merge.py:SparseMLASplitDecodeSinkMergeKernel.kernel"
       ],
       "kernel_id_patterns": [
         "attention.mla.merge",
         "attention.mla.sink_merge"
       ],
       "kernel_symbol_patterns": [
-        "*b12xattentionmlamergeSparseMLASplitDecodeMergeKernel*",
-        "*b12xattentionmlamergeSparseMLASplitDecodeSinkMergeKernel*"
+        "*sparkinferattentionmlamergeSparseMLASplitDecodeMergeKernel*",
+        "*sparkinferattentionmlamergeSparseMLASplitDecodeSinkMergeKernel*"
       ],
       "shape_branches": [
         "mla.merge",
@@ -888,11 +888,11 @@
         "tests/test_cute_migration_paged_corpus.py::test_paged_fp8_planewords_atom_byte_contract_graph"
       ],
       "source_kernels": [
-        "b12x/attention/paged/forward_extend_generic.py:PagedForwardKernel.kernel"
+        "sparkinfer/attention/paged/forward_extend_generic.py:PagedForwardKernel.kernel"
       ],
       "kernel_id_patterns": ["attention.paged.forward"],
       "kernel_symbol_patterns": [
-        "kernel_cutlass_kernel_b12xattentionpagedforward_extend_genericPagedForwardKernel*"
+        "kernel_cutlass_kernel_sparkinferattentionpagedforward_extend_genericPagedForwardKernel*"
       ],
       "shape_branches": [
         "paged.q8",
@@ -999,13 +999,13 @@
         "tests/test_cute_migration_paged_corpus.py::test_paged_decode_direct_graph_oracle"
       ],
       "source_kernels": [
-        "b12x/attention/paged/forward_paged.py:PagedForwardKernel.kernel",
-        "b12x/attention/paged/merge.py:PagedPersistentMergeKernel.kernel"
+        "sparkinfer/attention/paged/forward_paged.py:PagedForwardKernel.kernel",
+        "sparkinfer/attention/paged/merge.py:PagedPersistentMergeKernel.kernel"
       ],
       "kernel_id_patterns": ["attention.paged.merge"],
       "kernel_symbol_patterns": [
-        "*b12xattentionpagedforward_pagedPagedForwardKernel*",
-        "*b12xattentionpagedmergePagedPersistentMergeKernel*"
+        "*sparkinferattentionpagedforward_pagedPagedForwardKernel*",
+        "*sparkinferattentionpagedmergePagedPersistentMergeKernel*"
       ],
       "shape_branches": [
         "paged.decode.direct.bf16.variable_metadata",
@@ -1070,11 +1070,11 @@
         "tests/test_cute_migration_paged_corpus.py::test_paged_unreachable_raw_body_graph_oracle[fp8-decode-direct]"
       ],
       "source_kernels": [
-        "b12x/attention/paged/forward_paged.py:PagedFp8DecodeRawForwardKernel.kernel"
+        "sparkinfer/attention/paged/forward_paged.py:PagedFp8DecodeRawForwardKernel.kernel"
       ],
       "kernel_id_patterns": [],
       "kernel_symbol_patterns": [
-        "*b12xattentionpagedforward_pagedPagedFp8DecodeRawForwardKernel*"
+        "*sparkinferattentionpagedforward_pagedPagedFp8DecodeRawForwardKernel*"
       ],
       "shape_branches": ["diagnostic.paged.raw.fp8_decode.direct"],
       "shape_branch_evidence": {
@@ -1101,11 +1101,11 @@
         "tests/test_cute_migration_paged_corpus.py::test_paged_unreachable_raw_body_graph_oracle[bf16-extend-split]"
       ],
       "source_kernels": [
-        "b12x/attention/paged/forward_paged.py:PagedBf16ExtendRawForwardKernel.kernel"
+        "sparkinfer/attention/paged/forward_paged.py:PagedBf16ExtendRawForwardKernel.kernel"
       ],
       "kernel_id_patterns": [],
       "kernel_symbol_patterns": [
-        "*b12xattentionpagedforward_pagedPagedBf16ExtendRawForwardKernel*"
+        "*sparkinferattentionpagedforward_pagedPagedBf16ExtendRawForwardKernel*"
       ],
       "shape_branches": [
         "diagnostic.paged.raw.bf16_extend.direct",
@@ -1151,11 +1151,11 @@
         "tests/test_cute_migration_paged_corpus.py::test_paged_unreachable_raw_body_graph_oracle[fp8-extend-q48-split]"
       ],
       "source_kernels": [
-        "b12x/attention/paged/forward_paged.py:PagedFp8ExtendRawForwardKernel.kernel"
+        "sparkinfer/attention/paged/forward_paged.py:PagedFp8ExtendRawForwardKernel.kernel"
       ],
       "kernel_id_patterns": [],
       "kernel_symbol_patterns": [
-        "*b12xattentionpagedforward_pagedPagedFp8ExtendRawForwardKernel*"
+        "*sparkinferattentionpagedforward_pagedPagedFp8ExtendRawForwardKernel*"
       ],
       "shape_branches": [
         "diagnostic.paged.raw.fp8_extend.q32.direct",
@@ -1223,8 +1223,8 @@
         "tests/test_cute_migration_gemm_corpus.py::test_cute_migration_mxfp8_quant_gpu_oracle_and_graph[16]"
       ],
       "source_kernels": [
-        "b12x/gemm/dense.py:DenseGemmKernel.kernel",
-        "b12x/gemm/mxfp8_quant_cute.py:_MXFP8RowsQuantLaunch.kernel"
+        "sparkinfer/gemm/dense.py:DenseGemmKernel.kernel",
+        "sparkinfer/gemm/mxfp8_quant_cute.py:_MXFP8RowsQuantLaunch.kernel"
       ],
       "kernel_id_patterns": [
         "gemm.dense",
@@ -1233,8 +1233,8 @@
         "gemm.mxfp8_quant_cute"
       ],
       "kernel_symbol_patterns": [
-        "*b12xgemmdenseDenseGemmKernel*",
-        "*b12xgemmmxfp8_quant_cute_MXFP8RowsQuantLaunch*"
+        "*sparkinfergemmdenseDenseGemmKernel*",
+        "*sparkinfergemmmxfp8_quant_cute_MXFP8RowsQuantLaunch*"
       ],
       "shape_branches": [
         "gemm.dense",
@@ -1318,11 +1318,11 @@
         "tests/test_gemm_wo_projection.py::test_wo_quant_cute_paths_match_triton_bit_exact[group-major]"
       ],
       "source_kernels": [
-        "b12x/gemm/wo_quant_cute.py:_WOQuantCuTeLaunch.kernel"
+        "sparkinfer/gemm/wo_quant_cute.py:_WOQuantCuTeLaunch.kernel"
       ],
       "kernel_id_patterns": [],
       "kernel_symbol_patterns": [
-        "*b12xgemmwo_quant_cute_WOQuantCuTeLaunch*"
+        "*sparkinfergemmwo_quant_cute_WOQuantCuTeLaunch*"
       ],
       "shape_branches": [
         "gemm.weight_only_projection.grouped",
@@ -1388,35 +1388,35 @@
       "coverage_state": "ready",
       "gap_reason": "",
       "pytest_nodeids": [
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-split]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-post]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-split]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-post]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
-        "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-split]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-post]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-split]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-post]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
+        "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
       ],
       "source_kernels": [
-        "b12x/integration/residual_kernels.py:MHCPostPrePartialKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPostPreDecodeSplitNPartialKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPostPrePrefillPartialKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPostPrePrefillBlockMPartialKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPostPrePrefillGramKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPrefillBf16ProjectTmaKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPrefillTf32ProjectTmaKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCPrefillBf16ProjectKernel.kernel",
-        "b12x/integration/residual_kernels.py:MHCFinalizeGramKernel.kernel"
+        "sparkinfer/integration/residual_kernels.py:MHCPostPrePartialKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPostPreDecodeSplitNPartialKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPostPrePrefillPartialKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPostPrePrefillBlockMPartialKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPostPrePrefillGramKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPrefillBf16ProjectTmaKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPrefillTf32ProjectTmaKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCPrefillBf16ProjectKernel.kernel",
+        "sparkinfer/integration/residual_kernels.py:MHCFinalizeGramKernel.kernel"
       ],
       "kernel_id_patterns": [
         "integration.residual.mhc_post_pre_decode_split_n_*",
@@ -1442,15 +1442,15 @@
         "integration.residual.mhc_finalize_gram_hidden7168*"
       ],
       "kernel_symbol_patterns": [
-        "*b12xintegrationresidual_kernelsMHCPostPrePartialKernel*",
-        "*b12xintegrationresidual_kernelsMHCPostPreDecodeSplitNPartialKernel*",
-        "*b12xintegrationresidual_kernelsMHCPostPrePrefillPartialKernel*",
-        "*b12xintegrationresidual_kernelsMHCPostPrePrefillBlockMPartialKernel*",
-        "*b12xintegrationresidual_kernelsMHCPostPrePrefillGramKernel*",
-        "*b12xintegrationresidual_kernelsMHCPrefillBf16ProjectTmaKernel*",
-        "*b12xintegrationresidual_kernelsMHCPrefillTf32ProjectTmaKernel*",
-        "*b12xintegrationresidual_kernelsMHCPrefillBf16ProjectKernel*",
-        "*b12xintegrationresidual_kernelsMHCFinalizeGramKernel*"
+        "*sparkinferintegrationresidual_kernelsMHCPostPrePartialKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPostPreDecodeSplitNPartialKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPostPrePrefillPartialKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPostPrePrefillBlockMPartialKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPostPrePrefillGramKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPrefillBf16ProjectTmaKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPrefillTf32ProjectTmaKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCPrefillBf16ProjectKernel*",
+        "*sparkinferintegrationresidual_kernelsMHCFinalizeGramKernel*"
       ],
       "shape_branches": [
         "residual.h4096.decode.split",
@@ -1475,10 +1475,10 @@
       "shape_branch_evidence": {
         "residual.h4096.decode.split": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-split]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-split]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-split]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-split]"
           ],
           "manifest_predicates": [
             {"kernel_id": "integration.residual.mhc_post_pre_decode_split_n_hidden4096_s4n6x1", "compile_spec_version": 4, "compile_spec_hash": "18d36e770f1df35c53e3771bedd2e2c128486ab757ddb8a2471f7c2ee60a73df"},
@@ -1487,10 +1487,10 @@
         },
         "residual.h4096.decode.fused": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-fused]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-fused]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-fused]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-fused]"
           ],
           "shared_manifest_group": "residual.h4096.decode.fused_pre_finalize",
           "manifest_predicates": [
@@ -1500,10 +1500,10 @@
         },
         "residual.h4096.decode.post": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-post]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-post]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-post]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-post]"
           ],
           "manifest_predicates": [
             {"kernel_id": "integration.residual.mhc_post_hidden4096_hctile128_all4", "compile_spec_version": 2, "compile_spec_hash": "d17f51f49c0cf189600bc2b63d035678d5c4a1ef790a0fd76f7d29b3ac560323"}
@@ -1511,10 +1511,10 @@
         },
         "residual.h4096.decode.pre": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-pre]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-pre]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-pre]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-pre]"
           ],
           "shared_manifest_group": "residual.h4096.decode.fused_pre_finalize",
           "manifest_predicates": [
@@ -1524,10 +1524,10 @@
         },
         "residual.h4096.prefill.compact": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]"
           ],
           "shared_manifest_group": "residual.h4096.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1537,10 +1537,10 @@
         },
         "residual.h4096.prefill.block": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]"
           ],
           "shared_manifest_group": "residual.h4096.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1550,10 +1550,10 @@
         },
         "residual.h4096.prefill.bf16_tma": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]"
           ],
           "shared_manifest_group": "residual.h4096.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1564,10 +1564,10 @@
         },
         "residual.h4096.prefill.bf16_vector": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]"
           ],
           "shared_manifest_group": "residual.h4096.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1578,10 +1578,10 @@
         },
         "residual.h4096.prefill.tf32_tma": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]"
           ],
           "shared_manifest_group": "residual.h4096.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1592,10 +1592,10 @@
         },
         "residual.h7168.decode.split": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-split]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-split]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-split]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-split]"
           ],
           "manifest_predicates": [
             {"kernel_id": "integration.residual.mhc_post_pre_decode_split_n_hidden7168_s4n6x1", "compile_spec_version": 4, "compile_spec_hash": "a7804e8293a48176bfe4921df579154e5a360adce9b03f2bab2939fefa647308"},
@@ -1604,10 +1604,10 @@
         },
         "residual.h7168.decode.fused": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-fused]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-fused]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-fused]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-fused]"
           ],
           "shared_manifest_group": "residual.h7168.decode.fused_pre_finalize",
           "manifest_predicates": [
@@ -1617,10 +1617,10 @@
         },
         "residual.h7168.decode.post": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-post]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-post]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-post]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-post]"
           ],
           "manifest_predicates": [
             {"kernel_id": "integration.residual.mhc_post_hidden7168_hctile128_all4", "compile_spec_version": 2, "compile_spec_hash": "95994e17a7dc012f7074fd2ca186fdb38b592c5644deeea7092e1f48d4c5d597"}
@@ -1628,10 +1628,10 @@
         },
         "residual.h7168.decode.pre": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-pre]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-pre]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-pre]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-pre]"
           ],
           "shared_manifest_group": "residual.h7168.decode.fused_pre_finalize",
           "manifest_predicates": [
@@ -1641,10 +1641,10 @@
         },
         "residual.h7168.prefill.compact": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]"
           ],
           "shared_manifest_group": "residual.h7168.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1654,10 +1654,10 @@
         },
         "residual.h7168.prefill.block": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]"
           ],
           "shared_manifest_group": "residual.h7168.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1667,10 +1667,10 @@
         },
         "residual.h7168.prefill.bf16_tma": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]"
           ],
           "shared_manifest_group": "residual.h7168.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1681,10 +1681,10 @@
         },
         "residual.h7168.prefill.bf16_vector": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]"
           ],
           "shared_manifest_group": "residual.h7168.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1695,10 +1695,10 @@
         },
         "residual.h7168.prefill.tf32_tma": {
           "correctness_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
           ],
           "graph_nodeids": [
-            "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
+            "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
           ],
           "shared_manifest_group": "residual.h7168.prefill.shared_finalize_gram",
           "manifest_predicates": [
@@ -1712,47 +1712,47 @@
         "required": true,
         "oracle": "gpu_reference",
         "evidence_nodeids": [
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-split]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-post]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-split]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-post]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-split]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-post]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-split]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-post]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
         ]
       },
       "graph": {
         "required": true,
         "evidence_nodeids": [
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-split]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-post]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-split]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-post]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
-          "tests/test_residual_mhc.py::test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-split]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-fused]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-post]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h4096-pre]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-split]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-fused]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-post]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_decode_specialization_live_graph_oracle[h7168-pre]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-compact]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-block]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-bf16_vector]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[4096-64-tf32_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-compact]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-block]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_tma]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-bf16_vector]",
+          "tests/test_residual_mhc.py::test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference[7168-112-tf32_tma]"
         ]
       },
       "min_compile_events": 1
@@ -1769,9 +1769,9 @@
         "tests/test_cute_migration_moe_standard_corpus.py::test_standard_moe_tiny_decode_live_graph_oracle"
       ],
       "source_kernels": [
-        "b12x/moe/fused/dynamic.py:MoEDynamicKernelBackend.kernel",
-        "b12x/moe/fused/micro.py:MoEMicroKernelBackend.kernel",
-        "b12x/moe/fused/tiny_decode.py:MoETinyDecodeKernelBackend.kernel"
+        "sparkinfer/moe/fused/dynamic.py:MoEDynamicKernelBackend.kernel",
+        "sparkinfer/moe/fused/micro.py:MoEMicroKernelBackend.kernel",
+        "sparkinfer/moe/fused/tiny_decode.py:MoETinyDecodeKernelBackend.kernel"
       ],
       "kernel_id_patterns": [
         "integration.tp_moe.micro_direct",
@@ -1876,10 +1876,10 @@
         "tests/test_w4a16_serving_corpus.py::test_w4a16_nano35_chunked_prefill_corpus[m32768]"
       ],
       "source_kernels": [
-        "b12x/moe/fused/w4a16/kernel.py:W4A16GemmKernel.kernel",
-        "b12x/moe/fused/w4a16/kernel.py:W4A16FusedMoeKernel.kernel",
-        "b12x/moe/fused/w4a16/kernel.py:W4A16ActivationKernel.kernel",
-        "b12x/moe/fused/w4a16/kernel.py:W4A16TopKSumKernel.kernel"
+        "sparkinfer/moe/fused/w4a16/kernel.py:W4A16GemmKernel.kernel",
+        "sparkinfer/moe/fused/w4a16/kernel.py:W4A16FusedMoeKernel.kernel",
+        "sparkinfer/moe/fused/w4a16/kernel.py:W4A16ActivationKernel.kernel",
+        "sparkinfer/moe/fused/w4a16/kernel.py:W4A16TopKSumKernel.kernel"
       ],
       "kernel_id_patterns": [
         "moe.w4a16.small_m_direct",
@@ -1889,11 +1889,11 @@
         "moe.w4a16.topk_sum"
       ],
       "kernel_symbol_patterns": [
-        "*b12xmoefusedw4a16kernelMoEMicroKernelW4A16SmallMDirect*",
-        "*b12xmoefusedw4a16kernelW4A16GemmKernel*",
-        "*b12xmoefusedw4a16kernelW4A16FusedMoeKernel*",
-        "*b12xmoefusedw4a16kernelW4A16ActivationKernel*",
-        "*b12xmoefusedw4a16kernelW4A16TopKSumKernel*"
+        "*sparkinfermoefusedw4a16kernelMoEMicroKernelW4A16SmallMDirect*",
+        "*sparkinfermoefusedw4a16kernelW4A16GemmKernel*",
+        "*sparkinfermoefusedw4a16kernelW4A16FusedMoeKernel*",
+        "*sparkinfermoefusedw4a16kernelW4A16ActivationKernel*",
+        "*sparkinfermoefusedw4a16kernelW4A16TopKSumKernel*"
       ],
       "shape_branches": [
         "w4a16.nf3",
@@ -2203,13 +2203,13 @@
         "tests/test_w4a8_migration_corpus.py::test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph"
       ],
       "source_kernels": [
-        "b12x/moe/fused/w4a8_phase1.py:W4A8MaterializedPhase1Kernel.kernel",
-        "b12x/moe/fused/w4a8_phase2.py:W4A8MaterializedPhase2Kernel.kernel"
+        "sparkinfer/moe/fused/w4a8_phase1.py:W4A8MaterializedPhase1Kernel.kernel",
+        "sparkinfer/moe/fused/w4a8_phase2.py:W4A8MaterializedPhase2Kernel.kernel"
       ],
       "kernel_id_patterns": [],
       "kernel_symbol_patterns": [
-        "*b12xmoefusedw4a8_phase1W4A8MaterializedPhase1Kernel*",
-        "*b12xmoefusedw4a8_phase2W4A8MaterializedPhase2Kernel*"
+        "*sparkinfermoefusedw4a8_phase1W4A8MaterializedPhase1Kernel*",
+        "*sparkinfermoefusedw4a8_phase2W4A8MaterializedPhase2Kernel*"
       ],
       "shape_branches": [
         "w4a8.direct.silu.mx.m16",
@@ -2553,10 +2553,10 @@
         "tests/test_bf16_to_fp4_tma.py::test_bf16_to_fp4_tma_graph_replay_exact[prefill-m512-k7168]"
       ],
       "source_kernels": [
-        "b12x/quantization/bf16_to_fp4_tma.py:TestKernel.kernel"
+        "sparkinfer/quantization/bf16_to_fp4_tma.py:TestKernel.kernel"
       ],
       "kernel_id_patterns": ["quantization.bf16_to_fp4_tma"],
-      "kernel_symbol_patterns": ["*b12xquantizationbf16_to_fp4_tmaTestKernel*"],
+      "kernel_symbol_patterns": ["*sparkinferquantizationbf16_to_fp4_tmaTestKernel*"],
       "shape_branches": [
         "quant.bf16_to_fp4.retain",
         "quant.bf16_to_fp4.packed"

@@ -6,22 +6,22 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from b12x.attention.mla.compressed_reference import (
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_NOPE_DIM,
     COMPRESSED_MLA_ROPE_DIM,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from b12x.attention.mla.kernel import run_unified_decode, run_unified_prefill
-from b12x.attention.mla.reference import (
+from sparkinfer.attention.mla.kernel import run_unified_decode, run_unified_prefill
+from sparkinfer.attention.mla.reference import (
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
 )
-from b12x.attention.mla.traits import ScaleFormat
-from b12x.cute.intrinsics import pack_grouped_fp4_values
-from b12x.integration.compressed_scratch import (
-    B12XCompressedMLAScratchCaps,
+from sparkinfer.attention.mla.traits import ScaleFormat
+from sparkinfer.cute.intrinsics import pack_grouped_fp4_values
+from sparkinfer.integration.compressed_scratch import (
+    SPARKINFERCompressedMLAScratchCaps,
     _compressed_mla_scratch_layout,
     _materialize_compressed_mla_scratch,
 )
@@ -272,7 +272,7 @@ def _make_decode_workspace(
     width: int,
     device: torch.device,
 ):
-    caps = B12XCompressedMLAScratchCaps(
+    caps = SPARKINFERCompressedMLAScratchCaps(
         device=device,
         num_q_heads=heads,
         max_q_rows=rows,
@@ -1014,7 +1014,7 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
         per_token=per_token,
         device=device,
     )
-    caps = B12XCompressedMLAScratchCaps(
+    caps = SPARKINFERCompressedMLAScratchCaps(
         device=device,
         num_q_heads=heads,
         max_q_rows=rows,

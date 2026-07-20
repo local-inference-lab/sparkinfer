@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_oneshot import PCIeOneshotAllReducePool
+from sparkinfer.distributed.pcie_oneshot import PCIeOneshotAllReducePool
 from vllm import _custom_ops as ops
 
 
@@ -67,10 +67,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         rank=rank,
         world_size=world_size,
     )
-    hidden_size = int(os.getenv("B12X_PCIE_ONESHOT_HIDDEN_SIZE", "6144"))
+    hidden_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_HIDDEN_SIZE", "6144"))
     rows_to_benchmark = tuple(
         int(rows)
-        for rows in os.getenv("B12X_PCIE_ONESHOT_ROWS", "1,2,3,4,5,6,7,8").split(
+        for rows in os.getenv("SPARKINFER_PCIE_ONESHOT_ROWS", "1,2,3,4,5,6,7,8").split(
             ","
         )
     )
@@ -90,7 +90,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     try:
         if rank == 0:
             print(
-                "rows,bytes,b12x_fused_us,b12x_plus_rms_us,"
+                "rows,bytes,sparkinfer_fused_us,sparkinfer_plus_rms_us,"
                 "nccl_plus_rms_us"
             )
         for rows in rows_to_benchmark:
@@ -161,7 +161,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    world_size = int(os.getenv("B12X_PCIE_ONESHOT_WORLD_SIZE", "8"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_WORLD_SIZE", "8"))
     if torch.cuda.device_count() < world_size:
         raise SystemExit(
             f"need {world_size} GPUs, found {torch.cuda.device_count()}"

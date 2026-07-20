@@ -70,10 +70,10 @@ python -m validation.cutlass_migration diagnostic paired w4a16_serving --help
 ```
 
 Family discovery is a two-step offline review boundary. Each GPU producer
-writes a hashed `b12x.cute.migration.family_discovery.v1` fragment. Assembly
+writes a hashed `sparkinfer.cute.migration.family_discovery.v1` fragment. Assembly
 requires exactly one fragment for every closed-set family, converts exact cache
 paths into immutable file records, and writes a pending
-`b12x.cute.migration.end_to_end_contract_discovery.v1` artifact. A separate
+`sparkinfer.cute.migration.end_to_end_contract_discovery.v1` artifact. A separate
 command must revalidate and stamp that artifact with an explicit review ID:
 
 ```bash

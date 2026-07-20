@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark b12x dense_gemm against reference backends with graph replay.
+"""Benchmark sparkinfer dense_gemm against reference backends with graph replay.
 
 The FP4 track uses the Nemotron 3 Super shared-expert down projection. The
 MXFP8 tracks use the per-rank dense-linear shapes from the cached DeepSeek V4
 Flash DSpark checkpoint at TP=2, excluding routed experts. End-to-end MXFP8
-includes activation quantization and compares only b12x with DeepGEMM; weight
+includes activation quantization and compares only sparkinfer with DeepGEMM; weight
 quantization remains setup work.
 """
 
@@ -23,14 +23,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
-from b12x.cute.utils import (
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer.cute.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,
 )
-from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from b12x.gemm.dense import dense_gemm
-from b12x.gemm.wo_projection import empty_mxfp8_rows_for_dense_gemm
+from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm.dense import dense_gemm
+from sparkinfer.gemm.wo_projection import empty_mxfp8_rows_for_dense_gemm
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
 from flashinfer import mxfp8_quantize
@@ -260,11 +260,11 @@ def bench_one_fp4(
 
     results = {}
 
-    # b12x FP4.
+    # sparkinfer FP4.
     try:
-        b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
+        sparkinfer_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
 
-        def b12x_launch():
+        def sparkinfer_launch():
             dense_gemm(
                 (a_packed, a_sf),
                 (b_packed, b_sf),
@@ -273,21 +273,21 @@ def bench_one_fp4(
                 sf_dtype="float8_e4m3fn",
                 c_dtype="bfloat16",
                 sf_vec_size=16,
-                out=b12x_out,
+                out=sparkinfer_out,
             )
 
-        b12x_replay = capture_graph_replay(b12x_launch)
-        results["b12x_replay"] = b12x_replay
-        results["b12x_out"] = b12x_out
-        results["b12x"] = bench_events(
-            b12x_replay,
+        sparkinfer_replay = capture_graph_replay(sparkinfer_launch)
+        results["sparkinfer_replay"] = sparkinfer_replay
+        results["sparkinfer_out"] = sparkinfer_out
+        results["sparkinfer"] = bench_events(
+            sparkinfer_replay,
             warmup=warmup,
             iters=iters,
             l2_flush=l2_flush,
         )
     except Exception as exc:
-        results["b12x"] = None
-        print(f"      b12x FAILED: {exc}")
+        results["sparkinfer"] = None
+        print(f"      sparkinfer FAILED: {exc}")
 
     # FlashInfer CUTLASS FP4 reference.
     try:
@@ -322,15 +322,15 @@ def bench_one_fp4(
         print(f"      {FP4_REFERENCE_LABEL} FAILED: {exc}")
 
     if check:
-        if results.get("b12x_replay") is None or results.get("ref_replay") is None:
+        if results.get("sparkinfer_replay") is None or results.get("ref_replay") is None:
             raise BenchmarkAbort(
-                "correctness check requires both b12x and reference replays"
+                "correctness check requires both sparkinfer and reference replays"
             )
-        results["b12x_replay"]()
+        results["sparkinfer_replay"]()
         results["ref_replay"]()
         torch.cuda.synchronize()
         check_outputs(
-            results["b12x_out"][:, :, 0],
+            results["sparkinfer_out"][:, :, 0],
             results["ref_out"],
             label=FP4_REFERENCE_LABEL,
             cosine_threshold=COSINE_THRESHOLD,
@@ -353,7 +353,7 @@ def bench_one_fp8(
     """Benchmark one MXFP8 (M,N,K) problem with CUDA graph replay timing.
 
     When ``include_input_quant`` is true, each replay starts from the BF16 A
-    operand. The b12x launch uses caller-owned MXFP8 storage and the production
+    operand. The sparkinfer launch uses caller-owned MXFP8 storage and the production
     ``quantize_block_fp8_linear_input_mxfp8(..., out=...)`` path, which launches
     ``_quantize_dense_tk_to_tk_kernel`` before ``dense_gemm``. B remains a
     prequantized model weight for both backends.
@@ -364,26 +364,26 @@ def bench_one_fp8(
 
     results = {}
 
-    # b12x MXFP8. Keep quantizer output allocation outside capture so the e2e
+    # sparkinfer MXFP8. Keep quantizer output allocation outside capture so the e2e
     # replay matches an allocation-stable serving path.
     try:
-        b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
-        a_quantized_b12x = None
+        sparkinfer_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
+        a_quantized_sparkinfer = None
         if include_input_quant:
-            a_quantized_b12x = empty_mxfp8_rows_for_dense_gemm(
+            a_quantized_sparkinfer = empty_mxfp8_rows_for_dense_gemm(
                 M,
                 K,
                 device=a_source.device,
             )
 
-        def b12x_launch():
-            if a_quantized_b12x is not None:
+        def sparkinfer_launch():
+            if a_quantized_sparkinfer is not None:
                 quantize_block_fp8_linear_input_mxfp8(
                     a_source,
-                    out=a_quantized_b12x,
+                    out=a_quantized_sparkinfer,
                 )
-                a_values = a_quantized_b12x.values
-                a_scale_for_gemm = a_quantized_b12x.scale_mma
+                a_values = a_quantized_sparkinfer.values
+                a_scale_for_gemm = a_quantized_sparkinfer.scale_mma
             else:
                 a_values = a_quantized
                 a_scale_for_gemm = a_scale_mma
@@ -394,28 +394,28 @@ def bench_one_fp8(
                 sf_dtype="float8_e8m0fnu",
                 c_dtype="bfloat16",
                 sf_vec_size=32,
-                out=b12x_out,
+                out=sparkinfer_out,
                 # Match the production scaled-mm route: the graph shape is the
                 # regime hint, so 1024 stays on BK128 while 2048+ may select the
                 # separately keyed BK64 specialization.
                 expected_m=M,
             )
 
-        b12x_replay = capture_graph_replay(b12x_launch)
-        results["b12x_replay"] = b12x_replay
-        results["b12x_out"] = b12x_out
-        results["b12x"] = bench_events(
-            b12x_replay,
+        sparkinfer_replay = capture_graph_replay(sparkinfer_launch)
+        results["sparkinfer_replay"] = sparkinfer_replay
+        results["sparkinfer_out"] = sparkinfer_out
+        results["sparkinfer"] = bench_events(
+            sparkinfer_replay,
             warmup=warmup,
             iters=iters,
             l2_flush=l2_flush,
         )
     except Exception as exc:
-        results["b12x"] = None
-        print(f"      b12x FAILED: {exc}")
+        results["sparkinfer"] = None
+        print(f"      sparkinfer FAILED: {exc}")
 
     # FlashInfer is a reference only for the prequantized MXFP8 diagnostic.
-    # The end-to-end mode intentionally compares only b12x with DeepGEMM.
+    # The end-to-end mode intentionally compares only sparkinfer with DeepGEMM.
     if not include_input_quant:
         reference_label = FP8_REFERENCE_LABEL
         # FlashInfer currently rejects direct M=1 SM120 MXFP8. Use padded M=2
@@ -484,38 +484,38 @@ def bench_one_fp8(
 
         if check:
             if (
-                results.get("b12x_replay") is None
+                results.get("sparkinfer_replay") is None
                 or results.get("ref_replay") is None
             ):
                 raise BenchmarkAbort(
-                    "correctness check requires both b12x and reference replays"
+                    "correctness check requires both sparkinfer and reference replays"
                 )
-            results["b12x_replay"]()
+            results["sparkinfer_replay"]()
             results["ref_replay"]()
             torch.cuda.synchronize()
             check_outputs(
-                results["b12x_out"][:, :, 0],
+                results["sparkinfer_out"][:, :, 0],
                 results["ref_out"],
                 label=reference_label,
                 cosine_threshold=COSINE_THRESHOLD,
             )
     elif check:
-        if results.get("b12x_replay") is None:
-            raise BenchmarkAbort("correctness check requires the b12x e2e replay")
-        results["b12x_replay"]()
-        b12x_oracle = (a_source.float() @ b_source.float().T).to(torch.bfloat16)
+        if results.get("sparkinfer_replay") is None:
+            raise BenchmarkAbort("correctness check requires the sparkinfer e2e replay")
+        results["sparkinfer_replay"]()
+        sparkinfer_oracle = (a_source.float() @ b_source.float().T).to(torch.bfloat16)
         torch.cuda.synchronize()
         check_outputs(
-            results["b12x_out"][:, :, 0],
-            b12x_oracle,
-            label="BF16 source matmul oracle for b12x",
+            results["sparkinfer_out"][:, :, 0],
+            sparkinfer_oracle,
+            label="BF16 source matmul oracle for sparkinfer",
             cosine_threshold=DEEPGEMM_COSINE_THRESHOLD,
         )
 
     if include_input_quant:
         # DeepGEMM's dense-linear contract dynamically quantizes A per token and
         # consumes a model-load-time, per-128x128-block quantized B. Keep both
-        # native quantization granularities rather than adapting b12x operands.
+        # native quantization granularities rather than adapting sparkinfer operands.
         try:
             deep_gemm = load_deepgemm()
             b_deepgemm = deep_gemm.per_block_cast_to_fp8(b_source, True)
@@ -658,7 +658,7 @@ def main():
         batch_sizes = FP8_BATCH_SIZES
 
     mode_desc = ", ".join(mode.upper() for mode, _, _ in benchmark_modes)
-    print(f"Dense GEMM ({mode_desc}): b12x vs reference backends")
+    print(f"Dense GEMM ({mode_desc}): sparkinfer vs reference backends")
     if args.dtype == "fp4":
         print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     elif args.dtype in ("fp8", "fp8-e2e"):
@@ -678,7 +678,7 @@ def main():
             )
         if args.dtype in ("fp8-e2e", "all"):
             print(
-                "E2E BF16-oracle checks for b12x and DeepGEMM: on "
+                "E2E BF16-oracle checks for sparkinfer and DeepGEMM: on "
                 f"(cos >= {DEEPGEMM_COSINE_THRESHOLD:.6f} vs BF16 oracle)"
             )
     else:
@@ -688,7 +688,7 @@ def main():
     print()
 
     # Collect all results for summary.
-    # (mode, name, bs, M, N, K, b12x_med, flashinfer_med, deepgemm_med)
+    # (mode, name, bs, M, N, K, sparkinfer_med, flashinfer_med, deepgemm_med)
     all_results = []
 
     for mode, reference_label, bench_fn in benchmark_modes:
@@ -724,9 +724,9 @@ def main():
                     )
                     raise SystemExit(1) from None
 
-                b12x_med = (
-                    statistics.median(results["b12x"]) * 1000
-                    if results.get("b12x")
+                sparkinfer_med = (
+                    statistics.median(results["sparkinfer"]) * 1000
+                    if results.get("sparkinfer")
                     else None
                 )
                 ref_med = (
@@ -741,20 +741,20 @@ def main():
                 )
 
                 parts = [f"  {mode:<8} bs={bs:<3} (M={M:>3})"]
-                if b12x_med is not None:
-                    parts.append(f"b12x={b12x_med:6.1f}")
+                if sparkinfer_med is not None:
+                    parts.append(f"sparkinfer={sparkinfer_med:6.1f}")
                 if ref_med is not None:
                     parts.append(f"FlashInfer={ref_med:6.1f}")
                 if deepgemm_med is not None:
                     parts.append(f"DeepGEMM={deepgemm_med:6.1f}")
 
                 ratios = []
-                if b12x_med and ref_med:
-                    r = b12x_med / ref_med
-                    ratios.append(f"b12x/flashinfer-cutlass={r:.2f}x")
-                if b12x_med and deepgemm_med:
-                    r = b12x_med / deepgemm_med
-                    ratios.append(f"b12x/deepgemm={r:.2f}x")
+                if sparkinfer_med and ref_med:
+                    r = sparkinfer_med / ref_med
+                    ratios.append(f"sparkinfer/flashinfer-cutlass={r:.2f}x")
+                if sparkinfer_med and deepgemm_med:
+                    r = sparkinfer_med / deepgemm_med
+                    ratios.append(f"sparkinfer/deepgemm={r:.2f}x")
 
                 print("  ".join(parts) + "  " + "  ".join(ratios) + "  (graph us)")
 
@@ -766,7 +766,7 @@ def main():
                         M,
                         N,
                         K,
-                        b12x_med,
+                        sparkinfer_med,
                         ref_med,
                         deepgemm_med,
                     )
@@ -777,7 +777,7 @@ def main():
         print()
 
     print(f"\n{'=' * 75}")
-    print("  SUMMARY: b12x/reference (CUDA graph replay, lower = b12x faster)")
+    print("  SUMMARY: sparkinfer/reference (CUDA graph replay, lower = sparkinfer faster)")
     print(f"{'=' * 75}")
     header = f"  {'MODE':<9} {'GEMM':<30}"
     for bs in batch_sizes:

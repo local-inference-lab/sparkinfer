@@ -12,7 +12,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from b12x.distributed.pcie_twoshot import PCIeTwoShotSP, quantize_per_row
+from sparkinfer.distributed.pcie_twoshot import PCIeTwoShotSP, quantize_per_row
 
 ROWS = 4096
 ROW_ELEMS = 6144
@@ -145,8 +145,8 @@ def _bench(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
         return (time.perf_counter() - start) / iters * 1e6
 
     results = {
-        "b12x rs_fp8": timeit(lambda: pool.reduce_scatter_fp8(q, s, rs_out)),
-        "b12x ag_fp8": timeit(lambda: pool.all_gather_fp8(qs, ss, ag_out)),
+        "sparkinfer rs_fp8": timeit(lambda: pool.reduce_scatter_fp8(q, s, rs_out)),
+        "sparkinfer ag_fp8": timeit(lambda: pool.all_gather_fp8(qs, ss, ag_out)),
         "nccl rs bf16": timeit(
             lambda: dist.reduce_scatter_tensor(nccl_rs_out, x)
         ),

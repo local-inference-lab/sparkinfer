@@ -1,11 +1,11 @@
-"""Numeric gate: is b12x's MXFP8 activation quant at parity with DeepGEMM?
+"""Numeric gate: is sparkinfer's MXFP8 activation quant at parity with DeepGEMM?
 
-Compares b12x `quantize_block_fp8_linear_input_mxfp8` against DeepGEMM's
+Compares sparkinfer `quantize_block_fp8_linear_input_mxfp8` against DeepGEMM's
 reference `per_token_cast_to_fp8` (the 1d1d dense path quantizer) on identical
 BF16 inputs, at both gran_k=32 and gran_k=128, and reports:
-  - byte-exact fp8 match + e8m0 scale match (b12x vs each DeepGEMM granularity)
+  - byte-exact fp8 match + e8m0 scale match (sparkinfer vs each DeepGEMM granularity)
   - reconstruction error of each quant vs the original BF16 (accuracy)
-  - which gran_k b12x actually implements
+  - which gran_k sparkinfer actually implements
 
 Run with the assigned GPU:
   python benchmarks/probe_quant_parity_deepgemm.py
@@ -15,7 +15,7 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
 
 
 # ---- DeepGEMM reference (verbatim from deepgemm-other/deep_gemm/utils/math.py) ----
@@ -75,11 +75,11 @@ def main() -> None:
     x = (torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 3.0)
     xf = x.float()
 
-    # --- b12x quant ---
+    # --- sparkinfer quant ---
     rows = quantize_block_fp8_linear_input_mxfp8(x)
     b_vals = rows.values.view(torch.float8_e4m3fn)        # [M, K]
     b_sf = rows.scale_rows.view(torch.uint8)[0]           # [M, K//32]
-    print(f"b12x scale_rows shape {tuple(b_sf.shape)} -> implies gran_k={K // b_sf.shape[1]}")
+    print(f"sparkinfer scale_rows shape {tuple(b_sf.shape)} -> implies gran_k={K // b_sf.shape[1]}")
 
     # --- DeepGEMM quant at both granularities ---
     dg32_vals, dg32_sf_f = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
@@ -87,20 +87,20 @@ def main() -> None:
     dg32_sf = sf_fp32_to_e8m0_u8(dg32_sf_f)
     dg128_sf = sf_fp32_to_e8m0_u8(dg128_sf_f)
 
-    # --- byte-exact parity: b12x vs DeepGEMM gran_k=32 ---
-    print("\n[byte-exact] b12x vs DeepGEMM gran_k=32")
+    # --- byte-exact parity: sparkinfer vs DeepGEMM gran_k=32 ---
+    print("\n[byte-exact] sparkinfer vs DeepGEMM gran_k=32")
     v_eq = (b_vals.view(torch.uint8) == dg32_vals.view(torch.uint8)).float().mean().item()
     s_eq = (b_sf == dg32_sf).float().mean().item()
     print(f"  fp8 byte match = {v_eq*100:.3f}%   e8m0 scale match = {s_eq*100:.3f}%")
 
-    print("[byte-exact] b12x scale vs DeepGEMM gran_k=128 (after 4x broadcast)")
+    print("[byte-exact] sparkinfer scale vs DeepGEMM gran_k=128 (after 4x broadcast)")
     dg128_sf_bc = dg128_sf.repeat_interleave(4, dim=1)  # [M, K//32]
     s128_eq = (b_sf == dg128_sf_bc).float().mean().item()
-    print(f"  e8m0 scale match (b12x per-32 vs DG per-128 broadcast) = {s128_eq*100:.3f}%")
+    print(f"  e8m0 scale match (sparkinfer per-32 vs DG per-128 broadcast) = {s128_eq*100:.3f}%")
 
     # --- reconstruction accuracy vs original bf16 ---
     print("\n[reconstruction error vs original bf16]")
-    report("b12x (per-32)", dequant_per32(b_vals, b_sf, 32), xf)
+    report("sparkinfer (per-32)", dequant_per32(b_vals, b_sf, 32), xf)
     report("DeepGEMM gran_k=32", dequant_per32(dg32_vals, dg32_sf, 32), xf)
     report("DeepGEMM gran_k=128", dequant_per32(dg128_vals, dg128_sf, 128), xf)
 

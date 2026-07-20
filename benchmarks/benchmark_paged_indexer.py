@@ -13,12 +13,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn
-from b12x.attention.indexer import uses_paged_mqa_schedule
-from b12x.attention.indexer.kernel import (
+from sparkinfer.attention.indexer import uses_paged_mqa_schedule
+from sparkinfer.attention.indexer.kernel import (
     run_paged_supertile_logits_kernel,
 )
-from b12x.attention.indexer import (
-    B12XIndexerScratchCaps,
+from sparkinfer.attention.indexer import (
+    SPARKINFERIndexerScratchCaps,
     INDEXER_SOURCE_LAYOUT_PAGED,
     clear_indexer_caches,
     index_topk_fp8,
@@ -40,7 +40,7 @@ def _make_page_table(
     pages_per_row = min((int(seq_len) + 63) // 64, int(page_table_width))
     if int(page_stride) == 0:
         # vLLM's single-request prefill path expands one row without packing;
-        # b12x receives a stride-0 row-shared page table.
+        # sparkinfer receives a stride-0 row-shared page table.
         table = torch.full(
             (1, page_table_width), -1, dtype=torch.int32, device=device
         )
@@ -461,7 +461,7 @@ def main() -> None:
         packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
     # Match vLLM's rank-3 allocation, whose page bytes are planar
     # [64*128 quant][64*4 scales], then reproduce its zero-copy flattening for
-    # b12x. The apparent [64, 132] shape is an allocation contract, not an
+    # sparkinfer. The apparent [64, 132] shape is an allocation contract, not an
     # interleaved per-token byte layout.
     if cache_page_stride_bytes == logical_cache_page_bytes:
         vllm_kv_cache = packed_index_k_cache.view(cache_num_pages, 64, 132)
@@ -513,7 +513,7 @@ def main() -> None:
             (rows,), max_seq_len, dtype=torch.int32, device=device
         )
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=num_heads,
@@ -588,7 +588,7 @@ def main() -> None:
             # The benchmark can force the primitive outside the production row
             # routing gate. Keep that comparison graph-realistic with one fixed,
             # preinitialized workspace rather than per-replay allocations.
-            from b12x.attention.indexer.fused_indexer import (
+            from sparkinfer.attention.indexer.fused_indexer import (
                 fused_indexer_scratch_capacity,
             )
 
@@ -622,8 +622,8 @@ def main() -> None:
                 preinitialize_tile_logits=False,
             )
         if bench_mode == "fused-topk":
-            from b12x.attention.indexer.kernel import _split_index_k_cache_runtime_views
-            from b12x.attention.indexer.fused_indexer import run_fused_paged_indexer
+            from sparkinfer.attention.indexer.kernel import _split_index_k_cache_runtime_views
+            from sparkinfer.attention.indexer.fused_indexer import run_fused_paged_indexer
 
             assert fused_cache is not None
             quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
@@ -731,7 +731,7 @@ def main() -> None:
             # (production gathers them from the paged cache with
             # cp_gather_indexer_k_quant_cache_kernel), per-row causal
             # [cu_seqlen_ks, cu_seqlen_ke) ranges, then topKPerRowPrefill.
-            # Unpack the SAME cache bytes the b12x kernel reads.
+            # Unpack the SAME cache bytes the sparkinfer kernel reads.
             active_pages = min((max_seq_len + 63) // 64, page_table_width)
             page_ids = metadata.real_page_table[0, :active_pages].to(torch.int64)
             pages_u8 = index_k_cache[page_ids]  # (P, 8448) planar page bytes
@@ -813,14 +813,14 @@ def main() -> None:
         overlap_min = 1.0
         for row in range(rows):
             valid = min(topk, int(seqlens[row].item()))
-            b12x_set = set(out_indices[row][out_indices[row] >= 0].tolist())
+            sparkinfer_set = set(out_indices[row][out_indices[row] >= 0].tolist())
             ref_row = ref_indices[row][:valid]
             ref_set = set(ref_row[ref_row >= 0].tolist())
             denom = max(1, len(ref_set))
-            overlap_min = min(overlap_min, len(b12x_set & ref_set) / denom)
+            overlap_min = min(overlap_min, len(sparkinfer_set & ref_set) / denom)
         if overlap_min < 0.98:
             raise AssertionError(
-                f"b12x/vllm top-k sets diverge: min row overlap {overlap_min:.4f}"
+                f"sparkinfer/vllm top-k sets diverge: min row overlap {overlap_min:.4f}"
             )
         if args.eager:
             ref_samples_us = _event_time_us(
@@ -837,7 +837,7 @@ def main() -> None:
         ref_kind = "paged+persistent_topk" if not shared_page_table else "contig+topk_per_row"
         ref_summary = (
             f" ref=deepgemm_sm120({ref_kind}) ref_median_us={ref_median_us:.2f} "
-            f"b12x/ref={statistics.median(samples_us) / ref_median_us:.4f}x "
+            f"sparkinfer/ref={statistics.median(samples_us) / ref_median_us:.4f}x "
             f"topk_overlap_min={overlap_min:.4f}"
         )
 

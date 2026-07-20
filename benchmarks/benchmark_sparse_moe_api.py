@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the sparse-block b12x API with Qwen-style hidden-state inputs.
+"""Benchmark the sparse-block sparkinfer API with Qwen-style hidden-state inputs.
 
 This benchmark is graph-first: timings are CUDA graph replay times, not eager
 Python dispatch.
@@ -30,15 +30,15 @@ from benchmarks.benchmark_moe import (
     make_input_activations,
     require_sm120,
 )
-from b12x.integration.tp_moe import (
-    B12XFP4ExpertWeights,
+from sparkinfer.integration.tp_moe import (
+    SPARKINFERFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
     build_tp_moe_fp4_binding,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     clear_tp_moe_caches,
-    plan_b12x_fp4_moe_weights,
-    prepare_b12x_fp4_moe_weights,
+    plan_sparkinfer_fp4_moe_weights,
+    prepare_sparkinfer_fp4_moe_weights,
 )
 
 
@@ -53,8 +53,8 @@ def _make_spec() -> ModelSpec:
     )
 
 
-def _pack_experts(weights) -> B12XFP4ExpertWeights:
-    plan = plan_b12x_fp4_moe_weights(
+def _pack_experts(weights) -> SPARKINFERFP4ExpertWeights:
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format=weights.source_format,
         activation="silu",
@@ -64,7 +64,7 @@ def _pack_experts(weights) -> B12XFP4ExpertWeights:
         intermediate_size=weights.spec.I_tp,
         w13_layout=weights.w13_layout,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_global_scale=(
             weights.g1_alphas_per_expert

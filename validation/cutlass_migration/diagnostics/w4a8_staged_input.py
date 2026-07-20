@@ -23,7 +23,7 @@ def _prepare_cutlass_runtime() -> str:
         from cutlass.base_dsl import _mlir_helpers
 
         sys.modules["cutlass._mlir_helpers"] = _mlir_helpers
-    from b12x.cute.runtime_patches import apply_cutlass_runtime_patches
+    from sparkinfer.cute.runtime_patches import apply_cutlass_runtime_patches
 
     apply_cutlass_runtime_patches()
     return version
@@ -201,7 +201,7 @@ def main() -> int:
 
     cases = [_case(_run_w4a8_dynamic, tile_m) for tile_m in args.tiles]
     payload = {
-        "schema": "b12x.w4a8.staged_input_diagnostic.v1",
+        "schema": "sparkinfer.w4a8.staged_input_diagnostic.v1",
         "toolchain": {
             "cutlass_dsl": version,
             "torch": torch.__version__,

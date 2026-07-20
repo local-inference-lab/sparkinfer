@@ -16,7 +16,7 @@ from importlib.metadata import PackageNotFoundError, version
 import torch
 from cuda.bindings import driver as cuda_driver
 
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 from benchmarks.common import make_l2_flush_fn
 from validation.cutlass_migration.core.evidence_status import (
     add_evidence_status_argument,
@@ -90,7 +90,7 @@ def _manifest_for_spec(
     for path in cache.rglob("*.json"):
         manifest = json.loads(path.read_text())
         if (
-            manifest.get("schema") == "b12x.cute.compile_manifest.v3"
+            manifest.get("schema") == "sparkinfer.cute.compile_manifest.v3"
             and manifest.get("compile_spec_hash") == spec_hash
             and manifest.get("object_sha256")
         ):
@@ -106,15 +106,15 @@ def _manifest_for_spec(
 def _load_exact(cache: pathlib.Path, spec_hash: str):
     provenance = artifact_provenance(cache, spec_hash)
     cache_key = str(provenance["cache_key"])
-    previous = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    previous = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(cache_key)
     finally:
         if previous is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous
     if compiled is None:
         raise RuntimeError(f"failed to load exact object {provenance['object_path']}")
     manifest = json.loads(
@@ -592,9 +592,9 @@ def main() -> None:
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     root = REPO_ROOT
-    source_path = root / "b12x/moe/fused/dynamic.py"
+    source_path = root / "sparkinfer/moe/fused/dynamic.py"
     result = {
-        "schema": "b12x.w4a8.dynamic.cache_abba.v2",
+        "schema": "sparkinfer.w4a8.dynamic.cache_abba.v2",
         "evidence_status": args.evidence_status,
         "command": [sys.executable, *sys.argv],
         "worktree": str(root),
@@ -666,7 +666,7 @@ def main() -> None:
         "live_input_mutation_changed_input": True,
         "live_input_mutation_changed_output": True,
         "live_input_mutation": {
-            "schema": "b12x-live-input-mutation-v1",
+            "schema": "sparkinfer-live-input-mutation-v1",
             "captured_graph_reused": True,
             "in_place": True,
             "same_addresses": True,

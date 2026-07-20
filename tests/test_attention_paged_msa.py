@@ -5,12 +5,12 @@ import math
 import pytest
 import torch
 
-from b12x.attention.paged.reference import (
+from sparkinfer.attention.paged.reference import (
     materialize_paged_kv_cache,
     msa_attention_reference,
 )
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
@@ -127,7 +127,7 @@ def _run_msa_decode(
     assert page_size <= plan.kv_chunk_size <= 32 * page_size
     assert plan.total_num_partial_rows >= plan.new_batch_size
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -199,7 +199,7 @@ def _run_msa_extend(
     assert plan.cta_tile_q in (16, 128)
     assert plan.new_batch_size > 0
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,
@@ -936,7 +936,7 @@ def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
     q2k_data_ptr = int(q2k_indices.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1152,7 +1152,7 @@ def test_msa_decode_cuda_graph_captures_minimax_metadata_update_contract() -> No
     cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1384,7 +1384,7 @@ def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
     cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1591,7 +1591,7 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
     )
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1714,7 +1714,7 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
 def test_msa_decode_graph_metadata_skips_zero_length_padded_rows() -> None:
     require_sm12x()
 
-    from b12x.attention.paged.graph_replay import (
+    from sparkinfer.attention.paged.graph_replay import (
         update_msa_decode_graph_chunk_metadata,
     )
 
@@ -1763,7 +1763,7 @@ def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
     require_sm12x()
     clear_attention_caches()
 
-    import b12x.attention.paged.api as paged_api
+    import sparkinfer.attention.paged.api as paged_api
 
     forward_specs: list[str] = []
 
@@ -1778,13 +1778,13 @@ def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
 
     spec_by_batch: dict[int, str] = {}
     for batch in (1, 2, 4, 8, 16):
         page_table_width = 80
         scratch_plan = plan_paged_attention_scratch(
-            B12XPagedAttentionScratchCaps(
+            SPARKINFERPagedAttentionScratchCaps(
                 device=torch.device("cuda"),
                 mode="decode",
                 dtype=torch.bfloat16,
@@ -1871,7 +1871,7 @@ def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
     require_sm12x()
     clear_attention_caches()
 
-    import b12x.attention.paged.api as paged_api
+    import sparkinfer.attention.paged.api as paged_api
 
     forward_specs: list[str] = []
 
@@ -1886,7 +1886,7 @@ def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[8, 4],

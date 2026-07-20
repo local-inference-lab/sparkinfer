@@ -29,8 +29,8 @@ from benchmarks.benchmark_dense_gemm import (
     make_quantized_operand,
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.cute.utils import convert_sf_from_mma_layout
-from b12x.gemm.dense import DenseGemmKernel, dense_gemm
+from sparkinfer.cute.utils import convert_sf_from_mma_layout
+from sparkinfer.gemm.dense import DenseGemmKernel, dense_gemm
 from flashinfer.gemm import mm_fp4
 
 

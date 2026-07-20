@@ -1,13 +1,13 @@
 """w13_layout handling through the micro/dynamic (non-W4A16) serving paths.
 
 The gated micro/dynamic kernels consume fused FC1 weights as [up; gate]
-("w13"). vLLM fuses [gate; up] ("w31"/"gate_up"); b12x normalizes such
+("w13"). vLLM fuses [gate; up] ("w31"/"gate_up"); sparkinfer normalizes such
 sources with a one-time in-place half flip of the FC1 weights and their
 swizzled block scales at first use. These tests gate that flip:
 
 - the swizzle-aware scale half swap is validated against the independent
   reference unswizzler (so the e2e test below is not circular), and
-- b12x_moe_fp4 with gate-first weight copies + w13_layout="w31" must be
+- sparkinfer_moe_fp4 with gate-first weight copies + w13_layout="w31" must be
   bit-identical to the kernel-order baseline, for both nvfp4 and
   w4a8_nvfp4, across the micro and dynamic dispatch bands, including
   repeat launches (the flip must apply exactly once per storage).
@@ -80,8 +80,8 @@ def _rank_geometry(weights) -> tuple[int, int]:
 
 def test_scale_half_swap_matches_reference_unswizzle() -> None:
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import _swap_w13_scale_halves_inplace
-    from b12x.moe.fused.reference import unswizzle_block_scale
+    from sparkinfer.integration.tp_moe import _swap_w13_scale_halves_inplace
+    from sparkinfer.moe.fused.reference import unswizzle_block_scale
 
     weights = _sub_weights()
     n, k = _rank_geometry(weights)
@@ -115,7 +115,7 @@ def _run(
     launches: int = 1,
     seed: int = 1234,
 ) -> torch.Tensor:
-    from b12x.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
     from tests.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
     clear_tp_moe_caches()
@@ -164,7 +164,7 @@ def test_w31_sources_match_w13_baseline(m: int, quant_mode: str | None) -> None:
         m, quant_mode, weights["w13_weight"], weights["w13_blockscale"], "w13"
     )
 
-    from b12x.integration.tp_moe import _swap_w13_scale_halves_inplace
+    from sparkinfer.integration.tp_moe import _swap_w13_scale_halves_inplace
 
     w13_w31 = _swap_w1_halves(weights["w13_weight"], n)
     bs_w31 = weights["w13_blockscale"].clone()

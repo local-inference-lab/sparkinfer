@@ -15,13 +15,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.indexer.reference import (
+from sparkinfer.attention.indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.attention.indexer import (
-    B12XIndexerScratchCaps,
+from sparkinfer.attention.indexer import (
+    SPARKINFERIndexerScratchCaps,
     INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
     INDEXER_SOURCE_LAYOUT_PAGED,
     clear_indexer_caches,
@@ -324,7 +324,7 @@ def _run_decode_case(
 
     prepare_decode_graph()
     decode_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=cfg.num_heads,
@@ -478,7 +478,7 @@ def _run_extend_case(
     )
     seqlens_expanded = per_request_ke.repeat(batch)
     contiguous_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
             num_q_heads=cfg.num_heads,

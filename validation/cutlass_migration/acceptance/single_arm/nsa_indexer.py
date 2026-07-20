@@ -39,7 +39,7 @@ from validation.cutlass_migration.core.single_arm_e2e import (
 
 
 FAMILY = "nsa_indexer"
-INPUT_SCHEMA = "b12x.nsa_indexer.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.nsa_indexer.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "finite-checked-regions",
     "independent-torch-reference",

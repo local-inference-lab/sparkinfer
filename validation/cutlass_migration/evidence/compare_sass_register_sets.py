@@ -17,8 +17,8 @@ import sys
 from pathlib import Path
 
 
-_SIDECAR_SCHEMA = "b12x.cute.sass_register_sets.v3"
-_DELTA_SCHEMA = "b12x.cute.sass_register_set_delta.v3"
+_SIDECAR_SCHEMA = "sparkinfer.cute.sass_register_sets.v3"
+_DELTA_SCHEMA = "sparkinfer.cute.sass_register_set_delta.v3"
 _FAMILIES = ("r", "ur", "p", "up")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PAIR_KEY = ("comparison_semantic_key", "kernel")

@@ -1,6 +1,6 @@
 """Child-process verification for the frozen migration-corpus source tree.
 
-This module intentionally imports neither CUTLASS, torch, nor b12x.  The
+This module intentionally imports neither CUTLASS, torch, nor sparkinfer.  The
 launcher calls it before those runtimes are imported, and the pytest plugin
 calls it before test collection and again at session shutdown.
 """
@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any
 
 
-SOURCE_SNAPSHOT_SCHEMA = "b12x.cute.migration.source_snapshot.v2"
+SOURCE_SNAPSHOT_SCHEMA = "sparkinfer.cute.migration.source_snapshot.v2"
 SOURCE_SNAPSHOT_ENV = "CORPUS_FROZEN_SOURCE_MANIFEST"
 SOURCE_SNAPSHOT_SHA256_ENV = "CORPUS_FROZEN_SOURCE_MANIFEST_SHA256"
 SOURCE_SNAPSHOT_FINGERPRINT_ENV = (
     "CORPUS_FROZEN_SOURCE_SNAPSHOT_FINGERPRINT"
 )
-B12X_FINGERPRINT_ENV = "CORPUS_EXPECTED_B12X_PACKAGE_FINGERPRINT"
+SPARKINFER_FINGERPRINT_ENV = "CORPUS_EXPECTED_SPARKINFER_PACKAGE_FINGERPRINT"
 
 
 class SourceSnapshotError(RuntimeError):
@@ -142,13 +142,13 @@ def verify_frozen_source_from_environment(
     expected_manifest_sha = os.environ.get(
         SOURCE_SNAPSHOT_FINGERPRINT_ENV, ""
     ).strip()
-    expected_b12x_fingerprint = os.environ.get(B12X_FINGERPRINT_ENV, "").strip()
+    expected_sparkinfer_fingerprint = os.environ.get(SPARKINFER_FINGERPRINT_ENV, "").strip()
     if not all(
         (
             raw_manifest_path,
             expected_artifact_sha,
             expected_manifest_sha,
-            expected_b12x_fingerprint,
+            expected_sparkinfer_fingerprint,
         )
     ):
         raise SourceSnapshotError("frozen source environment is incomplete")
@@ -184,19 +184,19 @@ def verify_frozen_source_from_environment(
             f"expected={expected_manifest_sha!r}"
         )
 
-    expected_package = manifest.get("b12x_package")
+    expected_package = manifest.get("sparkinfer_package")
     if not isinstance(expected_package, dict):
-        raise SourceSnapshotError("frozen source manifest lacks b12x_package")
+        raise SourceSnapshotError("frozen source manifest lacks sparkinfer_package")
     observed_package = _tree_snapshot(
-        resolved_repo / "b12x",
+        resolved_repo / "sparkinfer",
         resolved_repo,
-        root_label="b12x",
+        root_label="sparkinfer",
     )
     if observed_package != expected_package:
-        raise SourceSnapshotError("b12x package differs from frozen source manifest")
-    if observed_package["fingerprint"] != expected_b12x_fingerprint:
+        raise SourceSnapshotError("sparkinfer package differs from frozen source manifest")
+    if observed_package["fingerprint"] != expected_sparkinfer_fingerprint:
         raise SourceSnapshotError(
-            "b12x fingerprint differs from frozen source environment"
+            "sparkinfer fingerprint differs from frozen source environment"
         )
 
     expected_trees = manifest.get("source_trees")
@@ -244,7 +244,7 @@ def verify_frozen_source_from_environment(
         "manifest_path": str(manifest_path.resolve()),
         "manifest_artifact_sha256": artifact_sha,
         "manifest_sha256": computed_manifest_sha,
-        "b12x_package_fingerprint": observed_package["fingerprint"],
+        "sparkinfer_package_fingerprint": observed_package["fingerprint"],
         "verified_file_count": verified_file_count,
         "verified_input_count": len(expected_inputs),
     }

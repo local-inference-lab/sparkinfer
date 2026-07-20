@@ -22,17 +22,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.attention.paged.api import paged_attention_forward
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.attention.paged.workspace import PagedAttentionWorkspace
-from b12x.attention.paged.planner import (
+from sparkinfer.attention.paged.api import paged_attention_forward
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+from sparkinfer.attention.paged.planner import (
     create_paged_plan,
     decode_chunk_pages_for_graph,
     resolve_decode_graph_ctas_per_sm,
 )
-from b12x.integration.attention import clear_attention_caches
-from b12x.integration.paged_attention_scratch import build_paged_attention_binding
-from b12x.cute import b12x_package_fingerprint
+from sparkinfer.integration.attention import clear_attention_caches
+from sparkinfer.integration.paged_attention_scratch import build_paged_attention_binding
+from sparkinfer.cute import sparkinfer_package_fingerprint
 
 
 _REFERENCE_MINIMUM_COSINE = 0.999
@@ -42,7 +42,7 @@ _REFERENCE_ABSOLUTE_TOLERANCE = 0.02
 _OUTPUT_GUARD_BYTES = 4 * 1024
 _TENSOR_HASH_CHUNK_BYTES = 64 * 1024 * 1024
 _RUNTIME_ENVIRONMENT_PREFIXES = (
-    "B12X_",
+    "SPARKINFER_",
     "CUTE_",
     "CUTLASS_",
     "CUDA_",
@@ -261,7 +261,7 @@ def _runtime_environment_provenance() -> dict[str, object]:
         for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
     }
     payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "sparkinfer-runtime-environment-v1",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -321,7 +321,7 @@ def _extend_read_only_input_snapshot(
         clones[name] = clone
         tensor_hashes[name] = actual_hash
     aggregate = _json_sha256(
-        {"schema": "b12x-read-only-inputs-v1", "tensor_sha256": tensor_hashes}
+        {"schema": "sparkinfer-read-only-inputs-v1", "tensor_sha256": tensor_hashes}
     )
     return _ReadOnlyInputSnapshot(
         clones=clones,
@@ -351,7 +351,7 @@ def _assert_read_only_inputs_unchanged(
 
 def _read_only_input_provenance(snapshot: _ReadOnlyInputSnapshot) -> dict[str, object]:
     return {
-        "schema": "b12x-read-only-inputs-v1",
+        "schema": "sparkinfer-read-only-inputs-v1",
         "tensor_sha256": dict(snapshot.tensor_sha256),
         "aggregate_sha256": snapshot.aggregate_sha256,
     }
@@ -539,7 +539,7 @@ def _initialize_raw_sample_log(
             "commit": _git_value("rev-parse", "HEAD"),
             "branch": _git_value("branch", "--show-current"),
             "dirty_paths": _git_value("status", "--short").splitlines(),
-            "b12x_package_fingerprint": b12x_package_fingerprint(),
+            "sparkinfer_package_fingerprint": sparkinfer_package_fingerprint(),
             "benchmark_sha256": benchmark_dependencies[
                 str(benchmark_path.relative_to(repo))
             ],
@@ -1041,7 +1041,7 @@ def _snapshot_backend_replay_inputs(
     return snapshot, {**base_inputs, **workspace_inputs}
 
 
-def _poison_backend_result_regions(capture: BackendCapture | B12xDecodeGraphBucket) -> None:
+def _poison_backend_result_regions(capture: BackendCapture | SparkinferDecodeGraphBucket) -> None:
     capture.guarded_output.poison()
     workspace = capture.workspace
     for tensor in (workspace.lse, workspace.tmp_output, workspace.tmp_lse):
@@ -1050,14 +1050,14 @@ def _poison_backend_result_regions(capture: BackendCapture | B12xDecodeGraphBuck
 
 
 def _assert_backend_result_regions_overwritten(
-    capture: BackendCapture | B12xDecodeGraphBucket,
+    capture: BackendCapture | SparkinferDecodeGraphBucket,
 ) -> None:
-    capture.guarded_output.assert_fully_overwritten(backend="b12x")
+    capture.guarded_output.assert_fully_overwritten(backend="sparkinfer")
     workspace = capture.workspace
     plan = workspace.plan
     lse = workspace.current_lse_view()
     if not bool(torch.isfinite(lse).all().item()):
-        raise AssertionError("b12x logical LSE result was not fully overwritten with finite values")
+        raise AssertionError("sparkinfer logical LSE result was not fully overwritten with finite values")
     if plan.split_kv:
         assert workspace.tmp_output is not None
         assert workspace.tmp_lse is not None
@@ -1066,16 +1066,16 @@ def _assert_backend_result_regions_overwritten(
         tmp_lse = workspace.tmp_lse[:partial_rows]
         if not bool(torch.isfinite(tmp_output).all().item()):
             raise AssertionError(
-                "b12x logical split-KV temporary output was not fully overwritten"
+                "sparkinfer logical split-KV temporary output was not fully overwritten"
             )
         if not bool(torch.isfinite(tmp_lse).all().item()):
             raise AssertionError(
-                "b12x logical split-KV temporary LSE was not fully overwritten"
+                "sparkinfer logical split-KV temporary LSE was not fully overwritten"
             )
 
 
 def _strict_backend_replay_for_correctness(
-    capture: BackendCapture | B12xDecodeGraphBucket,
+    capture: BackendCapture | SparkinferDecodeGraphBucket,
     *,
     l2_flush=None,
 ) -> None:
@@ -1416,7 +1416,7 @@ def _make_decode_bucket_shared_inputs(
 
 
 @dataclass
-class B12xDecodeGraphBucket:
+class SparkinferDecodeGraphBucket:
     shared: DecodeBucketSharedInputs
     workspace: PagedAttentionWorkspace
     graph: torch.cuda.CUDAGraph
@@ -1699,7 +1699,7 @@ def _capture_backend_graph(
         capture_snapshot = None
         capture_inputs = None
     graph = _capture_graph(run, warmup=warmup)
-    guarded_output.assert_fully_overwritten(backend="b12x-capture")
+    guarded_output.assert_fully_overwritten(backend="sparkinfer-capture")
     if capture_snapshot is not None and capture_inputs is not None:
         _assert_read_only_inputs_unchanged(capture_snapshot, capture_inputs)
     if mode == "extend":
@@ -1922,14 +1922,14 @@ def _capture_flashinfer_fa2_graph(
     )
 
 
-def _capture_b12x_decode_graph_bucket(
+def _capture_sparkinfer_decode_graph_bucket(
     *,
     shared: DecodeBucketSharedInputs,
     capture_fixed_split_pages: int | None,
     replay_fixed_split_pages: int | None,
     warmup: int,
     graph_ctas_per_sm: int | None,
-) -> B12xDecodeGraphBucket:
+) -> SparkinferDecodeGraphBucket:
     workspace = PagedAttentionWorkspace.for_tensors(
         mode="decode",
         q=shared.q,
@@ -1978,10 +1978,10 @@ def _capture_b12x_decode_graph_bucket(
         read_only_snapshot = None
         read_only_inputs = None
     graph = _capture_graph(run, warmup=warmup)
-    guarded_output.assert_fully_overwritten(backend="b12x-capture")
+    guarded_output.assert_fully_overwritten(backend="sparkinfer-capture")
     if read_only_snapshot is not None and read_only_inputs is not None:
         _assert_read_only_inputs_unchanged(read_only_snapshot, read_only_inputs)
-    return B12xDecodeGraphBucket(
+    return SparkinferDecodeGraphBucket(
         shared=shared,
         workspace=workspace,
         graph=graph,
@@ -2209,7 +2209,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         )
         check_suffix = ""
         reference_output: torch.Tensor | None = None
-        b12x_correctness: dict[str, object] | None = None
+        sparkinfer_correctness: dict[str, object] | None = None
         if args.check:
             _strict_backend_replay_for_correctness(
                 backend_capture,
@@ -2220,12 +2220,12 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             )
             reference_max_abs, reference_rel_l2, reference_cos, nonzero = (
                 _reference_gate(
-                    backend="b12x",
+                    backend="sparkinfer",
                     output=backend_capture.output,
                     reference=reference_output,
                 )
             )
-            b12x_correctness = {
+            sparkinfer_correctness = {
                 "oracle": "torch-reference",
                 "passed": True,
                 "finite": True,
@@ -2273,13 +2273,13 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         )
         _record_samples(
             args.raw_samples_jsonl,
-            backend="b12x",
+            backend="sparkinfer",
             case=sample_case,
             samples_ms=backend_times_ms,
-            correctness=b12x_correctness,
+            correctness=sparkinfer_correctness,
         )
         backend_metrics = CaseMetrics(
-            backend="b12x",
+            backend="sparkinfer",
             mean_us=statistics.fmean(backend_times_ms) * 1000.0,
         )
 
@@ -2326,7 +2326,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                     flashinfer_output,
                 )
                 fa2_correctness = {
-                    "oracle": "b12x-cross-check",
+                    "oracle": "sparkinfer-cross-check",
                     "passed": math.isfinite(fa2_cos),
                     "max_abs": fa2_max_abs,
                     "cosine": fa2_cos,
@@ -2368,7 +2368,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         print(line + check_suffix)
 
     if speedups:
-        print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
+        print(f"geomean fa2/sparkinfer: {statistics.geometric_mean(speedups):.3f}x")
 
 
 def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
@@ -2438,7 +2438,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         )
         capture_fallback_error: Exception | None = None
         try:
-            b12x_bucket = _capture_b12x_decode_graph_bucket(
+            sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
                 shared=shared,
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
@@ -2457,7 +2457,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 capture_fixed_split_pages=None,
                 source=f"{bucket_policy.source}+capture-auto",
             )
-            b12x_bucket = _capture_b12x_decode_graph_bucket(
+            sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
                 shared=shared,
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
@@ -2500,7 +2500,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
 
         for case in (case for case in cases if case.batch == batch):
             try:
-                b12x_bucket.prepare_replay(context_tokens=case.context_tokens)
+                sparkinfer_bucket.prepare_replay(context_tokens=case.context_tokens)
             except Exception as exc:
                 raise RuntimeError(
                     f"requested decode-graph case was blocked: "
@@ -2513,43 +2513,43 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 fa2_bucket.prepare_replay(context_tokens=case.context_tokens)
 
             check_suffix = ""
-            b12x_correctness: dict[str, object] | None = None
+            sparkinfer_correctness: dict[str, object] | None = None
             fa2_correctness: dict[str, object] | None = None
             if args.check:
                 _strict_backend_replay_for_correctness(
-                    b12x_bucket,
+                    sparkinfer_bucket,
                     l2_flush=l2_flush,
                 )
                 ref_out = _decode_reference_output(
-                    read_only_snapshot=b12x_bucket.read_only_snapshot,
+                    read_only_snapshot=sparkinfer_bucket.read_only_snapshot,
                 )
                 (
-                    b12x_ref_max_abs,
-                    b12x_ref_rel_l2,
-                    b12x_ref_cos,
-                    b12x_nonzero,
+                    sparkinfer_ref_max_abs,
+                    sparkinfer_ref_rel_l2,
+                    sparkinfer_ref_cos,
+                    sparkinfer_nonzero,
                 ) = _reference_gate(
-                    backend="b12x", output=b12x_bucket.output, reference=ref_out
+                    backend="sparkinfer", output=sparkinfer_bucket.output, reference=ref_out
                 )
-                b12x_correctness = {
+                sparkinfer_correctness = {
                     "oracle": "torch-reference",
                     "passed": True,
                     "finite": True,
-                    "nonzero": b12x_nonzero,
-                    "max_abs": b12x_ref_max_abs,
-                    "relative_l2": b12x_ref_rel_l2,
-                    "cosine": b12x_ref_cos,
+                    "nonzero": sparkinfer_nonzero,
+                    "max_abs": sparkinfer_ref_max_abs,
+                    "relative_l2": sparkinfer_ref_rel_l2,
+                    "cosine": sparkinfer_ref_cos,
                     "allclose": True,
                     "minimum_cosine": _REFERENCE_MINIMUM_COSINE,
                     "maximum_relative_l2": _REFERENCE_MAXIMUM_RELATIVE_L2,
                     "relative_tolerance": _REFERENCE_RELATIVE_TOLERANCE,
                     "absolute_tolerance": _REFERENCE_ABSOLUTE_TOLERANCE,
                     "read_only_inputs": _read_only_input_provenance(
-                        b12x_bucket.read_only_snapshot
+                        sparkinfer_bucket.read_only_snapshot
                     ),
                 }
                 check_suffix = (
-                    f" | b12x/ref rel_l2={b12x_ref_rel_l2:.6f} cos={b12x_ref_cos:.8f}"
+                    f" | sparkinfer/ref rel_l2={sparkinfer_ref_rel_l2:.6f} cos={sparkinfer_ref_cos:.8f}"
                 )
                 if fa2_bucket is not None:
                     _strict_guarded_replay_for_correctness(
@@ -2564,30 +2564,30 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     fa2_ref_rel_l2 = _relative_l2_error(flashinfer_output, ref_out)
                     fa2_ref_cos = _cosine_similarity(flashinfer_output, ref_out)
                     cross_rel_l2 = _relative_l2_error(
-                        b12x_bucket.output,
+                        sparkinfer_bucket.output,
                         flashinfer_output,
                     )
                     cross_cos = _cosine_similarity(
-                        b12x_bucket.output,
+                        sparkinfer_bucket.output,
                         flashinfer_output,
                     )
                     fa2_correctness = {
-                        "oracle": "torch-reference-and-b12x-cross-check",
+                        "oracle": "torch-reference-and-sparkinfer-cross-check",
                         "passed": math.isfinite(fa2_ref_cos)
                         and math.isfinite(cross_cos),
                         "reference_relative_l2": fa2_ref_rel_l2,
                         "reference_cosine": fa2_ref_cos,
-                        "b12x_cross_relative_l2": cross_rel_l2,
-                        "b12x_cross_cosine": cross_cos,
+                        "sparkinfer_cross_relative_l2": cross_rel_l2,
+                        "sparkinfer_cross_cosine": cross_cos,
                     }
                     check_suffix += (
                         f" | fa2/ref rel_l2={fa2_ref_rel_l2:.6f}"
                         f" cos={fa2_ref_cos:.8f}"
-                        f" | b12x/fa2 rel_l2={cross_rel_l2:.6f}"
+                        f" | sparkinfer/fa2 rel_l2={cross_rel_l2:.6f}"
                         f" cos={cross_cos:.8f}"
                     )
             backend_times_ms = _bench_graph(
-                b12x_bucket.graph,
+                sparkinfer_bucket.graph,
                 replays=args.replays,
                 l2_flush=l2_flush,
             )
@@ -2605,20 +2605,20 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     "head_dim": args.head_dim,
                     "q_dtype": str(dtype),
                     "kv_dtype": str(kv_dtype),
-                    "plan": b12x_bucket.current_plan_desc,
+                    "plan": sparkinfer_bucket.current_plan_desc,
                 },
                 input_seed=1 + bucket_idx,
                 input_generator="decode-bucket-shared-inputs-v1",
             )
             _record_samples(
                 args.raw_samples_jsonl,
-                backend="b12x",
+                backend="sparkinfer",
                 case=sample_case,
                 samples_ms=backend_times_ms,
-                correctness=b12x_correctness,
+                correctness=sparkinfer_correctness,
             )
             backend_metrics = CaseMetrics(
-                backend="b12x",
+                backend="sparkinfer",
                 mean_us=statistics.fmean(backend_times_ms) * 1000.0,
             )
 
@@ -2648,7 +2648,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 f"ctx={case.context_tokens:6d} "
                 f"kv={case.effective_cache_tokens:6d} "
                 f"cap={bucket_policy.capture_context_tokens:6d} "
-                f"{b12x_bucket.current_plan_desc:>17s} "
+                f"{sparkinfer_bucket.current_plan_desc:>17s} "
                 f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us"
             )
             if flashinfer_metrics is not None:
@@ -2661,12 +2661,12 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             print(line + check_suffix)
 
         del fa2_bucket
-        del b12x_bucket
+        del sparkinfer_bucket
         del shared
         torch.cuda.empty_cache()
 
     if speedups:
-        print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
+        print(f"geomean fa2/sparkinfer: {statistics.geometric_mean(speedups):.3f}x")
 
 
 def main(argv: list[str] | None = None) -> None:

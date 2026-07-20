@@ -1,7 +1,7 @@
 [project]
-name = "b12x"
+name = "sparkinfer"
 version = "0.30.2"
-description = "Unapologetically SM120-only CuTe DSL kernels for NVFP4 GEMM and MoE."
+description = "DGX Spark and RTX 6000-focused inference kernel library."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "Luke" }]
@@ -31,10 +31,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["b12x*"]
+include = ["sparkinfer*"]
 
 [tool.setuptools.package-data]
-"b12x.distributed" = ["*.cu"]
+"sparkinfer.distributed" = ["*.cu"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]

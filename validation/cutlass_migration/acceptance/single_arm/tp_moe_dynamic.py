@@ -55,12 +55,12 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.integration.tp_moe as tp_moe
+import sparkinfer.integration.tp_moe as tp_moe
 
 
 FAMILY = "tp_moe_dynamic"
 ARTIFACT_ROLE = "dynamic"
-INPUT_SCHEMA = "b12x.tp_moe.dynamic.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.tp_moe.dynamic.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "finite",
     "gpu-reference",
@@ -71,7 +71,7 @@ CORRECTNESS_GATES = (
 )
 NVFP4_REPLAYS_PER_REPORTED_SAMPLE = 8
 W4A8_REPLAYS_PER_REPORTED_SAMPLE = 1
-_TP_MOE_SOURCE = Path("b12x/integration/tp_moe.py")
+_TP_MOE_SOURCE = Path("sparkinfer/integration/tp_moe.py")
 
 
 @dataclass(frozen=True)
@@ -460,7 +460,7 @@ def _run_case(
         try:
 
             def launch() -> None:
-                output = tp_moe.b12x_moe_fp4(binding=state.binding)
+                output = tp_moe.sparkinfer_moe_fp4(binding=state.binding)
                 if output.data_ptr() != state.output.data_ptr():
                     raise AssertionError(f"{spec.case_id}: launcher replaced output")
 

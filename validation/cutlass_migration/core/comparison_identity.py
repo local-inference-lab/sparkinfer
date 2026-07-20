@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 
-COMPARISON_SEMANTIC_SCHEMA = "b12x.cute.cross_toolchain_comparison_identity.v1"
+COMPARISON_SEMANTIC_SCHEMA = "sparkinfer.cute.cross_toolchain_comparison_identity.v1"
 _OPERATIONAL_COMPILE_ENVIRONMENT = frozenset({"CUTE_DSL_KEEP", "CUTE_DSL_DUMP_DIR"})
 _OPERATIONAL_COMPILE_OPTION_PREFIXES = ("dump-ptx-path=",)
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.indexer import (
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer.attention.indexer import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     MSA_SM_SCALE,
@@ -16,22 +16,22 @@ from b12x.attention.indexer import (
     msa_q2k_indices_prefill,
     quantize_msa_q_fp8,
 )
-from b12x.attention.indexer.contiguous_kernel import (
+from sparkinfer.attention.indexer.contiguous_kernel import (
     run_contiguous_block_scores_kernel,
 )
-from b12x.attention.indexer.msa_reference import (
+from sparkinfer.attention.indexer.msa_reference import (
     msa_contiguous_block_scores_reference,
     msa_paged_decode_block_scores_reference,
     msa_q2k_indices_reference,
 )
-from b12x.attention.indexer.reference import pack_index_k_cache_reference
-from b12x.attention.indexer.scratch import (
-    B12XIndexerContiguousScratchCaps,
-    B12XIndexerPagedScratchCaps,
+from sparkinfer.attention.indexer.reference import pack_index_k_cache_reference
+from sparkinfer.attention.indexer.scratch import (
+    SPARKINFERIndexerContiguousScratchCaps,
+    SPARKINFERIndexerPagedScratchCaps,
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
 )
-from b12x.cute.compiler import compile_cache_info
+from sparkinfer.cute.compiler import compile_cache_info
 
 
 def _one_scratch(plan):
@@ -162,7 +162,7 @@ def test_msa_paged_scratch_binding_owns_decode_outputs() -> None:
         seed=92_155,
     )
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=4,
@@ -214,7 +214,7 @@ def test_msa_paged_binding_rejects_duplicate_outputs_and_runs_valid_kernel() -> 
         seed=92_156,
     )
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=4,
@@ -260,7 +260,7 @@ def test_msa_paged_binding_rejects_duplicate_outputs_and_runs_valid_kernel() -> 
         )
 
     nsa_plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device=device,
             num_q_heads=1,
             max_q_rows=2,
@@ -308,7 +308,7 @@ def test_msa_contiguous_scratch_binding_owns_prefill_outputs() -> None:
         seed=92_255,
     )
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=4,
@@ -367,7 +367,7 @@ def test_msa_contiguous_binding_rejects_duplicate_outputs_and_runs_valid_kernel(
         seed=92_256,
     )
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=4,
@@ -413,7 +413,7 @@ def test_msa_contiguous_binding_rejects_duplicate_outputs_and_runs_valid_kernel(
         )
 
     nsa_plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device=device,
             num_q_heads=1,
             max_q_rows=3,
@@ -590,7 +590,7 @@ def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights() -> None:
         seed=92_758,
     )
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device=device,
             num_q_heads=1,
             num_idx_heads=heads,

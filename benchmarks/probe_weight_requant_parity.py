@@ -1,10 +1,10 @@
-"""Does b12x's weight packing drop a re-quantization step vs DeepGEMM?
+"""Does sparkinfer's weight packing drop a re-quantization step vs DeepGEMM?
 
 DeepSeek-style FP8 checkpoints store (w_fp8, s_fp32) where s_fp32 = blockamax/448
 is an ARBITRARY fp32 per-128x128-block scale (NOT a power of two). To run a
 UE8M0 block-scaled MMA you must reconcile this with power-of-two scales.
 
-  A) b12x today: keep checkpoint w_fp8, round s_fp32 to nearest power-of-two
+  A) sparkinfer today: keep checkpoint w_fp8, round s_fp32 to nearest power-of-two
      (pack_fp8_block_scaled_weight_mxfp8 -> _scale_to_e8m0_u8 round). The fp8
      values stay matched to s_fp32, but are now multiplied by a DIFFERENT
      (rounded) scale -> per-block scale error up to sqrt(2).
@@ -14,7 +14,7 @@ UE8M0 block-scaled MMA you must reconcile this with power-of-two scales.
      with ceil; fp8 values re-optimized for the ue8m0 scale.
 
 Ground truth = the original bf16 weight (and the checkpoint intent C = w_fp8*s_fp32).
-If B is much closer than A, b12x is dropping the re-quantization step.
+If B is much closer than A, sparkinfer is dropping the re-quantization step.
 
 Run with the assigned GPU:
   python benchmarks/probe_weight_requant_parity.py
@@ -43,7 +43,7 @@ def per_block_cast_to_fp8(x, use_ue8m0=True, gran_k=128):
 
 
 def round_pow2(s):
-    # b12x _scale_to_e8m0_u8: round(log2(s)) -> nearest power of two
+    # sparkinfer _scale_to_e8m0_u8: round(log2(s)) -> nearest power of two
     e = torch.round(torch.log2(s.clamp_min(1e-30))).clamp(-127, 127)
     return torch.exp2(e)
 
@@ -77,7 +77,7 @@ def main():
     s_fp32 = s_fp32.view(N // 128, K // 128)
     C = w_fp8.float() * expand_block(s_fp32, 128, (N, K))        # checkpoint intent (best estimate of w_orig)
 
-    # --- A) b12x today: keep w_fp8, round the scale to pow2 ---
+    # --- A) sparkinfer today: keep w_fp8, round the scale to pow2 ---
     s_round = round_pow2(s_fp32)
     deq_A = w_fp8.float() * expand_block(s_round, 128, (N, K))
 
@@ -91,12 +91,12 @@ def main():
           f"min={(s_round/s_fp32).min().item():.4f}  max={(s_round/s_fp32).max().item():.4f}")
     print()
     print("  vs checkpoint intent C = w_fp8*s_fp32:")
-    print(f"    A) b12x round-scale, stale values : cos={cos(deq_A, C):.6f}  rel_fro={relfro(deq_A, C):.5f}")
+    print(f"    A) sparkinfer round-scale, stale values : cos={cos(deq_A, C):.6f}  rel_fro={relfro(deq_A, C):.5f}")
     print(f"    B) requantize (DeepGEMM-parity)   : cos={cos(deq_B, C):.6f}  rel_fro={relfro(deq_B, C):.5f}")
     print()
     print("  vs ORIGINAL bf16 weight w_orig:")
     print(f"    C) checkpoint intent              : cos={cos(C, w_orig):.6f}  rel_fro={relfro(C, w_orig):.5f}")
-    print(f"    A) b12x round-scale, stale values : cos={cos(deq_A, w_orig):.6f}  rel_fro={relfro(deq_A, w_orig):.5f}")
+    print(f"    A) sparkinfer round-scale, stale values : cos={cos(deq_A, w_orig):.6f}  rel_fro={relfro(deq_A, w_orig):.5f}")
     print(f"    B) requantize (DeepGEMM-parity)   : cos={cos(deq_B, w_orig):.6f}  rel_fro={relfro(deq_B, w_orig):.5f}")
 
     # --- end-to-end GEMM impact (A @ W^T), activation kept bf16-exact to isolate weight quant ---
@@ -105,7 +105,7 @@ def main():
     oracle = x @ w_orig.T
     print()
     print("  GEMM x@W^T cos vs fp32-oracle (weight quant only):")
-    print(f"    A) b12x round-scale  : cos={cos(x @ deq_A.T, oracle):.6f}  rel_fro={relfro(x @ deq_A.T, oracle):.5f}")
+    print(f"    A) sparkinfer round-scale  : cos={cos(x @ deq_A.T, oracle):.6f}  rel_fro={relfro(x @ deq_A.T, oracle):.5f}")
     print(f"    B) requantize        : cos={cos(x @ deq_B.T, oracle):.6f}  rel_fro={relfro(x @ deq_B.T, oracle):.5f}")
     print(f"    C) checkpoint intent : cos={cos(x @ C.T, oracle):.6f}  rel_fro={relfro(x @ C.T, oracle):.5f}")
 

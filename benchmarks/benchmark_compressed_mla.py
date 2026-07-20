@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.mla.compressed_reference import (
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
@@ -30,8 +30,8 @@ from b12x.attention.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from b12x.integration.mla import (
-    B12XCompressedMLAScratchCaps,
+from sparkinfer.integration.mla import (
+    SPARKINFERCompressedMLAScratchCaps,
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
@@ -65,7 +65,7 @@ VLLM_DSV4_TRACE_SWA_PAGE_SIZE = 64
 # 22 x 37,440B, 21 x 8,640B, and 20 x 1,728B slots make each physical block
 # 1,039,680B.  The trace allocation contains 7,792 blocks; consequently a
 # 37,440B layer view spans exactly 8,100,184,320B, matching the Cute tensor
-# extent encoded in the captured B12X kernel name.
+# extent encoded in the captured SPARKINFER kernel name.
 VLLM_DSV4_TRACE_CACHE_PAGE_STRIDE_BYTES = 1_039_680
 VLLM_DSV4_TRACE_CACHE_NUM_PAGES = 7_792
 VLLM_DSV4_TRACE_CACHE_VIEW_SPAN_BYTES = 8_100_184_320
@@ -102,14 +102,14 @@ class CaseReport:
     flashinfer_p90_replay_us: float | None = None
     flashinfer_replay_samples_us: tuple[float, ...] = ()
     flashinfer_sanity_algorithm: Sanity | None = None
-    b12x_vs_flashinfer_sanity: Sanity | None = None
+    sparkinfer_vs_flashinfer_sanity: Sanity | None = None
     split_chunks: int | None = None
     swa_valid: int | None = None
     indexed_valid: int | None = None
 
     @property
     def ratio_vs_flashinfer(self) -> float | None:
-        """B12X latency divided by FlashInfer latency; lower is faster."""
+        """SPARKINFER latency divided by FlashInfer latency; lower is faster."""
 
         if self.flashinfer_replay_us is None or self.flashinfer_replay_us <= 0.0:
             return None
@@ -135,15 +135,15 @@ class DSV4CompressedMLAProfile:
 
 @dataclass(frozen=True)
 class CacheViews:
-    b12x: torch.Tensor
+    sparkinfer: torch.Tensor
     flashinfer: torch.Tensor
 
 
 @dataclass(frozen=True)
 class TraceWeightedSummary:
-    b12x_total_us: float
+    sparkinfer_total_us: float
     flashinfer_total_us: float
-    b12x_avg_us: float
+    sparkinfer_avg_us: float
     flashinfer_avg_us: float
     ratio: float
     layer_count: int
@@ -516,10 +516,10 @@ def _make_cache_views(
     backing: torch.Tensor | None = None,
     byte_offset: int = 0,
 ) -> CacheViews:
-    """Expose one packed vLLM cache allocation to B12X and FlashInfer.
+    """Expose one packed vLLM cache allocation to SPARKINFER and FlashInfer.
 
     vLLM presents the same storage as ``[pages, page_size, 584]`` to
-    FlashInfer and as ``[pages, padded_page_bytes]`` to B12X. Packed KV cache
+    FlashInfer and as ``[pages, padded_page_bytes]`` to SPARKINFER. Packed KV cache
     groups retain the aggregate all-layer byte stride between successive
     physical pages, which is the important C128 addressing stress in the
     serving trace.
@@ -562,7 +562,7 @@ def _make_cache_views(
         and pages == active_pages
         and page_stride == page_nbytes
     ):
-        b12x_view = packed_cache
+        sparkinfer_view = packed_cache
     else:
         required_nbytes = byte_offset + (pages - 1) * page_stride + page_nbytes
         if backing is None:
@@ -583,20 +583,20 @@ def _make_cache_views(
             raise ValueError(
                 f"cache backing has {backing.numel()} bytes, needs {required_nbytes}"
             )
-        b12x_view = torch.as_strided(
+        sparkinfer_view = torch.as_strided(
             backing,
             size=(pages, page_nbytes),
             stride=(page_stride, 1),
             storage_offset=byte_offset,
         )
-        b12x_view[:active_pages].copy_(packed_cache)
+        sparkinfer_view[:active_pages].copy_(packed_cache)
 
     flashinfer_view = torch.as_strided(
-        b12x_view,
+        sparkinfer_view,
         size=(pages, int(page_size), COMPRESSED_MLA_BYTES_PER_TOKEN),
         stride=(page_stride, COMPRESSED_MLA_BYTES_PER_TOKEN, 1),
     )
-    return CacheViews(b12x=b12x_view, flashinfer=flashinfer_view)
+    return CacheViews(sparkinfer=sparkinfer_view, flashinfer=flashinfer_view)
 
 
 def _make_indices(
@@ -675,7 +675,7 @@ def _make_binding(
         production_decode_cap=production_decode_cap,
     )
     plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+        SPARKINFERCompressedMLAScratchCaps(
         device=device,
         num_q_heads=num_q_heads,
             max_q_rows=case.rows,
@@ -910,9 +910,9 @@ def _benchmark_case(
         nonlocal output
         output = compressed_mla_decode_forward(
             binding=binding,
-            swa_k_cache=swa_cache.b12x,
+            swa_k_cache=swa_cache.sparkinfer,
             swa_page_size=swa_page_size,
-            indexed_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
+            indexed_k_cache=indexed_cache.sparkinfer if indexed_cache is not None else None,
             indexed_page_size=case.indexed_page_size,
             attn_sink=attn_sink,
             sm_scale=_SM_SCALE,
@@ -924,12 +924,12 @@ def _benchmark_case(
     if verify:
         expected_algorithm = compressed_sparse_mla_reference(
             q,
-            swa_cache.b12x,
+            swa_cache.sparkinfer,
             swa_indices,
             swa_lengths,
             sm_scale=_SM_SCALE,
             attn_sink=attn_sink,
-            extra_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
+            extra_k_cache=indexed_cache.sparkinfer if indexed_cache is not None else None,
             extra_indices=indexed_indices,
             extra_topk_lengths=indexed_lengths,
             swa_page_size=swa_page_size,
@@ -951,13 +951,13 @@ def _benchmark_case(
         sanity_algorithm = _sanity(output, expected_algorithm)
         _check_algorithm_sanity(case, sanity_algorithm)
     if not bool(torch.isfinite(output.float()).all().item()):
-        raise BenchmarkFailure(f"non-finite B12X output for case={case.name}")
+        raise BenchmarkFailure(f"non-finite SPARKINFER output for case={case.name}")
     if not bool(torch.count_nonzero(output).item()):
-        raise BenchmarkFailure(f"all-zero B12X output for case={case.name}")
+        raise BenchmarkFailure(f"all-zero SPARKINFER output for case={case.name}")
 
     flashinfer_replay_us: list[float] = []
     flashinfer_sanity: Sanity | None = None
-    b12x_vs_flashinfer: Sanity | None = None
+    sparkinfer_vs_flashinfer: Sanity | None = None
     if reference == "flashinfer":
         from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4
 
@@ -1001,8 +1001,8 @@ def _benchmark_case(
         if expected_algorithm is not None:
             flashinfer_sanity = _sanity(flashinfer_output, expected_algorithm)
             _check_algorithm_sanity(case, flashinfer_sanity)
-        b12x_vs_flashinfer = _sanity(output, flashinfer_output)
-        _check_algorithm_sanity(case, b12x_vs_flashinfer)
+        sparkinfer_vs_flashinfer = _sanity(output, flashinfer_output)
+        _check_algorithm_sanity(case, sparkinfer_vs_flashinfer)
         if not bool(torch.isfinite(flashinfer_output.float()).all().item()):
             raise BenchmarkFailure(f"non-finite FlashInfer output for case={case.name}")
         if not bool(torch.count_nonzero(flashinfer_output).item()):
@@ -1030,7 +1030,7 @@ def _benchmark_case(
         ),
         flashinfer_replay_samples_us=tuple(flashinfer_replay_us),
         flashinfer_sanity_algorithm=flashinfer_sanity,
-        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer,
+        sparkinfer_vs_flashinfer_sanity=sparkinfer_vs_flashinfer,
         split_chunks=split_chunks,
         swa_valid=swa_valid,
         indexed_valid=indexed_valid,
@@ -1102,7 +1102,7 @@ def _render_report(report: CaseReport) -> str:
             [
                 f"flashinfer={report.flashinfer_replay_us:8.2f} us",
                 f"fi_p90={report.flashinfer_p90_replay_us:8.2f} us",
-                f"b12x/fi={report.ratio_vs_flashinfer:.4f}x",
+                f"sparkinfer/fi={report.ratio_vs_flashinfer:.4f}x",
             ]
         )
     if report.sanity_algorithm is not None:
@@ -1119,12 +1119,12 @@ def _render_report(report: CaseReport) -> str:
             f"rmse:{report.flashinfer_sanity_algorithm.rmse:.5f},"
             f"cos:{report.flashinfer_sanity_algorithm.cos:.6f}"
         )
-    if report.b12x_vs_flashinfer_sanity is not None:
+    if report.sparkinfer_vs_flashinfer_sanity is not None:
         parts.append(
-            "b12x_vs_fi="
-            f"max_abs:{report.b12x_vs_flashinfer_sanity.max_abs:.4f},"
-            f"rmse:{report.b12x_vs_flashinfer_sanity.rmse:.5f},"
-            f"cos:{report.b12x_vs_flashinfer_sanity.cos:.6f}"
+            "sparkinfer_vs_fi="
+            f"max_abs:{report.sparkinfer_vs_flashinfer_sanity.max_abs:.4f},"
+            f"rmse:{report.sparkinfer_vs_flashinfer_sanity.rmse:.5f},"
+            f"cos:{report.sparkinfer_vs_flashinfer_sanity.cos:.6f}"
         )
     return " | ".join(parts)
 
@@ -1147,7 +1147,7 @@ def _compute_trace_weighted_summary(
         raise BenchmarkFailure("weighted trace summary requires FlashInfer timings")
 
     layer_count = sum(layer_weights.values())
-    b12x_total = sum(
+    sparkinfer_total = sum(
         layer_weights[name] * by_name[name].replay_us for name in layer_weights
     )
     flashinfer_total = sum(
@@ -1155,11 +1155,11 @@ def _compute_trace_weighted_summary(
         for name in layer_weights
     )
     return TraceWeightedSummary(
-        b12x_total_us=b12x_total,
+        sparkinfer_total_us=sparkinfer_total,
         flashinfer_total_us=flashinfer_total,
-        b12x_avg_us=b12x_total / layer_count,
+        sparkinfer_avg_us=sparkinfer_total / layer_count,
         flashinfer_avg_us=flashinfer_total / layer_count,
-        ratio=b12x_total / flashinfer_total,
+        ratio=sparkinfer_total / flashinfer_total,
         layer_count=layer_count,
     )
 
@@ -1174,11 +1174,11 @@ def _render_trace_weighted_summary(
             f"layers={summary.layer_count}",
             "weights="
             + ",".join(f"{name}:{weight}" for name, weight in layer_weights.items()),
-            f"b12x_total={summary.b12x_total_us:.2f} us",
+            f"sparkinfer_total={summary.sparkinfer_total_us:.2f} us",
             f"flashinfer_total={summary.flashinfer_total_us:.2f} us",
-            f"b12x_avg={summary.b12x_avg_us:.2f} us",
+            f"sparkinfer_avg={summary.sparkinfer_avg_us:.2f} us",
             f"flashinfer_avg={summary.flashinfer_avg_us:.2f} us",
-            f"b12x/fi={summary.ratio:.4f}x",
+            f"sparkinfer/fi={summary.ratio:.4f}x",
         ]
     )
 
@@ -1372,7 +1372,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--print-raw-samples",
         action="store_true",
-        help="print every B12X and FlashInfer CUDA-graph replay sample",
+        help="print every SPARKINFER and FlashInfer CUDA-graph replay sample",
     )
     return _apply_benchmark_preset(parser.parse_args(argv))
 
@@ -1459,7 +1459,7 @@ def main(argv: list[str] | None = None) -> int:
         print(_render_report(report))
         if args.print_raw_samples:
             print(
-                f"raw case={report.case.name} backend=b12x us="
+                f"raw case={report.case.name} backend=sparkinfer us="
                 + ",".join(f"{sample:.3f}" for sample in report.replay_samples_us)
             )
             if report.flashinfer_replay_samples_us:

@@ -19,13 +19,13 @@ from benchmarks.benchmark_moe import (
     bench_repeated,
     get_scale_contract_params,
     load_expert_weights,
-    prepare_b12x_benchmark_weights,
+    prepare_sparkinfer_benchmark_weights,
     require_sm120,
 )
-from b12x.integration.tp_moe import (
-    B12XFP4ExpertWeights,
+from sparkinfer.integration.tp_moe import (
+    SPARKINFERFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
-    b12x_moe_fp4,
+    sparkinfer_moe_fp4,
     build_tp_moe_fp4_binding,
     clear_tp_moe_caches,
 )
@@ -67,7 +67,7 @@ def _measure_batch(
     *,
     batch_size: int,
     spec: ModelSpec,
-    experts: B12XFP4ExpertWeights,
+    experts: SPARKINFERFP4ExpertWeights,
     warmup: int,
     iters: int,
     repeats: int,
@@ -95,7 +95,7 @@ def _measure_batch(
     )
 
     def launch() -> torch.Tensor:
-        return b12x_moe_fp4(binding=binding)
+        return sparkinfer_moe_fp4(binding=binding)
 
     eager_stats = bench_repeated(
         launch,
@@ -155,7 +155,7 @@ def main() -> None:
         activation=args.activation,
     )
     params = get_scale_contract_params(weights, args.scale_contract)
-    experts, _ = prepare_b12x_benchmark_weights(
+    experts, _ = prepare_sparkinfer_benchmark_weights(
         weights,
         params,
         quant_mode="nvfp4",

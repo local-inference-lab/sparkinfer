@@ -33,13 +33,13 @@ from cutlass import Int32, Uint32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from b12x.cute.intrinsics import (
+from sparkinfer.cute.intrinsics import (
     e2m1x8_to_e4m3x8,
     ld_shared_u32,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
 )
-from b12x.gemm.dense import DenseGemmKernel
+from sparkinfer.gemm.dense import DenseGemmKernel
 from tests.test_w4a8_fragment_probe import _e4m3_bytes, _pack_b
 
 from .helpers import require_sm12x

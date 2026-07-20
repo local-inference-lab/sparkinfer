@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.mla.kernel import run_unified_decode
-from b12x.attention.mla.kv_cache import (
+from sparkinfer.attention.mla.kernel import run_unified_decode
+from sparkinfer.attention.mla.kv_cache import (
     clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache,
     concat_and_cache_nvfp4_mla_fp8_rope,
 )
-from b12x.attention.mla.prefill_mg import run_unified_prefill_mg
-from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
-from b12x.integration.sparse_mla_scratch import (
-    B12XSparseMLAScratchCaps,
+from sparkinfer.attention.mla.prefill_mg import run_unified_prefill_mg
+from sparkinfer.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+from sparkinfer.integration.sparse_mla_scratch import (
+    SPARKINFERSparseMLAScratchCaps,
     plan_sparse_mla_scratch,
 )
 
@@ -430,7 +430,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     sm_scale = _HEAD_DIM**-0.5
 
-    caps = B12XSparseMLAScratchCaps(
+    caps = SPARKINFERSparseMLAScratchCaps(
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,

@@ -10,8 +10,8 @@ import sys
 import pytest
 import torch
 
-from b12x.cute.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
-from b12x.quantization import (
+from sparkinfer.cute.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
+from sparkinfer.quantization import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
@@ -94,13 +94,13 @@ import os
 from pathlib import Path
 import sys
 
-os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
+os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
 
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
 
-from b12x.cute.compiler import (
+from sparkinfer.cute.compiler import (
     _compile_kwargs_json_key,
     _dsl_compile_options_kwargs_key,
 )
@@ -109,7 +109,7 @@ from validation.cutlass_migration.core.comparison_identity import (
     normalize_comparison_compile_options,
     normalize_comparison_compile_environment,
 )
-from b12x.quantization import (
+from sparkinfer.quantization import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
@@ -182,7 +182,7 @@ package_runtime = (
     "/tmp/site-packages/nvidia_cutlass_dsl/cu13/lib/"
     "libcute_dsl_runtime.so"
 )
-custom_runtime = "/opt/b12x-custom/libserving_runtime.so"
+custom_runtime = "/opt/sparkinfer-custom/libserving_runtime.so"
 synthetic_raw_environment = [
     ["CUDA_PATH", "/opt/cuda"],
     ["CUTE_DSL_LIBS", package_runtime + os.pathsep + custom_runtime],
@@ -256,12 +256,12 @@ import os
 from pathlib import Path
 import sys
 
-os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
+os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
 
 import torch
 
-import b12x.quantization as quantization
-from b12x.cute.compiler import clear_compile_cache, compile_cache_info
+import sparkinfer.quantization as quantization
+from sparkinfer.cute.compiler import clear_compile_cache, compile_cache_info
 
 clear_compile_cache()
 quantization._KERNEL_CACHE.clear()

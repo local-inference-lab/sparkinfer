@@ -45,7 +45,7 @@ binding from it. Concretely it must:
 - **not** init-write the scratch (counters are zeroed by the kernel prologue;
   ramps/maps are write-first; the only permitted write is a *guarded in-place*
   `fill_` on a scalar control view, e.g. `set_split_chunk_config`);
-- **never** construct a `B12XAttentionWorkspace` / `_TPCoreArena` / call
+- **never** construct a `SPARKINFERAttentionWorkspace` / `_TPCoreArena` / call
   `from_shared_arena` / `_make_workspace_views` / `make_workspace` /
   `_materialize_core_arena`.
 
@@ -55,8 +55,8 @@ barriers), or **caller** — never a bind-time arena materialization.
 
 ## The canonical pattern
 
-`B12XCompressedMLAScratch` (`b12x/integration/compressed_scratch.py`) is the gold
-template, and `B12XSparseMLAScratch` (`sparse_mla_scratch.py`) mirrors it:
+`SPARKINFERCompressedMLAScratch` (`sparkinfer/integration/compressed_scratch.py`) is the gold
+template, and `SPARKINFERSparseMLAScratch` (`sparse_mla_scratch.py`) mirrors it:
 
 ```
 @dataclass(kw_only=True)
@@ -90,7 +90,7 @@ non-overlapping offsets — and passes it to `plan.bind(scratch=…)`.
 3. Rewrite `bind()` to `scratch_tensor → _materialize_<x>_scratch → build_<x>_binding`.
    Delete `from_shared_arena` / `_make_workspace_views`.
 4. Change the binding's `scratch` field type to the container (`object`).
-5. Relax kernel-entry type hints from `B12XAttentionWorkspace` to `object`; the
+5. Relax kernel-entry type hints from `SPARKINFERAttentionWorkspace` to `object`; the
    kernels are unchanged (they duck-type).
 6. In vLLM, build the plan once, allocate one caller scratch tensor, and
-   `plan.bind(...)` per forward. Never construct a `B12XAttentionWorkspace`.
+   `plan.bind(...)` per forward. Never construct a `SPARKINFERAttentionWorkspace`.

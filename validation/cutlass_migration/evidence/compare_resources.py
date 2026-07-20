@@ -31,8 +31,8 @@ from validation.cutlass_migration.evidence.kernel_resources import (
     _read_specialization_contract,
 )
 
-_RESOURCE_REPORT_SCHEMA = "b12x.cute.kernel_resources.v4"
-_DELTA_REPORT_SCHEMA = "b12x.cute.kernel_resource_delta.v4"
+_RESOURCE_REPORT_SCHEMA = "sparkinfer.cute.kernel_resources.v4"
+_DELTA_REPORT_SCHEMA = "sparkinfer.cute.kernel_resource_delta.v4"
 _RESOURCE_REPORT_FIELDS = (
     *(
         "resource_report_schema,object_file,object_sha256,cache_key,manifest_status,"
@@ -184,7 +184,7 @@ def _validate_strict_resource_row(
             raise ValueError(f"{prefix}: {field} is not SHA-256")
     if row["manifest_status"] != "ok":
         raise ValueError(f"{prefix}: semantic manifest is not valid")
-    if row["manifest_schema"] != "b12x.cute.compile_manifest.v3":
+    if row["manifest_schema"] != "sparkinfer.cute.compile_manifest.v3":
         raise ValueError(f"{prefix}: unsupported semantic manifest schema")
     if comparison_semantic_key_from_resource_row(row) != row["comparison_semantic_key"]:
         raise ValueError(f"{prefix}: comparison semantic key mismatch")
@@ -370,7 +370,7 @@ def _family(row: dict[str, Any] | None) -> str:
     if target:
         return target
     kernel = str(row.get("kernel", ""))
-    match = re.search(r"kernel_b12x(.*?)_object_at", kernel)
+    match = re.search(r"kernel_sparkinfer(.*?)_object_at", kernel)
     return match.group(1) if match else kernel.split("__", 1)[0]
 
 
@@ -723,7 +723,7 @@ def main() -> int:
         "--require-matching-package-fingerprint",
         action="store_true",
         help=(
-            "require each report to contain one nonempty b12x package fingerprint "
+            "require each report to contain one nonempty sparkinfer package fingerprint "
             "and require the baseline and current fingerprints to match"
         ),
     )
@@ -910,14 +910,14 @@ def main() -> int:
         current_fingerprints = _field_values(current, "package_fingerprint")
         if len(baseline_fingerprints) != 1 or len(current_fingerprints) != 1:
             parser.error(
-                "each report must contain exactly one nonempty b12x package "
+                "each report must contain exactly one nonempty sparkinfer package "
                 "fingerprint: "
                 f"baseline={sorted(baseline_fingerprints)!r} "
                 f"current={sorted(current_fingerprints)!r}"
             )
         if baseline_fingerprints != current_fingerprints:
             parser.error(
-                "baseline and current b12x package fingerprints differ: "
+                "baseline and current sparkinfer package fingerprints differ: "
                 f"baseline={next(iter(baseline_fingerprints))!r} "
                 f"current={next(iter(current_fingerprints))!r}"
             )

@@ -39,13 +39,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
 
 
 FAMILY = "bf16_to_fp4_tma"
 ARTIFACT_ROLE = "bf16-to-fp4"
-INPUT_SCHEMA = "b12x.bf16_to_fp4_tma.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.bf16_to_fp4_tma.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "bit-exact-packed",
     "bit-exact-scale",
@@ -408,8 +408,8 @@ def main() -> int:
     )
 
     loaded: list[tuple[CaseSpec, object, dict[str, Any], dict[str, object]]] = []
-    original_fingerprint = cute_compiler._b12x_package_fingerprint
-    original_cache_dir = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
+    original_fingerprint = cute_compiler._sparkinfer_package_fingerprint
+    original_cache_dir = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
     try:
         for spec in CASES:
             launch, _, provenance = _load(
@@ -421,11 +421,11 @@ def main() -> int:
             )
             loaded.append((spec, launch, provenance, verify_artifact(provenance)))
     finally:
-        cute_compiler._b12x_package_fingerprint = original_fingerprint
+        cute_compiler._sparkinfer_package_fingerprint = original_fingerprint
         if original_cache_dir is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = original_cache_dir
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = original_cache_dir
 
     cases = [
         _run_case(

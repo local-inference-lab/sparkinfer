@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run and bind the GPU-only CUTLASS migration specialization corpus.
 
-The coordinator deliberately does not import torch, cutlass, or b12x.  Every
+The coordinator deliberately does not import torch, cutlass, or sparkinfer.  Every
 case runs in a fresh Python process, on one explicitly selected physical GPU,
 through the package's pytest launcher. Nsight Systems supplies the
 independent launch proof: a compile-manifest row is credited to a case only
@@ -60,21 +60,21 @@ _CONTRACT_BUILDER = EVIDENCE_ROOT / "specialization_contract.py"
 _PTX_CAPTURE = CORPUS_ROOT / "ptx_capture.py"
 _SOURCE_ATTESTATION = CORPUS_ROOT / "source_snapshot.py"
 _PROJECT_CONFIG = _ROOT / "pyproject.toml"
-_MATRIX_SCHEMA = "b12x.cute.migration.corpus_matrix.v1"
-_TRACE_SCHEMA = "b12x.cute.migration.case_trace.v1"
-_MANIFEST_SCHEMA = "b12x.cute.compile_manifest.v3"
-_SOURCE_SNAPSHOT_SCHEMA = "b12x.cute.migration.source_snapshot.v2"
-_SMEM_CONTRACT_SCHEMA = "b12x.cute.smem_contracts.v1"
-_SMEM_GATE_SCHEMA = "b12x.cute.migration.smem_contract_gate.v1"
+_MATRIX_SCHEMA = "sparkinfer.cute.migration.corpus_matrix.v1"
+_TRACE_SCHEMA = "sparkinfer.cute.migration.case_trace.v1"
+_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
+_SOURCE_SNAPSHOT_SCHEMA = "sparkinfer.cute.migration.source_snapshot.v2"
+_SMEM_CONTRACT_SCHEMA = "sparkinfer.cute.smem_contracts.v1"
+_SMEM_GATE_SCHEMA = "sparkinfer.cute.migration.smem_contract_gate.v1"
 _SOURCE_SNAPSHOT_ENV = "CORPUS_FROZEN_SOURCE_MANIFEST"
 _SOURCE_SNAPSHOT_SHA256_ENV = "CORPUS_FROZEN_SOURCE_MANIFEST_SHA256"
 _SOURCE_SNAPSHOT_FINGERPRINT_ENV = "CORPUS_FROZEN_SOURCE_SNAPSHOT_FINGERPRINT"
-_B12X_FINGERPRINT_ENV = "CORPUS_EXPECTED_B12X_PACKAGE_FINGERPRINT"
+_SPARKINFER_FINGERPRINT_ENV = "CORPUS_EXPECTED_SPARKINFER_PACKAGE_FINGERPRINT"
 _COMPILE_EVENT_RE = re.compile(
     # Pytest's progress marker can share the line with captured ``-s`` output
-    # (for example ``.[b12x cute.compile]``), so the structured marker is the
+    # (for example ``.[sparkinfer cute.compile]``), so the structured marker is the
     # record boundary; a physical-line anchor would silently drop events.
-    r"\[b12x cute\.compile\] "
+    r"\[sparkinfer cute\.compile\] "
     r"(?P<event>miss|disk-hit|disk-hit-after-wait)\b.*?"
     r"\bcache_key=(?P<prefix>[0-9a-f]{16})\b",
     re.MULTILINE,
@@ -101,7 +101,7 @@ _COMPILE_ENV_EXACT = {
     "NVCC",
 }
 _COMPILE_ENV_PREFIXES = (
-    "B12X_",
+    "SPARKINFER_",
     "CUDA_",
     "CUTE_",
     "CUTLASS_",
@@ -180,9 +180,9 @@ def _source_tree_snapshot(root: Path, *, root_label: str) -> dict[str, Any]:
     }
 
 
-def _b12x_package_snapshot() -> dict[str, Any]:
+def _sparkinfer_package_snapshot() -> dict[str, Any]:
     """Reproduce the exact package fingerprint used by the object cache."""
-    return _source_tree_snapshot(_ROOT / "b12x", root_label="b12x")
+    return _source_tree_snapshot(_ROOT / "sparkinfer", root_label="sparkinfer")
 
 
 def _source_input_record(path: Path) -> dict[str, Any]:
@@ -200,7 +200,7 @@ def _source_input_record(path: Path) -> dict[str, Any]:
 def _compute_source_snapshot(matrix_path: Path) -> dict[str, Any]:
     payload = {
         "schema": _SOURCE_SNAPSHOT_SCHEMA,
-        "b12x_package": _b12x_package_snapshot(),
+        "sparkinfer_package": _sparkinfer_package_snapshot(),
         # Freeze the complete test and evidence-tool trees.  This deliberately
         # exceeds the current import closure so a helper/auditor edit cannot
         # make the two compiler arms execute different corpus logic.
@@ -237,11 +237,11 @@ def _snapshot_differences(
     expected: dict[str, Any], observed: dict[str, Any]
 ) -> list[str]:
     differences: list[str] = []
-    expected_package = expected["b12x_package"]
-    observed_package = observed["b12x_package"]
+    expected_package = expected["sparkinfer_package"]
+    observed_package = observed["sparkinfer_package"]
     if expected_package["fingerprint"] != observed_package["fingerprint"]:
         differences.append(
-            "b12x_package:"
+            "sparkinfer_package:"
             f"{expected_package['fingerprint']}->{observed_package['fingerprint']}"
         )
     expected_inputs = expected["inputs"]
@@ -282,7 +282,7 @@ def _source_snapshot_environment(
         _SOURCE_SNAPSHOT_ENV: str(path),
         _SOURCE_SNAPSHOT_SHA256_ENV: _sha256(path),
         _SOURCE_SNAPSHOT_FINGERPRINT_ENV: str(snapshot["manifest_sha256"]),
-        _B12X_FINGERPRINT_ENV: str(snapshot["b12x_package"]["fingerprint"]),
+        _SPARKINFER_FINGERPRINT_ENV: str(snapshot["sparkinfer_package"]["fingerprint"]),
     }
 
 
@@ -307,7 +307,7 @@ def _source_snapshot_binding(path: Path, snapshot: dict[str, Any]) -> dict[str, 
         "schema": _SOURCE_SNAPSHOT_SCHEMA,
         "manifest_sha256": str(snapshot["manifest_sha256"]),
         "manifest_artifact_sha256": _sha256(path),
-        "b12x_package_fingerprint": str(snapshot["b12x_package"]["fingerprint"]),
+        "sparkinfer_package_fingerprint": str(snapshot["sparkinfer_package"]["fingerprint"]),
     }
 
 
@@ -358,7 +358,7 @@ def _validate_child_source_attestation(
     snapshot_path: Path,
     snapshot: dict[str, Any],
 ) -> None:
-    expected_file_count = int(snapshot["b12x_package"]["file_count"]) + sum(
+    expected_file_count = int(snapshot["sparkinfer_package"]["file_count"]) + sum(
         int(tree["file_count"]) for tree in snapshot["source_trees"].values()
     )
     expected = {
@@ -369,7 +369,7 @@ def _validate_child_source_attestation(
         "manifest_path": str(snapshot_path.resolve()),
         "manifest_artifact_sha256": _sha256(snapshot_path),
         "manifest_sha256": str(snapshot["manifest_sha256"]),
-        "b12x_package_fingerprint": str(snapshot["b12x_package"]["fingerprint"]),
+        "sparkinfer_package_fingerprint": str(snapshot["sparkinfer_package"]["fingerprint"]),
         "verified_file_count": expected_file_count,
         "verified_input_count": len(snapshot["inputs"]),
     }
@@ -435,11 +435,11 @@ def _assert_case_source_bindings(
         if not isinstance(manifests, dict) or any(
             not isinstance(manifest, dict)
             or manifest.get("package_fingerprint")
-            != expected["b12x_package_fingerprint"]
+            != expected["sparkinfer_package_fingerprint"]
             for manifest in manifests.values()
         ):
             raise CorpusError(
-                f"case {case_id}: compile manifest differs from frozen b12x source"
+                f"case {case_id}: compile manifest differs from frozen sparkinfer source"
             )
 
 
@@ -509,7 +509,7 @@ def _is_cute_kernel(decorator: ast.expr) -> bool:
 
 def _discover_source_kernels() -> set[str]:
     found: set[str] = set()
-    for path in sorted((_ROOT / "b12x").rglob("*.py")):
+    for path in sorted((_ROOT / "sparkinfer").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         names: list[str] = []
 
@@ -835,7 +835,7 @@ def validate_matrix(
         raise CorpusError("matrix cases do not assign every required shape branch once")
 
     hashes = {
-        "b12x_package_fingerprint": _b12x_package_snapshot()["fingerprint"],
+        "sparkinfer_package_fingerprint": _sparkinfer_package_snapshot()["fingerprint"],
         "matrix_raw_sha256": _sha256(matrix_path),
         "matrix_canonical_sha256": _canonical_sha256(matrix),
         "source_inventory_sha256": _sha256(_INVENTORY),
@@ -848,7 +848,7 @@ def validate_matrix(
         "smem_contract_auditor_sha256": _sha256(_SMEM_CONTRACT_AUDITOR),
     }
     report = {
-        "schema": "b12x.cute.migration.static_validation.v1",
+        "schema": "sparkinfer.cute.migration.static_validation.v1",
         "corpus_id": matrix["corpus_id"],
         "corpus_version": matrix["version"],
         "case_count": len(cases),
@@ -895,7 +895,7 @@ def _assert_validation_matches_snapshot(
     hashes = validation.get("hashes", {})
     inputs = snapshot["inputs"]
     expected = {
-        "b12x_package_fingerprint": snapshot["b12x_package"]["fingerprint"],
+        "sparkinfer_package_fingerprint": snapshot["sparkinfer_package"]["fingerprint"],
         "matrix_raw_sha256": inputs["matrix"]["sha256"],
         "source_inventory_sha256": inputs["source_inventory"]["sha256"],
         "runner_sha256": inputs["driver"]["sha256"],
@@ -945,7 +945,7 @@ def _canonical_subprocess_environment(
         "CUDA_PATH": str(cuda_path),
         "CUTE_DSL_ARCH": "sm_120a",
         # CUTLASS's function-derived dump filename is only a staging path.  The
-        # pytest plugin copies each final PTX immediately to its b12x cache-key
+        # pytest plugin copies each final PTX immediately to its sparkinfer cache-key
         # sidecar.  The capture hook excludes KEEP/DUMP_DIR from semantic
         # compile identity because they do not change generated code.
         "CUTE_DSL_KEEP": "ptx",
@@ -956,7 +956,7 @@ def _canonical_subprocess_environment(
     }
     env.update(canonical)
     record = {
-        "schema": "b12x.cute.migration.canonical_compile_environment.v1",
+        "schema": "sparkinfer.cute.migration.canonical_compile_environment.v1",
         "canonical": canonical,
         "removed_names": sorted(removed),
         "removed_value_sha256": {
@@ -1047,7 +1047,7 @@ def _run_smem_contract_audit() -> tuple[dict[str, Any], str]:
         or not isinstance(source_counts, dict)
         or report.get("audited_source_roots")
         != {
-            "production": ["b12x"],
+            "production": ["sparkinfer"],
             "infrastructure": ["benchmarks", "tests", "validation"],
         }
     ):
@@ -1294,7 +1294,7 @@ def _sqlite_columns(connection: sqlite3.Connection, table: str) -> set[str]:
 
 def _test_nvtx_label(case_id: str, nodeid: str) -> str:
     identity = hashlib.sha256(f"{case_id}\0{nodeid}".encode()).hexdigest()
-    return f"b12x-cute-corpus-test:{case_id}:{identity}"
+    return f"sparkinfer-cute-corpus-test:{case_id}:{identity}"
 
 
 def _nsys_trace(
@@ -1331,7 +1331,7 @@ def _nsys_trace(
 
         nvtx_columns = _sqlite_columns(connection, "NVTX_EVENTS")
         nvtx_rows = connection.execute("SELECT * FROM NVTX_EVENTS").fetchall()
-        case_label = f"b12x-cute-corpus-case:{case_id}"
+        case_label = f"sparkinfer-cute-corpus-case:{case_id}"
         nvtx_by_label: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for row in nvtx_rows:
             nvtx_text = str(row["text"] or "") if "text" in nvtx_columns else ""
@@ -1369,7 +1369,7 @@ def _nsys_trace(
         observed_test_labels = {
             nvtx_label
             for nvtx_label in nvtx_by_label
-            if nvtx_label.startswith(f"b12x-cute-corpus-test:{case_id}:")
+            if nvtx_label.startswith(f"sparkinfer-cute-corpus-test:{case_id}:")
         }
         if observed_test_labels != set(expected_labels.values()):
             raise CorpusError(
@@ -1672,7 +1672,7 @@ def _prewarm_case(
     telemetry = _read_json(telemetry_path)
     launcher_evidence = _read_json(launcher_evidence_path)
     if (
-        telemetry.get("schema") != "b12x.cute.migration.pytest_telemetry.v3"
+        telemetry.get("schema") != "sparkinfer.cute.migration.pytest_telemetry.v3"
         or int(telemetry.get("exitstatus", -1)) != 0
     ):
         raise CorpusError(f"case {case['id']}: invalid prewarm pytest telemetry")
@@ -1838,7 +1838,7 @@ def _run_case(
 
     telemetry = _read_json(telemetry_path)
     launcher_evidence = _read_json(launcher_evidence_path)
-    if telemetry.get("schema") != "b12x.cute.migration.pytest_telemetry.v3":
+    if telemetry.get("schema") != "sparkinfer.cute.migration.pytest_telemetry.v3":
         raise CorpusError(f"case {case_id}: invalid pytest telemetry")
     if int(telemetry.get("exitstatus", -1)) != 0:
         raise CorpusError(f"case {case_id}: pytest telemetry reports failure")
@@ -1929,7 +1929,7 @@ def _run_case(
         for nodeid in evidence:
             if not _reports_cover_nodeid(reports, nodeid):
                 raise CorpusError(f"case {case_id}: missing passed evidence {nodeid}")
-    if launcher_evidence.get("schema") != ("b12x.cute.migration.launcher_evidence.v2"):
+    if launcher_evidence.get("schema") != ("sparkinfer.cute.migration.launcher_evidence.v2"):
         raise CorpusError(f"case {case_id}: invalid launcher evidence")
     _validate_launcher_ptx_capture(launcher_evidence, case_id)
     _validate_launcher_source_binding(
@@ -1954,15 +1954,15 @@ def _run_case(
             f"case {case_id}: invalid Nsight platform architecture override: "
             f"{architecture_override!r}"
         )
-    b12x_record = launcher_evidence.get("artifacts", {}).get("b12x_package", {})
-    expected_b12x = (_ROOT / "b12x" / "__init__.py").resolve()
-    if Path(str(b12x_record.get("path", ""))).resolve() != expected_b12x:
+    sparkinfer_record = launcher_evidence.get("artifacts", {}).get("sparkinfer_package", {})
+    expected_sparkinfer = (_ROOT / "sparkinfer" / "__init__.py").resolve()
+    if Path(str(sparkinfer_record.get("path", ""))).resolve() != expected_sparkinfer:
         raise CorpusError(
-            f"case {case_id}: imported b12x from {b12x_record.get('path')!r}, "
-            f"expected current source {expected_b12x}"
+            f"case {case_id}: imported sparkinfer from {sparkinfer_record.get('path')!r}, "
+            f"expected current source {expected_sparkinfer}"
         )
-    if b12x_record.get("sha256") != _sha256(expected_b12x):
-        raise CorpusError(f"case {case_id}: current-source b12x hash mismatch")
+    if sparkinfer_record.get("sha256") != _sha256(expected_sparkinfer):
+        raise CorpusError(f"case {case_id}: current-source sparkinfer hash mismatch")
 
     after = _cache_manifests(cache_dir)
     new_keys = set(after) - set(before)
@@ -1992,7 +1992,7 @@ def _run_case(
             f"case {case_id}: prewarm/profile specialization sets differ: "
             f"prewarm={prewarm['used_cache_keys']} profile={used_keys}"
         )
-    expected_package_fingerprint = str(source_snapshot["b12x_package"]["fingerprint"])
+    expected_package_fingerprint = str(source_snapshot["sparkinfer_package"]["fingerprint"])
     manifests = {
         key: _validate_manifest(
             after[key],
@@ -2566,7 +2566,7 @@ def main() -> int:
             raise CorpusError("output and cache directories must be distinct")
         frozen_roots = tuple(
             (_ROOT / name).resolve()
-            for name in ("b12x", "benchmarks", "tests", "validation")
+            for name in ("sparkinfer", "benchmarks", "tests", "validation")
         )
         for label, path in (
             ("output directory", output_dir),
@@ -2616,11 +2616,11 @@ def main() -> int:
                 # leave subprocess.communicate() blocked before any test runs.
                 "CORPUS_EXPECTED_GPU_UUID": str(gpu["uuid"]),
                 "CORPUS_EXPECTED_GPU_NAME": str(gpu["name"]),
-                "B12X_CUTE_COMPILE_CACHE_DIR": str(cache_dir),
-                "B12X_CUTE_COMPILE_DISK_CACHE": "1",
-                "B12X_LOG_CUTE_COMPILES": "1",
-                "B12X_VLLM_ENGINE_STARTED": "1",
-                "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START": "1",
+                "SPARKINFER_CUTE_COMPILE_CACHE_DIR": str(cache_dir),
+                "SPARKINFER_CUTE_COMPILE_DISK_CACHE": "1",
+                "SPARKINFER_LOG_CUTE_COMPILES": "1",
+                "SPARKINFER_VLLM_ENGINE_STARTED": "1",
+                "SPARKINFER_LOG_CUTE_COMPILES_AFTER_ENGINE_START": "1",
             }
         )
         base_env.update(
@@ -2812,7 +2812,7 @@ def main() -> int:
         if _sha256(smem_contract_path) != smem_contract_final["report_sha256"]:
             raise CorpusError("SMEM contract artifact SHA-256 changed on write")
         smem_contract_finalization = {
-            "schema": "b12x.cute.migration.smem_contract_finalization.v1",
+            "schema": "sparkinfer.cute.migration.smem_contract_finalization.v1",
             "passed": True,
             "static_final_reports_equal": True,
             "gate": smem_contract_final,

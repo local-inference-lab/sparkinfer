@@ -49,14 +49,14 @@ from validation.cutlass_migration.diagnostics.paired.mla_prefill_mg import (
     _verify_artifact,
 )
 from validation.cutlass_migration.paths import DATA_ROOT, PACKAGE_ROOT, REPO_ROOT
-import b12x.attention.mla.kernel as mla_kernel
-import b12x.attention.mla.merge as mla_merge
-import b12x.cute.compiler as cute_compiler
-from b12x.attention.mla.compressed_reference import (
+import sparkinfer.attention.mla.kernel as mla_kernel
+import sparkinfer.attention.mla.merge as mla_merge
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_HEAD_DIM,
 )
-from b12x.integration.compressed_scratch import (
-    B12XCompressedMLAScratchCaps,
+from sparkinfer.integration.compressed_scratch import (
+    SPARKINFERCompressedMLAScratchCaps,
     _compressed_mla_scratch_layout,
     _materialize_compressed_mla_scratch,
 )
@@ -88,7 +88,7 @@ from tests.test_attention_mla_unified_corpus import (
 _DECODE_MERGE_SPEC_HASH = (
     "27844cab02ed922c483a620b933e04948bdef60f25de74d8adddb2342bb14804"
 )
-_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
+_GLM_H8_NATIVE_ENV = "SPARKINFER_MLA_SM120_GLM_H8_NATIVE"
 _DEFAULT_DECODE_ROWS = (1, 2)
 _DEFAULT_MERGE_ROWS = (2, 4, 32, 128)
 
@@ -344,15 +344,15 @@ def _load_exact(
     if object_sha256 != manifest["object_sha256"]:
         raise RuntimeError(f"object digest mismatch: {object_path}")
 
-    previous_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    previous_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(cache_key)
     finally:
         if previous_cache is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous_cache
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous_cache
     if compiled is None:
         raise RuntimeError(f"failed to load exact cached object {object_path}")
     return compiled, {
@@ -383,7 +383,7 @@ def _make_decode_workspace(
     family: str,
     device: torch.device,
 ):
-    caps = B12XCompressedMLAScratchCaps(
+    caps = SPARKINFERCompressedMLAScratchCaps(
         device=device,
         num_q_heads=heads,
         max_q_rows=rows,
@@ -1268,8 +1268,8 @@ def main() -> None:
         label: {spec_hash: 0 for spec_hash in spec_hashes} for label in labels
     }
     observed_specs: set[str] = set()
-    original_decode_launch = mla_kernel.b12x_launch
-    original_merge_launch = mla_merge.b12x_launch
+    original_decode_launch = mla_kernel.sparkinfer_launch
+    original_merge_launch = mla_merge.sparkinfer_launch
     force_glm_h8_native = isinstance(case, DecodeCase) and case.family == "glm"
     previous_glm_h8_native = os.environ.get(_GLM_H8_NATIVE_ENV)
 
@@ -1294,8 +1294,8 @@ def main() -> None:
 
     if force_glm_h8_native:
         os.environ[_GLM_H8_NATIVE_ENV] = "1"
-    mla_kernel.b12x_launch = exact_dispatch
-    mla_merge.b12x_launch = exact_dispatch
+    mla_kernel.sparkinfer_launch = exact_dispatch
+    mla_merge.sparkinfer_launch = exact_dispatch
     row_results: list[dict[str, object]] = []
     integrity_by_rows: dict[str, dict[str, object]] = {}
     try:
@@ -1351,8 +1351,8 @@ def main() -> None:
             row_results.append(row_result)
             active_label[0] = None
     finally:
-        mla_kernel.b12x_launch = original_decode_launch
-        mla_merge.b12x_launch = original_merge_launch
+        mla_kernel.sparkinfer_launch = original_decode_launch
+        mla_merge.sparkinfer_launch = original_merge_launch
         if force_glm_h8_native:
             if previous_glm_h8_native is None:
                 os.environ.pop(_GLM_H8_NATIVE_ENV, None)
@@ -1396,7 +1396,7 @@ def main() -> None:
         )
 
     result: dict[str, object] = {
-        "schema": "b12x.attention.mla.decode_merge.exact_cache_abba.v2",
+        "schema": "sparkinfer.attention.mla.decode_merge.exact_cache_abba.v2",
         "evidence_status": args.evidence_status,
         "command": [sys.executable, *sys.argv],
         "case": case_record,
@@ -1450,9 +1450,9 @@ def main() -> None:
                 "shared_abba": _sha256_file(
                     PACKAGE_ROOT / "diagnostics" / "paired" / "mla_prefill_mg.py"
                 ),
-                "decode": _sha256_file(REPO_ROOT / "b12x/attention/mla/kernel.py"),
-                "merge": _sha256_file(REPO_ROOT / "b12x/attention/mla/merge.py"),
-                "compiler": _sha256_file(REPO_ROOT / "b12x/cute/compiler.py"),
+                "decode": _sha256_file(REPO_ROOT / "sparkinfer/attention/mla/kernel.py"),
+                "merge": _sha256_file(REPO_ROOT / "sparkinfer/attention/mla/merge.py"),
+                "compiler": _sha256_file(REPO_ROOT / "sparkinfer/cute/compiler.py"),
                 "corpus_helpers": _sha256_file(
                     REPO_ROOT / "tests/test_attention_mla_unified_corpus.py"
                 ),

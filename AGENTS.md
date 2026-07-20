@@ -1,4 +1,4 @@
-# b12x Guidance
+# sparkinfer Guidance
 
 - Benchmark the real target path before making performance claims. Capture the
   command, commit, worktree, GPU mode, correctness state, raw timings, and
@@ -12,8 +12,8 @@
 - When tile, knob, or local sweeps plateau, profile or inspect architecture
   evidence and pivot to structural ideas. Debug promising crashes rather than
   discarding high-signal variants immediately.
-- `b12x` should own planner and policy decisions. Integrations should supply
-  metadata and capacity limits rather than duplicating b12x policy.
+- `sparkinfer` should own planner and policy decisions. Integrations should supply
+  metadata and capacity limits rather than duplicating sparkinfer policy.
 - W4A16 means BF16 activations with inline FP4/NVFP4 weight dequantization. Do
   not reintroduce activation-scale math into W4A16 kernel math.
 - Compressed MLA and GLM MLA/NSA are distinct contracts. Verify tensor layout,

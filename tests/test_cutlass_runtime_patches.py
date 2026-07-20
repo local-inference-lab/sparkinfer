@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-import b12x  # noqa: F401 - importing b12x applies the runtime patches under test.
+import sparkinfer  # noqa: F401 - importing sparkinfer applies the runtime patches under test.
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -16,8 +16,8 @@ from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
 from cutlass._mlir_helpers import op as cutlass_op_helpers
 
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.compiler import (
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.compiler import (
     DimKey,
     KernelCompileSpec,
     TensorKey,
@@ -26,7 +26,7 @@ from b12x.cute.compiler import (
     _structural_cache_key,
     tensor_key,
 )
-from b12x.cute.utils import make_ptr
+from sparkinfer.cute.utils import make_ptr
 
 from .helpers import require_sm12x
 
@@ -102,7 +102,7 @@ def test_cutlass_46_adapts_live_cuda_stream_handles() -> None:
     )
 
 
-def test_b12x_pointer_cache_key_is_structural() -> None:
+def test_sparkinfer_pointer_cache_key_is_structural() -> None:
     ptr_a = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
     ptr_b = make_ptr(cutlass.Int32, 32, cute.AddressSpace.gmem, assumed_align=16)
 
@@ -258,7 +258,7 @@ def test_pod_compile_spec_memory_key_does_not_recurse(monkeypatch) -> None:
         spec,
     )
 
-    assert key == ("b12x_cute_memory_cache_v2_explicit_spec", spec.hash_key)
+    assert key == ("sparkinfer_cute_memory_cache_v2_explicit_spec", spec.hash_key)
 
 
 def test_pod_compile_spec_disk_payload_uses_json_key(monkeypatch) -> None:
@@ -282,7 +282,7 @@ def test_pod_compile_spec_disk_payload_uses_json_key(monkeypatch) -> None:
         compile_spec=spec,
     )
 
-    assert payload[0] == "b12x_cute_compile_cache_v5_explicit_spec"
+    assert payload[0] == "sparkinfer_cute_compile_cache_v5_explicit_spec"
     assert payload[4] == spec.hash_key
     assert payload[5] == spec.json_key
 
@@ -317,7 +317,7 @@ def test_tensor_key_helper_builds_pod_compile_spec(monkeypatch) -> None:
         spec,
     )
 
-    assert key == ("b12x_cute_memory_cache_v2_explicit_spec", spec.hash_key)
+    assert key == ("sparkinfer_cute_memory_cache_v2_explicit_spec", spec.hash_key)
 
 
 def test_from_key_promotes_nested_pod_key_fields() -> None:
@@ -348,8 +348,8 @@ def test_from_key_promotes_nested_pod_key_fields() -> None:
 def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
     capsys, monkeypatch
 ) -> None:
-    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
-    monkeypatch.setenv("B12X_LOG_CUTE_COMPILES", "1")
+    monkeypatch.delenv("SPARKINFER_LOG_CUTE_COMPILE_STACK", raising=False)
+    monkeypatch.setenv("SPARKINFER_LOG_CUTE_COMPILES", "1")
 
     class FakeKernel:
         def __init__(self) -> None:
@@ -374,7 +374,7 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
     )
 
     out = capsys.readouterr().out
-    assert "[b12x cute.compile] miss" in out
+    assert "[sparkinfer cute.compile] miss" in out
     assert "FakeKernel" in out
     assert "'m': 16" in out
     assert "'n': 4096" in out
@@ -387,9 +387,9 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
 
 
 def test_explicit_spec_compile_miss_log_is_pod_first(capsys, monkeypatch) -> None:
-    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_ARGS", raising=False)
-    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
-    monkeypatch.setenv("B12X_LOG_CUTE_COMPILES", "1")
+    monkeypatch.delenv("SPARKINFER_LOG_CUTE_COMPILE_ARGS", raising=False)
+    monkeypatch.delenv("SPARKINFER_LOG_CUTE_COMPILE_STACK", raising=False)
+    monkeypatch.setenv("SPARKINFER_LOG_CUTE_COMPILES", "1")
 
     class FakeKernel:
         def __call__(self) -> None:
@@ -415,7 +415,7 @@ def test_explicit_spec_compile_miss_log_is_pod_first(capsys, monkeypatch) -> Non
     )
 
     out = capsys.readouterr().out
-    assert "[b12x cute.compile] miss" in out
+    assert "[sparkinfer cute.compile] miss" in out
     assert "FakeKernel" in out
     assert f"spec_hash={spec.hash_key}" in out
     assert f"spec={spec.json_key}" in out
@@ -424,8 +424,8 @@ def test_explicit_spec_compile_miss_log_is_pod_first(capsys, monkeypatch) -> Non
 
 
 def test_explicit_spec_compile_miss_log_can_include_args(capsys, monkeypatch) -> None:
-    monkeypatch.setenv("B12X_LOG_CUTE_COMPILE_ARGS", "1")
-    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
+    monkeypatch.setenv("SPARKINFER_LOG_CUTE_COMPILE_ARGS", "1")
+    monkeypatch.delenv("SPARKINFER_LOG_CUTE_COMPILE_STACK", raising=False)
 
     class FakeKernel:
         def __call__(self) -> None:
@@ -454,7 +454,7 @@ def test_explicit_spec_compile_miss_log_can_include_args(capsys, monkeypatch) ->
 
 
 def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
-    monkeypatch.setenv("B12X_LOG_CUTE_COMPILE_STACK", "1")
+    monkeypatch.setenv("SPARKINFER_LOG_CUTE_COMPILE_STACK", "1")
 
     class FakeKernel:
         def __call__(self) -> None:
@@ -474,7 +474,7 @@ def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
     call_logger()
 
     out = capsys.readouterr().out
-    assert "[b12x cute.compile] python_stack" in out
+    assert "[sparkinfer cute.compile] python_stack" in out
     assert "call_logger" in out
     assert "test_cutlass_runtime_patches.py" in out
 
@@ -588,7 +588,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     assert key_a != key_b
 
 
-def test_b12x_package_fingerprint_is_process_static(monkeypatch) -> None:
+def test_sparkinfer_package_fingerprint_is_process_static(monkeypatch) -> None:
     calls = 0
 
     def fake_compute_fingerprint():
@@ -596,21 +596,21 @@ def test_b12x_package_fingerprint_is_process_static(monkeypatch) -> None:
         calls += 1
         return f"fingerprint-{calls}"
 
-    cute_compiler._b12x_package_fingerprint.cache_clear()
+    cute_compiler._sparkinfer_package_fingerprint.cache_clear()
     cute_compiler._static_compile_cache_context.cache_clear()
     monkeypatch.setattr(
-        cute_compiler, "_compute_b12x_package_fingerprint", fake_compute_fingerprint
+        cute_compiler, "_compute_sparkinfer_package_fingerprint", fake_compute_fingerprint
     )
 
-    assert cute_compiler._b12x_package_fingerprint() == "fingerprint-1"
-    assert cute_compiler._b12x_package_fingerprint() == "fingerprint-1"
+    assert cute_compiler._sparkinfer_package_fingerprint() == "fingerprint-1"
+    assert cute_compiler._sparkinfer_package_fingerprint() == "fingerprint-1"
     assert calls == 1
-    cute_compiler._b12x_package_fingerprint.cache_clear()
+    cute_compiler._sparkinfer_package_fingerprint.cache_clear()
 
 
-def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+def test_sparkinfer_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
 
     calls = []
@@ -676,9 +676,9 @@ def test_dsl_compile_options_use_stable_cache_key(monkeypatch) -> None:
 def test_compile_progress_prints_before_after_and_running_total(
     capsys, monkeypatch
 ) -> None:
-    monkeypatch.setenv("B12X_PRINT_COMPILE_PROGRESS", "1")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_PRINT_COMPILE_PROGRESS", "1")
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", "0")
     cute_compiler.clear_compile_cache()
 
     calls = []
@@ -719,9 +719,9 @@ def test_compile_progress_prints_before_after_and_running_total(
 
 
 def test_compile_progress_prints_after_failed_compile(capsys, monkeypatch) -> None:
-    monkeypatch.setenv("B12X_PRINT_COMPILE_PROGRESS", "yes")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_PRINT_COMPILE_PROGRESS", "yes")
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", "0")
     cute_compiler.clear_compile_cache()
 
     def fake_compile(*args, **kwargs):
@@ -745,8 +745,8 @@ def test_compile_progress_prints_after_failed_compile(capsys, monkeypatch) -> No
 
 
 def test_explicit_spec_memory_hit_uses_lightweight_shape_key(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
 
     calls = []
@@ -798,9 +798,9 @@ def test_explicit_spec_memory_hit_uses_lightweight_shape_key(monkeypatch) -> Non
     assert cute_compiler.compile_cache_info()["memory_cache_hits"] == 1
 
 
-def test_b12x_compile_can_disable_memory_cache(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+def test_sparkinfer_compile_can_disable_memory_cache(monkeypatch) -> None:
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", "0")
     cute_compiler.clear_compile_cache()
 
     calls = []
@@ -825,9 +825,9 @@ def test_b12x_compile_can_disable_memory_cache(monkeypatch) -> None:
     assert cute_compiler.compile_cache_info()["memory_cache_size"] == 0
 
 
-def test_b12x_compile_disk_hit_populates_memory_cache(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_CUTE_COMPILE_DISK_CACHE", raising=False)
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+def test_sparkinfer_compile_disk_hit_populates_memory_cache(monkeypatch) -> None:
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", raising=False)
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
 
     compiled = object()
@@ -859,9 +859,9 @@ def test_b12x_compile_disk_hit_populates_memory_cache(monkeypatch) -> None:
     assert info["memory_cache_hits"] == 1
 
 
-def test_b12x_compile_rechecks_disk_after_cache_key_lock(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_CUTE_COMPILE_DISK_CACHE", raising=False)
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+def test_sparkinfer_compile_rechecks_disk_after_cache_key_lock(monkeypatch) -> None:
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", raising=False)
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
 
     compiled = object()

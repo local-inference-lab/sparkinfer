@@ -19,7 +19,7 @@ from validation.cutlass_migration.acceptance.e2e.index import REQUIRED_FAMILIES
 from validation.cutlass_migration.paths import REPO_ROOT
 
 
-SCHEMA = "b12x.cute.migration.end_to_end_producer_readiness.v1"
+SCHEMA = "sparkinfer.cute.migration.end_to_end_producer_readiness.v1"
 
 
 class ProducerBinding(NamedTuple):

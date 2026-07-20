@@ -5,14 +5,14 @@ import math
 import pytest
 import torch
 
-import b12x.gemm.block_fp8_linear as block_impl
-from b12x.gemm import (
+import sparkinfer.gemm.block_fp8_linear as block_impl
+from sparkinfer.gemm import (
     BlockFP8LinearBinding,
     BlockFP8LinearScratchCaps,
     BlockFP8LinearWeight,
     plan_block_fp8_linear_scratch,
 )
-from b12x.gemm.wo_projection import MXFP8Rows
+from sparkinfer.gemm.wo_projection import MXFP8Rows
 
 
 def _packed_weight(*, in_features: int = 128, out_features: int = 256) -> BlockFP8LinearWeight:

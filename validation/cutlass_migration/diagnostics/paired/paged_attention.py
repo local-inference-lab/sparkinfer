@@ -43,10 +43,10 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.attention.paged.api as paged_api
-from b12x.cute.compiler import b12x_package_fingerprint
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.attention import (
+import sparkinfer.attention.paged.api as paged_api
+from sparkinfer.cute.compiler import sparkinfer_package_fingerprint
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.integration.attention import (
     clear_attention_caches,
     paged_attention_forward,
 )
@@ -70,17 +70,17 @@ _REQUIRED_RUNTIME_SOURCES = frozenset(
         "benchmarks/common.py",
         "validation/cutlass_migration/diagnostics/paired/paged_attention.py",
         "validation/cutlass_migration/core/exact_cache_abba.py",
-        "b12x/attention/paged/api.py",
-        "b12x/attention/paged/forward_extend_generic.py",
-        "b12x/attention/paged/forward_paged.py",
-        "b12x/attention/paged/merge.py",
-        "b12x/attention/paged/planner.py",
-        "b12x/attention/paged/reference.py",
-        "b12x/attention/paged/traits.py",
-        "b12x/attention/paged/workspace.py",
-        "b12x/cute/compiler.py",
-        "b12x/integration/attention.py",
-        "b12x/integration/paged_attention_scratch.py",
+        "sparkinfer/attention/paged/api.py",
+        "sparkinfer/attention/paged/forward_extend_generic.py",
+        "sparkinfer/attention/paged/forward_paged.py",
+        "sparkinfer/attention/paged/merge.py",
+        "sparkinfer/attention/paged/planner.py",
+        "sparkinfer/attention/paged/reference.py",
+        "sparkinfer/attention/paged/traits.py",
+        "sparkinfer/attention/paged/workspace.py",
+        "sparkinfer/cute/compiler.py",
+        "sparkinfer/integration/attention.py",
+        "sparkinfer/integration/paged_attention_scratch.py",
         "tests/paged_attention_helpers.py",
         "tests/test_cute_migration_paged_corpus.py",
     }
@@ -265,7 +265,7 @@ def _source_path(module: object) -> Path | None:
         relative = path.relative_to(REPO_ROOT)
     except (OSError, ValueError):
         return None
-    if not relative.parts or relative.parts[0] not in {"b12x", "benchmarks", "tests"}:
+    if not relative.parts or relative.parts[0] not in {"sparkinfer", "benchmarks", "tests"}:
         return None
     if path.suffix != ".py" or not path.is_file():
         return None
@@ -320,7 +320,7 @@ def _require_matching_artifact_package_fingerprints(
     }
     if mismatched:
         raise RuntimeError(
-            "current b12x package fingerprint differs from exact-cache frozen "
+            "current sparkinfer package fingerprint differs from exact-cache frozen "
             f"source: runtime={runtime_package_fingerprint}, "
             f"artifacts={artifact_package_fingerprints}"
         )
@@ -542,7 +542,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
             exact, provenance = load_exact(caches[label], spec_hash)
             compiled[label][spec_hash] = exact
             artifacts[label][spec_hash] = provenance
-    runtime_package_fingerprint = b12x_package_fingerprint()
+    runtime_package_fingerprint = sparkinfer_package_fingerprint()
     artifact_package_fingerprints = _require_matching_artifact_package_fingerprints(
         artifacts,
         runtime_package_fingerprint,
@@ -1028,12 +1028,12 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     }
     if artifact_verification_after != artifact_verification_before:
         raise RuntimeError("exact cache artifacts changed during benchmark")
-    if b12x_package_fingerprint() != runtime_package_fingerprint:
-        raise RuntimeError("b12x package fingerprint changed during paged ABBA")
+    if sparkinfer_package_fingerprint() != runtime_package_fingerprint:
+        raise RuntimeError("sparkinfer package fingerprint changed during paged ABBA")
     gpu_mode_final = gpu_mode_snapshot(expected_physical_gpu)
     runtime_source_sha256 = _imported_runtime_source_sha256()
     return {
-        "schema": "b12x.attention.paged.exact_cache_abba.v1",
+        "schema": "sparkinfer.attention.paged.exact_cache_abba.v1",
         "evidence_status": args.evidence_status,
         "case": {
             "name": case.name,
@@ -1060,13 +1060,13 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
             "imported_runtime_source_sha256": runtime_source_sha256,
             "required_runtime_sources": sorted(_REQUIRED_RUNTIME_SOURCES),
             "runtime_sources_complete": True,
-            "runtime_b12x_package_fingerprint": runtime_package_fingerprint,
-            "artifact_b12x_package_fingerprints": artifact_package_fingerprints,
+            "runtime_sparkinfer_package_fingerprint": runtime_package_fingerprint,
+            "artifact_sparkinfer_package_fingerprints": artifact_package_fingerprints,
             "packages": _package_versions(),
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
         },
-        "runtime_b12x_package_fingerprint": runtime_package_fingerprint,
+        "runtime_sparkinfer_package_fingerprint": runtime_package_fingerprint,
         "artifacts": artifacts,
         "artifact_verification_before": artifact_verification_before,
         "artifact_verification_after": artifact_verification_after,

@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x.moe.fused.reference import compare_to_reference, moe_reference_w4a8_mx
+from sparkinfer.moe.fused.reference import compare_to_reference, moe_reference_w4a8_mx
 
 from .helpers import make_tp_moe_fp4_binding, require_sm12x
 from .test_w4a8_dynamic_kernel import _run_w4a8_dynamic
@@ -185,10 +185,10 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     """Prove the serving materialized route/phase1/phase2 prefill graph."""
 
     require_sm12x()
-    from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import sparkinfer_moe_fp4, clear_tp_moe_caches
 
-    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "64x128")
-    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_TILE_MN", "64x128")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     clear_tp_moe_caches()
     device = torch.device("cuda")
     m = 4096
@@ -260,7 +260,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     assert route_end <= intermediate_begin or intermediate_end <= route_begin
 
     def launch() -> None:
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
 
     launch()
     torch.cuda.synchronize()
@@ -328,7 +328,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     # The serving default is atomic scatter.  It must not reserve the routed
     # deterministic output (M * top-k * K BF16 values), but it must preserve
     # the same fixed-address graph and poison-overwrite contracts.
-    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
     clear_tp_moe_caches()
     atomic_output = torch.full_like(output, float("nan"))
     atomic_binding = make_tp_moe_fp4_binding(
@@ -345,7 +345,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     assert tuple(atomic_binding.route_output.shape) == (1, _K)
 
     def atomic_launch() -> None:
-        b12x_moe_fp4(binding=atomic_binding)
+        sparkinfer_moe_fp4(binding=atomic_binding)
 
     atomic_launch()
     torch.cuda.synchronize()
@@ -382,4 +382,4 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         ValueError,
         match="deterministic route-output capacity mismatch",
     ):
-        b12x_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))
+        sparkinfer_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))

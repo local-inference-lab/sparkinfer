@@ -4,10 +4,10 @@ import math
 
 import torch
 
-from b12x.attention.indexer.reference import pack_index_k_cache_reference
-from b12x.attention.paged.reference import msa_attention_reference
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.attention.indexer.reference import pack_index_k_cache_reference
+from sparkinfer.attention.paged.reference import msa_attention_reference
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
@@ -194,7 +194,7 @@ def _run_msa_extend_attention(
     )
     assert plan.msa_union_tile is True
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,
@@ -264,7 +264,7 @@ def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> No
     q2k_indices = torch.empty((4, batch, _MSA_TOPK), dtype=torch.int32, device=q.device)
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,

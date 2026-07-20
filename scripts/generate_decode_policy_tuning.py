@@ -215,7 +215,7 @@ def main() -> None:
     parser.add_argument("--input", action="append", required=True, help="Combined decode-policy JSON input")
     parser.add_argument(
         "--output-root",
-        default=str(pathlib.Path(__file__).resolve().parents[1] / "b12x" / "attention" / "paged" / "tuning"),
+        default=str(pathlib.Path(__file__).resolve().parents[1] / "sparkinfer" / "attention" / "paged" / "tuning"),
     )
     parser.add_argument(
         "--batch-list",

@@ -157,11 +157,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--input-root",
-        default=str(pathlib.Path(__file__).resolve().parents[1] / "b12x" / "attention" / "paged" / "tuning"),
+        default=str(pathlib.Path(__file__).resolve().parents[1] / "sparkinfer" / "attention" / "paged" / "tuning"),
     )
     parser.add_argument(
         "--output-root",
-        default=str(pathlib.Path(__file__).resolve().parents[1] / "b12x" / "attention" / "paged" / "tuning"),
+        default=str(pathlib.Path(__file__).resolve().parents[1] / "sparkinfer" / "attention" / "paged" / "tuning"),
     )
     parser.add_argument("--dtype-list", default="bf16,fp8")
     parser.add_argument("--batch-list", default="32,64,128")

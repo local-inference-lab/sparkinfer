@@ -17,9 +17,9 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.cute.compiler import b12x_package_fingerprint
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
-from b12x.quantization import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
+from sparkinfer.cute.compiler import sparkinfer_package_fingerprint
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer.quantization import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
 
 
 def _parse_args() -> argparse.Namespace:
@@ -179,14 +179,14 @@ def main() -> None:
         sorted_samples = sorted(samples_us)
         p95_index = min(len(sorted_samples) - 1, int(0.95 * len(sorted_samples)))
         record = {
-            "schema": "b12x.bf16_to_fp4_tma.graph_abba.v1",
+            "schema": "sparkinfer.bf16_to_fp4_tma.graph_abba.v1",
             "run_label": args.run_label,
             "command": [sys.executable, *sys.argv],
             "cwd": os.getcwd(),
             "git_commit": _git_value("rev-parse", "HEAD"),
             "worktree": _git_value("rev-parse", "--show-toplevel"),
             "dirty": bool(_git_value("status", "--short")),
-            "b12x_package_fingerprint": b12x_package_fingerprint(),
+            "sparkinfer_package_fingerprint": sparkinfer_package_fingerprint(),
             "cutlass_versions": _cutlass_versions(),
             "gpu": {
                 "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),

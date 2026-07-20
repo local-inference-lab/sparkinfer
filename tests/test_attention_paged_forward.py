@@ -5,18 +5,18 @@ import math
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
 from benchmarks.benchmark_paged_attention import (
     _capture_backend_graph,
     _capture_flashinfer_fa2_graph,
     _make_uniform_paged_inputs,
     _quantize_paged_kv_cache_global_e4m3,
 )
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.attention.paged.api import _build_extend_forward_kernel
-from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.attention.paged.api import _build_extend_forward_kernel
+from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
@@ -88,7 +88,7 @@ class _PagedScratchHarness:
             **kwargs,
         )
         self._scratch_plan = plan_paged_attention_scratch(
-            B12XPagedAttentionScratchCaps(
+            SPARKINFERPagedAttentionScratchCaps(
                 device=self.q.device,
                 mode=self.mode,
                 dtype=self.q.dtype,
@@ -622,7 +622,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
         device=q.device,
     )
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -789,7 +789,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm12x()
-    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
+    monkeypatch.setenv("SPARKINFER_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.02
@@ -1049,7 +1049,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
     require_sm12x()
     clear_attention_caches()
 
-    import b12x.attention.paged.api as paged_api
+    import sparkinfer.attention.paged.api as paged_api
 
     forward_specs: list[str] = []
 
@@ -1064,7 +1064,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
 
     batch = 4
     page_size = 128
@@ -1090,7 +1090,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
         return k_cache, v_cache
 
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=device,
             mode="extend",
             dtype=dtype,
@@ -1331,7 +1331,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm12x()
-    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
+    monkeypatch.setenv("SPARKINFER_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=8192)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.01

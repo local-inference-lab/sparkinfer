@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.gemm.block_fp8_linear import (
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer.gemm.block_fp8_linear import (
     BlockFP8LinearScratchCaps,
     block_fp8_linear_mxfp8,
     pack_block_fp8_linear_weight_mxfp8,
     plan_block_fp8_linear_scratch,
     quantize_block_fp8_linear_input_mxfp8,
 )
-from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
+from sparkinfer.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
 from .helpers import require_sm12x
 
@@ -276,7 +276,7 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
     # (tile choice does not change the block-scaled MMA result) and (b) be
     # reused for every live M in the regime under frozen resolution.
     require_sm12x()
-    from b12x.gemm.dense import _select_default_mma_tiler_mn
+    from sparkinfer.gemm.dense import _select_default_mma_tiler_mn
 
     torch.manual_seed(20260530)
     in_features, out_features = 1024, 8192  # wide-N (>1536) MXFP8 regime

@@ -61,7 +61,7 @@ from validation.cutlass_migration.paths import REPO_ROOT
 # Importing core.single_arm_e2e would import torch/CUTLASS and break the
 # assembler's offline contract.  Keep this literal synchronized with the
 # producer-exported FAMILY_DISCOVERY_SCHEMA constant.
-FAMILY_DISCOVERY_SCHEMA = "b12x.cute.migration.family_discovery.v1"
+FAMILY_DISCOVERY_SCHEMA = "sparkinfer.cute.migration.family_discovery.v1"
 
 _FRAGMENT_FIELDS = {
     "schema",
@@ -875,7 +875,7 @@ def _validate_family_fragment(
 
 
 def _write_temporary_json(value: Mapping[str, Any]) -> Path:
-    descriptor, raw_path = tempfile.mkstemp(prefix="b12x-discovery-", suffix=".json")
+    descriptor, raw_path = tempfile.mkstemp(prefix="sparkinfer-discovery-", suffix=".json")
     path = Path(raw_path)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
@@ -1062,7 +1062,7 @@ def _output_outside_harness(path: Path, harness_root: Path) -> None:
 
 
 def _self_test() -> None:
-    with tempfile.TemporaryDirectory(prefix="b12x-discovery-selftest-") as raw_root:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-discovery-selftest-") as raw_root:
         root = Path(raw_root)
         paths: list[Path] = []
         for index, family in enumerate(REQUIRED_FAMILIES):

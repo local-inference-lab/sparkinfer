@@ -37,13 +37,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.utils import current_cuda_stream, make_ptr
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.utils import current_cuda_stream, make_ptr
 
 
 FAMILY = "w4a16_topk_sum"
 ARTIFACT_ROLE = "topk-sum"
-INPUT_SCHEMA = "b12x.w4a16.topk_sum.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.w4a16.topk_sum.end_to_end_input.v1"
 KERNEL_ID = "moe.w4a16.topk_sum"
 HIDDEN_SIZE = 2_688
 TOPK = 6

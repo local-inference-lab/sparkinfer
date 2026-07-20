@@ -10,14 +10,14 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from b12x.attention.mla.reference import (
+from sparkinfer.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
-from b12x.integration.mla import (
-    B12XSparseMLAScratchCaps,
+from sparkinfer.integration.mla import (
+    SPARKINFERSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
@@ -227,7 +227,7 @@ def _make_sparse_mla_binding(
     use_cuda_graph: bool = False,
 ):
     plan = plan_sparse_mla_scratch(
-        B12XSparseMLAScratchCaps(
+        SPARKINFERSparseMLAScratchCaps(
             mode=mode,
             device=device,
             dtype=torch.bfloat16,

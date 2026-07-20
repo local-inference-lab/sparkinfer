@@ -5,36 +5,36 @@ from dataclasses import replace
 import pytest
 import torch
 
-import b12x.attention.indexer.api as indexer_impl
-import b12x.attention.mla.api as sparse_mla_impl
-import b12x.attention.mla.compressed_api as compressed_mla_impl
-import b12x.attention.indexer.paged as paged_indexer_impl
-from b12x.attention.mla.compressed_reference import (
+import sparkinfer.attention.indexer.api as indexer_impl
+import sparkinfer.attention.mla.api as sparse_mla_impl
+import sparkinfer.attention.mla.compressed_api as compressed_mla_impl
+import sparkinfer.attention.indexer.paged as paged_indexer_impl
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     compressed_mla_page_nbytes,
 )
-from b12x.attention.workspace import B12XAttentionArena, B12XAttentionWorkspace
-from b12x.attention.indexer import (
-    B12XIndexerContiguousBinding,
-    B12XIndexerPagedBinding,
-    B12XIndexerPagedScratch,
-    B12XIndexerScratchCaps,
+from sparkinfer.attention.workspace import SPARKINFERAttentionArena, SPARKINFERAttentionWorkspace
+from sparkinfer.attention.indexer import (
+    SPARKINFERIndexerContiguousBinding,
+    SPARKINFERIndexerPagedBinding,
+    SPARKINFERIndexerPagedScratch,
+    SPARKINFERIndexerScratchCaps,
     INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
     INDEXER_SOURCE_LAYOUT_PAGED,
     plan_indexer_scratch,
 )
-from b12x.attention.indexer.scratch import (
-    B12XIndexerContiguousScratchCaps,
-    B12XIndexerPagedScratchCaps,
+from sparkinfer.attention.indexer.scratch import (
+    SPARKINFERIndexerContiguousScratchCaps,
+    SPARKINFERIndexerPagedScratchCaps,
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
 )
-from b12x.integration import (
-    B12XCompressedMLABinding,
-    B12XCompressedMLAScratch,
-    B12XCompressedMLAScratchCaps,
-    B12XSparseMLABinding,
-    B12XSparseMLAScratchCaps,
+from sparkinfer.integration import (
+    SPARKINFERCompressedMLABinding,
+    SPARKINFERCompressedMLAScratch,
+    SPARKINFERCompressedMLAScratchCaps,
+    SPARKINFERSparseMLABinding,
+    SPARKINFERSparseMLAScratchCaps,
     plan_compressed_mla_scratch,
     plan_sparse_mla_scratch,
 )
@@ -48,8 +48,8 @@ def _workspace(
     max_paged_q_rows: int = 4,
     topk: int = 8,
     max_page_table_width: int = 8,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace(
+) -> SPARKINFERAttentionWorkspace:
+    return SPARKINFERAttentionWorkspace(
         mode="decode",
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
@@ -77,7 +77,7 @@ def _one_scratch(plan):
 
 def test_compressed_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+        SPARKINFERCompressedMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -97,7 +97,7 @@ def test_compressed_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
 
 def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
     plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+        SPARKINFERCompressedMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -118,7 +118,7 @@ def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
         swa_lengths=swa_lengths,
     )
 
-    assert isinstance(binding.scratch, B12XCompressedMLAScratch)
+    assert isinstance(binding.scratch, SPARKINFERCompressedMLAScratch)
     assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
     assert binding.scratch.tmp_output is not None
     assert binding.scratch.tmp_lse is not None
@@ -130,7 +130,7 @@ def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -158,7 +158,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_or_arena_factory(
     monkeypatch,
 ) -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -176,9 +176,9 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_or_arena_factory(
     def fail_factory(*args, **kwargs):
         raise AssertionError("scratch binding must not call workspace/arena factories")
 
-    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_factory)
-    monkeypatch.setattr(B12XAttentionArena, "from_shared_arena", fail_factory)
-    monkeypatch.setattr(B12XAttentionArena, "_make_workspace_views", fail_factory)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "make_workspace", fail_factory)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "from_shared_arena", fail_factory)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "_make_workspace_views", fail_factory)
 
     binding = plan.bind(
         scratch=scratch,
@@ -187,8 +187,8 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_or_arena_factory(
         active_width=active_width,
     )
 
-    assert isinstance(binding, B12XIndexerPagedBinding)
-    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
+    assert isinstance(binding, SPARKINFERIndexerPagedBinding)
+    assert isinstance(binding.scratch, SPARKINFERIndexerPagedScratch)
     assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
@@ -203,7 +203,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_or_arena_factory(
 
 def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
     paged_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=2,
@@ -214,7 +214,7 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
         )
     )
     contiguous_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
             num_q_heads=2,
@@ -235,7 +235,7 @@ def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
     # C4 routing is hardware-specific. A CPU plan has no Blackwell capability
     # metadata, so it conservatively retains the streamed tiled route.
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=64,
@@ -262,7 +262,7 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
 
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cuda",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=64,
@@ -279,7 +279,7 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
 def test_indexer_common_plan_selects_measured_glm_decode_routes(rows) -> None:
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=32,
@@ -299,7 +299,7 @@ def test_indexer_common_plan_selects_measured_glm_decode_routes(rows) -> None:
 @pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
 def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=64,
@@ -318,7 +318,7 @@ def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
 @pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
 def test_indexer_common_plan_selects_bk512_for_glm_prefill_buckets(rows) -> None:
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=32,
@@ -337,7 +337,7 @@ def test_indexer_common_plan_selects_bk512_for_glm_prefill_buckets(rows) -> None
 def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
+    monkeypatch.delenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", raising=False)
     common = dict(
         device="cpu",
         source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
@@ -348,9 +348,9 @@ def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
         mode="prefill",
         shared_page_table=True,
     )
-    automatic = plan_indexer_scratch(B12XIndexerScratchCaps(**common))
+    automatic = plan_indexer_scratch(SPARKINFERIndexerScratchCaps(**common))
     explicit = plan_indexer_scratch(
-        B12XIndexerScratchCaps(**common, supertile_k=32768)
+        SPARKINFERIndexerScratchCaps(**common, supertile_k=32768)
     )
 
     assert automatic.layout.supertile_tokens == 16384
@@ -373,7 +373,7 @@ def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
     ) // c4_tokens_per_k
 
     glm_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=4,
@@ -386,7 +386,7 @@ def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
         )
     )
     c4_plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device="cpu",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=4,
@@ -417,7 +417,7 @@ def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -442,7 +442,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
     monkeypatch,
 ) -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -460,7 +460,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
     def fail_make_workspace(*args, **kwargs):
         raise AssertionError("scratch binding must not call the workspace factory")
 
-    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "make_workspace", fail_make_workspace)
 
     binding = plan.bind(
         scratch=scratch,
@@ -469,7 +469,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
         active_width=active_width,
     )
 
-    assert isinstance(binding, B12XIndexerPagedBinding)
+    assert isinstance(binding, SPARKINFERIndexerPagedBinding)
     assert binding.real_page_table is real_page_table
     assert binding.metadata.real_page_table is real_page_table
     assert binding.metadata.cache_seqlens_int32 is cache_seqlens
@@ -478,7 +478,7 @@ def test_indexer_paged_scratch_bind_does_not_call_workspace_factory(
 
 def test_indexer_contiguous_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -502,7 +502,7 @@ def test_indexer_contiguous_scratch_bind_does_not_call_workspace_factory(
     monkeypatch,
 ) -> None:
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -518,18 +518,18 @@ def test_indexer_contiguous_scratch_bind_does_not_call_workspace_factory(
     def fail_make_workspace(*args, **kwargs):
         raise AssertionError("scratch binding must not call the workspace factory")
 
-    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "make_workspace", fail_make_workspace)
 
     binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end)
 
-    assert isinstance(binding, B12XIndexerContiguousBinding)
+    assert isinstance(binding, SPARKINFERIndexerContiguousBinding)
     assert binding.metadata.k_start is k_start
     assert binding.metadata.k_end is k_end
 
 
 def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_sparse_mla_scratch(
-        B12XSparseMLAScratchCaps(
+        SPARKINFERSparseMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -554,7 +554,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
     monkeypatch,
 ) -> None:
     plan = plan_sparse_mla_scratch(
-        B12XSparseMLAScratchCaps(
+        SPARKINFERSparseMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -575,7 +575,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
     def fail_make_workspace(*args, **kwargs):
         raise AssertionError("scratch binding must not call the workspace factory")
 
-    monkeypatch.setattr(B12XAttentionArena, "make_workspace", fail_make_workspace)
+    monkeypatch.setattr(SPARKINFERAttentionArena, "make_workspace", fail_make_workspace)
 
     binding = plan.bind(
         scratch=scratch,
@@ -585,7 +585,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
         nsa_cache_seqlens_int32=active_counts,
     )
 
-    assert isinstance(binding, B12XSparseMLABinding)
+    assert isinstance(binding, SPARKINFERSparseMLABinding)
     assert binding.q.data_ptr() == q.data_ptr()
     assert binding.selected_indices is selected_indices
 
@@ -608,7 +608,7 @@ def test_workspace_bind_compressed_mla_returns_common_binding_type() -> None:
         indexed_page_table=indexed_page_table,
     )
 
-    assert isinstance(binding, B12XCompressedMLABinding)
+    assert isinstance(binding, SPARKINFERCompressedMLABinding)
     assert binding.scratch is workspace
     assert binding.q.data_ptr() == q.data_ptr()
     assert binding.indexed_page_table is indexed_page_table
@@ -650,7 +650,7 @@ def test_workspace_bind_sparse_mla_returns_common_binding_type() -> None:
         nsa_cache_seqlens_int32=active_counts,
     )
 
-    assert isinstance(binding, B12XSparseMLABinding)
+    assert isinstance(binding, SPARKINFERSparseMLABinding)
     assert not hasattr(binding, "workspace")
     assert binding.scratch is workspace
     assert binding.q.data_ptr() == q.data_ptr()
@@ -660,7 +660,7 @@ def test_workspace_bind_sparse_mla_returns_common_binding_type() -> None:
 
 def test_indexer_paged_plan_bind_returns_common_binding_type() -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=3,
             max_q_rows=4,
@@ -687,9 +687,9 @@ def test_indexer_paged_plan_bind_returns_common_binding_type() -> None:
         shared_page_table=True,
     )
 
-    assert isinstance(binding, B12XIndexerPagedBinding)
+    assert isinstance(binding, SPARKINFERIndexerPagedBinding)
     assert not hasattr(binding, "workspace")
-    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
+    assert isinstance(binding.scratch, SPARKINFERIndexerPagedScratch)
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
     assert binding.expected_num_q_heads == 3
@@ -698,7 +698,7 @@ def test_indexer_paged_plan_bind_returns_common_binding_type() -> None:
 
 def test_indexer_paged_decode_plan_bind_returns_common_binding_type() -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=3,
             max_q_rows=4,
@@ -722,9 +722,9 @@ def test_indexer_paged_decode_plan_bind_returns_common_binding_type() -> None:
         schedule_metadata=schedule,
     )
 
-    assert isinstance(binding, B12XIndexerPagedBinding)
+    assert isinstance(binding, SPARKINFERIndexerPagedBinding)
     assert not hasattr(binding, "workspace")
-    assert isinstance(binding.scratch, B12XIndexerPagedScratch)
+    assert isinstance(binding.scratch, SPARKINFERIndexerPagedScratch)
     assert binding.metadata.real_page_table is real_page_table
     assert binding.metadata.paged_mqa_schedule_metadata is schedule
     assert binding.active_width is active_width
@@ -732,7 +732,7 @@ def test_indexer_paged_decode_plan_bind_returns_common_binding_type() -> None:
 
 def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=3,
             max_q_rows=4,
@@ -746,7 +746,7 @@ def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
 
     binding = plan.bind(scratch=scratch, k_start=k_start, k_end=k_end, topk=3)
 
-    assert isinstance(binding, B12XIndexerContiguousBinding)
+    assert isinstance(binding, SPARKINFERIndexerContiguousBinding)
     assert not hasattr(binding, "workspace")
     assert binding.metadata.k_start is k_start
     assert binding.metadata.k_end is k_end
@@ -848,7 +848,7 @@ def test_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None
 
 def test_indexer_paged_decode_binding_supplies_metadata(monkeypatch) -> None:
     plan = plan_indexer_paged_scratch(
-        B12XIndexerPagedScratchCaps(
+        SPARKINFERIndexerPagedScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=3,
@@ -903,7 +903,7 @@ def test_indexer_paged_decode_binding_supplies_metadata(monkeypatch) -> None:
 
 def test_indexer_contiguous_logits_binding_supplies_metadata(monkeypatch) -> None:
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=3,
@@ -947,7 +947,7 @@ def test_indexer_contiguous_logits_binding_supplies_metadata(monkeypatch) -> Non
 
 def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(monkeypatch) -> None:
     plan = plan_indexer_contiguous_scratch(
-        B12XIndexerContiguousScratchCaps(
+        SPARKINFERIndexerContiguousScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=3,

@@ -59,7 +59,7 @@ def _write_trace(
         )
         connection.execute(
             "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?)",
-            (*_CASE_RANGE, f"b12x-cute-corpus-case:{_CASE_ID}"),
+            (*_CASE_RANGE, f"sparkinfer-cute-corpus-case:{_CASE_ID}"),
         )
         for index in included_test_labels:
             connection.execute(
@@ -83,7 +83,7 @@ def _trace(
     kernels: tuple[tuple[int, int, str], ...],
     included_test_labels: tuple[int, ...] = (0, 1),
 ) -> dict[str, object]:
-    with tempfile.TemporaryDirectory(prefix="b12x-corpus-gpu-proof-") as directory:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-corpus-gpu-proof-") as directory:
         path = Path(directory) / "trace.sqlite"
         _write_trace(
             path,

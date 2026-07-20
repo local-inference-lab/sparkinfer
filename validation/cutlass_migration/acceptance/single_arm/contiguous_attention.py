@@ -39,12 +39,12 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 
 
 FAMILY = "contiguous_attention"
 ARTIFACT_ROLE = "contiguous-attention"
-INPUT_SCHEMA = "b12x.contiguous_attention.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.contiguous_attention.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "finite-output-and-lse",
     "guard-canaries",

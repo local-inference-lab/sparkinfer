@@ -19,9 +19,9 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, dsl_user_op
 
-from b12x.attention._cute import copy as cute_copy
-from b12x.attention._cute import pipeline as cute_pipeline
-from b12x.cute.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from sparkinfer.attention._cute import copy as cute_copy
+from sparkinfer.attention._cute import pipeline as cute_pipeline
+from sparkinfer.cute.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 
 
 _ROWS = 64

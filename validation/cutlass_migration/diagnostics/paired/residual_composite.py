@@ -44,13 +44,13 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import CORE_ROOT, DATA_ROOT, REPO_ROOT
-from b12x.integration import (
-    B12XMHCScratchCaps,
-    b12x_mhc_post_pre,
-    b12x_mhc_pre,
+from sparkinfer.integration import (
+    SPARKINFERMHCScratchCaps,
+    sparkinfer_mhc_post_pre,
+    sparkinfer_mhc_pre,
     plan_mhc_scratch,
 )
-from b12x.integration import residual_kernels
+from sparkinfer.integration import residual_kernels
 
 
 _PREFILL_TOKEN_DEFAULTS = (33, 384, 1024, 2048)
@@ -166,29 +166,29 @@ _KERNEL_ID_BY_SPEC.update(
 
 
 _DECODE_ENV = (
-    ("B12X_MHC_PREFILL_MIN_TOKENS", "96"),
-    ("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
-    ("B12X_MHC_PREFILL_TF32_MIN_TOKENS", "384"),
-    ("B12X_MHC_PREFILL_BF16_MMA", "0"),
-    ("B12X_MHC_PREFILL_TF32_MMA", "0"),
-    ("B12X_MHC_PREFILL_BLOCK_M", "0"),
-    ("B12X_MHC_PREFILL_COMPACT", "1"),
-    ("B12X_MHC_DECODE_TILE_N", "6"),
+    ("SPARKINFER_MHC_PREFILL_MIN_TOKENS", "96"),
+    ("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
+    ("SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS", "384"),
+    ("SPARKINFER_MHC_PREFILL_BF16_MMA", "0"),
+    ("SPARKINFER_MHC_PREFILL_TF32_MMA", "0"),
+    ("SPARKINFER_MHC_PREFILL_BLOCK_M", "0"),
+    ("SPARKINFER_MHC_PREFILL_COMPACT", "1"),
+    ("SPARKINFER_MHC_DECODE_TILE_N", "6"),
 )
 
 
 def _prefill_env(route: str) -> tuple[tuple[str, str], ...]:
     values = dict(_DECODE_ENV)
-    values["B12X_MHC_DECODE_SPLITS"] = "0"
+    values["SPARKINFER_MHC_DECODE_SPLITS"] = "0"
     if route == "prefill-bf16-tma":
-        values["B12X_MHC_PREFILL_BF16_MMA"] = "1"
-        values["B12X_MHC_PREFILL_BF16_TMA"] = "1"
+        values["SPARKINFER_MHC_PREFILL_BF16_MMA"] = "1"
+        values["SPARKINFER_MHC_PREFILL_BF16_TMA"] = "1"
     elif route == "prefill-bf16-vector":
-        values["B12X_MHC_PREFILL_BF16_MMA"] = "1"
-        values["B12X_MHC_PREFILL_BF16_TMA"] = "0"
+        values["SPARKINFER_MHC_PREFILL_BF16_MMA"] = "1"
+        values["SPARKINFER_MHC_PREFILL_BF16_TMA"] = "0"
     elif route == "prefill-tf32-tma":
-        values["B12X_MHC_PREFILL_TF32_MMA"] = "1"
-        values["B12X_MHC_PREFILL_BF16_TMA"] = "1"
+        values["SPARKINFER_MHC_PREFILL_TF32_MMA"] = "1"
+        values["SPARKINFER_MHC_PREFILL_BF16_TMA"] = "1"
     else:
         raise AssertionError(route)
     return tuple(sorted(values.items()))
@@ -203,9 +203,9 @@ def _case(
     all_specs: tuple[str, ...] | None = None,
 ) -> CaseDefinition:
     if route == "decode-split":
-        environment = (*_DECODE_ENV, ("B12X_MHC_DECODE_SPLITS", "4"))
+        environment = (*_DECODE_ENV, ("SPARKINFER_MHC_DECODE_SPLITS", "4"))
     elif route == "decode-pre":
-        environment = (*_DECODE_ENV, ("B12X_MHC_DECODE_SPLITS", "0"))
+        environment = (*_DECODE_ENV, ("SPARKINFER_MHC_DECODE_SPLITS", "0"))
     else:
         environment = _prefill_env(route)
     return CaseDefinition(
@@ -389,7 +389,7 @@ def _args() -> argparse.Namespace:
 
 def _coverage_manifest() -> dict[str, object]:
     return {
-        "schema": "b12x.residual.composite_exception_coverage.v1",
+        "schema": "sparkinfer.residual.composite_exception_coverage.v1",
         "exception_row_count": len(_ROWS),
         "case_count": len(_CASES),
         "excluded_dedicated_rows": [
@@ -410,9 +410,9 @@ def _coverage_manifest() -> dict[str, object]:
                 "hidden_size": case.hidden_size,
                 "route": case.route,
                 "production_entrypoint": (
-                    "b12x_mhc_pre"
+                    "sparkinfer_mhc_pre"
                     if case.route == "decode-pre"
-                    else "b12x_mhc_post_pre"
+                    else "sparkinfer_mhc_post_pre"
                 ),
                 "target_exception_rows": [
                     {
@@ -645,7 +645,7 @@ def _build_runtime(
     expected_m = max(_PREFILL_POLICY_MIN, tokens) if case.prefill else None
     max_tokens = tokens if expected_m is None else expected_m
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
@@ -691,7 +691,7 @@ def _build_runtime(
 
     def launch() -> tuple[torch.Tensor, ...]:
         if case.route == "decode-pre":
-            result = b12x_mhc_pre(
+            result = sparkinfer_mhc_pre(
                 x,
                 pre_fn,
                 scale,
@@ -704,7 +704,7 @@ def _build_runtime(
                 binding=binding,
             )
         else:
-            result = b12x_mhc_post_pre(
+            result = sparkinfer_mhc_post_pre(
                 x,
                 residual,
                 prev_post,
@@ -1173,14 +1173,14 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     if artifact_verification_after != artifact_verification_before:
         raise RuntimeError("exact cache artifacts changed during benchmark")
     return {
-        "schema": "b12x.residual.composite_exact_cache_abba.v1",
+        "schema": "sparkinfer.residual.composite_exact_cache_abba.v1",
         "evidence_status": args.evidence_status,
         "case": {
             "name": case.name,
             "hidden_size": case.hidden_size,
             "route": case.route,
             "production_entrypoint": (
-                "b12x_mhc_pre" if case.route == "decode-pre" else "b12x_mhc_post_pre"
+                "sparkinfer_mhc_pre" if case.route == "decode-pre" else "sparkinfer_mhc_post_pre"
             ),
             "target_exception_rows": [
                 {
@@ -1206,11 +1206,11 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                     DATA_ROOT / "cute_migration_corpus_matrix.json"
                 ),
                 "shared_abba": sha256_file(CORE_ROOT / "exact_cache_abba.py"),
-                "residual_api": sha256_file(REPO_ROOT / "b12x/integration/residual.py"),
+                "residual_api": sha256_file(REPO_ROOT / "sparkinfer/integration/residual.py"),
                 "residual_kernels": sha256_file(
-                    REPO_ROOT / "b12x/integration/residual_kernels.py"
+                    REPO_ROOT / "sparkinfer/integration/residual_kernels.py"
                 ),
-                "compiler": sha256_file(REPO_ROOT / "b12x/cute/compiler.py"),
+                "compiler": sha256_file(REPO_ROOT / "sparkinfer/cute/compiler.py"),
             },
             "packages": _package_versions(),
             "torch": torch.__version__,

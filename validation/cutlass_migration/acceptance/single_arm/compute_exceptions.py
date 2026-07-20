@@ -62,11 +62,11 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 
 
 FAMILY = "compute_exceptions"
-INPUT_SCHEMA = "b12x.compute_exceptions.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.compute_exceptions.end_to_end_input.v1"
 GUARD_ELEMENTS = 256
 GUARD_VALUE = 123.0
 
@@ -159,13 +159,13 @@ _ROUTE_PACK_ROLES = {
     "_pack_topk_routes_sort_kernel": "route-pack-sort",
 }
 
-_TP_SOURCE_FILES = (Path("b12x/integration/tp_moe.py"),)
+_TP_SOURCE_FILES = (Path("sparkinfer/integration/tp_moe.py"),)
 _TP_TINY_SOURCE_FILES = (
-    Path("b12x/integration/tp_moe.py"),
-    Path("b12x/moe/fused/tiny_decode.py"),
+    Path("sparkinfer/integration/tp_moe.py"),
+    Path("sparkinfer/moe/fused/tiny_decode.py"),
 )
-_W4_SOURCE_FILES = (Path("b12x/moe/fused/w4a16/kernel.py"),)
-_W4_ROUTE_SOURCE_FILES = (Path("b12x/moe/fused/w4a16/route_pack.py"),)
+_W4_SOURCE_FILES = (Path("sparkinfer/moe/fused/w4a16/kernel.py"),)
+_W4_ROUTE_SOURCE_FILES = (Path("sparkinfer/moe/fused/w4a16/route_pack.py"),)
 
 
 @dataclass(frozen=True)
@@ -239,10 +239,10 @@ class CaseSpec:
                 "maximum_normalized_rmse": self.paired.max_normalized_rmse,
             },
             "controlled_dispatch_environment": {
-                "B12X_W4A8_TINY_DECODE": "1",
-                "B12X_W4A16_SMALL_M_DIRECT": "1",
-                "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS": None,
-                "B12X_DYNAMIC_TILE_MN": None,
+                "SPARKINFER_W4A8_TINY_DECODE": "1",
+                "SPARKINFER_W4A16_SMALL_M_DIRECT": "1",
+                "SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS": None,
+                "SPARKINFER_DYNAMIC_TILE_MN": None,
             },
         }
 
@@ -426,7 +426,7 @@ def _owner_tensor_map(spec: CaseSpec, state: CaseState) -> dict[str, torch.Tenso
             return
         module = type(value).__module__
         if module.startswith(
-            ("b12x.", "tests.", "benchmarks.", "validation.cutlass_migration.")
+            ("sparkinfer.", "tests.", "benchmarks.", "validation.cutlass_migration.")
         ) and hasattr(value, "__dict__"):
             for name, item in sorted(vars(value).items()):
                 if not name.startswith("_"):

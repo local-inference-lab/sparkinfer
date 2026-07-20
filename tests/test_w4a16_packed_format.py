@@ -3,17 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.intrinsics import swizzle_block_scale
-from b12x.integration.tp_moe import (
-    plan_b12x_fp4_moe_weights,
-    prepare_b12x_fp4_moe_weights,
+from sparkinfer.cute.intrinsics import swizzle_block_scale
+from sparkinfer.integration.tp_moe import (
+    plan_sparkinfer_fp4_moe_weights,
+    prepare_sparkinfer_fp4_moe_weights,
 )
-from b12x.moe.execution import PreparedWeightLayout
-from b12x.moe.fused.w4a16.host import (
+from sparkinfer.moe.execution import PreparedWeightLayout
+from sparkinfer.moe.fused.w4a16.host import (
     reorder_w13_to_gate_up,
     unswizzle_expert_scales,
 )
-from b12x.moe.fused.w4a16.prepare import (
+from sparkinfer.moe.fused.w4a16.prepare import (
     prepare_w4a16_compressed_tensors_weights,
     prepare_w4a16_fp4_e8m0_k32_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
@@ -77,7 +77,7 @@ def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_accepts_w13_layout(
     w2_global_scale = torch.tensor([3.0, 5.0], dtype=torch.float32)
     a1_gscale = torch.tensor([0.5, 0.25], dtype=torch.float32)
     a2_gscale = torch.tensor([1.0 / 3.0, 0.2], dtype=torch.float32)
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -88,7 +88,7 @@ def test_prepare_fp4_moe_weights_modelopt_runtime_alphas_accepts_w13_layout(
         w13_layout=w13_layout,
     )
 
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_global_scale=w1_global_scale,
         a1_gscale=a1_gscale,
@@ -401,7 +401,7 @@ def test_mxfp4_native_source_format_is_removed() -> None:
 
 def test_fp4_e8m0_k32_is_rejected_by_w4a4_quant_mode() -> None:
     with pytest.raises(ValueError, match="quant_mode='w4a16'"):
-        plan_b12x_fp4_moe_weights(
+        plan_sparkinfer_fp4_moe_weights(
             quant_modes="nvfp4",
             source_format="fp4_e8m0_k32",
             activation="relu2",
@@ -571,7 +571,7 @@ def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
     activation: str,
 ) -> None:
     torch.manual_seed(20260522)
-    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("SPARKINFER_MOE_FORCE_A16", "1")
     experts, hidden_size, intermediate_size = 3, 128, 128
     w13, w13_blockscale, w2, w2_blockscale = _make_case(
         experts=experts,
@@ -593,7 +593,7 @@ def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
         w2_alphas,
         activation=activation,
     )
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation=activation,
@@ -603,7 +603,7 @@ def test_integration_packed_preparation_uses_raw_a16_alpha_contract(
         intermediate_size=intermediate_size,
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
@@ -653,7 +653,7 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes=("nvfp4", "w4a16"),
         source_format="modelopt_nvfp4",
         activation=activation,
@@ -662,7 +662,7 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
@@ -703,8 +703,8 @@ def test_modelopt_nvfp4_gate_up_source_does_not_rotate_gated_w13_twice() -> None
     )
 
     half = intermediate_size
-    b12x_w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
-    b12x_w13_blockscale = torch.cat(
+    sparkinfer_w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
+    sparkinfer_w13_blockscale = torch.cat(
         [w13_blockscale[:, half:], w13_blockscale[:, :half]], dim=1
     ).contiguous()
 
@@ -718,8 +718,8 @@ def test_modelopt_nvfp4_gate_up_source_does_not_rotate_gated_w13_twice() -> None
         activation="silu",
     )
     actual = prepare_w4a16_weights(
-        b12x_w13,
-        b12x_w13_blockscale,
+        sparkinfer_w13,
+        sparkinfer_w13_blockscale,
         w13_global_scale,
         w2,
         w2_blockscale,
@@ -771,7 +771,7 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
         w2_alphas,
         activation=activation,
     )
-    plan = plan_b12x_fp4_moe_weights(
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation=activation,
@@ -781,7 +781,7 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
         intermediate_size=intermediate_size,
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    actual_prepared = prepare_b12x_fp4_moe_weights(
+    actual_prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,

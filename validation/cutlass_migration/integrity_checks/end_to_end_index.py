@@ -55,7 +55,7 @@ def _record(path: str, label: str) -> dict[str, object]:
 
 def _package(label: str, files: list[dict[str, object]]) -> dict[str, object]:
     return {
-        "root": "b12x",
+        "root": "sparkinfer",
         "fingerprint": _sha(f"{label}-content"),
         "records_sha256": _canonical_sha256(files),
         "file_count": len(files),
@@ -80,8 +80,8 @@ def _source_manifest(root: Path, side: str) -> dict[str, object]:
         allowed_paths = list(BASELINE_RUNTIME_OVERLAY_PATHS)
         production_status: list[str] = []
         runtime_status = [
-            " M b12x/cute/compiler.py",
-            " M b12x/cute/runtime_patches.py",
+            " M sparkinfer/cute/compiler.py",
+            " M sparkinfer/cute/runtime_patches.py",
         ]
     else:
         production_files = [
@@ -97,9 +97,9 @@ def _source_manifest(root: Path, side: str) -> dict[str, object]:
     production_files.sort(key=lambda record: str(record["path"]))
     runtime_files.sort(key=lambda record: str(record["path"]))
     production_by_path = {
-        f"b12x/{record['path']}": record for record in production_files
+        f"sparkinfer/{record['path']}": record for record in production_files
     }
-    runtime_by_path = {f"b12x/{record['path']}": record for record in runtime_files}
+    runtime_by_path = {f"sparkinfer/{record['path']}": record for record in runtime_files}
     changed_paths = sorted(
         path
         for path in set(production_by_path) | set(runtime_by_path)
@@ -120,12 +120,12 @@ def _source_manifest(root: Path, side: str) -> dict[str, object]:
         "production": {
             "repo_root": str((root / f"{side}-production").resolve()),
             "git": {"commit": commit, "status": production_status},
-            "b12x_package": _package(f"{side}-production", production_files),
+            "sparkinfer_package": _package(f"{side}-production", production_files),
         },
         "runtime": {
             "repo_root": str((root / f"{side}-runtime").resolve()),
             "git": {"commit": commit, "status": runtime_status},
-            "b12x_package": _package(f"{side}-runtime", runtime_files),
+            "sparkinfer_package": _package(f"{side}-runtime", runtime_files),
         },
         "runtime_overlay": {
             "policy": policy,
@@ -398,7 +398,7 @@ def _condition(
             "mode_probes": [mode_probe],
         },
         "event_pool": {
-            "schema": "b12x.cuda_event_pool.v1",
+            "schema": "sparkinfer.cuda_event_pool.v1",
             "allocation_phase": "before_reported_samples",
             "prewarm_phase": "before_reported_samples",
             "prewarm_each_event": True,
@@ -420,7 +420,7 @@ def _condition(
         "gpu_mode_before_timing": mode_before,
         "gpu_mode_after_timing": mode_after,
         "gpu_mode_stability": {
-            "schema": "b12x.gpu_mode_stability.v1",
+            "schema": "sparkinfer.gpu_mode_stability.v1",
             "required_pstate": "P1",
             "required_memory_clock_equality": True,
             "max_sm_clock_delta_mhz": 60.0,
@@ -511,7 +511,7 @@ def _run(
             "compile_spec_json": compile_identity["compile_spec_json"],
             "semantic_key": _sha(f"semantic-{family}-{gpu}-{arm}-{role}"),
             "kernel_id": compile_identity["kernel_id"],
-            "package_fingerprint": source_manifest["runtime"]["b12x_package"][
+            "package_fingerprint": source_manifest["runtime"]["sparkinfer_package"][
                 "fingerprint"
             ],
             "toolchain": toolchain,
@@ -623,10 +623,10 @@ def _run(
         "source": {
             "manifest_sha256": source_manifest["manifest_sha256"],
             "manifest_artifact_sha256": source_artifact_sha,
-            "production_fingerprint": source_manifest["production"]["b12x_package"][
+            "production_fingerprint": source_manifest["production"]["sparkinfer_package"][
                 "fingerprint"
             ],
-            "runtime_package_fingerprint": source_manifest["runtime"]["b12x_package"][
+            "runtime_package_fingerprint": source_manifest["runtime"]["sparkinfer_package"][
                 "fingerprint"
             ],
         },
@@ -803,7 +803,7 @@ def _publish_first_run_mutation(
 
 def main() -> int:
     _validate_timing_mode_policy_contract()
-    with tempfile.TemporaryDirectory(prefix="b12x-e2e-selftest-") as raw_root:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-e2e-selftest-") as raw_root:
         root = Path(raw_root)
         sources: dict[str, dict[str, Any]] = {}
         source_paths: dict[str, Path] = {}
@@ -1360,7 +1360,7 @@ def main() -> int:
             entries=entries,
             stem="old-timer-schema",
             mutate=lambda run: run.__setitem__(
-                "schema", "b12x.cute.migration.end_to_end_process_result.v2"
+                "schema", "sparkinfer.cute.migration.end_to_end_process_result.v2"
             ),
         )
         _expect_failure(

@@ -40,13 +40,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
-from b12x.attention.mla.traits import ScaleFormat
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.attention.mla.traits import ScaleFormat
 
 
 FAMILY = "mla_prefill_mg"
 ARTIFACT_ROLE = "mla-prefill-mg"
-INPUT_SCHEMA = "b12x.attention.mla.prefill_mg.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.attention.mla.prefill_mg.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "allocator-stability",
     "boundary-heads",
@@ -624,9 +624,9 @@ def main() -> int:
         capture_roles.append(ARTIFACT_ROLE)
         return cute_compiler.run_compiled(loaded[spec_hash][0], runtime_args)
 
-    original_launch = paired.prefill_mg.b12x_launch
+    original_launch = paired.prefill_mg.sparkinfer_launch
     previous_gate = os.environ.get(paired._MG_GATE_ENV)
-    paired.prefill_mg.b12x_launch = exact_dispatch
+    paired.prefill_mg.sparkinfer_launch = exact_dispatch
     os.environ[paired._MG_GATE_ENV] = "1"
     try:
         cases: list[dict[str, object]] = []
@@ -648,7 +648,7 @@ def main() -> int:
             )
         active_spec_hash[0] = None
     finally:
-        paired.prefill_mg.b12x_launch = original_launch
+        paired.prefill_mg.sparkinfer_launch = original_launch
         if previous_gate is None:
             os.environ.pop(paired._MG_GATE_ENV, None)
         else:

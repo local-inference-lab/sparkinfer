@@ -25,7 +25,7 @@ import torch
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.intrinsics import (
+from sparkinfer.cute.intrinsics import (
     _fp4_encode_nibbles,
     broadcast_f32_to_half2,
     e2m1x8_mul_residual_to_e4m3x8,

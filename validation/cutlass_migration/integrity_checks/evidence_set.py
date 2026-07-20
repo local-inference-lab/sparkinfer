@@ -55,7 +55,7 @@ def _expect_failure(label: str, function, needle: str) -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="b12x-evidence-set-integrity-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-evidence-set-integrity-") as raw:
         root = Path(raw)
         contract = _hashed(
             {

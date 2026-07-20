@@ -39,8 +39,8 @@ from typing import Any
 import torch
 from cuda.bindings import driver as cuda_driver
 
-import b12x.cute.compiler as cute_compiler
-import b12x.integration.tp_moe as tp_moe
+import sparkinfer.cute.compiler as cute_compiler
+import sparkinfer.integration.tp_moe as tp_moe
 from benchmarks.common import (
     make_l2_flush_fn,
     nvidia_smi_gpu_mode_snapshot,
@@ -53,7 +53,7 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     time_conditions,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-from b12x.moe.fused.reference import compare_to_reference
+from sparkinfer.moe.fused.reference import compare_to_reference
 
 
 @dataclass(frozen=True)
@@ -167,7 +167,7 @@ def _args() -> argparse.Namespace:
         "--expected-current-package-fingerprint",
         required=True,
         help=(
-            "required b12x fingerprint for the current host source; frozen object "
+            "required sparkinfer fingerprint for the current host source; frozen object "
             "fingerprints are validated and reported separately"
         ),
     )
@@ -253,7 +253,7 @@ def _manifest_for_spec(
         except (OSError, json.JSONDecodeError):
             continue
         if (
-            manifest.get("schema") == "b12x.cute.compile_manifest.v3"
+            manifest.get("schema") == "sparkinfer.cute.compile_manifest.v3"
             and manifest.get("compile_spec_hash") == spec_hash
             and manifest.get("object_sha256")
         ):
@@ -307,7 +307,7 @@ def _load_exact(
     ptx_evidence = json.loads(ptx_evidence_path.read_text(encoding="utf-8"))
     ptx_object = ptx_evidence.get("object")
     if (
-        ptx_evidence.get("schema") != "b12x.cute.frontend_ptx.v3"
+        ptx_evidence.get("schema") != "sparkinfer.cute.frontend_ptx.v3"
         or ptx_evidence.get("cache_key") != cache_key
         or ptx_evidence.get("compile_spec_hash") != case.spec_hash
         or not isinstance(ptx_object, dict)
@@ -319,15 +319,15 @@ def _load_exact(
             f"{ptx_evidence_path}"
         )
 
-    previous_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    previous_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(cache_key)
     finally:
         if previous_cache is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous_cache
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous_cache
     if compiled is None:
         raise RuntimeError(f"failed to load exact cached object {object_path}")
 
@@ -499,8 +499,8 @@ def _validate_pair(
     if a["kernel_id"] != "integration.tp_moe.dynamic":
         raise RuntimeError(f"{case.name}: wrong kernel ID {a['kernel_id']!r}")
     expected_target = {
-        "nvfp4-prefill-m128": "b12x.integration.tp_moe._DynamicMoELaunch",
-        "w4a8-mx-materialized-m4096": ("b12x.integration.tp_moe._DynamicMoEW4A8Launch"),
+        "nvfp4-prefill-m128": "sparkinfer.integration.tp_moe._DynamicMoELaunch",
+        "w4a8-mx-materialized-m4096": ("sparkinfer.integration.tp_moe._DynamicMoEW4A8Launch"),
     }[case.name]
     if a["target"] != expected_target or b["target"] != expected_target:
         raise RuntimeError(
@@ -524,14 +524,14 @@ def _specialization_environment(compile_args: list[object]):
     if not isinstance(tile, list) or len(tile) != 2:
         raise RuntimeError(f"invalid tile compile fact: {tile}")
     controlled = {
-        "B12X_DYNAMIC_TILE_MN": f"{int(tile[0])}x{int(tile[1])}",
-        "B12X_DYNAMIC_WORK_SOURCE": str(compile_args[17]),
-        "B12X_ENABLE_DYNAMIC_DOWN_SCALE": "1" if compile_args[13] else "0",
-        "B12X_DYNAMIC_W4A8_SHARE_INPUT": "1" if compile_args[14] else "0",
-        "B12X_DYNAMIC_SWAP_AB": "1" if compile_args[15] else "0",
-        "B12X_DYNAMIC_DETERMINISTIC_OUTPUT": "1" if compile_args[16] else "0",
-        "B12X_DYNAMIC_W4A8_MATERIALIZED": "1" if compile_args[20] else "0",
-        "B12X_DYNAMIC_ENABLE_MULTICTA": "1",
+        "SPARKINFER_DYNAMIC_TILE_MN": f"{int(tile[0])}x{int(tile[1])}",
+        "SPARKINFER_DYNAMIC_WORK_SOURCE": str(compile_args[17]),
+        "SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE": "1" if compile_args[13] else "0",
+        "SPARKINFER_DYNAMIC_W4A8_SHARE_INPUT": "1" if compile_args[14] else "0",
+        "SPARKINFER_DYNAMIC_SWAP_AB": "1" if compile_args[15] else "0",
+        "SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT": "1" if compile_args[16] else "0",
+        "SPARKINFER_DYNAMIC_W4A8_MATERIALIZED": "1" if compile_args[20] else "0",
+        "SPARKINFER_DYNAMIC_ENABLE_MULTICTA": "1",
     }
     previous = {name: os.environ.get(name) for name in controlled}
     previous_override = tp_moe._DYNAMIC_TILE_MN_OVERRIDE
@@ -560,7 +560,7 @@ def _allocate_binding(
     quant_mode: str,
     fast_math: bool,
 ) -> tuple[object, tuple[torch.Tensor, ...], object]:
-    from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+    from sparkinfer.integration import TPMoEScratchCaps, plan_tp_moe_scratch
 
     scratch_plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
@@ -671,7 +671,7 @@ def _build_nvfp4_state(case: DynamicCase, compile_args: list[object]) -> CaseSta
 
 
 def _build_w4a8_state(case: DynamicCase, compile_args: list[object]) -> CaseState:
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
     from tests.test_w4a8_mx_tp_moe import (
         _E,
         _K,
@@ -931,7 +931,7 @@ def _runtime_compile_args(
         and n % 128 != 0
         and n % 32 == 0
     )
-    swap_env = os.environ.get("B12X_DYNAMIC_SWAP_AB")
+    swap_env = os.environ.get("SPARKINFER_DYNAMIC_SWAP_AB")
     if swap_env is not None:
         swap_ab = swap_env != "0"
     if is_w4a8:
@@ -1245,7 +1245,7 @@ def _run_case(
 
             def launch_exact(label: str) -> torch.Tensor:
                 select_arm(label)
-                output = tp_moe.b12x_moe_fp4(binding=state.binding)
+                output = tp_moe.sparkinfer_moe_fp4(binding=state.binding)
                 if output.data_ptr() != state.output.data_ptr():
                     raise AssertionError(f"{label}: launcher replaced output")
                 return output
@@ -1905,17 +1905,17 @@ def main() -> None:
         raise ValueError("--max-sm-clock-delta-mhz must be in (0, 60]")
     if args.l2_flush_bytes < 0:
         raise ValueError("--l2-flush-bytes must be non-negative")
-    current_package_fingerprint = cute_compiler.b12x_package_fingerprint()
+    current_package_fingerprint = cute_compiler.sparkinfer_package_fingerprint()
     if current_package_fingerprint != args.expected_current_package_fingerprint:
         raise RuntimeError(
-            "current b12x package fingerprint differs from the explicit host-source "
+            "current sparkinfer package fingerprint differs from the explicit host-source "
             "pin: "
             f"expected={args.expected_current_package_fingerprint}, "
             f"observed={current_package_fingerprint}"
         )
     current_relevant_source_sha256 = {
-        "integration_tp_moe": _sha256_file(REPO_ROOT / "b12x/integration/tp_moe.py"),
-        "dynamic_kernel": _sha256_file(REPO_ROOT / "b12x/moe/fused/dynamic.py"),
+        "integration_tp_moe": _sha256_file(REPO_ROOT / "sparkinfer/integration/tp_moe.py"),
+        "dynamic_kernel": _sha256_file(REPO_ROOT / "sparkinfer/moe/fused/dynamic.py"),
     }
     if current_relevant_source_sha256 != _FROZEN_RELEVANT_SOURCE_SHA256:
         raise RuntimeError(
@@ -2014,7 +2014,7 @@ def main() -> None:
         for case in cases
     )
     result = {
-        "schema": "b12x.tp_moe.dynamic.cache_abba.v2",
+        "schema": "sparkinfer.tp_moe.dynamic.cache_abba.v2",
         "evidence_status": args.evidence_status,
         "evidence_scope": {
             "kind": "frozen-object/current-host-replay",

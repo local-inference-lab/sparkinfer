@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Freeze production and measured-runtime b12x trees for the E2E gate.
+"""Freeze production and measured-runtime sparkinfer trees for the E2E gate.
 
 The baseline measurement tree contains resource-capture instrumentation that
 is not part of the pre-migration production source.  This builder snapshots a
 pristine production root and the actual runtime root independently, computes
-their complete b12x package fingerprints, and fails unless their delta is the
+their complete sparkinfer package fingerprints, and fails unless their delta is the
 closed instrumentation allowlist.  The current arm must have no overlay.
 
 Example:
 
   python -m validation.cutlass_migration acceptance source-manifest \
     --side baseline --source-id pre-migration-e71 \
-    --production-root /tmp/b12x-cutlass45-source \
-    --runtime-root ~/projects/b12x-research/rs-18-cutlass45-baseline \
-    --output /tmp/b12x-e2e-baseline-source.json
+    --production-root /tmp/sparkinfer-cutlass45-source \
+    --runtime-root ~/projects/sparkinfer-research/rs-18-cutlass45-baseline \
+    --output /tmp/sparkinfer-e2e-baseline-source.json
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _git_provenance(repo_root: Path) -> dict[str, object]:
         "--porcelain=v1",
         "--untracked-files=all",
         "--",
-        "b12x",
+        "sparkinfer",
     )
     return {
         "commit": commit,
@@ -73,13 +73,13 @@ def _git_provenance(repo_root: Path) -> dict[str, object]:
 
 
 def _tree_snapshot(repo_root: Path) -> dict[str, Any]:
-    package_root = repo_root / "b12x"
+    package_root = repo_root / "sparkinfer"
     if not package_root.is_dir() or package_root.is_symlink():
-        raise SourceManifestError(f"not a regular b12x package tree: {package_root}")
+        raise SourceManifestError(f"not a regular sparkinfer package tree: {package_root}")
     paths: list[Path] = []
     for path in package_root.rglob("*"):
         if path.is_symlink():
-            raise SourceManifestError(f"b12x package contains a symlink: {path}")
+            raise SourceManifestError(f"sparkinfer package contains a symlink: {path}")
         if not path.is_file():
             continue
         if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
@@ -87,7 +87,7 @@ def _tree_snapshot(repo_root: Path) -> dict[str, Any]:
         paths.append(path)
     paths.sort(key=lambda path: path.relative_to(package_root).as_posix())
     if not paths:
-        raise SourceManifestError(f"empty b12x package tree: {package_root}")
+        raise SourceManifestError(f"empty sparkinfer package tree: {package_root}")
 
     content_digest = hashlib.sha256()
     files: list[dict[str, Any]] = []
@@ -106,7 +106,7 @@ def _tree_snapshot(repo_root: Path) -> dict[str, Any]:
             }
         )
     return {
-        "root": "b12x",
+        "root": "sparkinfer",
         "fingerprint": content_digest.hexdigest(),
         "records_sha256": _canonical_sha256(files),
         "file_count": len(files),
@@ -118,7 +118,7 @@ def _endpoint(repo_root: Path) -> dict[str, object]:
     return {
         "repo_root": str(repo_root),
         "git": _git_provenance(repo_root),
-        "b12x_package": _tree_snapshot(repo_root),
+        "sparkinfer_package": _tree_snapshot(repo_root),
     }
 
 
@@ -128,15 +128,15 @@ def _overlay(
     *,
     side: str,
 ) -> dict[str, object]:
-    production_package = production["b12x_package"]
-    runtime_package = runtime["b12x_package"]
+    production_package = production["sparkinfer_package"]
+    runtime_package = runtime["sparkinfer_package"]
     assert isinstance(production_package, dict)
     assert isinstance(runtime_package, dict)
     production_files = {
-        f"b12x/{record['path']}": record for record in production_package["files"]
+        f"sparkinfer/{record['path']}": record for record in production_package["files"]
     }
     runtime_files = {
-        f"b12x/{record['path']}": record for record in runtime_package["files"]
+        f"sparkinfer/{record['path']}": record for record in runtime_package["files"]
     }
     changed_paths = sorted(
         path
@@ -191,7 +191,7 @@ def build_manifest(
         )
     if side == "baseline" and production_git["status"]:
         raise SourceManifestError(
-            "baseline production root is not pristine under b12x: "
+            "baseline production root is not pristine under sparkinfer: "
             f"{production_git['status']!r}"
         )
     payload = {
@@ -217,9 +217,9 @@ def _args() -> argparse.Namespace:
         parser.error("--source-id must be nonempty")
     output = args.output.resolve()
     for root in (args.production_root.resolve(), args.runtime_root.resolve()):
-        package_root = root / "b12x"
+        package_root = root / "sparkinfer"
         if output == package_root or package_root in output.parents:
-            parser.error("--output must not mutate a snapshotted b12x package")
+            parser.error("--output must not mutate a snapshotted sparkinfer package")
     return args
 
 

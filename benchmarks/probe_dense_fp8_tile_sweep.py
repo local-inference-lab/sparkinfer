@@ -28,7 +28,7 @@ from benchmarks.benchmark_dense_gemm import (
     make_mxfp8_operand,
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.gemm.dense import DenseGemmKernel, _select_default_mma_tiler_mn, dense_gemm
+from sparkinfer.gemm.dense import DenseGemmKernel, _select_default_mma_tiler_mn, dense_gemm
 
 import cutlass
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Graph-replay vLLM Triton paged decode probes for B12X comparisons."""
+"""Graph-replay vLLM Triton paged decode probes for SPARKINFER comparisons."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from benchmarks.benchmark_paged_attention import (
     _relative_l2_error,
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x.attention.paged.reference import paged_attention_reference
+from sparkinfer.attention.paged.reference import paged_attention_reference
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import KVQuantMode

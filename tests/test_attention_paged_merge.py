@@ -4,10 +4,10 @@ import torch
 
 import cutlass
 
-from b12x.attention.paged.api import _to_kernel_tensor, _torch_to_cutlass_dtype
-from b12x.attention.paged.merge import PagedPersistentMergeKernel
-from b12x.cute.compiler import compile as b12x_compile
-from b12x.cute.utils import current_cuda_stream
+from sparkinfer.attention.paged.api import _to_kernel_tensor, _torch_to_cutlass_dtype
+from sparkinfer.attention.paged.merge import PagedPersistentMergeKernel
+from sparkinfer.cute.compiler import compile as sparkinfer_compile
+from sparkinfer.cute.utils import current_cuda_stream
 
 from .helpers import require_sm12x
 
@@ -123,7 +123,7 @@ def _run_merge_kernel(
         else _to_kernel_tensor(total_rows_ptr, cutlass.Int32, assumed_align=4),
         current_cuda_stream(),
     )
-    compiled = b12x_compile(kernel, *args)
+    compiled = sparkinfer_compile(kernel, *args)
     compiled(*args)
 
 

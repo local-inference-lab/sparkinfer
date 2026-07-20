@@ -3,21 +3,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.integration.ep_moe as ep_moe
-from b12x.cute.intrinsics import swizzle_block_scale
-from b12x.integration import (
+import sparkinfer.integration.ep_moe as ep_moe
+from sparkinfer.cute.intrinsics import swizzle_block_scale
+from sparkinfer.integration import (
     EPMoEScratchCaps,
-    b12x_ep_moe_fp4,
-    plan_b12x_fp4_moe_weights,
+    sparkinfer_ep_moe_fp4,
+    plan_sparkinfer_fp4_moe_weights,
     plan_ep_moe_scratch,
     prepare_ep_expert_map,
 )
-from b12x.moe.fused.w4a16.host import max_w4a16_route_capacity
+from sparkinfer.moe.fused.w4a16.host import max_w4a16_route_capacity
 from tests.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
 
 def _weight_plan(*, local_experts: int = 4, dtype: torch.dtype = torch.bfloat16):
-    return plan_b12x_fp4_moe_weights(
+    return plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -235,7 +235,7 @@ def _run_ep_rank(
         expert_map=prepared_map,
         output=output,
     )
-    return b12x_ep_moe_fp4(binding=binding), binding
+    return sparkinfer_ep_moe_fp4(binding=binding), binding
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

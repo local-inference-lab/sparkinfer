@@ -4,21 +4,21 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from b12x.cute.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
-from b12x.integration.tp_moe import (
-    B12XFP4ExpertWeights,
+from sparkinfer.cute.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
+from sparkinfer.integration.tp_moe import (
+    SPARKINFERFP4ExpertWeights,
     TPMoEFP4Binding,
     _PreparedWeightRepresentation,
-    b12x_moe_fp4,
-    plan_b12x_fp4_moe_weights,
+    sparkinfer_moe_fp4,
+    plan_sparkinfer_fp4_moe_weights,
 )
-from b12x.moe.fused.activations import (
+from sparkinfer.moe.fused.activations import (
     SWIGLUOAI_DEFAULT_ALPHA,
     SWIGLUOAI_DEFAULT_BETA,
     SWIGLUOAI_DEFAULT_LIMIT,
     SWIGLUOAI_UNINTERLEAVE,
 )
-from b12x.moe.fused.reference import _apply_gated_activation, moe_reference_w4a16_f32
+from sparkinfer.moe.fused.reference import _apply_gated_activation, moe_reference_w4a16_f32
 
 
 def _pack_dense_fp4(dense: torch.Tensor) -> torch.Tensor:
@@ -172,7 +172,7 @@ def test_swigluoai_w4a16_f32_reference_matches_small_topk_torch_moe() -> None:
 
 def test_fp4_binding_owns_swigluoai_params() -> None:
     hidden, intermediate, experts, topk = 16, 16, 1, 1
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation=SWIGLUOAI_UNINTERLEAVE,
@@ -204,7 +204,7 @@ def test_fp4_binding_owns_swigluoai_params() -> None:
         hidden_size=hidden,
         intermediate_size=intermediate,
     )
-    expert_weights = B12XFP4ExpertWeights(
+    expert_weights = SPARKINFERFP4ExpertWeights(
         plan=weight_plan,
         a1_gscale=torch.ones(experts, dtype=torch.float32),
         w1_fp4=w1_fp4,
@@ -240,4 +240,4 @@ def test_fp4_binding_owns_swigluoai_params() -> None:
     )
 
     with pytest.raises(TypeError):
-        b12x_moe_fp4(binding=binding, swiglu_alpha=2.0)
+        sparkinfer_moe_fp4(binding=binding, swiglu_alpha=2.0)

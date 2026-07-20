@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.indexer.fused_indexer import (
+from sparkinfer.attention.indexer.fused_indexer import (
     KV_LAYOUT_CONTIGUOUS_MLA,
     KV_LAYOUT_PAGED,
     _BATCH_SLACK,

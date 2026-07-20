@@ -14,7 +14,7 @@ We feed A = identity-like patterns and B = constant, then check which
 output positions light up, to determine the byte-to-position mapping.
 
 Usage:
-    cd ~/projects/b12x-research/rs-4
+    cd ~/projects/sparkinfer-research/rs-4
     source ~/projects/sglang/.venv/bin/activate
     export CUTE_DSL_ARCH=sm_120a CUDA_VISIBLE_DEVICES=2
     PYTHONPATH=. python benchmarks/probe_mxfp8_fragment_layout.py
@@ -35,7 +35,7 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.intrinsics import mxfp8_mma_m16n8k32_f32_e4m3
+from sparkinfer.cute.intrinsics import mxfp8_mma_m16n8k32_f32_e4m3
 
 
 def _to_cute(x, dtype):

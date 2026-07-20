@@ -1,4 +1,4 @@
-"""Integration gate: the REAL b12x packer now re-quantizes fp32 checkpoint
+"""Integration gate: the REAL sparkinfer packer now re-quantizes fp32 checkpoint
 scales onto exact UE8M0, achieving DeepGEMM-parity weight error -- and leaves
 the already-UE8M0 (e8m0) path byte-for-byte unchanged.
 
@@ -10,8 +10,8 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from b12x.gemm.block_fp8_linear import pack_block_fp8_linear_weight_mxfp8
-from b12x.gemm.wo_projection import (
+from sparkinfer.gemm.block_fp8_linear import pack_block_fp8_linear_weight_mxfp8
+from sparkinfer.gemm.wo_projection import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
 )

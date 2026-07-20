@@ -1,12 +1,12 @@
 """Measurement-only pytest launcher for the CUTLASS migration corpus.
 
 CUTLASS DSL 4.5 keeps ``_mlir_helpers`` below ``cutlass.base_dsl`` while
-b12x's 4.6-only runtime patch imports the promoted top-level module.  The
+sparkinfer's 4.6-only runtime patch imports the promoted top-level module.  The
 corpus needs to measure the 4.5 baseline without adding that compatibility
 alias to production.  This launcher verifies PTX retention, installs the alias,
 installs the cache-key-bound PTX hook before loading the remaining runtime,
 verifies every runtime patch, records hashable evidence, and then hands off to
-pytest.  It is not imported by the b12x package.
+pytest.  It is not imported by the sparkinfer package.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 from validation.cutlass_migration.paths import REPO_ROOT
 
 
-_EVIDENCE_SCHEMA = "b12x.cute.migration.launcher_evidence.v2"
+_EVIDENCE_SCHEMA = "sparkinfer.cute.migration.launcher_evidence.v2"
 _NSYS_PLATFORM_ARCHITECTURE_ENV = "CORPUS_NSYS_PLATFORM_ARCHITECTURE"
 _PTX_CAPTURE_ENV = "CORPUS_RETAIN_FRONTEND_PTX"
 
@@ -74,7 +74,7 @@ def _write_evidence(path: Path, evidence: dict[str, Any]) -> None:
 
 
 def _frontend_ptx_capture_environment() -> dict[str, Any]:
-    """Verify retention controls before importing CUTLASS or b12x."""
+    """Verify retention controls before importing CUTLASS or sparkinfer."""
 
     raw_enabled = os.environ.get(_PTX_CAPTURE_ENV, "")
     enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -110,7 +110,7 @@ def _install_nsys_platform_architecture_override() -> dict[str, Any]:
     exit but remain unreaped, leaving Python blocked in ``communicate()``.  The
     coordinator records the native result before starting Nsight and passes it
     only to the profiled subprocess; this launcher installs that exact value
-    before importing b12x, torch, or Triton.
+    before importing sparkinfer, torch, or Triton.
     """
 
     raw = os.environ.get(_NSYS_PLATFORM_ARCHITECTURE_ENV)
@@ -173,7 +173,7 @@ def _prepare_runtime(cutlass_version: str, alias_installed: bool) -> dict[str, A
         if public_helpers is not base_helpers:
             raise RuntimeError("4.5 helper alias does not preserve module identity")
 
-    from b12x.cute.runtime_patches import (
+    from sparkinfer.cute.runtime_patches import (
         apply_cutlass_runtime_patches,
         cutlass_runtime_patch_status,
     )
@@ -184,17 +184,17 @@ def _prepare_runtime(cutlass_version: str, alias_installed: bool) -> dict[str, A
         raise RuntimeError(f"CUTLASS runtime patches are incomplete: {patch_status}")
 
     inspect_proxy = op_helpers.inspect
-    proxy_marker = bool(getattr(inspect_proxy, "_b12x_direct_frameinfo", False))
+    proxy_marker = bool(getattr(inspect_proxy, "_sparkinfer_direct_frameinfo", False))
     proxy_type = f"{type(inspect_proxy).__module__}.{type(inspect_proxy).__qualname__}"
-    expected_proxy_type = "b12x.cute.runtime_patches._DirectFrameInfoInspectProxy"
+    expected_proxy_type = "sparkinfer.cute.runtime_patches._DirectFrameInfoInspectProxy"
     if not proxy_marker or proxy_type != expected_proxy_type:
         raise RuntimeError(
             "direct-frameinfo proxy assertion failed: "
             f"marker={proxy_marker} type={proxy_type!r}"
         )
 
-    import b12x
-    import b12x.cute.runtime_patches as runtime_patches
+    import sparkinfer
+    import sparkinfer.cute.runtime_patches as runtime_patches
 
     return {
         "schema": _EVIDENCE_SCHEMA,
@@ -220,14 +220,14 @@ def _prepare_runtime(cutlass_version: str, alias_installed: bool) -> dict[str, A
             "mlir_helpers": _module_record(public_helpers),
             "mlir_op_helpers": _module_record(op_helpers),
             "runtime_patches": _module_record(runtime_patches),
-            "b12x_package": _module_record(b12x),
+            "sparkinfer_package": _module_record(sparkinfer),
         },
     }
 
 
 def main() -> int:
     # This is deliberately the first action: attest the complete source and
-    # evidence-tool closure before importing CUTLASS, b12x, torch, or pytest.
+    # evidence-tool closure before importing CUTLASS, sparkinfer, torch, or pytest.
     source_pre_runtime = _attest_frozen_source("launcher_pre_runtime")
     capture_environment = _frontend_ptx_capture_environment()
     architecture_override = _install_nsys_platform_architecture_override()

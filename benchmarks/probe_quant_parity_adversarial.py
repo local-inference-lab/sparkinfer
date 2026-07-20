@@ -1,16 +1,16 @@
-"""Adversarial quant-parity probe: hunt for ANY divergence between b12x's
+"""Adversarial quant-parity probe: hunt for ANY divergence between sparkinfer's
 MXFP8 quantization and DeepGEMM's reference, focusing on the cases the random
 test cannot exercise:
 
-  (1) ROUNDING: does b12x's exp2(clamp(ceil(log2(amax/448)),-127,127)) ever
+  (1) ROUNDING: does sparkinfer's exp2(clamp(ceil(log2(amax/448)),-127,127)) ever
       differ from DeepGEMM's bit-exact ceil_to_ue8m0(amax/448)?  Swept over a
       dense range incl. exact powers of two and just-above/below boundaries,
-      in pure torch (the formula) AND through the real b12x Triton kernel
+      in pure torch (the formula) AND through the real sparkinfer Triton kernel
       (libdevice log2/ceil/exp2).
   (2) WEIGHT round-vs-ceil: _scale_to_e8m0_u8 (round) vs _scale_u8_from_max_abs
       (ceil) divergence on FP32 block scales.
   (3) GRAN_K on OUTLIER-channel data: where 32 vs 128 actually matters --
-      reconstruction + GEMM-vs-fp32-oracle for b12x(32) vs DeepGEMM(128).
+      reconstruction + GEMM-vs-fp32-oracle for sparkinfer(32) vs DeepGEMM(128).
 
 Run with the assigned GPU:
   python benchmarks/probe_quant_parity_adversarial.py
@@ -20,8 +20,8 @@ GPU serialization, when enabled, is managed outside this command.
 
 import torch
 
-from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from b12x.gemm.wo_projection import _scale_to_e8m0_u8, _scale_u8_from_max_abs
+from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm.wo_projection import _scale_to_e8m0_u8, _scale_u8_from_max_abs
 
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -30,8 +30,8 @@ def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return (exp.clamp(1, 254) << 23).view(torch.float)
 
 
-def b12x_scale_formula(amax: torch.Tensor) -> torch.Tensor:
-    """Exactly b12x's Triton/torch scale: exp2(clamp(ceil(log2(amax/448)),-127,127))."""
+def sparkinfer_scale_formula(amax: torch.Tensor) -> torch.Tensor:
+    """Exactly sparkinfer's Triton/torch scale: exp2(clamp(ceil(log2(amax/448)),-127,127))."""
     safe = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
     e = torch.clamp(torch.ceil(torch.log2(safe)), -127.0, 127.0)
     return torch.exp2(e)
@@ -39,7 +39,7 @@ def b12x_scale_formula(amax: torch.Tensor) -> torch.Tensor:
 
 def test_rounding_formula() -> None:
     print("=" * 78)
-    print("(1a) ROUNDING formula sweep: b12x ceil(log2)+exp2  vs  bit-exact ceil_to_ue8m0")
+    print("(1a) ROUNDING formula sweep: sparkinfer ceil(log2)+exp2  vs  bit-exact ceil_to_ue8m0")
     dev = "cuda"
     # exact powers of two (sf == 2^k exactly): amax = 448 * 2^k
     ks = torch.arange(-30, 30, device=dev, dtype=torch.float32)
@@ -52,11 +52,11 @@ def test_rounding_formula() -> None:
     amax = torch.cat([pow2, eps_lo, eps_hi, dense])
 
     dg = ceil_to_ue8m0(amax / 448.0)            # bit-exact power-of-two scale
-    b12 = b12x_scale_formula(amax)              # b12x formula
+    b12 = sparkinfer_scale_formula(amax)              # sparkinfer formula
     # compare as exponents (avoid fp equality pitfalls)
     dg_e = torch.log2(dg).round().to(torch.int64)
     b12_e = torch.log2(b12).round().to(torch.int64)
-    # clamp dg to b12x's [-127,127] range for fair comparison (b12x clamps)
+    # clamp dg to sparkinfer's [-127,127] range for fair comparison (sparkinfer clamps)
     dg_e = dg_e.clamp(-127, 127)
     ndiff = (dg_e != b12_e).sum().item()
     print(f"   total={amax.numel()}  exponent mismatches={ndiff}")
@@ -64,14 +64,14 @@ def test_rounding_formula() -> None:
         idx = (dg_e != b12_e).nonzero().flatten()[:10]
         for i in idx.tolist():
             print(f"     amax={amax[i].item():.6e}  sf=amax/448={amax[i].item()/448:.6e}  "
-                  f"DG_exp={dg_e[i].item()}  b12x_exp={b12_e[i].item()}")
+                  f"DG_exp={dg_e[i].item()}  sparkinfer_exp={b12_e[i].item()}")
     else:
         print("   -> IDENTICAL across all powers of two, boundaries, and dense sweep.")
 
 
 def test_rounding_triton() -> None:
     print("=" * 78)
-    print("(1b) ROUNDING via REAL b12x Triton kernel on power-of-2-aligned input")
+    print("(1b) ROUNDING via REAL sparkinfer Triton kernel on power-of-2-aligned input")
     dev = "cuda"
     M, K = 32, 256
     # craft rows whose per-32 amax is exactly 448 * 2^k for varied k
@@ -93,7 +93,7 @@ def test_rounding_triton() -> None:
     print(f"   per-32 scale exponents compared={b_sf.numel()}  mismatches={ndiff}")
     if ndiff:
         bi, gi = (b_sf != dg_e).nonzero()[0].tolist()
-        print(f"     e.g. amax={amax[bi,gi].item():.6e} b12x_exp={b_sf[bi,gi].item()} DG_exp={dg_e[bi,gi].item()}")
+        print(f"     e.g. amax={amax[bi,gi].item():.6e} sparkinfer_exp={b_sf[bi,gi].item()} DG_exp={dg_e[bi,gi].item()}")
     else:
         print("   -> Triton kernel byte-exact with bit-exact ceil_to_ue8m0 even at boundaries.")
 
@@ -147,7 +147,7 @@ def test_outlier_granularity() -> None:
     xf = xb.float()
     w = (torch.randn(N, K, device=dev) * 0.3).to(torch.bfloat16)
 
-    # b12x actual quant (gran_k=32)
+    # sparkinfer actual quant (gran_k=32)
     rows = quantize_block_fp8_linear_input_mxfp8(xb)
     b_vals = rows.values.view(torch.float8_e4m3fn)
     b_sf = rows.scale_rows.view(torch.uint8)[0]
@@ -157,15 +157,15 @@ def test_outlier_granularity() -> None:
     _, dg32_deq = per_token_cast(xf, 32)
     _, dg128_deq = per_token_cast(xf, 128)
 
-    print(f"   reconstruction cos vs bf16:  b12x(32)={cos(b_deq, xf):.6f}  "
+    print(f"   reconstruction cos vs bf16:  sparkinfer(32)={cos(b_deq, xf):.6f}  "
           f"DG(32)={cos(dg32_deq, xf):.6f}  DG(128)={cos(dg128_deq, xf):.6f}")
-    print(f"   reconstruction rel_fro:      b12x(32)={((b_deq-xf).norm()/xf.norm()).item():.5f}  "
+    print(f"   reconstruction rel_fro:      sparkinfer(32)={((b_deq-xf).norm()/xf.norm()).item():.5f}  "
           f"DG(32)={((dg32_deq-xf).norm()/xf.norm()).item():.5f}  "
           f"DG(128)={((dg128_deq-xf).norm()/xf.norm()).item():.5f}")
     # GEMM vs fp32 oracle (weight kept bf16 to isolate activation-quant granularity)
     oracle = xf @ w.float().T
     wf = w.float()
-    print(f"   GEMM cos vs fp32 oracle:     b12x(32)={cos(b_deq @ wf.T, oracle):.6f}  "
+    print(f"   GEMM cos vs fp32 oracle:     sparkinfer(32)={cos(b_deq @ wf.T, oracle):.6f}  "
           f"DG(32)={cos(dg32_deq @ wf.T, oracle):.6f}  DG(128)={cos(dg128_deq @ wf.T, oracle):.6f}")
 
 

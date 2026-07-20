@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.indexer import clear_indexer_caches
-from b12x.attention.indexer.persistent_topk import (
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer.attention.indexer import clear_indexer_caches
+from sparkinfer.attention.indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from b12x.cute.compiler import compile_cache_info
+from sparkinfer.cute.compiler import compile_cache_info
 
 
 pytestmark = pytest.mark.skipif(

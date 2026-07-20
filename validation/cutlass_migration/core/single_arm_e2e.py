@@ -35,10 +35,10 @@ from validation.cutlass_migration.core.gpu_scope import (
     require_target_gpu,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 
 
-FAMILY_DISCOVERY_SCHEMA = "b12x.cute.migration.family_discovery.v1"
+FAMILY_DISCOVERY_SCHEMA = "sparkinfer.cute.migration.family_discovery.v1"
 
 
 @dataclass(frozen=True)
@@ -278,13 +278,13 @@ def begin_single_arm_session(
         raise RuntimeError("source manifest side differs from requested arm")
     source_runtime = source_manifest.get("runtime")
     runtime_package = (
-        source_runtime.get("b12x_package") if isinstance(source_runtime, dict) else None
+        source_runtime.get("sparkinfer_package") if isinstance(source_runtime, dict) else None
     )
     if not isinstance(runtime_package, dict):
-        raise RuntimeError("source manifest lacks runtime b12x package")
+        raise RuntimeError("source manifest lacks runtime sparkinfer package")
     runtime_fingerprint = str(runtime_package.get("fingerprint", ""))
-    if cute_compiler._b12x_package_fingerprint() != runtime_fingerprint:
-        raise RuntimeError("active b12x package differs from source manifest")
+    if cute_compiler._sparkinfer_package_fingerprint() != runtime_fingerprint:
+        raise RuntimeError("active sparkinfer package differs from source manifest")
     reviewed = (
         _reviewed_cases(
             contract,
@@ -450,7 +450,7 @@ def _build_family_discovery_result(
         raise RuntimeError("discovery timestamps are not ordered")
     source_runtime = session.source_manifest.get("runtime")
     runtime_package = (
-        source_runtime.get("b12x_package")
+        source_runtime.get("sparkinfer_package")
         if isinstance(source_runtime, Mapping)
         else None
     )
@@ -459,7 +459,7 @@ def _build_family_discovery_result(
         or source_runtime.get("repo_root") != str(session.repo_root)
         or not isinstance(runtime_package, Mapping)
         or runtime_package.get("fingerprint") != session.runtime_fingerprint
-        or cute_compiler._b12x_package_fingerprint() != session.runtime_fingerprint
+        or cute_compiler._sparkinfer_package_fingerprint() != session.runtime_fingerprint
     ):
         raise RuntimeError("discovery runtime differs from its frozen source manifest")
 

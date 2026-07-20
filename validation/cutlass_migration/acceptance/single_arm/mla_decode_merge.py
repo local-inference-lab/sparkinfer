@@ -40,13 +40,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.attention.mla.kernel as mla_kernel
-import b12x.attention.mla.merge as mla_merge
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.attention.mla.kernel as mla_kernel
+import sparkinfer.attention.mla.merge as mla_merge
+import sparkinfer.cute.compiler as cute_compiler
 
 
 FAMILY = "mla_decode_merge"
-INPUT_SCHEMA = "b12x.attention.mla.decode_merge.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.attention.mla.decode_merge.end_to_end_input.v1"
 DECODE_ROLE = "mla-decode"
 DECODE_MERGE_ROLE = "mla-decode-merge-one-chunk"
 DIRECT_MERGE_ROLE = "mla-direct-merge-five-chunk"
@@ -878,11 +878,11 @@ def main() -> int:
         capture_roles.append(role_by_spec[spec_hash])
         return cute_compiler.run_compiled(loaded[spec_hash][0], runtime_args)
 
-    original_decode_launch = mla_kernel.b12x_launch
-    original_merge_launch = mla_merge.b12x_launch
+    original_decode_launch = mla_kernel.sparkinfer_launch
+    original_merge_launch = mla_merge.sparkinfer_launch
     previous_glm_h8 = os.environ.get(paired._GLM_H8_NATIVE_ENV)
-    mla_kernel.b12x_launch = exact_dispatch
-    mla_merge.b12x_launch = exact_dispatch
+    mla_kernel.sparkinfer_launch = exact_dispatch
+    mla_merge.sparkinfer_launch = exact_dispatch
     os.environ[paired._GLM_H8_NATIVE_ENV] = "1"
     try:
         cases: list[dict[str, object]] = []
@@ -905,8 +905,8 @@ def main() -> int:
                 cases.append(_run_merge_case(**common))
         active_spec_hashes.clear()
     finally:
-        mla_kernel.b12x_launch = original_decode_launch
-        mla_merge.b12x_launch = original_merge_launch
+        mla_kernel.sparkinfer_launch = original_decode_launch
+        mla_merge.sparkinfer_launch = original_merge_launch
         if previous_glm_h8 is None:
             os.environ.pop(paired._GLM_H8_NATIVE_ENV, None)
         else:

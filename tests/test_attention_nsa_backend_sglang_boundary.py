@@ -47,7 +47,7 @@ class _FakeBackend:
             else 1
         )
         self.nsa_index_topk = req_to_token.shape[1]
-        self.nsa_decode_impl = "b12x_mla"
+        self.nsa_decode_impl = "sparkinfer_mla"
         self.nsa_prefill_impl = "flashmla_sparse"
         self.speculative_num_draft_tokens = 0
         self.real_page_size = 1
@@ -59,7 +59,7 @@ class _FakeBackend:
         return page_indices
 
 
-def test_sglang_nsa_replay_cuda_graph_handles_frozen_metadata_for_b12x_decode() -> None:
+def test_sglang_nsa_replay_cuda_graph_handles_frozen_metadata_for_sparkinfer_decode() -> None:
     module = _import_sglang_nsa_backend()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

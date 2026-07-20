@@ -1,4 +1,4 @@
-"""End-to-end w4a8_nvfp4 dispatch through b12x_moe_fp4 with real weights.
+"""End-to-end w4a8_nvfp4 dispatch through sparkinfer_moe_fp4 with real weights.
 
 Gates the Phase-5 serving integration: the same entry point, scratch binding,
 and checkpoint weights as the nvfp4 path, with
@@ -52,8 +52,8 @@ def _weights():
 
 def test_unswizzle_batched_matches_reference() -> None:
     _skip_if_unavailable()
-    from b12x.integration.tp_moe import _unswizzle_block_scales_batched
-    from b12x.moe.fused.reference import unswizzle_block_scale
+    from sparkinfer.integration.tp_moe import _unswizzle_block_scales_batched
+    from sparkinfer.moe.fused.reference import unswizzle_block_scale
 
     spec = _make_spec()
     weights = _weights()
@@ -67,7 +67,7 @@ def test_unswizzle_batched_matches_reference() -> None:
 
 
 def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
-    from b12x.integration.tp_moe import (
+    from sparkinfer.integration.tp_moe import (
         clear_tp_moe_caches,
     )
 
@@ -103,8 +103,8 @@ def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
 
 def _w4a8_oracle(m: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Run moe_reference_w4a8_mx on the real checkpoint weights."""
-    from b12x.integration.tp_moe import _derive_w4a8_weight_grids
-    from b12x.moe.fused.reference import moe_reference_w4a8_mx
+    from sparkinfer.integration.tp_moe import _derive_w4a8_weight_grids
+    from sparkinfer.moe.fused.reference import moe_reference_w4a8_mx
 
     device = torch.device("cuda")
     spec = _make_spec()

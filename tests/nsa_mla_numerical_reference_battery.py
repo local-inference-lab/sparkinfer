@@ -2,7 +2,7 @@
 """Standalone numerical reference battery for NSA Indexer and Sparse MLA.
 
 This file is intentionally not named test_*.py. Run it directly when you want a
-large SGLang-shaped correctness pass against the B12X reference implementations.
+large SGLang-shaped correctness pass against the SPARKINFER reference implementations.
 """
 
 from __future__ import annotations
@@ -24,18 +24,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from b12x.attention.workspace import B12XAttentionWorkspace  # noqa: E402
-from b12x.attention.mla.reference import (  # noqa: E402
+from sparkinfer.attention.workspace import SPARKINFERAttentionWorkspace  # noqa: E402
+from sparkinfer.attention.mla.reference import (  # noqa: E402
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
 )
-from b12x.attention.indexer.reference import (  # noqa: E402
+from sparkinfer.attention.indexer.reference import (  # noqa: E402
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.integration.mla import (  # noqa: E402
-    B12XSparseMLAScratchCaps,
+from sparkinfer.integration.mla import (  # noqa: E402
+    SPARKINFERSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
@@ -43,8 +43,8 @@ from b12x.integration.mla import (  # noqa: E402
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
-from b12x.attention.indexer import (  # noqa: E402
-    B12XIndexerScratchCaps,
+from sparkinfer.attention.indexer import (  # noqa: E402
+    SPARKINFERIndexerScratchCaps,
     INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
     INDEXER_SOURCE_LAYOUT_PAGED,
     IndexerContiguousMetadata,
@@ -476,8 +476,8 @@ def _make_workspace(
     mla_heads: int = DEFAULT_MLA_HEADS,
     index_heads: int = DEFAULT_INDEX_HEADS,
     use_cuda_graph: bool = False,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
+) -> SPARKINFERAttentionWorkspace:
+    return SPARKINFERAttentionWorkspace.for_fixed_capacity(
         mode=mode,
         device=device,
         dtype=torch.bfloat16,
@@ -516,7 +516,7 @@ def _make_paged_indexer_binding(
     use_cuda_graph: bool = False,
 ):
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=index_heads,
@@ -550,7 +550,7 @@ def _make_contiguous_indexer_binding(
     k_end: torch.Tensor,
 ):
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
             num_q_heads=index_heads,
@@ -587,7 +587,7 @@ def _make_sparse_mla_binding(
     use_cuda_graph: bool = False,
 ):
     plan = plan_sparse_mla_scratch(
-        B12XSparseMLAScratchCaps(
+        SPARKINFERSparseMLAScratchCaps(
             mode=mode,
             device=device,
             dtype=torch.bfloat16,
@@ -1981,7 +1981,7 @@ def _run_sglang_paged_eager(
         mla_heads=case.mla_heads,
         index_heads=case.index_heads,
     )
-    b12x_metadata = IndexerPagedDecodeMetadata(
+    sparkinfer_metadata = IndexerPagedDecodeMetadata(
         real_page_table=shape["real_expanded"],
         cache_seqlens_int32=shape["seqlens_expanded"],
         paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
@@ -1993,7 +1993,7 @@ def _run_sglang_paged_eager(
         q_fp8=q_fp8[:q_offset],
         weights=weights[:q_offset],
         index_k_cache=index_k_cache,
-        metadata=b12x_metadata,
+        metadata=sparkinfer_metadata,
         page_size=PAGE_SIZE,
         contract_phantoms=workspace.get_paged_indexer_contract_phantoms(),
         workspace=workspace,
@@ -2233,7 +2233,7 @@ def _run_sglang_paged_graph(
         index_heads=case.index_heads,
         use_cuda_graph=True,
     )
-    b12x_metadata = IndexerPagedDecodeMetadata(
+    sparkinfer_metadata = IndexerPagedDecodeMetadata(
         real_page_table=graph_real,
         cache_seqlens_int32=graph_seqlens,
         paged_mqa_schedule_metadata=graph_schedule,
@@ -2276,7 +2276,7 @@ def _run_sglang_paged_graph(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=b12x_metadata,
+            metadata=sparkinfer_metadata,
             page_size=PAGE_SIZE,
             contract_phantoms=indexer_workspace.get_paged_indexer_contract_phantoms(),
             workspace=indexer_workspace,

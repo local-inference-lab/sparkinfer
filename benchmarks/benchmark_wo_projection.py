@@ -7,7 +7,7 @@ This benchmark times the explicit native MXFP8 two-GEMM skeleton:
     tmp:  [tokens, rank, groups] -> group-major [tokens, groups * rank]
     WO-B: [tokens, groups * rank] x [hidden, groups * rank]
 
-The b12x path uses owned GPU quant/packing kernels for the activation operands
+The sparkinfer path uses owned GPU quant/packing kernels for the activation operands
 around the two native MXFP8 dense GEMMs. Weight quantization is still setup
 work, matching model-load behavior rather than the per-token serving path.
 """
@@ -26,8 +26,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-import b12x.gemm.wo_projection as wo_projection_impl
-from b12x.gemm.wo_projection import (
+import sparkinfer.gemm.wo_projection as wo_projection_impl
+from sparkinfer.gemm.wo_projection import (
     WOProjectionScratchCaps,
     dequantize_mxfp8_rows_torch,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,
@@ -140,7 +140,7 @@ def _block_fp8_checkpoint(
     weight_bf16: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a BF16 `[N,K]` weight to checkpoint-style FP8 with exact
-    power-of-two 128x128 block scales, so b12x and DeepGEMM consume identical
+    power-of-two 128x128 block scales, so sparkinfer and DeepGEMM consume identical
     FP8 bytes."""
 
     n, k = map(int, weight_bf16.shape)
@@ -165,7 +165,7 @@ def build_deepgemm_launch(
 ) -> Callable[[], torch.Tensor]:
     """Build the serving DeepGEMM WO chain (vLLM deep_gemm_fp8_o_proj):
     fused inverse-RoPE FP8 quant -> fp8_einsum (WO-A) -> QuantFP8 ->
-    fp8_gemm_nt (WO-B), from the same FP8 checkpoint tensors as b12x."""
+    fp8_gemm_nt (WO-B), from the same FP8 checkpoint tensors as sparkinfer."""
 
     import vllm.envs as envs
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -316,7 +316,7 @@ def make_case(
     ckpt_wo_a_fp8 = ckpt_wo_a_scale = ckpt_wo_b_fp8 = ckpt_wo_b_scale = None
     if block_scaled_weights:
         # Serving checkpoints carry FP8 weights with 128x128 block scales;
-        # both b12x and DeepGEMM pack from the same FP8 bytes.
+        # both sparkinfer and DeepGEMM pack from the same FP8 bytes.
         ckpt_wo_a_fp8, ckpt_wo_a_scale = _block_fp8_checkpoint(
             wo_a_grd.reshape(groups * rank, group_width)
         )
@@ -440,7 +440,7 @@ def bench_one(
                 expected_m=tokens,
             )
 
-            def b12x_launch() -> torch.Tensor:
+            def sparkinfer_launch() -> torch.Tensor:
                 return wo_projection_inv_rope_mxfp8(binding=binding)
 
         else:
@@ -452,21 +452,21 @@ def bench_one(
                 expected_m=tokens,
             )
 
-            def b12x_launch() -> torch.Tensor:
+            def sparkinfer_launch() -> torch.Tensor:
                 return wo_projection_mxfp8(binding=binding)
 
-        b12x_replay, b12x_graph_out = capture_graph_replay(b12x_launch)
-        results["b12x_replay"] = b12x_replay
-        results["b12x_out"] = b12x_graph_out if inv_rope else binding.output
-        results["b12x"] = bench_events(
-            b12x_replay,
+        sparkinfer_replay, sparkinfer_graph_out = capture_graph_replay(sparkinfer_launch)
+        results["sparkinfer_replay"] = sparkinfer_replay
+        results["sparkinfer_out"] = sparkinfer_graph_out if inv_rope else binding.output
+        results["sparkinfer"] = bench_events(
+            sparkinfer_replay,
             warmup=warmup,
             iters=iters,
             l2_flush=l2_flush,
         )
     except Exception as exc:
-        results["b12x"] = None
-        print(f"      b12x two-GEMM FAILED: {exc}")
+        results["sparkinfer"] = None
+        print(f"      sparkinfer two-GEMM FAILED: {exc}")
 
     try:
         torch_outputs: list[torch.Tensor | None] = [None]
@@ -521,15 +521,15 @@ def bench_one(
             print(f"      deepgemm WO chain FAILED: {exc}")
 
     if check:
-        if results.get("b12x_replay") is None or results.get("torch_replay") is None:
+        if results.get("sparkinfer_replay") is None or results.get("torch_replay") is None:
             raise BenchmarkAbort(
-                "correctness check requires both b12x and torch replays"
+                "correctness check requires both sparkinfer and torch replays"
             )
-        results["b12x_replay"]()
+        results["sparkinfer_replay"]()
         results["torch_replay"]()
         torch.cuda.synchronize()
         check_outputs(
-            results["b12x_out"][:, :, 0],
+            results["sparkinfer_out"][:, :, 0],
             results["torch_out"],
             label=REFERENCE_LABEL,
         )
@@ -604,7 +604,7 @@ def main() -> None:
     )
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
 
-    print(f"WO projection: b12x native MXFP8 two-GEMM vs {REFERENCE_LABEL}")
+    print(f"WO projection: sparkinfer native MXFP8 two-GEMM vs {REFERENCE_LABEL}")
     route = "inverse-RoPE serving op" if args.inv_rope else "plain WO binding"
     print(f"Route: {route}")
     if args.compare_deepgemm:
@@ -634,7 +634,7 @@ def main() -> None:
         "4 warps"
     )
     print(
-        "b12x note: activation quant/scale packing is included in the graph replay path."
+        "sparkinfer note: activation quant/scale packing is included in the graph replay path."
     )
     print(f"warmup={args.warmup}, iters={args.iters}")
     print()
@@ -665,37 +665,37 @@ def main() -> None:
             )
             raise SystemExit(1) from exc
 
-        b12x_times = results.get("b12x")
+        sparkinfer_times = results.get("sparkinfer")
         torch_times = results.get(REFERENCE_LABEL)
         dg_times = results.get(DEEPGEMM_LABEL)
-        b12x_med = statistics.median(b12x_times) * 1000.0 if b12x_times else None
+        sparkinfer_med = statistics.median(sparkinfer_times) * 1000.0 if sparkinfer_times else None
         torch_med = statistics.median(torch_times) * 1000.0 if torch_times else None
         dg_med = statistics.median(dg_times) * 1000.0 if dg_times else None
 
         parts = [f"  tokens={tokens:<4}"]
-        if b12x_times is not None:
-            parts.append(f"b12x={fmt_us(b12x_times)}")
+        if sparkinfer_times is not None:
+            parts.append(f"sparkinfer={fmt_us(sparkinfer_times)}")
         if dg_times is not None:
             parts.append(f"deepgemm={fmt_us(dg_times)}")
         if torch_times is not None:
             parts.append(f"torch={fmt_us(torch_times)}")
-        if b12x_med is not None and dg_med is not None:
-            parts.append(f"b12x/dg={b12x_med / dg_med:.2f}x")
-        if b12x_med is not None and torch_med is not None:
-            parts.append(f"b12x/torch={b12x_med / torch_med:.2f}x")
+        if sparkinfer_med is not None and dg_med is not None:
+            parts.append(f"sparkinfer/dg={sparkinfer_med / dg_med:.2f}x")
+        if sparkinfer_med is not None and torch_med is not None:
+            parts.append(f"sparkinfer/torch={sparkinfer_med / torch_med:.2f}x")
         print("  ".join(parts) + "  (graph replay)")
-        all_results.append((tokens, b12x_med, torch_med, dg_med))
+        all_results.append((tokens, sparkinfer_med, torch_med, dg_med))
 
     def print_summary(label: str, pairs: list[tuple[int, float | None, float | None]]) -> None:
         print(f"\n{'=' * 75}")
-        print(f"  SUMMARY: b12x / {label} (CUDA graph replay, lower = b12x faster)")
+        print(f"  SUMMARY: sparkinfer / {label} (CUDA graph replay, lower = sparkinfer faster)")
         print(f"{'=' * 75}")
         print(f"  {'tokens':<10}  {'ratio':>10}")
         print("  " + "-" * 24)
         ratios = []
-        for tokens, b12x_med, other_med in pairs:
-            if b12x_med is not None and other_med is not None:
-                ratio = b12x_med / other_med
+        for tokens, sparkinfer_med, other_med in pairs:
+            if sparkinfer_med is not None and other_med is not None:
+                ratio = sparkinfer_med / other_med
                 ratios.append(ratio)
                 print(f"  {tokens:<10}  {ratio:>9.2f}x")
             else:

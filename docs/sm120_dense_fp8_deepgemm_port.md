@@ -1,7 +1,7 @@
 # SM120 dense FP8 GEMM — DeepGEMM perf port (postmortem & handoff)
 
 Porting the SM120 DeepSeek FP8 GEMM techniques from `~/projects/deepgemm-other`
-into b12x's CuTeDSL `dense_gemm`, to make the **FP8 kernels b12x exposes**
+into sparkinfer's CuTeDSL `dense_gemm`, to make the **FP8 kernels sparkinfer exposes**
 (`dense_gemm` and the `wo_a`/`wo_b` + `block_fp8_linear` paths built on it)
 faster. Built on branch `rs-2`, validated on RTX PRO 6000 Blackwell (sm_120,
 188 SMs). Commits: `87d4bed2` (Graft A), `1ca79e96` (Graft A.2 dense+block_fp8),
@@ -13,13 +13,13 @@ faster. Built on branch `rs-2`, validated on RTX PRO 6000 Blackwell (sm_120,
 
 - **dense FP8 (MXFP8) is now ~1.6× faster than FlashInfer CUTLASS** on the
   benchmark shape (Nemotron down-proj), up from **1.44× slower**:
-  `benchmark_dense_gemm.py --dtype fp8` geo **1.44× → 0.63×** (lower = b12x
+  `benchmark_dense_gemm.py --dtype fp8` geo **1.44× → 0.63×** (lower = sparkinfer
   faster). FP4 path unchanged (~0.77×).
 - The whole win is **tile selection** — zero numeric change (every tile is
   byte-identical: cos=1.0, maxabs=0 vs the prior output and vs CUTLASS).
 - **Two grafts, both `dense_gemm`-level, additive, fully gated:**
   1. **Graft A** — replace the wide-N MXFP8 tile pin `(128,128)` with the best
-     **M-independent** tile **`(64,128)`**. Honors b12x's one-kernel-per-(N,K)
+     **M-independent** tile **`(64,128)`**. Honors sparkinfer's one-kernel-per-(N,K)
      freeze/reuse serving contract; beats (128,128) at *every* M (1.1×–2.4×);
      generalizes (best single tile on Nemotron / GLM5-down / block_fp8 shapes).
   2. **Graft A.2** — a DeepGEMM-style **`expected_m` regime hint**. A caller
@@ -40,9 +40,9 @@ faster. Built on branch `rs-2`, validated on RTX PRO 6000 Blackwell (sm_120,
 ### Files touched
 | file | change |
 |---|---|
-| `b12x/gemm/dense.py` | `_select_default_mma_tiler_mn`: `(64,128)` default + `expected_m` regime tiles; `dense_gemm(..., expected_m=None)` |
-| `b12x/gemm/block_fp8_linear.py` | `expected_m` through `block_fp8_linear_mxfp8` / binding / build / workspace+scratch `.bind` / `prewarm` |
-| `b12x/gemm/wo_projection.py` | `expected_m` through wo_a/wo_b leaves / both orchestrators / both bindings / both builds / all four `.bind*` |
+| `sparkinfer/gemm/dense.py` | `_select_default_mma_tiler_mn`: `(64,128)` default + `expected_m` regime tiles; `dense_gemm(..., expected_m=None)` |
+| `sparkinfer/gemm/block_fp8_linear.py` | `expected_m` through `block_fp8_linear_mxfp8` / binding / build / workspace+scratch `.bind` / `prewarm` |
+| `sparkinfer/gemm/wo_projection.py` | `expected_m` through wo_a/wo_b leaves / both orchestrators / both bindings / both builds / all four `.bind*` |
 | `benchmarks/probe_dense_fp8_tile_sweep.py` | new: per-(M,tile) sweep, parameterized by N,K (the evidence behind the tile choice) |
 | `tests/test_dense_gemm_expected_m.py` | new: regime-selection unit tests |
 | `tests/test_gemm_block_fp8_linear.py`, `tests/test_gemm_wo_projection.py`, `tests/test_wo_projection_scratch_bindings.py` | hint integration + fake updates |
@@ -58,7 +58,7 @@ faster. Built on branch `rs-2`, validated on RTX PRO 6000 Blackwell (sm_120,
 > were rounded to UE8M0 while keeping stale FP8 values → ~2.7× excess weight
 > error). Fixed; see §8.
 
-b12x **already had** a working CuTeDSL SM120 block-scaled FP8 GEMM, and it
+sparkinfer **already had** a working CuTeDSL SM120 block-scaled FP8 GEMM, and it
 **already does DeepSeek-style scaling with the identical MMA instruction**
 (`mma.sync...mxf8f6f4.block_scale.scale_vec::1X.m16n8k32...ue8m0`). Activations
 are 128-col-max-abs quantized (SGLang/DeepSeek) and stored at 1×32 ue8m0;
@@ -94,7 +94,7 @@ callers that declare a decode regime.
 
 ## 4. The two invariants that shaped the design
 
-- **One kernel per (N,K), reused for all live M under frozen resolution.** b12x
+- **One kernel per (N,K), reused for all live M under frozen resolution.** sparkinfer
   keeps M out of the compile key (warm once, serve any token count, no per-M
   recompile; `test_block_fp8_linear_small_live_m_reuses_prefill_dense_kernel`).
   ⇒ the *default* tile must be **M-independent** (Graft A). The `expected_m`
@@ -129,8 +129,8 @@ return plan.bind_inv_rope(
 ```
 
 Under CUDA-graph capture each graph fixes `o.shape[0]`, so `expected_m` is fixed
-per captured kernel (freeze-safe). **Takes effect only once these `rs-2` b12x
-changes land in the b12x that vllm imports** (vllm imports the main clone, not
+per captured kernel (freeze-safe). **Takes effect only once these `rs-2` sparkinfer
+changes land in the sparkinfer that vllm imports** (vllm imports the main clone, not
 this worktree).
 
 **Alternative (no vllm change): auto-default `expected_m` in the WO binding.**
@@ -139,7 +139,7 @@ inputs), and the binding is built per-forward / per-capture, so defaulting
 `expected_m = tokens` there is freeze-safe and would give vllm the decode win
 with zero vllm edits — at the cost of making the WO *default* token-count-aware
 (decode→32×128, prefill→64×128) rather than M-independent. Left as a decision
-(explicit opt-in vs b12x-side default change).
+(explicit opt-in vs sparkinfer-side default change).
 
 ### DSV4-Flash TP=2 validation (the real profile)
 
@@ -222,14 +222,14 @@ against DeepGEMM's actual quantizer (`deepgemm-other/deep_gemm/utils/math.py`),
 - The `ceil(log2)/exp2` UE8M0 path equals DeepGEMM's bit-exact `ceil_to_ue8m0`
   across 200k values incl. exact powers of two and the real Triton kernel
   (`benchmarks/probe_quant_parity_adversarial.py`: 0 mismatches).
-- gran_k=32 (b12x) vs 128 (DeepGEMM) is real but **numerically neutral** in
+- gran_k=32 (sparkinfer) vs 128 (DeepGEMM) is real but **numerically neutral** in
   realistic regimes (identical cos even with 3%×40 outlier channels) and costs
   nothing at the MMA (which consumes per-32 SF either way).
 
 **The weight path dropped a re-quantization step (the real bug):**
 - DeepSeek checkpoints carry `(w_fp8, weight_scale_inv)` where `weight_scale_inv
   = block_amax/448` is an **arbitrary fp32** 128×128 block scale. Production
-  (`vllm-other …/scaled_mm/b12x.py`) feeds it straight to
+  (`vllm-other …/scaled_mm/sparkinfer.py`) feeds it straight to
   `pack_fp8_block_scaled_weight_mxfp8` — used by **both** dense `block_fp8` and
   the WO `wo_a`/`wo_b` weights.
 - The packer **rounded the scale to the nearest power of two and kept the
@@ -241,10 +241,10 @@ against DeepGEMM's actual quantizer (`deepgemm-other/deep_gemm/utils/math.py`),
 - **Why it was missed:** there was never a byte-exact test vs DeepGEMM, and the
   one test that exercises this packer (`test_pack_fp8_block_scaled_weight_…`)
   feeds **already-power-of-two e8m0** scales, so the arbitrary-fp32 case never
-  ran. The GEMM correctness gate compared b12x to a reference consuming b12x's
+  ran. The GEMM correctness gate compared sparkinfer to a reference consuming sparkinfer's
   *own* FP8, so a DeepGEMM divergence was invisible.
 
-**Fix** (`b12x/gemm/wo_projection.py`): when the block scale is **not** already
+**Fix** (`sparkinfer/gemm/wo_projection.py`): when the block scale is **not** already
 exact UE8M0, `pack_fp8_block_scaled_weight_mxfp8` now **re-quantizes** —
 reconstruct `w_fp8 · s_fp32`, then ceil-UE8M0 `per_block_cast` to derive *fresh*
 FP8 values consistent with the power-of-two scale (DeepGEMM

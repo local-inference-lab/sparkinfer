@@ -81,7 +81,7 @@ def _timing(*, replays: int) -> dict[str, object]:
             "flush_inside_timed_interval": False,
         },
         "event_pool": {
-            "schema": "b12x.cuda_event_pool.v1",
+            "schema": "sparkinfer.cuda_event_pool.v1",
             "allocation_phase": "before_reported_samples",
             "prewarm_phase": "before_reported_samples",
             "prewarm_each_event": True,
@@ -150,7 +150,7 @@ def _smem_report() -> dict[str, object]:
     rows = [
         _smem_allocator_row(
             source_category="production",
-            path="b12x/production_kernel.py",
+            path="sparkinfer/production_kernel.py",
             method="allocate",
         ),
         _smem_allocator_row(
@@ -161,7 +161,7 @@ def _smem_report() -> dict[str, object]:
         {
             "kind": "private_memrange",
             "source_category": "production",
-            "path": "b12x/cute/smem.py",
+            "path": "sparkinfer/cute/smem.py",
             "line": 17,
             "column": 11,
             "scope": "",
@@ -203,13 +203,13 @@ def _smem_report() -> dict[str, object]:
     }
     counts = {field: production[field] + infrastructure[field] for field in production}
     return {
-        "schema": "b12x.cute.smem_contracts.v1",
+        "schema": "sparkinfer.cute.smem_contracts.v1",
         "root": "/synthetic/source",
         "audited_source_roots": {
-            "production": ["b12x"],
+            "production": ["sparkinfer"],
             "infrastructure": ["benchmarks", "tests", "validation"],
         },
-        "central_private_memrange_path": "b12x/cute/smem.py",
+        "central_private_memrange_path": "sparkinfer/cute/smem.py",
         "rows": rows,
         "counts": counts,
         "source_counts": {
@@ -232,13 +232,13 @@ def _write_smem_fixture(
     report_sha = hashlib.sha256(smem_path.read_bytes()).hexdigest()
     auditor_sha = "c" * 64
     gate = {
-        "schema": "b12x.cute.migration.smem_contract_gate.v1",
+        "schema": "sparkinfer.cute.migration.smem_contract_gate.v1",
         "passed": True,
         "auditor": {
             "path": "validation/cutlass_migration/evidence/smem_contracts.py",
             "sha256": auditor_sha,
         },
-        "report_schema": "b12x.cute.smem_contracts.v1",
+        "report_schema": "sparkinfer.cute.smem_contracts.v1",
         "report_sha256": report_sha,
         "counts": report["counts"],
         "report": report,
@@ -246,7 +246,7 @@ def _write_smem_fixture(
     artifact = {
         "path": str(smem_path),
         "sha256": report_sha,
-        "schema": "b12x.cute.smem_contracts.v1",
+        "schema": "sparkinfer.cute.smem_contracts.v1",
     }
     trace = {
         "source_root": "/synthetic/source",
@@ -255,7 +255,7 @@ def _write_smem_fixture(
             "smem_contracts": gate,
         },
         "smem_contracts": {
-            "schema": "b12x.cute.migration.smem_contract_finalization.v1",
+            "schema": "sparkinfer.cute.migration.smem_contract_finalization.v1",
             "passed": True,
             "static_final_reports_equal": True,
             "gate": gate,
@@ -367,7 +367,7 @@ def _condition(
         "gpu_mode_before_timing": before,
         "gpu_mode_after_timing": after,
         "gpu_mode_stability": {
-            "schema": "b12x.gpu_mode_stability.v1",
+            "schema": "sparkinfer.gpu_mode_stability.v1",
             "required_pstate": "P1",
             "required_memory_clock_equality": True,
             "required_active_throttle_reasons": required_active_throttle_reasons,
@@ -397,7 +397,7 @@ def _condition(
 
 def _timing_mode_policy(required_mask: int) -> dict[str, object]:
     return {
-        "schema": "b12x.gpu_timing_mode_policy.v1",
+        "schema": "sparkinfer.gpu_timing_mode_policy.v1",
         "required_pstate": "P1",
         "required_active_throttle_reasons": required_mask,
         "active_throttle_reasons_match": "exact",
@@ -441,12 +441,12 @@ def _validate(
 
 
 def _selftest_smem_finalization() -> None:
-    with tempfile.TemporaryDirectory(prefix="b12x-release-smem-selftest-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-release-smem-selftest-") as raw:
         base = Path(raw)
 
         trace_path, trace, manifest, _ = _write_smem_fixture(base / "positive")
         record = _validate_smem_contract_finalization(trace_path, trace, manifest)
-        if record.get("schema") != "b12x.cute.smem_contracts.v1":
+        if record.get("schema") != "sparkinfer.cute.smem_contracts.v1":
             raise AssertionError("valid final SMEM artifact did not pass")
 
         trace_path, trace, manifest, _ = _write_smem_fixture(base / "missing")
@@ -485,7 +485,7 @@ def _selftest_smem_finalization() -> None:
         )
 
         trace_path, trace, manifest, report = _write_smem_fixture(base / "schema")
-        report["schema"] = "b12x.cute.smem_contracts.invalid"
+        report["schema"] = "sparkinfer.cute.smem_contracts.invalid"
         _refresh_smem_fixture(trace_path, trace, report)
         _expect_failure(
             "mutated final SMEM schema",
@@ -495,14 +495,14 @@ def _selftest_smem_finalization() -> None:
 
 
 def _selftest_bf16_schema_transition() -> None:
-    old_schema = "b12x.bf16_to_fp4_tma.cache_abba.v3"
-    new_schema = "b12x.bf16_to_fp4_tma.cache_abba.v4"
+    old_schema = "sparkinfer.bf16_to_fp4_tma.cache_abba.v3"
+    new_schema = "sparkinfer.bf16_to_fp4_tma.cache_abba.v4"
     if (
         old_schema in _SUPPORTED_ABBA_SCHEMAS
         or new_schema not in _SUPPORTED_ABBA_SCHEMAS
     ):
         raise AssertionError("BF16 aggregate schema transition is not fail-closed")
-    with tempfile.TemporaryDirectory(prefix="b12x-release-bf16-schema-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-release-bf16-schema-") as raw:
         old_path = Path(raw) / "old-v3.json"
         old_path.write_text(json.dumps({"schema": old_schema}), encoding="utf-8")
         _expect_failure(
@@ -525,8 +525,8 @@ def _selftest_bf16_schema_transition() -> None:
 
 
 def _selftest_contiguous_schema_transition() -> None:
-    old_schema = "b12x.contiguous_attention.cache_abba.v1"
-    new_schema = "b12x.contiguous_attention.cache_abba.v2"
+    old_schema = "sparkinfer.contiguous_attention.cache_abba.v1"
+    new_schema = "sparkinfer.contiguous_attention.cache_abba.v2"
     if (
         old_schema in _SUPPORTED_ABBA_SCHEMAS
         or new_schema not in _SUPPORTED_ABBA_SCHEMAS
@@ -534,7 +534,7 @@ def _selftest_contiguous_schema_transition() -> None:
         raise AssertionError(
             "contiguous aggregate schema transition is not fail-closed"
         )
-    with tempfile.TemporaryDirectory(prefix="b12x-release-contiguous-schema-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-release-contiguous-schema-") as raw:
         old_path = Path(raw) / "old-v1.json"
         old_path.write_text(json.dumps({"schema": old_schema}), encoding="utf-8")
         _expect_failure(
@@ -545,14 +545,14 @@ def _selftest_contiguous_schema_transition() -> None:
 
 
 def _selftest_w4a8_schema_transition() -> None:
-    old_schema = "b12x.w4a8.dynamic.cache_abba.v1"
-    new_schema = "b12x.w4a8.dynamic.cache_abba.v2"
+    old_schema = "sparkinfer.w4a8.dynamic.cache_abba.v1"
+    new_schema = "sparkinfer.w4a8.dynamic.cache_abba.v2"
     if (
         old_schema in _SUPPORTED_ABBA_SCHEMAS
         or new_schema not in _SUPPORTED_ABBA_SCHEMAS
     ):
         raise AssertionError("W4A8 aggregate schema transition is not fail-closed")
-    with tempfile.TemporaryDirectory(prefix="b12x-release-w4a8-schema-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-release-w4a8-schema-") as raw:
         old_path = Path(raw) / "old-v1.json"
         old_path.write_text(json.dumps({"schema": old_schema}), encoding="utf-8")
         _expect_failure(
@@ -566,23 +566,23 @@ def _selftest_remaining_timer_schema_transitions() -> None:
     transitions = (
         (
             "MLA decode/merge",
-            "b12x.attention.mla.decode_merge.exact_cache_abba.v1",
-            "b12x.attention.mla.decode_merge.exact_cache_abba.v2",
+            "sparkinfer.attention.mla.decode_merge.exact_cache_abba.v1",
+            "sparkinfer.attention.mla.decode_merge.exact_cache_abba.v2",
         ),
         (
             "MLA prefill-MG",
-            "b12x.attention.mla.prefill_mg.exact_cache_abba.v3",
-            "b12x.attention.mla.prefill_mg.exact_cache_abba.v4",
+            "sparkinfer.attention.mla.prefill_mg.exact_cache_abba.v3",
+            "sparkinfer.attention.mla.prefill_mg.exact_cache_abba.v4",
         ),
         (
             "TP-MoE dynamic",
-            "b12x.tp_moe.dynamic.cache_abba.v1",
-            "b12x.tp_moe.dynamic.cache_abba.v2",
+            "sparkinfer.tp_moe.dynamic.cache_abba.v1",
+            "sparkinfer.tp_moe.dynamic.cache_abba.v2",
         ),
         (
             "W4A16 serving timing-mode policy",
-            "b12x.w4a16.serving.cache_abba.v1",
-            "b12x.w4a16.serving.cache_abba.v2",
+            "sparkinfer.w4a16.serving.cache_abba.v1",
+            "sparkinfer.w4a16.serving.cache_abba.v2",
         ),
     )
     for name, old_schema, new_schema in transitions:
@@ -591,7 +591,7 @@ def _selftest_remaining_timer_schema_transitions() -> None:
             or new_schema not in _SUPPORTED_ABBA_SCHEMAS
         ):
             raise AssertionError(f"{name} schema transition is not fail-closed")
-        with tempfile.TemporaryDirectory(prefix="b12x-release-timer-schema-") as raw:
+        with tempfile.TemporaryDirectory(prefix="sparkinfer-release-timer-schema-") as raw:
             old_path = Path(raw) / "old.json"
             old_path.write_text(json.dumps({"schema": old_schema}), encoding="utf-8")
             _expect_failure(
@@ -619,7 +619,7 @@ def main() -> int:
         raise AssertionError("valid K=1/K=2 aggregate timing did not pass")
 
     policy_artifact = {
-        "schema": "b12x.w4a16.serving.cache_abba.v2",
+        "schema": "sparkinfer.w4a16.serving.cache_abba.v2",
         "timing_mode_policy": _timing_mode_policy(0x4),
     }
     validated_policy = _validate_artifact_timing_mode_policy(
@@ -632,14 +632,14 @@ def main() -> int:
     for name, artifact, rows, expected in (
         (
             "missing W4 timing policy",
-            {"schema": "b12x.w4a16.serving.cache_abba.v2"},
+            {"schema": "sparkinfer.w4a16.serving.cache_abba.v2"},
             [{"required_active_throttle_reasons": 0x4}],
             "lacks its top-level timing-mode policy",
         ),
         (
             "mismatched W4 timing policy",
             {
-                "schema": "b12x.w4a16.serving.cache_abba.v2",
+                "schema": "sparkinfer.w4a16.serving.cache_abba.v2",
                 "timing_mode_policy": _timing_mode_policy(0),
             },
             [{"required_active_throttle_reasons": 0x4}],

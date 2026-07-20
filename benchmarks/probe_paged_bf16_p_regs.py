@@ -12,8 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
-from b12x.integration.attention import PagedAttentionWorkspace, clear_attention_caches
+from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
+from sparkinfer.integration.attention import PagedAttentionWorkspace, clear_attention_caches
 from tests.test_attention_paged_planner import _make_inputs
 
 _LANES = 32
@@ -45,13 +45,13 @@ def _dump_words(
     plain_bf16_layout: bool = False,
 ) -> tuple[torch.Tensor, int]:
     overrides = {
-        "B12X_PAGED_KV_DEBUG_DUMP": "PREGS",
-        "B12X_PAGED_KV_TMA": "1" if use_tma else None,
-        "B12X_PAGED_KV_TMA_COPYFRAG_QK": "1" if (use_tma and copyfrag_qk) else None,
-        "B12X_PAGED_KV_TMA_PLAIN_BF16_LAYOUT": "1" if (use_tma and plain_bf16_layout) else None,
-        "B12X_PAGED_KV_TMA_COPYFRAG_PV": None,
-        "B12X_PAGED_KV_TMA_DONOR_GEMM": None,
-        "B12X_PAGED_KV_TMA_REPACK_V": None,
+        "SPARKINFER_PAGED_KV_DEBUG_DUMP": "PREGS",
+        "SPARKINFER_PAGED_KV_TMA": "1" if use_tma else None,
+        "SPARKINFER_PAGED_KV_TMA_COPYFRAG_QK": "1" if (use_tma and copyfrag_qk) else None,
+        "SPARKINFER_PAGED_KV_TMA_PLAIN_BF16_LAYOUT": "1" if (use_tma and plain_bf16_layout) else None,
+        "SPARKINFER_PAGED_KV_TMA_COPYFRAG_PV": None,
+        "SPARKINFER_PAGED_KV_TMA_DONOR_GEMM": None,
+        "SPARKINFER_PAGED_KV_TMA_REPACK_V": None,
     }
     with _env(overrides):
         clear_attention_caches()
@@ -114,22 +114,22 @@ def main() -> None:
     parser.add_argument(
         "--lhs-copyfrag-qk",
         action="store_true",
-        help="enable B12X_PAGED_KV_TMA_COPYFRAG_QK for the left-hand dump",
+        help="enable SPARKINFER_PAGED_KV_TMA_COPYFRAG_QK for the left-hand dump",
     )
     parser.add_argument(
         "--rhs-copyfrag-qk",
         action="store_true",
-        help="enable B12X_PAGED_KV_TMA_COPYFRAG_QK for the right-hand dump",
+        help="enable SPARKINFER_PAGED_KV_TMA_COPYFRAG_QK for the right-hand dump",
     )
     parser.add_argument(
         "--lhs-plain-bf16-layout",
         action="store_true",
-        help="enable B12X_PAGED_KV_TMA_PLAIN_BF16_LAYOUT for the left-hand TMA dump",
+        help="enable SPARKINFER_PAGED_KV_TMA_PLAIN_BF16_LAYOUT for the left-hand TMA dump",
     )
     parser.add_argument(
         "--rhs-plain-bf16-layout",
         action="store_true",
-        help="enable B12X_PAGED_KV_TMA_PLAIN_BF16_LAYOUT for the right-hand TMA dump",
+        help="enable SPARKINFER_PAGED_KV_TMA_PLAIN_BF16_LAYOUT for the right-hand TMA dump",
     )
     parser.add_argument(
         "--show-lane",

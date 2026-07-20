@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the first-layer B12X mHC broadcast pre kernel."""
+"""Benchmark the first-layer SPARKINFER mHC broadcast pre kernel."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from benchmarks.common import (
     make_l2_flush_fn,
     require_sm120,
 )
-from b12x.integration import b12x_mhc_pre
+from sparkinfer.integration import sparkinfer_mhc_pre
 
 
 def _reference(
@@ -112,7 +112,7 @@ def main() -> None:
 
     def run() -> None:
         nonlocal output
-        output = b12x_mhc_pre(
+        output = sparkinfer_mhc_pre(
             residual,
             fn,
             scale,

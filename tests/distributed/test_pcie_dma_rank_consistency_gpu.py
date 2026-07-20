@@ -59,7 +59,7 @@ def assert_output(
 
 
 def worker(rank: int, world: int, port: int, mode: str) -> None:
-    os.environ["B12X_PCIE_DMA_FP8"] = mode
+    os.environ["SPARKINFER_PCIE_DMA_FP8"] = mode
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -68,7 +68,7 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
         rank=rank,
         world_size=world,
     )
-    from b12x.distributed.pcie_dma import PCIeDmaAllReduce
+    from sparkinfer.distributed.pcie_dma import PCIeDmaAllReduce
 
     ring = PCIeDmaAllReduce(
         exchange_group=dist.group.WORLD,

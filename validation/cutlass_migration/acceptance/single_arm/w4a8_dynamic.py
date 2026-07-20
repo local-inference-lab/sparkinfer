@@ -53,7 +53,7 @@ from tests.test_w4a8_dynamic_kernel import _run_w4a8_dynamic
 
 FAMILY = "w4a8_dynamic"
 ARTIFACT_ROLE = "direct-dynamic"
-INPUT_SCHEMA = "b12x.w4a8.dynamic.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.w4a8.dynamic.end_to_end_input.v1"
 REPLAYS_PER_REPORTED_SAMPLE = 8
 CORRECTNESS_GATES = (
     "finite",

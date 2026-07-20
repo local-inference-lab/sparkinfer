@@ -46,7 +46,7 @@ def _bind_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ):
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         plan_attention_scratch,
     )
 
@@ -108,7 +108,7 @@ def _bind_varlen_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ):
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         plan_varlen_attention_scratch,
     )
 
@@ -393,7 +393,7 @@ def test_contiguous_attention_matches_sglang_torch_ref(
     window_size: Tuple[int, int],
 ) -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_attention_plan,
     )
@@ -430,7 +430,7 @@ def test_contiguous_attention_matches_sglang_torch_ref(
 @torch.inference_mode()
 def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_attention_plan,
     )
@@ -484,7 +484,7 @@ def test_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sink
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -551,7 +551,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -618,7 +618,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_a
 @torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and_sinks() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_varlen_attention_plan,
     )
@@ -685,7 +685,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_multi_tile_swa_and
 @torch.inference_mode()
 def test_contiguous_attention_replays_under_cuda_graph_with_stable_workspace() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_attention_plan,
     )
@@ -756,11 +756,11 @@ def test_contiguous_typed_smem_boundary_rejects_and_replays_graph_oracle() -> No
     device = _require_contiguous_backend()
     import cutlass
 
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_attention_plan,
     )
-    from b12x.attention.contiguous.forward import ContiguousAttentionForwardKernel
+    from sparkinfer.attention.contiguous.forward import ContiguousAttentionForwardKernel
 
     tile_shape = (64, 48)
     accepted_head_dim = 304
@@ -872,7 +872,7 @@ def test_contiguous_typed_smem_boundary_rejects_and_replays_graph_oracle() -> No
 @torch.inference_mode()
 def test_varlen_contiguous_attention_replays_under_cuda_graph_with_live_metadata() -> None:
     device = _require_contiguous_backend()
-    from b12x.attention.contiguous import (
+    from sparkinfer.attention.contiguous import (
         clear_attention_caches,
         create_varlen_attention_plan,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the fused b12x mHC residual post_pre (Gram) kernel vs vLLM."""
+"""Benchmark the fused sparkinfer mHC residual post_pre (Gram) kernel vs vLLM."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from benchmarks.common import (
     make_l2_flush_fn,
     require_sm120,
 )
-from b12x.integration import (
-    B12XMHCScratchCaps,
-    b12x_mhc_post_pre,
+from sparkinfer.integration import (
+    SPARKINFERMHCScratchCaps,
+    sparkinfer_mhc_post_pre,
     plan_mhc_scratch,
 )
 
@@ -242,30 +242,30 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.no_prefill_tf32_mma:
-        os.environ["B12X_MHC_PREFILL_TF32_MMA"] = "0"
+        os.environ["SPARKINFER_MHC_PREFILL_TF32_MMA"] = "0"
     elif args.prefill_tf32_mma:
-        os.environ["B12X_MHC_PREFILL_TF32_MMA"] = "1"
+        os.environ["SPARKINFER_MHC_PREFILL_TF32_MMA"] = "1"
     if args.prefill_bf16_mma:
-        os.environ["B12X_MHC_PREFILL_BF16_MMA"] = "1"
+        os.environ["SPARKINFER_MHC_PREFILL_BF16_MMA"] = "1"
     if args.no_prefill_block_m:
-        os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "0"
+        os.environ["SPARKINFER_MHC_PREFILL_BLOCK_M"] = "0"
     elif args.prefill_block_m:
-        os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "1"
+        os.environ["SPARKINFER_MHC_PREFILL_BLOCK_M"] = "1"
     if args.prefill_block_m or not args.no_prefill_block_m:
-        os.environ["B12X_MHC_PREFILL_BLOCK_M_SIZE"] = str(args.prefill_block_m_size)
-        os.environ["B12X_MHC_PREFILL_TILE_N"] = str(args.prefill_tile_n)
+        os.environ["SPARKINFER_MHC_PREFILL_BLOCK_M_SIZE"] = str(args.prefill_block_m_size)
+        os.environ["SPARKINFER_MHC_PREFILL_TILE_N"] = str(args.prefill_tile_n)
     prefill_tf32_enabled = (
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_MMA",
-            os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1"),
+            "SPARKINFER_MHC_PREFILL_TF32_MMA",
+            os.environ.get("SPARKINFER_MHC_PREFILL_BF16_MMA", "1"),
         )
         != "0"
     )
     prefill_policy_m = args.expected_m or args.tokens
     prefill_tf32_min_tokens = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_MIN_TOKENS",
-            os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
+            "SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS",
+            os.environ.get("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
         )
     )
     prefill_tf32_selected = (
@@ -273,58 +273,58 @@ def main() -> None:
         and prefill_policy_m >= prefill_tf32_min_tokens
         and prefill_tf32_enabled
     )
-    prefill_bf16_enabled = os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
-    prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
+    prefill_bf16_enabled = os.environ.get("SPARKINFER_MHC_PREFILL_BF16_MMA", "1") != "0"
+    prefill_block_m_enabled = os.environ.get("SPARKINFER_MHC_PREFILL_BLOCK_M", "1") != "0"
     prefill_gram_threads = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_GRAM_THREADS",
-            os.environ.get("B12X_MHC_PREFILL_THREADS", "1024"),
+            "SPARKINFER_MHC_PREFILL_GRAM_THREADS",
+            os.environ.get("SPARKINFER_MHC_PREFILL_THREADS", "1024"),
         )
     )
     prefill_finalize_threads = int(
-        os.environ.get("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
+        os.environ.get("SPARKINFER_MHC_PREFILL_FINALIZE_THREADS", "256")
     )
     prefill_tf32_tma_m_warps = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_M_WARPS",
+            "SPARKINFER_MHC_PREFILL_TF32_TMA_M_WARPS",
             os.environ.get(
-                "B12X_MHC_PREFILL_TF32_TMA_WARPS",
-                os.environ.get("B12X_MHC_PREFILL_TMA_WARPS", "1"),
+                "SPARKINFER_MHC_PREFILL_TF32_TMA_WARPS",
+                os.environ.get("SPARKINFER_MHC_PREFILL_TMA_WARPS", "1"),
             ),
         )
     )
     prefill_tf32_tma_n_warps = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
+        os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
     )
     prefill_tf32_tma_m = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_M",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
+            "SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_M",
+            os.environ.get("SPARKINFER_MHC_PREFILL_TMA_TILE_M", "16"),
         )
     )
     prefill_tf32_tma_n = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
+        os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_N", "8")
     )
     prefill_tf32_tma_k = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_K", "256"),
+            "SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_K",
+            os.environ.get("SPARKINFER_MHC_PREFILL_TMA_TILE_K", "256"),
         )
     )
     prefill_tf32_tma_stages = int(
         os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_STAGES",
-            os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
+            "SPARKINFER_MHC_PREFILL_TF32_TMA_STAGES",
+            os.environ.get("SPARKINFER_MHC_PREFILL_TMA_STAGES", "1"),
         )
     )
     prefill_tf32_tma_chunk_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
+        os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
     )
     prefill_tf32_tma_chunk_geometry = (
         args.tokens >= prefill_tf32_tma_chunk_min_tokens
     )
     prefill_tf32_tma_long_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
+        os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
     )
     prefill_tf32_tma_long_geometry = (
         args.hidden_size == 4096
@@ -334,80 +334,80 @@ def main() -> None:
     if prefill_tf32_tma_chunk_geometry:
         if args.hidden_size == 4096:
             prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
+                os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
             )
             prefill_tf32_tma_n_warps = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
                 )
             )
             prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
+                os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
             )
             prefill_tf32_tma_n = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
                 )
             )
             prefill_tf32_tma_k_splits = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8"
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8"
                 )
             )
             prefill_tf32_tma_k = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
                 )
             )
             prefill_tf32_tma_stages = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_STAGES", "2"),
                 )
             )
         else:
             prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
+                os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
             )
             prefill_tf32_tma_n_warps = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
                 )
             )
             prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
+                os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
             )
             prefill_tf32_tma_n = int(
                 os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
+                    "SPARKINFER_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
                 )
             )
     if prefill_tf32_tma_long_geometry:
         prefill_tf32_tma_m_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
         )
         prefill_tf32_tma_n_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
         )
         prefill_tf32_tma_m = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
         )
         prefill_tf32_tma_n = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
         )
         prefill_tf32_tma_k = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
         )
         prefill_tf32_tma_stages = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
         )
         prefill_tf32_tma_k_splits = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
+            os.environ.get("SPARKINFER_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
         )
 
     device = require_sm120()
@@ -423,7 +423,7 @@ def main() -> None:
     fn_bf16 = fn.to(torch.bfloat16).contiguous() if args.prefill_bf16_mma else None
     scratch_tokens = max(args.tokens, args.expected_m or args.tokens)
     fused_plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device=device,
             max_tokens=scratch_tokens,
             hidden_size=args.hidden_size,
@@ -470,7 +470,7 @@ def main() -> None:
         )
 
     def run_fused() -> None:
-        b12x_mhc_post_pre(
+        sparkinfer_mhc_post_pre(
             x,
             residual,
             prev_post,
@@ -626,7 +626,7 @@ def main() -> None:
         line += (
             " vllm_deep_gemm=True"
             f" vllm_post_pre_us={vllm_median:.2f}/{vllm_min:.2f} "
-            f"b12x_vs_vllm={vllm_median / fused_median:.3f}x "
+            f"sparkinfer_vs_vllm={vllm_median / fused_median:.3f}x "
             f"vllm_y_max={vllm_y_max:.3g} vllm_y_rmse={vllm_y_rmse:.3g} "
             f"vllm_post_max={vllm_post_max:.3g} vllm_comb_max={vllm_comb_max:.3g} "
             f"vllm_out_max={vllm_out_max:.3g} vllm_out_rmse={vllm_out_rmse:.3g}"

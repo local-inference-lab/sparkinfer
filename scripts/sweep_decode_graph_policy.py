@@ -27,9 +27,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.paged.planner import PagedPlan, create_paged_plan
-from b12x.attention.paged.tuning.registry import normalize_kv_dtype_key
-from b12x.integration.attention import PagedAttentionWorkspace
+from sparkinfer.attention.paged.planner import PagedPlan, create_paged_plan
+from sparkinfer.attention.paged.tuning.registry import normalize_kv_dtype_key
+from sparkinfer.integration.attention import PagedAttentionWorkspace
 
 from benchmarks.benchmark_paged_attention import (
     _bench_graph,

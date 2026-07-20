@@ -8,12 +8,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_dma import PCIeDmaAllReduce
+from sparkinfer.distributed.pcie_dma import PCIeDmaAllReduce
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_DMA_TEST") != "1",
-    reason="set B12X_RUN_PCIE_DMA_TEST=1 to run PCIe ring allreduce GPU tests",
+    os.getenv("SPARKINFER_RUN_PCIE_DMA_TEST") != "1",
+    reason="set SPARKINFER_RUN_PCIE_DMA_TEST=1 to run PCIe ring allreduce GPU tests",
 )
 
 
@@ -48,7 +48,7 @@ def _assert_close(actual: torch.Tensor, ref: torch.Tensor, world_size: int) -> N
     # fp32 reference. E4M3 wire needs a wider band: per-128 amax scaling gives
     # ~6% relative error per quantization, and the FP8 ring requantizes partial
     # sums at each reduce-scatter hop.
-    if os.getenv("B12X_PCIE_DMA_FP8", "0") not in ("", "0"):
+    if os.getenv("SPARKINFER_PCIE_DMA_FP8", "0") not in ("", "0"):
         torch.testing.assert_close(
             actual.float(), ref, rtol=1.5e-1, atol=6e-2 * world_size
         )
@@ -109,7 +109,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_DMA_WORLD_SIZE", "2"))
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
@@ -118,7 +118,7 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
 
 
 def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
-    os.environ["B12X_PCIE_DMA_FP8"] = mode
+    os.environ["SPARKINFER_PCIE_DMA_FP8"] = mode
     _worker(rank, world_size, port)
 
 
@@ -126,7 +126,7 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
 def test_pcie_dma_all_reduce_fp8_wire(mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_DMA_WORLD_SIZE", "2"))
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

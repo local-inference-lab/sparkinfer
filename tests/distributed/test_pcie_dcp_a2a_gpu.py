@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_dcp_a2a import (
+from sparkinfer.distributed.pcie_dcp_a2a import (
     PCIeDCPA2APool,
     _load_extension,
     lse_reduce_scatter_reference,
@@ -16,8 +16,8 @@ from b12x.distributed.pcie_dcp_a2a import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
-    reason="set B12X_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
+    os.getenv("SPARKINFER_RUN_PCIE_DCP_A2A_TEST") != "1",
+    reason="set SPARKINFER_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
 TOTAL_HEADS = 32
@@ -301,7 +301,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 8):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
     if torch.cuda.device_count() < world_size:

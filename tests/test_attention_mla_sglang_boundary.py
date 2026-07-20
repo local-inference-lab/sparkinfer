@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from b12x.attention.mla.reference import (
+from sparkinfer.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
@@ -34,16 +34,16 @@ def _import_sglang_nsa_backend():
     return module
 
 
-def _get_b12x_forward_method(nsa_backend_module):
+def _get_sparkinfer_forward_method(nsa_backend_module):
     backend_cls = nsa_backend_module.NativeSparseAttnBackend
-    method = getattr(backend_cls, "_forward_b12x", None)
+    method = getattr(backend_cls, "_forward_sparkinfer", None)
     if method is None:
-        method = getattr(backend_cls, "_forward_b12x_mla")
+        method = getattr(backend_cls, "_forward_sparkinfer_mla")
     return method
 
 
-def _get_b12x_decode_kv_reshape_method(nsa_backend_module):
-    return nsa_backend_module.NativeSparseAttnBackend._reshape_b12x_decode_kv_rows
+def _get_sparkinfer_decode_kv_reshape_method(nsa_backend_module):
+    return nsa_backend_module.NativeSparseAttnBackend._reshape_sparkinfer_decode_kv_rows
 
 
 def _full_prefix_page_table(
@@ -87,9 +87,9 @@ def _make_fake_backend(
     backend_cls = nsa_backend_module.NativeSparseAttnBackend
 
     class _FakeBackend:
-        _gather_b12x_extend_kv_rows = backend_cls._gather_b12x_extend_kv_rows
-        _get_b12x_extend_row_ids = backend_cls._get_b12x_extend_row_ids
-        _reshape_b12x_decode_kv_rows = _get_b12x_decode_kv_reshape_method(
+        _gather_sparkinfer_extend_kv_rows = backend_cls._gather_sparkinfer_extend_kv_rows
+        _get_sparkinfer_extend_row_ids = backend_cls._get_sparkinfer_extend_row_ids
+        _reshape_sparkinfer_decode_kv_rows = _get_sparkinfer_decode_kv_reshape_method(
             nsa_backend_module
         )
 
@@ -104,8 +104,8 @@ def _make_fake_backend(
             self.qk_rope_head_dim = cfg.qk_rope_head_dim
             self.nsa_index_topk = topk
             self.real_page_size = 64
-            self.b12x_workspaces: dict[tuple[str, int, int], object] = {}
-            self.b12x_mla_workspaces = self.b12x_workspaces
+            self.sparkinfer_workspaces: dict[tuple[str, int, int], object] = {}
+            self.sparkinfer_mla_workspaces = self.sparkinfer_workspaces
             self.max_running_requests = 32
             self.server_args = type(
                 "_FakeServerArgs",
@@ -117,7 +117,7 @@ def _make_fake_backend(
                 },
             )()
 
-        def _b12x_extend_total_q_capacity(
+        def _sparkinfer_extend_total_q_capacity(
             self, forward_batch=None, required_q: int | None = None
         ):
             del forward_batch
@@ -125,7 +125,7 @@ def _make_fake_backend(
                 return max(int(required_q), 1)
             return int(self.server_args.max_prefill_tokens)
 
-        def _b12x_extend_batch_capacity(
+        def _sparkinfer_extend_batch_capacity(
             self, forward_batch=None, required_batch: int | None = None
         ):
             del forward_batch
@@ -133,7 +133,7 @@ def _make_fake_backend(
                 return max(int(required_batch), 1)
             return int(self.max_running_requests)
 
-        def _b12x_extend_kv_rows_capacity(
+        def _sparkinfer_extend_kv_rows_capacity(
             self, forward_batch=None, required_rows: int | None = None
         ):
             base = int(required_rows or 0)
@@ -143,7 +143,7 @@ def _make_fake_backend(
                 base = max(base, int(forward_batch.get_max_chunk_capacity()))
             return max(base, 1)
 
-        def _get_b12x_workspace(
+        def _get_sparkinfer_workspace(
             self,
             *,
             mode: str,
@@ -152,11 +152,11 @@ def _make_fake_backend(
             batch: int | None = None,
             max_kv_rows: int | None = None,
         ):
-            from b12x.attention.workspace import B12XAttentionWorkspace
+            from sparkinfer.attention.workspace import SPARKINFERAttentionWorkspace
 
             normalized_mode = "verify" if mode == "target_verify" else mode
             if normalized_mode not in ("decode", "extend", "verify", "draft_extend"):
-                raise AssertionError(f"unexpected b12x workspace mode: {mode}")
+                raise AssertionError(f"unexpected sparkinfer workspace mode: {mode}")
             total_q_cap = (
                 max(int(total_q), 1)
                 if total_q is not None
@@ -177,10 +177,10 @@ def _make_fake_backend(
                 else max(int(max_kv_rows or total_q_cap), 1)
             )
             key = (normalized_mode, int(v_head_dim), kv_rows_cap)
-            workspace = self.b12x_workspaces.get(key)
+            workspace = self.sparkinfer_workspaces.get(key)
             if workspace is not None:
                 return workspace
-            workspace = B12XAttentionWorkspace.for_fixed_capacity(
+            workspace = SPARKINFERAttentionWorkspace.for_fixed_capacity(
                 mode=normalized_mode,
                 device=self.device,
                 dtype=self.q_dtype,
@@ -200,13 +200,13 @@ def _make_fake_backend(
                 page_size=self.real_page_size,
                 use_cuda_graph=True,
             )
-            self.b12x_workspaces[key] = workspace
+            self.sparkinfer_workspaces[key] = workspace
             return workspace
 
     return _FakeBackend()
 
 
-def test_sglang_b12x_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
+def test_sglang_sparkinfer_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
     nsa_backend_module = _import_sglang_nsa_backend()
     cfg = SimpleNamespace(num_heads=8, kv_lora_rank=512, qk_rope_head_dim=64)
     backend = _make_fake_backend(
@@ -221,17 +221,17 @@ def test_sglang_b12x_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
         out_cache_loc=torch.tensor([2, 6, 9], dtype=torch.int32),
         get_max_chunk_capacity=lambda: 12,
     )
-    workspace = backend._get_b12x_workspace(
+    workspace = backend._get_sparkinfer_workspace(
         mode="extend",
         total_q=1,
         batch=1,
         v_head_dim=cfg.kv_lora_rank,
-        max_kv_rows=backend._b12x_extend_kv_rows_capacity(
+        max_kv_rows=backend._sparkinfer_extend_kv_rows_capacity(
             forward_batch, required_rows=3
         ),
     )
 
-    gathered = backend._gather_b12x_extend_kv_rows(
+    gathered = backend._gather_sparkinfer_extend_kv_rows(
         kv_cache=kv_cache,
         forward_batch=forward_batch,
         metadata=SimpleNamespace(seq_lens_sum=3, page_table_1_flattened=None),
@@ -246,7 +246,7 @@ def test_sglang_b12x_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
 
     first_ptr = gathered.data_ptr()
     forward_batch.out_cache_loc = torch.tensor([1, 4], dtype=torch.int32)
-    gathered_again = backend._gather_b12x_extend_kv_rows(
+    gathered_again = backend._gather_sparkinfer_extend_kv_rows(
         kv_cache=kv_cache,
         forward_batch=forward_batch,
         metadata=SimpleNamespace(seq_lens_sum=2, page_table_1_flattened=None),
@@ -259,7 +259,7 @@ def test_sglang_b12x_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
     )
 
 
-def _forward_b12x_mla(
+def _forward_sparkinfer_mla(
     nsa_backend_module,
     backend,
     *,
@@ -271,9 +271,9 @@ def _forward_b12x_mla(
     v_head_dim: int,
     mode: str,
 ) -> torch.Tensor:
-    forward_b12x = _get_b12x_forward_method(nsa_backend_module)
-    workspace = backend._get_b12x_workspace(mode=mode, v_head_dim=v_head_dim)
-    return forward_b12x(
+    forward_sparkinfer = _get_sparkinfer_forward_method(nsa_backend_module)
+    workspace = backend._get_sparkinfer_workspace(mode=mode, v_head_dim=v_head_dim)
+    return forward_sparkinfer(
         backend,
         q_all=q_all,
         kv_cache=kv_cache,
@@ -364,7 +364,7 @@ def _make_extend_metadata(
     )
 
 
-def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
+def test_sglang_sparkinfer_mla_decode_boundary_matches_dense_oracle() -> None:
     device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
@@ -390,7 +390,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
         cfg, device=device, topk=topk, nsa_backend_module=nsa_backend_module
     )
 
-    actual = _forward_b12x_mla(
+    actual = _forward_sparkinfer_mla(
         nsa_backend_module,
         backend,
         q_all=q_all,
@@ -417,7 +417,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads() -> (
+def test_sglang_sparkinfer_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads() -> (
     None
 ):
     device = require_sm12x()
@@ -451,7 +451,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
         num_q_heads=local_heads,
     )
 
-    actual = _forward_b12x_mla(
+    actual = _forward_sparkinfer_mla(
         nsa_backend_module,
         backend,
         q_all=q_local,
@@ -478,7 +478,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> (
+def test_sglang_sparkinfer_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> (
     None
 ):
     device = require_sm12x()
@@ -513,7 +513,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
     )
     backend.kv_cache_dtype = torch.float8_e4m3fn
 
-    actual = _forward_b12x_mla(
+    actual = _forward_sparkinfer_mla(
         nsa_backend_module,
         backend,
         q_all=q_local,
@@ -540,7 +540,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-def test_sglang_b12x_mla_extend_boundary_matches_dense_oracle() -> None:
+def test_sglang_sparkinfer_mla_extend_boundary_matches_dense_oracle() -> None:
     device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
@@ -572,7 +572,7 @@ def test_sglang_b12x_mla_extend_boundary_matches_dense_oracle() -> None:
         cfg, device=device, topk=topk, nsa_backend_module=nsa_backend_module
     )
 
-    actual = _forward_b12x_mla(
+    actual = _forward_sparkinfer_mla(
         nsa_backend_module,
         backend,
         q_all=q_all,

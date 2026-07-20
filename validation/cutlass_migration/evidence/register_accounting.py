@@ -43,8 +43,8 @@ _ANNOTATION_FIELDS = (
     "evidence",
     "performance_status",
 )
-_ANNOTATION_TEMPLATE_SCHEMA = "b12x.cute.kernel_register_annotation_template.v2"
-_COMMON_PTXAS_DELTA_SCHEMA = "b12x.cute.common_ptxas_positive_delta.v2"
+_ANNOTATION_TEMPLATE_SCHEMA = "sparkinfer.cute.kernel_register_annotation_template.v2"
+_COMMON_PTXAS_DELTA_SCHEMA = "sparkinfer.cute.common_ptxas_positive_delta.v2"
 _DEFAULT_ANNOTATION = {
     "cause": "unresolved",
     "disposition": "pending-review",
@@ -99,9 +99,9 @@ _COMMON_PTXAS_REQUIRED_FIELDS = (
     "common_any_local_memory_increase",
     "common_any_static_shared_memory_increase",
 )
-_DELTA_REPORT_SCHEMA = "b12x.cute.kernel_resource_delta.v4"
-_RESOURCE_REPORT_SCHEMA = "b12x.cute.kernel_resources.v4"
-_ACCOUNTING_SCHEMA = "b12x.cute.kernel_register_accounting.v5"
+_DELTA_REPORT_SCHEMA = "sparkinfer.cute.kernel_resource_delta.v4"
+_RESOURCE_REPORT_SCHEMA = "sparkinfer.cute.kernel_resources.v4"
+_ACCOUNTING_SCHEMA = "sparkinfer.cute.kernel_register_accounting.v5"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DELTA_REPORT_FIELDS = (
     *(

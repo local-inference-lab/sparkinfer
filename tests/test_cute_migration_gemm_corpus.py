@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
-from b12x.gemm.dense import (
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer.gemm.dense import (
     dense_gemm,
     dense_gemm_fused_quant_a,
     dense_gemm_fused_quant_a_grouped,
 )
-from b12x.gemm.mxfp8_quant_cute import quantize_mxfp8_rows_cute
-from b12x.gemm.wo_projection import (
+from sparkinfer.gemm.mxfp8_quant_cute import quantize_mxfp8_rows_cute
+from sparkinfer.gemm.wo_projection import (
     dequantize_mxfp8_rows_torch,
     empty_mxfp8_rows_for_dense_gemm,
     quantize_mxfp8_rows_torch,

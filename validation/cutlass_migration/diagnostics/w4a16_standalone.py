@@ -4,7 +4,7 @@
 This intentionally exercises the legacy standalone GEMM and activation
 classes directly.  The fused MoE path embeds GEMM objects but does not emit
 the standalone ``W4A16GemmKernel`` or ``W4A16ActivationKernel`` symbols.
-Point ``B12X_CUTE_COMPILE_CACHE_DIR`` at a fresh directory when using this
+Point ``SPARKINFER_CUTE_COMPILE_CACHE_DIR`` at a fresh directory when using this
 probe to populate a resource-audit corpus.
 """
 
@@ -22,18 +22,18 @@ from validation.cutlass_migration.core.gpu_scope import (
     add_target_gpu_argument,
     require_target_gpu,
 )
-from b12x.cute.intrinsics import swizzle_block_scale
-from b12x.cute.utils import current_cuda_stream
-from b12x.moe.fused.w4a16.host import (
+from sparkinfer.cute.intrinsics import swizzle_block_scale
+from sparkinfer.cute.utils import current_cuda_stream
+from sparkinfer.moe.fused.w4a16.host import (
     packed_gemm_scratch_elements,
     unswizzle_expert_scales,
 )
-from b12x.moe.fused.w4a16.kernel import (
+from sparkinfer.moe.fused.w4a16.kernel import (
     compile_w4a16_activation,
     compile_w4a16_gemm,
     pack_topk_routes_by_expert,
 )
-from b12x.moe.fused.w4a16.prepare import (
+from sparkinfer.moe.fused.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights,
 )
 

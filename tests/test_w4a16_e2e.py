@@ -3,24 +3,24 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.intrinsics import (
+from sparkinfer.cute.intrinsics import (
     FLOAT4_E2M1_MAX,
     fp4_quantize_values_torch,
     pack_grouped_fp4_values,
     swizzle_block_scale,
 )
-from b12x.integration.tp_moe import (
-    plan_b12x_fp4_moe_weights,
-    prepare_b12x_fp4_moe_weights,
+from sparkinfer.integration.tp_moe import (
+    plan_sparkinfer_fp4_moe_weights,
+    prepare_sparkinfer_fp4_moe_weights,
 )
-from b12x.moe.execution import PreparedWeightLayout
-from b12x.moe.fused.reference import (
+from sparkinfer.moe.execution import PreparedWeightLayout
+from sparkinfer.moe.fused.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,
 )
-from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
-from b12x.moe.fused.w4a16.kernel import (
+from sparkinfer.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
+from sparkinfer.moe.fused.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     MoEMicroKernelW4A16SmallMDirect,
     _small_m_direct_supported,
@@ -28,7 +28,7 @@ from b12x.moe.fused.w4a16.kernel import (
     compile_w4a16_topk_sum,
     run_w4a16_moe,
 )
-from b12x.moe.fused.w4a16.prepare import (
+from sparkinfer.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
     prepare_w4a16_e8m0_native_weights,
     prepare_w4a16_modelopt_native_weights,
@@ -887,7 +887,7 @@ def test_w4a16_tc_decode_fused_sum_matches_oracle(
     Validate the epilogue across the whole small-M range, not just powers of
     two, since 3/5/6/7 were never exercised through it before. TC-decode is
     unconditional for packed small-M, so no toggle is needed."""
-    import b12x.moe.fused.w4a16.kernel as w4a16_kernel
+    import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
 
     # Spy on the fused compile so we can assert the fused-sum path actually engaged
     # (a silent fallback to the packed GEMM would also pass the cosine gate).
@@ -1140,7 +1140,7 @@ def test_w4a16_activation_amax_calibration_tracks_routed_inputs_and_fc2_inputs(
         return compile_w4a16_fused_moe(**kwargs)
 
     monkeypatch.setattr(
-        "b12x.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
+        "sparkinfer.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
         spy_compile_w4a16_fused_moe,
     )
 
@@ -1271,7 +1271,7 @@ def test_w4a16_activation_amax_forces_main_kernel_over_native_small_m_direct(
         return compile_w4a16_fused_moe(**kwargs)
 
     monkeypatch.setattr(
-        "b12x.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
+        "sparkinfer.moe.fused.w4a16.kernel.compile_w4a16_fused_moe",
         spy_compile_w4a16_fused_moe,
     )
 
@@ -1558,7 +1558,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         weights
     )
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation=activation,
@@ -1568,7 +1568,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         intermediate_size=intermediate_size,
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,

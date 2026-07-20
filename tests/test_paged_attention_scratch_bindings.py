@@ -5,20 +5,20 @@ import math
 import pytest
 import torch
 
-import b12x.attention.paged.api as paged_api
-import b12x.integration.paged_attention_scratch as scratch_api
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.paged_attention_scratch import (
-    B12XPagedAttentionBinding,
-    B12XPagedAttentionScratchCaps,
+import sparkinfer.attention.paged.api as paged_api
+import sparkinfer.integration.paged_attention_scratch as scratch_api
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.integration.paged_attention_scratch import (
+    SPARKINFERPagedAttentionBinding,
+    SPARKINFERPagedAttentionScratchCaps,
     plan_paged_attention_scratch,
 )
 
 from .helpers import require_sm12x
 
 
-def _caps() -> B12XPagedAttentionScratchCaps:
-    return B12XPagedAttentionScratchCaps(
+def _caps() -> SPARKINFERPagedAttentionScratchCaps:
+    return SPARKINFERPagedAttentionScratchCaps(
         device="cpu",
         mode="decode",
         dtype=torch.bfloat16,
@@ -186,7 +186,7 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
         self._plan = object()
         return self
 
-    monkeypatch.setattr(scratch_api.B12XPagedAttentionScratch, "prepare", fake_prepare)
+    monkeypatch.setattr(scratch_api.SPARKINFERPagedAttentionScratch, "prepare", fake_prepare)
 
     binding = plan.bind(
         scratch=scratch,
@@ -201,8 +201,8 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
         active_total_q=2,
     )
 
-    assert isinstance(binding, B12XPagedAttentionBinding)
-    assert isinstance(binding.scratch, scratch_api.B12XPagedAttentionScratch)
+    assert isinstance(binding, SPARKINFERPagedAttentionBinding)
+    assert isinstance(binding.scratch, scratch_api.SPARKINFERPagedAttentionScratch)
     assert binding.q is q
     assert binding.output is output
     assert calls["page_table"] is page_table
@@ -215,7 +215,7 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
 def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch) -> None:
     scratch = object()
     q, k_cache, v_cache, output, *_ = _runtime_tensors()
-    binding = B12XPagedAttentionBinding(
+    binding = SPARKINFERPagedAttentionBinding(
         scratch=scratch,
         q=q,
         k_cache=k_cache,
@@ -237,7 +237,7 @@ def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch)
 def test_paged_attention_forward_rejects_binding_plus_runtime_tensors() -> None:
     scratch = object()
     q, k_cache, v_cache, output, *_ = _runtime_tensors()
-    binding = B12XPagedAttentionBinding(
+    binding = SPARKINFERPagedAttentionBinding(
         scratch=scratch,
         q=q,
         k_cache=k_cache,
@@ -292,7 +292,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
     max_batch = len(q_seqlens)
     max_partial_rows = max_batch * 64 if mode == "decode" else 0
     plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode=mode,
             dtype=q.dtype,
@@ -383,7 +383,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
     max_partial_rows = max_batch * 64 if mode == "decode" else 0
     max_work_items = 516 if mode == "extend" else 256
     plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode=mode,
             dtype=q.dtype,
@@ -446,7 +446,7 @@ def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
     paged_api.clear_paged_caches()
 
     plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device="cuda",
             mode="extend",
             dtype=torch.bfloat16,
@@ -540,7 +540,7 @@ def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata
         dtype=torch.float32,
     )
     plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -698,7 +698,7 @@ def _run_mimo_v25_fp8_decode_graph_case(
     v_descale = torch.ones((batch, 1), device=q.device, dtype=torch.float32)
 
     plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -805,7 +805,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
         del kernel, compile_args, runtime_args
         captured_specs.append(compile_spec)
 
-    monkeypatch.setattr(paged_api, "b12x_launch", capture_launch)
+    monkeypatch.setattr(paged_api, "sparkinfer_launch", capture_launch)
 
     def bind_no_split_decode(batch: int) -> None:
         q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
@@ -819,7 +819,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
             )
         )
         plan = plan_paged_attention_scratch(
-            B12XPagedAttentionScratchCaps(
+            SPARKINFERPagedAttentionScratchCaps(
                 device=q.device,
                 mode="decode",
                 dtype=q.dtype,
@@ -885,7 +885,7 @@ def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
         raise AssertionError("non-split decode should not update chunk metadata")
 
     monkeypatch.setattr(
-        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        "sparkinfer.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
         fail_regular_metadata_update,
     )
     cache_seqlens = [129, 193, 257, 385, 449, 513, 577]
@@ -918,7 +918,7 @@ def test_mimo_v25_fp8_decode_graph_pads_large_power2_page_table_width(
         )
 
     monkeypatch.setattr(
-        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        "sparkinfer.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
         fail_regular_metadata_update,
     )
     _run_mimo_v25_fp8_decode_graph_case(

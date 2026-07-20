@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from b12x.moe.fused.reference import (
+from sparkinfer.moe.fused.reference import (
     compare_to_reference,
     moe_reference_nvfp4,
     moe_reference_w4a8_mx,
@@ -252,7 +252,7 @@ def _prepare_and_bind(
     quant_mode: str,
     source_format: str,
 ) -> _BoundCase:
-    from b12x.integration import TPMoEScratchCaps, plan_tp_moe_scratch
+    from sparkinfer.integration import TPMoEScratchCaps, plan_tp_moe_scratch
 
     experts = prepare_tp_moe_fp4_experts(
         a=inputs.a,
@@ -342,7 +342,7 @@ def _run_live_graph_check(
     min_cos: float,
     max_normalized_rmse: float,
 ) -> None:
-    from b12x.integration import b12x_moe_fp4
+    from sparkinfer.integration import sparkinfer_moe_fp4
 
     binding = case.binding
     output = binding.output
@@ -350,7 +350,7 @@ def _run_live_graph_check(
 
     # Eager warmup resolves and compiles the production specialization before
     # capture.  No workspace or output allocation occurs inside the graph.
-    b12x_moe_fp4(binding=binding)
+    sparkinfer_moe_fp4(binding=binding)
     torch.cuda.synchronize()
     _assert_oracle(
         output,
@@ -365,7 +365,7 @@ def _run_live_graph_check(
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
     _assert_oracle(
@@ -404,10 +404,10 @@ def _run_live_graph_check(
 
 
 def _reset_dispatch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
-    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
-    monkeypatch.delenv("B12X_W4A8_TINY_DECODE", raising=False)
-    from b12x.integration.tp_moe import clear_tp_moe_caches
+    monkeypatch.delenv("SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("SPARKINFER_W4A8_TINY_DECODE", raising=False)
+    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
 
     clear_tp_moe_caches()
 

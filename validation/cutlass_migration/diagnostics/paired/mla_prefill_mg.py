@@ -43,10 +43,10 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     time_conditions,
 )
 from validation.cutlass_migration.paths import DATA_ROOT, REPO_ROOT
-import b12x.attention.mla.prefill_mg as prefill_mg
-import b12x.cute.compiler as cute_compiler
-from b12x.attention.mla.kernel import run_unified_prefill
-from b12x.attention.mla.traits import ScaleFormat
+import sparkinfer.attention.mla.prefill_mg as prefill_mg
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.attention.mla.kernel import run_unified_prefill
+from sparkinfer.attention.mla.traits import ScaleFormat
 from tests.test_attention_mla_unified_corpus import (
     _ALLOCATOR_COUNTERS,
     _GLM_V_DIM,
@@ -69,7 +69,7 @@ from tests.test_attention_mla_unified_corpus import (
 )
 
 
-_MG_GATE_ENV = "B12X_MLA_SM120_PREFILL_MG"
+_MG_GATE_ENV = "SPARKINFER_MLA_SM120_PREFILL_MG"
 _DEFAULT_ROWS = (1, 2, 8, 32, 128, 512, 2048)
 
 
@@ -360,7 +360,7 @@ def _manifest_for_spec(
         except (OSError, json.JSONDecodeError):
             continue
         if (
-            manifest.get("schema") == "b12x.cute.compile_manifest.v3"
+            manifest.get("schema") == "sparkinfer.cute.compile_manifest.v3"
             and manifest.get("compile_spec_hash") == spec_hash
             and manifest.get("object_sha256")
         ):
@@ -447,15 +447,15 @@ def _load_exact(
     if object_sha256 != manifest["object_sha256"]:
         raise RuntimeError(f"object digest mismatch: {object_path}")
 
-    previous_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    previous_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(cache_key)
     finally:
         if previous_cache is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous_cache
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous_cache
     if compiled is None:
         raise RuntimeError(f"failed to load exact cached object {object_path}")
     return compiled, {
@@ -1200,7 +1200,7 @@ def main() -> None:
     active_label: list[str | None] = [None]
     dispatch_counts = {label: 0 for label in labels}
     observed_specs: set[str] = set()
-    original_launch = prefill_mg.b12x_launch
+    original_launch = prefill_mg.sparkinfer_launch
     previous_gate = os.environ.get(_MG_GATE_ENV)
     os.environ[_MG_GATE_ENV] = "1"
 
@@ -1224,7 +1224,7 @@ def main() -> None:
         dispatch_counts[label] += 1
         return cute_compiler.run_compiled(compiled[label], runtime_args)
 
-    prefill_mg.b12x_launch = exact_dispatch
+    prefill_mg.sparkinfer_launch = exact_dispatch
     row_results: list[dict[str, object]] = []
     integrity_by_rows: dict[str, dict[str, dict[str, object]]] = {}
     try:
@@ -1268,7 +1268,7 @@ def main() -> None:
             row_results.append(row_result)
             active_label[0] = None
     finally:
-        prefill_mg.b12x_launch = original_launch
+        prefill_mg.sparkinfer_launch = original_launch
         active_label[0] = None
         if previous_gate is None:
             os.environ.pop(_MG_GATE_ENV, None)
@@ -1284,7 +1284,7 @@ def main() -> None:
         raise RuntimeError("artifact integrity changed during benchmark")
     gpu_mode_final = gpu_mode_snapshot(args.expected_physical_gpu)
     result: dict[str, object] = {
-        "schema": "b12x.attention.mla.prefill_mg.exact_cache_abba.v4",
+        "schema": "sparkinfer.attention.mla.prefill_mg.exact_cache_abba.v4",
         "evidence_status": args.evidence_status,
         "command": [sys.executable, *sys.argv],
         "case": {
@@ -1349,12 +1349,12 @@ def main() -> None:
             "source_sha256": {
                 "benchmark": _sha256_file(Path(__file__).resolve()),
                 "prefill_dispatch": _sha256_file(
-                    REPO_ROOT / "b12x/attention/mla/prefill.py"
+                    REPO_ROOT / "sparkinfer/attention/mla/prefill.py"
                 ),
                 "prefill_mg": _sha256_file(
-                    REPO_ROOT / "b12x/attention/mla/prefill_mg.py"
+                    REPO_ROOT / "sparkinfer/attention/mla/prefill_mg.py"
                 ),
-                "compiler": _sha256_file(REPO_ROOT / "b12x/cute/compiler.py"),
+                "compiler": _sha256_file(REPO_ROOT / "sparkinfer/cute/compiler.py"),
                 "corpus_helpers": _sha256_file(
                     REPO_ROOT / "tests/test_attention_mla_unified_corpus.py"
                 ),

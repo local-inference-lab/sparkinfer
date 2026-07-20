@@ -63,7 +63,7 @@ back toward the shared GLM/NSA indexer structure without regressing GLM.
 - Dense C4 logits remain a decode-only path; long prefill uses tiled/supertile
   logits with fixed workspace capacity.
 - The current long-prefill supertile cap is selected by the fixed workspace
-  contract, not live sequence length. SGLang caps this below the current b12x
+  contract, not live sequence length. SGLang caps this below the current sparkinfer
   paged-scorer schedule threshold, so a 4096-row prefill chunk plans a
   65024-token C4 supertile while still consuming the live full page table at
   runtime.

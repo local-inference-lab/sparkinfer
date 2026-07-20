@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import b12x.attention.contiguous.api as contig
-from b12x.attention.contiguous import (
+import sparkinfer.attention.contiguous.api as contig
+from sparkinfer.attention.contiguous import (
     AttentionBinding,
     VarlenAttentionBinding,
     plan_attention_scratch,
@@ -172,7 +172,7 @@ def test_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
     sink = torch.empty((4,), dtype=torch.float32)
     binding = plan.bind(scratch=scratch, q=q, k=k, v=v, attention_sink_bias=sink)
 
-    out, lse = contig.b12x_attention_forward(binding=binding)
+    out, lse = contig.sparkinfer_attention_forward(binding=binding)
 
     assert out is binding.output
     assert lse is binding.lse
@@ -198,7 +198,7 @@ def test_attention_binding_owns_runtime_tensors(monkeypatch) -> None:
     binding = plan.bind(scratch=scratch, q=q, k=k, v=v, attention_sink_bias=sink)
 
     with pytest.raises(ValueError, match="binding owns runtime tensors"):
-        contig.b12x_attention_forward(q, k, v, binding=binding)
+        contig.sparkinfer_attention_forward(q, k, v, binding=binding)
 
 
 def test_varlen_attention_scratch_plan_binds_live_tensors(monkeypatch) -> None:
@@ -276,7 +276,7 @@ def test_varlen_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
         attention_sink_bias=sink,
     )
 
-    out, lse = contig.b12x_varlen_attention_forward(binding=binding)
+    out, lse = contig.sparkinfer_varlen_attention_forward(binding=binding)
 
     assert out is binding.output
     assert lse is binding.lse

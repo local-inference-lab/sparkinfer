@@ -238,7 +238,7 @@ def test_render_case_line_reports_flashinfer_race_and_correctness() -> None:
             rmse=0.002,
             cos=0.9998,
         ),
-        b12x_vs_flashinfer_sanity=benchmark_mla.SanityMetrics(
+        sparkinfer_vs_flashinfer_sanity=benchmark_mla.SanityMetrics(
             max_abs=0.02,
             rmse=0.002,
             cos=0.9998,
@@ -248,9 +248,9 @@ def test_render_case_line_reports_flashinfer_race_and_correctness() -> None:
     line = benchmark_mla._render_case_line(report)
 
     assert "fi_mla=  250.00 us" in line
-    assert "b12x/fi=0.800x" in line
+    assert "sparkinfer/fi=0.800x" in line
     assert "fi_cos=0.9998000" in line
-    assert "b12x_fi_cos=0.9998000" in line
+    assert "sparkinfer_fi_cos=0.9998000" in line
 
 
 def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
@@ -336,7 +336,7 @@ def test_render_summary_lines_reports_flashinfer_ratio_direction() -> None:
     lines = benchmark_mla._render_summary_lines([report])
 
     assert "  flashinfer:  250.00 us" in lines
-    assert "  b12x/fi:     0.800x (<1 means b12x faster)" in lines
+    assert "  sparkinfer/fi:     0.800x (<1 means sparkinfer faster)" in lines
 
 
 def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:

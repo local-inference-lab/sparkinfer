@@ -6,14 +6,14 @@ import math
 import pytest
 import torch
 
-import b12x.attention.mla.compressed_api as compressed_api_impl
-import b12x.attention.mla.merge as mla_split_impl
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.workspace import (
-    B12XAttentionArena,
-    B12XAttentionArenaCaps,
+import sparkinfer.attention.mla.compressed_api as compressed_api_impl
+import sparkinfer.attention.mla.merge as mla_split_impl
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer.attention.workspace import (
+    SPARKINFERAttentionArena,
+    SPARKINFERAttentionArenaCaps,
 )
-from b12x.attention.mla.compressed_reference import (
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -23,21 +23,21 @@ from b12x.attention.mla.compressed_reference import (
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from b12x.attention.mla.compressed_api import (
+from sparkinfer.attention.mla.compressed_api import (
     _should_use_sm121_single_pass_decode,
 )
-from b12x.attention.mla.kernel import _dsv4_h16_auto
-from b12x.attention.mla.compressed_config import (
+from sparkinfer.attention.mla.kernel import _dsv4_h16_auto
+from sparkinfer.attention.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
-from b12x.integration.mla import (
-    B12XCompressedMLAScratchCaps,
+from sparkinfer.integration.mla import (
+    SPARKINFERCompressedMLAScratchCaps,
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
     plan_compressed_mla_scratch,
 )
-from b12x.cute.compiler import clear_compile_cache, compile_cache_info
+from sparkinfer.cute.compiler import clear_compile_cache, compile_cache_info
 
 from .helpers import require_sm12x
 
@@ -223,7 +223,7 @@ def _make_compressed_binding(
     max_page_table_width: int | None = None,
 ):
     plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+        SPARKINFERCompressedMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
@@ -376,14 +376,14 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
         paged_indexer_logits_k_rows=4160 * 64,
         paged_indexer_tile_logits_k_rows=32768,
     )
-    capped = B12XAttentionArena.required_nbytes(
-        B12XAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
+    capped = SPARKINFERAttentionArena.required_nbytes(
+        SPARKINFERAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
     )
-    layout = B12XAttentionArena._layout(
-        B12XAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
+    layout = SPARKINFERAttentionArena._layout(
+        SPARKINFERAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
     )
-    legacy_ragged = B12XAttentionArena.required_nbytes(
-        B12XAttentionArenaCaps(
+    legacy_ragged = SPARKINFERAttentionArena.required_nbytes(
+        SPARKINFERAttentionArenaCaps(
             **{
                 **base_caps,
                 "extend_max_kv_rows": compressed_prefill_q * max(selected_widths),

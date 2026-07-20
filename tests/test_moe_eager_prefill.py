@@ -12,10 +12,10 @@ from benchmarks.benchmark_moe import (
     load_expert_weights,
     make_routed_inputs,
 )
-from b12x.integration.tp_moe import (
+from sparkinfer.integration.tp_moe import (
     clear_tp_moe_caches,
 )
-from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
+from sparkinfer.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
 from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 

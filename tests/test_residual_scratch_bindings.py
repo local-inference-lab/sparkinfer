@@ -3,18 +3,18 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.integration.residual as residual_impl
-from b12x.integration import (
-    B12XMHCBinding,
-    B12XMHCScratchCaps,
+import sparkinfer.integration.residual as residual_impl
+from sparkinfer.integration import (
+    SPARKINFERMHCBinding,
+    SPARKINFERMHCScratchCaps,
     plan_mhc_scratch,
 )
-from b12x.integration.residual import MHC_DEFAULT_BLOCK_K, MHC_DEFAULT_SPLIT_K
+from sparkinfer.integration.residual import MHC_DEFAULT_BLOCK_K, MHC_DEFAULT_SPLIT_K
 
 
 def test_mhc_scratch_plan_exposes_one_component_scratch_spec() -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -36,7 +36,7 @@ def test_mhc_scratch_plan_exposes_one_component_scratch_spec() -> None:
 
 def test_mhc_scratch_plan_binds_caller_owned_scratch(monkeypatch) -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -48,7 +48,7 @@ def test_mhc_scratch_plan_binds_caller_owned_scratch(monkeypatch) -> None:
 
     binding = plan.bind(scratch=scratch)
 
-    assert isinstance(binding, B12XMHCBinding)
+    assert isinstance(binding, SPARKINFERMHCBinding)
     assert not hasattr(binding, "workspace")
     assert binding.partials.shape == (4, 8, residual_impl.MHC_PARTIALS)
     assert binding.y is None
@@ -61,7 +61,7 @@ def test_mhc_scratch_plan_binds_caller_owned_scratch(monkeypatch) -> None:
 
 def test_mhc_scratch_plan_binds_live_token_shape() -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -93,7 +93,7 @@ def test_mhc_scratch_plan_binds_live_token_shape() -> None:
 
 def test_mhc_plan_binding_maps_caller_owned_outputs() -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -109,7 +109,7 @@ def test_mhc_plan_binding_maps_caller_owned_outputs() -> None:
 
     binding = plan.bind(scratch=scratch, y=y, post=post, comb=comb, out=out)
 
-    assert isinstance(binding, B12XMHCBinding)
+    assert isinstance(binding, SPARKINFERMHCBinding)
     assert not hasattr(binding, "workspace")
     assert binding.partials.data_ptr() == scratch.data_ptr()
     assert binding.y is y
@@ -119,8 +119,8 @@ def test_mhc_plan_binding_maps_caller_owned_outputs() -> None:
 
 
 def test_mhc_prefill_bf16_project_policy_defaults_to_large_expected_m(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MMA", raising=False)
-    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_BF16_MMA", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", raising=False)
     norm_weight = torch.empty((16,), dtype=torch.bfloat16)
     fn_bf16 = torch.empty((24, 64), dtype=torch.bfloat16)
 
@@ -150,15 +150,15 @@ def test_mhc_prefill_bf16_project_policy_can_be_overridden(monkeypatch) -> None:
     norm_weight = torch.empty((16,), dtype=torch.bfloat16)
     fn_bf16 = torch.empty((24, 64), dtype=torch.bfloat16)
 
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "0")
     assert not residual_impl._use_mhc_prefill_bf16_project(
         norm_weight=norm_weight,
         policy_m=4096,
         fn_bf16=fn_bf16,
     )
 
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "256")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "1")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "256")
     assert residual_impl._use_mhc_prefill_bf16_project(
         norm_weight=norm_weight,
         policy_m=256,
@@ -167,10 +167,10 @@ def test_mhc_prefill_bf16_project_policy_can_be_overridden(monkeypatch) -> None:
 
 
 def test_mhc_prefill_tf32_project_policy_defaults_to_bf16_regime(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
-    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MMA", raising=False)
-    monkeypatch.delenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_BF16_MMA", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", raising=False)
     norm_weight = torch.empty((16,), dtype=torch.bfloat16)
 
     assert not residual_impl._use_mhc_prefill_tf32_project(
@@ -190,34 +190,34 @@ def test_mhc_prefill_tf32_project_policy_defaults_to_bf16_regime(monkeypatch) ->
 def test_mhc_prefill_tf32_project_policy_can_be_overridden(monkeypatch) -> None:
     norm_weight = torch.empty((16,), dtype=torch.bfloat16)
 
-    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_TF32_MMA", "0")
     assert not residual_impl._use_mhc_prefill_tf32_project(
         norm_weight=norm_weight,
         policy_m=4096,
     )
 
-    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "0")
     assert not residual_impl._use_mhc_prefill_tf32_project(
         norm_weight=norm_weight,
         policy_m=4096,
     )
 
-    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "1")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_TF32_MMA", "1")
     assert residual_impl._use_mhc_prefill_tf32_project(
         norm_weight=norm_weight,
         policy_m=4096,
     )
 
-    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_MMA", raising=False)
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "256")
+    monkeypatch.delenv("SPARKINFER_MHC_PREFILL_TF32_MMA", raising=False)
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "1")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MIN_TOKENS", "256")
     assert residual_impl._use_mhc_prefill_tf32_project(
         norm_weight=norm_weight,
         policy_m=256,
     )
 
-    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MIN_TOKENS", "512")
+    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_TF32_MIN_TOKENS", "512")
     assert not residual_impl._use_mhc_prefill_tf32_project(
         norm_weight=norm_weight,
         policy_m=384,
@@ -230,7 +230,7 @@ def test_mhc_prefill_tf32_project_policy_can_be_overridden(monkeypatch) -> None:
 
 def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -260,7 +260,7 @@ def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
 
     monkeypatch.setattr(residual_impl, "_validate_pre_inputs", fake_validate_pre_inputs)
 
-    residual_out, post, comb, y = residual_impl.b12x_mhc_pre(
+    residual_out, post, comb, y = residual_impl.sparkinfer_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -283,7 +283,7 @@ def test_mhc_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
 
 def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -320,7 +320,7 @@ def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
         fake_validate_post_pre_inputs,
     )
 
-    residual_cur, post, comb, y = residual_impl.b12x_mhc_post_pre(
+    residual_cur, post, comb, y = residual_impl.sparkinfer_mhc_post_pre(
         x,
         residual,
         prev_post,
@@ -346,7 +346,7 @@ def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
 
 def test_mhc_pre_binding_owns_outputs() -> None:
     plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
+        SPARKINFERMHCScratchCaps(
             device="cpu",
             max_tokens=4,
             hidden_size=16,
@@ -359,7 +359,7 @@ def test_mhc_pre_binding_owns_outputs() -> None:
     y_out = torch.empty((0, 16), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="binding owns scratch and output buffers"):
-        residual_impl.b12x_mhc_pre(
+        residual_impl.sparkinfer_mhc_pre(
             torch.empty((0, 16), dtype=torch.bfloat16),
             torch.empty((24, 16), dtype=torch.float32),
             torch.empty((3,), dtype=torch.float32),

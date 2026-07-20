@@ -10,7 +10,7 @@ All kernels implement the same logical graph:
 
 The public `quant_mode` names historically bundled numeric semantics, source
 storage, prepared storage, scheduling, and graph partitioning.  `MoESpec` and
-`MoEExecutionPlan` in `b12x.moe.execution` name those choices independently.
+`MoEExecutionPlan` in `sparkinfer.moe.execution` name those choices independently.
 
 ## Independent axes
 
@@ -169,9 +169,9 @@ public path has one direction:
 plan weights -> prepare one expert owner -> plan scratch -> bind -> run
 ```
 
-`plan_b12x_fp4_moe_weights` chooses the representation and storage policy.
-`prepare_b12x_fp4_moe_weights` executes that decision once and returns the sole
-`B12XFP4ExpertWeights` owner. Scratch and launch planning derive source format,
+`plan_sparkinfer_fp4_moe_weights` chooses the representation and storage policy.
+`prepare_sparkinfer_fp4_moe_weights` executes that decision once and returns the sole
+`SPARKINFERFP4ExpertWeights` owner. Scratch and launch planning derive source format,
 activation, dtype, geometry, and W13 order from that owner's plan. Binding takes
 the owner—not raw weight tensors—and execution takes only the completed binding.
 
@@ -185,7 +185,7 @@ the owner—not raw weight tensors—and execution takes only the completed bind
 
 There is no runtime raw-weight overload, prepared-payload override, old cache-key
 fallback, or source-plus-repack serving state. Internal representation payloads
-are not exported from `b12x.integration`.
+are not exported from `sparkinfer.integration`.
 
 ## End state
 

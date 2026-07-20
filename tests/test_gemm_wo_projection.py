@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.gemm.wo_projection import (
+from sparkinfer.gemm.wo_projection import (
     FP8_E4M3_MAX,
     MXFP8Rows,
     WO_A_INPUT_QUANT_GROUP_SIZE,
@@ -899,7 +899,7 @@ def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
 def _wo_b_fused_vs_unfused(
     tokens: int, rank: int, groups: int, hidden: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from b12x.gemm.wo_projection import wo_b_dense_gemm_fused_quant_mxfp8
+    from sparkinfer.gemm.wo_projection import wo_b_dense_gemm_fused_quant_mxfp8
 
     tmp = empty_dense_gemm_mnl_view(
         tokens, rank, groups, device="cuda", dtype=torch.bfloat16
@@ -949,7 +949,7 @@ def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
 def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
     require_sm12x()
     torch.manual_seed(31010)
-    from b12x.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
+    from sparkinfer.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
 
     for tokens, groups, group_width, rank in (
         (1, 2, 256, 128),
@@ -983,7 +983,7 @@ def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
 def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
     require_sm12x()
     torch.manual_seed(31011)
-    from b12x.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
+    from sparkinfer.gemm.wo_projection import wo_a_dense_gemm_fused_quant_mxfp8
 
     tokens, groups, heads_per_group = 3, 2, 4
     head_dim, nope_dim, rope_dim = 128, 96, 32
@@ -1143,7 +1143,7 @@ def test_wo_quant_cute_paths_match_triton_bit_exact(quant_path: str) -> None:
             atol=0,
         )
 
-    from b12x.gemm.wo_quant_cute import (
+    from sparkinfer.gemm.wo_quant_cute import (
         quantize_wo_group_major_rows_cute,
         quantize_wo_grouped_rows_cute,
     )

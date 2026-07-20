@@ -1,11 +1,11 @@
-"""Head-to-head: b12x dense MXFP8 GEMM vs DeepGEMM SM120 fp8_gemm_nt (1d1d).
+"""Head-to-head: sparkinfer dense MXFP8 GEMM vs DeepGEMM SM120 fp8_gemm_nt (1d1d).
 
 Graph-replay timed, correctness-gated (each vs its own fp32 oracle). Both run
-their native FP8 block-scaled path (b12x: per-32 ue8m0; DeepGEMM: per_token/
+their native FP8 block-scaled path (sparkinfer: per-32 ue8m0; DeepGEMM: per_token/
 per_block gran_k=128 ue8m0). We time only the GEMM (operands pre-quantized
 outside the captured region).
 
-Run with the assigned GPU and an environment that provides b12x and DeepGEMM:
+Run with the assigned GPU and an environment that provides sparkinfer and DeepGEMM:
   python benchmarks/benchmark_dense_fp8_vs_deepgemm.py
 
 GPU serialization, when enabled, is managed outside this command. Do not wrap
@@ -31,7 +31,7 @@ from benchmarks.benchmark_dense_gemm import (
     make_mxfp8_operand,
 )
 from benchmarks.common import make_l2_flush_fn
-from b12x.gemm.dense import dense_gemm
+from sparkinfer.gemm.dense import dense_gemm
 
 
 def cos(a, b):
@@ -57,7 +57,7 @@ def deepgemm_setup(M, N, K):
     return launch, d, oracle
 
 
-def b12x_setup(M, N, K):
+def sparkinfer_setup(M, N, K):
     a_q, a_s, a_mma, a_src = make_mxfp8_operand(M, K)
     b_q, b_s, b_mma, b_src = make_mxfp8_operand(N, K)
     out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
@@ -78,7 +78,7 @@ def b12x_setup(M, N, K):
 def run(M, N, K, l2, warmup, iters):
     print(f"\n(M={M}, N={N}, K={K})")
     row = {"M": M}
-    for name, setup in (("deepgemm", deepgemm_setup), ("b12x", b12x_setup)):
+    for name, setup in (("deepgemm", deepgemm_setup), ("sparkinfer", sparkinfer_setup)):
         try:
             launch, out, oracle = setup(M, N, K)
             replay = capture_graph_replay(launch)
@@ -93,9 +93,9 @@ def run(M, N, K, l2, warmup, iters):
         except Exception as exc:
             row[name] = None
             print(f"  {name:9s} FAILED: {exc}")
-    if row.get("b12x") and row.get("deepgemm"):
-        r = row["b12x"] / row["deepgemm"]
-        print(f"  -> b12x/deepgemm = {r:.2f}x  ({'b12x slower' if r > 1 else 'b12x faster'})")
+    if row.get("sparkinfer") and row.get("deepgemm"):
+        r = row["sparkinfer"] / row["deepgemm"]
+        print(f"  -> sparkinfer/deepgemm = {r:.2f}x  ({'sparkinfer slower' if r > 1 else 'sparkinfer faster'})")
     return row
 
 
@@ -130,17 +130,17 @@ def main():
         ratios = []
         for M in Ms:
             r = run(M, N, K, l2, warmup, iters)
-            if r.get("b12x") and r.get("deepgemm"):
-                ratios.append((M, r["b12x"], r["deepgemm"], r["b12x"] / r["deepgemm"]))
+            if r.get("sparkinfer") and r.get("deepgemm"):
+                ratios.append((M, r["sparkinfer"], r["deepgemm"], r["sparkinfer"] / r["deepgemm"]))
         by_cfg[(label, N, K)] = ratios
 
-    print("\n==== summary: DeepSeek-V4-Flash q/k/v projections, TP=2 (b12x/dg; >1 = b12x slower) ====")
+    print("\n==== summary: DeepSeek-V4-Flash q/k/v projections, TP=2 (sparkinfer/dg; >1 = sparkinfer slower) ====")
     all_r = []
     for (label, N, K), ratios in by_cfg.items():
         print(f"\n  {label}  N={N} K={K}")
         for M, b, d, r in ratios:
             all_r.append(r)
-            print(f"    M={M:5d}: b12x={b:8.1f}us  dg={d:8.1f}us  {r:.2f}x  ({'b12x slower' if r > 1.02 else 'b12x faster' if r < 0.98 else 'tie'})")
+            print(f"    M={M:5d}: sparkinfer={b:8.1f}us  dg={d:8.1f}us  {r:.2f}x  ({'sparkinfer slower' if r > 1.02 else 'sparkinfer faster' if r < 0.98 else 'tie'})")
         if ratios:
             print(f"    -> {label} geomean = {statistics.geometric_mean([x[3] for x in ratios]):.2f}x")
     if all_r:

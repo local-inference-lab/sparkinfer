@@ -10,8 +10,8 @@ from __future__ import annotations
 import cutlass
 import pytest
 
-import b12x.gemm.dense as dense_module
-from b12x.gemm.dense import (
+import sparkinfer.gemm.dense as dense_module
+from sparkinfer.gemm.dense import (
     _DenseGemmFusedQuantALaunch,
     _DenseGemmLaunch,
     _DenseGemmPolicy,
@@ -133,9 +133,9 @@ def test_dense_compile_key_separates_replicated_sfb_reuse():
 
 
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
-    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", False)
+    monkeypatch.setattr(dense_module, "_SPARKINFER_DENSE_ATOM_24", False)
     atom_42 = _bk64_launch()
-    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", True)
+    monkeypatch.setattr(dense_module, "_SPARKINFER_DENSE_ATOM_24", True)
     atom_24 = _bk64_launch()
 
     assert _compile_key_differences(atom_42, atom_24) == [(False, True)]
@@ -245,7 +245,7 @@ def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
 
 
 def test_grouped_wo_a_prefill_keeps_bm64_bk128():
-    # The DeepGEMM schedule loses on b12x's grouped WO-A kernel at every probed
+    # The DeepGEMM schedule loses on sparkinfer's grouped WO-A kernel at every probed
     # prefill size, so keep the established narrow-N schedule.
     n, k = 1024, 512
     for em in (2048, 4096, 8192):

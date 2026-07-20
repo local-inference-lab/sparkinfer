@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.paged.planner import (
+from sparkinfer.attention.paged.planner import (
     PagedPlanBudget,
     build_decode_chunk_pages_lut,
     create_paged_plan,
@@ -11,8 +11,8 @@ from b12x.attention.paged.planner import (
     infer_paged_mode,
     resolve_decode_graph_ctas_per_sm,
 )
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     plan_paged_attention_scratch,
 )
 
@@ -126,7 +126,7 @@ def test_paged_scratch_shapes_follow_plan_metadata() -> None:
         cu_seqlens_q,
     )
     scratch_plan = plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
+        SPARKINFERPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,

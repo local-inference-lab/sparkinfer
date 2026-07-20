@@ -34,8 +34,8 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     topology_signature,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.cute.compiler as cute_compiler
-from b12x.integration import residual_kernels
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.integration import residual_kernels
 
 
 _PARTIALS = 25
@@ -111,7 +111,7 @@ def _manifest_for_spec(
     for path in cache.rglob("*.json"):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if (
-            manifest.get("schema") == "b12x.cute.compile_manifest.v3"
+            manifest.get("schema") == "sparkinfer.cute.compile_manifest.v3"
             and manifest.get("compile_spec_hash") == spec_hash
             and manifest.get("object_sha256")
         ):
@@ -128,15 +128,15 @@ def _load_exact(cache: pathlib.Path, spec_hash: str) -> tuple[object, dict]:
     object_path = manifest_path.with_suffix(".o")
     if _file_sha256(object_path) != manifest["object_sha256"]:
         raise RuntimeError(f"object digest mismatch: {object_path}")
-    prior = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    prior = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(manifest["cache_key"])
     finally:
         if prior is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = prior
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = prior
     if compiled is None:
         raise RuntimeError(f"failed to load exact object {object_path}")
     return compiled, {
@@ -675,7 +675,7 @@ def main() -> None:
     gpu_mode_final = gpu_mode_snapshot(args.expected_physical_gpu)
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     result = {
-        "schema": "b12x.residual_prefill_partial.cache_abba.v4",
+        "schema": "sparkinfer.residual_prefill_partial.cache_abba.v4",
         "evidence_status": args.evidence_status,
         "provenance": {
             "command": [str(pathlib.Path(sys.executable).resolve()), *sys.argv],
@@ -685,9 +685,9 @@ def main() -> None:
             "source_sha256": {
                 "benchmark": _file_sha256(pathlib.Path(__file__).resolve()),
                 "residual_kernels": _file_sha256(
-                    root / "b12x/integration/residual_kernels.py"
+                    root / "sparkinfer/integration/residual_kernels.py"
                 ),
-                "compiler": _file_sha256(root / "b12x/cute/compiler.py"),
+                "compiler": _file_sha256(root / "sparkinfer/cute/compiler.py"),
             },
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,

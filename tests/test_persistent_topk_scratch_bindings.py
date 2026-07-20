@@ -3,17 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.attention.indexer.persistent_topk as persistent_topk_impl
-from b12x.attention.indexer import (
-    B12XPersistentTopK2048Binding,
-    B12XPersistentTopK2048ScratchCaps,
+import sparkinfer.attention.indexer.persistent_topk as persistent_topk_impl
+from sparkinfer.attention.indexer import (
+    SPARKINFERPersistentTopK2048Binding,
+    SPARKINFERPersistentTopK2048ScratchCaps,
     plan_persistent_topk2048_scratch,
 )
 
 
 def _plan():
     return plan_persistent_topk2048_scratch(
-        B12XPersistentTopK2048ScratchCaps(
+        SPARKINFERPersistentTopK2048ScratchCaps(
             device="cpu",
             max_rows=4,
             max_stride=16,
@@ -42,7 +42,7 @@ def test_persistent_topk2048_scratch_plan_binds_caller_owned_arena() -> None:
 
     binding = plan.bind(scratch=scratch, logits=logits, lengths=lengths)
 
-    assert isinstance(binding, B12XPersistentTopK2048Binding)
+    assert isinstance(binding, SPARKINFERPersistentTopK2048Binding)
     assert binding.logits is logits
     assert binding.lengths is lengths
     assert not hasattr(binding, "workspace")

@@ -259,12 +259,12 @@ def test_cache_views_can_share_a_larger_strided_pool() -> None:
         byte_offset=576,
     )
 
-    assert views.b12x.shape == (4, page_nbytes)
-    assert views.b12x.stride() == (4096, 1)
-    assert views.b12x.storage_offset() == 576
+    assert views.sparkinfer.shape == (4, page_nbytes)
+    assert views.sparkinfer.stride() == (4096, 1)
+    assert views.sparkinfer.storage_offset() == 576
     assert views.flashinfer.shape == (4, page_size, 584)
     assert views.flashinfer.stride() == (4096, 584, 1)
-    assert torch.equal(views.b12x[:2], packed)
+    assert torch.equal(views.sparkinfer[:2], packed)
 
 
 def test_trace_layer_weights_cover_all_target_layers() -> None:

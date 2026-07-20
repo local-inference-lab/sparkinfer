@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.cute.intrinsics import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
-from b12x.integration import tp_moe
-from b12x.integration.tp_moe import clear_tp_moe_caches
-from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
+from sparkinfer.cute.intrinsics import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
+from sparkinfer.integration import tp_moe
+from sparkinfer.integration.tp_moe import clear_tp_moe_caches
+from sparkinfer.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
 from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 
@@ -387,10 +387,10 @@ def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
         torch.cuda.synchronize(device)
         return output
 
-    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "16x128")
-    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_TILE_MN", "16x128")
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
     atomic = run()
-    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     deterministic = run()
     repeat = run()
 

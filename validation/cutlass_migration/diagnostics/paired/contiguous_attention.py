@@ -36,8 +36,8 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.utils import current_cuda_stream, make_ptr
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.utils import current_cuda_stream, make_ptr
 
 
 def _args() -> argparse.Namespace:
@@ -106,17 +106,17 @@ def _manifest_for_spec(
 
 def _load_exact(cache: pathlib.Path, spec_hash: str) -> tuple[object, dict[str, Any]]:
     provenance = artifact_provenance(cache, spec_hash)
-    previous = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    previous = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
     try:
         compiled = cute_compiler._load_cute_compile_from_disk(
             str(provenance["cache_key"])
         )
     finally:
         if previous is None:
-            os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+            os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
         else:
-            os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous
+            os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous
     if compiled is None:
         raise RuntimeError(f"failed to load exact object {provenance['object_path']}")
     return compiled, provenance
@@ -735,7 +735,7 @@ def main() -> None:
         "scenario_1_live_mutation": correctness_scenario_1,
     }
     result = {
-        "schema": "b12x.contiguous_attention.cache_abba.v2",
+        "schema": "sparkinfer.contiguous_attention.cache_abba.v2",
         "evidence_status": args.evidence_status,
         "provenance": {
             "command": [str(pathlib.Path(sys.executable).resolve()), *sys.argv],
@@ -744,10 +744,10 @@ def main() -> None:
             "git_status_short": _git_output(root, "status", "--short").splitlines(),
             "source_sha256": {
                 "benchmark": _file_sha256(pathlib.Path(__file__).resolve()),
-                "api": _file_sha256(root / "b12x/attention/contiguous/api.py"),
-                "forward": _file_sha256(root / "b12x/attention/contiguous/forward.py"),
-                "mask": _file_sha256(root / "b12x/attention/contiguous/mask.py"),
-                "compiler": _file_sha256(root / "b12x/cute/compiler.py"),
+                "api": _file_sha256(root / "sparkinfer/attention/contiguous/api.py"),
+                "forward": _file_sha256(root / "sparkinfer/attention/contiguous/forward.py"),
+                "mask": _file_sha256(root / "sparkinfer/attention/contiguous/mask.py"),
+                "compiler": _file_sha256(root / "sparkinfer/cute/compiler.py"),
             },
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,

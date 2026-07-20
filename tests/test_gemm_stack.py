@@ -7,16 +7,16 @@ import pytest
 import torch
 import cutlass
 
-import b12x.gemm.dense as dense_module
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
-from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
-from b12x.gemm.dense import (
+import sparkinfer.gemm.dense as dense_module
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
+from sparkinfer.cute.utils import convert_sf_from_mma_layout, get_num_sm
+from sparkinfer.gemm.dense import (
     DenseGemmKernel,
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
     dense_gemm,
 )
-from b12x.gemm.wo_projection import (
+from sparkinfer.gemm.wo_projection import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
     quantize_mxfp8_rows_torch,

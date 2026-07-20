@@ -103,17 +103,17 @@ def _make_layer_chain_bindings(
 
 
 def _run_layer_chain_bindings(bindings) -> list[torch.Tensor]:
-    from b12x.integration import b12x_moe_fp4
+    from sparkinfer.integration import sparkinfer_moe_fp4
 
-    return [b12x_moe_fp4(binding=binding) for binding in bindings]
+    return [sparkinfer_moe_fp4(binding=binding) for binding in bindings]
 
 
 @pytest.mark.parametrize("m", [1, 2, 4, 8])
 def test_moe_nonzero(m):
-    """Validate `b12x_moe_fp4` produces non-zero output with real weights."""
+    """Validate `sparkinfer_moe_fp4` produces non-zero output with real weights."""
     _skip_if_unavailable()
 
-    from b12x.integration import clear_tp_moe_caches
+    from sparkinfer.integration import clear_tp_moe_caches
 
     clear_tp_moe_caches()
 
@@ -153,7 +153,7 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     """Validate graph replay stays correct when routing contents change."""
     _skip_if_unavailable()
 
-    from b12x.integration import b12x_moe_fp4, clear_tp_moe_caches
+    from sparkinfer.integration import sparkinfer_moe_fp4, clear_tp_moe_caches
 
     clear_tp_moe_caches()
 
@@ -187,12 +187,12 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     )
 
     # Compile once before capture; the replay check below is about routing safety.
-    b12x_moe_fp4(binding=graph_binding)
+    sparkinfer_moe_fp4(binding=graph_binding)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        b12x_moe_fp4(binding=graph_binding)
+        sparkinfer_moe_fp4(binding=graph_binding)
 
     for seed in (123, 456):
         x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
@@ -226,7 +226,7 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     """Validate a captured multi-layer graph stays correct under routing churn."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import clear_tp_moe_caches
+    from sparkinfer.integration.tp_moe import clear_tp_moe_caches
 
     clear_tp_moe_caches()
 

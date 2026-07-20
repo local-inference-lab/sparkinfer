@@ -37,13 +37,13 @@ from validation.cutlass_migration.core.gpu_scope import (
     add_target_gpu_argument as add_target_gpu_argument,
     require_target_gpu as require_target_gpu,
 )
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 
 
-SINGLE_ARM_E2E_RUN_SCHEMA = "b12x.cute.migration.end_to_end_process_result.v4"
-_ABBA_EVENT_POOL_SCHEMA = "b12x.cuda_event_pool.v1"
-_ABBA_MODE_STABILITY_SCHEMA = "b12x.gpu_mode_stability.v1"
-GPU_TIMING_MODE_POLICY_SCHEMA = "b12x.gpu_timing_mode_policy.v1"
+SINGLE_ARM_E2E_RUN_SCHEMA = "sparkinfer.cute.migration.end_to_end_process_result.v4"
+_ABBA_EVENT_POOL_SCHEMA = "sparkinfer.cuda_event_pool.v1"
+_ABBA_MODE_STABILITY_SCHEMA = "sparkinfer.gpu_mode_stability.v1"
+GPU_TIMING_MODE_POLICY_SCHEMA = "sparkinfer.gpu_timing_mode_policy.v1"
 _PERMITTED_REQUIRED_ACTIVE_THROTTLE_REASONS = frozenset((0, 0x4))
 _CUTLASS_PACKAGE_NAMES = (
     "nvidia-cutlass-dsl",
@@ -53,7 +53,7 @@ _CUTLASS_PACKAGE_NAMES = (
     "nvidia-cutlass-dsl-libs-cu13",
 )
 _RUNTIME_ENVIRONMENT_PREFIXES = (
-    "B12X_",
+    "SPARKINFER_",
     "CUTE_",
     "CUTLASS_",
     "CUDA_",
@@ -80,7 +80,7 @@ _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS = (
     "NVIDIA_TF32_OVERRIDE",
 )
 _RUNTIME_ENVIRONMENT_OPERATIONAL_PATH_EXCEPTIONS = (
-    "B12X_CUTE_COMPILE_CACHE_DIR",
+    "SPARKINFER_CUTE_COMPILE_CACHE_DIR",
     "CUTE_DSL_CACHE_DIR",
     "CUTE_DSL_LIBS",
 )
@@ -158,7 +158,7 @@ def manifest_for_spec(
         except (OSError, json.JSONDecodeError):
             continue
         if (
-            manifest.get("schema") == "b12x.cute.compile_manifest.v3"
+            manifest.get("schema") == "sparkinfer.cute.compile_manifest.v3"
             and manifest.get("compile_spec_hash") == spec_hash
             and manifest.get("object_sha256")
         ):
@@ -237,21 +237,21 @@ def load_exact(
     # CUTLASS' ExternalBinaryModule may finalize/patch the ELF object while
     # loading it. Release evidence must remain immutable, so load a verified
     # staging copy and keep the manifest-bound source object untouched.
-    with tempfile.TemporaryDirectory(prefix="b12x-exact-cache-load-") as raw_stage:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-exact-cache-load-") as raw_stage:
         stage_cache = Path(raw_stage)
         stage_shard = stage_cache / key[:2]
         stage_shard.mkdir(parents=True)
         shutil.copy2(object_path, stage_shard / f"{key}.o")
         shutil.copy2(manifest_path, stage_shard / f"{key}.json")
-        previous = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-        os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(stage_cache)
+        previous = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+        os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(stage_cache)
         try:
             compiled = cute_compiler._load_cute_compile_from_disk(key)
         finally:
             if previous is None:
-                os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+                os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
             else:
-                os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous
+                os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous
     if compiled is None:
         raise RuntimeError(f"failed to load exact cached object {object_path}")
     verify_artifact(provenance)
@@ -301,9 +301,9 @@ def pin_module_launches(
     compiled_by_spec: Mapping[str, object],
     observed_specs: list[str],
 ) -> Iterator[None]:
-    """Replace one module-local ``b12x_launch`` with exact-object execution."""
+    """Replace one module-local ``sparkinfer_launch`` with exact-object execution."""
 
-    original = module.b12x_launch
+    original = module.sparkinfer_launch
 
     def pinned_launch(
         _kernel,
@@ -323,11 +323,11 @@ def pin_module_launches(
             )
         cute_compiler.run_compiled(compiled, runtime_args)
 
-    module.b12x_launch = pinned_launch
+    module.sparkinfer_launch = pinned_launch
     try:
         yield
     finally:
-        module.b12x_launch = original
+        module.sparkinfer_launch = original
 
 
 def graph_topology(graph: torch.cuda.CUDAGraph) -> dict[str, object]:
@@ -1366,7 +1366,7 @@ def _single_arm_runtime_environment() -> tuple[str, str]:
         for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
     }
     raw_payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "sparkinfer-runtime-environment-v1",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -1431,7 +1431,7 @@ def source_ptxas_version(provenance: Mapping[str, Any]) -> str:
             f"exact-object frontend PTX sidecar is unavailable: {sidecar_path}: {exc}"
         ) from exc
     if (
-        sidecar.get("schema") != "b12x.cute.frontend_ptx.v3"
+        sidecar.get("schema") != "sparkinfer.cute.frontend_ptx.v3"
         or sidecar.get("cache_key") != provenance["cache_key"]
         or sidecar.get("compile_spec_hash") != provenance["compile_spec_hash"]
         or sidecar.get("package_fingerprint") != provenance["package_fingerprint"]
@@ -2060,15 +2060,15 @@ def build_single_arm_e2e_result(
         repo_root
     ):
         raise RuntimeError("single-arm worktree differs from frozen source runtime")
-    runtime_package = source_runtime.get("b12x_package")
+    runtime_package = source_runtime.get("sparkinfer_package")
     production = source.get("production")
     if not isinstance(runtime_package, dict) or not isinstance(production, dict):
         raise RuntimeError("single-arm source manifest lacks package trees")
-    production_package = production.get("b12x_package")
+    production_package = production.get("sparkinfer_package")
     if not isinstance(production_package, dict):
         raise RuntimeError("single-arm source manifest lacks production package")
     runtime_fingerprint = str(runtime_package.get("fingerprint", ""))
-    observed_source_fingerprint = cute_compiler._b12x_package_fingerprint()
+    observed_source_fingerprint = cute_compiler._sparkinfer_package_fingerprint()
     if not runtime_fingerprint or observed_source_fingerprint != runtime_fingerprint:
         raise RuntimeError("single-arm runtime differs from frozen source manifest")
 

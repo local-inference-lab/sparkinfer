@@ -5,9 +5,9 @@ import math
 import pytest
 import torch
 
-from b12x.attention.paged.reference import paged_attention_reference
-from b12x.integration.attention import (
-    B12XPagedAttentionScratchCaps,
+from sparkinfer.attention.paged.reference import paged_attention_reference
+from sparkinfer.integration.attention import (
+    SPARKINFERPagedAttentionScratchCaps,
     clear_attention_caches,
     create_paged_plan,
     paged_attention_forward,
@@ -79,7 +79,7 @@ class _PagedGraphScratchHarness:
                 1,
             )
             self._scratch_plan = plan_paged_attention_scratch(
-                B12XPagedAttentionScratchCaps(
+                SPARKINFERPagedAttentionScratchCaps(
                     device=self.q.device,
                     mode=self.mode,
                     dtype=self.q.dtype,

@@ -120,7 +120,7 @@ def main() -> None:
     parser.add_argument("--input-json", action="append", default=[])
     parser.add_argument(
         "--output-root",
-        default=str(pathlib.Path(__file__).resolve().parents[1] / "b12x" / "moe" / "tuning"),
+        default=str(pathlib.Path(__file__).resolve().parents[1] / "sparkinfer" / "moe" / "tuning"),
     )
     parser.add_argument("--output-name", default="decode.max_active_clusters.py")
     parser.add_argument("--regime", default="decode")

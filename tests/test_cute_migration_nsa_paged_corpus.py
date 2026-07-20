@@ -17,31 +17,31 @@ from typing import Any
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.indexer import (
+from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from sparkinfer.attention.indexer import (
     build_paged_mqa_schedule_metadata,
     clear_indexer_caches,
 )
-from b12x.attention.indexer.fused_indexer import (
+from sparkinfer.attention.indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     fused_indexer_scratch_capacity,
     run_fused_paged_indexer,
 )
-from b12x.attention.indexer.kernel import (
+from sparkinfer.attention.indexer.kernel import (
     _split_index_k_cache_runtime_views,
     build_indexer_paged_logits_kernel_binding,
     build_indexer_paged_supertile_logits_kernel_binding,
     build_indexer_paged_tiled_logits_kernel_binding,
 )
-from b12x.attention.indexer.persistent_topk import (
+from sparkinfer.attention.indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from b12x.attention.indexer.reference import (
+from sparkinfer.attention.indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.cute.compiler import compile_cache_info
+from sparkinfer.cute.compiler import compile_cache_info
 
 
 pytestmark = pytest.mark.skipif(
@@ -463,7 +463,7 @@ def test_nsa_paged_scheduled_multi_graph_live_gpu_oracle() -> None:
 
 def test_nsa_paged_stream_graph_live_gpu_oracle(monkeypatch) -> None:
     """Streamed supertile scorer without the tiled-top-k selector helper."""
-    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1")
+    monkeypatch.setenv("SPARKINFER_INDEXER_STREAM_SCORER", "1")
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(83_401)
     rows, heads, max_pages, cache_pages = 2, 64, 8, 96

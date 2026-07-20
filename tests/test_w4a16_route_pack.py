@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from b12x.moe.fused.w4a16.kernel import pack_topk_routes_by_expert
+from sparkinfer.moe.fused.w4a16.kernel import pack_topk_routes_by_expert
 
 
 def _expected_route_pack(

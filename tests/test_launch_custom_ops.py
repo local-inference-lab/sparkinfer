@@ -5,10 +5,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 def test_mhc_decode_split_n_environment_override(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.setenv("B12X_MHC_DECODE_SPLITS", "4")
-    monkeypatch.setenv("B12X_MHC_DECODE_TILE_N", "3")
+    monkeypatch.setenv("SPARKINFER_MHC_DECODE_SPLITS", "4")
+    monkeypatch.setenv("SPARKINFER_MHC_DECODE_TILE_N", "3")
     assert residual_kernels._selected_post_pre_decode_split_n(
         num_tokens=16,
         hidden_size=4096,
@@ -17,10 +17,10 @@ def test_mhc_decode_split_n_environment_override(monkeypatch) -> None:
 
 
 def test_mhc_sm121_decode_split_n_policy(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.delenv("B12X_MHC_DECODE_SPLITS", raising=False)
-    monkeypatch.delenv("B12X_MHC_DECODE_TILE_N", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_DECODE_SPLITS", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_DECODE_TILE_N", raising=False)
     select = residual_kernels._selected_post_pre_decode_split_n
 
     assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == (0, 0)
@@ -31,9 +31,9 @@ def test_mhc_sm121_decode_split_n_policy(monkeypatch) -> None:
 
 
 def test_mhc_decode_finalize_threads_environment_override(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.setenv("B12X_MHC_DECODE_FINALIZE_THREADS", "128")
+    monkeypatch.setenv("SPARKINFER_MHC_DECODE_FINALIZE_THREADS", "128")
     assert (
         residual_kernels._selected_mhc_decode_finalize_threads(
             num_tokens=16,
@@ -45,9 +45,9 @@ def test_mhc_decode_finalize_threads_environment_override(monkeypatch) -> None:
 
 
 def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.delenv("B12X_MHC_DECODE_FINALIZE_THREADS", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_DECODE_FINALIZE_THREADS", raising=False)
     select = residual_kernels._selected_mhc_decode_finalize_threads
 
     assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == 0
@@ -58,9 +58,9 @@ def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
 
 
 def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PARTIALS_PER_CTA", raising=False)
     select = residual_kernels._selected_post_pre_partials_per_cta
 
     assert select(num_tokens=2, hidden_size=4096, compute_capability=(12, 1)) == 4
@@ -70,9 +70,9 @@ def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:
 
 
 def test_mhc_decode_partial_group_policy_preserves_sm120(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+    monkeypatch.delenv("SPARKINFER_MHC_PARTIALS_PER_CTA", raising=False)
     select = residual_kernels._selected_post_pre_partials_per_cta
 
     assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == 4
@@ -80,9 +80,9 @@ def test_mhc_decode_partial_group_policy_preserves_sm120(monkeypatch) -> None:
 
 
 def test_mhc_decode_partial_group_environment_override(monkeypatch) -> None:
-    from b12x.integration import residual_kernels
+    from sparkinfer.integration import residual_kernels
 
-    monkeypatch.setenv("B12X_MHC_PARTIALS_PER_CTA", "7")
+    monkeypatch.setenv("SPARKINFER_MHC_PARTIALS_PER_CTA", "7")
     assert (
         residual_kernels._selected_post_pre_partials_per_cta(
             num_tokens=16,
@@ -94,7 +94,7 @@ def test_mhc_decode_partial_group_environment_override(monkeypatch) -> None:
 
 
 def test_dense_gemm_launch_has_fake_dispatch() -> None:
-    __import__("b12x.gemm.dense")
+    __import__("sparkinfer.gemm.dense")
 
     with FakeTensorMode():
         a = torch.empty((2, 32, 1), dtype=torch.float8_e4m3fn)
@@ -104,7 +104,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
         c = torch.empty((2, 4, 1), dtype=torch.bfloat16)
         alpha = torch.empty((1,), dtype=torch.float32)
 
-        torch.ops.b12x.dense_gemm_launch(
+        torch.ops.sparkinfer.dense_gemm_launch(
             a,
             b,
             sfa,
@@ -138,7 +138,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             None,
         )
-        torch.ops.b12x.dense_gemm_launch(
+        torch.ops.sparkinfer.dense_gemm_launch(
             a,
             b,
             sfa,
@@ -175,7 +175,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
 
 
 def test_mhc_launch_ops_have_fake_dispatch() -> None:
-    __import__("b12x.integration.residual_kernels")
+    __import__("sparkinfer.integration.residual_kernels")
 
     with FakeTensorMode():
         residual = torch.empty((2, 4096), dtype=torch.bfloat16)
@@ -192,8 +192,8 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
         comb = torch.empty((2, 24), dtype=torch.float32)
         norm_weight = torch.empty((4096,), dtype=torch.float32)
 
-        torch.ops.b12x.mhc_pre_partial_launch(residual, fn, partials, True)
-        torch.ops.b12x.mhc_post_pre_partial_launch(
+        torch.ops.sparkinfer.mhc_pre_partial_launch(residual, fn, partials, True)
+        torch.ops.sparkinfer.mhc_post_pre_partial_launch(
             x,
             residual,
             prev_post,
@@ -203,7 +203,7 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             out,
             True,
         )
-        torch.ops.b12x.mhc_finalize_gram_launch(
+        torch.ops.sparkinfer.mhc_finalize_gram_launch(
             residual,
             partials,
             scale,
@@ -224,7 +224,7 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
 
 
 def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
-    __import__("b12x.integration.tp_moe")
+    __import__("sparkinfer.integration.tp_moe")
 
     with FakeTensorMode():
         a = torch.empty((2, 128), dtype=torch.bfloat16)
@@ -251,7 +251,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
         alpha = torch.empty((4,), dtype=torch.float32)
         task = torch.empty((16,), dtype=torch.int32)
 
-        torch.ops.b12x.tp_moe_dynamic_launch(
+        torch.ops.sparkinfer.tp_moe_dynamic_launch(
             packed_a_view,
             packed_a_flat,
             scale_flat,
@@ -318,7 +318,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             False,
         )
 
-        torch.ops.b12x.tp_moe_compact_micro_launch(
+        torch.ops.sparkinfer.tp_moe_compact_micro_launch(
             scalar_i32,
             scalar_i32,
             micro_intermediate,
@@ -352,7 +352,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
 
 
 def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
-    __import__("b12x.moe.fused.w4a16.kernel")
+    __import__("sparkinfer.moe.fused.w4a16.kernel")
 
     with FakeTensorMode():
         a = torch.empty((2, 128), dtype=torch.bfloat16)
@@ -366,7 +366,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
         output = torch.empty((2, 128), dtype=torch.bfloat16)
         barrier = torch.empty((1,), dtype=torch.int32)
 
-        torch.ops.b12x.w4a16_small_m_direct_launch(
+        torch.ops.sparkinfer.w4a16_small_m_direct_launch(
             a,
             w13_u8,
             scale_u8,
@@ -407,7 +407,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
         workspace = torch.empty((512,), dtype=torch.int32)
         activation_amax = torch.empty((2, 4, 2), dtype=torch.float32)
 
-        torch.ops.b12x.w4a16_fused_moe_launch(
+        torch.ops.sparkinfer.w4a16_fused_moe_launch(
             a,
             w13_u8,
             w2_u8,
@@ -456,7 +456,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             0,
         )
 
-        torch.ops.b12x.w4a16_fused_moe_calibrated_launch(
+        torch.ops.sparkinfer.w4a16_fused_moe_calibrated_launch(
             a,
             w13_u8,
             w2_u8,
@@ -505,7 +505,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             0,
         )
 
-        torch.ops.b12x.w4a16_topk_sum_launch(
+        torch.ops.sparkinfer.w4a16_topk_sum_launch(
             fc2_out,
             output,
             2,

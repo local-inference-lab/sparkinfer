@@ -51,7 +51,7 @@ from validation.cutlass_migration.core.single_arm_e2e import (
 
 
 FAMILY = "paged_attention"
-INPUT_SCHEMA = "b12x.paged_attention.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.paged_attention.end_to_end_input.v1"
 CORRECTNESS_GATES = (
     "finite-output-and-lse",
     "guard-canaries",

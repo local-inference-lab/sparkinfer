@@ -47,7 +47,7 @@ def _is_cute_kernel(decorator: ast.expr) -> bool:
 
 def _source_kernels(root: Path) -> set[SourceKernel]:
     kernels: set[SourceKernel] = set()
-    for path in sorted((root / "b12x").rglob("*.py")):
+    for path in sorted((root / "sparkinfer").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         names: list[str] = []
 
@@ -136,7 +136,7 @@ def main() -> int:
         "--root",
         type=Path,
         default=REPO_ROOT,
-        help="repository root containing b12x/",
+        help="repository root containing sparkinfer/",
     )
     parser.add_argument(
         "--inventory",

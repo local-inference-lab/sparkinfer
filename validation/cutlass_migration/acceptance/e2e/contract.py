@@ -54,9 +54,9 @@ from validation.cutlass_migration.paths import REPO_ROOT
 _REPO_ROOT = REPO_ROOT
 
 
-DISCOVERY_SCHEMA = "b12x.cute.migration.end_to_end_contract_discovery.v1"
-COMPILE_MANIFEST_SCHEMA = "b12x.cute.compile_manifest.v3"
-FRONTEND_PTX_SCHEMA = "b12x.cute.frontend_ptx.v3"
+DISCOVERY_SCHEMA = "sparkinfer.cute.migration.end_to_end_contract_discovery.v1"
+COMPILE_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
+FRONTEND_PTX_SCHEMA = "sparkinfer.cute.frontend_ptx.v3"
 KERNEL_NODE_TYPE = "CU_GRAPH_NODE_TYPE_KERNEL"
 HARNESS_TREES = ("benchmarks", "tests", "validation")
 
@@ -174,9 +174,9 @@ def _iter_tree_files(root: Path) -> list[Path]:
 
 
 def _package_snapshot(repo_root: Path) -> dict[str, object]:
-    package_root = repo_root / "b12x"
+    package_root = repo_root / "sparkinfer"
     paths = _iter_tree_files(package_root)
-    _require(paths, f"empty b12x package tree: {package_root}")
+    _require(paths, f"empty sparkinfer package tree: {package_root}")
     digest = hashlib.sha256()
     records: list[dict[str, object]] = []
     for path in paths:
@@ -194,7 +194,7 @@ def _package_snapshot(repo_root: Path) -> dict[str, object]:
             }
         )
     return {
-        "root": "b12x",
+        "root": "sparkinfer",
         "fingerprint": digest.hexdigest(),
         "records_sha256": _canonical_sha256(records),
         "file_count": len(records),
@@ -206,8 +206,8 @@ def _verify_source_endpoint(endpoint: Mapping[str, Any], *, location: str) -> No
     repo_root = Path(str(endpoint["repo_root"])).resolve()
     observed = _package_snapshot(repo_root)
     _require(
-        observed == endpoint["b12x_package"],
-        f"{location}: b12x tree changed after its source manifest was frozen",
+        observed == endpoint["sparkinfer_package"],
+        f"{location}: sparkinfer tree changed after its source manifest was frozen",
     )
 
 
@@ -345,7 +345,7 @@ def _validate_cache_artifact(
         f"{location}: unsupported compile manifest schema",
     )
     _require(
-        manifest.get("cache_format") == "b12x_cute_compile_cache_v5_explicit_spec",
+        manifest.get("cache_format") == "sparkinfer_cute_compile_cache_v5_explicit_spec",
         f"{location}: exact explicit compile specification is required",
     )
     cache_key = manifest.get("cache_key")
@@ -572,9 +572,9 @@ def _validate_graph(value: object, *, location: str) -> dict[str, Any]:
 
 
 def _source_records_by_repo_path(source: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    runtime = source["manifest"]["runtime"]["b12x_package"]
+    runtime = source["manifest"]["runtime"]["sparkinfer_package"]
     return {
-        f"b12x/{record['path']}": record
+        f"sparkinfer/{record['path']}": record
         for record in runtime["files"]
         if isinstance(record, dict)
     }

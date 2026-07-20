@@ -37,13 +37,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
-from b12x.integration import residual_kernels
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.integration import residual_kernels
 
 
 FAMILY = "residual_prefill_partial"
 ARTIFACT_ROLE = "prefill-partial"
-INPUT_SCHEMA = "b12x.residual_prefill_partial.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.residual_prefill_partial.end_to_end_input.v1"
 TOKENS = 33
 PARTIALS = 25
 MIXES = 24

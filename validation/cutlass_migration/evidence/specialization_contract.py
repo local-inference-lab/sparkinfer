@@ -31,7 +31,7 @@ _FIELDS = [
     "kernel",
 ]
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_METADATA_SCHEMA = "b12x.cute.resource_row_contract.v2"
+_METADATA_SCHEMA = "sparkinfer.cute.resource_row_contract.v2"
 
 
 def _file_record(path: Path) -> dict[str, str]:

@@ -47,17 +47,17 @@ from validation.cutlass_migration.evidence.register_accounting import (
 )
 
 
-_INDEX_SCHEMA = "b12x.cute.migration.release_artifact_index.v1"
-_EXCEPTION_INDEX_SCHEMA = "b12x.cute.migration.release_exception_index.v1"
-_TRACE_SCHEMA = "b12x.cute.migration.case_trace.v1"
-_MATRIX_SCHEMA = "b12x.cute.migration.corpus_matrix.v1"
-_CORPUS_ID = "b12x-cutlass-45-46-full-gpu-corpus"
+_INDEX_SCHEMA = "sparkinfer.cute.migration.release_artifact_index.v1"
+_EXCEPTION_INDEX_SCHEMA = "sparkinfer.cute.migration.release_exception_index.v1"
+_TRACE_SCHEMA = "sparkinfer.cute.migration.case_trace.v1"
+_MATRIX_SCHEMA = "sparkinfer.cute.migration.corpus_matrix.v1"
+_CORPUS_ID = "sparkinfer-cutlass-45-46-full-gpu-corpus"
 _CORPUS_VERSION = "1"
 _ARCHITECTURE = "sm_120a"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_CUDA_EVENT_POOL_SCHEMA = "b12x.cuda_event_pool.v1"
-_GPU_MODE_STABILITY_SCHEMA = "b12x.gpu_mode_stability.v1"
-_GPU_TIMING_MODE_POLICY_SCHEMA = "b12x.gpu_timing_mode_policy.v1"
+_CUDA_EVENT_POOL_SCHEMA = "sparkinfer.cuda_event_pool.v1"
+_GPU_MODE_STABILITY_SCHEMA = "sparkinfer.gpu_mode_stability.v1"
+_GPU_TIMING_MODE_POLICY_SCHEMA = "sparkinfer.gpu_timing_mode_policy.v1"
 _REQUIRED_TIMING_PSTATE = "P1"
 _MAX_TIMING_SM_CLOCK_DELTA_MHZ = 60.0
 _MIN_TIMING_PRECONDITION_SECONDS = 5.0
@@ -70,12 +70,12 @@ _TIMING_STABLE_MODE_FIELDS = [
     "compute_mode",
     "power.limit",
 ]
-_SMEM_CONTRACT_SCHEMA = "b12x.cute.smem_contracts.v1"
-_SMEM_GATE_SCHEMA = "b12x.cute.migration.smem_contract_gate.v1"
-_SMEM_FINALIZATION_SCHEMA = "b12x.cute.migration.smem_contract_finalization.v1"
+_SMEM_CONTRACT_SCHEMA = "sparkinfer.cute.smem_contracts.v1"
+_SMEM_GATE_SCHEMA = "sparkinfer.cute.migration.smem_contract_gate.v1"
+_SMEM_FINALIZATION_SCHEMA = "sparkinfer.cute.migration.smem_contract_finalization.v1"
 _SMEM_AUDITOR_PATH = "validation/cutlass_migration/evidence/smem_contracts.py"
 _SMEM_SOURCE_ROOTS = {
-    "production": ["b12x"],
+    "production": ["sparkinfer"],
     "infrastructure": ["benchmarks", "tests", "validation"],
 }
 _SMEM_COUNT_FIELDS = {
@@ -157,19 +157,19 @@ _TOOLCHAIN_PACKAGE_NAMES = {
 
 _SUPPORTED_ABBA_SCHEMAS = frozenset(
     {
-        "b12x.bf16_to_fp4_tma.cache_abba.v4",
-        "b12x.compute_exceptions.cache_abba.v1",
-        "b12x.contiguous_attention.cache_abba.v2",
-        "b12x.attention.mla.decode_merge.exact_cache_abba.v2",
-        "b12x.attention.mla.prefill_mg.exact_cache_abba.v4",
-        "b12x.attention.indexer.exact_cache_abba.v1",
-        "b12x.attention.paged.exact_cache_abba.v1",
-        "b12x.residual_prefill_partial.cache_abba.v4",
-        "b12x.residual.composite_exact_cache_abba.v1",
-        "b12x.tp_moe.dynamic.cache_abba.v2",
-        "b12x.w4a16.serving.cache_abba.v2",
-        "b12x.w4a16.topk_sum.cache_abba.v1",
-        "b12x.w4a8.dynamic.cache_abba.v2",
+        "sparkinfer.bf16_to_fp4_tma.cache_abba.v4",
+        "sparkinfer.compute_exceptions.cache_abba.v1",
+        "sparkinfer.contiguous_attention.cache_abba.v2",
+        "sparkinfer.attention.mla.decode_merge.exact_cache_abba.v2",
+        "sparkinfer.attention.mla.prefill_mg.exact_cache_abba.v4",
+        "sparkinfer.attention.indexer.exact_cache_abba.v1",
+        "sparkinfer.attention.paged.exact_cache_abba.v1",
+        "sparkinfer.residual_prefill_partial.cache_abba.v4",
+        "sparkinfer.residual.composite_exact_cache_abba.v1",
+        "sparkinfer.tp_moe.dynamic.cache_abba.v2",
+        "sparkinfer.w4a16.serving.cache_abba.v2",
+        "sparkinfer.w4a16.topk_sum.cache_abba.v1",
+        "sparkinfer.w4a8.dynamic.cache_abba.v2",
     }
 )
 
@@ -331,10 +331,10 @@ def _validate_source_manifest(path: Path) -> tuple[dict[str, Any], str]:
         f"{path}: source manifest canonical hash mismatch "
         f"recorded={recorded!r}, computed={computed}",
     )
-    package = manifest.get("b12x_package")
-    _require(isinstance(package, dict), f"{path}: missing b12x_package")
+    package = manifest.get("sparkinfer_package")
+    _require(isinstance(package, dict), f"{path}: missing sparkinfer_package")
     fingerprint = package.get("fingerprint")
-    _require(_is_sha256(fingerprint), f"{path}: invalid b12x package fingerprint")
+    _require(_is_sha256(fingerprint), f"{path}: invalid sparkinfer package fingerprint")
     return manifest, str(fingerprint)
 
 
@@ -380,7 +380,7 @@ def _validate_smem_contract_report(
         and report.get("schema") == _SMEM_CONTRACT_SCHEMA
         and report.get("root") == source_root
         and report.get("audited_source_roots") == _SMEM_SOURCE_ROOTS
-        and report.get("central_private_memrange_path") == "b12x/cute/smem.py"
+        and report.get("central_private_memrange_path") == "sparkinfer/cute/smem.py"
         and report.get("passed") is True,
         f"{path}: invalid final SMEM report schema/root/policy",
     )
@@ -428,7 +428,7 @@ def _validate_smem_contract_report(
             and isinstance(row_path, str)
             and row_path
             and (
-                (source_category == "production" and row_path.startswith("b12x/"))
+                (source_category == "production" and row_path.startswith("sparkinfer/"))
                 or (
                     source_category == "infrastructure"
                     and row_path.startswith(("benchmarks/", "tests/", "validation/"))
@@ -510,7 +510,7 @@ def _validate_smem_contract_report(
             _require(
                 set(row) == _SMEM_PRIVATE_ROW_FIELDS
                 and source_category == "production"
-                and row_path == "b12x/cute/smem.py"
+                and row_path == "sparkinfer/cute/smem.py"
                 and isinstance(row.get("line"), int)
                 and not isinstance(row.get("line"), bool)
                 and row["line"] > 0
@@ -801,7 +801,7 @@ def _validate_corpus(
     _require(
         binding.get("schema") == SOURCE_SNAPSHOT_SCHEMA
         and binding.get("manifest_sha256") == manifest["manifest_sha256"]
-        and binding.get("b12x_package_fingerprint") == fingerprint,
+        and binding.get("sparkinfer_package_fingerprint") == fingerprint,
         f"{trace_path}: source binding does not match frozen manifest",
     )
     artifact = source_snapshot.get("artifact")
@@ -1239,13 +1239,13 @@ def _path_is_true(value: dict[str, Any], *paths: str) -> bool:
 def _serving_units(path: Path, artifact: dict[str, Any]) -> list[dict[str, Any]]:
     schema = str(artifact.get("schema", ""))
     collection = {
-        "b12x.compute_exceptions.cache_abba.v1": "cases",
-        "b12x.attention.mla.decode_merge.exact_cache_abba.v2": "rows",
-        "b12x.attention.mla.prefill_mg.exact_cache_abba.v4": "rows",
-        "b12x.residual.composite_exact_cache_abba.v1": "shapes",
-        "b12x.tp_moe.dynamic.cache_abba.v2": "cases",
-        "b12x.w4a16.serving.cache_abba.v2": "cases",
-        "b12x.w4a16.topk_sum.cache_abba.v1": "cases",
+        "sparkinfer.compute_exceptions.cache_abba.v1": "cases",
+        "sparkinfer.attention.mla.decode_merge.exact_cache_abba.v2": "rows",
+        "sparkinfer.attention.mla.prefill_mg.exact_cache_abba.v4": "rows",
+        "sparkinfer.residual.composite_exact_cache_abba.v1": "shapes",
+        "sparkinfer.tp_moe.dynamic.cache_abba.v2": "cases",
+        "sparkinfer.w4a16.serving.cache_abba.v2": "cases",
+        "sparkinfer.w4a16.topk_sum.cache_abba.v1": "cases",
     }.get(schema)
     if collection is None:
         return [artifact]
@@ -1897,15 +1897,15 @@ def _validate_serving_gates(path: Path, artifact: dict[str, Any]) -> None:
     if "all_correct" in artifact:
         _require(artifact["all_correct"] is True, f"{path}: all_correct is not true")
     mandatory_live_schemas = {
-        "b12x.attention.paged.exact_cache_abba.v1",
-        "b12x.attention.indexer.exact_cache_abba.v1",
-        "b12x.bf16_to_fp4_tma.cache_abba.v4",
-        "b12x.contiguous_attention.cache_abba.v2",
-        "b12x.residual_prefill_partial.cache_abba.v4",
-        "b12x.tp_moe.dynamic.cache_abba.v2",
-        "b12x.w4a16.serving.cache_abba.v2",
-        "b12x.w4a16.topk_sum.cache_abba.v1",
-        "b12x.w4a8.dynamic.cache_abba.v2",
+        "sparkinfer.attention.paged.exact_cache_abba.v1",
+        "sparkinfer.attention.indexer.exact_cache_abba.v1",
+        "sparkinfer.bf16_to_fp4_tma.cache_abba.v4",
+        "sparkinfer.contiguous_attention.cache_abba.v2",
+        "sparkinfer.residual_prefill_partial.cache_abba.v4",
+        "sparkinfer.tp_moe.dynamic.cache_abba.v2",
+        "sparkinfer.w4a16.serving.cache_abba.v2",
+        "sparkinfer.w4a16.topk_sum.cache_abba.v1",
+        "sparkinfer.w4a8.dynamic.cache_abba.v2",
     }
     schema = str(artifact.get("schema", ""))
     if schema in mandatory_live_schemas:
@@ -1922,15 +1922,15 @@ def _validate_serving_gates(path: Path, artifact: dict[str, Any]) -> None:
             f"{path}: schema requires an explicit changed-output proof",
         )
         strict_live_schemas = {
-            "b12x.attention.paged.exact_cache_abba.v1",
-            "b12x.attention.indexer.exact_cache_abba.v1",
-            "b12x.bf16_to_fp4_tma.cache_abba.v4",
-            "b12x.contiguous_attention.cache_abba.v2",
-            "b12x.residual_prefill_partial.cache_abba.v4",
-            "b12x.tp_moe.dynamic.cache_abba.v2",
-            "b12x.w4a16.serving.cache_abba.v2",
-            "b12x.w4a16.topk_sum.cache_abba.v1",
-            "b12x.w4a8.dynamic.cache_abba.v2",
+            "sparkinfer.attention.paged.exact_cache_abba.v1",
+            "sparkinfer.attention.indexer.exact_cache_abba.v1",
+            "sparkinfer.bf16_to_fp4_tma.cache_abba.v4",
+            "sparkinfer.contiguous_attention.cache_abba.v2",
+            "sparkinfer.residual_prefill_partial.cache_abba.v4",
+            "sparkinfer.tp_moe.dynamic.cache_abba.v2",
+            "sparkinfer.w4a16.serving.cache_abba.v2",
+            "sparkinfer.w4a16.topk_sum.cache_abba.v1",
+            "sparkinfer.w4a8.dynamic.cache_abba.v2",
         }
         if schema in strict_live_schemas:
             _require(
@@ -3306,7 +3306,7 @@ def _validate_artifact_timing_mode_policy(
     requested_mask = next(iter(requested_masks))
     raw_policy = artifact.get("timing_mode_policy")
     requires_top_level_policy = (
-        artifact.get("schema") == "b12x.w4a16.serving.cache_abba.v2"
+        artifact.get("schema") == "sparkinfer.w4a16.serving.cache_abba.v2"
     )
     if raw_policy is None:
         _require(
@@ -3827,7 +3827,7 @@ def main() -> None:
                 corpus["source_fingerprint"] == source_fingerprint
                 for corpus in corpora.values()
             ),
-            "four-corpus b12x package fingerprints differ",
+            "four-corpus sparkinfer package fingerprints differ",
         )
         expected_resource_keys = corpora["gpu4_cutlass45"]["resource_keys"]
         _require(

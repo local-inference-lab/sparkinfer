@@ -31,8 +31,8 @@ def _run_json(cmd: list[str], env: dict[str, str]) -> tuple[str, dict[str, objec
 
 def _probe_swizzle(swizzle: str, *, run_pytest: bool) -> dict[str, object]:
     env = os.environ.copy()
-    env["B12X_PAGED_KV_TMA"] = "1"
-    env["B12X_PAGED_KV_TMA_SWIZZLE"] = swizzle
+    env["SPARKINFER_PAGED_KV_TMA"] = "1"
+    env["SPARKINFER_PAGED_KV_TMA_SWIZZLE"] = swizzle
 
     preg_cmd = [
         sys.executable,

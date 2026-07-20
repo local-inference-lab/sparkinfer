@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
-import b12x.cute.compiler as cute_compiler
+import sparkinfer.cute.compiler as cute_compiler
 from validation.cutlass_migration.core.exact_cache_abba import (
     _PreparedAbbaEventPool,
     _balanced_duration_precondition,
@@ -91,7 +91,7 @@ def _validate_exact_load_staging() -> None:
     key = "0" * 64
     spec_hash = "1" * 64
     object_bytes = b"immutable-exact-cache-object"
-    with tempfile.TemporaryDirectory(prefix="b12x-exact-cache-selftest-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-exact-cache-selftest-") as raw:
         cache = Path(raw) / "cache"
         shard = cache / key[:2]
         shard.mkdir(parents=True)
@@ -101,7 +101,7 @@ def _validate_exact_load_staging() -> None:
         manifest_path.write_text(
             json.dumps(
                 {
-                    "schema": "b12x.cute.compile_manifest.v3",
+                    "schema": "sparkinfer.cute.compile_manifest.v3",
                     "cache_key": key,
                     "compile_spec_hash": spec_hash,
                     "object_sha256": hashlib.sha256(object_bytes).hexdigest(),
@@ -121,7 +121,7 @@ def _validate_exact_load_staging() -> None:
         staged: dict[str, object] = {}
 
         def fake_load(observed_key: str) -> object:
-            stage_cache = Path(os.environ["B12X_CUTE_COMPILE_CACHE_DIR"])
+            stage_cache = Path(os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"])
             stage_object = stage_cache / observed_key[:2] / f"{observed_key}.o"
             staged["separate_cache"] = stage_cache != cache
             staged["before"] = stage_object.read_bytes()
@@ -129,14 +129,14 @@ def _validate_exact_load_staging() -> None:
             staged["after"] = stage_object.read_bytes()
             return object()
 
-        previous_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
+        previous_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
         with patch(
             "validation.cutlass_migration.core.exact_cache_abba."
             "cute_compiler._load_cute_compile_from_disk",
             fake_load,
         ):
             compiled, provenance = load_exact(cache, spec_hash)
-        restored_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
+        restored_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
 
         if compiled is None or provenance["object_bytes"] != len(object_bytes):
             raise AssertionError("staged exact-cache load did not return provenance")
@@ -161,7 +161,7 @@ def _validate_compiler_disk_load_staging() -> None:
 
     key = "4" * 64
     object_bytes = b"immutable-compiler-cache-object"
-    with tempfile.TemporaryDirectory(prefix="b12x-compiler-cache-selftest-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sparkinfer-compiler-cache-selftest-") as raw:
         cache = Path(raw) / "cache"
         object_path = cache / key[:2] / f"{key}.o"
         object_path.parent.mkdir(parents=True)
@@ -181,8 +181,8 @@ def _validate_compiler_disk_load_staging() -> None:
             def __getattr__(self, _name: str) -> object:
                 return sentinel
 
-        previous_cache = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
-        os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+        previous_cache = os.environ.get("SPARKINFER_CUTE_COMPILE_CACHE_DIR")
+        os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
         try:
             with patch(
                 "cutlass.base_dsl.export.external_binary_module.ExternalBinaryModule",
@@ -191,9 +191,9 @@ def _validate_compiler_disk_load_staging() -> None:
                 compiled = cute_compiler._load_cute_compile_from_disk(key)
         finally:
             if previous_cache is None:
-                os.environ.pop("B12X_CUTE_COMPILE_CACHE_DIR", None)
+                os.environ.pop("SPARKINFER_CUTE_COMPILE_CACHE_DIR", None)
             else:
-                os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = previous_cache
+                os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = previous_cache
 
         staged_path = observed.get("path")
         if compiled is not sentinel:

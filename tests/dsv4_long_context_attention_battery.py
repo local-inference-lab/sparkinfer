@@ -17,7 +17,7 @@ from typing import Callable
 
 import torch
 
-from b12x.attention.mla.compressed_reference import (
+from sparkinfer.attention.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -30,15 +30,15 @@ from b12x.attention.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from b12x.integration import (
-    B12XCompressedMLAScratchCaps,
+from sparkinfer.integration import (
+    SPARKINFERCompressedMLAScratchCaps,
     clear_mla_caches,
     compressed_mla_decode_forward,
     compressed_mla_split_chunks_for_contract,
     plan_compressed_mla_scratch,
 )
-from b12x.attention.indexer import (
-    B12XIndexerScratchCaps,
+from sparkinfer.attention.indexer import (
+    SPARKINFERIndexerScratchCaps,
     INDEXER_SOURCE_LAYOUT_PAGED,
     clear_indexer_caches,
     index_topk_fp8,
@@ -155,7 +155,7 @@ def _deepgemm_style_paged_index_logits(
     """Independent paged-MQA-logit reference adapted from DeepGEMM.
 
     This mirrors /home/luke/projects/DeepGEMM/tests/test_attention.py:
-    ref_paged_mqa_logits.  The only adaptation is b12x's packed FP8+scale
+    ref_paged_mqa_logits.  The only adaptation is sparkinfer's packed FP8+scale
     K-cache layout and DSV4's single-token-per-row indexer shape.
     """
 
@@ -273,7 +273,7 @@ def _make_index_binding(
     route: str = "auto",
 ):
     plan = plan_indexer_scratch(
-        B12XIndexerScratchCaps(
+        SPARKINFERIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=INDEX_HEADS,
@@ -314,7 +314,7 @@ def _make_mla_binding(
 ):
     max_chunks = compressed_mla_split_chunks_for_contract(rows=rows, width=width)
     plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+        SPARKINFERCompressedMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
@@ -458,7 +458,7 @@ def run_deepgemm_reference_alignment(args: argparse.Namespace, device: torch.dev
     page_table[7, -3:] = -1
     page_table = page_table.contiguous()
 
-    b12x_ref = paged_index_logits_reference(
+    sparkinfer_ref = paged_index_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=packed_loop,
@@ -474,12 +474,12 @@ def run_deepgemm_reference_alignment(args: argparse.Namespace, device: torch.dev
         seqlens=seqlens,
     )
     _assert_logits_match(
-        b12x_ref,
+        sparkinfer_ref,
         deepgemm_ref,
-        label="reference-audit-b12x-vs-deepgemm-paged-mqa",
+        label="reference-audit-sparkinfer-vs-deepgemm-paged-mqa",
     )
     _assert_topk_sets_equal(
-        _topk_from_logits_with_invalid_fill(b12x_ref, topk),
+        _topk_from_logits_with_invalid_fill(sparkinfer_ref, topk),
         _topk_from_logits_with_invalid_fill(deepgemm_ref, topk),
         label="reference-audit-topk",
     )

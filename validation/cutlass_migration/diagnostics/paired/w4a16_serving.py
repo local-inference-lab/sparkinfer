@@ -34,19 +34,19 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import CORE_ROOT, REPO_ROOT
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.intrinsics import swizzle_block_scale
-from b12x.cute.runtime_control import (
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.intrinsics import swizzle_block_scale
+from sparkinfer.cute.runtime_control import (
     freeze_kernel_resolution,
     kernel_resolution_frozen,
     unfreeze_kernel_resolution,
 )
-from b12x.moe.fused.w4a16.host import (
+from sparkinfer.moe.fused.w4a16.host import (
     plan_w4a16_buffers,
     select_route_block_size_m,
 )
-import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-from b12x.moe.fused.w4a16.prepare import (
+import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
+from sparkinfer.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers,
     prepare_w4a16_modelopt_nvfp4_weights,
 )
@@ -1242,15 +1242,15 @@ def main() -> None:
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     source_paths = {
         "benchmark": Path(__file__).resolve(),
-        "kernel": REPO_ROOT / "b12x/moe/fused/w4a16/kernel.py",
-        "host": REPO_ROOT / "b12x/moe/fused/w4a16/host.py",
-        "prepare": REPO_ROOT / "b12x/moe/fused/w4a16/prepare.py",
-        "compiler": REPO_ROOT / "b12x/cute/compiler.py",
+        "kernel": REPO_ROOT / "sparkinfer/moe/fused/w4a16/kernel.py",
+        "host": REPO_ROOT / "sparkinfer/moe/fused/w4a16/host.py",
+        "prepare": REPO_ROOT / "sparkinfer/moe/fused/w4a16/prepare.py",
+        "compiler": REPO_ROOT / "sparkinfer/cute/compiler.py",
         "exact_cache_abba": CORE_ROOT / "exact_cache_abba.py",
         "gpu_scope": CORE_ROOT / "gpu_scope.py",
     }
     result = {
-        "schema": "b12x.w4a16.serving.cache_abba.v2",
+        "schema": "sparkinfer.w4a16.serving.cache_abba.v2",
         "evidence_status": args.evidence_status,
         "command": [sys.executable, *sys.argv],
         "labels": {"a": labels[0], "b": labels[1]},
@@ -1268,7 +1268,7 @@ def main() -> None:
         "source_sha256": {
             name: sha256_file(path) for name, path in source_paths.items()
         },
-        "host_package_fingerprint": cute_compiler.b12x_package_fingerprint(),
+        "host_package_fingerprint": cute_compiler.sparkinfer_package_fingerprint(),
         "caches": {label: str(cache.resolve()) for label, cache in caches.items()},
         "shared_topk_cache": (
             str(args.shared_topk_cache.resolve())

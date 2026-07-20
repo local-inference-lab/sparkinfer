@@ -13,7 +13,7 @@ import sys
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _LINE_RE = re.compile(
     r"^(decode|extend)\s+bs=\s*(?P<batch>\d+)\s+q=\s*(?P<q>\d+)\s+k=\s*(?P<k>\d+)\s+"
-    r"(?P<plan>[^|]+)\|\s+b12x median=\s*(?P<b12x>[0-9.]+)\s+us.*\|\s+fa2 median=\s*(?P<fa2>[0-9.]+)\s+us.*\|\s+fa2/b12x=\s*(?P<speedup>[0-9.]+)x"
+    r"(?P<plan>[^|]+)\|\s+sparkinfer median=\s*(?P<sparkinfer>[0-9.]+)\s+us.*\|\s+fa2 median=\s*(?P<fa2>[0-9.]+)\s+us.*\|\s+fa2/sparkinfer=\s*(?P<speedup>[0-9.]+)x"
 )
 
 
@@ -64,16 +64,16 @@ def _run_once(*, cache_len: int, fixed_split_pages: int, env_overrides: dict[str
         phase = m.group(1)
         lines[phase] = {
             "plan": m.group("plan").strip(),
-            "b12x_us": float(m.group("b12x")),
+            "sparkinfer_us": float(m.group("sparkinfer")),
             "fa2_us": float(m.group("fa2")),
-            "fa2_over_b12x": float(m.group("speedup")),
+            "fa2_over_sparkinfer": float(m.group("speedup")),
         }
     result["status"] = "ok"
     result["decode"] = lines.get("decode")
     result["extend"] = lines.get("extend")
     if "decode" in lines and "extend" in lines:
         result["geo"] = statistics.geometric_mean(
-            [lines["decode"]["fa2_over_b12x"], lines["extend"]["fa2_over_b12x"]]
+            [lines["decode"]["fa2_over_sparkinfer"], lines["extend"]["fa2_over_sparkinfer"]]
         )
     return result
 

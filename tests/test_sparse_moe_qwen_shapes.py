@@ -21,17 +21,17 @@ from benchmarks.benchmark_moe import (
     load_gate_weight,
     make_input_activations,
 )
-from b12x.integration import (
-    B12XFP4ExpertWeights,
-    b12x_route_experts_fast,
-    b12x_sparse_moe_fp4,
+from sparkinfer.integration import (
+    SPARKINFERFP4ExpertWeights,
+    sparkinfer_route_experts_fast,
+    sparkinfer_sparse_moe_fp4,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     clear_tp_moe_caches,
-    plan_b12x_fp4_moe_weights,
-    prepare_b12x_fp4_moe_weights,
+    plan_sparkinfer_fp4_moe_weights,
+    prepare_sparkinfer_fp4_moe_weights,
 )
-import b12x.integration.tp_moe as tp_moe_impl
+import sparkinfer.integration.tp_moe as tp_moe_impl
 from tests.helpers import run_tp_moe_fp4
 
 
@@ -59,8 +59,8 @@ def _load_qwen_case() -> tuple[ModelSpec, object, torch.Tensor]:
     return spec, load_expert_weights(MODEL_PATH, spec), load_gate_weight(MODEL_PATH, spec)
 
 
-def _pack_experts(weights) -> B12XFP4ExpertWeights:
-    plan = plan_b12x_fp4_moe_weights(
+def _pack_experts(weights) -> SPARKINFERFP4ExpertWeights:
+    plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format=weights.source_format,
         activation="silu",
@@ -70,7 +70,7 @@ def _pack_experts(weights) -> B12XFP4ExpertWeights:
         intermediate_size=weights.spec.I_tp,
         w13_layout=weights.w13_layout,
     )
-    prepared = prepare_b12x_fp4_moe_weights(
+    prepared = prepare_sparkinfer_fp4_moe_weights(
         plan=plan,
         w1_global_scale=(
             weights.g1_alphas_per_expert
@@ -122,7 +122,7 @@ def test_route_experts_fast_matches_manual_qwen_gate_path(m: int) -> None:
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
     del weights
 
-    routing = b12x_route_experts_fast(
+    routing = sparkinfer_route_experts_fast(
         binding=build_tp_moe_route_binding(
             scratch=_make_scratch(),
             hidden_states=hidden_states,
@@ -156,7 +156,7 @@ def test_route_experts_fast_reuses_exact_workspace_buffers() -> None:
     del weights, topk_ids
     scratch = _make_scratch()
 
-    first = b12x_route_experts_fast(
+    first = sparkinfer_route_experts_fast(
         binding=build_tp_moe_route_binding(
             scratch=scratch,
             hidden_states=hidden_states,
@@ -164,7 +164,7 @@ def test_route_experts_fast_reuses_exact_workspace_buffers() -> None:
             gate_weight=gate_weight,
         )
     )
-    second = b12x_route_experts_fast(
+    second = sparkinfer_route_experts_fast(
         binding=build_tp_moe_route_binding(
             scratch=scratch,
             hidden_states=hidden_states,
@@ -193,7 +193,7 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
     hidden_states = make_input_activations(spec, m, seed=10_000 + m, device=device)
 
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
-    sparse_output, routing = b12x_sparse_moe_fp4(
+    sparse_output, routing = sparkinfer_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
             scratch=_make_scratch(),
             hidden_states=hidden_states,
@@ -235,7 +235,7 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
 
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
     output = torch.empty_like(hidden_states)
-    sparse_output, routing = b12x_sparse_moe_fp4(
+    sparse_output, routing = sparkinfer_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
             scratch=_make_scratch(),
             hidden_states=hidden_states,

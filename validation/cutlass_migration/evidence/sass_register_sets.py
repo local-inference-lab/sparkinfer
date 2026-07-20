@@ -32,7 +32,7 @@ from validation.cutlass_migration.evidence.kernel_resources import (
 )
 
 
-_SIDECAR_SCHEMA = "b12x.cute.sass_register_sets.v3"
+_SIDECAR_SCHEMA = "sparkinfer.cute.sass_register_sets.v3"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INSTRUCTION_LINE_RE = re.compile(
     r"^\s*/\*[0-9a-fA-F]+\*/.*;\s*$",

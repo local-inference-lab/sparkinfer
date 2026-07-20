@@ -24,10 +24,10 @@ _CUTLASS_PACKAGES = (
     "nvidia-cutlass-dsl-libs-cu12",
     "nvidia-cutlass-dsl-libs-cu13",
 )
-_CASE_CONTRACT_SCHEMA = "b12x.graph_replay_case_contract.v1"
-_RUNTIME_ENVIRONMENT_SCHEMA = "b12x-runtime-environment-v1"
+_CASE_CONTRACT_SCHEMA = "sparkinfer.graph_replay_case_contract.v1"
+_RUNTIME_ENVIRONMENT_SCHEMA = "sparkinfer-runtime-environment-v1"
 _RUNTIME_ENVIRONMENT_PREFIXES = (
-    "B12X_",
+    "SPARKINFER_",
     "CUTE_",
     "CUTLASS_",
     "CUDA_",
@@ -57,7 +57,7 @@ _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS = (
 # across a CUTLASS-version comparison that uses isolated venvs/caches.  No
 # other environment field is normalized.
 _RUNTIME_ENVIRONMENT_OPERATIONAL_PATH_EXCEPTIONS = (
-    "B12X_CUTE_COMPILE_CACHE_DIR",
+    "SPARKINFER_CUTE_COMPILE_CACHE_DIR",
     "CUTE_DSL_CACHE_DIR",
     "CUTE_DSL_LIBS",
 )
@@ -369,7 +369,7 @@ def _validate_read_only_input_provenance(
         )
     tensor_hashes = provenance.get("tensor_sha256")
     if (
-        provenance.get("schema") != "b12x-read-only-inputs-v1"
+        provenance.get("schema") != "sparkinfer-read-only-inputs-v1"
         or not isinstance(tensor_hashes, dict)
         or not tensor_hashes
         or any(
@@ -383,7 +383,7 @@ def _validate_read_only_input_provenance(
         raise ValueError(f"{path}:{line_number}: invalid read-only input hashes")
     expected_aggregate = _json_sha256(
         {
-            "schema": "b12x-read-only-inputs-v1",
+            "schema": "sparkinfer-read-only-inputs-v1",
             "tensor_sha256": tensor_hashes,
         }
     )
@@ -745,7 +745,7 @@ def _source_signature(run: Run) -> str:
             "commit": run.provenance.get("commit"),
             "branch": run.provenance.get("branch"),
             "dirty_paths": run.provenance.get("dirty_paths"),
-            "b12x_package_fingerprint": run.provenance.get("b12x_package_fingerprint"),
+            "sparkinfer_package_fingerprint": run.provenance.get("sparkinfer_package_fingerprint"),
             "benchmark_sha256": run.provenance.get("benchmark_sha256"),
             "experiment": _experiment_signature(run),
             "cutlass": run.provenance.get("cutlass"),
@@ -761,7 +761,7 @@ def main() -> int:
     parser.add_argument("b1", type=Path)
     parser.add_argument("b2", type=Path)
     parser.add_argument("a2", type=Path)
-    parser.add_argument("--backend", default="b12x")
+    parser.add_argument("--backend", default="sparkinfer")
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument(
         "--require-exact-case-contract",
@@ -953,10 +953,10 @@ def main() -> int:
     a1, b1, b2, a2 = runs
 
     a_fingerprints = {
-        str(run.provenance.get("b12x_package_fingerprint", "")) for run in (a1, a2)
+        str(run.provenance.get("sparkinfer_package_fingerprint", "")) for run in (a1, a2)
     }
     b_fingerprints = {
-        str(run.provenance.get("b12x_package_fingerprint", "")) for run in (b1, b2)
+        str(run.provenance.get("sparkinfer_package_fingerprint", "")) for run in (b1, b2)
     }
     if (
         len(a_fingerprints) != 1

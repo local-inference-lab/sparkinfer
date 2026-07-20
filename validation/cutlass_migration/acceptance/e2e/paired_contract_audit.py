@@ -282,7 +282,7 @@ def _supported_schemas(path: Path) -> set[str]:
 
 def _load_matrix(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema") != "b12x.cute.migration.abba_producer_contract_matrix.v1":
+    if value.get("schema") != "sparkinfer.cute.migration.abba_producer_contract_matrix.v1":
         raise RuntimeError(f"{path}: unsupported matrix schema")
     return value
 
@@ -375,7 +375,7 @@ def main() -> int:
     runtime_follow_up_count = sum(bool(row["runtime_follow_up"]) for row in rows)
     runtime_follow_up_count += bool(single_arm_follow_up)
     result = {
-        "schema": "b12x.cute.migration.abba_producer_contract_audit.v1",
+        "schema": "sparkinfer.cute.migration.abba_producer_contract_audit.v1",
         "status": "pass" if runtime_follow_up_count == 0 else "fail",
         "matrix": {
             "path": str(matrix_path),

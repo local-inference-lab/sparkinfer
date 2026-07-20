@@ -1,14 +1,14 @@
 # SM120 sparse MLA — Port Postmortem & Handoff
 
 Porting FlashInfer's hand-written SM120 sparse-MLA CUDA kernels to 100% CuTeDSL as a
-unified, `cute.constexpr`-specialized backend in b12x. Built on branch `rs-1` over 14
+unified, `cute.constexpr`-specialized backend in sparkinfer. Built on branch `rs-1` over 14
 commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (sm_120, 188 SMs).
 
 ---
 
 ## 1. TL;DR / current state
 
-- **`b12x/attention/mla/`** is a new, 100%-CuTeDSL backend that reimplements
+- **`sparkinfer/attention/mla/`** is a new, 100%-CuTeDSL backend that reimplements
   FlashInfer's SM120 sparse-MLA **decode + prefill** for **two model types in ONE traced
   kernel family**, specialized at trace time via `cute.constexpr`:
   - **DSV4** (compressed, UE8M0 footer scales, `V_HAS_ROPE`) — hot-op **PTX byte-matches
@@ -65,7 +65,7 @@ Commit-per-phase kept every checkpoint green and bisectable.
 
 ## 3. What worked
 
-- **Reusing the existing b12x kernels as idiom references.** The mbarrier producer/consumer
+- **Reusing the existing sparkinfer kernels as idiom references.** The mbarrier producer/consumer
   pipeline (`_cute/pipeline.py`), the production-grade `const_expr` specialization style
   (`w4a16`), the inline-PTX op vocabulary (`intrinsics.py`: mxfp8 MMA, ldmatrix, cvt, byte_perm), and
   the base-2 split/merge (`split.py`, reused verbatim) meant most "novel" mechanisms already
@@ -146,7 +146,7 @@ default-flipped, no fallbacks, faster-than-legacy decode, 157 tests green.
 
 **Optional / future:**
 - **P9c — FlashInfer AutoTuner.** Per-shape `chunks_per_block` sweep+cache (the env override hook
-  `B12X_MLA_SM120_NUM_SPLITS` exists). Marginal — the wave-balanced default already wins.
+  `SPARKINFER_MLA_SM120_NUM_SPLITS` exists). Marginal — the wave-balanced default already wins.
 - **BF16 compute mode.** Deferred; FP8-only today. A perf/coverage item (upstream uses BF16-QK
   for some prefill shapes), not a correctness gap.
 - **`prmt.b32` soft parity.** DSV4 decode emits ~84 vs FlashInfer's ~98 (d2_load_b fragment
@@ -171,7 +171,7 @@ default-flipped, no fallbacks, faster-than-legacy decode, 157 tests green.
   const_expr arms; touching one must not perturb the other (re-verify DSV4 PTX byte-identity).
 - **Cache versioning.** `KernelCompileSpec` versions are bumped on any device-trace change
   (decode and prefill independently) to invalidate stale cubins. Bump them if you change a kernel.
-- **Re-verifying PTX parity.** `B12X_CUTE_COMPILE_DISK_CACHE=0 B12X_CUTE_COMPILE_MEMORY_CACHE=0
+- **Re-verifying PTX parity.** `SPARKINFER_CUTE_COMPILE_DISK_CACHE=0 SPARKINFER_CUTE_COMPILE_MEMORY_CACHE=0
   CUTE_DSL_KEEP=ptx python <probe>`; diff the hot-op histogram against the reference in
   `~/projects/archive/sm120port/ref_ptx/` (env var is `CUTE_DSL_KEEP=ptx`, not the deprecated
   `CUTE_DSL_KEEP_PTX`). DSV4 byte-identity is checked by stash-diffing a recompiled pre-change tree.

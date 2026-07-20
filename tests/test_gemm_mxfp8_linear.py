@@ -4,12 +4,12 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-from b12x.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
-from b12x.gemm.mxfp8_linear import (
+from sparkinfer.gemm.block_fp8_linear import quantize_block_fp8_linear_input_mxfp8
+from sparkinfer.gemm.mxfp8_linear import (
     mxfp8_linear,
     pack_mxfp8_linear_weight,
 )
-from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
+from sparkinfer.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
 from .helpers import require_sm12x
 

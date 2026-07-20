@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.distributed.pcie_dcp_a2a import PCIeDCPA2APool
+from sparkinfer.distributed.pcie_dcp_a2a import PCIeDCPA2APool
 
 
 TOTAL_HEADS = 32
@@ -125,7 +125,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "8"))
+    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "8"))
     if torch.cuda.device_count() < world_size:
         raise SystemExit(
             f"need {world_size} GPUs, found {torch.cuda.device_count()}"

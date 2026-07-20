@@ -8,7 +8,7 @@ part of the acceptance gate.
 Two comparisons are required so source changes cannot hide a compiler
 regression:
 
-1. **Compiler-only:** identical final b12x source compiled once with CUTLASS DSL
+1. **Compiler-only:** identical final sparkinfer source compiled once with CUTLASS DSL
    4.5.2 and once with 4.6.0.
 2. **End to end:** the pre-migration 4.5.2 source compared with the final 4.6.0
    candidate.
@@ -21,7 +21,7 @@ events for the same specialization keys with zero profiled misses.  This keeps
 CUPTI out of compiler helper subprocesses (which can deadlock after exit under
 injection) while still tracing every exact production CUDA entry point and the
 serving disk-cache load path.
-Every performance log must also carry the exact b12x package-content
+Every performance log must also carry the exact sparkinfer package-content
 fingerprint and benchmark-script SHA-256; the A-B-B-A comparator rejects a
 missing or mixed fingerprint even when the commit, dirty-path list, and branch
 names happen to match.
@@ -75,7 +75,7 @@ python -m validation.cutlass_migration evidence resources "$CACHE_46" \
   --require-kernel-symbol-pattern-file validation/cutlass_migration/data/cute_kernel_symbol_coverage.txt
 
 # When GPU corpus shards use separate caches/reports, merge each toolchain
-# independently. Conflicting duplicate semantic-key/symbol rows, mixed b12x
+# independently. Conflicting duplicate semantic-key/symbol rows, mixed sparkinfer
 # package fingerprints, and mixed CUTLASS/toolchain versions are rejected.
 python -m validation.cutlass_migration evidence merge-resources \
   "$ATTENTION_REPORT_45" "$COMPUTE_REPORT_45" "$W4A16_REPORT_45" \
@@ -138,7 +138,7 @@ python -m validation.cutlass_migration evidence register-accounting "$DELTA_REPO
 
 python -m validation.cutlass_migration diagnostic graph-abba \
   "$A1_JSONL" "$B1_JSONL" "$B2_JSONL" "$A2_JSONL" \
-  --backend b12x --output "$ABBA_REPORT" \
+  --backend sparkinfer --output "$ABBA_REPORT" \
   --expected-a-cutlass-version 4.5.2 \
   --expected-b-cutlass-version 4.6.0 \
   --allowed-physical-gpu "$PHYSICAL_GPU" \
@@ -172,8 +172,8 @@ python -m validation.cutlass_migration acceptance release-index \
   --output-csv "$RELEASE_EXCEPTION_INDEX"
 ```
 
-The JSON uses schema `b12x.cute.migration.release_artifact_index.v1`; the CSV
-uses `b12x.cute.migration.release_exception_index.v1`. The command imports no
+The JSON uses schema `sparkinfer.cute.migration.release_artifact_index.v1`; the CSV
+uses `sparkinfer.cute.migration.release_exception_index.v1`. The command imports no
 GPU runtime and fails closed unless all four corpora have the same frozen
 source and exact production specialization coverage. Every resource symbol
 must be case-bound. Every production-bound compile spec—not only rows with a
@@ -194,7 +194,7 @@ after changing either a producer or the final validator:
 
 ```bash
 python -m validation.cutlass_migration acceptance paired-contract-audit \
-  --output /tmp/b12x-abba-producer-contract-audit.json
+  --output /tmp/sparkinfer-abba-producer-contract-audit.json
 
 python -m validation.cutlass_migration integrity-check exact-cache-abba
 python -m validation.cutlass_migration integrity-check release-aggregate

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent Torch reference for the TP MoE path.
 
-This verifies auto-dispatched `b12x_moe_fp4(...)` against a pure PyTorch
+This verifies auto-dispatched `sparkinfer_moe_fp4(...)` against a pure PyTorch
 reference that models the NVFP4 block-scaled FC1/FC2 math directly, rather
 than using another kernel implementation as the correctness oracle.
 """
@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from b12x.cute.intrinsics import fp4_quantize_values_torch
+from sparkinfer.cute.intrinsics import fp4_quantize_values_torch
 from benchmarks.benchmark_moe import (
     MODEL_PATH,
     TP_RANK,
@@ -28,8 +28,8 @@ from benchmarks.benchmark_moe import (
     get_scale_contract_params,
     load_expert_weights,
 )
-from b12x.integration.tp_moe import (
-    b12x_moe_fp4,
+from sparkinfer.integration.tp_moe import (
+    sparkinfer_moe_fp4,
     clear_tp_moe_caches,
 )
 
@@ -240,7 +240,7 @@ def _moe_reference_nvfp4(
     return output
 
 
-def _make_b12x_moe_binding(
+def _make_sparkinfer_moe_binding(
     x: torch.Tensor,
     weights,
     scale_params,
@@ -293,14 +293,14 @@ def _run_impl(
     if clear_state:
         clear_tp_moe_caches()
     scale_params = get_scale_contract_params(weights, scale_contract)
-    binding = _make_b12x_moe_binding(
+    binding = _make_sparkinfer_moe_binding(
         x,
         weights,
         scale_params,
         topk_weights,
         topk_ids,
     )
-    out = b12x_moe_fp4(binding=binding)
+    out = sparkinfer_moe_fp4(binding=binding)
     torch.cuda.synchronize()
     return out.detach().clone()
 
@@ -337,14 +337,14 @@ def _run_impl_sequence(
         scale_params = get_scale_contract_params(weights, scale_contract)
         if clear_state_between_calls:
             clear_tp_moe_caches()
-        binding = _make_b12x_moe_binding(
+        binding = _make_sparkinfer_moe_binding(
             x,
             weights,
             scale_params,
             topk_weights,
             topk_ids,
         )
-        out = b12x_moe_fp4(binding=binding)
+        out = sparkinfer_moe_fp4(binding=binding)
         torch.cuda.synchronize()
         outputs.append(out.detach().clone())
     return outputs
@@ -356,7 +356,7 @@ def main() -> None:
     parser.add_argument("--layer-indices", type=int, nargs="+", default=[0])
     parser.add_argument("--sequence-repeats", type=int, default=1)
     parser.add_argument("--clear-state-between-calls", action="store_true")
-    parser.add_argument("--impls", nargs="+", default=["flashinfer", "b12x"])
+    parser.add_argument("--impls", nargs="+", default=["flashinfer", "sparkinfer"])
     parser.add_argument("--activation-scale", type=float, default=10.0)
     parser.add_argument("--oracle-mode", choices=["f32", "nvfp4"], default="nvfp4")
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="per-expert")

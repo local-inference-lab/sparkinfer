@@ -5,7 +5,7 @@ import torch
 
 from benchmarks.benchmark_paged_attention import (
     _build_decode_replay_cases,
-    _capture_b12x_decode_graph_bucket,
+    _capture_sparkinfer_decode_graph_bucket,
     _capture_flashinfer_decode_graph_bucket,
     _cosine_similarity,
     _decode_reference_output,
@@ -91,7 +91,7 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         kv_dtype=torch.bfloat16,
         seed=17,
     )
-    b12x_bucket = _capture_b12x_decode_graph_bucket(
+    sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
         shared=shared,
         capture_fixed_split_pages=policy.capture_fixed_split_pages,
         replay_fixed_split_pages=policy.replay_fixed_split_pages,
@@ -110,17 +110,17 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         warmup=1,
     )
 
-    b12x_graph_id = id(b12x_bucket.graph)
+    sparkinfer_graph_id = id(sparkinfer_bucket.graph)
     fa2_graph_id = id(fa2_bucket.graph)
 
     for context_tokens in (16_384, 131_072):
-        b12x_bucket.prepare_replay(context_tokens=context_tokens)
+        sparkinfer_bucket.prepare_replay(context_tokens=context_tokens)
         fa2_bucket.prepare_replay(context_tokens=context_tokens)
         ref_out = _decode_reference_output(
-            read_only_snapshot=b12x_bucket.read_only_snapshot,
+            read_only_snapshot=sparkinfer_bucket.read_only_snapshot,
         )
 
-        _strict_backend_replay_for_correctness(b12x_bucket)
+        _strict_backend_replay_for_correctness(sparkinfer_bucket)
         _strict_guarded_replay_for_correctness(
             backend="flashinfer-fa2",
             graph=fa2_bucket.graph,
@@ -129,10 +129,10 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
             read_only_inputs=fa2_bucket.read_only_inputs,
         )
 
-        assert id(b12x_bucket.graph) == b12x_graph_id
+        assert id(sparkinfer_bucket.graph) == sparkinfer_graph_id
         assert id(fa2_bucket.graph) == fa2_graph_id
 
-        assert _relative_l2_error(b12x_bucket.output, ref_out) <= 0.02
-        assert _cosine_similarity(b12x_bucket.output, ref_out) >= 0.9999
+        assert _relative_l2_error(sparkinfer_bucket.output, ref_out) <= 0.02
+        assert _cosine_similarity(sparkinfer_bucket.output, ref_out) >= 0.9999
         assert _relative_l2_error(fa2_bucket.output_view, ref_out) <= 0.005
         assert _cosine_similarity(fa2_bucket.output_view, ref_out) >= 0.99999

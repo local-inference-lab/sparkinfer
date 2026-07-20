@@ -8,9 +8,9 @@ import torch
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.attention._cute import ops as attention_ops
-from b12x.attention.mla.reference import _MLA_GROUP_SIZE, dense_mla_reference, pack_mla_kv_cache_reference
-from b12x.attention.mla.legacy.kernel import (
+from sparkinfer.attention._cute import ops as attention_ops
+from sparkinfer.attention.mla.reference import _MLA_GROUP_SIZE, dense_mla_reference, pack_mla_kv_cache_reference
+from sparkinfer.attention.mla.legacy.kernel import (
     _MLA_HEADS_PER_TILE,
     _MLA_NUM_MMA_KV,
     _MLA_NOPE_GROUP_KV_VECS,
@@ -56,7 +56,7 @@ from b12x.attention.mla.legacy.kernel import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
-from b12x.cute.intrinsics import byte_perm, ldmatrix_m8n8x4_left_half_b16, ldmatrix_m8n8x4_right_half_b16
+from sparkinfer.cute.intrinsics import byte_perm, ldmatrix_m8n8x4_left_half_b16, ldmatrix_m8n8x4_right_half_b16
 
 from .helpers import require_sm12x
 from .test_attention_mla_reference import _make_glm_case

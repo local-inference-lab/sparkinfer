@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-import b12x.attention.mla.merge as mla_merge
+import sparkinfer.attention.mla.merge as mla_merge
 
 from .helpers import require_sm12x
 

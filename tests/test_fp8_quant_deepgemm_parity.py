@@ -3,7 +3,7 @@
 This is the byte-exact comparison-against-DeepGEMM that the SM120 dense-FP8 port
 never had: the prior work *asserted* "activations are stored at 1x32 ue8m0,
 identical to DeepGEMM's 1d1d" but never measured it, and the GEMM correctness
-gate compared b12x against a reference that consumed b12x's *own* quantized FP8,
+gate compared sparkinfer against a reference that consumed sparkinfer's *own* quantized FP8,
 so any divergence from DeepGEMM was invisible. These tests pin the contract:
 
   1. ACTIVATION quant is byte-for-byte identical to DeepGEMM `per_token_cast_to_fp8`
@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import torch
 
-from b12x.gemm.block_fp8_linear import (
+from sparkinfer.gemm.block_fp8_linear import (
     pack_block_fp8_linear_weight_mxfp8,
     quantize_block_fp8_linear_input_mxfp8,
 )
-from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
+from sparkinfer.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
 from .helpers import require_sm12x
 
@@ -62,7 +62,7 @@ def _relfro(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_activation_quant_byte_exact_with_deepgemm() -> None:
-    """b12x activation MXFP8 quant == DeepGEMM per_token_cast_to_fp8 (gran_k=32)."""
+    """sparkinfer activation MXFP8 quant == DeepGEMM per_token_cast_to_fp8 (gran_k=32)."""
     require_sm12x()
     torch.manual_seed(0)
     M, K = 64, 5376  # Nemotron down-proj K (= 42 * 128)
@@ -76,7 +76,7 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
     dg_vals = dg_vals.view(torch.uint8)
     dg_sf = _sf_fp32_to_e8m0_u8(dg_sf_f)
 
-    # b12x quantizes at 32-element K groups -> one UE8M0 scale per 32.
+    # sparkinfer quantizes at 32-element K groups -> one UE8M0 scale per 32.
     assert b_sf.shape[1] == K // 32, f"expected gran_k=32 scale grid, got {b_sf.shape}"
     torch.testing.assert_close(b_vals, dg_vals, rtol=0, atol=0)
     torch.testing.assert_close(b_sf, dg_sf, rtol=0, atol=0)

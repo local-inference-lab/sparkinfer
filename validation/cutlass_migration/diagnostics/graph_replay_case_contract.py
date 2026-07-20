@@ -18,7 +18,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sample_log", type=Path)
     parser.add_argument("-o", "--output", type=Path, required=True)
-    parser.add_argument("--backend", default="b12x")
+    parser.add_argument("--backend", default="sparkinfer")
     parser.add_argument(
         "--allow-non-reference-oracle",
         action="store_true",

@@ -60,13 +60,13 @@ from validation.cutlass_migration.core.single_arm_e2e import (
     finish_single_arm_session,
     verify_case_compile_contract,
 )
-import b12x.cute.compiler as cute_compiler
-from b12x.moe.fused.w4a16.host import (
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.moe.fused.w4a16.host import (
     plan_w4a16_buffers,
     select_route_block_size_m,
 )
-import b12x.moe.fused.w4a16.kernel as w4a16_kernel
-from b12x.moe.fused.w4a16.prepare import (
+import sparkinfer.moe.fused.w4a16.kernel as w4a16_kernel
+from sparkinfer.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers,
     prepare_w4a16_modelopt_nvfp4_weights,
 )
@@ -75,7 +75,7 @@ from b12x.moe.fused.w4a16.prepare import (
 FAMILY = "w4a16_serving"
 FUSED_ARTIFACT_ROLE = "fused-moe"
 TOPK_ARTIFACT_ROLE = "topk-sum"
-INPUT_SCHEMA = "b12x.w4a16.serving.end_to_end_input.v1"
+INPUT_SCHEMA = "sparkinfer.w4a16.serving.end_to_end_input.v1"
 CASES_M = (*_REQUIRED_DECODE_M, *_REQUIRED_PREFILL_M)
 COMMON_CORRECTNESS_GATES = (
     "torch-w4a16-reference",
@@ -93,7 +93,7 @@ ROUTED_CORRECTNESS_GATES = (
     *COMMON_CORRECTNESS_GATES,
     "production-route-pack-in-graph",
 )
-_ROUTE_PACK_SOURCE = Path("b12x/moe/fused/w4a16/route_pack.py")
+_ROUTE_PACK_SOURCE = Path("sparkinfer/moe/fused/w4a16/route_pack.py")
 _ROUTE_PACK_ROLES = {
     "_pack_topk_routes_small_prefix_kernel": "route-pack-small-prefix",
     "_pack_topk_routes_prefix_kernel": "route-pack-prefix",

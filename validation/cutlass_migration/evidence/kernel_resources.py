@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Audit SM120 CuTe DSL objects for registers and thread-local memory.
 
-Run real GPU workloads with ``B12X_CUTE_COMPILE_CACHE_DIR`` pointed at a fresh
-directory, then pass that directory here.  The b12x object cache stores the
+Run real GPU workloads with ``SPARKINFER_CUTE_COMPILE_CACHE_DIR`` pointed at a fresh
+directory, then pass that directory here.  The sparkinfer object cache stores the
 compiled CUDA ELF inside each host object, so this audit reads the exact cubins
 that the workload launched instead of recompiling approximations.
 """
@@ -45,9 +45,9 @@ _TEXT_KERNEL_SECTION_RE = re.compile(
     re.MULTILINE,
 )
 _CACHE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
-_MANIFEST_SCHEMA = "b12x.cute.compile_manifest.v3"
-_RESOURCE_REPORT_SCHEMA = "b12x.cute.kernel_resources.v4"
-_CONTRACT_METADATA_SCHEMA = "b12x.cute.resource_row_contract.v2"
+_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
+_RESOURCE_REPORT_SCHEMA = "sparkinfer.cute.kernel_resources.v4"
+_CONTRACT_METADATA_SCHEMA = "sparkinfer.cute.resource_row_contract.v2"
 _SPECIALIZATION_CONTRACT_FIELDS = [
     "kernel_id",
     "compile_spec_version",
@@ -407,7 +407,7 @@ def _semantic_target_key(target_key: Any) -> Any:
 def _semantic_payload_from_cache_payload(cache_payload: list[Any]) -> dict[str, Any]:
     if len(cache_payload) != 10:
         raise ValueError(f"explicit cache payload has {len(cache_payload)} fields")
-    if cache_payload[0] != "b12x_cute_compile_cache_v5_explicit_spec":
+    if cache_payload[0] != "sparkinfer_cute_compile_cache_v5_explicit_spec":
         raise ValueError(f"unsupported cache format {cache_payload[0]!r}")
     semantic: dict[str, Any] = {
         "cache_format": cache_payload[0],
@@ -1142,7 +1142,7 @@ def _audit_object(
 
 
 def _short_kernel_name(kernel: str) -> str:
-    match = re.search(r"kernel_b12x(.*?)_object_at", kernel)
+    match = re.search(r"kernel_sparkinfer(.*?)_object_at", kernel)
     return match.group(1) if match else kernel
 
 

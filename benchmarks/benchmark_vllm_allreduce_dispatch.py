@@ -1,4 +1,4 @@
-"""Validate vLLM CustomAllreduce b12x wiring: autotuned crossovers + routing."""
+"""Validate vLLM CustomAllreduce sparkinfer wiring: autotuned crossovers + routing."""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ os.environ.setdefault("NCCL_IB_DISABLE", "1")
 os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
 os.environ.setdefault("NCCL_PROTO", "LL,LL128,Simple")
 os.environ.setdefault("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
-os.environ.setdefault("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
+os.environ.setdefault("VLLM_PCIE_ALLREDUCE_BACKEND", "sparkinfer")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
 import torch

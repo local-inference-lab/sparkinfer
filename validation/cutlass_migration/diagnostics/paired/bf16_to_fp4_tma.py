@@ -37,9 +37,9 @@ from validation.cutlass_migration.core.exact_cache_abba import (
     verify_artifact,
 )
 from validation.cutlass_migration.paths import REPO_ROOT
-import b12x.cute.compiler as cute_compiler
-from b12x.cute.intrinsics import quantize_grouped_nvfp4_torch
-import b12x.quantization as quantization
+import sparkinfer.cute.compiler as cute_compiler
+from sparkinfer.cute.intrinsics import quantize_grouped_nvfp4_torch
+import sparkinfer.quantization as quantization
 
 
 def _args() -> argparse.Namespace:
@@ -109,10 +109,10 @@ def _provenance(repo_root: pathlib.Path) -> dict[str, object]:
     ).stdout
     source_paths = (
         pathlib.Path(__file__).resolve(),
-        repo_root / "b12x" / "quantization" / "__init__.py",
-        repo_root / "b12x" / "quantization" / "bf16_to_fp4_tma.py",
-        repo_root / "b12x" / "cute" / "compiler.py",
-        repo_root / "b12x" / "cute" / "fp4.py",
+        repo_root / "sparkinfer" / "quantization" / "__init__.py",
+        repo_root / "sparkinfer" / "quantization" / "bf16_to_fp4_tma.py",
+        repo_root / "sparkinfer" / "cute" / "compiler.py",
+        repo_root / "sparkinfer" / "cute" / "fp4.py",
     )
     package_versions = {}
     for package in ("nvidia-cutlass-dsl", "torch"):
@@ -143,8 +143,8 @@ def _load(
     K: int,
     spec_mode: str,
 ):
-    os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = str(cache)
-    cute_compiler._b12x_package_fingerprint = lambda: fingerprint
+    os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = str(cache)
+    cute_compiler._sparkinfer_package_fingerprint = lambda: fingerprint
     cute_compiler.clear_compile_cache()
     quantization._KERNEL_CACHE.clear()
     original_spec_factory = quantization.KernelCompileSpec
@@ -237,7 +237,7 @@ def main() -> None:
     if args.M % 128 or args.K % 128:
         raise ValueError("M and K must be multiples of 128")
 
-    original_fingerprint = cute_compiler._b12x_package_fingerprint
+    original_fingerprint = cute_compiler._sparkinfer_package_fingerprint
     try:
         launch_a, cache_a, artifact_a = _load(
             args.a_cache,
@@ -254,7 +254,7 @@ def main() -> None:
             args.b_spec_mode,
         )
     finally:
-        cute_compiler._b12x_package_fingerprint = original_fingerprint
+        cute_compiler._sparkinfer_package_fingerprint = original_fingerprint
     artifacts = {args.a_label: artifact_a, args.b_label: artifact_b}
     if artifact_a["compile_spec_json"] != artifact_b["compile_spec_json"]:
         raise RuntimeError("A/B compile specifications differ")
@@ -533,7 +533,7 @@ def main() -> None:
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     result = {
-        "schema": "b12x.bf16_to_fp4_tma.cache_abba.v4",
+        "schema": "sparkinfer.bf16_to_fp4_tma.cache_abba.v4",
         "evidence_status": args.evidence_status,
         "provenance": provenance,
         "object_provenance": artifacts,

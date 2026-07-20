@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.integration import tp_moe as tp_moe_impl
-from b12x.integration import plan_b12x_fp4_moe_weights, plan_tp_moe_execution
-from b12x.moe.execution import (
+from sparkinfer.integration import tp_moe as tp_moe_impl
+from sparkinfer.integration import plan_sparkinfer_fp4_moe_weights, plan_tp_moe_execution
+from sparkinfer.moe.execution import (
     GemmEngine,
     MoERegime,
     OperandEncoding,
@@ -29,7 +29,7 @@ def _weight_plan(
     n: int = 128,
     w4a16_layout: PreparedWeightLayout | None = None,
 ):
-    return plan_b12x_fp4_moe_weights(
+    return plan_sparkinfer_fp4_moe_weights(
         quant_modes=quant_modes,
         source_format=source_format,
         activation="silu",
@@ -236,8 +236,8 @@ def test_native_w4a8_m1_alone_selects_fixed_materialized_regime(
 ) -> None:
     """M=1 specializes unified dynamic; neighboring decode sizes do not."""
 
-    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "materialized_queue")
-    monkeypatch.setenv("B12X_DYNAMIC_W4A8_MATERIALIZED", "1")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_WORK_SOURCE", "materialized_queue")
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_W4A8_MATERIALIZED", "1")
     common = dict(
         quant_mode="w4a8_mx",
         activation="silu",

@@ -5,14 +5,14 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
+def test_sparkinfer_mla_custom_ops_have_fake_dispatch() -> None:
     # Import modules for registration side effects.
-    __import__("b12x.attention.mla.kernel")
-    __import__("b12x.attention.mla.prefill")
+    __import__("sparkinfer.attention.mla.kernel")
+    __import__("sparkinfer.attention.mla.prefill")
     # prefill_mg registers the single-cache MG op + the new dual-cache MG op
     # (sparse_mla_sm120_prefill_mg_dual). prefill.py imports it lazily, so import it
     # explicitly here for the binding/fake-dispatch coverage.
-    __import__("b12x.attention.mla.prefill_mg")
+    __import__("sparkinfer.attention.mla.prefill_mg")
 
     with FakeTensorMode():
         q_all = torch.empty((2, 2, 512), dtype=torch.bfloat16)
@@ -26,7 +26,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         attn_sink = torch.empty((2,), dtype=torch.float32)
         output = torch.empty((2, 2, 512), dtype=torch.bfloat16)
 
-        torch.ops.b12x.compressed_mla_split_decode_forward(
+        torch.ops.sparkinfer.compressed_mla_split_decode_forward(
             q_all,
             cache,
             indices,
@@ -53,7 +53,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
             True,
             False,
         )
-        torch.ops.b12x.sparse_mla_split_decode_merge(
+        torch.ops.sparkinfer.sparse_mla_split_decode_merge(
             tmp_output,
             tmp_lse,
             scalar_i32,
@@ -67,7 +67,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
 
         mid_output = torch.empty((2, 2, 2, 512), dtype=torch.bfloat16)
         mid_lse = torch.empty((2, 2, 2), dtype=torch.float32)
-        torch.ops.b12x.sparse_mla_sm120_decode_grid(
+        torch.ops.sparkinfer.sparse_mla_sm120_decode_grid(
             q_all,
             cache,
             indices,
@@ -103,7 +103,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         # The single-cache decode-reuse prefill op was REMOVED (no fallback kernel
         # in prefill.py); the only prefill op is the MG dual-cache op below.
         # DUAL-CACHE MG prefill op (the new op DSV4 has_extra routes through).
-        torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
+        torch.ops.sparkinfer.sparse_mla_sm120_prefill_mg_dual(
             q_all,        # q
             cache,        # kv_flat (MAIN)
             indices,      # topk_indices
@@ -137,9 +137,9 @@ def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None
     # DSV4 dual-cache heads=80 is a paired 64-head MG prefix plus one 16-head
     # single-group tail. This is Python dispatch coverage only; the focused CUDA
     # numerics live in the SM120 test suite.
-    __import__("b12x.attention.mla.prefill")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill import run_unified_prefill
+    __import__("sparkinfer.attention.mla.prefill")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
 
     calls = []
 
@@ -184,10 +184,10 @@ def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None
 
 
 def test_glm_prefill_partitions_120_heads_as_32_16_8(monkeypatch) -> None:
-    __import__("b12x.attention.mla.prefill")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill import run_unified_prefill
-    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+    __import__("sparkinfer.attention.mla.prefill")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
+    from sparkinfer.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
 
     calls = []
 
@@ -222,10 +222,10 @@ def test_glm_prefill_partitions_120_heads_as_32_16_8(monkeypatch) -> None:
 
 
 def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
-    __import__("b12x.attention.mla.prefill")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill import run_unified_prefill
-    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+    __import__("sparkinfer.attention.mla.prefill")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
+    from sparkinfer.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
 
     calls = []
 
@@ -258,9 +258,9 @@ def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
 
 
 def test_sm120_prefill_dual_partitions_40_heads_with_8_tail(monkeypatch) -> None:
-    __import__("b12x.attention.mla.prefill")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill import run_unified_prefill
+    __import__("sparkinfer.attention.mla.prefill")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
 
     calls = []
 
@@ -297,10 +297,10 @@ def test_sm120_prefill_dual_partitions_40_heads_with_8_tail(monkeypatch) -> None
 
 
 def test_glm_tp8_prefill_routes_to_single_group_mg(monkeypatch) -> None:
-    __import__("b12x.attention.mla.prefill")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill import run_unified_prefill
-    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+    __import__("sparkinfer.attention.mla.prefill")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
+    from sparkinfer.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
 
     calls = []
 
@@ -334,10 +334,10 @@ def test_glm_tp8_prefill_routes_to_single_group_mg(monkeypatch) -> None:
 
 
 def test_prefill_mg_heads8_uses_flat_valid_hpb_launcher(monkeypatch) -> None:
-    __import__("b12x.attention.mla.prefill_mg")
-    import b12x.attention.mla.prefill_mg as prefill_mg
-    from b12x.attention.mla.prefill_mg import run_unified_prefill_mg
-    from b12x.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
+    __import__("sparkinfer.attention.mla.prefill_mg")
+    import sparkinfer.attention.mla.prefill_mg as prefill_mg
+    from sparkinfer.attention.mla.prefill_mg import run_unified_prefill_mg
+    from sparkinfer.attention.mla.traits import ComputeMode, ModelType, ScaleFormat
 
     calls = []
 
@@ -377,8 +377,8 @@ def test_sm120_prefill_dual_non_eligible_raises() -> None:
     # everything else RAISEs (the decode-reuse has_extra fallback was removed).
     # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
     # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).
-    __import__("b12x.attention.mla.prefill")
-    from b12x.attention.mla.prefill import run_unified_prefill
+    __import__("sparkinfer.attention.mla.prefill")
+    from sparkinfer.attention.mla.prefill import run_unified_prefill
 
     topk = 64  # != 128 -> non-eligible dual
     q = torch.empty((2, 32, 512), dtype=torch.bfloat16)

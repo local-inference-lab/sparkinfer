@@ -33,7 +33,7 @@ E2M1_TO_FLOAT32 = [
 
 def require_sm12x() -> torch.device:
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for b12x tests")
+        pytest.skip("CUDA is required for sparkinfer tests")
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
         pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")
@@ -57,15 +57,15 @@ def prepare_tp_moe_fp4_experts(
     w13_layout: str = "w13",
 ):
     """Prepare one explicit expert owner from source tensors for a test."""
-    from b12x.integration import (
-        plan_b12x_fp4_moe_weights,
-        prepare_b12x_fp4_moe_weights,
+    from sparkinfer.integration import (
+        plan_sparkinfer_fp4_moe_weights,
+        prepare_sparkinfer_fp4_moe_weights,
     )
 
     normalized_mode = quant_mode.lower()
     weight_E = int(w1_fp4.shape[0])
     n = int(w2_fp4.shape[2]) * 2
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes=normalized_mode,
         source_format=source_format,
         activation=activation,
@@ -80,7 +80,7 @@ def prepare_tp_moe_fp4_experts(
     if normalized_mode in {"nvfp4", "w4a8_nvfp4"}:
         w1_global_scale = (w1_alphas.float() * a1_gscale.float()).contiguous()
         w2_global_scale = (w2_alphas.float() * a2_gscale.float()).contiguous()
-    return prepare_b12x_fp4_moe_weights(
+    return prepare_sparkinfer_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w1_fp4,
         w1_blockscale=w1_blockscale,
@@ -110,7 +110,7 @@ def make_tp_moe_fp4_binding(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ):
-    from b12x.integration import (
+    from sparkinfer.integration import (
         TPMoEScratchCaps,
         plan_tp_moe_scratch,
     )
@@ -155,9 +155,9 @@ def make_tp_moe_fp4_binding(
 
 
 def run_tp_moe_fp4(**kwargs) -> torch.Tensor:
-    from b12x.integration import b12x_moe_fp4
+    from sparkinfer.integration import sparkinfer_moe_fp4
 
-    return b12x_moe_fp4(binding=make_tp_moe_fp4_binding(**kwargs))
+    return sparkinfer_moe_fp4(binding=make_tp_moe_fp4_binding(**kwargs))
 
 
 def _align_up(value: int, alignment: int) -> int:

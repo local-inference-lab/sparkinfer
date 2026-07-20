@@ -2,7 +2,7 @@
 
 This module is the ground-truth numeric reference for the P8 SM120 DSV4 *prefill*
 port. Like ``dsv4_ref.py`` (the decode reference it reuses), it has NO dependency
-on the CuTeDSL kernel, on ``b12x.cute``, or on the FlashInfer runtime — it is
+on the CuTeDSL kernel, on ``sparkinfer.cute``, or on the FlashInfer runtime — it is
 pure PyTorch so build/verification agents can compare kernel state and the final
 BF16 O / log2 LSE against a trusted oracle.
 

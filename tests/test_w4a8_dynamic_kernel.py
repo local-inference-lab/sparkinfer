@@ -13,14 +13,14 @@ import pytest
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from b12x.cute.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
-from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
+from sparkinfer.cute.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
+from sparkinfer.cute.compiler import KernelCompileSpec, compile as sparkinfer_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
-from b12x.integration.tp_moe import _DynamicMoEW4A8Launch, current_cuda_stream
-from b12x.moe.fused.dynamic import MoEDynamicKernelBackend
-from b12x.moe.fused.reference import (
+from sparkinfer.integration.tp_moe import _DynamicMoEW4A8Launch, current_cuda_stream
+from sparkinfer.moe.fused.dynamic import MoEDynamicKernelBackend
+from sparkinfer.moe.fused.reference import (
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
     moe_reference_w4a8_mx,
@@ -241,7 +241,7 @@ def _run_w4a8_dynamic(
     def _compile_or_override(*args, **kwargs):
         if compiled_override is not None:
             return compiled_override
-        return b12x_compile(*args, **kwargs)
+        return sparkinfer_compile(*args, **kwargs)
 
     compiled = _compile_or_override(
         launch,
@@ -344,11 +344,11 @@ def _run_w4a8_dynamic(
     if capture_intermediate:
         if not return_debug:
             raise ValueError("capture_intermediate requires return_debug=True")
-        from b12x.cute.intrinsics import (
+        from sparkinfer.cute.intrinsics import (
             _ue8m0_output_scale_torch,
             pow2_ceil_ue8m0_torch,
         )
-        from b12x.moe.fused.reference import (
+        from sparkinfer.moe.fused.reference import (
             _make_fp4_lut,
             _quant_dequant_mxfp8_rows,
             _w4a8_effective_weight,
@@ -456,7 +456,7 @@ def _run_w4a8_dynamic(
     if capture_fc1_raw:
         if not return_debug:
             raise ValueError("capture_fc1_raw requires return_debug=True")
-        from b12x.moe.fused.reference import (
+        from sparkinfer.moe.fused.reference import (
             _make_fp4_lut,
             _quant_dequant_mxfp8_rows,
             _w4a8_effective_weight,
@@ -907,7 +907,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     def fake_ptr_u32():
         return make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
 
-    compiled = b12x_compile(
+    compiled = sparkinfer_compile(
         launch,
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),

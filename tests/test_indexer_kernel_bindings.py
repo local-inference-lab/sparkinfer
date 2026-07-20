@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.attention.indexer.contiguous_kernel as contiguous_kernel
-import b12x.attention.indexer.kernel as paged_kernel
+import sparkinfer.attention.indexer.contiguous_kernel as contiguous_kernel
+import sparkinfer.attention.indexer.kernel as paged_kernel
 
 
 def _paged_tensors():

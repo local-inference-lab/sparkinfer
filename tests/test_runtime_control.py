@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 import cutlass.cute as cute
 
-import b12x
-import b12x.cute.compiler as cute_compiler
-import b12x.cute.runtime_control as runtime_control
-from b12x.cute.compiler import KernelCompileSpec
+import sparkinfer
+import sparkinfer.cute.compiler as cute_compiler
+import sparkinfer.cute.runtime_control as runtime_control
+from sparkinfer.cute.compiler import KernelCompileSpec
 
 
 @pytest.fixture(autouse=True)
@@ -16,10 +16,10 @@ def _clear_kernel_resolution_freeze():
     runtime_control.unfreeze_kernel_resolution()
 
 
-def test_b12x_exports_kernel_resolution_freeze_api() -> None:
-    assert b12x.freeze_kernel_resolution is runtime_control.freeze_kernel_resolution
-    assert b12x.unfreeze_kernel_resolution is runtime_control.unfreeze_kernel_resolution
-    assert b12x.freeze_compilation is runtime_control.freeze_kernel_resolution
+def test_sparkinfer_exports_kernel_resolution_freeze_api() -> None:
+    assert sparkinfer.freeze_kernel_resolution is runtime_control.freeze_kernel_resolution
+    assert sparkinfer.unfreeze_kernel_resolution is runtime_control.unfreeze_kernel_resolution
+    assert sparkinfer.freeze_compilation is runtime_control.freeze_kernel_resolution
 
 
 def test_kernel_resolution_freeze_error_includes_context() -> None:
@@ -39,8 +39,8 @@ def test_kernel_resolution_freeze_error_includes_context() -> None:
 
 
 def test_cute_launch_allows_cached_hits_but_rejects_new_resolution(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
-    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("SPARKINFER_CUTE_COMPILE_MEMORY_CACHE", raising=False)
     cute_compiler.clear_compile_cache()
     compile_calls: list[tuple[tuple[object, ...], bool]] = []
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.distributed.pcie_dcp_a2a import (
+from sparkinfer.distributed.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _staging_layout,
@@ -225,13 +225,13 @@ def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._current_stream_key",
+        "sparkinfer.distributed.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._is_current_stream_capturing",
+        "sparkinfer.distributed.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
