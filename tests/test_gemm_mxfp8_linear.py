@@ -69,6 +69,15 @@ def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
     return x_deq @ w_deq.T
 
 
+def _storage_tail_bytes(tensor: torch.Tensor) -> int:
+    last_item = tensor.storage_offset() + sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    logical_end = (last_item + 1) * tensor.element_size()
+    return tensor.untyped_storage().nbytes() - logical_end
+
+
 def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
     require_sm120()
     require_mxf8_mma()
@@ -153,16 +162,45 @@ def test_mxfp8_linear_default_fused_path_captures_with_k_padding() -> None:
     weight, weight_scale = _quantize_modelopt_mxfp8_rows(weight_bf16)
     packed = pack_mxfp8_linear_weight(weight, weight_scale)
 
-    eager = mxfp8_linear(source, packed).clone()
+    eager = mxfp8_linear(
+        source, packed, tail_padding_bytes=64 * 1024
+    ).clone()
     torch.cuda.synchronize()
 
-    mxfp8_linear(source, packed)
+    mxfp8_linear(source, packed, tail_padding_bytes=64 * 1024)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = mxfp8_linear(source, packed)
+        actual = mxfp8_linear(source, packed, tail_padding_bytes=64 * 1024)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
 
+    assert _storage_tail_bytes(actual) >= 64 * 1024
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_mxfp8_linear_writes_directly_to_tail_padded_output() -> None:
+    require_sm120()
+    require_mxf8_mma()
+    torch.manual_seed(20260720)
+
+    tokens, in_features, out_features = 6, 128, 64
+    source = torch.randn(
+        (tokens, in_features), device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    weight_bf16 = torch.randn(
+        (out_features, in_features), device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    bias = torch.randn((out_features,), device="cuda", dtype=torch.bfloat16)
+    weight, weight_scale = _quantize_modelopt_mxfp8_rows(weight_bf16)
+    packed = pack_mxfp8_linear_weight(weight, weight_scale)
+
+    expected = mxfp8_linear(source, packed, bias=bias)
+    actual = mxfp8_linear(
+        source, packed, bias=bias, tail_padding_bytes=64 * 1024
+    )
+    torch.cuda.synchronize()
+
+    assert _storage_tail_bytes(actual) >= 64 * 1024
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

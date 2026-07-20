@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cutlass.cute as cute
@@ -36,6 +37,19 @@ def _c_dtype_name(dtype: torch.dtype) -> str:
     if dtype == torch.float16:
         return "float16"
     raise ValueError(f"b12x MXFP8 linear output dtype must be bf16/fp16, got {dtype}")
+
+
+def _tail_padded_output(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    tail_padding_bytes: int,
+) -> torch.Tensor:
+    numel = math.prod(shape)
+    pad_numel = math.ceil(tail_padding_bytes / dtype.itemsize)
+    owner = torch.empty(numel + pad_numel, dtype=dtype, device=device)
+    return owner[:numel].view(shape)
 
 
 def _source_2d(source: torch.Tensor) -> torch.Tensor:
@@ -178,17 +192,27 @@ def _mxfp8_linear_fused_op(
     out_features: int,
     expected_m: int,
     stream_int: int | None,
+    tail_padding_bytes: int,
 ) -> torch.Tensor:
     del weight_scale_rows
     tokens = int(source_2d.shape[0])
     source_for_quant = _pad_source_2d_k(source_2d, int(padded_in_features))
     x_q = quantize_block_fp8_linear_input_mxfp8(source_for_quant)
+    output = None
+    if tail_padding_bytes > 0:
+        output = _tail_padded_output(
+            (tokens, out_features, 1),
+            dtype=source_2d.dtype,
+            device=source_2d.device,
+            tail_padding_bytes=tail_padding_bytes,
+        )
     return dense_gemm(
         (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
         (
             weight_values.reshape(out_features, padded_in_features, 1),
             weight_scale_mma,
         ),
+        out=output,
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype=_c_dtype_name(source_2d.dtype),
@@ -210,8 +234,9 @@ def _mxfp8_linear_fused_fake(
     out_features: int,
     expected_m: int,
     stream_int: int | None,
+    tail_padding_bytes: int,
 ) -> torch.Tensor:
-    del stream_int
+    del stream_int, tail_padding_bytes
     del weight_values, weight_scale_rows, weight_scale_mma
     del in_features, padded_in_features, expected_m
     return torch.empty(
@@ -228,6 +253,7 @@ def mxfp8_linear(
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
     stream: object = None,
+    tail_padding_bytes: int = 0,
 ) -> torch.Tensor:
     """Run a ModelOpt MXFP8 linear through the native b12x dense GEMM path."""
 
@@ -235,6 +261,8 @@ def mxfp8_linear(
     if not isinstance(packed_weight, MXFP8LinearWeight):
         raise TypeError("packed_weight must be an MXFP8LinearWeight")
     source_2d = _source_2d(source)
+    if tail_padding_bytes < 0:
+        raise ValueError("tail_padding_bytes must be non-negative")
     tokens, in_features = map(int, source_2d.shape)
     if in_features != int(packed_weight.in_features):
         raise ValueError(
@@ -246,7 +274,12 @@ def mxfp8_linear(
 
     out_features = int(packed_weight.out_features)
     if tokens == 0:
-        output = source_2d.new_empty((0, out_features))
+        output = _tail_padded_output(
+            (0, out_features),
+            dtype=source_2d.dtype,
+            device=source_2d.device,
+            tail_padding_bytes=tail_padding_bytes,
+        )
     else:
         output = torch.ops.b12x.mxfp8_linear_fused(
             source_2d,
@@ -258,9 +291,10 @@ def mxfp8_linear(
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
             cuda_stream_to_int(stream),
+            tail_padding_bytes,
         )
     if bias is not None:
-        output = output + bias
+        output.add_(bias)
     return output.view(*source.shape[:-1], out_features)
 
 
