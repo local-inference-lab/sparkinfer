@@ -54,7 +54,7 @@ from b12x.integration.compressed_scratch import (
     _materialize_compressed_mla_scratch,
 )
 
-from .helpers import require_sm120 as _require_sm120
+from .helpers import require_sm12x as _require_sm12x
 
 
 # GLM_NSA uncompressed decode contract: q_head_dim = d_nope + d_rope = 512 + 64 = 576,
@@ -189,12 +189,12 @@ def compressed_mla_decode_forward(
     )
 
 
-def require_sm120_sparse_mla() -> torch.device:
+def require_sm12x_sparse_mla() -> torch.device:
     """Skip unless a real SM120+ device is present (mirrors the compressed-MLA pattern).
 
     The routing branch under test is only reachable on SM120 hardware.
     """
-    device = _require_sm120()
+    device = _require_sm12x()
     if get_sm_version(device) < 120:
         pytest.skip("SM120 sparse MLA dispatch requires an SM120+ device")
     return device
@@ -254,7 +254,7 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
     without compiling a kernel for tiny inputs, and pin the legacy reference so any
     accidental legacy fallthrough would be counted (it must stay zero).
     """
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -291,7 +291,7 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
 
 @torch.inference_mode()
 def test_glm_decode_backend_legacy_is_retired() -> None:
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
 
     q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(device)
     with pytest.raises(ValueError, match="legacy sparse MLA kernels have been retired"):
@@ -318,7 +318,7 @@ def test_glm_decode_valid_contract_routes_to_sm120(monkeypatch) -> None:
     legacy reference does NOT run. We monkeypatch run_unified_decode to a sentinel
     so the routing decision is observed without compiling a kernel for tiny inputs.
     """
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -395,7 +395,7 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
     The launcher is exercised end-to-end by .sm120port/probes/glm_prefill_e2e_check.py
     vs glm_prefill_ref; here we prove ONLY the GATE intercepts a prefill-like GLM
     contract and routes to prefill (not decode / not legacy split)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"prefill": 0, "decode": 0}
@@ -445,7 +445,7 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
 def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
     """(3a) The decode mode still routes to run_unified_decode (prefill routing is
     gated on workspace.mode -- decode must NOT regress to prefill)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     _force_legacy_reference(monkeypatch)
 
     routed = {"prefill": 0, "decode": 0}
@@ -522,7 +522,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     """DSV4 main-cache contract: compressed_mla_decode_forward routes to
     SM120 sparse MLA.run_unified_decode (kernel split-K partials + reused base-2 merge)
     and matches compressed_sparse_mla_reference."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     del monkeypatch
 
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
@@ -568,7 +568,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mod
     """DSV4 compressed contract in a prefill-like mode routes
     compressed_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
     DSV4 prefill), NOT run_unified_decode."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     routed = {"prefill": 0, "decode": 0}
 
     def fake_run_unified_prefill(*, q, output=None, **kwargs):
@@ -620,7 +620,7 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
 
     A mapped indexed_page_table raises because the active gather addresses the
     extra cache by raw slot id; that guard is checked separately."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     del monkeypatch
 
     topk, extra_topk, pbs_extra = 64, 128, 2
@@ -672,7 +672,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
     UNSUPPORTED (upstream FlashInfer addresses the extra cache by raw slot id only).
     Per the no-legacy-fallback directive the dispatch must RAISE a clear error, not
     silently route to legacy."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=7)
     scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
@@ -700,7 +700,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
 def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
     """A partial dual-cache trio (some-but-not-all indexed_* args) is a HARD ERROR
     matching upstream's required-together ICHECK (sparse_mla_sm120.cu:171-174)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=11)
     scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
@@ -726,7 +726,7 @@ def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
 def test_glm_decode_backend_kwarg_routes_to_unified(monkeypatch) -> None:
     """(b') backend="sm120" routes the GLM decode to SM120 sparse MLA even with
     an explicit backend kwarg (GLM_NSA implemented; the gate routes via run_unified_decode)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -874,7 +874,7 @@ def test_unified_decode_launcher_matches_dsv4_ref(topk, forced_num_splits) -> No
     the dsv4_ref oracle for num_heads=128 at the validated P5 gate, for BOTH
     num_splits=1 and a forced>1 split (the multi-split chunk-aligned partition is
     numerically identical to single-split)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse, eff_splits = _run_unified_dsv4(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
     )
@@ -907,7 +907,7 @@ def test_unified_decode_multi_split_equals_single_split(topk, forced_num_splits)
     """A forced multi-split decode must equal the single-split decode (same
     chunk-aligned candidate partition, merged base-2): each candidate is owned by
     exactly one split, so the reduction is exact, not just within-tolerance."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_single, _, _, _, _ = _run_unified_dsv4(
         device, topk=topk, forced_num_splits=1, seed=topk,
     )
@@ -978,7 +978,7 @@ def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_nu
     """run_unified_decode DSV4 dual-cache (main + extra, ONE online softmax over the
     union) matches dsv4_extra_decode_reference for num_heads=128, topk=512 x
     extra_topk in {64,128}, single AND forced>1 split, at the P5 gate."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
         device, topk=topk, extra_topk=extra_topk,
         forced_num_splits=forced_num_splits, seed=topk + extra_topk,
@@ -994,7 +994,7 @@ def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_nu
 def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> None:
     """DSV4 dual-cache prefill heads=80 uses the split MG path (64-head paired
     prefix + 16-head tail) and matches the PyTorch extra-cache oracle."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_prefill
 
     num_heads = 80
@@ -1046,7 +1046,7 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
 def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
     """DSV4 prefill heads=8 uses a single MG group with VALID_HPB=8 and must not
     read or reduce the zero-padded upper half of the HPB=16 tile."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_prefill
 
     num_tokens, num_heads, topk = 16, 8, 128
@@ -1098,7 +1098,7 @@ def test_unified_prefill_glm_tp8_topk2048_matches_reference(
     """GLM 5.x TP8 has eight local attention heads and a 2048-token sparse
     selection.  Exercise that serving shape directly, including the
     VALID_HPB=8 tail and both contiguous and vLLM packed page-strided caches."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_prefill
 
     num_tokens, num_heads, topk = 2, 8, 2048
@@ -1173,7 +1173,7 @@ def test_unified_prefill_glm_tp8_topk2048_matches_reference(
 def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     """extra_topk=0 (no extra cache) must reduce to the single-cache decode: the
     dual reference's concat is a no-op, so the unified main-only path matches."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     # main-only via the single-cache launcher path (extra args omitted) vs the
     # dual reference with extra_topk=0 (== dsv4_decode_reference).
     got_O, _, exp_O, _, _ = _run_unified_dsv4(
@@ -1199,7 +1199,7 @@ def test_unified_decode_dual_cache_zero_width_main_extra_only(
 
     This is the P10h zero-width-main fix: cute.make_layout(0) is illegal, so the
     main topk_row is elided to a degenerate 1-extent view that is never read."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
         device, topk=0, extra_topk=extra_topk,
         forced_num_splits=forced_num_splits, seed=extra_topk + 13,
@@ -1297,7 +1297,7 @@ def test_unified_decode_glm_tp8_native_swap_ab_matches_reference(
     forced_num_splits,
 ) -> None:
     """GLM TP8 uses the native four-warp swapped-QK decode specialization."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     import b12x.attention.mla.kernel as launch
 
     got_O, exp_O, _ = _run_unified_glm(
@@ -1328,7 +1328,7 @@ def test_unified_decode_glm_tp8_native_matches_padded_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The native TP8 path preserves the former padded decode numerics."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     kwargs = dict(
         topk=256,
         forced_num_splits=4,
@@ -1346,7 +1346,7 @@ def test_unified_decode_glm_tp8_native_matches_padded_path(
 @torch.inference_mode()
 def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None:
     """The uniform scalar-length entry uses the same native TP8 math path."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     import b12x.attention.mla.kernel as launch
 
     got_O, exp_O, _ = _run_unified_glm(
@@ -1372,7 +1372,7 @@ def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> Non
     """run_unified_decode GLM_NSA branch (ARBITRARY_FP32 inline scales,
     V_HAS_ROPE=false, 512/128/4) matches the glm_ref oracle for num_heads=128 at
     the looser GLM gate (cos > 0.995, O atol 3e-2), for single AND forced>1 split."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, exp_O, eff_splits = _run_unified_glm(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
     )
@@ -1389,7 +1389,7 @@ def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> Non
 def test_unified_decode_glm_multi_split_equals_single_split(topk, forced_num_splits) -> None:
     """A forced GLM multi-split decode must match the single-split decode (same
     chunk-aligned candidate partition, merged base-2)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_single, _, _ = _run_unified_glm(device, topk=topk, forced_num_splits=1, seed=topk)
     got_multi, _, eff_splits = _run_unified_glm(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
@@ -1407,7 +1407,7 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
     """GLM_NSA decode with num_tokens in {1,4,16}, num_heads=128, and MIXED
     per-token active_token_counts (the GLM topk_length) matches glm_decode_reference
     per token at the GLM gate (cos > 0.995)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_decode
     from b12x.integration.sparse_mla_scratch import (
         B12XSparseMLAScratchCaps,
@@ -1468,7 +1468,7 @@ def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits
     """GLM_NSA decode return_lse: the FINAL base-2 LSE reconstructed from mid_lse
     matches the glm_ref oracle base-2 LSE (the GLM branch shares the merge + LSE
     reconstruction with DSV4)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_decode
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
@@ -1576,7 +1576,7 @@ def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> 
     """attn_sink fold (wired into the split.py sink-merge, upstream's sink-in-merge
     design) matches the dsv4_ref oracle (which folds sink as output *= sigmoid(lse_e
     - sink))."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, _, exp_O, _, sink = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=True,
         return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
@@ -1596,7 +1596,7 @@ def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> 
 def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) -> None:
     """return_lse returns the FINAL base-2 LSE reconstructed from the per-split
     mid_lse; it matches the dsv4_ref base-2 LSE (no sink)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, _ = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
         return_lse=True, lse_scale="base2", forced_num_splits=forced_num_splits,
@@ -1616,7 +1616,7 @@ def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) ->
 def test_unified_decode_return_lse_natural_scale() -> None:
     """return_lse with lse_scale='natural' returns the natural-log LSE (= base-2 *
     ln2)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     _, got_lse_nat, _, exp_lse_log2, _ = _run_unified_dsv4_feature(
         device, topk=256, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
         return_lse=True, lse_scale="natural", forced_num_splits=1, seed=99,
@@ -1636,7 +1636,7 @@ def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_spli
     (not multiples of 16)} match the dsv4_ref oracle (which attends per-head over
     only the valid heads). The kernel zero-pads the HPB=16 tile and gates writes to
     the valid head rows via the (up to two) per-head-block grids."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk = 256
     got_O, _, exp_O, _, _ = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=num_heads, with_sink=False,
@@ -1656,7 +1656,7 @@ def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_spli
 def test_unified_decode_valid_hpb_with_lse_and_sink() -> None:
     """A non-multiple-of-16 head shard (24) WITH both attn_sink + return_lse: O and
     the sink-folded LSE both match the reference on exactly the valid heads."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, sink = _run_unified_dsv4_feature(
         device, topk=256, num_heads=24, with_sink=True,
         return_lse=True, lse_scale="base2", forced_num_splits=2, seed=4242,
@@ -1764,7 +1764,7 @@ def test_unified_decode_multitoken_per_token_length(num_tokens, neg_pad_past_len
     BOTH when the caller passes real lengths with valid indices (a; the OLD uniform
     kernel was latently wrong) AND when the caller -1-pads indices past the length
     (b; the OLD uniform kernel was already correct via idx<0)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk = 512
     lengths = _mixed_lengths(num_tokens, topk, device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
@@ -1788,7 +1788,7 @@ def test_unified_decode_multitoken_old_uniform_was_wrong_for_valid_indices() -> 
     the length (no -1 padding), the per-token kernel must DIFFER from a uniform
     full-topk decode (proving the per-token masking actually changes the result --
     i.e. the old uniform-length kernel was latently wrong for this contract)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk, num_tokens = 512, 4
     # Real mixed lengths < topk for the short tokens.
     lengths = _mixed_lengths(num_tokens, topk, device)
@@ -1823,7 +1823,7 @@ def test_unified_decode_uniform_length_batch_matches_reference() -> None:
     """A multi-token batch whose every topk_length[t] == topk must match the
     reference. CUDA dispatch avoids a host read of the length tensor, so uniform
     batches can still use the per-token entrypoint."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     topk, num_tokens = 512, 4
     full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
@@ -1838,7 +1838,7 @@ def test_unified_decode_uniform_length_batch_matches_reference() -> None:
 def test_unified_decode_mixed_length_routes_to_per_token_kernel() -> None:
     """A genuinely-mixed-length multi-token batch must route to the per-token
     kernel (per_token_len=True in the plan side-channel)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     import b12x.attention.mla.kernel as L
     topk, num_tokens = 512, 4
     lengths = _mixed_lengths(num_tokens, topk, device)
@@ -1857,7 +1857,7 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     """DSV4 dual-cache decode with MIXED per-token MAIN topk_length AND per-token
     EXTRA extra_topk_length (num_tokens in {1,4,16}, num_heads=128) matches
     dsv4_extra_decode_reference over the masked union, per token."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_decode
 
     topk, extra_topk, pbs_extra = 512, 128, 2
@@ -1953,7 +1953,7 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
     must produce O==0 (cos==1 via _cosine's 0-norm guard, plus an explicit norm
     check) -- without the empty-row guard it normalized a spurious all-masked softmax
     sum to garbage (the cos~0.20 extend failure)."""
-    device = require_sm120_sparse_mla()
+    device = require_sm12x_sparse_mla()
     from b12x.attention.mla.kernel import run_unified_prefill
 
     # MG-eligible GLM width (topk in {512,1024,2048}); the off-64-boundary

@@ -12,7 +12,7 @@ from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, be
 from b12x.integration.tp_moe import clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference
 
-from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -118,7 +118,7 @@ def _launch_on_stream(
 
 
 def test_b12x_uses_current_cuda_stream() -> None:
-    require_sm120()
+    require_sm12x()
     _require_model_weights()
 
     clear_tp_moe_caches()

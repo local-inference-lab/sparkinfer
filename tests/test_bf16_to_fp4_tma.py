@@ -16,7 +16,7 @@ from b12x.quantization import (
     compile_bf16_to_fp4_tma,
 )
 
-from .helpers import dequantize_grouped_nvfp4, require_sm120
+from .helpers import dequantize_grouped_nvfp4, require_sm12x
 
 
 def _reference(
@@ -86,7 +86,7 @@ _RESOURCE_SHAPES = [
 def test_dsl_compile_option_provenance_is_fresh_process_stable(
     tmp_path: Path,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     script = r"""
 import json
 import hashlib
@@ -248,7 +248,7 @@ print(json.dumps(result, sort_keys=True))
 def test_bf16_to_fp4_tma_compile_identity_separates_strategy_and_mac(
     tmp_path: Path,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     cache_dir = tmp_path / "compile-cache"
     script = r"""
 import json
@@ -348,7 +348,7 @@ def test_bf16_to_fp4_tma_eager_exact(
     K: int,
     global_scale_value: float,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     source = _random_source(
         device,
         M,
@@ -384,7 +384,7 @@ def test_bf16_to_fp4_tma_graph_replay_exact(
     K: int,
     global_scale_value: float,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     source = _random_source(
         device,
         M,
@@ -483,7 +483,7 @@ def test_bf16_to_fp4_tma_graph_replay_exact(
 
 
 def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     M = K = 128
     # Each group of 16 values targets one E4M3 scale encoding. This spans
     # zero, two subnormal values, the minimum normal value, and both sides of
@@ -623,7 +623,7 @@ def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
 
 
 def test_bf16_to_fp4_tma_rejects_invalid_capacity_and_aliasing() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     with pytest.raises(ValueError, match="multiples"):
         compile_bf16_to_fp4_tma(127, 128)
     with pytest.raises(ValueError, match="multiples"):

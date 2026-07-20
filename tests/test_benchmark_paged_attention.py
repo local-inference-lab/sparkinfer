@@ -16,7 +16,7 @@ from benchmarks.benchmark_paged_attention import (
     _strict_guarded_replay_for_correctness,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def test_decode_replay_cases_cover_requested_qwen35_batch_buckets() -> None:
@@ -65,7 +65,7 @@ def test_decode_graph_bucket_policy_defaults_to_heuristic_qwen35_capture_contrac
 
 @torch.inference_mode()
 def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_reference() -> None:
-    require_sm120()
+    require_sm12x()
 
     policy = _resolve_decode_graph_bucket_policy(
         batch=1,

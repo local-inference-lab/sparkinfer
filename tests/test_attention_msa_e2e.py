@@ -14,7 +14,7 @@ from b12x.integration.attention import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .paged_attention_helpers import make_paged_inputs
 
 
@@ -235,7 +235,7 @@ def _run_msa_extend_attention(
 
 @torch.inference_mode()
 def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
 
     batch = 2
@@ -423,7 +423,7 @@ def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> No
 
 @torch.inference_mode()
 def test_msa_prefill_indexer_selection_to_union_attention_contract() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[8, 5],
         cache_seqlens=[384, 512],

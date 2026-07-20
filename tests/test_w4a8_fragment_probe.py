@@ -34,7 +34,7 @@ from b12x.cute.intrinsics import (
     mxfp8_mma_m16n8k32_f32_e4m3,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 _M, _N, _K = 16, 8, 64  # one m16n8 tile, two k32 blocks
 
@@ -173,7 +173,7 @@ def _e4m3_bytes(values: torch.Tensor) -> torch.Tensor:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_probe_data_path_exact_unit_scales() -> None:
     """Expansion + k-permutation + double-k32 MMA, bit-exact on dyadic data."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(0)
     # Dyadic values: every product and partial sum is exact in f32, so the
@@ -196,7 +196,7 @@ def test_w4a8_probe_data_path_exact_unit_scales() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_probe_residual_path_exact() -> None:
     """The NVFP4 residual multiply inside the expansion, bit-exact."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(1)
     a_vals = torch.tensor([0.5, 1.0, 2.0, -1.0], device=device)
@@ -274,7 +274,7 @@ def _discover_mapping(role: str) -> dict[tuple[int, int], tuple[int, int]]:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_probe_sf_selector_mapping() -> None:
     """Discover and pin the scale_vec::1X SFA/SFB (lane, byte) mapping."""
-    require_sm120()
+    require_sm12x()
     sfa_map = _discover_mapping("sfa")
     sfb_map = _discover_mapping("sfb")
     print("SFA mapping (lane, byte) -> (row, kblock):", sorted(sfa_map.items()))
@@ -296,7 +296,7 @@ def test_w4a8_probe_sf_selector_mapping() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_probe_full_scaled_vs_oracle() -> None:
     """Random data + real block scales routed per the discovered mapping."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(2)
 

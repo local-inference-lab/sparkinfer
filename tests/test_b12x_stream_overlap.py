@@ -9,7 +9,7 @@ from b12x.integration.tp_moe import (
 )
 from b12x.moe.fused.reference import compare_to_reference
 
-from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -121,7 +121,7 @@ def _assert_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 def test_b12x_supports_overlapping_stream_launches() -> None:
-    require_sm120()
+    require_sm12x()
     _require_model_weights()
 
     clear_tp_moe_caches()

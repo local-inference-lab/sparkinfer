@@ -26,7 +26,7 @@ _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
     sys.path.insert(0, str(_FLASHINFER_ROOT))
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _import_flashinfer_gemm():
@@ -110,7 +110,7 @@ def _run_dense_gemm(
 def test_dense_gemm_matches_flashinfer_cudnn(
     M: int, N: int, K: int, c_dtype_str: str,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(42)
 
@@ -160,7 +160,7 @@ def test_dense_gemm_fp4_swap_ab_small_tilen_matches_flashinfer_cudnn(
     mma_tiler_mn: tuple[int, int],
     load_path: str,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(7)
 
@@ -279,7 +279,7 @@ def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
 def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(29)
 
     # Use the real grouped WO-A geometry. The manual BK64 path is deliberately
@@ -345,7 +345,7 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
     gate_shape: tuple[int, int, int],
     down_shape: tuple[int, int, int],
 ) -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(1234)
 
     gate_m, gate_n, gate_k = gate_shape

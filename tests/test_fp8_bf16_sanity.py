@@ -16,7 +16,7 @@ from b12x.cute.intrinsics import (
     fp8x4_e4m3_to_bfloat2x2,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 class TinyFp8Bf16DequantKernel:
@@ -108,7 +108,7 @@ def _to_cute_tensor(x: torch.Tensor, dtype) -> cute.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_tiny_fp8_bf16_dequant_matches_reference() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(0)
     device = torch.device("cuda")
 

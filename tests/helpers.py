@@ -31,9 +31,12 @@ E2M1_TO_FLOAT32 = [
 ]
 
 
-def require_sm120() -> torch.device:
+def require_sm12x() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for b12x tests")
+    major, minor = torch.cuda.get_device_capability()
+    if major != 12 or minor not in (0, 1):
+        pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")
     return torch.device("cuda")
 
 

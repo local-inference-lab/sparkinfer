@@ -225,7 +225,7 @@ def _device_name(device: torch.device) -> str:
     return f"{props.name} sm_{major}{minor}"
 
 
-def _require_sm120() -> torch.device | None:
+def _require_sm12x() -> torch.device | None:
     if not torch.cuda.is_available():
         print("SKIP: CUDA is not available")
         return None
@@ -3162,7 +3162,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    device = _require_sm120()
+    device = _require_sm12x()
     if device is None:
         return 0
     print(

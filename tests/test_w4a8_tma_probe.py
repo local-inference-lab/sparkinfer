@@ -42,7 +42,7 @@ from b12x.cute.intrinsics import (
 from b12x.gemm.dense import DenseGemmKernel
 from tests.test_w4a8_fragment_probe import _e4m3_bytes, _pack_b
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 _TILE_N = 128
 _TILE_K = 128  # fp4 positions -> 64 bytes per row
@@ -313,7 +313,7 @@ def test_tma_b_layout_dump_matches_swizzle_formula():
     """P1: the physical (row, chunk) -> smem offset mapping equals the
     primary byte-domain Swizzle<2,4,3> formula, for both stages, with an
     8192B stage stride."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     b_words = _make_b_source(device, n_tiles=1, k_tiles=2)
     dump = _run("dump", b_words).cpu()
@@ -356,7 +356,7 @@ def test_tma_b_corrected_read_formula():
     """P2: the consumer-shaped corrected read returns exactly the source
     word for every (n_in, kb, lane_c), on both stages (8192B apart) and a
     non-zero k_tile (FC2 pair second-tile analogue)."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     b_words = _make_b_source(device, n_tiles=1, k_tiles=4)
     src = b_words.cpu().view(_TILE_N, 16, 4)
@@ -379,7 +379,7 @@ def test_tma_b_gemm_bit_exact():
     reproduces the torch oracle bit-exactly (dyadic data, unit scales), on
     both stages (the fused gate/up granule halves are exactly stage 0/1 of
     this layout, 8192B apart)."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(7)
     a_vals = torch.tensor([0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 4.0, -2.0], device=device)

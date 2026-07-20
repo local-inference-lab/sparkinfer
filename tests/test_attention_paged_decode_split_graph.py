@@ -25,7 +25,7 @@ from b12x.integration.attention import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .paged_attention_helpers import make_paged_inputs
 
 
@@ -191,7 +191,7 @@ def _run_forced_split_decode_graph(
 @torch.inference_mode()
 def test_forced_split_decode_graph_gqa16_head_dim128() -> None:
     """MiniMax-M3 dense-layer shape: 64 q heads / 4 KV heads / head_dim 128."""
-    require_sm120()
+    require_sm12x()
     _run_forced_split_decode_graph(
         q_heads=64,
         kv_heads=4,
@@ -204,7 +204,7 @@ def test_forced_split_decode_graph_gqa16_head_dim128() -> None:
 @torch.inference_mode()
 def test_forced_split_decode_graph_gqa12_head_dim128() -> None:
     """gqa 12: second MMA row slot partially occupied."""
-    require_sm120()
+    require_sm12x()
     _run_forced_split_decode_graph(
         q_heads=48,
         kv_heads=4,
@@ -216,7 +216,7 @@ def test_forced_split_decode_graph_gqa12_head_dim128() -> None:
 @torch.inference_mode()
 def test_forced_split_decode_graph_gqa8_head_dim256() -> None:
     """gqa 8 / head_dim 256 control (single row slot fast path)."""
-    require_sm120()
+    require_sm12x()
     _run_forced_split_decode_graph(
         q_heads=8,
         kv_heads=1,
@@ -229,7 +229,7 @@ def test_forced_split_decode_graph_gqa8_head_dim256() -> None:
 @torch.inference_mode()
 def test_forced_split_decode_graph_gqa16_head_dim128_batch2() -> None:
     """batch != 4 exercises the bf16/128 regular-decode merge bdy=3 config."""
-    require_sm120()
+    require_sm12x()
     _run_forced_split_decode_graph(
         q_heads=64,
         kv_heads=4,

@@ -14,7 +14,7 @@ from b12x.integration.paged_attention_scratch import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _caps() -> B12XPagedAttentionScratchCaps:
@@ -265,7 +265,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
     window_left: int,
     use_attention_sink: bool,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = (
@@ -364,7 +364,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
 def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
     mode: str,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     q_seqlens = [5] if mode == "extend" else [1]
@@ -442,7 +442,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
 
 
 def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     plan = plan_paged_attention_scratch(
@@ -518,7 +518,7 @@ def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
 
 @torch.inference_mode()
 def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata() -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     batch = 4
@@ -790,7 +790,7 @@ def _run_mimo_v25_fp8_decode_graph_case(
 def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     captured_specs = []
@@ -878,7 +878,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
 def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     def fail_regular_metadata_update(**kwargs: object) -> None:
@@ -909,7 +909,7 @@ def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
 def test_mimo_v25_fp8_decode_graph_pads_large_power2_page_table_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     paged_api.clear_paged_caches()
 
     def fail_regular_metadata_update(**kwargs: object) -> None:

@@ -9,7 +9,7 @@ import torch
 
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_w4a8_mx
 
-from .helpers import make_tp_moe_fp4_binding, require_sm120
+from .helpers import make_tp_moe_fp4_binding, require_sm12x
 from .test_w4a8_dynamic_kernel import _run_w4a8_dynamic
 from .test_w4a8_mx_tp_moe import (
     _E,
@@ -112,7 +112,7 @@ def test_w4a8_direct_tile_recipe_activation_matches_oracle_under_graph(
 ) -> None:
     """Cover every direct tile/recipe/activation specialization under replay."""
 
-    require_sm120()
+    require_sm12x()
     # M16 also supplies the decode-sized boundary; the remaining inputs cross
     # their tile boundary so tail predicates execute in every specialization.
     m = {16: 1, 32: 33, 64: 65, 128: 129}[tile_m]
@@ -151,7 +151,7 @@ def test_w4a8_packed_prefill_matches_oracle_under_graph(
 ) -> None:
     """Exercise activation packing and routed prefill at serving-scale M."""
 
-    require_sm120()
+    require_sm12x()
     output, reference, launch, state = _run_w4a8_dynamic(
         recipe=recipe,
         activation=activation,
@@ -184,7 +184,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
 ) -> None:
     """Prove the serving materialized route/phase1/phase2 prefill graph."""
 
-    require_sm120()
+    require_sm12x()
     from b12x.integration.tp_moe import b12x_moe_fp4, clear_tp_moe_caches
 
     monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "64x128")

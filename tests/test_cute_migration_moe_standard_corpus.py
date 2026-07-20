@@ -21,7 +21,7 @@ from b12x.moe.fused.reference import (
 
 from .helpers import (
     prepare_tp_moe_fp4_experts,
-    require_sm120,
+    require_sm12x,
     swizzle_block_scale_reference,
 )
 
@@ -417,7 +417,7 @@ def test_standard_moe_micro_live_graph_oracle(
 ) -> None:
     """Reach ``integration.tp_moe.micro_direct`` through production dispatch."""
 
-    device = require_sm120()
+    device = require_sm12x()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_nvfp4_weights(device, seed=101)
     initial = _make_inputs(device, m=2, seed=102, route_shift=0)
@@ -468,7 +468,7 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
 ) -> None:
     """Reach ``integration.tp_moe.dynamic`` at a prefill-sized standard M."""
 
-    device = require_sm120()
+    device = require_sm12x()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_nvfp4_weights(device, seed=201)
     initial = _make_inputs(device, m=128, seed=202, route_shift=0)
@@ -503,7 +503,7 @@ def test_standard_moe_tiny_decode_live_graph_oracle(
 ) -> None:
     """Reach both ``integration.tp_moe.tiny_decode`` production phases."""
 
-    device = require_sm120()
+    device = require_sm12x()
     _reset_dispatch_environment(monkeypatch)
     weights = _make_mxfp4_weights(device, seed=301)
     initial = _make_inputs(device, m=2, seed=302, route_shift=0)

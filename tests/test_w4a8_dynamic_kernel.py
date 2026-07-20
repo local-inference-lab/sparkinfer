@@ -26,7 +26,7 @@ from b12x.moe.fused.reference import (
     moe_reference_w4a8_mx,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 _TILE_M = 128
 _TILE_N = 128
@@ -722,7 +722,7 @@ def _run_w4a8_dynamic(
 @pytest.mark.parametrize("recipe", ["w4a8_mx", "w4a8_nvfp4"])
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
 def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
-    require_sm120()
+    require_sm12x()
     out, ref = _run_w4a8_dynamic(
         recipe=recipe, activation=activation,
         E=4, m=8, K=256, n=128, top_k=2, seed=11,
@@ -740,7 +740,7 @@ def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
     activation: str,
 ) -> None:
     """Exercise the production M16/four-MMA/two-DMA regime directly."""
-    require_sm120()
+    require_sm12x()
     kernel = MoEDynamicKernelBackend(
         16,
         (16, _TILE_N),
@@ -768,7 +768,7 @@ def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_nvfp4_relu2_m32_rows_16_17_match_oracle() -> None:
     """Guard the FC1-A/FC2-residual alias handoff at the first M16 boundary."""
-    require_sm120()
+    require_sm12x()
     m = 18
     topk_ids = torch.tensor(
         [[0, 1 + token % 3] for token in range(m)],
@@ -814,7 +814,7 @@ def test_w4a8_nvfp4_relu2_m32_rows_16_17_match_oracle() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_boundary_m_sizes() -> None:
-    require_sm120()
+    require_sm12x()
     for m in (1, 3, 127, 129):
         out, ref = _run_w4a8_dynamic(
             recipe="w4a8_mx", activation="silu",
@@ -828,7 +828,7 @@ def test_w4a8_dynamic_boundary_m_sizes() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     """Capture the w4a8 launch in a CUDA graph; replay must track routing."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(7)
     E, m, K, n, top_k = 4, 8, 256, 128, 2

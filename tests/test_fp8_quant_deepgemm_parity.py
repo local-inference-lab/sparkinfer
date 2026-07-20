@@ -27,7 +27,7 @@ from b12x.gemm.block_fp8_linear import (
 )
 from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 # --- DeepGEMM reference (verbatim from deepgemm-other/deep_gemm/utils/math.py) ---
@@ -63,7 +63,7 @@ def _relfro(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def test_activation_quant_byte_exact_with_deepgemm() -> None:
     """b12x activation MXFP8 quant == DeepGEMM per_token_cast_to_fp8 (gran_k=32)."""
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(0)
     M, K = 64, 5376  # Nemotron down-proj K (= 42 * 128)
     x = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 3.0)
@@ -84,7 +84,7 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
 
 def test_ue8m0_rounding_matches_bit_exact_ceil() -> None:
     """ceil(log2(x))/exp2 == bit-exact ceil_to_ue8m0, incl. exact powers of two."""
-    require_sm120()
+    require_sm12x()
     dev = "cuda"
     ks = torch.arange(-30, 30, device=dev, dtype=torch.float32)
     pow2 = 448.0 * torch.exp2(ks)
@@ -116,7 +116,7 @@ def test_weight_pack_requantizes_arbitrary_fp32_scales_to_parity() -> None:
     The fix must (a) reach near the irreducible e4m3 floor and (b) be strictly
     better than the old "round the scale, keep stale FP8 values" behaviour.
     """
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(0)
     N, K = 4096, 4096
     w_fp8, s_fp32, w_orig = _deepseek_checkpoint(N, K, "cuda")
@@ -139,7 +139,7 @@ def test_weight_pack_requantizes_arbitrary_fp32_scales_to_parity() -> None:
 
 def test_weight_pack_keeps_ue8m0_values_verbatim() -> None:
     """Already-UE8M0 scales must NOT trigger re-quant: FP8 values stay byte-identical."""
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(0)
     N, K = 2048, 2048
     w_orig = (torch.randn(N, K, device="cuda") * 0.2).to(torch.bfloat16).float()

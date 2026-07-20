@@ -13,7 +13,7 @@ from b12x.integration.attention import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
 
 
@@ -183,7 +183,7 @@ class _PagedGraphScratchHarness:
 
 @torch.inference_mode()
 def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata() -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
@@ -260,7 +260,7 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
 
 @torch.inference_mode()
 def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata() -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
@@ -329,7 +329,7 @@ def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata()
 
 @torch.inference_mode()
 def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(

@@ -7,11 +7,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _require_contiguous_backend() -> torch.device:
-    device = require_sm120()
+    device = require_sm12x()
     pytest.importorskip("cutlass")
     pytest.importorskip("cuda.bindings.driver")
     return device

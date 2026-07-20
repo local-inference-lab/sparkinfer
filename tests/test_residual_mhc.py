@@ -12,7 +12,7 @@ from b12x.integration import (
     plan_mhc_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _mhc_pre_reference(
@@ -112,7 +112,7 @@ def _make_mhc_binding(
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
 def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     hidden_size = 4096
     _, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -180,7 +180,7 @@ def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
 def test_b12x_mhc_post_match_reference(tokens: int) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -215,7 +215,7 @@ def test_b12x_mhc_post_match_reference(tokens: int) -> None:
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
 def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -280,7 +280,7 @@ def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
 
 @pytest.mark.parametrize("tokens", [1, 3])
 def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -378,7 +378,7 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
     prefill_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     tokens = 33
     expected_m = 384
     monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
@@ -543,7 +543,7 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
 
 
 def test_b12x_mhc_pro_hidden_match_reference() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     tokens = 1
     hidden_size = 7168
     split_k = 112
@@ -677,7 +677,7 @@ def test_b12x_mhc_decode_specialization_live_graph_oracle(
     decode_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     monkeypatch.setenv(
         "B12X_MHC_DECODE_SPLITS", "4" if decode_mode == "split" else "0"
     )
@@ -895,7 +895,7 @@ def test_b12x_mhc_decode_specialization_live_graph_oracle(
 
 
 def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     tokens = 2
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(

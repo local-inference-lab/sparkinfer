@@ -17,7 +17,7 @@ from b12x.integration.tp_moe import (
 )
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
-from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -39,7 +39,7 @@ def _make_spec() -> ModelSpec:
 
 
 def test_moe_eager_prefill_matches_oracle_across_shapes() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     _require_model_weights()
 
     clear_tp_moe_caches()

@@ -12,7 +12,7 @@ from b12x.gemm.block_fp8_linear import (
 )
 from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _make_block_fp8_weight(
@@ -52,7 +52,7 @@ def _reference_from_quantized_operands(
 
 
 def test_block_fp8_linear_matches_quantized_reference() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260523)
 
     tokens, in_features, out_features = 7, 256, 384
@@ -75,7 +75,7 @@ def test_block_fp8_linear_matches_quantized_reference() -> None:
 
 
 def test_block_fp8_linear_replays_under_cuda_graph() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260524)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -124,7 +124,7 @@ def test_block_fp8_linear_replays_under_cuda_graph() -> None:
 
 
 def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260526)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -173,7 +173,7 @@ def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
 
 
 def test_block_fp8_linear_default_fused_path_captures() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260525)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -199,7 +199,7 @@ def test_block_fp8_linear_default_fused_path_captures() -> None:
 
 
 def test_block_fp8_linear_live_m_does_not_resolve_new_dense_kernel() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260528)
 
     warm_tokens, live_tokens = 4096, 1824
@@ -236,7 +236,7 @@ def test_block_fp8_linear_live_m_does_not_resolve_new_dense_kernel() -> None:
 
 
 def test_block_fp8_linear_small_live_m_reuses_prefill_dense_kernel() -> None:
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260529)
 
     warm_tokens = 512
@@ -275,7 +275,7 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
     # 32x128 tile) must (a) produce byte-identical output to the default
     # (tile choice does not change the block-scaled MMA result) and (b) be
     # reused for every live M in the regime under frozen resolution.
-    require_sm120()
+    require_sm12x()
     from b12x.gemm.dense import _select_default_mma_tiler_mn
 
     torch.manual_seed(20260530)
@@ -326,7 +326,7 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
 
 def test_block_fp8_linear_expected_m_short_k_large_n_matches_reference() -> None:
     """Exercise the production expected_m route through 128x128x64."""
-    require_sm120()
+    require_sm12x()
     torch.manual_seed(20260702)
 
     tokens, in_features, out_features = 16, 1024, 16384

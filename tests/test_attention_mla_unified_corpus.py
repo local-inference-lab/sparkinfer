@@ -26,7 +26,7 @@ from b12x.integration.compressed_scratch import (
     _materialize_compressed_mla_scratch,
 )
 
-from .helpers import dequantize_token_major_nvfp4, ref_fp4_quant, require_sm120
+from .helpers import dequantize_token_major_nvfp4, ref_fp4_quant, require_sm12x
 
 
 _PAGE_SIZE = 64
@@ -294,7 +294,7 @@ def _make_decode_workspace(
 )
 def test_unified_decode_entrypoint_live_graph_oracle(entrypoint: str) -> None:
     """Cover all four active UnifiedDecodeKernel @cute.kernel entrypoints."""
-    device = require_sm120()
+    device = require_sm12x()
     rows, heads, main_width = 2, 8, 64
     has_extra = entrypoint.startswith("extra")
     per_token = entrypoint.endswith("per-token")
@@ -360,7 +360,7 @@ def test_unified_decode_entrypoint_live_graph_oracle(entrypoint: str) -> None:
 @pytest.mark.parametrize("entrypoint", ["main", "dual"])
 def test_unified_prefill_entrypoint_live_graph_oracle(entrypoint: str) -> None:
     """Cover both active UnifiedPrefillMGKernel @cute.kernel entrypoints."""
-    device = require_sm120()
+    device = require_sm12x()
     rows, heads, main_width = 2, 16, 128
     has_extra = entrypoint == "dual"
     extra_width = 64 if has_extra else 0
@@ -792,7 +792,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
     DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each with ``mg_n_hg`` 1
     and 2.  DSV4 BF16 uses two 64-candidate tiles; every 512-wide case uses eight.
     """
-    device = require_sm120()
+    device = require_sm12x()
     rows = 2
 
     if case.family == "dsv4":
@@ -1004,7 +1004,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
 @pytest.mark.parametrize("entrypoint", ["main", "per-token"])
 def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
     """Compile and validate GLM's distinct 101-KiB typed-SMEM decode body."""
-    device = require_sm120()
+    device = require_sm12x()
     rows, heads, width = 2, 8, 128
     per_token = entrypoint == "per-token"
     inputs = _make_glm_inputs(
@@ -1068,7 +1068,7 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
 @torch.inference_mode()
 def test_unified_glm_prefill_live_graph_oracle() -> None:
     """Validate GLM MG prefill with live inputs and fixed caller-owned output."""
-    device = require_sm120()
+    device = require_sm12x()
     rows, heads, width = 2, 8, 512
     inputs = _make_glm_inputs(
         rows=rows,

@@ -16,7 +16,7 @@ from b12x.gemm.wo_projection import (
     quantize_mxfp8_rows_torch,
 )
 
-from .helpers import dequantize_grouped_nvfp4, require_sm120
+from .helpers import dequantize_grouped_nvfp4, require_sm12x
 
 
 pytestmark = pytest.mark.skipif(
@@ -76,7 +76,7 @@ def _mxfp8_gemm_reference(
 
 
 def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
-    require_sm120()
+    require_sm12x()
     generator = torch.Generator(device="cuda").manual_seed(46_001)
     m, n, k = 32, 128, 128
     a_source = (
@@ -140,7 +140,7 @@ def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
 
 
 def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
-    require_sm120()
+    require_sm12x()
     generator = torch.Generator(device="cuda").manual_seed(46_002)
     m, n, k = 2, 128, 128
     source = (
@@ -201,7 +201,7 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
 
 
 def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph() -> None:
-    require_sm120()
+    require_sm12x()
     generator = torch.Generator(device="cuda").manual_seed(46_003)
     m, n, k, groups = 2, 128, 128, 2
     source = (
@@ -272,7 +272,7 @@ def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph() -> None
 
 @pytest.mark.parametrize("m", [4, 16])
 def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int) -> None:
-    require_sm120()
+    require_sm12x()
     generator = torch.Generator(device="cuda").manual_seed(46_100 + m)
     source = (
         torch.randn(

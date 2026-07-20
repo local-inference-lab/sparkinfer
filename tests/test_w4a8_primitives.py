@@ -31,7 +31,7 @@ from b12x.cute.intrinsics import (
     silu_mul_quantize_block_fp8_mx,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -205,7 +205,7 @@ def _e2m1_lut_f32(device: torch.device) -> torch.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_e2m1x8_to_e4m3x8_exact() -> None:
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(0)
     # All 16 codes in every nibble position, plus random patterns.
@@ -232,7 +232,7 @@ def test_e2m1x8_to_e4m3x8_exact() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_e2m1x8_mul_residual_to_e4m3x8_matches_f16_reference() -> None:
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(1)
     n = 4096
@@ -301,7 +301,7 @@ def _run_quant(kernel_cls, x: torch.Tensor, up: torch.Tensor) -> tuple[torch.Ten
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_quantize_block_fp8_mx_bit_exact() -> None:
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(2)
     blocks = [
@@ -325,7 +325,7 @@ def test_quantize_block_fp8_mx_bit_exact() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_silu_mul_quantize_block_fp8_mx_close_to_torch() -> None:
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(3)
     rows = 512
@@ -435,7 +435,7 @@ class _QdE4M3Kernel:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_quant_dequant_e4m3_2_matches_prefill_quantizer() -> None:
     """The micro a8_mx round-trip must bit-match quant_dequant_mxfp8_torch."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     torch.manual_seed(5)
     x = torch.cat(

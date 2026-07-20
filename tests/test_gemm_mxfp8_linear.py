@@ -11,7 +11,7 @@ from b12x.gemm.mxfp8_linear import (
 )
 from b12x.gemm.wo_projection import dequantize_mxfp8_rows_torch
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def require_mxf8_mma() -> None:
@@ -70,7 +70,7 @@ def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
 
 
 def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
-    require_sm120()
+    require_sm12x()
     require_mxf8_mma()
     torch.manual_seed(20260614)
 
@@ -99,7 +99,7 @@ def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
 
 
 def test_mxfp8_linear_pads_k32_to_dense_tile() -> None:
-    require_sm120()
+    require_sm12x()
     require_mxf8_mma()
     torch.manual_seed(20260615)
 
@@ -138,7 +138,7 @@ def test_mxfp8_linear_pads_k32_to_dense_tile() -> None:
 
 
 def test_mxfp8_linear_default_fused_path_captures_with_k_padding() -> None:
-    require_sm120()
+    require_sm12x()
     require_mxf8_mma()
     torch.manual_seed(20260616)
 

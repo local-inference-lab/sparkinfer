@@ -9,7 +9,7 @@ from b12x.attention.paged.merge import PagedPersistentMergeKernel
 from b12x.cute.compiler import compile as b12x_compile
 from b12x.cute.utils import current_cuda_stream
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def _merge_reference_base2(
@@ -129,7 +129,7 @@ def _run_merge_kernel(
 
 @torch.inference_mode()
 def test_paged_persistent_merge_matches_reference() -> None:
-    require_sm120()
+    require_sm12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem()
     )
@@ -160,7 +160,7 @@ def test_paged_persistent_merge_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
-    require_sm120()
+    require_sm12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem()
     )
@@ -196,7 +196,7 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
-    require_sm120()
+    require_sm12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem(counts=[8, 7, 5])
     )
@@ -227,7 +227,7 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None:
-    require_sm120()
+    require_sm12x()
     counts = [1, 3, 2, 4]
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_regular_decode_graph_merge_problem(counts=counts)

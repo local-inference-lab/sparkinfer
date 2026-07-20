@@ -14,7 +14,7 @@ from b12x.attention.mla.reference import (
     pack_mla_kv_cache_reference,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .test_attention_mla_reference import _compare, _make_glm_case, _require_glm_weights
 
 
@@ -365,7 +365,7 @@ def _make_extend_metadata(
 
 
 def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
 
@@ -420,7 +420,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
 def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads() -> (
     None
 ):
-    device = require_sm120()
+    device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
 
@@ -481,7 +481,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
 def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> (
     None
 ):
-    device = require_sm120()
+    device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
 
@@ -541,7 +541,7 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
 
 
 def test_sglang_b12x_mla_extend_boundary_matches_dense_oracle() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     _require_glm_weights()
     nsa_backend_module = _import_sglang_nsa_backend()
 

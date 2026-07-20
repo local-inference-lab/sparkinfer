@@ -23,7 +23,7 @@ from b12x.integration.attention import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .paged_attention_helpers import quantize_paged_kv_cache_e4m3
 from .test_attention_paged_planner import _make_inputs
 
@@ -294,7 +294,7 @@ def _run_decode_reference_check(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_short_context() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[64, 128, 192],
@@ -328,7 +328,7 @@ def test_paged_forward_matches_reference_decode_short_context() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_dense_page128() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[200, 384],
@@ -369,7 +369,7 @@ def test_paged_forward_matches_reference_decode_dense_page128() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1, 1, 1, 1, 1, 1],
         cache_seqlens=[64, 64, 64, 64, 64, 64, 64, 64],
@@ -413,7 +413,7 @@ def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> No
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 192, 256],
@@ -452,7 +452,7 @@ def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_with_relative_bias() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 256, 384],
@@ -504,7 +504,7 @@ def test_paged_forward_large_relative_bias_is_numerically_stable(
     mode: str,
     q_seqlen: int,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[q_seqlen],
         cache_seqlens=[222],
@@ -592,7 +592,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
     window_left: int,
     relative_extent: int,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1],
@@ -709,7 +709,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_window_and_sink() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 192, 256],
@@ -752,7 +752,7 @@ def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_wind
 
 @torch.inference_mode()
 def test_paged_forward_attention_sink_affects_denominator_only() -> None:
-    require_sm120()
+    require_sm12x()
     q_heads = 8
     kv_heads = 1
     head_dim = 256
@@ -788,7 +788,7 @@ def test_paged_forward_attention_sink_affects_denominator_only() -> None:
 def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context_batch8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     monkeypatch.setenv("B12X_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64)
     assert plan_desc.endswith(",split")
@@ -798,7 +798,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[64, 64],
@@ -833,7 +833,7 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
 @torch.inference_mode()
 def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
     """Replay the one-stage BF16 K/V TMA specialization as a serving graph."""
-    require_sm120()
+    require_sm12x()
     device = torch.device("cuda")
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[4],
@@ -1003,7 +1003,7 @@ def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_dense_page128() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[256, 384],
@@ -1046,7 +1046,7 @@ def test_paged_forward_matches_reference_extend_dense_page128() -> None:
 def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
 
     import b12x.attention.paged.api as paged_api
@@ -1173,7 +1173,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[320, 384],
@@ -1218,7 +1218,7 @@ def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[320, 384],
@@ -1274,7 +1274,7 @@ def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[2048, 4096],
@@ -1319,7 +1319,7 @@ def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
-    require_sm120()
+    require_sm12x()
     output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=512)
     assert plan_desc.endswith(",split")
     assert (output - fa2_out).abs().max().item() <= 0.01
@@ -1330,7 +1330,7 @@ def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
 def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sm120()
+    require_sm12x()
     monkeypatch.setenv("B12X_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=8192)
     assert plan_desc.endswith(",split")
@@ -1340,7 +1340,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_bf16_kv_extend() -> None:
-    require_sm120()
+    require_sm12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[2048, 4096],

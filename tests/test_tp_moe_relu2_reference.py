@@ -8,7 +8,7 @@ from b12x.integration import tp_moe
 from b12x.integration.tp_moe import clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
-from .helpers import prepare_tp_moe_fp4_experts, require_sm120, run_tp_moe_fp4
+from .helpers import prepare_tp_moe_fp4_experts, require_sm12x, run_tp_moe_fp4
 
 
 BACKEND_CASES = [
@@ -87,7 +87,7 @@ def _run_activation_case(
     micro_dynamic_cutover: int,
     fast_math: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = require_sm120()
+    device = require_sm12x()
     (
         x,
         topk_ids,
@@ -162,7 +162,7 @@ def _run_single_token_multi_expert_case(
     topk_ids_dtype: torch.dtype,
     micro_dynamic_cutover: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(7)
 
     m, E, k, n = 1, 4, 128, 128
@@ -322,7 +322,7 @@ def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Grouped deterministic FC2 slices preserve FC1 input and accumulate."""
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(20260716)
     m, experts_count, k, n, topk = 29, 32, 256, 384, 6
 

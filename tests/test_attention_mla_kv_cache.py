@@ -15,7 +15,7 @@ from b12x.integration.sparse_mla_scratch import (
     plan_sparse_mla_scratch,
 )
 
-from .helpers import E2M1_TO_FLOAT32, require_sm120
+from .helpers import E2M1_TO_FLOAT32, require_sm12x
 
 
 _RECORD_BYTES = 368
@@ -257,7 +257,7 @@ def _dequantize_records(
 def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
     dtype: torch.dtype,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     num_tokens = 6
     kv_c, k_pe, expected_packed, expected_group_scales, expected_rope_scales = (
         _make_exactly_quantizable_inputs(
@@ -419,7 +419,7 @@ def _assert_reader_matches_dequantized_records(
 
 @torch.inference_mode()
 def test_writer_records_feed_production_head_multisplit_decode() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     topk = 129
     q, cache, indices = _make_written_reader_case(
         rows=1,
@@ -484,7 +484,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
 
 @torch.inference_mode()
 def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     topk = 129
     q, cache, indices = _make_written_reader_case(
         rows=2,

@@ -7,7 +7,7 @@ import torch
 
 import b12x.attention.mla.merge as mla_merge
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 _HEAD_DIM = 512
@@ -221,7 +221,7 @@ def _assert_replay_matches_oracle(
 
 
 def _run_fixed_merge_graph_case(*, with_sink: bool) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     rows = 4
     heads = 32
     chunks = 5

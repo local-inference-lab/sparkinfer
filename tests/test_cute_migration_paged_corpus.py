@@ -37,7 +37,7 @@ from b12x.integration.attention import (
     plan_paged_attention_scratch,
 )
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
 
 
@@ -174,7 +174,7 @@ def _make_fixed_graph_binding(
 @torch.inference_mode()
 def test_paged_fp8_prefill_size_graph_oracle(q_len: int) -> None:
     """Pin every requested generic-prefill size to an oracle and graph replay."""
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -258,7 +258,7 @@ def _run_paged_forward_graph_oracle(
     disable_split_kv: bool,
 ) -> None:
     """Exercise an API-routed PagedForward graph with live inputs."""
-    require_sm120()
+    require_sm12x()
     clear_attention_caches()
     mode = "decode" if disable_split_kv else "verify"
     q_len = 1 if mode == "decode" else 4
@@ -680,7 +680,7 @@ def _launch_compiled_pair(
 @torch.inference_mode()
 def test_paged_unreachable_raw_body_graph_oracle(case: _RawCase) -> None:
     """Migration-only proof for raw bodies that have no serving call sites."""
-    require_sm120()
+    require_sm12x()
     cache_len = 128 if case.split_kv else 64
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -802,7 +802,7 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
     request: pytest.FixtureRequest,
 ) -> None:
     """Check every PLANEWORDS byte through the supported CuTe-atom path."""
-    require_sm120()
+    require_sm12x()
     monkeypatch.setenv("B12X_PAGED_KV_TMA", "1")
     monkeypatch.setenv("B12X_PAGED_KV_DEBUG_DUMP", "PLANEWORDS")
     monkeypatch.setenv("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "3,4,3")

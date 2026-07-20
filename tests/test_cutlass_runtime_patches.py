@@ -28,7 +28,7 @@ from b12x.cute.compiler import (
 )
 from b12x.cute.utils import make_ptr
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 def test_compile_only_cache_warning_is_suppressed() -> None:
@@ -72,7 +72,7 @@ def test_cutlass_source_locations_do_not_scan_for_enclosing_function(
 
 
 def test_cutlass_46_adapts_live_cuda_stream_handles() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     torch_stream = torch.cuda.Stream(device=device)
     source = torch.arange(256, dtype=torch.float32, device=device)
     result = torch.empty_like(source)

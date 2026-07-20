@@ -58,7 +58,7 @@ from b12x.attention.mla.legacy.kernel import (
 )
 from b12x.cute.intrinsics import byte_perm, ldmatrix_m8n8x4_left_half_b16, ldmatrix_m8n8x4_right_half_b16
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 from .test_attention_mla_reference import _make_glm_case
 
 
@@ -874,7 +874,7 @@ def _run_probe(
     tid_b: int = 0,
     grouped_a4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    require_sm120()
+    require_sm12x()
     device = p.device
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     v_fp8 = (v_src / scales.unsqueeze(1)).clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
@@ -2260,7 +2260,7 @@ def _reconstruct_score_tile32_from_dump(out_dump: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_tiny_mla_pv_probe_bf16_path_matches_reference() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(0)
 
     p = torch.randn((16, _MLA_TOKEN_TILE), device=device, dtype=torch.float32).to(torch.bfloat16) / 4
@@ -2273,7 +2273,7 @@ def test_tiny_mla_pv_probe_bf16_path_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_raw_qk_bf16_probe_matches_reference() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(60_101)
 
     q = (torch.randn((1, 16, 128), device=device, dtype=torch.float32) / 4).to(torch.bfloat16)
@@ -2287,7 +2287,7 @@ def test_raw_qk_bf16_probe_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_raw_qk_mxfp8_probe_matches_k32_quantized_reference() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(60_201)
 
     q = (torch.randn((1, 16, 128), device=device, dtype=torch.float32) / 4).to(torch.bfloat16)
@@ -2305,7 +2305,7 @@ def test_raw_qk_mxfp8_probe_matches_k32_quantized_reference() -> None:
 
 @pytest.mark.skip(reason="Manual diagnostic probe while MXFP8 PV fragment mapping is under investigation")
 def test_tiny_mla_pv_probe_mxfp8_unit_scale_matches_reference() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     torch.manual_seed(1)
 
     p = torch.randn((16, _MLA_TOKEN_TILE), device=device, dtype=torch.float32).to(torch.bfloat16) / 2
@@ -2325,7 +2325,7 @@ def test_tiny_mla_pv_probe_mxfp8_unit_scale_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_live_fragment_probe_bf16_matches_dense_reference_group0() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     cfg, q_all, k_nope, k_rope = _make_glm_case(
         cache_len=2050,
         q_len=1,
@@ -2363,7 +2363,7 @@ def test_live_fragment_probe_bf16_matches_dense_reference_group0() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_live_fragment_probe_a_pack_matches_host_reconstruction() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     cfg, q_all, k_nope, k_rope = _make_glm_case(
         cache_len=2050,
         q_len=1,

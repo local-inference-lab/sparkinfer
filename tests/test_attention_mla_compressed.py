@@ -39,7 +39,7 @@ from b12x.integration.mla import (
 )
 from b12x.cute.compiler import clear_compile_cache, compile_cache_info
 
-from .helpers import require_sm120
+from .helpers import require_sm12x
 
 
 _COMPRESSED_HEAD_DIM = 512
@@ -157,7 +157,7 @@ def _make_split_merge_tensors(
 
 @torch.inference_mode()
 def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_compile_cache()
     mla_split_impl.clear_sparse_mla_merge_kernel_cache()
 
@@ -328,7 +328,7 @@ def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
 
 
 def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     selected_widths = (128, 640, 2880)
     graph_q_rows = 16
     compressed_prefill_q = 8192
@@ -401,7 +401,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
     assert capped < int(2.25 * (1 << 30))
 
 def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     gen = torch.Generator(device=device)
     gen.manual_seed(31)
 
@@ -441,7 +441,7 @@ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
 def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     monkeypatch,
 ) -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
     del monkeypatch
 
@@ -506,7 +506,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
 
 @torch.inference_mode()
 def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=21, device=device)
@@ -611,7 +611,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     width = 32
@@ -678,7 +678,7 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     swa_page_size = 256
@@ -745,7 +745,7 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     rows = 8
@@ -815,7 +815,7 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=71, device=device)
@@ -885,7 +885,7 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
 @torch.inference_mode()
 def test_compressed_mla_mapped_page_table_is_rejected() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=181, device=device)
@@ -929,7 +929,7 @@ def test_compressed_mla_mapped_page_table_is_rejected() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     rows = 3
@@ -988,7 +988,7 @@ def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_rejects_live_mapped_page_table() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     indexed_cache = _make_cache(
@@ -1034,7 +1034,7 @@ def test_compressed_mla_rejects_live_mapped_page_table() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     rows = 8
@@ -1154,7 +1154,7 @@ def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
     persistent-max reads must complete before the row-sum reduction overwrites
     the scratch. Without it, outputs wobble run-to-run (worst for short
     topk_lengths) and depend on unrelated memory traffic."""
-    device = require_sm120()
+    device = require_sm12x()
     clear_mla_caches()
 
     rows, width = 8, 512
