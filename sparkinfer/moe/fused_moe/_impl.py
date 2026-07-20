@@ -8216,13 +8216,20 @@ def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
         return False
     if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
         return False
+    num_tokens = plan.routed_rows // plan.num_topk
+    if _use_barrier_free_nvfp4_split(
+        quant_mode=plan.quant_mode,
+        num_tokens=num_tokens,
+        activation=plan.activation,
+    ):
+        return False
     # The compact native-NVFP4 micro grid is a bounded, single-wave decode
     # launch. M=1..7 survives graph-replay concurrency stress; M=8 changes the
     # launch geometry, so that boundary and all larger resident plans must
     # remain serialized.
-    return plan.routed_rows // plan.num_topk <= 7 and _is_native_nvfp4_micro_decode(
+    return num_tokens <= 7 and _is_native_nvfp4_micro_decode(
         quant_mode=plan.quant_mode,
-        num_tokens=plan.routed_rows // plan.num_topk,
+        num_tokens=num_tokens,
         activation=plan.activation,
     )
 
