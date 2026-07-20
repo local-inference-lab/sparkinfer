@@ -197,3 +197,88 @@ def test_native_nvfp4_split_matches_fused(
     split = _run_mode(4, "nvfp4", seed=113)
 
     torch.testing.assert_close(split, fused, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("m", range(1, 8))
+def test_native_nvfp4_fused_micro_graph_replay_with_aux_stream_work(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+) -> None:
+    """The bounded native-NVFP4 decode grid is stable beside aux work."""
+    if not torch.cuda.is_available():
+        pytest.skip("No CUDA")
+    from benchmarks.benchmark_moe import make_shape_only_expert_weights
+    from b12x.integration.tp_moe import (
+        allocate_tp_moe_workspace_pool,
+        b12x_moe_fp4,
+        build_tp_moe_fp4_binding,
+        clear_tp_moe_caches,
+    )
+
+    monkeypatch.setenv("B12X_NVFP4_SPLIT_DECODE", "0")
+    clear_tp_moe_caches()
+    device = torch.device("cuda")
+    spec = ModelSpec(
+        hidden_size=6144,
+        intermediate_size=2048,
+        num_experts=16,
+        top_k=8,
+        tp_size=8,
+        tp_rank=0,
+    )
+    weights = make_shape_only_expert_weights(
+        spec,
+        layer_idx=0,
+        activation="silu",
+    )
+    x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=211 + m, device=device)
+    experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
+        w1_fp4=weights.w13_weight,
+        w1_blockscale=weights.w13_blockscale_swizzled,
+        w1_alphas=weights.g1_alphas_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
+        w2_fp4=weights.w2_weight,
+        w2_blockscale=weights.w2_blockscale_swizzled,
+        w2_alphas=weights.g2_alphas_per_expert,
+        quant_mode="nvfp4",
+        w13_layout=weights.w13_layout,
+    )
+    output = torch.empty_like(x)
+    binding = build_tp_moe_fp4_binding(
+        scratch=allocate_tp_moe_workspace_pool(),
+        a=x,
+        experts=experts,
+        topk_weights=topk_weights.contiguous(),
+        topk_ids=topk_ids.contiguous(),
+        output=output,
+        input_scales_static=True,
+        quant_mode="nvfp4",
+    )
+
+    b12x_moe_fp4(binding=binding)
+    torch.cuda.synchronize()
+    expected = output.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        b12x_moe_fp4(binding=binding)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    aux_stream = torch.cuda.Stream()
+    aux_a = torch.randn(2048, 2048, dtype=torch.bfloat16, device=device)
+    aux_b = torch.randn(2048, 2048, dtype=torch.bfloat16, device=device)
+    aux_out = torch.empty_like(aux_a)
+    for _ in range(64):
+        output.zero_()
+        aux_stream.wait_stream(torch.cuda.current_stream())
+        graph.replay()
+        with torch.cuda.stream(aux_stream):
+            torch.mm(aux_a, aux_b, out=aux_out)
+        torch.cuda.current_stream().wait_stream(aux_stream)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, atol=2e-3, rtol=0.0)
