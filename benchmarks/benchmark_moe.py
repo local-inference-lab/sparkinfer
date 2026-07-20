@@ -26,7 +26,6 @@ import torch.nn.functional as F
 
 from benchmarks.checkpoint_loader import IndexedSafetensorLoader
 from b12x.moe.fused.reference import (
-    FlashInferTrtllmFP4E8M0K32Weights,
     OracleMetrics,
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
@@ -34,10 +33,13 @@ from b12x.moe.fused.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a8_mx,
     moe_reference_w4a16_fp4_e8m0_k32,
-    moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
     moe_reference_w4a16_f32,
-    prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
     unswizzle_block_scale,
+)
+from b12x.moe.fused.reference_flashinfer import (
+    FlashInferTrtllmFP4E8M0K32Weights,
+    moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
+    prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
 from b12x.moe.fused.activations import (
     SUPPORTED_MOE_ACTIVATIONS,

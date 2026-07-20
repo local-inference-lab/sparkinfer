@@ -8,6 +8,8 @@ from b12x.cute.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
 from b12x.moe.fused.reference import (
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,
+)
+from b12x.moe.fused.reference_flashinfer import (
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
 from b12x.moe.fused.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
