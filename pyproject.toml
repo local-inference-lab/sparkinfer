@@ -35,7 +35,7 @@ where = ["."]
 include = ["sparkinfer*"]
 
 [tool.setuptools.package-data]
-"sparkinfer.distributed" = ["*.cu"]
+"sparkinfer.comm.pcie" = ["*.cu"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
