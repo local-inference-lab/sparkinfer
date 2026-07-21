@@ -8205,14 +8205,26 @@ def _use_barrier_free_nvfp4_split(
 
 
 def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
-    """Whether a planned MoE launch can safely overlap unrelated CUDA work."""
+    """Whether shared experts may use the pre-resident auxiliary stream.
+
+    The caller must submit the shared-expert work before this plan and enqueue
+    a consumer-stream wait before launching the routed experts. A true result
+    does not permit a resident-grid kernel to execute concurrently with the
+    auxiliary work.
+    """
     if not isinstance(plan, TPMoEPlan):
         raise TypeError("plan must be a TPMoEPlan")
-    if plan.implementation != "micro":
-        return False
     if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
         return False
     num_tokens = plan.routed_rows // plan.num_topk
+    # W4A16 decode uses a device-wide barrier. It is still safe to overlap the
+    # shared expert with gate/router work because vLLM waits for the auxiliary
+    # stream before submitting this resident launch. Keep the same tested
+    # small-decode boundary as the native NVFP4 path.
+    if plan.implementation == "w4a16":
+        return plan.quant_mode == "w4a16" and 1 <= num_tokens <= 7
+    if plan.implementation != "micro":
+        return False
     if _use_barrier_free_nvfp4_split(
         quant_mode=plan.quant_mode,
         num_tokens=num_tokens,

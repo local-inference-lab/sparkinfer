@@ -237,6 +237,40 @@ def test_native_nvfp4_micro_allows_aux_stream_overlap(
     assert plan_supports_aux_stream_overlap(plan)
 
 
+@pytest.mark.parametrize("source_format", ["modelopt_nvfp4", "fp4_e8m0_k32"])
+@pytest.mark.parametrize("num_tokens", [1, 7])
+def test_w4a16_decode_allows_pre_resident_aux_stream(
+    source_format: str,
+    num_tokens: int,
+) -> None:
+    weights = _weight_plan("w4a16", source_format=source_format)
+    plan = plan_tp_moe_execution(
+        num_tokens=num_tokens,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode="w4a16",
+    )
+
+    assert plan.implementation == "w4a16"
+    assert plan_supports_aux_stream_overlap(plan)
+
+
+@pytest.mark.parametrize("num_tokens", [8, 64])
+def test_w4a16_large_resident_launch_rejects_aux_stream(num_tokens: int) -> None:
+    weights = _weight_plan("w4a16", source_format="modelopt_nvfp4")
+    plan = plan_tp_moe_execution(
+        num_tokens=num_tokens,
+        num_topk=2,
+        device=torch.device("cpu"),
+        weight_plan=weights,
+        quant_mode="w4a16",
+    )
+
+    assert plan.implementation == "w4a16"
+    assert not plan_supports_aux_stream_overlap(plan)
+
+
 def test_aux_stream_overlap_rejects_large_resident_launches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
