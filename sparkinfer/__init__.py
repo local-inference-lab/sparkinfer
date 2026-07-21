@@ -36,8 +36,8 @@ from ._lib.runtime_control import (
     unfreeze_kernel_resolution,
 )
 
-# Static op registry: one entry per op directory, kept in lockstep by
-# tests/test_registry.py.  Grows as port phases land.
+# Static logical-op registry, kept in lockstep with public op directories and
+# the explicit private-module overrides below by tests/test_registry.py.
 _OPS: tuple[str, ...] = (
     "attention.paged",
     "attention.sparse_mla",
@@ -47,6 +47,7 @@ _OPS: tuple[str, ...] = (
     "comm.pcie",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
+    "gemm.bmm",
     "gemm.mxfp8_linear",
     "gemm.wo_projection",
     "moe.fused_moe",
@@ -56,6 +57,16 @@ _OPS: tuple[str, ...] = (
     "quantization.nvfp4",
 )
 
+# A group-level function cannot share its name with an imported child module.
+# These registry entries keep their public qualname while their metadata and
+# implementation live under a private package.
+_OP_MODULE_OVERRIDES: dict[str, str] = {
+    "gemm.bmm": "gemm._bmm",
+}
+_CACHE_CLEAR_OVERRIDES: dict[str, str] = {
+    "gemm.bmm": "clear_bmm_caches",
+}
+
 _GROUPS = ("attention", "comm", "gemm", "moe", "norm", "quantization")
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
     # public name -> (module, attribute)
@@ -63,10 +74,15 @@ _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
 }
 
 
+def _op_module_path(qualname: str) -> str:
+    return _OP_MODULE_OVERRIDES.get(qualname, qualname)
+
+
 def list_ops() -> tuple[OpMeta, ...]:
     """Import every op's (cheap) ``__init__`` and return their ``META``s."""
     return tuple(
-        importlib.import_module(f".{op_path}", __name__).META for op_path in _OPS
+        importlib.import_module(f".{_op_module_path(op_path)}", __name__).META
+        for op_path in _OPS
     )
 
 
@@ -76,14 +92,16 @@ def find_op(qualname: str) -> OpMeta:
         raise KeyError(
             f"unknown experimental sparkinfer op {qualname!r}; known ops: {sorted(_OPS)}"
         )
-    return importlib.import_module(f".{qualname}", __name__).META
+    return importlib.import_module(f".{_op_module_path(qualname)}", __name__).META
 
 
 def clear_all_caches() -> None:
     """Clear caches of every op already imported; never forces imports."""
     for op_path in _OPS:
-        api = sys.modules.get(f"{__name__}.{op_path}.api")
-        clear = getattr(api, "clear_caches", None) if api is not None else None
+        module_path = _op_module_path(op_path)
+        api = sys.modules.get(f"{__name__}.{module_path}.api")
+        clear_name = _CACHE_CLEAR_OVERRIDES.get(op_path, "clear_caches")
+        clear = getattr(api, clear_name, None) if api is not None else None
         if clear is not None:
             clear()
     compiler = sys.modules.get(f"{__name__}._lib.compiler")

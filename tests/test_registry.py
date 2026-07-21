@@ -32,10 +32,15 @@ def _sparkinfer():
 
 def test_registry_matches_disk():
     sparkinfer = _sparkinfer()
-    assert sorted(sparkinfer._OPS) == _on_disk_ops(), (
-        "sparkinfer._OPS and the op directories under sparkinfer/ "
-        "must be in bijection; register new ops in _OPS"
+    overrides = set(sparkinfer._OP_MODULE_OVERRIDES)
+    assert sorted(set(sparkinfer._OPS) - overrides) == _on_disk_ops(), (
+        "sparkinfer._OPS and public op directories under sparkinfer/ must be "
+        "in bijection apart from explicit private-module overrides"
     )
+    for qualname, module_path in sparkinfer._OP_MODULE_OVERRIDES.items():
+        assert qualname in sparkinfer._OPS
+        module = importlib.import_module(f"sparkinfer.{module_path}")
+        assert module.META.qualname == qualname
 
 
 def test_list_ops_and_find_op():
@@ -52,11 +57,15 @@ def test_every_op_meta_contract():
     sparkinfer = _sparkinfer()
     for meta in sparkinfer.list_ops():
         module = importlib.import_module(
-            f"sparkinfer.{meta.qualname}"
+            f"sparkinfer.{sparkinfer._op_module_path(meta.qualname)}"
         )
         assert isinstance(module.META, sparkinfer.OpMeta)
         assert set(module.__all__) == set(meta.entry_points) | {"META"}, meta.qualname
-        assert "is_supported" in meta.entry_points, meta.qualname
+        assert any(
+            name == "is_supported"
+            or (name.startswith("is_") and name.endswith("_supported"))
+            for name in meta.entry_points
+        ), meta.qualname
         assert meta.archs and set(meta.archs) <= {"sm120a", "sm121a"}, meta.qualname
         assert meta.provenance.commit, f"{meta.qualname} missing provenance commit"
         assert meta.test_path and (REPO / meta.test_path).is_file(), (
@@ -79,7 +88,7 @@ def test_every_op_api_resolves():
     sparkinfer = _sparkinfer()
     for meta in sparkinfer.list_ops():
         module = importlib.import_module(
-            f"sparkinfer.{meta.qualname}"
+            f"sparkinfer.{sparkinfer._op_module_path(meta.qualname)}"
         )
         for name in meta.entry_points:
             assert getattr(module, name) is not None, f"{meta.qualname}.{name}"
