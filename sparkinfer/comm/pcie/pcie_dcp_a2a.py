@@ -19,6 +19,7 @@ from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     _align_up,
+    _coordinated_close_channels,
     _current_stream_key,
     _is_current_stream_capturing,
     _normalize_device,
@@ -205,6 +206,8 @@ class PCIeDCPA2A:
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
         self._ptr = self._ext.init_dcp_a2a(
             list(signal_ptrs),
             list(staging0_ptrs),
@@ -460,20 +463,35 @@ class PCIeDCPA2A:
         )
         return out
 
-    def close(self) -> None:
-        if self._closed:
+    def _close_ipc_imports(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
-        with suppress(Exception):
-            self._ext.dispose(self._ptr)
+        if getattr(self, "_ptr", 0):
+            with suppress(Exception):
+                self._ext.dispose(self._ptr)
+            self._ptr = 0
         if self._ipc is not None:
             for shared in self._owned_buffers:
                 for ptr in shared.remote_ptrs:
                     with suppress(Exception):
                         self._ipc.cudaIpcCloseMemHandle(ptr)
+        self._ipc_imports_closed = True
+
+    def _free_ipc_exports(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports()
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
                 with suppress(Exception):
                     self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
+        self._ipc_exports_freed = True
+
+    def close(self) -> None:
+        self._close_ipc_imports()
+        self._free_ipc_exports()
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -512,6 +530,7 @@ class PCIeDCPA2APool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
+        self._all_channels: list[PCIeDCPA2A] = []
         self._capture_channel_stack: list[PCIeDCPA2A] = []
         self._closed = False
         if channel_factory is None and exchange_group is None:
@@ -583,7 +602,50 @@ class PCIeDCPA2APool:
                 stream_affine=not self.single_channel,
             )
         channel._bind_stream_key(stream_key)
+        self._all_channels.append(channel)
         return channel
+
+    def checkpoint_channels(self) -> tuple[int, dict[int, PCIeDCPA2A]]:
+        """Snapshot channel ownership before a throwaway graph capture."""
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2APool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot checkpoint channels during capture")
+        return len(self._all_channels), dict(self._channels)
+
+    def rollback_channels(
+        self,
+        checkpoint: tuple[int, dict[int, PCIeDCPA2A]],
+    ) -> None:
+        """Close channels created after ``checkpoint`` and restore mappings.
+
+        Callers must destroy and synchronize any graphs that reference the
+        transient channels before rolling back.
+        """
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2APool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot roll back channels during capture")
+        all_channels_len, channels = checkpoint
+        if not 0 <= all_channels_len <= len(self._all_channels):
+            raise ValueError("channel checkpoint does not belong to this pool")
+
+        retained = self._all_channels[:all_channels_len]
+        retained_ids = {id(channel) for channel in retained}
+        transient = self._all_channels[all_channels_len:]
+        self._all_channels = retained
+        self._channels = dict(channels)
+
+        channels_to_close = tuple(
+            dict.fromkeys(
+                channel for channel in transient if id(channel) not in retained_ids
+            )
+        )
+        _coordinated_close_channels(
+            channels_to_close,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def for_stream(self, stream: object = None) -> PCIeDCPA2A:
         if self._closed:
@@ -594,6 +656,17 @@ class PCIeDCPA2APool:
         else:
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
+        if (
+            not self.single_channel
+            and _is_current_stream_capturing(self.device)
+            and self._capture_channel_stack
+        ):
+            # Independent graph managers may reuse a torch-owned nested stream
+            # key. The enclosing capture, not a stale key mapping, determines
+            # which IPC channel is safe for this graph.
+            channel = self._capture_channel_stack[-1]
+            self._channels[key] = channel
+            return channel
         channel = self._channels.get(key)
         if channel is not None:
             return channel
@@ -676,7 +749,20 @@ class PCIeDCPA2APool:
     @contextmanager
     def capture(self, stream: object = None):
         """Bind nested CUDA captures to the enclosing stream's channel."""
-        channel = self.for_stream(stream)
+        if self.single_channel:
+            channel = self.for_stream(stream)
+        else:
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "PCIe DCP A2A capture context must be entered before CUDA "
+                    "graph capture starts"
+                )
+            stream_key = _current_stream_key(self.device, stream)
+            key = 0 if stream_key is None else int(stream_key)
+            # Keep a graph-owned channel even when CUDA recycles the enclosing
+            # stream handle used by a previously captured graph manager.
+            channel = self._new_channel(stream_key)
+            self._channels[key] = channel
         self._capture_channel_stack.append(channel)
         try:
             yield channel
@@ -690,10 +776,11 @@ class PCIeDCPA2APool:
             return
         self._closed = True
         seen: set[int] = set()
-        for channel in self._channels.values():
+        for channel in (*self._all_channels, *self._channels.values()):
             if id(channel) not in seen:
                 seen.add(id(channel))
                 channel.close()
+        self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:
