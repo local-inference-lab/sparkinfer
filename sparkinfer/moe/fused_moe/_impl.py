@@ -1187,6 +1187,20 @@ def _is_w4a8_quant_mode(quant_mode: str) -> bool:
     return quant_mode in _W4A8_QUANT_MODES
 
 
+def _dynamic_kernel_intermediate_size(n: int, quant_mode: str) -> int:
+    """Return the intermediate extent consumed by the dynamic kernel.
+
+    Prepared W4A8-MX weights use ceil-tiled N128 storage. The launch treats
+    that zero-padded tail as part of the kernel extent, so every plan-time
+    geometry and scratch calculation must use the same padded value.
+    """
+
+    n = int(n)
+    if _normalize_quant_mode(quant_mode) == "w4a8_mx":
+        return align_up(n, 128)
+    return n
+
+
 def _micro_scale_format_for_quant_mode(quant_mode: str) -> str:
     quant_mode = _normalize_quant_mode(quant_mode)
     return "e8m0_k32" if quant_mode == "w4a8_mx" else "e4m3_k16"
@@ -2567,9 +2581,10 @@ def _plan_core_workspace(
 
     # Tile planner: must match the kernel's choice (keyed identically on the
     # workspace capacity) so the grouped task/scale scratch is sized correctly.
+    dynamic_kernel_n = _dynamic_kernel_intermediate_size(n, quant_mode)
     dynamic_tile_m, dynamic_tile_n = _select_dynamic_tile_mn(
         routed_rows,
-        n,
+        dynamic_kernel_n,
         quant_mode,
         num_experts=state_E,
         activation=activation_spec.activation,
@@ -2577,7 +2592,7 @@ def _plan_core_workspace(
     if dynamic_physical_tiles is None or dynamic_task_capacity is None:
         dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(
             state_E,
-            n,
+            dynamic_kernel_n,
             routed_rows,
             tile_m=dynamic_tile_m,
             tile_n=dynamic_tile_n,
@@ -2587,12 +2602,16 @@ def _plan_core_workspace(
             activation=activation_spec.activation,
             routed_rows=routed_rows,
             num_experts=state_E,
-            n=n,
+            n=dynamic_kernel_n,
             deterministic_output=False,
         ):
             direct_groups = max(
                 1,
-                ((n + dynamic_tile_n - 1) // dynamic_tile_n + _DYNAMIC_SLICE_CHUNK - 1)
+                (
+                    (dynamic_kernel_n + dynamic_tile_n - 1) // dynamic_tile_n
+                    + _DYNAMIC_SLICE_CHUNK
+                    - 1
+                )
                 // _DYNAMIC_SLICE_CHUNK,
             )
             dynamic_tiles = max(dynamic_tiles, routed_rows)
@@ -2623,7 +2642,7 @@ def _plan_core_workspace(
     if _is_w4a8_quant_mode(quant_mode):
         materialized_intermediate_bytes = max(
             16,
-            dynamic_rows_padded * (n + n // 32),
+            dynamic_rows_padded * (dynamic_kernel_n + dynamic_kernel_n // 32),
         )
     materialized_intermediate_rows = max(
         1,
@@ -4631,7 +4650,7 @@ def _resolve_workspace_layout(
                 return "micro", max(1, routed_rows), max(1, routed_rows)
             tile_m, _ = _select_dynamic_tile_mn(
                 routed_rows,
-                n,
+                _dynamic_kernel_intermediate_size(n, quant_mode),
                 quant_mode,
                 num_experts=weight_E,
                 activation=activation,
@@ -4765,13 +4784,14 @@ def plan_tp_moe_execution(
     dynamic_tile_n = None
     max_tokens_per_launch = num_tokens
     if implementation == "dynamic":
+        dynamic_kernel_n = _dynamic_kernel_intermediate_size(n, quant_mode)
         # Tile planner (same routed_rows/n as _plan_core_workspace and the kernel
         # build) -> the task/row geometry sized here matches what the kernel
         # indexes. Must NOT use the bare _dynamic_tile_m (would size for 128 while
         # the kernel runs the planner's tile -> scratch under-size).
         dynamic_tile_m, dynamic_tile_n = _select_dynamic_tile_mn(
             routed_rows,
-            n,
+            dynamic_kernel_n,
             quant_mode,
             num_experts=state_E,
             activation=activation,
@@ -4779,7 +4799,7 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles, gate_tile_cnt, dynamic_task_capacity = (
             _dynamic_task_geometry(
                 state_E,
-                n,
+                dynamic_kernel_n,
                 routed_rows,
                 tile_m=dynamic_tile_m,
                 tile_n=dynamic_tile_n,
@@ -4790,7 +4810,7 @@ def plan_tp_moe_execution(
             activation=activation,
             routed_rows=routed_rows,
             num_experts=state_E,
-            n=n,
+            n=dynamic_kernel_n,
             deterministic_output=False,
         ):
             direct_groups = max(
@@ -7619,7 +7639,7 @@ def _launch_dynamic_flat(
         # n_pad therefore computes the exact result — the padded FC1 columns
         # are silu(0)*0 = 0 and w2's padded K rows are zero. tiny_decode
         # keeps the logical-n bounds for the decode band.
-        n = -(-int(n) // 128) * 128
+        n = _dynamic_kernel_intermediate_size(n, quant_mode)
     decode_regime = bool(
         w4a8_repacked
         and _w4a8_dynamic_decode_candidate(
@@ -7675,7 +7695,9 @@ def _launch_dynamic_flat(
             raise ValueError(
                 "dynamic W4A8 materialized scratch exceeds preplanned capacity: "
                 f"need {required_intermediate_bytes} bytes, have "
-                f"{available_intermediate_bytes}"
+                f"{available_intermediate_bytes}; physical_tiles_capacity="
+                f"{physical_tiles_capacity}, selected_tile_m={selected_tile_m}, "
+                f"n={n}, routed_rows={routed_rows}, m={m}, num_topk={num_topk}"
             )
     if not multicta_enabled:
         effective_mac = 1
