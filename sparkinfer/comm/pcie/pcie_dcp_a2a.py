@@ -497,6 +497,12 @@ class PCIeDCPA2A:
             self.close()
 
 
+@dataclass(frozen=True)
+class _ChannelCheckpoint:
+    pool_id: int
+    channels: tuple[tuple[int, PCIeDCPA2A], ...]
+
+
 class PCIeDCPA2APool:
     """Create an independent DCP collective channel for each CUDA stream."""
 
@@ -701,6 +707,41 @@ class PCIeDCPA2APool:
             popped = self._capture_channel_stack.pop()
             if popped is not channel:
                 raise RuntimeError("PCIe DCP A2A capture channel stack corrupted")
+
+    def checkpoint_channels(self) -> _ChannelCheckpoint:
+        """Snapshot channels before a disposable CUDA graph capture."""
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2APool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot checkpoint channels during CUDA graph capture")
+        return _ChannelCheckpoint(
+            pool_id=id(self),
+            channels=tuple(self._channels.items()),
+        )
+
+    def rollback_channels(self, checkpoint: _ChannelCheckpoint) -> None:
+        """Release channels created after ``checkpoint`` and restore aliases."""
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2APool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot roll back channels during CUDA graph capture")
+        if checkpoint.pool_id != id(self):
+            raise ValueError("channel checkpoint belongs to a different pool")
+
+        saved_channels = dict(checkpoint.channels)
+        saved_channel_ids = {id(channel) for channel in saved_channels.values()}
+        new_channels: list[PCIeDCPA2A] = []
+        seen: set[int] = set()
+        for channel in self._channels.values():
+            channel_id = id(channel)
+            if channel_id not in saved_channel_ids and channel_id not in seen:
+                seen.add(channel_id)
+                new_channels.append(channel)
+
+        self._channels.clear()
+        self._channels.update(saved_channels)
+        for channel in new_channels:
+            channel.close()
 
     def close(self) -> None:
         if self._closed:
