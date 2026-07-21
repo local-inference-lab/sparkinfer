@@ -793,8 +793,8 @@ def _worker(
 
 @pytest.mark.parametrize(
     ("world_size", "record_bytes"),
-    ((4, 432), (8, 656)),
-    ids=("dcp4-record432", "dcp8-record656"),
+    ((4, 368), (4, 432), (8, 368), (8, 656)),
+    ids=("dcp4-record368", "dcp4-record432", "dcp8-record368", "dcp8-record656"),
 )
 def test_pcie_selected_record_ce_eager_graph_overflow_and_big_offset(
     world_size: int,
@@ -807,8 +807,8 @@ def test_pcie_selected_record_ce_eager_graph_overflow_and_big_offset(
         and os.getenv("SPARKINFER_RUN_PCIE_SELECTED_RECORDS_CE_WORLD8_TEST") != "1"
     ):
         pytest.skip(
-            "set SPARKINFER_RUN_PCIE_SELECTED_RECORDS_CE_WORLD8_TEST=1 for the "
-            "DCP8/656-byte gate"
+            "set SPARKINFER_RUN_PCIE_SELECTED_RECORDS_CE_WORLD8_TEST=1 for "
+            "the DCP8 selected-record gate"
         )
     if torch.cuda.device_count() < world_size:
         pytest.skip(
