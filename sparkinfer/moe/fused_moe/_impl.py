@@ -6544,9 +6544,7 @@ def _select_micro_mma_tiler_mn(
     resident_clusters: int | None = None,
 ) -> tuple[int, int]:
     if os.environ.get("SPARKINFER_MOE_TILE_MN"):
-        return tuple(
-            int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x")
-        )
+        return tuple(int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x"))
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     if max_rows <= 32 and n <= 256:
@@ -6626,9 +6624,7 @@ def _get_micro_kernel(
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
         return last_kval, kernel.grid_x
-    reuse_compiled = (
-        os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
-    )
+    reuse_compiled = os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
     if reuse_compiled:
         cached = _MICRO_KERNEL_CACHE.get(cache_key)
         if cached is not None:
@@ -8173,6 +8169,79 @@ def _launch_dynamic_topk_sum(
     )
 
 
+def _is_native_nvfp4_micro_decode(
+    *,
+    quant_mode: str,
+    num_tokens: int,
+    activation: str,
+) -> bool:
+    """Return whether this is the bounded native-NVFP4 micro decode band."""
+    return (
+        _normalize_quant_mode(quant_mode) in {"nvfp4", "w4a8_nvfp4"}
+        and 1 <= int(num_tokens) <= _MICRO_MAX_TOKENS
+        and activation == "silu"
+    )
+
+
+def _use_barrier_free_nvfp4_split(
+    *,
+    quant_mode: str,
+    num_tokens: int,
+    activation: str,
+) -> bool:
+    """Return whether native NVFP4 decode uses separate FC1/FC2 launches.
+
+    The split path remains available for diagnostics, but it loses the serving
+    benefit of the bounded micro launch overlapping GLM shared experts.
+    """
+    return (
+        _is_native_nvfp4_micro_decode(
+            quant_mode=quant_mode,
+            num_tokens=num_tokens,
+            activation=activation,
+        )
+        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "0") == "1"
+    )
+
+
+def tp_moe_plan_supports_aux_stream_overlap(plan: TPMoEPlan) -> bool:
+    """Whether shared experts may use the pre-resident auxiliary stream.
+
+    The caller must submit the shared-expert work before this plan and enqueue
+    a consumer-stream wait before launching the routed experts. A true result
+    does not permit a resident-grid kernel to execute concurrently with the
+    auxiliary work.
+    """
+    if not isinstance(plan, TPMoEPlan):
+        raise TypeError("plan must be a TPMoEPlan")
+    if plan.num_topk <= 0 or plan.routed_rows % plan.num_topk != 0:
+        return False
+    num_tokens = plan.routed_rows // plan.num_topk
+    # W4A16 decode uses a device-wide barrier. It is still safe to overlap the
+    # shared expert with gate/router work because vLLM waits for the auxiliary
+    # stream before submitting this resident launch. Keep the same tested
+    # small-decode boundary as the native NVFP4 path.
+    if plan.implementation == "w4a16":
+        return plan.quant_mode == "w4a16" and 1 <= num_tokens <= 7
+    if plan.implementation != "micro":
+        return False
+    if _use_barrier_free_nvfp4_split(
+        quant_mode=plan.quant_mode,
+        num_tokens=num_tokens,
+        activation=plan.activation,
+    ):
+        return False
+    # The compact native-NVFP4 micro grid is a bounded, single-wave decode
+    # launch. M=1..7 survives graph-replay concurrency stress; M=8 changes the
+    # launch geometry, so that boundary and all larger resident plans must
+    # remain serialized.
+    return num_tokens <= 7 and _is_native_nvfp4_micro_decode(
+        quant_mode=plan.quant_mode,
+        num_tokens=num_tokens,
+        activation=plan.activation,
+    )
+
+
 def _launch_compact_micro_flat(
     *,
     barrier_count: torch.Tensor,
@@ -8208,11 +8277,10 @@ def _launch_compact_micro_flat(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
-    use_native_nvfp4_split = (
-        quant_mode == "w4a8_nvfp4"
-        and 1 <= m <= 8
-        and activation == "silu"
-        and os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE", "1") != "0"
+    use_native_nvfp4_split = _use_barrier_free_nvfp4_split(
+        quant_mode=quant_mode,
+        num_tokens=m,
+        activation=activation,
     )
     if use_native_nvfp4_split:
         # Preserve the ModelOpt NVFP4 representation and scalar math exactly.
@@ -9225,9 +9293,7 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get(
-                    "SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1"
-                )
+                and os.environ.get("SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
                 != "0"
             ),
             share_expert_scales=(
@@ -9586,7 +9652,9 @@ def _select_experts_reference(
     )
 
 
-def sparkinfer_route_experts_fast(*, binding: TPMoERouteBinding) -> SPARKINFERTopKRouting:
+def sparkinfer_route_experts_fast(
+    *, binding: TPMoERouteBinding
+) -> SPARKINFERTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current
