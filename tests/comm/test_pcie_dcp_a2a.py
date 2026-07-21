@@ -183,6 +183,24 @@ def test_runtime_validates_and_dispatches_to_extension():
     assert ext.dispose_calls == [1234]
 
 
+def test_runtime_accepts_head_major_input_and_output():
+    ext = _FakeExt()
+    runtime = _make_runtime(ext)
+    input_storage = torch.arange(
+        32 * 4 * 64, dtype=torch.bfloat16
+    ).reshape(32, 4, 64)
+    partial_output = input_storage.transpose(0, 1)[:2]
+    partial_lse = torch.zeros(2, 32, dtype=torch.float32)
+    output_storage = torch.empty(16, 2, 64, dtype=torch.bfloat16)
+    out = output_storage.transpose(0, 1)
+
+    actual = runtime.lse_reduce_scatter(partial_output, partial_lse, out=out)
+
+    assert actual is out
+    assert actual.stride() == (64, 2 * 64, 1)
+    torch.testing.assert_close(actual, partial_output[:, :16])
+
+
 def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
     runtime = _make_runtime()
     good_output = torch.zeros(1, 32, 64, dtype=torch.bfloat16)
@@ -197,6 +215,9 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
             torch.zeros(5, 32, 64, dtype=torch.bfloat16),
             torch.zeros(5, 32, dtype=torch.float32),
         )
+    unsupported_view = torch.zeros(1, 33, 64, dtype=torch.bfloat16)[:, :32]
+    with pytest.raises(ValueError, match="packed token-major or head-major"):
+        runtime.lse_reduce_scatter(unsupported_view, good_lse)
 
     with pytest.raises(ValueError, match="configured local heads/head_dim"):
         runtime.all_gather_heads(good_output[:, :8])

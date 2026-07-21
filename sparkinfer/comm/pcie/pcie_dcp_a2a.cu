@@ -152,7 +152,11 @@ __global__ void __launch_bounds__(512, 1)
                           RankStaging staging, int64_t lse_offset,
                           RankSignals signals, Signal *self,
                           T *__restrict__ output, int rank, int batch,
-                          int total_heads, int head_dim, bool natural_log) {
+                          int total_heads, int head_dim,
+                          int64_t input_stride_batch,
+                          int64_t input_stride_head,
+                          int64_t output_stride_batch,
+                          int64_t output_stride_head, bool natural_log) {
   constexpr int kPackElems = 8;
   const int heads_per_rank = total_heads / world_size;
   const int packs_per_head = head_dim / kPackElems;
@@ -175,9 +179,12 @@ __global__ void __launch_bounds__(512, 1)
     for (int dest = 0; dest < world_size; ++dest) {
       const int64_t source_row = int64_t(batch_index) * total_heads +
                                  dest * heads_per_rank + local_head;
-      const int64_t base = source_row * packs_per_head;
+      const int64_t input_base =
+          int64_t(batch_index) * input_stride_batch +
+          int64_t(dest * heads_per_rank + local_head) * input_stride_head;
+      const int64_t staging_base = source_row * packs_per_head;
       for (int pack = lane; pack < packs_per_head; pack += warpSize) {
-        staging_out[base + pack] = local_packs[base + pack];
+        staging_out[staging_base + pack] = local_packs[input_base + pack];
       }
       if (lane == 0) {
         staging_lse[source_row] = local_lse[source_row];
@@ -240,12 +247,19 @@ __global__ void __launch_bounds__(512, 1)
     }
     const float inv_weight_sum = 1.0f / fmaxf(weight_sum, 1.0e-10f);
 
-    const int64_t source_base = source_row * packs_per_head;
-    const int64_t output_base = int64_t(row) * packs_per_head;
+    const int64_t staging_base = source_row * packs_per_head;
+    const int64_t local_base =
+        int64_t(batch_index) * input_stride_batch +
+        int64_t(global_head) * input_stride_head;
+    const int64_t output_base =
+        int64_t(batch_index) * output_stride_batch +
+        int64_t(local_head) * output_stride_head;
     for (int pack = lane; pack < packs_per_head; pack += warpSize) {
       float accum[kPackElems] = {};
 #pragma unroll
       for (int i = 0; i < world_size; ++i) {
+        const int src = (rank + i) % world_size;
+        const int64_t source_base = src == rank ? local_base : staging_base;
         const Pack<T> values = rot_packs[i][source_base + pack];
         const float weight = weights[i] * inv_weight_sum;
 #pragma unroll
@@ -348,7 +362,10 @@ public:
   template <typename T>
   void run(cudaStream_t stream, const T *partial_output,
            const float *partial_lse, T *output, int batch, int total_heads,
-           int head_dim, bool natural_log, int threads, int block_limit) {
+           int head_dim, int64_t input_stride_batch,
+           int64_t input_stride_head, int64_t output_stride_batch,
+           int64_t output_stride_head, bool natural_log, int threads,
+           int block_limit) {
     const int64_t output_elems = int64_t(batch) * total_heads * head_dim;
     const int64_t lse_elems = int64_t(batch) * total_heads;
     if (output_elems > output_capacity_elems_ || lse_elems > lse_capacity_) {
@@ -389,7 +406,9 @@ public:
 #define LAUNCH(world)                                                          \
   dcp_lse_reduce_kernel<T, world><<<blocks, threads, 0, stream>>>(             \
       partial_output, partial_lse, staging_[slot], lse_offset_, signals_,      \
-      self_signal_, output, rank_, batch, total_heads, head_dim, natural_log)
+      self_signal_, output, rank_, batch, total_heads, head_dim,               \
+      input_stride_batch, input_stride_head, output_stride_batch,              \
+      output_stride_head, natural_log)
     switch (world_size_) {
     case 2:
       LAUNCH(2);
@@ -503,8 +522,7 @@ static void lse_reduce_scatter(fptr_t pointer, torch::Tensor &partial_output,
 
   TORCH_CHECK(partial_output.is_cuda() && partial_lse.is_cuda() &&
               output.is_cuda());
-  TORCH_CHECK(partial_output.is_contiguous() && partial_lse.is_contiguous() &&
-              output.is_contiguous());
+  TORCH_CHECK(partial_lse.is_contiguous());
   TORCH_CHECK_EQ(partial_output.dim(), 3);
   TORCH_CHECK_EQ(partial_lse.dim(), 2);
   TORCH_CHECK_EQ(output.dim(), 3);
@@ -521,6 +539,35 @@ static void lse_reduce_scatter(fptr_t pointer, torch::Tensor &partial_output,
   TORCH_CHECK_EQ(output.size(0), batch);
   TORCH_CHECK_EQ(output.size(1), total_heads / runtime->world_size_);
   TORCH_CHECK_EQ(output.size(2), head_dim);
+  TORCH_CHECK_EQ(partial_output.stride(2), 1);
+  TORCH_CHECK_EQ(output.stride(2), 1);
+
+  const auto input_heads = partial_output.size(1);
+  const auto output_heads = output.size(1);
+  const bool input_token_major =
+      partial_output.stride(0) == input_heads * head_dim &&
+      partial_output.stride(1) == head_dim;
+  const bool input_head_major =
+      partial_output.stride(0) == head_dim &&
+      partial_output.stride(1) >= batch * head_dim;
+  const bool output_token_major =
+      output.stride(0) == output_heads * head_dim &&
+      output.stride(1) == head_dim;
+  const bool output_head_major =
+      output.stride(0) == head_dim && output.stride(1) >= batch * head_dim;
+  TORCH_CHECK(input_token_major || input_head_major,
+              "partial_output must be packed token-major or head-major");
+  TORCH_CHECK(output_token_major || output_head_major,
+              "output must be packed token-major or head-major");
+  TORCH_CHECK_EQ(partial_output.stride(0) % 8, 0);
+  TORCH_CHECK_EQ(partial_output.stride(1) % 8, 0);
+  TORCH_CHECK_EQ(output.stride(0) % 8, 0);
+  TORCH_CHECK_EQ(output.stride(1) % 8, 0);
+
+  const int64_t input_stride_batch = partial_output.stride(0) / 8;
+  const int64_t input_stride_head = partial_output.stride(1) / 8;
+  const int64_t output_stride_batch = output.stride(0) / 8;
+  const int64_t output_stride_head = output.stride(1) / 8;
 
   switch (partial_output.scalar_type()) {
   case at::ScalarType::Half:
@@ -528,8 +575,9 @@ static void lse_reduce_scatter(fptr_t pointer, torch::Tensor &partial_output,
                  reinterpret_cast<const half *>(partial_output.data_ptr()),
                  reinterpret_cast<const float *>(partial_lse.data_ptr()),
                  reinterpret_cast<half *>(output.data_ptr()), int(batch),
-                 int(total_heads), int(head_dim), natural_log, int(threads),
-                 int(block_limit));
+                 int(total_heads), int(head_dim), input_stride_batch,
+                 input_stride_head, output_stride_batch, output_stride_head,
+                 natural_log, int(threads), int(block_limit));
     break;
   case at::ScalarType::BFloat16:
     runtime->run(
@@ -537,8 +585,9 @@ static void lse_reduce_scatter(fptr_t pointer, torch::Tensor &partial_output,
         reinterpret_cast<const nv_bfloat16 *>(partial_output.data_ptr()),
         reinterpret_cast<const float *>(partial_lse.data_ptr()),
         reinterpret_cast<nv_bfloat16 *>(output.data_ptr()), int(batch),
-        int(total_heads), int(head_dim), natural_log, int(threads),
-        int(block_limit));
+        int(total_heads), int(head_dim), input_stride_batch,
+        input_stride_head, output_stride_batch, output_stride_head,
+        natural_log, int(threads), int(block_limit));
     break;
   default:
     TORCH_CHECK(false, "partial_output must be float16 or bfloat16");

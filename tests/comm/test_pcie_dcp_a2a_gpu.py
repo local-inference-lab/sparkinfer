@@ -20,10 +20,11 @@ pytestmark = pytest.mark.skipif(
     reason="set SPARKINFER_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
-TOTAL_HEADS = 32
+TOTAL_HEADS = 16
 HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
-MAX_BATCH = 4
+MAX_BATCH = 64
+TEST_BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
 
 
 def _free_port() -> int:
@@ -105,7 +106,7 @@ def _check_eager(
     device: torch.device,
 ) -> None:
     for dtype in (torch.bfloat16, torch.float16):
-        for step, batch in enumerate((1, 2, 4), start=1):
+        for step, batch in enumerate(TEST_BATCHES, start=1):
             local_q = _rank_query(
                 step + 100,
                 rank,
@@ -144,6 +145,33 @@ def _check_eager(
             )
             torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
+            input_storage = torch.empty(
+                TOTAL_HEADS,
+                MAX_BATCH,
+                HEAD_DIM,
+                dtype=dtype,
+                device=device,
+            )
+            head_major_input = input_storage.transpose(0, 1)[:batch]
+            head_major_input.copy_(partial_output)
+            output_storage = torch.empty(
+                TOTAL_HEADS // world_size,
+                MAX_BATCH,
+                HEAD_DIM,
+                dtype=dtype,
+                device=device,
+            )
+            head_major_output = output_storage.transpose(0, 1)[:batch]
+            actual = pool.lse_reduce_scatter(
+                head_major_input,
+                partial_lse,
+                out=head_major_output,
+            )
+            torch.cuda.synchronize(device)
+            assert actual is head_major_output
+            assert actual.movedim(0, 1).stride(0) == MAX_BATCH * HEAD_DIM
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
 
 def _check_graph(
     pool: PCIeDCPA2APool,
@@ -154,30 +182,34 @@ def _check_graph(
     stream = torch.cuda.Stream(device=device)
     channel = pool.for_stream(stream)
     layers = 7
-    inputs = [
+    input_storages = [
         torch.empty(
-            1,
             TOTAL_HEADS,
+            MAX_BATCH,
             HEAD_DIM,
             dtype=torch.bfloat16,
             device=device,
         )
         for _ in range(layers)
     ]
+    inputs = [storage.transpose(0, 1) for storage in input_storages]
     lses = [
-        torch.empty(1, TOTAL_HEADS, dtype=torch.float32, device=device)
+        torch.empty(MAX_BATCH, TOTAL_HEADS, dtype=torch.float32, device=device)
         for _ in range(layers)
     ]
-    outputs = [
+    output_storages = [
         torch.empty(
-            1,
             TOTAL_HEADS // world_size,
+            MAX_BATCH,
             HEAD_DIM,
             dtype=torch.bfloat16,
             device=device,
         )
         for _ in range(layers)
     ]
+    outputs = [storage.transpose(0, 1) for storage in output_storages]
+    assert all(tensor.stride(1) == MAX_BATCH * HEAD_DIM for tensor in inputs)
+    assert all(tensor.stride(1) == MAX_BATCH * HEAD_DIM for tensor in outputs)
     local_queries = [
         torch.empty(
             1,
@@ -220,7 +252,7 @@ def _check_graph(
             partial_output, partial_lse = _rank_inputs(
                 step,
                 rank,
-                1,
+                MAX_BATCH,
                 torch.bfloat16,
                 device,
             )
@@ -257,7 +289,7 @@ def _check_graph(
                     step,
                     rank,
                     world_size,
-                    1,
+                    MAX_BATCH,
                     torch.bfloat16,
                     device,
                 )

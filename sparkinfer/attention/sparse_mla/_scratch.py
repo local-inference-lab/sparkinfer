@@ -53,6 +53,7 @@ class SPARKINFERSparseMLAScratchCaps:
     max_chunks_per_row: int = 64
     max_q_chunks: int | None = None
     page_size: int = 64
+    head_major_output: bool = False
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -110,6 +111,7 @@ class SPARKINFERSparseMLAScratch:
     mode: str = "decode"
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
+    head_major_output: bool = False
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
@@ -180,8 +182,6 @@ def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
         raise ValueError(f"q must be rank-3, got {tuple(q.shape)}")
     if q.dtype != scratch.dtype:
         raise TypeError(f"q must have dtype {scratch.dtype}, got {q.dtype}")
-    if not q.is_contiguous():
-        raise ValueError("q must be contiguous")
     _validate_device(q, scratch=scratch, name="q")
     if int(q.shape[0]) > int(scratch.max_total_q):
         raise ValueError(
@@ -195,6 +195,8 @@ def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
         raise ValueError(
             f"q head_dim {int(q.shape[2])} does not match scratch head_dim {scratch.head_dim}"
         )
+    if not q.is_contiguous():
+        raise ValueError("q must be contiguous")
     return q.detach()
 
 
@@ -396,10 +398,14 @@ def _materialize_sparse_mla_scratch(
                 num_q_heads=num_q_heads,
                 max_chunks_per_row=max_chunks_per_row,
                 v_head_dim=v_head_dim,
+                head_major_output=caps.head_major_output,
             ),
             dtype=caps.dtype,
         )
-        output_buffer = _split_output_buffer_from_tmp(tmp_output)
+        output_buffer = _split_output_buffer_from_tmp(
+            tmp_output,
+            head_major_output=caps.head_major_output,
+        )
         tmp_lse, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.tmp_lse_offset_bytes,
@@ -425,12 +431,21 @@ def _materialize_sparse_mla_scratch(
             dtype=torch.int32,
         )
     else:
-        output_buffer, _ = materialize_scratch_view(
-            scratch_storage,
-            offset_bytes=layout.output_offset_bytes,
-            shape=(max_total_q, num_q_heads, v_head_dim),
-            dtype=caps.dtype,
-        )
+        if caps.head_major_output:
+            output_buffer, _ = materialize_scratch_strided_view(
+                scratch_storage,
+                offset_bytes=layout.output_offset_bytes,
+                shape=(max_total_q, num_q_heads, v_head_dim),
+                stride=(v_head_dim, max_total_q * v_head_dim, 1),
+                dtype=caps.dtype,
+            )
+        else:
+            output_buffer, _ = materialize_scratch_view(
+                scratch_storage,
+                offset_bytes=layout.output_offset_bytes,
+                shape=(max_total_q, num_q_heads, v_head_dim),
+                dtype=caps.dtype,
+            )
 
     sm_scale_tensor, _ = materialize_scratch_view(
         scratch_storage,
@@ -453,6 +468,7 @@ def _materialize_sparse_mla_scratch(
         max_chunks_per_row=max_chunks_per_row,
         page_size=caps.page_size,
         mode=caps.mode,
+        head_major_output=caps.head_major_output,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         output_buffer=output_buffer,
