@@ -201,10 +201,15 @@ def _split_tmp_output_stride(
     num_q_heads: int,
     max_chunks_per_row: int,
     v_head_dim: int,
+    head_major_output: bool = False,
 ) -> tuple[int, int, int, int]:
     del max_chunks_per_row
-    row_stride = int(num_q_heads) * int(v_head_dim)
-    head_stride = int(v_head_dim)
+    if head_major_output:
+        row_stride = int(v_head_dim)
+        head_stride = int(max_total_q) * int(v_head_dim)
+    else:
+        row_stride = int(num_q_heads) * int(v_head_dim)
+        head_stride = int(v_head_dim)
     chunk_stride = int(max_total_q) * int(num_q_heads) * int(v_head_dim)
     return (row_stride, head_stride, chunk_stride, 1)
 
@@ -236,11 +241,26 @@ def _allocate_split_tmp_output(
     )
 
 
-def _split_output_buffer_from_tmp(tmp_output: torch.Tensor) -> torch.Tensor:
+def _split_output_buffer_from_tmp(
+    tmp_output: torch.Tensor,
+    *,
+    head_major_output: bool = False,
+) -> torch.Tensor:
     if tmp_output.ndim != 4:
         raise ValueError(f"tmp_output must be rank 4, got {tmp_output.ndim}")
     output = tmp_output[:, :, 0, :]
-    if not output.is_contiguous():
+    if head_major_output:
+        expected_stride = (
+            int(output.shape[2]),
+            int(output.shape[0]) * int(output.shape[2]),
+            1,
+        )
+        if tuple(output.stride()) != expected_stride:
+            raise RuntimeError(
+                "split MLA tmp_output layout must make chunk 0 head-major: "
+                f"expected stride={expected_stride}, got {tuple(output.stride())}"
+            )
+    elif not output.is_contiguous():
         raise RuntimeError(
             "split MLA tmp_output layout must make chunk 0 a contiguous output buffer"
         )

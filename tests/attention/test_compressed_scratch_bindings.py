@@ -535,6 +535,41 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     assert plan.layout.nbytes == specs[0].nbytes
 
 
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_sparse_mla_scratch_can_expose_head_major_output(mode: str) -> None:
+    caps = SPARKINFERSparseMLAScratchCaps(
+        device="cpu",
+        num_q_heads=8,
+        max_q_rows=6,
+        max_width=32,
+        head_dim=576,
+        v_head_dim=512,
+        mode=mode,
+        max_chunks_per_row=4,
+        head_major_output=True,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    scratch = _one_scratch(plan)
+    q = torch.empty((6, 8, 576), dtype=torch.bfloat16)
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        selected_indices=torch.empty((6, 32), dtype=torch.int32),
+        cache_seqlens_int32=torch.empty((6,), dtype=torch.int32),
+        nsa_cache_seqlens_int32=torch.empty((6,), dtype=torch.int32),
+    )
+
+    output = binding.scratch.output_buffer
+    assert output is not None
+    assert output.shape == (6, 8, 512)
+    assert output.stride() == (512, 6 * 512, 1)
+    assert not output.is_contiguous()
+    assert binding.scratch.head_major_output
+    if mode == "decode":
+        assert binding.scratch.tmp_output is not None
+        assert output.data_ptr() == binding.scratch.tmp_output[:, :, 0, :].data_ptr()
+
+
 def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
     monkeypatch,
 ) -> None:
