@@ -3840,9 +3840,11 @@ def _sparse_mla_prefill_mg_flat_launch(
         )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.sm120.prefill_mg",
-        # v3 adds the FP8-RoPE record specialization/read path. The explicit
-        # cache key does not hash source, so do not reuse v2 KLD-only cubins.
-        3,
+        # v4: latent_scale == 1.0 is folded out at trace time, producing a
+        # cubin without the outer-scale multiply; the identity and dynamic
+        # variants must not share a cache entry.
+        4,
+        key_field("latent_scale_identity", int(float(latent_scale) == 1.0)),
         *spec_fields,
     )
     entry = kernel.call_dual if has_extra else kernel
