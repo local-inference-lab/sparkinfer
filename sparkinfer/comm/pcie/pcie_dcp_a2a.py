@@ -40,11 +40,11 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         stride_batch == heads * head_dim and stride_head == head_dim
     )
     capacity_strided_head_major = (
-        stride_batch == head_dim and stride_head >= batch * head_dim
+        stride_batch == head_dim
+        and stride_head >= batch * head_dim
+        and stride_head % 8 == 0
     )
     return packed_token_major or capacity_strided_head_major
-
-
 @dataclass(frozen=True)
 class _StagingLayout:
     signal_bytes: int
