@@ -28,6 +28,8 @@ import torch
 
 from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
 from sparkinfer.attention.nsa_indexer.paged import (
+    _plan_two_level_slices,
+    _two_level_slice_width,
     index_topk_fp8,
     pack_paged_index_k_cache_reference,
     prepare_paged_indexer_metadata,
@@ -43,6 +45,63 @@ _ROWS = 16
 _NUM_HEADS = 32
 _TOPK = 2048
 _PAGE_START = 3
+
+
+@pytest.mark.parametrize(
+    ("width_tokens", "max_slices", "expected_width", "expected_slices"),
+    [
+        (131072, 32, 16384, 8),
+        (262144, 32, 16384, 16),
+        (262144, 8, 32768, 8),
+        (300000, 8, 37504, 8),
+    ],
+)
+def test_two_level_slice_width_bounds_candidate_workspace(
+    width_tokens: int,
+    max_slices: int,
+    expected_width: int,
+    expected_slices: int,
+) -> None:
+    slice_width = _two_level_slice_width(
+        width_tokens,
+        _PAGE,
+        max_slices=max_slices,
+    )
+    assert slice_width == expected_width
+    assert -(-width_tokens // slice_width) == expected_slices
+
+
+@pytest.mark.parametrize(
+    (
+        "width_tokens",
+        "supertile_tokens",
+        "max_slices",
+        "expected_chunks",
+        "expected_slices",
+    ),
+    [
+        (131072, 16384, 8, 8, 8),
+        (167936, 16384, 8, 0, 0),
+        (262144, 32768, 8, 8, 8),
+        (262144, 16384, 8, 0, 0),
+        (300032, 16384, 32, 19, 19),
+    ],
+)
+def test_two_level_slice_plan_falls_back_before_exceeding_cap(
+    width_tokens: int,
+    supertile_tokens: int,
+    max_slices: int,
+    expected_chunks: int,
+    expected_slices: int,
+) -> None:
+    plan = _plan_two_level_slices(
+        width_tokens // _PAGE,
+        _PAGE,
+        supertile_tokens // _PAGE,
+        max_slices=max_slices,
+    )
+    assert len(plan) == expected_chunks
+    assert sum(chunk_slices for chunk_slices, _ in plan) == expected_slices
 
 
 def _build_scene(device: torch.device, seq_len: int, scores: str) -> dict:

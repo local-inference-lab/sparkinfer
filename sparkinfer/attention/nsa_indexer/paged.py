@@ -34,7 +34,86 @@ from sparkinfer.attention.nsa_indexer.tiled_topk import (
 # cap that keeps the candidate buffers capacity-independent (~topk*8B*cap per
 # row) at very long contexts.
 _TWO_LEVEL_SLICE_TOKENS = 16384
-_TWO_LEVEL_MAX_SLICES = 32
+_TWO_LEVEL_MAX_SLICES_ENV = "SPARKINFER_PAGED_INDEX_TWO_LEVEL_MAX_SLICES"
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive integer, got {raw_value!r}"
+        ) from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {raw_value!r}")
+    return value
+
+
+_TWO_LEVEL_MAX_SLICES = _read_positive_int_env(
+    _TWO_LEVEL_MAX_SLICES_ENV,
+    32,
+)
+
+
+def _two_level_slice_width(
+    width_tokens: int,
+    page_size: int,
+    *,
+    max_slices: int = _TWO_LEVEL_MAX_SLICES,
+) -> int:
+    """Choose an aligned level-1 width while bounding candidate-buffer slices."""
+    if max_slices < 1:
+        raise ValueError(f"max_slices must be positive, got {max_slices}")
+    slice_tokens = _TWO_LEVEL_SLICE_TOKENS
+    min_slice = -(-width_tokens // max_slices)
+    if min_slice > slice_tokens:
+        slice_tokens = -(-min_slice // page_size) * page_size
+    return slice_tokens
+
+
+def _plan_two_level_slices(
+    page_table_width: int,
+    page_size: int,
+    supertile_pages: int,
+    *,
+    max_slices: int = _TWO_LEVEL_MAX_SLICES,
+) -> list[tuple[int, int]]:
+    """Plan bounded two-level candidates or select the streaming-fold fallback."""
+    if page_table_width < 1 or page_size < 1 or supertile_pages < 1:
+        raise ValueError(
+            "page_table_width, page_size, and supertile_pages must be positive"
+        )
+    width_tokens = page_table_width * page_size
+    if width_tokens < 2 * _TWO_LEVEL_SLICE_TOKENS:
+        return []
+
+    slice_tokens = _two_level_slice_width(
+        width_tokens,
+        page_size,
+        max_slices=max_slices,
+    )
+    num_chunks = -(-page_table_width // supertile_pages)
+    slices: list[tuple[int, int]] = []
+    base = 0
+    for chunk_idx in range(num_chunks):
+        chunk_pages = (
+            min((chunk_idx + 1) * supertile_pages, page_table_width)
+            - chunk_idx * supertile_pages
+        )
+        chunk_tokens = chunk_pages * page_size
+        chunk_slices = max(1, -(-chunk_tokens // slice_tokens))
+        if base + chunk_slices > max_slices:
+            # A wider slice cannot span separate supertile launches. Use the
+            # bounded two-buffer streaming fold instead of exceeding the cap.
+            return []
+        slices.append((chunk_slices, base))
+        base += chunk_slices
+    return slices
+
+
 from sparkinfer.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
@@ -779,27 +858,19 @@ def index_topk_fp8(
     # the last chunk. The per-chunk tile-logits scratch stays at the supertile
     # ceiling. Physical-slot output keeps the legacy carry chain (the fold
     # gather emits logical indices).
-    width_tokens = page_table_width * page_size
-    two_level_slices: list[tuple[int, int]] = []
+    two_level_slices = _plan_two_level_slices(
+        page_table_width,
+        page_size,
+        supertile_pages,
+    )
     total_slices = 0
     fold_values = None
     fold_indices = None
     fold_lengths = None
-    if not output_physical_slots and width_tokens >= 2 * _TWO_LEVEL_SLICE_TOKENS:
-        slice_tokens = _TWO_LEVEL_SLICE_TOKENS
-        min_slice = -(-width_tokens // _TWO_LEVEL_MAX_SLICES)
-        if min_slice > slice_tokens:
-            slice_tokens = -(-min_slice // page_size) * page_size
-        base = 0
-        for c in range(num_chunks):
-            c_pages = (
-                min((c + 1) * supertile_pages, page_table_width) - c * supertile_pages
-            )
-            c_tokens = c_pages * page_size
-            splits_c = max(1, -(-c_tokens // slice_tokens))
-            two_level_slices.append((splits_c, base))
-            base += splits_c
-        total_slices = base
+    if output_physical_slots:
+        two_level_slices = []
+    if two_level_slices:
+        total_slices = sum(chunk_slices for chunk_slices, _ in two_level_slices)
         fold_values = torch.empty(
             (q_rows * total_slices, topk), dtype=torch.float32, device=q_fp8.device
         )
