@@ -49,6 +49,9 @@ from ._impl import (
     plan_tp_moe_execution as plan_execution,
 )
 from ._impl import (
+    tp_moe_plan_supports_aux_stream_overlap as plan_supports_aux_stream_overlap,
+)
+from ._impl import (
     plan_tp_moe_scratch as plan,
 )
 from ._impl import (
@@ -92,6 +95,7 @@ __all__ = [
     "WeightsPlan",
     "plan",
     "plan_execution",
+    "plan_supports_aux_stream_overlap",
     "plan_weights",
     "prepare_weights",
     "bind",
