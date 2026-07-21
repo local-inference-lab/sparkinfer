@@ -28,11 +28,11 @@ def _spec(b_major: str) -> dict[str, object]:
     return {**BASE_SPEC, "b_major": b_major, "sf_axis": b_major}
 
 
-def _make_pack(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_pack(seed: int = 7, batch: int = BATCH) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     values = (
         torch.randn(
-            BATCH * PACK_ROWS,
+            batch * PACK_ROWS,
             K_K_MAJOR,
             device="cuda",
             generator=generator,
@@ -43,7 +43,7 @@ def _make_pack(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
     scales = torch.randint(
         118,
         132,
-        (BATCH * PACK_ROWS, K_K_MAJOR // 32),
+        (batch * PACK_ROWS, K_K_MAJOR // 32),
         device="cuda",
         generator=generator,
         dtype=torch.uint8,
@@ -52,10 +52,10 @@ def _make_pack(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _rhs_views(
-    values: torch.Tensor, scales: torch.Tensor
+    values: torch.Tensor, scales: torch.Tensor, batch: int = BATCH
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    values_3d = values.view(BATCH, PACK_ROWS, K_K_MAJOR)
-    scales_3d = scales.view(BATCH, PACK_ROWS, K_K_MAJOR // 32)
+    values_3d = values.view(batch, PACK_ROWS, K_K_MAJOR)
+    scales_3d = scales.view(batch, PACK_ROWS, K_K_MAJOR // 32)
     return {
         # B-major N: logical/physical [B,K,N], scales grouped along N.
         "n": (
@@ -84,18 +84,18 @@ def _logical_b(rhs: tuple[torch.Tensor, torch.Tensor], b_major: str) -> torch.Te
 
 
 def _graph_output(
-    *, b_major: str, m: int, n: int
+    *, b_major: str, m: int, n: int, batch: int = BATCH
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if b_major == "k":
         backing = torch.full(
-            (m, BATCH, n + 8),
+            (m, batch, n + 8),
             torch.nan,
             device="cuda",
             dtype=torch.bfloat16,
         )
         return backing[..., :n].transpose(0, 1), backing[..., n:]
     return (
-        torch.empty(BATCH, m, n, device="cuda", dtype=torch.bfloat16),
+        torch.empty(batch, m, n, device="cuda", dtype=torch.bfloat16),
         None,
     )
 
@@ -337,10 +337,60 @@ def test_can_implement_reports_only_qualified_specialization() -> None:
         **_spec("n"),
     )
     assert gemm.can_implement_bmm(**kwargs)
+    assert gemm.can_implement_bmm(**{**kwargs, "batch": 8})
     assert not gemm.can_implement_bmm(**{**kwargs, "max_m": 33})
     assert not gemm.can_implement_bmm(**{**kwargs, "batch": BATCH - 1})
+    assert not gemm.can_implement_bmm(**{**kwargs, "batch": 7})
     assert not gemm.can_implement_bmm(**{**kwargs, "sf_axis": "k"})
     assert not gemm.can_implement_bmm(**{**kwargs, "b_dtype": "bfloat16"})
+
+
+@pytest.mark.parametrize("b_major", ["n", "k"])
+def test_tp8_geometry_matches_reference_and_cuda_graph(b_major: str) -> None:
+    """The GLM TP8 shard uses eight MLA heads per rank."""
+    require_sparkinfer()
+    batch = 8
+    m = 4
+    values, scales = _make_pack(seed=23, batch=batch)
+    rhs = _rhs_views(values, scales, batch=batch)[b_major]
+    logical_b = _logical_b(rhs, b_major)
+    k = int(logical_b.shape[1])
+    n = int(logical_b.shape[2])
+    assert gemm.can_implement_bmm(
+        batch=batch,
+        max_m=32,
+        n=n,
+        k=k,
+        device=values.device,
+        **_spec(b_major),
+    )
+    assert gemm.prewarm_bmm(rhs, (m,), **_spec(b_major)) == 1
+
+    lhs = torch.zeros(batch, m, k, device="cuda", dtype=torch.bfloat16)
+    out, padding = _graph_output(
+        b_major=b_major,
+        m=m,
+        n=n,
+        batch=batch,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = gemm.bmm(lhs, rhs, out, **_spec(b_major))
+    assert returned is out
+
+    fresh = torch.randn_like(lhs)
+    lhs.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = torch.bmm(fresh, logical_b)
+    reference64 = torch.bmm(fresh.double(), logical_b.double())
+    candidate_error = (out.double() - reference64).abs().max().item()
+    cublas_error = (expected.double() - reference64).abs().max().item()
+    assert torch.isfinite(out).all()
+    assert candidate_error <= cublas_error * 1.05 + 1e-12
+    if padding is not None:
+        assert torch.isnan(padding).all()
 
 
 @pytest.mark.parametrize("b_major", ["n", "k"])
