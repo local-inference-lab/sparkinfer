@@ -890,9 +890,10 @@ class _Mxfp8Launch:
 
 
 _LAUNCH_CACHE: dict[tuple[object, ...], _Mxfp8Launch] = {}
+_QUALIFIED_BATCHES = frozenset((8, 16))
 _QUALIFIED_GEOMETRIES = {
-    _BMajor.N: (16, 192, 512),
-    _BMajor.K: (16, 512, 256),
+    _BMajor.N: (192, 512),
+    _BMajor.K: (512, 256),
 }
 
 
@@ -1103,7 +1104,8 @@ def _geometry_is_qualified(
 ) -> bool:
     return (
         1 <= int(m) <= _MAX_M
-        and (int(groups), int(k), int(n)) == _QUALIFIED_GEOMETRIES[b_major]
+        and int(groups) in _QUALIFIED_BATCHES
+        and (int(k), int(n)) == _QUALIFIED_GEOMETRIES[b_major]
     )
 
 
