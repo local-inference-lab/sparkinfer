@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 MAX_RECORDS = 31
-RECORD_WIDTHS = (16, 37, 432)
+RECORD_WIDTHS = (16, 37, 368, 432)
 ODD_RECORD_BYTES = 37
 POOL_RECORDS_PER_RANK = 67
 
