@@ -33,6 +33,9 @@ from .pcie_selected_records import (
 from .pcie_selected_records import (
     PCIeSelectedRecordExchangeInitializationError as SelectedRecordExchangeInitializationError,
 )
+from .pcie_selected_records_ce import (
+    PCIeSelectedRecordCopyExchange as SelectedRecordCopyExchange,
+)
 from .pcie_twoshot import (
     PCIeTwoShotSP as TwoShotReduceScatter,
 )
@@ -58,6 +61,7 @@ __all__ = [
     "DcpAllToAllPool",
     "SelectedRecordExchange",
     "SelectedRecordExchangeInitializationError",
+    "SelectedRecordCopyExchange",
     "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",

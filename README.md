@@ -120,6 +120,23 @@ Set `SPARKINFER_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with i
 cache-key parameters and duration — useful for figuring out what warmup
 actually covered. `SPARKINFER_TIMING=1` enables per-kernel timing logs.
 
+### Selected-record copy exchange
+
+`sparkinfer.comm.pcie.SelectedRecordCopyExchange` moves sparse, fixed-width
+records between CUDA-IPC peers through the PCIe copy engine. `exchange()`
+handles one record plane. `exchange_layers()` packs three planes with one
+destination map, issues one rotated DMA exchange and arrival barrier, then
+unpacks the planes into caller-owned outputs. The layered layout overlays the
+same IPC slab; `layered_max_records` reports its bounded capacity so callers can
+fall back to `exchange()` when needed.
+
+All ranks must call exchanges in the same order and with rank-consistent active
+record counts. One exchange object is stream-affine. Run one eager exchange on
+that stream before CUDA graph capture, then replay it on the same stream. The
+balanced deferred-release protocol makes single-layer, three-layer, and empty
+exchanges safe to alternate, but `close()` must run before the process group is
+destroyed.
+
 ## Where to look next
 
 - `tests/` is the executable spec — per-group API and numerical-reference
