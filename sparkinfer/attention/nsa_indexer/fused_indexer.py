@@ -1171,6 +1171,7 @@ class SparseNSAFusedIndexerKernel:
         kv_layout: int = KV_LAYOUT_PAGED,
         paged_output: bool = False,
         ctas_per_group: int = 1,
+        num_sms: int = 0,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
         k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
         k_scales_row_stride: int = _PAGE_SIZE,
@@ -1256,8 +1257,20 @@ class SparseNSAFusedIndexerKernel:
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
+        # Cooperative grid-barrier merge (_group_barrier) spins until every one of
+        # the group's ctas_per_group CTAs has arrived, so they must all be co-resident
+        # at once. This kernel launches one CTA per SM (1024 threads + min_blocks_per_mp
+        # =1), so a group larger than the SM count can never be fully resident and the
+        # barrier deadlocks the device. When that happens, drop to the serial last-CTA
+        # arm, which packs to a global slab and exits (no barrier) and therefore
+        # tolerates arbitrary grid oversubscription. num_sms <= 0 means "unknown" and
+        # applies no guard (the ctas=1 FLAT path and direct constructions).
+        self.num_sms = int(num_sms)
+        self.coop_co_resident = self.num_sms <= 0 or self.ctas_per_group <= self.num_sms
         self.coop_merge_possible = (
-            self.merge_in_kernel and self.max_seq_capacity > self.merge_threshold
+            self.merge_in_kernel
+            and self.max_seq_capacity > self.merge_threshold
+            and self.coop_co_resident
         )
         self.pack_cap = self.ctas_per_group * int(self.topk)
         # Both cross-CTA merge arms are compiled and chosen at runtime per group by
@@ -2425,6 +2438,7 @@ def _build_fused_indexer_kernel(
     topk: int,
     paged_output: bool,
     ctas_per_group: int,
+    num_sms: int = 0,
     merge_threshold: int = _LAST_CTA_MERGE_MAX,
     k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
     k_scales_row_stride: int = _PAGE_SIZE,
@@ -2438,6 +2452,7 @@ def _build_fused_indexer_kernel(
         kv_layout=kv_layout,
         paged_output=paged_output,
         ctas_per_group=ctas_per_group,
+        num_sms=num_sms,
         merge_threshold=merge_threshold,
         k_quant_page_stride=k_quant_page_stride,
         k_scales_row_stride=k_scales_row_stride,
@@ -2480,11 +2495,23 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     # the v2 kernel, so they keep their v2 cache keys: the heavy legacy
     # variants (e.g. heads=16/topk=2048/ctas=96) have pathologically long cold
     # compiles and their warm cubins are load-bearing.
-    variant = (
-        "fused_indexer_v4_directk64"
-        if kernel.direct_k_score
-        else "fused_indexer_v2_coop"
-    )
+    # A group that oversubscribes the SMs (ctas_per_group > num_sms) drops the coop
+    # grid-barrier arm for the serial last-CTA arm (see coop_co_resident) -- a distinct
+    # traced kernel, so it needs its own cache key. This also invalidates any stale
+    # pre-fix cubin for those variants, which baked in the deadlocking coop arm.
+    if kernel.direct_k_score:
+        # direct-K needs ctas_per_group <= 16, co-resident on every real SM12x part,
+        # so this keeps its historical key. The suffix keeps the key honest (no trace
+        # collision) if a <16-SM device ever oversubscribes a direct-K build.
+        variant = (
+            "fused_indexer_v4_directk64"
+            if kernel.coop_co_resident
+            else "fused_indexer_v4_directk64_oversub_serial"
+        )
+    elif kernel.coop_co_resident:
+        variant = "fused_indexer_v2_coop"
+    else:
+        variant = "fused_indexer_v2_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )
@@ -2588,7 +2615,10 @@ def run_fused_paged_indexer(
     merge_threshold drives the per-group runtime cross-CTA merge auto-switch: a row
     whose live seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
     barriers; faster for few-row/short-K); larger rows use the cooperative
-    grid-barrier radix. 0 forces cooperative; a very large value forces last-CTA."""
+    grid-barrier radix. 0 forces cooperative; a very large value forces last-CTA.
+    A group that oversubscribes the SMs (ctas_per_group > num_sms) always takes the
+    serial last-CTA arm regardless of merge_threshold: the cooperative grid barrier
+    needs every CTA of the group co-resident (1 CTA/SM), impossible past num_sms."""
     rows = int(q_bytes.shape[0])
     dev = q_bytes.device
     max_pages = int(real_page_table.shape[1])
@@ -2651,12 +2681,14 @@ def run_fused_paged_indexer(
         and int(q_bytes.stride(0)) % 16 == 0
     )
     q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
+    num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
     kernel = _build_fused_indexer_kernel(
         KV_LAYOUT_PAGED,
         int(num_heads),
         int(topk),
         bool(output_physical_slots),
         ctas_per_group,
+        num_sms=int(num_sms),
         merge_threshold=int(merge_threshold),
         k_quant_page_stride=k_quant_page_stride,
         k_scales_row_stride=k_scales_row_stride,
