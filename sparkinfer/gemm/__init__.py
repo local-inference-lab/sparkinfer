@@ -3,6 +3,7 @@
 - ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
 - ``mxfp8_linear``: ModelOpt MXFP8 linear (one-shot).
+- ``qbmm_absorb``: weight-only MXFP8 batched GEMM for MLA absorbed projections.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
 """
 
@@ -11,7 +12,13 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("blockscaled", "block_fp8_linear", "mxfp8_linear", "wo_projection")
+_OP_MODULES = (
+    "blockscaled",
+    "block_fp8_linear",
+    "mxfp8_linear",
+    "qbmm_absorb",
+    "wo_projection",
+)
 
 
 def __getattr__(name: str) -> Any:
