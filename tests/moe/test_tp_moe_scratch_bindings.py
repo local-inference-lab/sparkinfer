@@ -408,6 +408,70 @@ def test_tp_moe_scratch_plan_can_skip_route_scratch() -> None:
     assert plan.scratch_specs()[0].name == "tp_moe.scratch"
 
 
+def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM TP6 plans logical N=352 but launches its repacked N=384 extent."""
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(tp_moe_impl, "_current_compute_capability", lambda: (12, 0))
+    weight_plan = _weight_plan(
+        "w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        experts=256,
+        k=6144,
+        n=352,
+    )
+    execution = tp_moe_impl.plan_tp_moe_execution(
+        num_tokens=4096,
+        num_topk=8,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a8_mx",
+    )
+    core = tp_moe_impl._plan_core_workspace(
+        execution.implementation,
+        execution.quant_mode,
+        execution.state_E,
+        execution.weight_E,
+        execution.k,
+        execution.n,
+        execution.num_topk,
+        execution.device,
+        execution.dtype,
+        routed_rows=execution.routed_rows,
+        max_rows=execution.max_rows,
+        activation=execution.activation,
+        dynamic_physical_tiles=execution.dynamic_physical_tiles,
+        dynamic_task_capacity=execution.dynamic_task_capacity,
+        source_format=weight_plan.source_format,
+    )
+    intermediate = next(
+        spec for spec in core.tensor_specs if spec.name == "materialized_intermediate"
+    )
+    available_bytes = tp_moe_impl._tensor_numel(
+        intermediate.shape
+    ) * tp_moe_impl._dtype_nbytes(intermediate.dtype)
+    kernel_n = tp_moe_impl._dynamic_kernel_intermediate_size(
+        execution.n, execution.quant_mode
+    )
+    tile_m, _ = tp_moe_impl._select_dynamic_tile_mn(
+        execution.routed_rows,
+        kernel_n,
+        execution.quant_mode,
+        num_experts=execution.state_E,
+        activation=execution.activation,
+        compute_capability=(12, 0),
+    )
+    required_bytes = (
+        execution.dynamic_physical_tiles * tile_m * (kernel_n + kernel_n // 32)
+    )
+
+    assert execution.n == 352
+    assert kernel_n == 384
+    assert available_bytes >= required_bytes
+
+
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
