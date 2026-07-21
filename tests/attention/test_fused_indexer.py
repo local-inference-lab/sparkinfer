@@ -14,6 +14,7 @@ import torch
 from sparkinfer.attention.nsa_indexer.fused_indexer import (
     KV_LAYOUT_CONTIGUOUS_MLA,
     KV_LAYOUT_PAGED,
+    SparseNSAFusedIndexerKernel,
     _BATCH_SLACK,
     _COOP_STATE_WORDS,
     _DSV4_BATCH_SLACK,
@@ -73,6 +74,39 @@ def test_fused_indexer_warmup_rows_cover_sm120_c4_policies(monkeypatch):
     )
 
     assert rows == tuple(range(1, 17))
+
+
+def test_coop_merge_co_residency_guard():
+    """A group that oversubscribes the SMs must drop the coop grid-barrier arm.
+
+    The cooperative merge spins in a grid barrier until all ctas_per_group CTAs of a
+    group arrive, but the kernel runs one CTA per SM, so ctas_per_group > num_sms can
+    never be fully co-resident and deadlocks. The build must fall back to the serial
+    last-CTA arm. This host-side check is the only executable regression for the
+    deadlock -- the hang itself wedges the GPU and cannot be exercised directly.
+    """
+
+    def build(ctas, num_sms):
+        return SparseNSAFusedIndexerKernel(
+            num_heads_static=16,
+            topk=2048,
+            kv_layout=KV_LAYOUT_PAGED,
+            ctas_per_group=ctas,
+            num_sms=num_sms,
+        )
+
+    # ctas_per_group > num_sms -> serial fallback (coop disabled).
+    over = build(49, 48)
+    assert over.coop_co_resident is False
+    assert over.coop_merge_possible is False
+    # A full single wave (==) stays cooperative -- the shipped rows=1 decode config.
+    edge = build(48, 48)
+    assert edge.coop_co_resident is True
+    assert edge.coop_merge_possible is True
+    # Comfortably under the SM count stays cooperative.
+    assert build(24, 48).coop_merge_possible is True
+    # num_sms unknown (0) applies no guard: the ctas=1 FLAT path / direct construction.
+    assert build(188, 0).coop_co_resident is True
 
 
 def test_paged_dsv4_always_uses_large_fused_carry():
