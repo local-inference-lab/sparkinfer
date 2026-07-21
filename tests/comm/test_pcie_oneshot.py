@@ -342,7 +342,9 @@ def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
     assert runtime.should_allreduce(torch.arange(4, dtype=torch.int32)) is False
     assert runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)) is False
     assert runtime.should_allreduce(torch.arange(7, dtype=torch.bfloat16)) is False
-    assert runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)[::2]) is False
+    assert (
+        runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)[::2]) is False
+    )
 
 
 def test_graph_buffer_api_exposes_explicit_registration_hooks():
@@ -525,8 +527,13 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
-    monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr(
+        "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        lambda group: "cpu",
+    )
 
     def fake_broadcast(object_list, src, group=None, device=None):
         object_list[0] = remote_meta[src]
@@ -545,11 +552,18 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
-    monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr(
+        "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        lambda group: "cpu",
+    )
     monkeypatch.setattr(
         "torch.distributed.broadcast_object_list",
-        lambda object_list, src, group=None, device=None: object_list.__setitem__(0, ([], [])),
+        lambda object_list, src, group=None, device=None: object_list.__setitem__(
+            0, ([], [])
+        ),
     )
 
     runtime = _make_runtime(exchange_group=object())
@@ -566,7 +580,9 @@ def test_capture_registers_graph_buffers_after_context(monkeypatch):
     runtime = _make_runtime(exchange_group=object())
     calls = []
 
-    monkeypatch.setattr(runtime, "register_graph_buffers", lambda: calls.append("registered"))
+    monkeypatch.setattr(
+        runtime, "register_graph_buffers", lambda: calls.append("registered")
+    )
 
     with runtime.capture():
         pass
@@ -578,7 +594,9 @@ def test_eager_capture_skips_graph_buffer_registration(monkeypatch):
     runtime = _make_runtime(eager=True, exchange_group=object())
     calls = []
 
-    monkeypatch.setattr(runtime, "register_graph_buffers", lambda: calls.append("registered"))
+    monkeypatch.setattr(
+        runtime, "register_graph_buffers", lambda: calls.append("registered")
+    )
 
     with runtime.capture():
         pass
@@ -651,8 +669,14 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(eager=True),
     )
 
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._current_stream_key", lambda device, stream=None: 7)
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing", lambda device: True)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 7,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda device: True,
+    )
 
     with pytest.raises(RuntimeError, match="before capture starts"):
         pool.for_stream()
@@ -705,3 +729,198 @@ def test_nested_capture_reuses_its_outer_channel(monkeypatch):
     assert pool._channels[70] is target_channel
     assert pool._channels[80] is draft_channel
     assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
+    created = []
+    current_stream = [7]
+    capturing = [False]
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as target_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is target_channel
+        capturing[0] = False
+
+    # CUDA may recycle both handles for the next graph manager. Neither stale
+    # mapping may make the draft graph retain the target graph's IPC channel.
+    with pool.capture(7) as draft_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is draft_channel
+        capturing[0] = False
+
+    assert target_channel is not draft_channel
+    assert pool._channels[7] is draft_channel
+    assert pool._channels[70] is draft_channel
+    assert target_channel in pool._all_channels
+    assert draft_channel in pool._all_channels
+    assert [entry[0] for entry in created] == [7, 7]
+
+    pool.close()
+    assert target_channel._ext.dispose_calls == [12345]
+    assert draft_channel._ext.dispose_calls == [12345]
+
+
+def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 3 if stream is None else int(stream),
+    )
+
+    eager_channel = pool.for_stream()
+    checkpoint = pool.checkpoint_channels()
+    with pool.capture(7) as profile_channel:
+        pass
+
+    pool.rollback_channels(checkpoint)
+
+    assert pool._all_channels == [eager_channel]
+    assert pool._channels == {3: eager_channel}
+    assert profile_channel._ext.dispose_calls == [12345]
+    assert eager_channel._ext.dispose_calls == []
+
+
+def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
+    events = []
+
+    class FakeChannel:
+        def _close_ipc_imports(self):
+            events.append("close-imports")
+
+        def _free_ipc_exports(self):
+            events.append("free-exports")
+
+    group = object()
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        exchange_group=group,
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    retained = FakeChannel()
+    transient = FakeChannel()
+    pool._all_channels = [retained]
+    pool._channels = {3: retained}
+    checkpoint = pool.checkpoint_channels()
+    pool._all_channels.append(transient)
+    pool._channels[7] = transient
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+
+    pool.rollback_channels(checkpoint)
+
+    assert events == [
+        "barrier",
+        "close-imports",
+        "barrier",
+        "free-exports",
+        "barrier",
+    ]
+    assert pool._all_channels == [retained]
+    assert pool._channels == {3: retained}
+
+
+def test_channel_teardown_completes_when_ipc_cleanup_raises():
+    events = []
+
+    class FailingExt:
+        def dispose(self, ptr):
+            events.append(("dispose", ptr))
+            raise RuntimeError("dispose failed")
+
+    class FailingIPC:
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append(("close", ptr))
+            raise RuntimeError("close failed")
+
+        def cudaFree(self, ptr):
+            events.append(("free", ptr))
+            raise RuntimeError("free failed")
+
+    class SharedBuffer:
+        def __init__(self, local_ptr, remote_ptrs):
+            self.local_ptr = local_ptr
+            self.remote_ptrs = remote_ptrs
+
+    channel = object.__new__(PCIeOneshotAllReduce)
+    channel._closed = False
+    channel._ipc_imports_closed = False
+    channel._ipc_exports_freed = False
+    channel._ptr = 123
+    channel._ext = FailingExt()
+    channel._ipc = FailingIPC()
+    channel._owned_buffers = [
+        SharedBuffer(1000, (2000, 3000)),
+        SharedBuffer(4000, (5000,)),
+    ]
+    channel._registered_input_ptrs = {1: (2,)}
+
+    channel.close()
+    channel.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("close", 5000),
+        ("free", 1000),
+        ("free", 4000),
+    ]
+    assert channel._ptr == 0
+    assert channel._closed
+    assert channel._ipc_imports_closed
+    assert channel._ipc_exports_freed
+    assert channel._owned_buffers == []
+    assert channel._registered_input_ptrs == {}
+
+
+def test_pool_rejects_channel_rollback_during_capture():
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    checkpoint = pool.checkpoint_channels()
+
+    with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
+        pool.rollback_channels(checkpoint)

@@ -162,6 +162,30 @@ class _OwnedSharedBuffer:
     remote_ptrs: tuple[int, ...]
 
 
+def _coordinated_close_channels(
+    channels: Sequence[object],
+    *,
+    exchange_group: Optional[ProcessGroup],
+    device: torch.device,
+) -> None:
+    """Release exported CUDA IPC allocations after every peer unmaps them."""
+    unique_channels = tuple(dict.fromkeys(channels))
+    if exchange_group is None:
+        for channel in unique_channels:
+            channel.close()
+        return
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    dist.barrier(group=exchange_group)
+    for channel in unique_channels:
+        channel._close_ipc_imports()
+    dist.barrier(group=exchange_group)
+    for channel in unique_channels:
+        channel._free_ipc_exports()
+    dist.barrier(group=exchange_group)
+
+
 @dataclass(frozen=True)
 class _ChannelSharedBuffers:
     owned_buffer: _OwnedSharedBuffer
@@ -291,6 +315,8 @@ class PCIeOneshotAllReduce:
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
         self._ext = ext_module or _load_extension()
 
         if ext_module is None and self.device.type != "cuda":
@@ -870,21 +896,36 @@ class PCIeOneshotAllReduce:
             logger.info("\n".join(lines))
         return crossover
 
-    def close(self) -> None:
-        if self._closed:
+    def _close_ipc_imports(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
         if getattr(self, "_ptr", 0):
-            self._ext.dispose(self._ptr)
+            with suppress(Exception):
+                self._ext.dispose(self._ptr)
             self._ptr = 0
-        for shared in self._owned_buffers:
-            for ptr in shared.remote_ptrs:
-                if self._ipc is not None:
-                    self._ipc.cudaIpcCloseMemHandle(ptr)
-            if self._ipc is not None:
-                self._ipc.cudaFree(shared.local_ptr)
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
+                for ptr in shared.remote_ptrs:
+                    with suppress(Exception):
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+        self._ipc_imports_closed = True
+
+    def _free_ipc_exports(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports()
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
+                with suppress(Exception):
+                    self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
         self._registered_input_ptrs.clear()
+        self._ipc_exports_freed = True
+
+    def close(self) -> None:
+        self._close_ipc_imports()
+        self._free_ipc_exports()
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -943,6 +984,7 @@ class PCIeOneshotAllReducePool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeOneshotAllReduce] = {}
+        self._all_channels: list[PCIeOneshotAllReduce] = []
         self._capture_channel_stack: list[PCIeOneshotAllReduce] = []
         self._closed = False
 
@@ -1014,6 +1056,7 @@ class PCIeOneshotAllReducePool:
             if self.single_channel:
                 channel._stream_affine = False
             channel._bind_stream_key(stream_key)
+            self._all_channels.append(channel)
             return channel
 
         if self.exchange_group is None or self._ipc is None or self._ext is None:
@@ -1053,7 +1096,52 @@ class PCIeOneshotAllReducePool:
                     self._ipc.cudaFree(shared.local_ptr)
             raise
         channel._bind_stream_key(stream_key)
+        self._all_channels.append(channel)
         return channel
+
+    def checkpoint_channels(
+        self,
+    ) -> tuple[int, dict[int, PCIeOneshotAllReduce]]:
+        """Snapshot channel ownership before a throwaway graph capture."""
+        if self._closed:
+            raise RuntimeError("pool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot checkpoint channels during capture")
+        return len(self._all_channels), dict(self._channels)
+
+    def rollback_channels(
+        self,
+        checkpoint: tuple[int, dict[int, PCIeOneshotAllReduce]],
+    ) -> None:
+        """Close channels created after ``checkpoint`` and restore mappings.
+
+        Callers must destroy and synchronize any graphs that reference the
+        transient channels before rolling back.
+        """
+        if self._closed:
+            raise RuntimeError("pool is closed")
+        if self._capture_channel_stack:
+            raise RuntimeError("cannot roll back channels during capture")
+        all_channels_len, channels = checkpoint
+        if not 0 <= all_channels_len <= len(self._all_channels):
+            raise ValueError("channel checkpoint does not belong to this pool")
+
+        retained = self._all_channels[:all_channels_len]
+        retained_ids = {id(channel) for channel in retained}
+        transient = self._all_channels[all_channels_len:]
+        self._all_channels = retained
+        self._channels = dict(channels)
+
+        channels_to_close = tuple(
+            dict.fromkeys(
+                channel for channel in transient if id(channel) not in retained_ids
+            )
+        )
+        _coordinated_close_channels(
+            channels_to_close,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
         if self._closed:
@@ -1074,6 +1162,14 @@ class PCIeOneshotAllReducePool:
 
         stream_key = _current_stream_key(self.device, stream)
         channel_key = 0 if stream_key is None else int(stream_key)
+        if _is_current_stream_capturing(self.device) and self._capture_channel_stack:
+            # CUDA and torch/Inductor may recycle a nested capture stream key
+            # between independent target and draft graph managers. The active
+            # enclosing capture owns the channel even if that key still maps
+            # to a channel captured by an earlier manager.
+            channel = self._capture_channel_stack[-1]
+            self._channels[channel_key] = channel
+            return channel
         channel = self._channels.get(channel_key)
         if channel is not None:
             return channel
@@ -1151,7 +1247,22 @@ class PCIeOneshotAllReducePool:
 
     @contextmanager
     def capture(self, stream: object = None):
-        channel = self.for_stream(stream)
+        if self.single_channel:
+            channel = self.for_stream(stream)
+        else:
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "PCIe oneshot capture context must be entered before CUDA "
+                    "graph capture starts"
+                )
+            stream_key = _current_stream_key(self.device, stream)
+            channel_key = 0 if stream_key is None else int(stream_key)
+            # A CUDA stream handle can be recycled after one graph manager
+            # finishes capture. Graphs retain the channel pointers, so a new
+            # manager must receive a fresh channel even when the numeric stream
+            # key is identical. _all_channels keeps replaced channels alive.
+            channel = self._new_channel(stream_key)
+            self._channels[channel_key] = channel
         with channel.capture(stream=stream):
             self._capture_channel_stack.append(channel)
             try:
@@ -1165,8 +1276,12 @@ class PCIeOneshotAllReducePool:
         if self._closed:
             return
         self._closed = True
-        for channel in self._channels.values():
-            channel.close()
+        seen: set[int] = set()
+        for channel in (*self._all_channels, *self._channels.values()):
+            if id(channel) not in seen:
+                seen.add(id(channel))
+                channel.close()
+        self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:
