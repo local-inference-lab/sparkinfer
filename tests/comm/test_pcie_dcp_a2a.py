@@ -5,6 +5,7 @@ import torch
 
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
+    PCIeDCPA2APool,
     _staging_layout,
     lse_reduce_scatter_reference,
 )
@@ -223,3 +224,202 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
         runtime.all_gather_heads(good_output[:, :8])
     with pytest.raises(ValueError, match="exceeds configured capacity"):
         runtime.all_gather_heads(torch.zeros(5, 16, 64, dtype=torch.bfloat16))
+
+
+def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
+    created = []
+    current_stream = [7]
+    capturing = [False]
+
+    def make_channel(stream_key):
+        runtime = _make_runtime()
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as target_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is target_channel
+        capturing[0] = False
+
+    with pool.capture(8) as draft_channel:
+        capturing[0] = True
+        current_stream[0] = 80
+        assert pool.for_stream() is draft_channel
+        capturing[0] = False
+
+    assert target_channel is not draft_channel
+    assert pool._channels[70] is target_channel
+    assert pool._channels[80] is draft_channel
+    assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
+    created = []
+    current_stream = [7]
+    capturing = [False]
+
+    def make_channel(stream_key):
+        runtime = _make_runtime()
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as target_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is target_channel
+        capturing[0] = False
+
+    with pool.capture(7) as draft_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is draft_channel
+        capturing[0] = False
+
+    assert target_channel is not draft_channel
+    assert pool._channels[7] is draft_channel
+    assert pool._channels[70] is draft_channel
+    assert target_channel in pool._all_channels
+    assert draft_channel in pool._all_channels
+    assert [entry[0] for entry in created] == [7, 7]
+
+    pool.close()
+    assert target_channel._ext.dispose_calls == [1234]
+    assert draft_channel._ext.dispose_calls == [1234]
+
+
+def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime()
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=make_channel,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: 3 if stream is None else int(stream),
+    )
+
+    eager_channel = pool.for_stream()
+    checkpoint = pool.checkpoint_channels()
+    with pool.capture(7) as profile_channel:
+        pass
+
+    pool.rollback_channels(checkpoint)
+
+    assert pool._all_channels == [eager_channel]
+    assert pool._channels == {3: eager_channel}
+    assert profile_channel._ext.dispose_calls == [1234]
+    assert eager_channel._ext.dispose_calls == []
+
+
+def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
+    events = []
+
+    class FakeChannel:
+        def _close_ipc_imports(self):
+            events.append("close-imports")
+
+        def _free_ipc_exports(self):
+            events.append("free-exports")
+
+    group = object()
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        exchange_group=group,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    retained = FakeChannel()
+    transient = FakeChannel()
+    pool._all_channels = [retained]
+    pool._channels = {3: retained}
+    checkpoint = pool.checkpoint_channels()
+    pool._all_channels.append(transient)
+    pool._channels[7] = transient
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+
+    pool.rollback_channels(checkpoint)
+
+    assert events == [
+        "barrier",
+        "close-imports",
+        "barrier",
+        "free-exports",
+        "barrier",
+    ]
+    assert pool._all_channels == [retained]
+    assert pool._channels == {3: retained}
+
+
+def test_pool_rejects_channel_rollback_during_capture():
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    checkpoint = pool.checkpoint_channels()
+
+    with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
+        pool.rollback_channels(checkpoint)
