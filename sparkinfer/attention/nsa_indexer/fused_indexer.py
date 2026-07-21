@@ -63,6 +63,7 @@ from sparkinfer.attention.nsa_indexer.tiled_topk import (
     _THREADS_PER_CTA as _RADIX_THREADS,
     _convert_to_uint8,
     _convert_to_uint32,
+    _exact_overflow_fallback,
     _smem_ld,
     _smem_red_add,
     _smem_st,
@@ -1054,96 +1055,38 @@ def _fused_radix_select(
                     cute.arch.sync_threads()
 
     # ---- exact overflow fallback ----
-    # The buffered coarse+refine above drops winners when more than `cands` candidates
-    # share the coarse threshold bucket (clustered scores; the cross-CTA merge can pack
-    # up to ctas_per_group*topk candidates). When that happens, redo the selection
-    # EXACTLY with a 4-round 8-bit MSD radix that RE-SCANS vin each round filtered by the
-    # locked key prefix -- no candidate buffer, so no overflow. Same convention as the
-    # cooperative arm (_convert_to_uint32 monotone key, byte=(key>>shift)&0xFF). Slower
-    # (re-scans n_total per round on one CTA) but only taken on the rare clustered case;
-    # it overwrites s_out[0:topk]. Scalars: ni0=prefix, thr=remaining_k, ni1=bucket,
-    # lr=next remaining_k, ctr=output counter.
+    # The buffered coarse+refine above drops winners when more than `cands`
+    # candidates share the coarse threshold bucket (clustered scores; the
+    # cross-CTA merge can pack up to ctas_per_group*topk candidates). Redo the
+    # selection exactly by re-scanning vin -- see _exact_overflow_fallback. The
+    # single contiguous vin_v source uses the flat=True load path.
     if bin_count > Int32(cands):
-        if tx == Int32(0):
-            _smem_st(ni0, Int32(0), Int32(0))
-            _smem_st(thr, Int32(0), topk_static)
-        cute.arch.sync_threads()
-        for ex_round in cutlass.range_constexpr(4):
-            ex_shift = Uint32(24 - ex_round * 8)
-            ex_prefix = Uint32(_smem_ld(ni0, Int32(0)))
-            ex_remaining = Int32(_smem_ld(thr, Int32(0)))
-            if tx < Int32(256):
-                s_hist0[tx] = Int32(0)
-            cute.arch.sync_threads()
-            idx_base = Int32(tx)
-            while idx_base < n_total:
-                ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
-                if cutlass.const_expr(ex_round == 0):
-                    _smem_red_add(
-                        h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
-                    )
-                else:
-                    ex_mask = Uint32(0xFFFFFFFF) << Uint32(32 - ex_round * 8)
-                    if (ex_key & ex_mask) == ex_prefix:
-                        _smem_red_add(
-                            h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
-                        )
-                idx_base += Int32(_RADIX_THREADS)
-            cute.arch.sync_threads()
-            for ex_stage in cutlass.range_constexpr(8):
-                ex_j = Int32(1 << ex_stage)
-                if tx < Int32(256):
-                    if (ex_stage & 1) == 0:
-                        ex_v = Int32(s_hist0[tx])
-                        if tx < Int32(256) - ex_j:
-                            ex_v = ex_v + Int32(s_hist0[tx + ex_j])
-                        s_hist1[tx] = ex_v
-                    else:
-                        ex_v = Int32(s_hist1[tx])
-                        if tx < Int32(256) - ex_j:
-                            ex_v = ex_v + Int32(s_hist1[tx + ex_j])
-                        s_hist0[tx] = ex_v
-                cute.arch.sync_threads()
-            if tx == Int32(0):
-                _smem_st(ni1, Int32(0), Int32(0))
-                _smem_st(lr, Int32(0), ex_remaining)
-            cute.arch.sync_threads()
-            if tx < Int32(256):
-                ex_cge = Int32(s_hist0[tx])
-                ex_cgt = Int32(0)
-                if tx + Int32(1) < Int32(256):
-                    ex_cgt = Int32(s_hist0[tx + Int32(1)])
-                if (ex_cge >= ex_remaining) & (ex_cgt < ex_remaining):
-                    _smem_st(ni1, Int32(0), Int32(tx))
-                    _smem_st(lr, Int32(0), ex_remaining - ex_cgt)
-            cute.arch.sync_threads()
-            if tx == Int32(0):
-                ex_bucket = Uint32(_smem_ld(ni1, Int32(0)))
-                _smem_st(ni0, Int32(0), Int32(ex_prefix | (ex_bucket << ex_shift)))
-                _smem_st(thr, Int32(0), _smem_ld(lr, Int32(0)))
-            cute.arch.sync_threads()
-        ex_pivot = Uint32(_smem_ld(ni0, Int32(0)))
-        if tx == Int32(0):
-            _smem_st(ctr, Int32(0), Int32(0))
-        cute.arch.sync_threads()
-        idx_base = Int32(tx)
-        while idx_base < n_total:
-            ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
-            if ex_key > ex_pivot:
-                ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
-                if ex_pos < topk_static:
-                    s_out[ex_pos] = idx_base
-            idx_base += Int32(_RADIX_THREADS)
-        cute.arch.sync_threads()
-        idx_base = Int32(tx)
-        while idx_base < n_total:
-            ex_key = _convert_to_uint32(Float32(vin_v[idx_base]))
-            if ex_key == ex_pivot:
-                ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
-                if ex_pos < topk_static:
-                    s_out[ex_pos] = idx_base
-            idx_base += Int32(_RADIX_THREADS)
-        cute.arch.sync_threads()
+        _exact_overflow_fallback(
+            tx,
+            n_total,
+            topk_static,
+            s_hist0,
+            s_hist1,
+            s_out,
+            h0,
+            ctr,
+            thr,
+            ni0,
+            ni1,
+            lr,
+            flat=True,
+            flat_values=vin_v,
+            input_tensor=vin_v,
+            carry_values=vin_v,
+            row_base=Int32(0),
+            row_start=Int32(0),
+            carry_base=Int32(0),
+            chunk_len=Int32(0),
+            block_q=1,
+            block_k=1,
+            is_tiled=False,
+            is_first=True,
+        )
     cute.arch.sync_threads()
     i = Int32(tx)
     while i < topk_static:
@@ -2499,19 +2442,21 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     # grid-barrier arm for the serial last-CTA arm (see coop_co_resident) -- a distinct
     # traced kernel, so it needs its own cache key. This also invalidates any stale
     # pre-fix cubin for those variants, which baked in the deadlocking coop arm.
+    # v5/v3 (bumped from v4/v2): the candidate-buffer overflow fix changed the
+    # radix-select body, so every variant needs a fresh key to drop stale cubins.
     if kernel.direct_k_score:
         # direct-K needs ctas_per_group <= 16, co-resident on every real SM12x part,
         # so this keeps its historical key. The suffix keeps the key honest (no trace
         # collision) if a <16-SM device ever oversubscribes a direct-K build.
         variant = (
-            "fused_indexer_v4_directk64"
+            "fused_indexer_v5_directk64"
             if kernel.coop_co_resident
-            else "fused_indexer_v4_directk64_oversub_serial"
+            else "fused_indexer_v5_directk64_oversub_serial"
         )
     elif kernel.coop_co_resident:
-        variant = "fused_indexer_v2_coop"
+        variant = "fused_indexer_v3_coop"
     else:
-        variant = "fused_indexer_v2_oversub_serial"
+        variant = "fused_indexer_v3_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )

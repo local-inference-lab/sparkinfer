@@ -231,6 +231,218 @@ def _convert_to_uint32(x: Float32) -> Uint32:
     return result
 
 
+@cute.jit
+def _fallback_load_value(
+    flat: cutlass.Constexpr[bool],
+    idx: Int32,
+    flat_values,
+    input_tensor,
+    carry_values,
+    row_base: Int32,
+    row_start: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    block_q: cutlass.Constexpr[int],
+    block_k: cutlass.Constexpr[int],
+    is_tiled: cutlass.Constexpr[bool],
+    is_first: cutlass.Constexpr[bool],
+) -> Float32:
+    """Load a candidate value for the exact overflow fallback.
+
+    When ``flat`` the value comes straight from a single contiguous source
+    (``flat_values[idx]``, the fused kernel's ``vin_v``); otherwise it routes
+    through the tiled kernel's virtual loader so the same fallback body serves
+    both the local-tiled and carry-fold candidate ranges. The unused branch is
+    constexpr-elided, so the stand-in tensors passed for it are never indexed.
+    """
+    value = Float32(0.0)
+    if cutlass.const_expr(flat):
+        value = Float32(flat_values[idx])
+    else:
+        value = _load_value_virtual(
+            input_tensor,
+            carry_values,
+            row_base,
+            row_start,
+            carry_base,
+            chunk_len,
+            idx,
+            block_q,
+            block_k,
+            is_tiled,
+            is_first,
+        )
+    return value
+
+
+@cute.jit
+def _exact_overflow_fallback(
+    tx: Int32,
+    n_total: Int32,
+    topk_static: Int32,
+    s_hist0: cute.Tensor,
+    s_hist1: cute.Tensor,
+    s_out: cute.Tensor,
+    h0: Int32,
+    ctr: Int32,
+    thr: Int32,
+    ni0: Int32,
+    ni1: Int32,
+    lr: Int32,
+    flat: cutlass.Constexpr[bool],
+    flat_values,
+    input_tensor,
+    carry_values,
+    row_base: Int32,
+    row_start: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    block_q: cutlass.Constexpr[int],
+    block_k: cutlass.Constexpr[int],
+    is_tiled: cutlass.Constexpr[bool],
+    is_first: cutlass.Constexpr[bool],
+):
+    """Exact overflow fallback shared by the tiled and fused radix kernels.
+
+    The buffered coarse+refine select drops winners when more than the candidate
+    buffer capacity share the coarse threshold bucket (clustered scores). When
+    that happens, redo the selection EXACTLY with a 4-round 8-bit MSD radix that
+    RE-SCANS the values each round filtered by the locked key prefix -- no
+    candidate buffer, so no overflow. Same convention as the buffered arm
+    (``_convert_to_uint32`` monotone key, byte=(key>>shift)&0xFF). Slower
+    (re-scans n_total per round on one CTA) but only taken on the rare clustered
+    case; it overwrites s_out[0:topk_static]. All 1024 threads must call this.
+    Scalars: ni0=prefix, thr=remaining_k, ni1=bucket, lr=next remaining_k,
+    ctr=output counter.
+    """
+    if tx == Int32(0):
+        _smem_st(ni0, Int32(0), Int32(0))
+        _smem_st(thr, Int32(0), topk_static)
+    cute.arch.sync_threads()
+    for ex_round in cutlass.range_constexpr(4):
+        ex_shift = Uint32(24 - ex_round * 8)
+        ex_prefix = Uint32(_smem_ld(ni0, Int32(0)))
+        ex_remaining = Int32(_smem_ld(thr, Int32(0)))
+        if tx < Int32(256):
+            s_hist0[tx] = Int32(0)
+        cute.arch.sync_threads()
+        idx_base = Int32(tx)
+        while idx_base < n_total:
+            ex_key = _convert_to_uint32(
+                _fallback_load_value(
+                    flat,
+                    idx_base,
+                    flat_values,
+                    input_tensor,
+                    carry_values,
+                    row_base,
+                    row_start,
+                    carry_base,
+                    chunk_len,
+                    block_q,
+                    block_k,
+                    is_tiled,
+                    is_first,
+                )
+            )
+            if cutlass.const_expr(ex_round == 0):
+                _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
+            else:
+                ex_mask = Uint32(0xFFFFFFFF) << Uint32(32 - ex_round * 8)
+                if (ex_key & ex_mask) == ex_prefix:
+                    _smem_red_add(
+                        h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
+                    )
+            idx_base += Int32(_THREADS_PER_CTA)
+        cute.arch.sync_threads()
+        for ex_stage in cutlass.range_constexpr(8):
+            ex_j = Int32(1 << ex_stage)
+            if tx < Int32(256):
+                if (ex_stage & 1) == 0:
+                    ex_v = Int32(s_hist0[tx])
+                    if tx < Int32(256) - ex_j:
+                        ex_v = ex_v + Int32(s_hist0[tx + ex_j])
+                    s_hist1[tx] = ex_v
+                else:
+                    ex_v = Int32(s_hist1[tx])
+                    if tx < Int32(256) - ex_j:
+                        ex_v = ex_v + Int32(s_hist1[tx + ex_j])
+                    s_hist0[tx] = ex_v
+            cute.arch.sync_threads()
+        if tx == Int32(0):
+            _smem_st(ni1, Int32(0), Int32(0))
+            _smem_st(lr, Int32(0), ex_remaining)
+        cute.arch.sync_threads()
+        if tx < Int32(256):
+            ex_cge = Int32(s_hist0[tx])
+            ex_cgt = Int32(0)
+            if tx + Int32(1) < Int32(256):
+                ex_cgt = Int32(s_hist0[tx + Int32(1)])
+            if (ex_cge >= ex_remaining) & (ex_cgt < ex_remaining):
+                _smem_st(ni1, Int32(0), Int32(tx))
+                _smem_st(lr, Int32(0), ex_remaining - ex_cgt)
+        cute.arch.sync_threads()
+        if tx == Int32(0):
+            ex_bucket = Uint32(_smem_ld(ni1, Int32(0)))
+            _smem_st(ni0, Int32(0), Int32(ex_prefix | (ex_bucket << ex_shift)))
+            _smem_st(thr, Int32(0), _smem_ld(lr, Int32(0)))
+        cute.arch.sync_threads()
+    ex_pivot = Uint32(_smem_ld(ni0, Int32(0)))
+    if tx == Int32(0):
+        _smem_st(ctr, Int32(0), Int32(0))
+    cute.arch.sync_threads()
+    idx_base = Int32(tx)
+    while idx_base < n_total:
+        ex_key = _convert_to_uint32(
+            _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
+            )
+        )
+        if ex_key > ex_pivot:
+            ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+            if ex_pos < topk_static:
+                s_out[ex_pos] = idx_base
+        idx_base += Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+    idx_base = Int32(tx)
+    while idx_base < n_total:
+        ex_key = _convert_to_uint32(
+            _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
+            )
+        )
+        if ex_key == ex_pivot:
+            ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+            if ex_pos < topk_static:
+                s_out[ex_pos] = idx_base
+        idx_base += Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+
+
 def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
@@ -729,6 +941,11 @@ class SparseNSATiledTopkKernel:
                     idx_base = idx_base + Int32(_THREADS_PER_CTA)
 
                 cute.arch.sync_threads()
+                # ni0 now holds the FULL threshold-bin candidate count: the xadd
+                # ran for every bin-matching key, even past _SMEM_CANDS. Capture it
+                # before the round loop clobbers ni0, to detect when the threshold
+                # bucket overflowed the candidate buffer (winners dropped past the cap).
+                bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
                 # Stage 2: refine with 8-bit radix passes
                 for round_idx in cutlass.range_constexpr(4):
@@ -876,6 +1093,37 @@ class SparseNSATiledTopkKernel:
                                 i = i + Int32(_THREADS_PER_CTA)
 
                             cute.arch.sync_threads()
+
+                # Exact overflow fallback: the buffered refine above dropped
+                # winners when more than _SMEM_CANDS candidates shared the coarse
+                # threshold bucket. Redo the selection exactly by re-scanning.
+                if bin_count > Int32(_SMEM_CANDS):
+                    _exact_overflow_fallback(
+                        tx,
+                        total_len,
+                        topk_static,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
+                        flat=False,
+                        flat_values=input_tensor,
+                        input_tensor=input_tensor,
+                        carry_values=carry_values,
+                        row_base=row_base,
+                        row_start=row_start,
+                        carry_base=out_base,
+                        chunk_len=length,
+                        block_q=self.block_q,
+                        block_k=self.block_k,
+                        is_tiled=self.is_tiled,
+                        is_first=self.is_first,
+                    )
 
             cute.arch.sync_threads()
             idx0 = Int32(tx)
@@ -1245,7 +1493,7 @@ def run_tiled_topk(
             dynamic_dims=(0,),
         ),
         (
-            "tiled_topk_v21",
+            "tiled_topk_v22",
             topk,
             block_q,
             block_k,
@@ -1415,7 +1663,7 @@ def run_row_topk(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
         (
-            "row_topk_v5",
+            "row_topk_v6",
             topk,
             output_gather_table is not None,
         ),
