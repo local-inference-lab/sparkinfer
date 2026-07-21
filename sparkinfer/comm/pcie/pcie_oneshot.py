@@ -1162,10 +1162,7 @@ class PCIeOneshotAllReducePool:
 
         stream_key = _current_stream_key(self.device, stream)
         channel_key = 0 if stream_key is None else int(stream_key)
-        if (
-            _is_current_stream_capturing(self.device)
-            and self._capture_channel_stack
-        ):
+        if _is_current_stream_capturing(self.device) and self._capture_channel_stack:
             # CUDA and torch/Inductor may recycle a nested capture stream key
             # between independent target and draft graph managers. The active
             # enclosing capture owns the channel even if that key still maps

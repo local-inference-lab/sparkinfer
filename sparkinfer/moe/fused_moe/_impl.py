@@ -6544,9 +6544,7 @@ def _select_micro_mma_tiler_mn(
     resident_clusters: int | None = None,
 ) -> tuple[int, int]:
     if os.environ.get("SPARKINFER_MOE_TILE_MN"):
-        return tuple(
-            int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x")
-        )
+        return tuple(int(x) for x in os.environ["SPARKINFER_MOE_TILE_MN"].split("x"))
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     if max_rows <= 32 and n <= 256:
@@ -6626,9 +6624,7 @@ def _get_micro_kernel(
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
         return last_kval, kernel.grid_x
-    reuse_compiled = (
-        os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
-    )
+    reuse_compiled = os.environ.get("SPARKINFER_MICRO_REUSE_COMPILED", "1") != "0"
     if reuse_compiled:
         cached = _MICRO_KERNEL_CACHE.get(cache_key)
         if cached is not None:
@@ -9285,9 +9281,7 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get(
-                    "SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1"
-                )
+                and os.environ.get("SPARKINFER_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
                 != "0"
             ),
             share_expert_scales=(
@@ -9646,7 +9640,9 @@ def _select_experts_reference(
     )
 
 
-def sparkinfer_route_experts_fast(*, binding: TPMoERouteBinding) -> SPARKINFERTopKRouting:
+def sparkinfer_route_experts_fast(
+    *, binding: TPMoERouteBinding
+) -> SPARKINFERTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

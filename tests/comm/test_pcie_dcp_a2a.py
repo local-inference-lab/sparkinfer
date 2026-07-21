@@ -5,6 +5,7 @@ import torch
 
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
+    PCIeDCPA2APool,
     _staging_layout,
     lse_reduce_scatter_reference,
 )
@@ -202,6 +203,8 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
         runtime.all_gather_heads(good_output[:, :8])
     with pytest.raises(ValueError, match="exceeds configured capacity"):
         runtime.all_gather_heads(torch.zeros(5, 16, 64, dtype=torch.bfloat16))
+
+
 def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
     created = []
     current_stream = [7]
@@ -222,13 +225,13 @@ def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._is_current_stream_capturing",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -270,13 +273,13 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._is_current_stream_capturing",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -322,7 +325,7 @@ def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_dcp_a2a._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: 3 if stream is None else int(stream),
     )
 
@@ -368,7 +371,7 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     pool._all_channels.append(transient)
     pool._channels[7] = transient
     monkeypatch.setattr(
-        "b12x.distributed.pcie_oneshot.dist.barrier",
+        "sparkinfer.comm.pcie.pcie_dcp_a2a.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 

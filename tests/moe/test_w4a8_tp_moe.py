@@ -208,11 +208,11 @@ def test_native_nvfp4_fused_micro_graph_replay_with_aux_stream_work(
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
     from benchmarks.benchmark_moe import make_shape_only_expert_weights
-    from b12x.integration.tp_moe import (
+    from sparkinfer.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
-        b12x_moe_fp4,
         build_tp_moe_fp4_binding,
         clear_tp_moe_caches,
+        sparkinfer_moe_fp4,
     )
 
     monkeypatch.setenv("SPARKINFER_NVFP4_SPLIT_DECODE", "0")
@@ -257,7 +257,7 @@ def test_native_nvfp4_fused_micro_graph_replay_with_aux_stream_work(
         quant_mode="nvfp4",
     )
 
-    b12x_moe_fp4(binding=binding)
+    sparkinfer_moe_fp4(binding=binding)
     torch.cuda.synchronize()
     expected = output.clone()
 
@@ -265,7 +265,7 @@ def test_native_nvfp4_fused_micro_graph_replay_with_aux_stream_work(
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
-        b12x_moe_fp4(binding=binding)
+        sparkinfer_moe_fp4(binding=binding)
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
 

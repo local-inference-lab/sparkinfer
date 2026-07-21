@@ -342,7 +342,9 @@ def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
     assert runtime.should_allreduce(torch.arange(4, dtype=torch.int32)) is False
     assert runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)) is False
     assert runtime.should_allreduce(torch.arange(7, dtype=torch.bfloat16)) is False
-    assert runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)[::2]) is False
+    assert (
+        runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)[::2]) is False
+    )
 
 
 def test_graph_buffer_api_exposes_explicit_registration_hooks():
@@ -525,8 +527,13 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
-    monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr(
+        "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        lambda group: "cpu",
+    )
 
     def fake_broadcast(object_list, src, group=None, device=None):
         object_list[0] = remote_meta[src]
@@ -545,11 +552,18 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
-    monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr(
+        "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        lambda group: "cpu",
+    )
     monkeypatch.setattr(
         "torch.distributed.broadcast_object_list",
-        lambda object_list, src, group=None, device=None: object_list.__setitem__(0, ([], [])),
+        lambda object_list, src, group=None, device=None: object_list.__setitem__(
+            0, ([], [])
+        ),
     )
 
     runtime = _make_runtime(exchange_group=object())
@@ -566,7 +580,9 @@ def test_capture_registers_graph_buffers_after_context(monkeypatch):
     runtime = _make_runtime(exchange_group=object())
     calls = []
 
-    monkeypatch.setattr(runtime, "register_graph_buffers", lambda: calls.append("registered"))
+    monkeypatch.setattr(
+        runtime, "register_graph_buffers", lambda: calls.append("registered")
+    )
 
     with runtime.capture():
         pass
@@ -578,7 +594,9 @@ def test_eager_capture_skips_graph_buffer_registration(monkeypatch):
     runtime = _make_runtime(eager=True, exchange_group=object())
     calls = []
 
-    monkeypatch.setattr(runtime, "register_graph_buffers", lambda: calls.append("registered"))
+    monkeypatch.setattr(
+        runtime, "register_graph_buffers", lambda: calls.append("registered")
+    )
 
     with runtime.capture():
         pass
@@ -651,8 +669,14 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(eager=True),
     )
 
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._current_stream_key", lambda device, stream=None: 7)
-    monkeypatch.setattr("sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing", lambda device: True)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 7,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda device: True,
+    )
 
     with pytest.raises(RuntimeError, match="before capture starts"):
         pool.for_stream()
@@ -724,13 +748,13 @@ def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_oneshot._is_current_stream_capturing",
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -775,7 +799,7 @@ def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "b12x.distributed.pcie_oneshot._current_stream_key",
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 3 if stream is None else int(stream),
     )
 
@@ -818,7 +842,7 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     pool._all_channels.append(transient)
     pool._channels[7] = transient
     monkeypatch.setattr(
-        "b12x.distributed.pcie_oneshot.dist.barrier",
+        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 
