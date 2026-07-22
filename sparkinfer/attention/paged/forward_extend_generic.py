@@ -124,7 +124,7 @@ def _cp_async_bulk_tensor_2d(
     dst_smem_addr: Int32,
     tensor_map_ptr: Int64,
     coord0: Int32,
-    coord1: Int32,
+    coord1: Int64,
     mbar_smem_addr: Int32,
     *,
     loc=None,
@@ -318,7 +318,10 @@ def _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
         )
         else mPageTable[request_idx, page_idx]
     )
-    page_row_base = page_id * page_size + page_row_offset
+    # Page ids are allocator-owned pool coordinates.  Widen before scaling so
+    # high recycled ids cannot overflow even when every individual tensor
+    # extent still fits in Int32.
+    page_row_base = Int64(page_id) * Int64(page_size) + Int64(page_row_offset)
     desc_ptr = Int64(mDescPtrsFlat[kv_head_idx])
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
@@ -3465,10 +3468,31 @@ class PagedForwardKernel:
                 else selected_token_count
             )
         else:
+            # Bound direct causal extend work to the key span visible to this
+            # query tile.  A request-level SWA start cannot prune prefill when
+            # Q == K because the first query still starts at key zero; using
+            # the tile's first/last query rows avoids rereading the whole cache
+            # for every later tile.  Keep the start page-aligned for paged TMA.
+            tile_first_q_token = packed_tile_start // group_size
+            tile_last_q_token = (packed_tile_end - Int32(1)) // group_size
+            tile_causal_start = cache_len - qo_len + tile_first_q_token
+            tile_causal_end = cache_len - qo_len + tile_last_q_token + Int32(1)
+            tile_causal_end = cutlass.select_(
+                tile_causal_end < cache_len, tile_causal_end, cache_len
+            )
+            tile_window_start = Int32(0)
+            if const_expr(self.window_left >= 0):
+                tile_window_start = tile_causal_start - Int32(self.window_left)
+                tile_window_start = cutlass.select_(
+                    tile_window_start > Int32(0), tile_window_start, Int32(0)
+                )
+                tile_window_start = (
+                    tile_window_start // mKCache.shape[1]
+                ) * mKCache.shape[1]
             kv_window_start = (
                 mKvWindowStartTokens[request_idx]
-                if const_expr(self.window_left >= 0)
-                else Int32(0)
+                if const_expr(self.split_kv and self.window_left >= 0)
+                else tile_window_start
             )
             msa_q_row_idx = Int32(0)
             msa_visible_len = Int32(0)
@@ -3487,7 +3511,7 @@ class PagedForwardKernel:
                     cache_len,
                 )
                 if const_expr(self.split_kv)
-                else cache_len
+                else tile_causal_end
             )
         request_partial_start = mOIndptr[request_idx]
         request_partial_end = mOIndptr[request_idx + 1]

@@ -238,6 +238,19 @@ def update_decode_graph_metadata_fused_triton(
         policy_pages = tl.minimum(policy_pages, WINDOW_PAGE_SPAN)
     policy_pages = tl.minimum(tl.maximum(policy_pages, 1), lut_size - 1)
     chunk_pages = tl.load(decode_chunk_pages_lut_ptr + policy_pages).to(tl.int32)
+    # The LUT is Plan-owned graph state and should already respect capacity,
+    # but preserve full KV coverage if its contents are corrupted or replaced.
+    # Increasing the shared chunk size keeps every request at or below the
+    # fixed chunk grid; simply clamping ``num_chunks`` would drop KV pages.
+    required_chunk_pages = tl.max(
+        tl.where(
+            batch_mask,
+            (effective_pages + max_chunks_per_req - 1) // max_chunks_per_req,
+            1,
+        ),
+        axis=0,
+    )
+    chunk_pages = tl.maximum(chunk_pages, required_chunk_pages)
     num_chunks = tl.maximum((effective_pages + chunk_pages - 1) // chunk_pages, 1)
     prefix = tl.cumsum(tl.where(batch_mask, num_chunks, 0), 0)
 
@@ -378,6 +391,7 @@ def update_decode_graph_compact_work_metadata_triton(
     work_items_capacity,
     block_valid_capacity,
     BATCH: tl.constexpr,
+    MAX_Q_TILES_PER_REQ: tl.constexpr,
     BLOCK_CHUNKS: tl.constexpr,
 ):
     req_idx = tl.program_id(axis=0)
@@ -386,14 +400,17 @@ def update_decode_graph_compact_work_metadata_triton(
     req_start = tl.load(o_indptr_ptr + req_idx).to(tl.int32)
     req_end = tl.load(o_indptr_ptr + req_idx + 1).to(tl.int32)
     num_chunks = req_end - req_start
-    work_offsets = req_start + chunk_offsets
-    active = (req_idx < BATCH) & (chunk_offsets < num_chunks)
+    num_work_items = num_chunks * MAX_Q_TILES_PER_REQ
+    qo_tile_idx = chunk_offsets // num_chunks
+    kv_tile_idx = chunk_offsets - qo_tile_idx * num_chunks
+    work_offsets = req_start * MAX_Q_TILES_PER_REQ + chunk_offsets
+    active = (req_idx < BATCH) & (chunk_offsets < num_work_items)
     work_mask = active & (work_offsets < work_items_capacity)
-    valid_mask = active & (work_offsets < block_valid_capacity)
+    valid_mask = work_mask & (work_offsets < block_valid_capacity)
     tl.store(request_indices_ptr + work_offsets, req_idx, mask=work_mask)
-    tl.store(qo_tile_indices_ptr + work_offsets, 0, mask=work_mask)
+    tl.store(qo_tile_indices_ptr + work_offsets, qo_tile_idx, mask=work_mask)
     tl.store(
-        kv_tile_indices_ptr + work_offsets, chunk_offsets.to(tl.int32), mask=work_mask
+        kv_tile_indices_ptr + work_offsets, kv_tile_idx.to(tl.int32), mask=work_mask
     )
     tl.store(block_valid_mask_ptr + work_offsets, 1, mask=valid_mask)
 
@@ -957,6 +974,7 @@ def update_decode_graph_chunk_metadata_fused(
     page_size: int,
     window_page_span: int = 0,
     window_left: int = -1,
+    max_q_tiles_per_req: int = 1,
 ) -> None:
     device = cache_seqlens.device
     if request_indices.device != device:
@@ -983,6 +1001,9 @@ def update_decode_graph_chunk_metadata_fused(
         raise ValueError("page_size must be positive")
     if window_left < -1:
         raise ValueError("window_left must be -1 or non-negative")
+    max_q_tiles_per_req = int(max_q_tiles_per_req)
+    if max_q_tiles_per_req <= 0:
+        raise ValueError("max_q_tiles_per_req must be positive")
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
@@ -1000,11 +1021,17 @@ def update_decode_graph_chunk_metadata_fused(
         raise RuntimeError(
             "decode graph workspace request_indices shape is incompatible with the batch bucket"
         )
-    max_chunks_per_req = work_items_capacity // bs
-    if max_chunks_per_req <= 0:
+    max_work_items_per_req = work_items_capacity // bs
+    if max_work_items_per_req <= 0:
         raise RuntimeError(
             "decode graph workspace must allocate at least one chunk per request"
         )
+    if max_work_items_per_req % max_q_tiles_per_req != 0:
+        raise RuntimeError(
+            "decode graph workspace work capacity is incompatible with the "
+            "query-tile grid"
+        )
+    max_chunks_per_req = max_work_items_per_req // max_q_tiles_per_req
     if int(merge_indptr.shape[0]) < bs + 1 or int(o_indptr.shape[0]) < bs + 1:
         raise RuntimeError(
             "decode graph indptr buffers are smaller than the graph batch"
@@ -1042,7 +1069,7 @@ def update_decode_graph_chunk_metadata_fused(
         ),
     )
     update_decode_graph_compact_work_metadata_triton[
-        (bs, triton.cdiv(max_chunks_per_req, _DECODE_BLOCK_CHUNKS))
+        (bs, triton.cdiv(max_work_items_per_req, _DECODE_BLOCK_CHUNKS))
     ](
         request_indices,
         qo_tile_indices,
@@ -1052,6 +1079,7 @@ def update_decode_graph_chunk_metadata_fused(
         work_items_capacity,
         block_valid_capacity,
         BATCH=bs,
+        MAX_Q_TILES_PER_REQ=max_q_tiles_per_req,
         BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
     )
 
@@ -1074,6 +1102,7 @@ def update_decode_graph_replay_metadata(
     page_size: int,
     window_page_span: int = 0,
     window_left: int = -1,
+    max_q_tiles_per_req: int = 1,
 ) -> None:
     if req_to_token.device != page_table.device:
         raise ValueError("req_to_token and page_table must be on the same device")
@@ -1092,6 +1121,9 @@ def update_decode_graph_replay_metadata(
         )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
+    max_q_tiles_per_req = int(max_q_tiles_per_req)
+    if max_q_tiles_per_req <= 0:
+        raise ValueError("max_q_tiles_per_req must be positive")
 
     bs = int(cache_seqlens.shape[0])
     if bs <= 0:
@@ -1110,10 +1142,15 @@ def update_decode_graph_replay_metadata(
         raise RuntimeError(
             "decode graph workspace request_indices shape is incompatible with the batch bucket"
         )
-    max_chunks_per_req = work_items_capacity // bs
-    if max_chunks_per_req <= 0:
+    max_work_items_per_req = work_items_capacity // bs
+    if max_work_items_per_req <= 0:
         raise RuntimeError(
             "decode graph workspace must allocate at least one chunk per request"
+        )
+    if max_work_items_per_req % max_q_tiles_per_req != 0:
+        raise RuntimeError(
+            "decode graph workspace work capacity is incompatible with the "
+            "query-tile grid"
         )
 
     page_blocks = triton.cdiv(int(page_table.shape[1]), _DECODE_BLOCK_PAGES)
@@ -1143,6 +1180,7 @@ def update_decode_graph_replay_metadata(
         page_size=page_size,
         window_page_span=window_page_span,
         window_left=window_left,
+        max_q_tiles_per_req=max_q_tiles_per_req,
     )
 
 
@@ -1252,6 +1290,7 @@ def update_msa_decode_graph_chunk_metadata(
         work_items_capacity,
         block_valid_capacity,
         BATCH=bs,
+        MAX_Q_TILES_PER_REQ=1,
         BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
     )
 
@@ -1588,6 +1627,7 @@ def update_decode_graph_chunk_metadata(
     page_size: int,
     window_page_span: int = 0,
     window_left: int = -1,
+    max_q_tiles_per_req: int = 1,
 ) -> None:
     device = cache_seqlens.device
     if request_indices.device != device:
@@ -1623,6 +1663,7 @@ def update_decode_graph_chunk_metadata(
         page_size=page_size,
         window_page_span=window_page_span,
         window_left=window_left,
+        max_q_tiles_per_req=max_q_tiles_per_req,
     )
 
 

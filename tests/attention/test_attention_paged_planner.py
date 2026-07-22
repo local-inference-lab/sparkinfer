@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,9 +11,16 @@ from sparkinfer.attention.paged.planner import (
     create_paged_plan,
     decode_chunk_pages_for_graph,
     infer_paged_mode,
+    plan_decode_graph_capacity,
+    plan_verify_graph_capacity,
     resolve_decode_graph_ctas_per_sm,
 )
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
+from sparkinfer.attention.paged._scratch import (
+    SPARKINFERPagedAttentionScratchCaps,
+    _paged_attention_scratch_layout,
+    plan_decode_graph_scratch_envelope,
+    plan_paged_attention_scratch,
+)
 
 
 def _make_inputs(
@@ -91,22 +100,27 @@ def test_paged_decode_plan_ignores_fixed_split_metadata() -> None:
     assert plan.total_num_partial_rows == 0
 
 
-def test_paged_decode_plan_rejects_forced_split_kv() -> None:
+def test_paged_eager_decode_plan_honors_explicit_forced_split_kv() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[2048, 4096],
     )
 
-    with pytest.raises(ValueError, match="decode plans do not support split-kv"):
-        create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            force_split_kv=True,
-        )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        fixed_split_size=8,
+        force_split_kv=True,
+    )
+
+    assert plan.split_kv is True
+    assert plan.kv_chunk_size == 8 * 64
+    assert plan.new_batch_size == 12
+    assert plan.total_num_partial_rows == 12
 
 
 def test_paged_scratch_shapes_follow_plan_metadata() -> None:
@@ -395,7 +409,7 @@ def test_paged_extend_plan_rejects_fixed_split_smaller_than_full_span() -> None:
         )
 
 
-def test_paged_graph_mode_uses_decode_graph_heuristic() -> None:
+def test_paged_graph_mode_defaults_to_decode_graph_split_heuristic() -> None:
     batch = 7
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1] * batch,
@@ -415,10 +429,458 @@ def test_paged_graph_mode_uses_decode_graph_heuristic() -> None:
     expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
     assert plan.graph_ctas_per_sm == 2
     assert plan.max_batch_size_if_split == expected_budget
+    expected_chunk_pages = decode_chunk_pages_for_graph(
+        q_dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        batch=batch,
+        page_size=int(k_cache.shape[1]),
+        head_dim_qk=int(q.shape[2]),
+        head_dim_vo=int(v_cache.shape[3]),
+        gqa_group_size=int(q.shape[1] // k_cache.shape[2]),
+        max_effective_kv_pages=8192 // 64,
+        max_chunks_per_req=expected_budget // batch,
+    )
+    assert expected_chunk_pages is not None
+    assert plan.split_kv is True
+    assert plan.kv_chunk_size == expected_chunk_pages * 64
+    assert plan.new_batch_size > batch
+    assert plan.total_num_partial_rows == plan.new_batch_size
+
+
+def test_paged_graph_decode_auto_split_preserves_explicit_opt_outs() -> None:
+    inputs = _make_inputs(
+        q_seqlens=[1] * 4,
+        cache_seqlens=[8192] * 4,
+        kv_dtype=torch.bfloat16,
+    )
+
+    explicit_false = create_paged_plan(
+        *inputs,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        force_split_kv=False,
+    )
+    explicit_disable = create_paged_plan(
+        *inputs,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        disable_split_kv=True,
+    )
+
+    assert explicit_false.split_kv is False
+    assert explicit_disable.split_kv is False
+    assert explicit_false.new_batch_size == explicit_disable.new_batch_size == 4
+
+
+def test_paged_graph_decode_auto_split_uses_short_window_chunk_policy() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1],
+        cache_seqlens=[8192],
+        page_size=128,
+        q_heads=36,
+        kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+
+    short_window_plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        window_left=512,
+    )
+    explicit_direct_plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        window_left=512,
+        force_split_kv=False,
+    )
+    long_full_plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        window_left=-1,
+    )
+
+    assert short_window_plan.split_kv is True
+    assert short_window_plan.kv_chunk_size == 128
+    assert short_window_plan.new_batch_size == 5
+    assert explicit_direct_plan.split_kv is False
+    assert explicit_direct_plan.new_batch_size == 1
+    assert long_full_plan.split_kv is True
+    assert long_full_plan.new_batch_size > 1
+
+
+def test_paged_graph_decode_auto_split_falls_back_with_fixed_capacity() -> None:
+    inputs = _make_inputs(
+        q_seqlens=[1] * 8,
+        cache_seqlens=[8192] * 8,
+        kv_dtype=torch.bfloat16,
+    )
+    no_partial_budget = PagedPlanBudget(
+        max_total_q=8,
+        max_batch=8,
+        max_page_table_width=128,
+        max_work_items=16,
+        max_partial_rows=0,
+    )
+
+    plan = create_paged_plan(
+        *inputs,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        max_batch_size_if_split=16,
+        plan_budget=no_partial_budget,
+    )
+
     assert plan.split_kv is False
-    assert plan.kv_chunk_size == 8192
-    assert plan.new_batch_size == batch
+    assert plan.new_batch_size == 8
     assert plan.total_num_partial_rows == 0
+
+    with pytest.raises(ValueError, match="workspace budget"):
+        create_paged_plan(
+            *inputs,
+            enable_cuda_graph=True,
+            graph_chunk_policy=True,
+            max_batch_size_if_split=16,
+            plan_budget=no_partial_budget,
+            force_split_kv=True,
+        )
+
+
+def test_decode_graph_capacity_is_static_exact_and_capacity_aware() -> None:
+    capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=36,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=128,
+        batch=1,
+        max_cache_page_count=512,
+        window_left=512,
+    )
+
+    assert capacity.query_tiles_per_request == 1
+    assert capacity.max_effective_kv_pages == 5
+    assert len(capacity.chunk_pages_lut) == 5
+    assert capacity.max_chunks_per_request == 5
+    assert capacity.max_work_items == 5
+    assert capacity.max_partial_rows == 5
+
+    direct_only = plan_decode_graph_capacity(
+        device=torch.device("cuda"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=8,
+        max_cache_page_count=128,
+        max_work_items=8,
+        max_partial_rows=0,
+    )
+
+    assert direct_only.max_chunks_per_request == 1
+    assert direct_only.max_work_items == 8
+    assert direct_only.max_partial_rows == 0
+    assert all(
+        (page_count + chunk_pages - 1) // chunk_pages == 1
+        for page_count, chunk_pages in enumerate(
+            direct_only.chunk_pages_lut, start=1
+        )
+    )
+
+
+def test_decode_graph_capacity_counts_multiple_query_tiles() -> None:
+    capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=128,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=2,
+        max_cache_page_count=64,
+        max_work_items=16,
+        max_partial_rows=0,
+    )
+
+    assert capacity.cta_tile_q == 16
+    assert capacity.query_tiles_per_request == 8
+    assert capacity.max_chunks_per_request == 1
+    assert capacity.max_work_items == 16
+    assert capacity.max_partial_rows == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "page_size",
+        "num_q_heads",
+        "max_cache_pages",
+        "window_left",
+        "expected_effective_pages",
+        "expected_chunk_pages",
+        "expected_partial_rows",
+    ),
+    [
+        (64, 24, 2048, -1, 2048, 67, 248),
+        (128, 36, 1024, 511, 6, 1, 48),
+    ],
+)
+def test_verify_graph_capacity_matches_laguna_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+    num_q_heads: int,
+    max_cache_pages: int,
+    window_left: int,
+    expected_effective_pages: int,
+    expected_chunk_pages: int,
+    expected_partial_rows: int,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=188),
+    )
+
+    capacity = plan_verify_graph_capacity(
+        device=torch.device("cuda", 0),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=num_q_heads,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=page_size,
+        batch=1,
+        query_len=8,
+        max_cache_page_count=max_cache_pages,
+        window_left=window_left,
+    )
+
+    assert capacity.cta_tile_q == 16
+    assert capacity.max_work_items == 94
+    assert capacity.max_effective_kv_pages == expected_effective_pages
+    assert capacity.kv_chunk_size_pages == expected_chunk_pages
+    assert capacity.max_partial_rows == expected_partial_rows
+    expected_cache_seqlen = (
+        max_cache_pages * page_size
+        if window_left < 0
+        else (max_cache_pages - 1) * page_size + 1
+    )
+    assert capacity.representative_cache_seqlen == expected_cache_seqlen
+
+
+def test_decode_graph_scratch_envelope_covers_every_batch_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin the architecture budget so this regression is deterministic on both
+    # DGX Spark and workstation Blackwell.  This Laguna-like geometry has a
+    # larger mid-batch split layout than its batch-256 direct layout.
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            multi_processor_count=159,
+            major=12,
+            minor=0,
+        ),
+    )
+    geometry = dict(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=36,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=128,
+        max_cache_page_count=512,
+    )
+    max_batch = 256
+
+    bucket_nbytes: list[int] = []
+    for batch in range(1, max_batch + 1):
+        capacity = plan_decode_graph_capacity(**geometry, batch=batch)
+        caps = SPARKINFERPagedAttentionScratchCaps(
+            device=geometry["device"],
+            mode="decode",
+            dtype=geometry["q_dtype"],
+            kv_dtype=geometry["kv_dtype"],
+            num_q_heads=geometry["num_q_heads"],
+            num_kv_heads=geometry["num_kv_heads"],
+            head_dim_qk=geometry["head_dim_qk"],
+            head_dim_vo=geometry["head_dim_vo"],
+            page_size=geometry["page_size"],
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=geometry["max_cache_page_count"],
+            max_work_items=capacity.max_work_items,
+            max_partial_rows=capacity.max_partial_rows,
+            num_cache_pages=1,
+            use_cuda_graph=True,
+            copy_runtime_metadata=True,
+        )
+        bucket_nbytes.append(int(_paged_attention_scratch_layout(caps).nbytes))
+
+    envelope = plan_decode_graph_scratch_envelope(
+        **geometry,
+        max_batch=max_batch,
+        max_page_table_width=geometry["max_cache_page_count"],
+    )
+    expected_nbytes = max(bucket_nbytes)
+    expected_witness = bucket_nbytes.index(expected_nbytes) + 1
+
+    assert expected_nbytes > bucket_nbytes[-1]
+    assert envelope.nbytes == expected_nbytes
+    assert envelope.witness_batch == expected_witness
+
+
+def test_decode_graph_scratch_envelope_applies_direct_only_storage_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=159),
+    )
+    envelope = plan_decode_graph_scratch_envelope(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        max_batch=8,
+        max_page_table_width=128,
+        max_partial_rows=0,
+    )
+    batch_eight_capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=8,
+        max_cache_page_count=128,
+        max_partial_rows=0,
+    )
+
+    assert batch_eight_capacity.max_partial_rows == 0
+    assert 1 <= envelope.witness_batch <= 8
+    assert envelope.nbytes > 0
+
+
+def test_prepare_decode_graph_replay_state_respects_direct_only_caps() -> None:
+    caps = SPARKINFERPagedAttentionScratchCaps(
+        device=torch.device("cuda"),
+        mode="decode",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        max_total_q=8,
+        max_batch=8,
+        max_page_table_width=128,
+        max_work_items=8,
+        max_partial_rows=0,
+        num_cache_pages=128,
+        use_cuda_graph=True,
+    )
+    scratch_plan = plan_paged_attention_scratch(caps)
+
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=8,
+        max_page_table_width=128,
+        max_cache_page_count=128,
+    )
+
+    assert scratch_plan.plan.split_kv is False
+    assert scratch_plan.plan.new_batch_size == 8
+    assert scratch_plan.plan.total_num_partial_rows == 0
+
+
+def test_prepare_windowed_decode_uses_nonmonotone_lut_worst_page_count() -> None:
+    capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=128,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=3,
+        max_cache_page_count=67,
+        window_left=1023,
+    )
+    # This policy is intentionally non-monotone: the schedule maximum occurs
+    # before the longest representable windowed cache span.
+    assert capacity.worst_page_count < capacity.max_effective_kv_pages
+
+    scratch_plan = plan_paged_attention_scratch(
+        SPARKINFERPagedAttentionScratchCaps(
+            device=torch.device("cuda"),
+            mode="decode",
+            dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            num_q_heads=128,
+            num_kv_heads=1,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            page_size=64,
+            max_total_q=3,
+            max_batch=3,
+            max_page_table_width=67,
+            max_work_items=capacity.max_work_items,
+            max_partial_rows=capacity.max_partial_rows,
+            num_cache_pages=67,
+            use_cuda_graph=True,
+        )
+    )
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=3,
+        max_page_table_width=67,
+        max_cache_page_count=67,
+        window_left=1023,
+    )
+
+    assert scratch_plan.plan.new_batch_size == capacity.max_work_items
+    assert (
+        scratch_plan.plan.total_num_partial_rows == capacity.max_partial_rows
+    )
 
 
 def test_decode_graph_chunk_pages_for_graph_uses_heuristic() -> None:
@@ -490,6 +952,61 @@ def test_decode_graph_chunk_pages_uses_finer_fp8_minimax_bs1_splits() -> None:
         )
         == 9
     )
+
+
+def test_decode_graph_page128_laguna_keeps_adaptive_one_wave_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = dict(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        batch=1,
+        page_size=128,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        gqa_group_size=9,
+        max_chunks_per_req=94,
+    )
+
+    assert decode_chunk_pages_for_graph(
+        max_effective_kv_pages=511, **kwargs
+    ) == 11
+    assert decode_chunk_pages_for_graph(
+        max_effective_kv_pages=512, **kwargs
+    ) == 11
+    assert decode_chunk_pages_for_graph(
+        max_effective_kv_pages=513, **kwargs
+    ) == 11
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=188),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+    capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=36,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=128,
+        batch=1,
+        max_cache_page_count=513,
+    )
+    assert capacity.architecture_max_chunks_per_request == 94
+    assert capacity.max_chunks_per_request == 47
+    assert capacity.max_work_items == 47
+    assert capacity.max_partial_rows == 47
+    assert capacity.worst_page_count == 47
+    assert capacity.chunk_pages_lut[45:49] == (1, 1, 2, 2)
+    assert capacity.chunk_pages_lut[510:513] == (11, 11, 11)
 
 
 def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> None:

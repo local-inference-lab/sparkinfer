@@ -13,7 +13,7 @@ import shlex
 import statistics
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Callable, Mapping
 
@@ -22,16 +22,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
+from sparkinfer.attention import paged
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged.reference import paged_attention_reference
 from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-from sparkinfer.attention.paged.planner import (
-    create_paged_plan,
-    decode_chunk_pages_for_graph,
-    resolve_decode_graph_ctas_per_sm,
-)
+from sparkinfer.attention.paged.planner import create_paged_plan
 from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
 from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
 from sparkinfer._lib import sparkinfer_package_fingerprint
 
 
@@ -151,6 +149,81 @@ def _bench_graph(
     return [start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)]
 
 
+_PAIRED_AB_BA_TIMING_METHOD = "paired-interleaved-ab-ba"
+
+
+def _balanced_graph_replay_schedule(
+    replays: int,
+    *,
+    backend_a: str = "sparkinfer",
+    backend_b: str = "flashinfer-fa2",
+) -> tuple[tuple[str, str], ...]:
+    """Return an AB/BA schedule whose sample index is the replay-pair index."""
+    if replays <= 0:
+        raise ValueError("paired graph timing requires at least one replay")
+    if backend_a == backend_b:
+        raise ValueError("paired graph timing requires distinct backend names")
+    return tuple(
+        (backend_a, backend_b) if pair_idx % 2 == 0 else (backend_b, backend_a)
+        for pair_idx in range(replays)
+    )
+
+
+def _bench_graph_pair_balanced(
+    graph_a: torch.cuda.CUDAGraph,
+    graph_b: torch.cuda.CUDAGraph,
+    *,
+    replays: int,
+    backend_a: str = "sparkinfer",
+    backend_b: str = "flashinfer-fa2",
+    l2_flush=None,
+) -> tuple[list[float], list[float], dict[str, object]]:
+    """Time two graphs in alternating AB/BA order with independent events."""
+    schedule = _balanced_graph_replay_schedule(
+        replays,
+        backend_a=backend_a,
+        backend_b=backend_b,
+    )
+    graphs = {backend_a: graph_a, backend_b: graph_b}
+    starts = {
+        backend_a: [torch.cuda.Event(enable_timing=True) for _ in range(replays)],
+        backend_b: [torch.cuda.Event(enable_timing=True) for _ in range(replays)],
+    }
+    ends = {
+        backend_a: [torch.cuda.Event(enable_timing=True) for _ in range(replays)],
+        backend_b: [torch.cuda.Event(enable_timing=True) for _ in range(replays)],
+    }
+
+    for pair_idx, backend_order in enumerate(schedule):
+        for backend in backend_order:
+            if l2_flush is not None:
+                l2_flush()
+                # Match the single-graph timing contract: the flush completes
+                # outside the timed interval and cannot overlap graph replay.
+                torch.cuda.synchronize()
+            starts[backend][pair_idx].record()
+            graphs[backend].replay()
+            ends[backend][pair_idx].record()
+    torch.cuda.synchronize()
+
+    samples = {
+        backend: [
+            start.elapsed_time(end)
+            for start, end in zip(starts[backend], ends[backend], strict=True)
+        ]
+        for backend in (backend_a, backend_b)
+    }
+    timing = {
+        "method": _PAIRED_AB_BA_TIMING_METHOD,
+        "sample_index": "replay-pair-index",
+        "pair_count": replays,
+        "even_pair_order": [backend_a, backend_b],
+        "odd_pair_order": [backend_b, backend_a],
+        "l2_flush_before_each_backend_replay": l2_flush is not None,
+    }
+    return samples[backend_a], samples[backend_b], timing
+
+
 def _replay_graph_for_correctness(
     graph: torch.cuda.CUDAGraph,
     *,
@@ -243,6 +316,94 @@ def _json_sha256(payload: object) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _decode_graph_replay_policy_metadata(
+    *,
+    include_flashinfer: bool,
+) -> dict[str, object]:
+    """Describe live-length planning included in and excluded from timing.
+
+    FlashInfer's ``use_cuda_graph=True`` stabilizes its buffers and captured
+    execution, but its public FA2 ``plan`` API is still a host operation.  The
+    decode-bucket benchmark calls it once for each live length before replay
+    timing.  Sparkinfer instead captures its schedule updater in the graph.
+    Keep that asymmetry explicit wherever a replay ratio is recorded.
+    """
+    backends: dict[str, object] = {
+        "sparkinfer": {
+            "strict_live_length_graph_safe": True,
+            "live_length_dependent_host_planning": False,
+            "runtime_metadata_binding": (
+                "stable-address device buffers bound by reference; no page-table, "
+                "cache-length, or cu-seqlens D2D copies are captured"
+            ),
+            "live_length_staging_before_timing": [
+                "fill persistent device cache_seqlens input",
+            ],
+            "planning_timed": [
+                "captured device replay-metadata updater selects schedule, chunking, and valid work",
+            ],
+            "planning_excluded_from_timing": [],
+            "timed_graph_work": [
+                "device replay-metadata updater",
+                "paged-attention execution",
+                "captured split-kv merge when selected",
+            ],
+        }
+    }
+    if include_flashinfer:
+        backends["flashinfer-fa2"] = {
+            "strict_live_length_graph_safe": False,
+            "live_length_dependent_host_planning": True,
+            "live_length_staging_before_timing": [
+                "construct active paged-kv metadata for the measured context",
+                "copy paged-kv metadata into fixed CUDA-graph buffers",
+            ],
+            "planning_timed": [],
+            "planning_excluded_from_timing": [
+                "FlashInfer BatchDecodeWithPagedKVCacheWrapper.plan",
+            ],
+            "timed_graph_work": [
+                "previously captured FlashInfer FA2 paged-attention execution",
+            ],
+            "available_strict_graph_safe_live_length_path_in_benchmark": False,
+        }
+
+    payload: dict[str, object] = {
+        "schema": "sparkinfer-decode-graph-replay-policy-v1",
+        "measurement_scope": "captured-cuda-graph-replay-only",
+        "backends": backends,
+        "comparison_limitation": (
+            "FlashInfer live-length metadata construction and host wrapper.plan are "
+            "excluded, while Sparkinfer's device schedule updater runs inside every "
+            "timed graph replay; ratios are captured-execution comparisons, not "
+            "strict graph-safe end-to-end serving comparisons."
+            if include_flashinfer
+            else "Sparkinfer device schedule selection is included in every timed graph replay."
+        ),
+    }
+    payload["sha256"] = _json_sha256(payload)
+    return payload
+
+
+def _decode_graph_timing_metadata(
+    base_timing: Mapping[str, object] | None,
+    *,
+    include_flashinfer: bool,
+) -> dict[str, object]:
+    timing = (
+        dict(base_timing)
+        if base_timing is not None
+        else {
+            "method": "single-backend-sequential",
+            "sample_index": "replay-index",
+        }
+    )
+    timing["replay_policy"] = _decode_graph_replay_policy_metadata(
+        include_flashinfer=include_flashinfer
+    )
+    return timing
 
 
 def _runtime_environment_provenance() -> dict[str, object]:
@@ -419,6 +580,7 @@ def _expected_case_contract(args: argparse.Namespace) -> dict[str, object]:
             "batch",
             "q_seqlen",
             "cache_seqlen",
+            "window_left",
         ]
         expected = [
             {
@@ -427,6 +589,7 @@ def _expected_case_contract(args: argparse.Namespace) -> dict[str, object]:
                 "batch": case.batch,
                 "q_seqlen": case.q_seqlen,
                 "cache_seqlen": case.cache_seqlen,
+                "window_left": args.window_left,
             }
             for case in _build_shape_cases(
                 batch=args.batch,
@@ -479,6 +642,7 @@ def _record_samples(
     case: dict[str, object],
     samples_ms: list[float],
     correctness: dict[str, object] | None = None,
+    timing: dict[str, object] | None = None,
 ) -> None:
     samples_us = [sample * 1000.0 for sample in samples_ms]
     _append_jsonl(
@@ -499,6 +663,7 @@ def _record_samples(
             "minimum": min(samples_us),
             "maximum": max(samples_us),
             "correctness": correctness,
+            "timing": timing,
         },
     )
 
@@ -578,6 +743,16 @@ def _initialize_raw_sample_log(
                 "cuda_graph_replay": True,
                 "stable_allocations": True,
                 "fixed_workspace_capacity": True,
+                "decode_graph_replay_policy": (
+                    _decode_graph_replay_policy_metadata(
+                        include_flashinfer=args.compare_fa2
+                    )
+                    if args.mode == "decode-graph-buckets"
+                    else {"status": "not-applicable-to-legacy-matrix"}
+                ),
+                "requested_kv_cache_layout": _kv_cache_layout_name(
+                    combined_kv_cache=args.combined_kv_cache
+                ),
                 "warmup": args.warmup,
                 "replays": args.replays,
                 "l2_flush": args.flush_l2,
@@ -788,6 +963,33 @@ def _make_uniform_page_metadata(
     return page_table, cache_seqlens
 
 
+def _kv_cache_layout_name(*, combined_kv_cache: bool) -> str:
+    return (
+        "combined-pages-2-nhd-strided-views"
+        if combined_kv_cache
+        else "separate-contiguous-nhd"
+    )
+
+
+def _kv_cache_layout_contract(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> dict[str, object]:
+    same_storage = (
+        k_cache.untyped_storage().data_ptr()
+        == v_cache.untyped_storage().data_ptr()
+    )
+    return {
+        "schema": "sparkinfer-paged-kv-layout-v1",
+        "kind": _kv_cache_layout_name(combined_kv_cache=same_storage),
+        "shared_storage": same_storage,
+        "k_stride": list(k_cache.stride()),
+        "v_stride": list(v_cache.stride()),
+        "k_storage_offset_elements": int(k_cache.storage_offset()),
+        "v_storage_offset_elements": int(v_cache.storage_offset()),
+    }
+
+
 def _make_uniform_paged_inputs(
     *,
     batch: int,
@@ -800,6 +1002,7 @@ def _make_uniform_paged_inputs(
     head_dim: int,
     dtype: torch.dtype,
     seed: int,
+    combined_kv_cache: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -817,18 +1020,34 @@ def _make_uniform_paged_inputs(
     capture_cache_seqlen = max(cache_seqlen, capture_cache_seqlen or cache_seqlen)
     capture_pages_per_request = (capture_cache_seqlen + page_size - 1) // page_size
     num_pages = batch * capture_pages_per_request
-    k_cache = (
-        torch.randn(
-            num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype
+    if combined_kv_cache:
+        combined_cache = (
+            torch.randn(
+                num_pages,
+                2,
+                page_size,
+                kv_heads,
+                head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            / 4
         )
-        / 4
-    )
-    v_cache = (
-        torch.randn(
-            num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype
+        k_cache = combined_cache[:, 0]
+        v_cache = combined_cache[:, 1]
+    else:
+        k_cache = (
+            torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype
+            )
+            / 4
         )
-        / 4
-    )
+        v_cache = (
+            torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype
+            )
+            / 4
+        )
     page_table, cache_seqlens = _make_uniform_page_metadata(
         batch=batch,
         cache_seqlen=cache_seqlen,
@@ -864,6 +1083,7 @@ def _quantize_paged_kv_cache_global_e4m3(
     *,
     batch: int,
     kv_heads: int,
+    combined_kv_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
     finfo = torch.finfo(torch.float8_e4m3fn)
     k_scale = k_cache.abs().amax().to(torch.float32) / finfo.max
@@ -894,9 +1114,16 @@ def _quantize_paged_kv_cache_global_e4m3(
         dtype=torch.float32,
         device=v_cache.device,
     )
+    if combined_kv_cache:
+        combined_cache = torch.stack((k_fp8, v_fp8), dim=1)
+        k_fp8 = combined_cache[:, 0]
+        v_fp8 = combined_cache[:, 1]
+    else:
+        k_fp8 = k_fp8.contiguous()
+        v_fp8 = v_fp8.contiguous()
     return (
-        k_fp8.contiguous(),
-        v_fp8.contiguous(),
+        k_fp8,
+        v_fp8,
         k_descale,
         v_descale,
         float(k_scale.item()),
@@ -937,6 +1164,110 @@ def _format_plan_desc(*, kv_chunk_size: int, split_kv: bool) -> str:
     return f"{desc},split" if split_kv else f"{desc},nosplit"
 
 
+def _format_decode_graph_replay_plan_desc(
+    workspace: object,
+) -> str:
+    plan = workspace.plan
+    assert workspace.request_indices is not None
+    split_desc = "split" if plan.split_kv else "nosplit"
+    return (
+        f"chunk=device-lut,grid={int(workspace.request_indices.numel())},"
+        f"{split_desc}"
+    )
+
+
+def _paged_forward_traits_contract(plan: object) -> dict[str, object]:
+    traits = select_paged_forward_traits_from_plan(plan)
+    return {
+        "schema": "sparkinfer-paged-forward-traits-v1",
+        "cta_tile_q": int(traits.cta_tile_q),
+        "cta_tile_kv": int(traits.cta_tile_kv),
+        "num_mma_q": int(traits.num_mma_q),
+        "num_mma_kv": int(traits.num_mma_kv),
+        "num_threads": int(traits.num_threads),
+        "launch_smem_bytes": int(traits.launch_smem_bytes),
+        "num_ctas_per_sm": int(traits.num_ctas_per_sm),
+    }
+
+
+def _observe_decode_graph_replay_topology(
+    workspace: object,
+    *,
+    batch: int,
+) -> dict[str, object]:
+    """Read the schedule produced by the captured device updater after replay."""
+    plan = workspace.plan
+    required = {
+        name: getattr(workspace, name, None)
+        for name in (
+            "request_indices",
+            "block_valid_mask",
+            "merge_indptr",
+            "o_indptr",
+            "kv_chunk_size_ptr",
+        )
+    }
+    missing = [name for name, tensor in required.items() if not isinstance(tensor, torch.Tensor)]
+    if missing:
+        raise RuntimeError(
+            "decode graph replay topology is missing workspace tensors: "
+            f"{missing}"
+        )
+    if batch <= 0 or batch > int(plan.total_q):
+        raise ValueError(
+            f"observed decode batch {batch} is outside plan total_q={plan.total_q}"
+        )
+
+    chunk_tokens = int(required["kv_chunk_size_ptr"][0].item())
+    page_size = int(plan.page_size)
+    if chunk_tokens <= 0 or chunk_tokens % page_size != 0:
+        raise RuntimeError(
+            "captured decode updater produced an invalid chunk size: "
+            f"chunk_tokens={chunk_tokens}, page_size={page_size}"
+        )
+    partial_rows = int(required["merge_indptr"][batch].item())
+    output_rows = int(required["o_indptr"][batch].item())
+    if output_rows != partial_rows:
+        raise RuntimeError(
+            "captured decode updater produced inconsistent merge/output topology: "
+            f"merge_rows={partial_rows}, output_rows={output_rows}"
+        )
+    work_item_capacity = int(required["request_indices"].numel())
+    regularized = bool(
+        getattr(workspace, "_use_regular_decode_graph_replay", False)
+    )
+    useful_work_items = (
+        partial_rows
+        if regularized
+        else int(required["block_valid_mask"].count_nonzero().item())
+    )
+    if useful_work_items < 0 or useful_work_items > work_item_capacity:
+        raise RuntimeError(
+            "captured decode updater produced an invalid useful-work count: "
+            f"useful={useful_work_items}, capacity={work_item_capacity}"
+        )
+    num_kv_heads = int(plan.num_kv_heads)
+    return {
+        "schema": "sparkinfer-decode-graph-observed-topology-v2",
+        "source": "captured-device-lut-updater",
+        "scheduling_mode": (
+            "regularized-fixed-grid" if regularized else "compact-valid-mask"
+        ),
+        "kv_chunk_size_tokens": chunk_tokens,
+        "kv_chunk_size_pages": chunk_tokens // page_size,
+        "useful_work_items": useful_work_items,
+        "work_item_capacity": work_item_capacity,
+        "padded_work_items": work_item_capacity - useful_work_items,
+        "forward_grid_ctas": work_item_capacity * num_kv_heads,
+        "useful_forward_ctas": useful_work_items * num_kv_heads,
+        "early_exit_forward_ctas": (
+            work_item_capacity - useful_work_items
+        )
+        * num_kv_heads,
+        "partial_rows": partial_rows,
+    }
+
+
 def _run_backend_forward(
     *,
     workspace: PagedAttentionWorkspace,
@@ -972,7 +1303,7 @@ def _build_backend_graph_plan(
     assert workspace._plan_k_cache is not None
     assert workspace._plan_v_cache is not None
     active_total_q = int(cu_seqlens_q[-1].item())
-    return create_paged_plan(
+    plan = create_paged_plan(
         workspace._plan_q[:active_total_q],
         workspace._plan_k_cache,
         workspace._plan_v_cache,
@@ -982,10 +1313,19 @@ def _build_backend_graph_plan(
         mode=workspace.mode,
         fixed_split_size=-1 if fixed_split_pages is None else int(fixed_split_pages),
         disable_split_kv=False,
+        # A fixed split override is an explicit benchmark contract, not merely
+        # chunk-size metadata.  Force the split path so the CLI can never
+        # silently benchmark the direct kernel while printing a split value.
+        force_split_kv=True if fixed_split_pages is not None else None,
         enable_cuda_graph=True,
         graph_chunk_policy=True,
         graph_ctas_per_sm=graph_ctas_per_sm,
     )
+    if fixed_split_pages is not None and not plan.split_kv:
+        raise RuntimeError(
+            "fixed split benchmark control produced a no-split paged plan"
+        )
+    return plan
 
 
 def _load_backend_graph_plan(
@@ -1003,7 +1343,7 @@ def _load_backend_graph_plan(
     return _format_plan_desc(kv_chunk_size=plan.kv_chunk_size, split_kv=plan.split_kv)
 
 
-_WORKSPACE_READ_ONLY_FIELDS = (
+_WORKSPACE_SCHEDULE_FIELDS = (
     "request_indices",
     "qo_tile_indices",
     "kv_tile_indices",
@@ -1013,19 +1353,33 @@ _WORKSPACE_READ_ONLY_FIELDS = (
     "kv_window_start_tokens",
     "total_num_rows_ptr",
     "block_valid_mask",
+)
+
+_WORKSPACE_RUNTIME_METADATA_FIELDS = (
     "page_table",
     "cache_seqlens",
     "cu_seqlens_q",
+)
+
+_WORKSPACE_POLICY_READ_ONLY_FIELDS = (
     "_decode_graph_chunk_pages_lut",
 )
 
 
 def _workspace_read_only_inputs(
-    workspace: PagedAttentionWorkspace,
+    workspace: object,
+    *,
+    include_schedule: bool = True,
+    include_runtime_metadata: bool = True,
 ) -> dict[str, torch.Tensor]:
+    fields = _WORKSPACE_POLICY_READ_ONLY_FIELDS
+    if include_runtime_metadata:
+        fields = _WORKSPACE_RUNTIME_METADATA_FIELDS + fields
+    if include_schedule:
+        fields = _WORKSPACE_SCHEDULE_FIELDS + fields
     return {
         f"workspace.{name}": tensor
-        for name in _WORKSPACE_READ_ONLY_FIELDS
+        for name in fields
         if isinstance((tensor := getattr(workspace, name, None)), torch.Tensor)
     }
 
@@ -1034,9 +1388,15 @@ def _snapshot_backend_replay_inputs(
     *,
     base_snapshot: _ReadOnlyInputSnapshot,
     base_inputs: Mapping[str, torch.Tensor],
-    workspace: PagedAttentionWorkspace,
+    workspace: object,
+    include_workspace_schedule: bool = True,
+    include_workspace_runtime_metadata: bool = True,
 ) -> tuple[_ReadOnlyInputSnapshot, dict[str, torch.Tensor]]:
-    workspace_inputs = _workspace_read_only_inputs(workspace)
+    workspace_inputs = _workspace_read_only_inputs(
+        workspace,
+        include_schedule=include_workspace_schedule,
+        include_runtime_metadata=include_workspace_runtime_metadata,
+    )
     snapshot = _extend_read_only_input_snapshot(base_snapshot, **workspace_inputs)
     return snapshot, {**base_inputs, **workspace_inputs}
 
@@ -1047,6 +1407,59 @@ def _poison_backend_result_regions(capture: BackendCapture | SparkinferDecodeGra
     for tensor in (workspace.lse, workspace.tmp_output, workspace.tmp_lse):
         if tensor is not None:
             tensor.fill_(float("nan"))
+
+
+def _active_split_kv_temporary_results(
+    *,
+    tmp_output: torch.Tensor,
+    tmp_lse: torch.Tensor,
+    o_indptr: torch.Tensor,
+    batch: int,
+    regular_decode_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select only temporary rows written by the current correctness replay."""
+    if batch <= 0:
+        raise AssertionError(f"decode graph replay produced an invalid batch: {batch}")
+    if int(o_indptr.shape[0]) < batch + 1:
+        raise AssertionError("decode graph replay o_indptr is smaller than the graph batch")
+
+    active_partial_rows = int(o_indptr[batch].item())
+    if not 0 < active_partial_rows <= int(tmp_output.shape[0]):
+        raise AssertionError(
+            "decode graph replay produced an invalid active partial-row count: "
+            f"{active_partial_rows}"
+        )
+    if not regular_decode_graph:
+        return tmp_output[:active_partial_rows], tmp_lse[:active_partial_rows]
+
+    # The regularized fixed grid reserves max_chunks_per_request rows for each
+    # request.  Its forward and merge kernels address row
+    # req * max_chunks_per_request + chunk, so shorter replays leave deliberate
+    # holes between requests.  This is a post-replay correctness observation;
+    # it never feeds launch policy or timing.
+    if int(tmp_output.shape[0]) % batch != 0:
+        raise AssertionError(
+            "regular decode graph temporary-row capacity is not divisible by batch"
+        )
+    max_chunks_per_request = int(tmp_output.shape[0]) // batch
+    chunks_per_request = o_indptr[1 : batch + 1] - o_indptr[:batch]
+    valid_chunk_counts = (chunks_per_request > 0) & (
+        chunks_per_request <= max_chunks_per_request
+    )
+    if not bool(valid_chunk_counts.all().item()):
+        raise AssertionError(
+            "regular decode graph replay produced an invalid per-request chunk count"
+        )
+    chunk_slots = torch.arange(max_chunks_per_request, device=o_indptr.device)
+    active_mask = chunk_slots.unsqueeze(0) < chunks_per_request.unsqueeze(1)
+    return (
+        tmp_output.reshape(batch, max_chunks_per_request, *tmp_output.shape[1:])[
+            active_mask
+        ],
+        tmp_lse.reshape(batch, max_chunks_per_request, *tmp_lse.shape[1:])[
+            active_mask
+        ],
+    )
 
 
 def _assert_backend_result_regions_overwritten(
@@ -1061,9 +1474,22 @@ def _assert_backend_result_regions_overwritten(
     if plan.split_kv:
         assert workspace.tmp_output is not None
         assert workspace.tmp_lse is not None
-        partial_rows = int(plan.total_num_partial_rows)
-        tmp_output = workspace.tmp_output[:partial_rows]
-        tmp_lse = workspace.tmp_lse[:partial_rows]
+        tmp_output = workspace.tmp_output[: int(plan.total_num_partial_rows)]
+        tmp_lse = workspace.tmp_lse[: int(plan.total_num_partial_rows)]
+        if (
+            isinstance(capture, SparkinferDecodeGraphBucket)
+            and workspace._decode_graph_chunk_pages_lut is not None
+        ):
+            assert workspace.o_indptr is not None
+            tmp_output, tmp_lse = _active_split_kv_temporary_results(
+                tmp_output=tmp_output,
+                tmp_lse=tmp_lse,
+                o_indptr=workspace.o_indptr,
+                batch=capture.batch,
+                regular_decode_graph=bool(
+                    workspace._use_regular_decode_graph_replay
+                ),
+            )
         if not bool(torch.isfinite(tmp_output).all().item()):
             raise AssertionError(
                 "sparkinfer logical split-KV temporary output was not fully overwritten"
@@ -1129,23 +1555,6 @@ def _decode_effective_cache_tokens(
     return int(context_tokens + q_seqlen)
 
 
-def _make_decode_context_metadata(
-    *,
-    batch: int,
-    context_tokens: int,
-    page_size: int,
-    num_pages: int,
-    seed: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _make_uniform_page_metadata(
-        batch=batch,
-        cache_seqlen=_decode_effective_cache_tokens(context_tokens=context_tokens),
-        page_size=page_size,
-        num_pages=num_pages,
-        seed=seed,
-    )
-
-
 @dataclass(frozen=True)
 class DecodeReplayCase:
     batch: int
@@ -1189,9 +1598,13 @@ class DecodeGraphBucketPolicy:
     batch: int
     capture_context_tokens: int
     capture_page_count: int
-    capture_fixed_split_pages: int | None
-    replay_fixed_split_pages: int | None
-    graph_ctas_per_sm: int | None
+    graph_ctas_per_sm: int
+    query_tiles_per_request: int
+    architecture_max_chunks_per_request: int
+    max_chunks_per_request: int
+    max_work_items: int
+    max_partial_rows: int
+    worst_page_count: int
     source: str
 
     @property
@@ -1215,6 +1628,17 @@ def _resolve_decode_graph_bucket_policy(
     fixed_split_pages_override: int,
     graph_ctas_per_sm_override: int,
 ) -> DecodeGraphBucketPolicy:
+    if fixed_split_pages_override > 0:
+        raise ValueError(
+            "decode-graph-buckets uses the production device-LUT replay policy; "
+            "--fixed-split-pages is only supported by legacy-matrix"
+        )
+    if graph_ctas_per_sm_override > 0:
+        raise ValueError(
+            "decode-graph-buckets uses the production device-LUT replay policy; "
+            "--graph-ctas-per-sm is only supported by legacy-matrix"
+        )
+
     if capture_context_override > 0:
         capture_context_tokens = int(capture_context_override)
         source = "manual"
@@ -1238,64 +1662,32 @@ def _resolve_decode_graph_bucket_policy(
         + page_size
         - 1
     ) // page_size
-
-    if fixed_split_pages_override > 0:
-        capture_fixed_split_pages = int(fixed_split_pages_override)
-        replay_fixed_split_pages = int(fixed_split_pages_override)
-        source = "manual"
-    else:
-        graph_ctas_hint = resolve_decode_graph_ctas_per_sm(
-            kv_dtype=kv_dtype,
-            batch=batch,
-            page_size=page_size,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
-            graph_ctas_per_sm=graph_ctas_per_sm_override
-            if graph_ctas_per_sm_override > 0
-            else None,
-        )
-        max_chunks_per_req = None
-        if torch.cuda.is_available():
-            num_sms = int(
-                torch.cuda.get_device_properties("cuda").multi_processor_count
-            )
-            max_chunks_per_req = max(
-                (num_sms * graph_ctas_hint) // max(int(batch), 1), 1
-            )
-        capture_fixed_split_pages = decode_chunk_pages_for_graph(
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            batch=batch,
-            page_size=page_size,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
-            max_effective_kv_pages=capture_page_count,
-            max_chunks_per_req=max_chunks_per_req,
-        )
-        replay_fixed_split_pages = None
-
-    if graph_ctas_per_sm_override > 0:
-        graph_ctas_per_sm = int(graph_ctas_per_sm_override)
-        source = "manual"
-    else:
-        graph_ctas_per_sm = resolve_decode_graph_ctas_per_sm(
-            kv_dtype=kv_dtype,
-            batch=batch,
-            page_size=page_size,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
-        )
+    capacity = paged.decode_graph_capacity(
+        device=torch.device("cuda", torch.cuda.current_device()),
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        num_q_heads=q_heads,
+        num_kv_heads=kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        page_size=page_size,
+        batch=batch,
+        max_cache_page_count=capture_page_count,
+    )
 
     return DecodeGraphBucketPolicy(
         batch=int(batch),
         capture_context_tokens=int(capture_context_tokens),
         capture_page_count=capture_page_count,
-        capture_fixed_split_pages=capture_fixed_split_pages,
-        replay_fixed_split_pages=replay_fixed_split_pages,
-        graph_ctas_per_sm=graph_ctas_per_sm,
+        graph_ctas_per_sm=capacity.graph_ctas_per_sm,
+        query_tiles_per_request=capacity.query_tiles_per_request,
+        architecture_max_chunks_per_request=(
+            capacity.architecture_max_chunks_per_request
+        ),
+        max_chunks_per_request=capacity.max_chunks_per_request,
+        max_work_items=capacity.max_work_items,
+        max_partial_rows=capacity.max_partial_rows,
+        worst_page_count=capacity.worst_page_count,
         source=source,
     )
 
@@ -1303,6 +1695,7 @@ def _resolve_decode_graph_bucket_policy(
 @dataclass(frozen=True)
 class DecodeBucketSharedInputs:
     batch: int
+    capture_context_tokens: int
     q: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
@@ -1313,7 +1706,6 @@ class DecodeBucketSharedInputs:
     v_descale: torch.Tensor | None
     k_scale: float | None
     v_scale: float | None
-    seed: int
     read_only_snapshot: _ReadOnlyInputSnapshot | None
 
     @property
@@ -1345,6 +1737,7 @@ def _make_decode_bucket_shared_inputs(
     kv_dtype: torch.dtype,
     seed: int,
     strict_check: bool = True,
+    combined_kv_cache: bool = False,
 ) -> DecodeBucketSharedInputs:
     (
         q,
@@ -1370,6 +1763,7 @@ def _make_decode_bucket_shared_inputs(
         head_dim=head_dim,
         dtype=dtype,
         seed=seed,
+        combined_kv_cache=combined_kv_cache,
     )
     k_descale = None
     v_descale = None
@@ -1382,6 +1776,7 @@ def _make_decode_bucket_shared_inputs(
                 v_cache,
                 batch=batch,
                 kv_heads=kv_heads,
+                combined_kv_cache=combined_kv_cache,
             )
         )
     read_only_snapshot = (
@@ -1400,6 +1795,7 @@ def _make_decode_bucket_shared_inputs(
     )
     return DecodeBucketSharedInputs(
         batch=batch,
+        capture_context_tokens=int(capture_context_tokens),
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1410,7 +1806,6 @@ def _make_decode_bucket_shared_inputs(
         v_descale=v_descale,
         k_scale=k_scale,
         v_scale=v_scale,
-        seed=seed,
         read_only_snapshot=read_only_snapshot,
     )
 
@@ -1418,16 +1813,17 @@ def _make_decode_bucket_shared_inputs(
 @dataclass
 class SparkinferDecodeGraphBucket:
     shared: DecodeBucketSharedInputs
-    workspace: PagedAttentionWorkspace
+    scratch_plan: object
+    scratch_storage: torch.Tensor
+    binding: object
+    workspace: object
     graph: torch.cuda.CUDAGraph
     output: torch.Tensor
     guarded_output: _GuardedOutput
-    capture_fixed_split_pages: int | None
-    replay_fixed_split_pages: int | None
-    graph_ctas_per_sm: int | None
     current_page_table: torch.Tensor
     current_cache_seqlens: torch.Tensor
     current_plan_desc: str
+    forward_traits_contract: dict[str, object]
     read_only_snapshot: _ReadOnlyInputSnapshot | None
     read_only_inputs: dict[str, torch.Tensor] | None
 
@@ -1460,51 +1856,41 @@ class SparkinferDecodeGraphBucket:
         return self.shared.v_descale
 
     def prepare_replay(self, *, context_tokens: int) -> None:
-        page_table, cache_seqlens = _make_decode_context_metadata(
-            batch=self.batch,
-            context_tokens=context_tokens,
-            page_size=int(self.k_cache.shape[1]),
-            num_pages=int(self.k_cache.shape[0]),
-            seed=self.shared.seed,
+        if context_tokens > self.shared.capture_context_tokens:
+            raise ValueError(
+                "decode graph replay context exceeds the captured bucket: "
+                f"{context_tokens} > {self.shared.capture_context_tokens}"
+            )
+        effective_cache_tokens = _decode_effective_cache_tokens(
+            context_tokens=context_tokens
         )
-        replay_plan = _build_backend_graph_plan(
-            workspace=self.workspace,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=self.cu_seqlens_q,
-            fixed_split_pages=self.replay_fixed_split_pages,
-            graph_ctas_per_sm=self.graph_ctas_per_sm,
-        )
-        self.current_plan_desc = _load_backend_graph_plan(
-            workspace=self.workspace,
-            plan=replay_plan,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=self.cu_seqlens_q,
-        )
+        # The graph owns a fixed page table and fixed schedule topology.  A
+        # replay changes only this persistent device length tensor; the
+        # captured device updater selects chunking and valid work from the LUT.
+        self.current_cache_seqlens.fill_(effective_cache_tokens)
         if self.shared.read_only_snapshot is not None:
             source_snapshot = _extend_read_only_input_snapshot(
                 self.shared.read_only_snapshot,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
+                page_table=self.current_page_table,
+                cache_seqlens=self.current_cache_seqlens,
             )
             source_inputs = {
                 **self.shared.read_only_inputs,
-                "page_table": page_table,
-                "cache_seqlens": cache_seqlens,
+                "page_table": self.current_page_table,
+                "cache_seqlens": self.current_cache_seqlens,
             }
             self.read_only_snapshot, self.read_only_inputs = (
                 _snapshot_backend_replay_inputs(
                     base_snapshot=source_snapshot,
                     base_inputs=source_inputs,
                     workspace=self.workspace,
+                    include_workspace_schedule=False,
+                    include_workspace_runtime_metadata=False,
                 )
             )
         else:
             self.read_only_snapshot = None
             self.read_only_inputs = None
-        self.current_page_table = page_table
-        self.current_cache_seqlens = cache_seqlens
 
 
 @dataclass
@@ -1534,12 +1920,23 @@ class FlashinferDecodeGraphBucket:
         return self.output.view(-1, self.q_heads, self.head_dim)
 
     def prepare_replay(self, *, context_tokens: int) -> None:
-        page_table, cache_seqlens = _make_decode_context_metadata(
-            batch=self.batch,
-            context_tokens=context_tokens,
-            page_size=self.page_size,
-            num_pages=int(self.shared.k_cache.shape[0]),
-            seed=self.shared.seed,
+        if context_tokens > self.shared.capture_context_tokens:
+            raise ValueError(
+                "FlashInfer replay context exceeds the captured bucket: "
+                f"{context_tokens} > {self.shared.capture_context_tokens}"
+            )
+        effective_cache_tokens = _decode_effective_cache_tokens(
+            context_tokens=context_tokens
+        )
+        active_pages = (
+            effective_cache_tokens + self.page_size - 1
+        ) // self.page_size
+        # Use the same fixed bucket page mapping as Sparkinfer so both backends
+        # and the reference consume identical logical KV inputs.
+        page_table = self.shared.capture_page_table[:, :active_pages]
+        cache_seqlens = torch.full_like(
+            self.shared.capture_cache_seqlens,
+            effective_cache_tokens,
         )
         qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = (
             _make_flashinfer_page_metadata(
@@ -1595,6 +1992,7 @@ def _capture_backend_graph(
     v_descale: torch.Tensor | None,
     warmup: int,
     graph_ctas_per_sm: int | None,
+    window_left: int,
     strict_check: bool = True,
 ) -> BackendCapture:
     base_snapshot = (
@@ -1649,6 +2047,7 @@ def _capture_backend_graph(
             max_page_table_width=int(capture_page_table.shape[1]),
             max_cache_seqlen=int(capture_cache_seqlens.max().item()),
             cu_seqlens_q=cu_seqlens_q,
+            window_left=window_left,
         )
         capture_plan = workspace.plan
         replay_plan = None
@@ -1707,6 +2106,7 @@ def _capture_backend_graph(
             page_table,
             cache_seqlens,
             cu_seqlens_q,
+            window_left=window_left,
         )
         chunk_desc = _format_plan_desc(
             kv_chunk_size=capture_plan.kv_chunk_size,
@@ -1761,6 +2161,7 @@ def _capture_flashinfer_fa2_graph(
     v_scale: float | None,
     workspace_bytes: int,
     warmup: int,
+    window_left: int,
 ) -> FlashinferCapture:
     flashinfer = _import_flashinfer()
     batch = int(page_table.shape[0])
@@ -1810,6 +2211,7 @@ def _capture_flashinfer_fa2_graph(
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             sm_scale=sm_scale,
+            window_left=window_left,
         )
         q_input = q.view(batch, q_heads, head_dim)
         guarded_output = _allocate_guarded_output(q_input)
@@ -1837,6 +2239,7 @@ def _capture_flashinfer_fa2_graph(
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             sm_scale=sm_scale,
+            window_left=window_left,
         )
         return FlashinferCapture(
             graph=graph,
@@ -1880,6 +2283,7 @@ def _capture_flashinfer_fa2_graph(
         q_data_type=q_dtype,
         kv_data_type=kv_dtype,
         sm_scale=sm_scale,
+        window_left=window_left,
     )
     guarded_output = _allocate_guarded_output(q)
     output = guarded_output.output
@@ -1902,6 +2306,7 @@ def _capture_flashinfer_fa2_graph(
         q_data_type=q_dtype,
         kv_data_type=kv_dtype,
         sm_scale=sm_scale,
+        window_left=window_left,
     )
     return FlashinferCapture(
         graph=graph,
@@ -1925,74 +2330,118 @@ def _capture_flashinfer_fa2_graph(
 def _capture_sparkinfer_decode_graph_bucket(
     *,
     shared: DecodeBucketSharedInputs,
-    capture_fixed_split_pages: int | None,
-    replay_fixed_split_pages: int | None,
+    policy: DecodeGraphBucketPolicy,
     warmup: int,
-    graph_ctas_per_sm: int | None,
 ) -> SparkinferDecodeGraphBucket:
-    workspace = PagedAttentionWorkspace.for_tensors(
+    if policy.batch != shared.batch:
+        raise ValueError("decode graph policy batch does not match shared inputs")
+    if policy.capture_page_count != int(shared.capture_page_table.shape[1]):
+        raise ValueError(
+            "decode graph policy page capacity does not match shared inputs"
+        )
+    caps = paged.Caps(
+        device=shared.q.device,
         mode="decode",
-        q=shared.q,
-        k_cache=shared.k_cache,
-        v_cache=shared.v_cache,
-        use_cuda_graph=False,
+        dtype=shared.q.dtype,
+        kv_dtype=shared.k_cache.dtype,
+        num_q_heads=int(shared.q.shape[1]),
+        num_kv_heads=int(shared.k_cache.shape[2]),
+        head_dim_qk=int(shared.q.shape[2]),
+        head_dim_vo=int(shared.v_cache.shape[3]),
+        page_size=int(shared.k_cache.shape[1]),
+        max_total_q=shared.batch,
+        max_batch=shared.batch,
+        max_page_table_width=policy.capture_page_count,
+        max_work_items=policy.max_work_items,
+        max_partial_rows=policy.max_partial_rows,
+        num_cache_pages=int(shared.k_cache.shape[0]),
+        use_cuda_graph=True,
+        # The serving graph owns stable, full-bucket device metadata buffers.
+        # Bind those addresses directly so replay measures the device policy
+        # updater and attention kernels, not redundant full page-table D2D
+        # copies introduced solely by the benchmark harness.
+        copy_runtime_metadata=False,
     )
-    capture_plan = _build_backend_graph_plan(
-        workspace=workspace,
-        page_table=shared.capture_page_table,
-        cache_seqlens=shared.capture_cache_seqlens,
-        cu_seqlens_q=shared.cu_seqlens_q,
-        fixed_split_pages=capture_fixed_split_pages,
-        graph_ctas_per_sm=graph_ctas_per_sm,
+    scratch_plan = paged.plan(caps)
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=shared.batch,
+        total_q_capacity=shared.batch,
+        max_page_table_width=policy.capture_page_count,
+        max_cache_page_count=policy.capture_page_count,
     )
-    workspace._ensure_capacity(capture_plan)
-    workspace.use_cuda_graph = True
-    capture_plan_desc = _load_backend_graph_plan(
-        workspace=workspace,
-        plan=capture_plan,
-        page_table=shared.capture_page_table,
-        cache_seqlens=shared.capture_cache_seqlens,
-        cu_seqlens_q=shared.cu_seqlens_q,
+    (scratch_spec,) = scratch_plan.scratch_specs()
+    scratch_storage = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
     )
+    replay_cache_seqlens = shared.capture_cache_seqlens.clone()
     guarded_output = _allocate_guarded_output(shared.q)
     output = guarded_output.output
+    captured_binding: object | None = None
 
     def run() -> None:
-        _run_backend_forward(
-            workspace=workspace,
+        nonlocal captured_binding
+        captured_binding = paged.bind(
+            scratch_plan,
+            scratch=scratch_storage,
             q=shared.q,
             k_cache=shared.k_cache,
             v_cache=shared.v_cache,
             output=output,
+            page_table=shared.capture_page_table,
+            cache_seqlens=replay_cache_seqlens,
+            cu_seqlens_q=shared.cu_seqlens_q,
+            active_total_q=shared.batch,
             k_descale=shared.k_descale,
             v_descale=shared.v_descale,
         )
+        paged.run(binding=captured_binding)
 
+    graph = _capture_graph(run, warmup=warmup)
+    if captured_binding is None:
+        raise RuntimeError("decode graph capture did not retain its production binding")
+    workspace = captured_binding.scratch
+    capture_plan_desc = _format_decode_graph_replay_plan_desc(workspace)
+    guarded_output.assert_fully_overwritten(backend="sparkinfer-capture")
     if shared.read_only_snapshot is not None:
+        _assert_read_only_inputs_unchanged(
+            shared.read_only_snapshot,
+            shared.read_only_inputs,
+        )
+        source_snapshot = _extend_read_only_input_snapshot(
+            shared.read_only_snapshot,
+            page_table=shared.capture_page_table,
+            cache_seqlens=replay_cache_seqlens,
+        )
+        source_inputs = {
+            **shared.read_only_inputs,
+            "page_table": shared.capture_page_table,
+            "cache_seqlens": replay_cache_seqlens,
+        }
         read_only_snapshot, read_only_inputs = _snapshot_backend_replay_inputs(
-            base_snapshot=shared.read_only_snapshot,
-            base_inputs=shared.read_only_inputs,
+            base_snapshot=source_snapshot,
+            base_inputs=source_inputs,
             workspace=workspace,
+            include_workspace_schedule=False,
+            include_workspace_runtime_metadata=False,
         )
     else:
         read_only_snapshot = None
         read_only_inputs = None
-    graph = _capture_graph(run, warmup=warmup)
-    guarded_output.assert_fully_overwritten(backend="sparkinfer-capture")
-    if read_only_snapshot is not None and read_only_inputs is not None:
-        _assert_read_only_inputs_unchanged(read_only_snapshot, read_only_inputs)
     return SparkinferDecodeGraphBucket(
         shared=shared,
+        scratch_plan=scratch_plan,
+        scratch_storage=scratch_storage,
+        binding=captured_binding,
         workspace=workspace,
         graph=graph,
         output=output,
         guarded_output=guarded_output,
-        capture_fixed_split_pages=capture_fixed_split_pages,
-        replay_fixed_split_pages=replay_fixed_split_pages,
-        graph_ctas_per_sm=graph_ctas_per_sm,
         current_page_table=shared.capture_page_table,
-        current_cache_seqlens=shared.capture_cache_seqlens,
+        current_cache_seqlens=replay_cache_seqlens,
         current_plan_desc=capture_plan_desc,
+        forward_traits_contract=_paged_forward_traits_contract(workspace.plan),
         read_only_snapshot=read_only_snapshot,
         read_only_inputs=read_only_inputs,
     )
@@ -2091,6 +2540,8 @@ def _capture_flashinfer_decode_graph_bucket(
 
 def _reference_output_from_snapshot(
     snapshot: _ReadOnlyInputSnapshot,
+    *,
+    window_left: int = -1,
 ) -> torch.Tensor:
     cloned = snapshot.clones
     ref_out, _ = paged_attention_reference(
@@ -2103,6 +2554,7 @@ def _reference_output_from_snapshot(
         k_descale=cloned.get("k_descale"),
         v_descale=cloned.get("v_descale"),
         causal=True,
+        window_left=window_left,
     )
     return ref_out
 
@@ -2140,9 +2592,13 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "head_dim": args.head_dim,
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
+            "kv_cache_layout": _kv_cache_layout_name(
+                combined_kv_cache=args.combined_kv_cache
+            ),
             "fixed_split_pages": args.fixed_split_pages,
             "capture_cache_seqlen": args.capture_cache_seqlen,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
+            "window_left": args.window_left,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
             "l2_flush": args.flush_l2,
@@ -2173,6 +2629,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             head_dim=args.head_dim,
             dtype=dtype,
             seed=1 + case_idx,
+            combined_kv_cache=args.combined_kv_cache,
         )
         k_descale = None
         v_descale = None
@@ -2185,6 +2642,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                     v_cache,
                     batch=case.batch,
                     kv_heads=args.kv_heads,
+                    combined_kv_cache=args.combined_kv_cache,
                 )
             )
         backend_capture = _capture_backend_graph(
@@ -2205,6 +2663,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             graph_ctas_per_sm=args.graph_ctas_per_sm
             if args.graph_ctas_per_sm > 0
             else None,
+            window_left=args.window_left,
             strict_check=args.check,
         )
         check_suffix = ""
@@ -2216,7 +2675,8 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 l2_flush=l2_flush,
             )
             reference_output = _reference_output_from_snapshot(
-                backend_capture.read_only_snapshot
+                backend_capture.read_only_snapshot,
+                window_left=args.window_left,
             )
             reference_max_abs, reference_rel_l2, reference_cos, nonzero = (
                 _reference_gate(
@@ -2260,12 +2720,14 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 "batch": case.batch,
                 "q_seqlen": case.q_seqlen,
                 "cache_seqlen": case.cache_seqlen,
+                "window_left": args.window_left,
                 "page_size": args.page_size,
                 "q_heads": args.q_heads,
                 "kv_heads": args.kv_heads,
                 "head_dim": args.head_dim,
                 "q_dtype": str(dtype),
                 "kv_dtype": str(kv_dtype),
+                "kv_cache_layout": _kv_cache_layout_contract(k_cache, v_cache),
                 "plan": backend_capture.plan_desc,
             },
             input_seed=1 + case_idx,
@@ -2306,6 +2768,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 v_scale=v_scale,
                 workspace_bytes=flashinfer_workspace_bytes,
                 warmup=args.warmup,
+                window_left=args.window_left,
             )
             flashinfer_output = flashinfer_capture.output
             if args.check:
@@ -2318,20 +2781,52 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                     read_only_inputs=backend_capture.read_only_inputs,
                     l2_flush=l2_flush,
                 )
-                fa2_max_abs = (
+                (
+                    fa2_ref_max_abs,
+                    fa2_ref_rel_l2,
+                    fa2_ref_cos,
+                    fa2_nonzero,
+                ) = _reference_gate(
+                    backend="flashinfer-fa2",
+                    output=flashinfer_output,
+                    reference=reference_output,
+                )
+                cross_max_abs = (
                     (backend_capture.output - flashinfer_output).abs().max().item()
                 )
-                fa2_cos = _cosine_similarity(
+                cross_rel_l2 = _relative_l2_error(
+                    backend_capture.output,
+                    flashinfer_output,
+                )
+                cross_cos = _cosine_similarity(
                     backend_capture.output,
                     flashinfer_output,
                 )
                 fa2_correctness = {
-                    "oracle": "sparkinfer-cross-check",
-                    "passed": math.isfinite(fa2_cos),
-                    "max_abs": fa2_max_abs,
-                    "cosine": fa2_cos,
+                    "oracle": "torch-reference",
+                    "passed": True,
+                    "finite": True,
+                    "nonzero": fa2_nonzero,
+                    "max_abs": fa2_ref_max_abs,
+                    "relative_l2": fa2_ref_rel_l2,
+                    "cosine": fa2_ref_cos,
+                    "allclose": True,
+                    "minimum_cosine": _REFERENCE_MINIMUM_COSINE,
+                    "maximum_relative_l2": _REFERENCE_MAXIMUM_RELATIVE_L2,
+                    "relative_tolerance": _REFERENCE_RELATIVE_TOLERANCE,
+                    "absolute_tolerance": _REFERENCE_ABSOLUTE_TOLERANCE,
+                    "sparkinfer_cross_max_abs": cross_max_abs,
+                    "sparkinfer_cross_relative_l2": cross_rel_l2,
+                    "sparkinfer_cross_cosine": cross_cos,
+                    "read_only_inputs": _read_only_input_provenance(
+                        backend_capture.read_only_snapshot
+                    ),
                 }
-                check_suffix += f" fa2_max_abs={fa2_max_abs:.5f} fa2_cos={fa2_cos:.8f}"
+                check_suffix += (
+                    f" fa2/ref_rel_l2={fa2_ref_rel_l2:.6f}"
+                    f" fa2/ref_cos={fa2_ref_cos:.8f}"
+                    f" sparkinfer/fa2_cos={cross_cos:.8f}"
+                )
             flashinfer_times_ms = _bench_graph(
                 flashinfer_capture.graph,
                 replays=args.replays,
@@ -2401,6 +2896,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "head_dim": args.head_dim,
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
+            "kv_cache_layout": _kv_cache_layout_name(
+                combined_kv_cache=args.combined_kv_cache
+            ),
             "fixed_split_pages": args.fixed_split_pages,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
             "replays": args.replays,
@@ -2435,35 +2933,13 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             kv_dtype=kv_dtype,
             seed=1 + bucket_idx,
             strict_check=args.check,
+            combined_kv_cache=args.combined_kv_cache,
         )
-        capture_fallback_error: Exception | None = None
-        try:
-            sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
-                shared=shared,
-                capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
-                replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
-                warmup=args.warmup,
-                graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
-            )
-        except Exception as exc:
-            if (
-                args.fixed_split_pages > 0
-                or bucket_policy.capture_fixed_split_pages is None
-            ):
-                raise
-            capture_fallback_error = exc
-            bucket_policy = replace(
-                bucket_policy,
-                capture_fixed_split_pages=None,
-                source=f"{bucket_policy.source}+capture-auto",
-            )
-            sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
-                shared=shared,
-                capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
-                replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
-                warmup=args.warmup,
-                graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
-            )
+        sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
+            shared=shared,
+            policy=bucket_policy,
+            warmup=args.warmup,
+        )
         print(
             f"decode-graph-bucket "
             f"bs={batch:2d} "
@@ -2471,17 +2947,12 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             f"capture_ctx={bucket_policy.capture_context_tokens:6d} "
             f"capture_kv={bucket_policy.effective_capture_tokens:6d} "
             f"capture_pages={bucket_policy.capture_page_count:4d} "
-            f"capture_split={str(bucket_policy.capture_fixed_split_pages):>4s} "
-            f"replay_split={str(bucket_policy.replay_fixed_split_pages):>4s} "
-            f"graph_ctas_per_sm={str(bucket_policy.graph_ctas_per_sm):>4s}"
+            f"graph_ctas_per_sm={bucket_policy.graph_ctas_per_sm:2d} "
+            f"qtiles_per_req={bucket_policy.query_tiles_per_request:2d} "
+            f"max_chunks_per_req={bucket_policy.max_chunks_per_request:4d} "
+            f"max_work_items={bucket_policy.max_work_items:5d} "
+            f"max_partial_rows={bucket_policy.max_partial_rows:5d}"
         )
-        if capture_fallback_error is not None:
-            print(
-                f"decode-graph-bucket "
-                f"bs={batch:2d} "
-                f"capture_split_fallback=None "
-                f"reason={type(capture_fallback_error).__name__}:{capture_fallback_error}"
-            )
         fa2_bucket = (
             _capture_flashinfer_decode_graph_bucket(
                 shared=shared,
@@ -2561,24 +3032,49 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         l2_flush=l2_flush,
                     )
                     flashinfer_output = fa2_bucket.output_view
-                    fa2_ref_rel_l2 = _relative_l2_error(flashinfer_output, ref_out)
-                    fa2_ref_cos = _cosine_similarity(flashinfer_output, ref_out)
+                    (
+                        fa2_ref_max_abs,
+                        fa2_ref_rel_l2,
+                        fa2_ref_cos,
+                        fa2_nonzero,
+                    ) = _reference_gate(
+                        backend="flashinfer-fa2",
+                        output=flashinfer_output,
+                        reference=ref_out,
+                    )
                     cross_rel_l2 = _relative_l2_error(
                         sparkinfer_bucket.output,
                         flashinfer_output,
+                    )
+                    cross_max_abs = (
+                        (sparkinfer_bucket.output - flashinfer_output)
+                        .abs()
+                        .max()
+                        .item()
                     )
                     cross_cos = _cosine_similarity(
                         sparkinfer_bucket.output,
                         flashinfer_output,
                     )
                     fa2_correctness = {
-                        "oracle": "torch-reference-and-sparkinfer-cross-check",
-                        "passed": math.isfinite(fa2_ref_cos)
-                        and math.isfinite(cross_cos),
-                        "reference_relative_l2": fa2_ref_rel_l2,
-                        "reference_cosine": fa2_ref_cos,
+                        "oracle": "torch-reference",
+                        "passed": True,
+                        "finite": True,
+                        "nonzero": fa2_nonzero,
+                        "max_abs": fa2_ref_max_abs,
+                        "relative_l2": fa2_ref_rel_l2,
+                        "cosine": fa2_ref_cos,
+                        "allclose": True,
+                        "minimum_cosine": _REFERENCE_MINIMUM_COSINE,
+                        "maximum_relative_l2": _REFERENCE_MAXIMUM_RELATIVE_L2,
+                        "relative_tolerance": _REFERENCE_RELATIVE_TOLERANCE,
+                        "absolute_tolerance": _REFERENCE_ABSOLUTE_TOLERANCE,
+                        "sparkinfer_cross_max_abs": cross_max_abs,
                         "sparkinfer_cross_relative_l2": cross_rel_l2,
                         "sparkinfer_cross_cosine": cross_cos,
+                        "read_only_inputs": _read_only_input_provenance(
+                            fa2_bucket.read_only_snapshot
+                        ),
                     }
                     check_suffix += (
                         f" | fa2/ref rel_l2={fa2_ref_rel_l2:.6f}"
@@ -2586,11 +3082,34 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         f" | sparkinfer/fa2 rel_l2={cross_rel_l2:.6f}"
                         f" cos={cross_cos:.8f}"
                     )
-            backend_times_ms = _bench_graph(
-                sparkinfer_bucket.graph,
-                replays=args.replays,
-                l2_flush=l2_flush,
+            flashinfer_times_ms: list[float] | None = None
+            timing_metadata: dict[str, object] | None = None
+            if fa2_bucket is not None:
+                (
+                    backend_times_ms,
+                    flashinfer_times_ms,
+                    timing_metadata,
+                ) = _bench_graph_pair_balanced(
+                    sparkinfer_bucket.graph,
+                    fa2_bucket.graph,
+                    replays=args.replays,
+                    l2_flush=l2_flush,
+                )
+            else:
+                backend_times_ms = _bench_graph(
+                    sparkinfer_bucket.graph,
+                    replays=args.replays,
+                    l2_flush=l2_flush,
+                )
+            timing_metadata = _decode_graph_timing_metadata(
+                timing_metadata,
+                include_flashinfer=fa2_bucket is not None,
             )
+            observed_replay_topology = _observe_decode_graph_replay_topology(
+                sparkinfer_bucket.workspace,
+                batch=case.batch,
+            )
+            replay_policy = timing_metadata["replay_policy"]
             sample_case = _case_contract(
                 {
                     "profile": args.profile,
@@ -2599,13 +3118,43 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     "context_tokens": case.context_tokens,
                     "effective_cache_tokens": case.effective_cache_tokens,
                     "capture_context_tokens": bucket_policy.capture_context_tokens,
+                    "capture_page_count": bucket_policy.capture_page_count,
+                    "graph_ctas_per_sm": bucket_policy.graph_ctas_per_sm,
+                    "query_tiles_per_request": (
+                        bucket_policy.query_tiles_per_request
+                    ),
+                    "architecture_max_chunks_per_request": (
+                        bucket_policy.architecture_max_chunks_per_request
+                    ),
+                    "max_chunks_per_request": (
+                        bucket_policy.max_chunks_per_request
+                    ),
+                    "max_work_items": bucket_policy.max_work_items,
+                    "max_partial_rows": bucket_policy.max_partial_rows,
+                    "worst_page_count": bucket_policy.worst_page_count,
                     "page_size": args.page_size,
                     "q_heads": args.q_heads,
                     "kv_heads": args.kv_heads,
                     "head_dim": args.head_dim,
                     "q_dtype": str(dtype),
                     "kv_dtype": str(kv_dtype),
+                    "kv_cache_layout": _kv_cache_layout_contract(
+                        shared.k_cache,
+                        shared.v_cache,
+                    ),
+                    "timing_method": (
+                        _PAIRED_AB_BA_TIMING_METHOD
+                        if fa2_bucket is not None
+                        else "single-backend-sequential"
+                    ),
+                    "replay_policy": replay_policy,
                     "plan": sparkinfer_bucket.current_plan_desc,
+                    "sparkinfer_forward_traits": (
+                        sparkinfer_bucket.forward_traits_contract
+                    ),
+                    "sparkinfer_observed_replay_topology": (
+                        observed_replay_topology
+                    ),
                 },
                 input_seed=1 + bucket_idx,
                 input_generator="decode-bucket-shared-inputs-v1",
@@ -2616,6 +3165,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 case=sample_case,
                 samples_ms=backend_times_ms,
                 correctness=sparkinfer_correctness,
+                timing=timing_metadata,
             )
             backend_metrics = CaseMetrics(
                 backend="sparkinfer",
@@ -2624,17 +3174,14 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
 
             flashinfer_metrics: CaseMetrics | None = None
             if fa2_bucket is not None:
-                flashinfer_times_ms = _bench_graph(
-                    fa2_bucket.graph,
-                    replays=args.replays,
-                    l2_flush=l2_flush,
-                )
+                assert flashinfer_times_ms is not None
                 _record_samples(
                     args.raw_samples_jsonl,
                     backend="flashinfer-fa2",
                     case=sample_case,
                     samples_ms=flashinfer_times_ms,
                     correctness=fa2_correctness,
+                    timing=timing_metadata,
                 )
                 flashinfer_metrics = CaseMetrics(
                     backend="flashinfer-fa2",
@@ -2649,6 +3196,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 f"kv={case.effective_cache_tokens:6d} "
                 f"cap={bucket_policy.capture_context_tokens:6d} "
                 f"{sparkinfer_bucket.current_plan_desc:>17s} "
+                f"observed={observed_replay_topology['kv_chunk_size_pages']:3d}p/"
+                f"{observed_replay_topology['useful_work_items']:3d}w/"
+                f"{observed_replay_topology['work_item_capacity']:3d}c "
                 f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us"
             )
             if flashinfer_metrics is not None:
@@ -2701,12 +3251,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--kv-dtype", choices=["same", "bf16", "fp16", "fp8_e4m3fn"], default="same"
     )
+    parser.add_argument(
+        "--combined-kv-cache",
+        action="store_true",
+        help=(
+            "benchmark K/V as strided views into one "
+            "[pages, 2, page_size, kv_heads, head_dim] allocation"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
     parser.add_argument("--fixed-split-pages", type=int, default=0)
     parser.add_argument("--capture-cache-seqlen", type=int, default=0)
     parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
+    parser.add_argument(
+        "--window-left",
+        type=int,
+        default=-1,
+        help="causal sliding-window size for legacy-matrix cases; -1 is full attention",
+    )
     parser.add_argument("--ci-level", type=float, default=0.95, help=argparse.SUPPRESS)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
@@ -2732,6 +3296,10 @@ def main(argv: list[str] | None = None) -> None:
     args.profile = _canonical_profile_name(args.profile)
 
     require_sm120()
+    if args.window_left < -1:
+        raise ValueError("--window-left must be -1 or a non-negative token count")
+    if args.mode != "legacy-matrix" and args.window_left != -1:
+        raise ValueError("--window-left is currently supported only in legacy-matrix mode")
     if args.replays < 100:
         raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
     _gqa_group_size(q_heads=args.q_heads, kv_heads=args.kv_heads)

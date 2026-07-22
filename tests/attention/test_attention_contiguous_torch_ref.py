@@ -549,6 +549,62 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
 
 
 @torch.inference_mode()
+def test_varlen_contiguous_attention_matches_laguna_gqa9_geometry() -> None:
+    device = _require_contiguous_backend()
+    from sparkinfer.attention._shared.contiguous import (
+        clear_attention_caches,
+        create_varlen_attention_plan,
+    )
+
+    clear_attention_caches()
+    lengths = (8,) * 8
+    q, k, v, cu_seqlens = _make_varlen_gqa_inputs(
+        lengths,
+        q_heads=36,
+        kv_heads=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=83,
+    )
+    window_size = (511, 511)
+    max_seqlen = max(lengths)
+
+    plan = create_varlen_attention_plan(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+        window_size=window_size,
+    )
+    out, _lse = _run_varlen_attention_with_plan(
+        plan,
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+        window_size=window_size,
+    )
+    torch.cuda.synchronize()
+
+    ref = _vision_torch_ref_attention(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        window_size=window_size,
+    )
+    assert (out - ref).abs().max().item() <= 0.035
+    assert _cosine_similarity(out, ref) >= 0.9998
+
+
+@torch.inference_mode()
 def test_varlen_contiguous_attention_matches_sglang_torch_ref_single_token_gqa_and_sinks() -> None:
     device = _require_contiguous_backend()
     from sparkinfer.attention._shared.contiguous import (

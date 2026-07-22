@@ -4,12 +4,40 @@ import torch
 
 import cutlass
 
-from sparkinfer.attention.paged._forward import _to_kernel_tensor, _torch_to_cutlass_dtype
+from sparkinfer.attention.paged._forward import (
+    _build_merge_kernel,
+    _to_kernel_tensor,
+    _torch_to_cutlass_dtype,
+)
 from sparkinfer.attention.paged.merge import PagedPersistentMergeKernel
 from sparkinfer._lib.compiler import compile as sparkinfer_compile
 from sparkinfer._lib.utils import current_cuda_stream
 
 from tests._reference.helpers import require_sparkinfer
+
+
+def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
+    b1 = _build_merge_kernel(
+        torch.bfloat16,
+        128,
+        1,
+        1,
+        True,
+        True,
+        False,
+    )
+    b2 = _build_merge_kernel(
+        torch.bfloat16,
+        128,
+        2,
+        1,
+        True,
+        True,
+        False,
+    )
+
+    assert b1.bdy == 4
+    assert b2.bdy == 3
 
 
 def _merge_reference_base2(

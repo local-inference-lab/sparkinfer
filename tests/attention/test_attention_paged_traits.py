@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from sparkinfer.attention.paged.planner import create_paged_plan
@@ -116,3 +118,87 @@ def test_paged_fp8_decode_traits_keep_minimax_head128_tile_within_page() -> None
 
     assert traits.num_mma_kv == 1
     assert traits.cta_tile_kv == 64
+
+
+def test_laguna_page128_split_graph_traits_consume_one_physical_page(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+    plan = SimpleNamespace(
+        mode="decode",
+        enable_cuda_graph=True,
+        split_kv=True,
+        msa_block_sparse=False,
+        page_size=128,
+        cta_tile_q=16,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        num_q_heads=36,
+        num_kv_heads=4,
+        gqa_group_size=9,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        device=torch.device("cuda", 0),
+    )
+
+    traits = select_paged_forward_traits_from_plan(plan)
+
+    assert traits.num_mma_kv == 2
+    assert traits.cta_tile_kv == 128
+    assert traits.shared_storage_bytes == 36864
+    # The canonical typed storage keeps its 1,024-byte TMA payload alignment:
+    # two 16-byte barrier arrays precede a 36,864-byte payload at offset 1,024.
+    assert traits.launch_smem_bytes == 37888
+    assert traits.num_ctas_per_sm == 2
+
+
+def test_laguna_page128_traits_reject_same_gqa_nonproduction_head_counts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+    for num_q_heads, num_kv_heads in ((18, 2), (72, 8)):
+        plan = SimpleNamespace(
+            mode="decode",
+            enable_cuda_graph=True,
+            split_kv=True,
+            msa_block_sparse=False,
+            page_size=128,
+            cta_tile_q=16,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            gqa_group_size=9,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            device=torch.device("cuda", 0),
+        )
+
+        traits = select_paged_forward_traits_from_plan(plan)
+
+        assert traits.num_mma_kv == 1
+        assert traits.cta_tile_kv == 64

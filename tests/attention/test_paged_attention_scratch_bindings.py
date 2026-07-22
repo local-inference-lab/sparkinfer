@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,6 +44,35 @@ def _runtime_tensors():
     cache_seqlens = torch.ones((2,), dtype=torch.int32)
     cu_seqlens_q = torch.arange(3, dtype=torch.int32)
     return q, k_cache, v_cache, output, page_table, cache_seqlens, cu_seqlens_q
+
+
+def _prepared_cpu_decode_graph_scratch() -> scratch_api.SPARKINFERPagedAttentionScratch:
+    return scratch_api.SPARKINFERPagedAttentionScratch(
+        shared_scratch=torch.empty(1, dtype=torch.uint8),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        mode="decode",
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim_qk=16,
+        head_dim_vo=16,
+        page_size=4,
+        max_total_q=2,
+        max_batch=2,
+        max_page_table_width=3,
+        max_work_items=4,
+        max_partial_rows=4,
+        num_cache_pages=8,
+        use_cuda_graph=True,
+        _plan=SimpleNamespace(
+            page_table_shape=(2, 3),
+            total_q=2,
+            window_left=-1,
+        ),
+        _plan_metadata_cache=object(),
+        _decode_graph_chunk_pages_lut=torch.ones(4, dtype=torch.int32),
+    )
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -160,6 +191,158 @@ def test_paged_attention_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.caps.max_total_q == 2
+
+
+def test_decode_graph_scratch_plan_requires_exact_batch_bucket() -> None:
+    plan = plan_paged_attention_scratch(replace(_caps(), use_cuda_graph=True))
+
+    with pytest.raises(ValueError, match="must exactly match its scratch bucket"):
+        plan.prepare_decode_graph_replay_state(
+            batch=1,
+            total_q_capacity=1,
+            max_page_table_width=3,
+            max_cache_page_count=3,
+        )
+
+
+def test_decode_graph_scratch_plan_requires_one_query_per_request() -> None:
+    plan = plan_paged_attention_scratch(replace(_caps(), use_cuda_graph=True))
+
+    with pytest.raises(ValueError, match="must cover one query per request"):
+        plan.prepare_decode_graph_replay_state(
+            batch=2,
+            total_q_capacity=1,
+            max_page_table_width=3,
+            max_cache_page_count=3,
+        )
+
+
+def test_decode_graph_scratch_plan_rejects_preparation_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = plan_paged_attention_scratch(replace(_caps(), use_cuda_graph=True))
+    object.__setattr__(plan.caps, "device", torch.device("cuda"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        plan.prepare_decode_graph_replay_state(
+            batch=2,
+            total_q_capacity=2,
+            max_page_table_width=3,
+            max_cache_page_count=3,
+        )
+
+
+@pytest.mark.parametrize("invalid_kind", ["dtype", "contiguity"])
+def test_prepared_decode_graph_scratch_requires_fixed_metadata_contract(
+    invalid_kind: str,
+) -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+    page_table = torch.empty((2, 3), dtype=torch.int32)
+    if invalid_kind == "dtype":
+        page_table = page_table.to(torch.int64)
+        expected = "torch.int32"
+    else:
+        page_table = torch.empty((2, 6), dtype=torch.int32)[:, ::2]
+        assert not page_table.is_contiguous()
+        expected = "contiguous"
+
+    with pytest.raises((TypeError, ValueError), match=expected):
+        scratch.prepare(
+            page_table,
+            torch.empty((2,), dtype=torch.int32),
+            torch.empty((3,), dtype=torch.int32),
+            active_total_q=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("page_table_shape", "cache_shape", "cu_shape", "active_total_q", "match"),
+    [
+        ((1, 3), (2,), (3,), 2, "page_table must exactly match"),
+        ((2, 3), (1,), (3,), 2, "cache_seqlens must exactly match"),
+        ((2, 3), (2,), (2,), 2, "cu_seqlens_q must exactly match"),
+        ((2, 3), (2,), (3,), 1, "active_total_q must exactly match"),
+    ],
+)
+def test_prepared_decode_graph_scratch_rejects_partial_runtime_bucket(
+    page_table_shape: tuple[int, int],
+    cache_shape: tuple[int],
+    cu_shape: tuple[int],
+    active_total_q: int,
+    match: str,
+) -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+
+    with pytest.raises(ValueError, match=match):
+        scratch.prepare(
+            torch.empty(page_table_shape, dtype=torch.int32),
+            torch.empty(cache_shape, dtype=torch.int32),
+            torch.empty(cu_shape, dtype=torch.int32),
+            active_total_q=active_total_q,
+        )
+
+
+@pytest.mark.parametrize("short_tensor", ["q", "output", "active_total_q"])
+def test_prepared_decode_graph_binding_rejects_partial_total_q(
+    short_tensor: str,
+) -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+    q, k_cache, v_cache, output, *_ = _runtime_tensors()
+    if short_tensor == "q":
+        q = q[:1]
+    elif short_tensor == "output":
+        output = output[:1]
+
+    with pytest.raises(ValueError, match="total_q must exactly match"):
+        scratch.bind(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            active_total_q=1 if short_tensor == "active_total_q" else None,
+        )
+
+
+def test_decode_graph_capture_prepare_and_forward_insert_one_updater(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+    calls = 0
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        scratch_api.SPARKINFERPagedAttentionScratch,
+        "_bind_runtime_metadata",
+        lambda self, page_table, cache_seqlens, cu_seqlens_q: None,
+    )
+    monkeypatch.setattr(
+        scratch_api.SPARKINFERPagedAttentionScratch,
+        "_copy_cached_plan_metadata",
+        lambda self, cache: None,
+    )
+
+    def update(self: scratch_api.SPARKINFERPagedAttentionScratch) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(
+        scratch_api.SPARKINFERPagedAttentionScratch,
+        "update_decode_graph_replay_metadata_from_runtime_cache_seqlens",
+        update,
+    )
+
+    scratch.prepare(
+        torch.empty((2, 3), dtype=torch.int32),
+        torch.empty((2,), dtype=torch.int32),
+        torch.empty((3,), dtype=torch.int32),
+        active_total_q=2,
+    )
+    assert calls == 0
+
+    scratch.device = torch.device("cuda")
+    paged_api._capture_decode_graph_replay_metadata_if_needed(scratch)
+    assert calls == 1
 
 
 def test_paged_attention_scratch_bind_returns_common_binding_type(
@@ -753,6 +936,14 @@ def _run_mimo_v25_fp8_decode_graph_case(
     with torch.cuda.graph(graph):
         binding = bind()
         binding.run()
+    with pytest.raises(RuntimeError, match="cannot replace decode graph replay state"):
+        plan.prepare_decode_graph_replay_state(
+            batch=batch,
+            total_q_capacity=batch,
+            max_page_table_width=int(page_table.shape[1]),
+            max_cache_page_count=int(page_table.shape[1]),
+            window_left=window_left,
+        )
     graph.replay()
     torch.cuda.synchronize()
 
@@ -841,6 +1032,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
             max_page_table_width=int(page_table.shape[1]),
             max_cache_page_count=int(page_table.shape[1]),
             window_left=-1,
+            force_split_kv=False,
         )
         (spec,) = plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)

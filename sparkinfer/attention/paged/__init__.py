@@ -40,6 +40,12 @@ META = OpMeta(
         "Binding",
         "Workspace",
         "Budget",
+        "DecodeGraphCapacity",
+        "VerifyGraphCapacity",
+        "DecodeGraphScratchEnvelope",
+        "decode_graph_capacity",
+        "verify_graph_capacity",
+        "decode_graph_scratch_envelope",
         "plan",
         "bind",
         "run",
@@ -61,9 +67,9 @@ META = OpMeta(
     test_path="tests/attention/test_paged.py",
     since="0.7.0",
     notes=(
-        "Decode CUDA-graph replay is implemented but currently untested "
-        "in-tree (sparkinfer's replay tests are stale against the current planner); "
-        "graph coverage comes from compressed_mla until they are refreshed."
+        "Decode CUDA-graph replay uses fixed preplanned capacity and rebuilds "
+        "live schedules on-device; in-tree tests cover split, direct, MSA, "
+        "multi-query-tile, shared-scratch, and high-page-id replay."
     ),
 )
 
@@ -72,10 +78,16 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Binding,
         Budget,
         Caps,
+        DecodeGraphCapacity,
+        VerifyGraphCapacity,
+        DecodeGraphScratchEnvelope,
         Plan,
         Workspace,
         bind,
         clear_caches,
+        decode_graph_capacity,
+        verify_graph_capacity,
+        decode_graph_scratch_envelope,
         infer_mode,
         is_supported,
         plan,

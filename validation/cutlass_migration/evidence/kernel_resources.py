@@ -45,7 +45,15 @@ _TEXT_KERNEL_SECTION_RE = re.compile(
     re.MULTILINE,
 )
 _CACHE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
-_MANIFEST_SCHEMA = "sparkinfer.cute.compile_manifest.v3"
+_MANIFEST_SCHEMAS = frozenset(
+    {
+        # Current compiler namespace.
+        "sparkinfer._lib.compile_manifest.v3",
+        # Preserve auditability of manifests emitted before the compiler moved
+        # from ``sparkinfer.cute`` to ``sparkinfer._lib``.
+        "sparkinfer.cute.compile_manifest.v3",
+    }
+)
 _RESOURCE_REPORT_SCHEMA = "sparkinfer.cute.kernel_resources.v4"
 _CONTRACT_METADATA_SCHEMA = "sparkinfer.cute.resource_row_contract.v2"
 _SPECIALIZATION_CONTRACT_FIELDS = [
@@ -435,7 +443,7 @@ def _manifest_integrity_status(
     filename_key: str,
     object_bytes: bytes,
 ) -> str:
-    if raw.get("schema") != _MANIFEST_SCHEMA:
+    if raw.get("schema") not in _MANIFEST_SCHEMAS:
         return "unsupported-schema"
     cache_key = raw.get("cache_key")
     if not isinstance(cache_key, str) or not _CACHE_KEY_RE.fullmatch(cache_key):

@@ -108,6 +108,7 @@ def select_paged_forward_traits(
     kv_dtype: torch.dtype,
     o_dtype: torch.dtype | None = None,
     device: torch.device | int | None = None,
+    exact_num_mma_kv: int | None = None,
 ) -> PagedForwardTraits:
     if head_dim_qk % 16 != 0 or head_dim_vo % 16 != 0:
         raise ValueError("head_dim_qk and head_dim_vo must be multiples of 16")
@@ -222,11 +223,29 @@ def select_paged_forward_traits(
     # Choose the MMA tile and residency together from exact CUTLASS typed
     # allocations. This preserves the occupancy-first policy without deriving
     # a per-CTA budget from assumed residency and feeding it back into the tile.
-    # The primary cta_q=16 backend is the exact-plane 64-row decode family; a
-    # larger KV tile disables that ingress path, so it is not a valid candidate.
-    max_candidate_mma_kv = 1 if cta_tile_q == 16 else max_num_mma_kv_reg
+    # The general cta_q=16 backend is the exact-plane 64-row decode family.  An
+    # exact graph specialization may request a wider tile explicitly; keeping
+    # that choice out of the generic candidate sweep prevents unrelated decode
+    # families from silently changing their register and shared-memory shape.
+    if exact_num_mma_kv is not None:
+        exact_num_mma_kv = int(exact_num_mma_kv)
+        if exact_num_mma_kv <= 0 or exact_num_mma_kv > max_num_mma_kv_reg:
+            raise ValueError(
+                f"exact_num_mma_kv={exact_num_mma_kv} is outside the supported "
+                f"range [1, {max_num_mma_kv_reg}]"
+            )
+    max_candidate_mma_kv = (
+        exact_num_mma_kv
+        if exact_num_mma_kv is not None
+        else (1 if cta_tile_q == 16 else max_num_mma_kv_reg)
+    )
     candidates: list[tuple[int, int, int, int, int]] = []
     for candidate_mma_kv in range(1, max_candidate_mma_kv + 1):
+        if (
+            exact_num_mma_kv is not None
+            and candidate_mma_kv != exact_num_mma_kv
+        ):
+            continue
         if _paged_is_invalid(
             num_mma_q=num_mma_q,
             num_mma_kv=candidate_mma_kv,
@@ -312,12 +331,41 @@ def select_paged_forward_traits_from_plan(
     *,
     o_dtype: torch.dtype | None = None,
 ) -> PagedForwardTraits:
+    resolved_o_dtype = plan.dtype if o_dtype is None else o_dtype
+    device_capability = tuple(torch.cuda.get_device_capability(plan.device))
+    # Laguna's production decode graph uses one BF16 query row, 36 query heads,
+    # four FP8 KV heads, and physical 128-token pages.  Select exactly two KV
+    # MMAs per KV warp for that static family so each CTA consumes one physical
+    # page per loop iteration.  This is plan/capacity metadata only: no live
+    # sequence length participates in the choice.
+    exact_num_mma_kv = (
+        2
+        if (
+            plan.mode == "decode"
+            and device_capability == (12, 0)
+            and plan.enable_cuda_graph
+            and plan.split_kv
+            and not plan.msa_block_sparse
+            and plan.page_size == 128
+            and plan.cta_tile_q == 16
+            and plan.head_dim_qk == 128
+            and plan.head_dim_vo == 128
+            and plan.num_q_heads == 36
+            and plan.num_kv_heads == 4
+            and plan.gqa_group_size == 9
+            and plan.dtype == torch.bfloat16
+            and plan.kv_dtype == _FP8_KV_DTYPE
+            and resolved_o_dtype == torch.bfloat16
+        )
+        else None
+    )
     return select_paged_forward_traits(
         cta_tile_q=plan.cta_tile_q,
         head_dim_qk=plan.head_dim_qk,
         head_dim_vo=plan.head_dim_vo,
         q_dtype=plan.dtype,
         kv_dtype=plan.kv_dtype,
-        o_dtype=o_dtype,
+        o_dtype=resolved_o_dtype,
         device=plan.device,
+        exact_num_mma_kv=exact_num_mma_kv,
     )

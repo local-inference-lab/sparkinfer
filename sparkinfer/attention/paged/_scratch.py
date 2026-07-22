@@ -1,9 +1,11 @@
 """Caller-owned scratch plans for the primary paged-attention backend.
 
 Eager PLAN -> BIND -> KERNEL. The scratch plan owns only shape/capacity policy
-and tiny shape-only planning tensors. Each bind maps caller-owned uint8 scratch
-into plain tensor views, prepares/copies metadata into those views, and returns
-a binding consumed by ``sparkinfer.attention.paged._forward.paged_attention_forward``.
+and the fixed-address metadata needed by decode CUDA graphs. Each bind maps
+caller-owned uint8 scratch into plain tensor views and returns a binding consumed
+by ``sparkinfer.attention.paged._forward.paged_attention_forward``. Decode graph
+plans bind their persistent schedule metadata directly instead of copying it
+through shared numerical scratch on every replay.
 """
 
 from __future__ import annotations
@@ -19,11 +21,9 @@ from torch.profiler import record_function
 from sparkinfer.attention.paged.planner import (
     PagedPlan,
     PagedPlanBudget,
-    build_decode_chunk_pages_lut,
     create_paged_plan,
-    decode_graph_max_chunks_per_request_budget,
     infer_paged_mode,
-    resolve_decode_graph_ctas_per_sm,
+    plan_decode_graph_capacity,
 )
 from sparkinfer._lib.scratch import (
     ScratchBufferSpec,
@@ -272,6 +272,122 @@ def _paged_attention_scratch_layout(
 
 
 @dataclass(frozen=True)
+class SPARKINFERPagedDecodeGraphScratchEnvelope:
+    """Exact shared-scratch reservation over a range of decode buckets.
+
+    ``witness_batch`` is the smallest batch whose exact, policy-selected layout
+    reaches ``nbytes``.  Decode chunk policy is batch dependent, so the largest
+    batch is not necessarily the largest layout.
+    """
+
+    nbytes: int
+    witness_batch: int
+
+
+def plan_decode_graph_scratch_envelope(
+    *,
+    device: torch.device | str,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    max_batch: int,
+    max_page_table_width: int,
+    max_cache_page_count: int | None = None,
+    window_left: int = -1,
+    graph_ctas_per_sm: int | None = None,
+    max_work_items: int | None = None,
+    max_partial_rows: int | None = None,
+    force_split_kv: bool | None = None,
+    copy_runtime_metadata: bool = True,
+) -> SPARKINFERPagedDecodeGraphScratchEnvelope:
+    """Return the exact maximum scratch layout for decode batches ``1..N``.
+
+    This is a host-side serving-capacity query.  It evaluates every valid batch
+    bucket because decode CTA/chunk policy is deliberately batch dependent and
+    has no monotonic-layout guarantee.  No live sequence length participates in
+    the decision; replay still selects the active schedule inside the kernels.
+
+    Optional work/partial limits are applied independently to every bucket by
+    :func:`plan_decode_graph_capacity`, keeping policy in Sparkinfer while an
+    integration supplies only fixed storage limits.
+    """
+
+    device = _canonical_device(device)
+    max_batch = int(max_batch)
+    max_page_table_width = int(max_page_table_width)
+    if max_batch <= 0:
+        raise ValueError("max_batch must be positive")
+    if max_page_table_width <= 0:
+        raise ValueError("max_page_table_width must be positive")
+    if max_cache_page_count is None:
+        max_cache_page_count = max_page_table_width
+    else:
+        max_cache_page_count = int(max_cache_page_count)
+    if max_cache_page_count <= 0:
+        raise ValueError("max_cache_page_count must be positive")
+    if max_cache_page_count > max_page_table_width:
+        raise ValueError(
+            "max_cache_page_count cannot exceed max_page_table_width, got "
+            f"{max_cache_page_count} > {max_page_table_width}"
+        )
+
+    envelope_nbytes = -1
+    witness_batch = 1
+    for batch in range(1, max_batch + 1):
+        capacity = plan_decode_graph_capacity(
+            device=device,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            batch=batch,
+            max_cache_page_count=max_cache_page_count,
+            window_left=window_left,
+            graph_ctas_per_sm=graph_ctas_per_sm,
+            max_work_items=max_work_items,
+            max_partial_rows=max_partial_rows,
+            force_split_kv=force_split_kv,
+        )
+        bucket_caps = SPARKINFERPagedAttentionScratchCaps(
+            device=device,
+            mode="decode",
+            dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=max_page_table_width,
+            max_work_items=capacity.max_work_items,
+            max_partial_rows=capacity.max_partial_rows,
+            # Cache pool cardinality does not occupy scratch.  Keep this
+            # shape-only field minimal so the capacity query allocates nothing.
+            num_cache_pages=1,
+            use_cuda_graph=True,
+            copy_runtime_metadata=copy_runtime_metadata,
+        )
+        bucket_nbytes = int(_paged_attention_scratch_layout(bucket_caps).nbytes)
+        if bucket_nbytes > envelope_nbytes:
+            envelope_nbytes = bucket_nbytes
+            witness_batch = batch
+
+    return SPARKINFERPagedDecodeGraphScratchEnvelope(
+        nbytes=int(envelope_nbytes),
+        witness_batch=int(witness_batch),
+    )
+
+
+@dataclass(frozen=True)
 class _SPARKINFERPagedPlanMetadataCache:
     request_indices: torch.Tensor
     qo_tile_indices: torch.Tensor
@@ -280,6 +396,8 @@ class _SPARKINFERPagedPlanMetadataCache:
     o_indptr: torch.Tensor
     block_valid_mask: torch.Tensor
     kv_window_start_tokens: torch.Tensor
+    kv_chunk_size_ptr: torch.Tensor
+    total_num_rows_ptr: torch.Tensor
     kv_chunk_size: int
     total_q: int
 
@@ -299,6 +417,12 @@ def _make_plan_metadata_cache(
         kv_window_start_tokens=_copy_int_metadata(
             plan.kv_window_start_tokens,
             device=device,
+        ),
+        kv_chunk_size_ptr=torch.full(
+            (1,), int(plan.kv_chunk_size), dtype=torch.int32, device=device
+        ),
+        total_num_rows_ptr=torch.full(
+            (1,), int(plan.total_q), dtype=torch.int32, device=device
         ),
         kv_chunk_size=int(plan.kv_chunk_size),
         total_q=int(plan.total_q),
@@ -358,6 +482,17 @@ class SPARKINFERPagedAttentionScratch:
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
     _decode_graph_metadata_captured_in_graph: bool = False
+    _uses_plan_owned_decode_graph_metadata: bool = False
+    # Keep the public scratch Plan reachable from a materialized binding.  A
+    # binding may be created before CUDA graph capture, so ``bind()`` cannot be
+    # the only place that records that the Plan-owned replay addresses escaped
+    # into a graph.  ``paged_attention_forward`` follows this reference when a
+    # pre-bound ``binding.run()`` is captured.
+    _owner_scratch_plan: SPARKINFERPagedAttentionScratchPlan | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _prefill_graph_max_q_tiles_per_req: int | None = None
     _prefill_graph_max_chunks_per_q_tile: int | None = None
     _prefill_graph_max_q_rows_per_req: int | None = None
@@ -456,6 +591,38 @@ class SPARKINFERPagedAttentionScratch:
                     "window_left must be -1 for full attention or a "
                     "non-negative token count"
                 )
+            if (
+                self.use_cuda_graph
+                and self.mode == "decode"
+                and self._decode_graph_chunk_pages_lut is not None
+                and self._plan is not None
+            ):
+                self._validate_decode_graph_runtime_contract(
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    active_total_q=active_total_q,
+                )
+            if (
+                self.use_cuda_graph
+                and self.mode == "verify"
+                and self._plan is not None
+            ):
+                if int(window_left) != int(self._plan.window_left):
+                    raise ValueError(
+                        "verifier graph replay was prepared with "
+                        f"window_left={self._plan.window_left}, got "
+                        f"window_left={int(window_left)}"
+                    )
+                if self._plan_metadata_cache is None:
+                    raise RuntimeError(
+                        "verifier graph replay is missing cached plan metadata"
+                    )
+                self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+                self._copy_cached_plan_metadata(self._plan_metadata_cache)
+                self._update_prefill_graph_replay_metadata_from_runtime()
+                return self
+
             if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
                 if self._plan is None:
                     raise RuntimeError(
@@ -474,12 +641,6 @@ class SPARKINFERPagedAttentionScratch:
                     )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 self._copy_cached_plan_metadata(self._plan_metadata_cache)
-                if (
-                    self.mode == "decode"
-                    and self._decode_graph_chunk_pages_lut is not None
-                ):
-                    self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
-                    self._decode_graph_metadata_captured_in_graph = True
                 return self
 
             if (
@@ -500,10 +661,7 @@ class SPARKINFERPagedAttentionScratch:
                         "graph-mode paged scratch is missing cached plan metadata"
                     )
                 self._copy_cached_plan_metadata(self._plan_metadata_cache)
-                if not self._decode_graph_metadata_captured_in_graph:
-                    self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
-                    if torch.cuda.is_current_stream_capturing():
-                        self._decode_graph_metadata_captured_in_graph = True
+                self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
                 return self
 
             if active_total_q is None:
@@ -691,6 +849,54 @@ class SPARKINFERPagedAttentionScratch:
                 f"scratch capacity {self.max_batch + 1}"
             )
 
+    def _validate_decode_graph_runtime_contract(
+        self,
+        *,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        active_total_q: int | None,
+    ) -> None:
+        """Require the exact static decode bucket installed before capture."""
+        if self._plan is None:
+            raise RuntimeError("decode graph scratch has not been prepared")
+        metadata = (page_table, cache_seqlens, cu_seqlens_q)
+        if any(tensor.device != self.device for tensor in metadata):
+            raise ValueError("decode graph metadata must stay on the scratch device")
+        if any(tensor.dtype != torch.int32 for tensor in metadata):
+            raise TypeError("decode graph metadata must use torch.int32")
+        if any(not tensor.is_contiguous() for tensor in metadata):
+            raise ValueError("decode graph metadata must be contiguous")
+        expected_batch = int(self._plan.page_table_shape[0])
+        expected_width = int(self._plan.page_table_shape[1])
+        expected_total_q = int(self._plan.total_q)
+        if tuple(page_table.shape) != (expected_batch, expected_width):
+            raise ValueError(
+                "decode graph page_table must exactly match the prepared bucket: "
+                f"got {tuple(page_table.shape)}, expected "
+                f"({expected_batch}, {expected_width})"
+            )
+        if tuple(cache_seqlens.shape) != (expected_batch,):
+            raise ValueError(
+                "decode graph cache_seqlens must exactly match the prepared batch: "
+                f"got {tuple(cache_seqlens.shape)}, expected ({expected_batch},)"
+            )
+        if tuple(cu_seqlens_q.shape) != (expected_batch + 1,):
+            raise ValueError(
+                "decode graph cu_seqlens_q must exactly match the prepared batch: "
+                f"got {tuple(cu_seqlens_q.shape)}, expected "
+                f"({expected_batch + 1},)"
+            )
+        if expected_total_q != expected_batch:
+            raise RuntimeError(
+                "prepared decode graph bucket must contain one query per request"
+            )
+        if active_total_q is not None and int(active_total_q) != expected_total_q:
+            raise ValueError(
+                "decode graph active_total_q must exactly match the prepared bucket: "
+                f"got {int(active_total_q)}, expected {expected_total_q}"
+            )
+
     def _copy_runtime_metadata(
         self,
         page_table: torch.Tensor,
@@ -747,6 +953,33 @@ class SPARKINFERPagedAttentionScratch:
         assert self.total_num_rows_ptr is not None
         assert self.block_valid_mask is not None
 
+        if self._uses_plan_owned_decode_graph_metadata:
+            # Decode CUDA graphs use the tensors in ``cache`` as their live
+            # replay state.  They are allocated during Plan preparation, have
+            # fixed addresses for the Plan lifetime, and are private to the
+            # Plan even when numerical scratch is shared across layers.  A
+            # copy here would both add graph nodes and, for a live cache, risk
+            # zeroing a tensor before copying it to itself.
+            aliases = (
+                (self.request_indices, cache.request_indices),
+                (self.qo_tile_indices, cache.qo_tile_indices),
+                (self.kv_tile_indices, cache.kv_tile_indices),
+                (self.merge_indptr, cache.merge_indptr),
+                (self.o_indptr, cache.o_indptr),
+                (self.block_valid_mask, cache.block_valid_mask),
+                (self.kv_window_start_tokens, cache.kv_window_start_tokens),
+                (self.kv_chunk_size_ptr, cache.kv_chunk_size_ptr),
+                (self.total_num_rows_ptr, cache.total_num_rows_ptr),
+            )
+            if any(
+                int(bound.data_ptr()) != int(persistent.data_ptr())
+                for bound, persistent in aliases
+            ):
+                raise RuntimeError(
+                    "decode graph replay metadata must alias its owning Plan state"
+                )
+            return
+
         if self._decode_graph_chunk_pages_lut is None:
             self._use_regular_decode_graph_replay = False
         self._prefill_graph_max_q_tiles_per_req = None
@@ -786,6 +1019,98 @@ class SPARKINFERPagedAttentionScratch:
         self._copy_cached_plan_metadata(cache)
         return cache
 
+    def _cache_prefill_graph_replay_shape_from_plan(self) -> None:
+        if self._plan is None:
+            raise RuntimeError("prefill graph replay plan has not been prepared")
+        if self.mode not in ("extend", "verify") or not self.use_cuda_graph:
+            raise RuntimeError(
+                "prefill graph replay shape is only valid for graph extend/verify"
+            )
+        active_work_items = [
+            (request_idx, q_tile_idx, kv_tile_idx)
+            for request_idx, q_tile_idx, kv_tile_idx, valid in zip(
+                self._plan.request_indices,
+                self._plan.qo_tile_indices,
+                self._plan.kv_tile_indices,
+                self._plan.block_valid_mask,
+                strict=False,
+            )
+            if valid
+        ]
+        if not active_work_items:
+            raise RuntimeError("prefill graph replay plan contains no active work")
+        max_q_tiles_per_req = (
+            max(q_tile_idx for _, q_tile_idx, _ in active_work_items) + 1
+        )
+        max_chunks_per_q_tile = (
+            max(kv_tile_idx for _, _, kv_tile_idx in active_work_items) + 1
+        )
+        max_q_rows_per_req = max(
+            1,
+            (
+                int(max_q_tiles_per_req) * int(self._plan.cta_tile_q)
+                + int(self._plan.gqa_group_size)
+                - 1
+            )
+            // int(self._plan.gqa_group_size),
+        )
+        self._prefill_graph_max_q_tiles_per_req = int(max_q_tiles_per_req)
+        self._prefill_graph_max_chunks_per_q_tile = int(max_chunks_per_q_tile)
+        self._prefill_graph_max_q_rows_per_req = int(max_q_rows_per_req)
+
+    def _update_prefill_graph_replay_metadata_from_runtime(self) -> None:
+        if self._plan is None:
+            raise RuntimeError("prefill graph scratch has not been prepared")
+        if self.cache_seqlens is None or self.cu_seqlens_q is None:
+            raise RuntimeError("prefill graph scratch is missing sequence metadata")
+        if self.request_indices is None:
+            raise RuntimeError("prefill graph scratch is missing request indices")
+        if self.qo_tile_indices is None or self.kv_tile_indices is None:
+            raise RuntimeError("prefill graph scratch is missing tile indices")
+        if self.merge_indptr is None or self.o_indptr is None:
+            raise RuntimeError("prefill graph scratch is missing indptr buffers")
+        if self.kv_chunk_size_ptr is None:
+            raise RuntimeError("prefill graph scratch is missing kv_chunk_size_ptr")
+        if self.total_num_rows_ptr is None:
+            raise RuntimeError("prefill graph scratch is missing total_num_rows_ptr")
+        if self.block_valid_mask is None:
+            raise RuntimeError("prefill graph scratch is missing block_valid_mask")
+        if self.kv_window_start_tokens is None:
+            raise RuntimeError(
+                "prefill graph scratch is missing kv_window_start_tokens"
+            )
+        if (
+            self._prefill_graph_max_q_tiles_per_req is None
+            or self._prefill_graph_max_chunks_per_q_tile is None
+            or self._prefill_graph_max_q_rows_per_req is None
+        ):
+            self._cache_prefill_graph_replay_shape_from_plan()
+
+        from .graph_replay import update_prefill_graph_chunk_metadata
+
+        update_prefill_graph_chunk_metadata(
+            cache_seqlens=self.cache_seqlens,
+            cu_seqlens_q=self.cu_seqlens_q,
+            request_indices=self.request_indices,
+            qo_tile_indices=self.qo_tile_indices,
+            kv_tile_indices=self.kv_tile_indices,
+            merge_indptr=self.merge_indptr,
+            o_indptr=self.o_indptr,
+            block_valid_mask=self.block_valid_mask,
+            kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+            kv_window_start_tokens=self.kv_window_start_tokens,
+            total_num_rows_ptr=self.total_num_rows_ptr,
+            batch=int(self._plan.page_table_shape[0]),
+            max_q_tiles_per_req=int(self._prefill_graph_max_q_tiles_per_req),
+            max_chunks_per_q_tile=int(self._prefill_graph_max_chunks_per_q_tile),
+            max_q_rows_per_req=int(self._prefill_graph_max_q_rows_per_req),
+            cta_tile_q=int(self._plan.cta_tile_q),
+            gqa_group_size=int(self._plan.gqa_group_size),
+            page_size=int(self.page_size),
+            split_kv=bool(self._plan.split_kv),
+            window_left=int(self._plan.window_left),
+        )
+
     def _validate_decode_graph_replay_capacity(self, *, batch: int) -> None:
         if self._decode_graph_max_chunks_per_req is None:
             raise RuntimeError("decode graph replay policy has not been prepared")
@@ -794,12 +1119,20 @@ class SPARKINFERPagedAttentionScratch:
         if batch <= 0:
             raise ValueError("decode graph replay requires bs > 0")
         work_items_capacity = int(self.request_indices.shape[0])
-        if work_items_capacity % batch != 0:
+        max_q_tiles_per_req = 1
+        if self._plan is not None and self._plan.split_kv:
+            max_q_tiles_per_req = max(
+                (int(self._plan.gqa_group_size) + int(self._plan.cta_tile_q) - 1)
+                // int(self._plan.cta_tile_q),
+                1,
+            )
+        work_items_per_batch = batch * max_q_tiles_per_req
+        if work_items_capacity % work_items_per_batch != 0:
             raise RuntimeError(
                 "decode graph scratch request_indices shape is incompatible "
-                "with the batch bucket"
+                "with the batch/query-tile bucket"
             )
-        max_chunks_per_req = work_items_capacity // batch
+        max_chunks_per_req = work_items_capacity // work_items_per_batch
         if max_chunks_per_req <= 0:
             raise RuntimeError(
                 "decode graph scratch must allocate at least one chunk per request"
@@ -922,6 +1255,15 @@ class SPARKINFERPagedAttentionScratch:
                 update_decode_graph_chunk_metadata,
             )
 
+            max_q_tiles_per_req = max(
+                (
+                    int(self._plan.gqa_group_size)
+                    + int(self._plan.cta_tile_q)
+                    - 1
+                )
+                // int(self._plan.cta_tile_q),
+                1,
+            )
             update_decode_graph_chunk_metadata(
                 cache_seqlens=self.cache_seqlens,
                 request_indices=self.request_indices,
@@ -936,6 +1278,10 @@ class SPARKINFERPagedAttentionScratch:
                 page_size=self.page_size,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
+                # Multi-qtile decode needs one work item for every
+                # (query tile, KV chunk) pair.  The prepared device LUT is
+                # already clamped to this fixed work capacity.
+                max_q_tiles_per_req=max_q_tiles_per_req,
             )
         if (
             not getattr(self._plan, "msa_block_sparse", False)
@@ -971,10 +1317,25 @@ class SPARKINFERPagedAttentionScratch:
                 f"(*, {self.num_q_heads}, {self.head_dim_qk}), got {tuple(q.shape)}"
             )
         if (
+            self.use_cuda_graph
+            and self.mode == "decode"
+            and self._decode_graph_chunk_pages_lut is not None
+            and self._plan is not None
+            and int(q.shape[0]) != int(self._plan.total_q)
+        ):
+            raise ValueError(
+                "decode graph q total_q must exactly match the prepared bucket: "
+                f"got {int(q.shape[0])}, expected {int(self._plan.total_q)}"
+            )
+        if (
             int(k_cache.shape[1]) != self.page_size
             or int(v_cache.shape[1]) != self.page_size
         ):
-            raise ValueError(f"paged scratch expects page_size={self.page_size}")
+            raise ValueError(
+                f"paged scratch expects page_size={self.page_size}, got "
+                f"k_cache shape {tuple(k_cache.shape)} and "
+                f"v_cache shape {tuple(v_cache.shape)}"
+            )
         if (
             int(k_cache.shape[2]) != self.num_kv_heads
             or int(v_cache.shape[2]) != self.num_kv_heads
@@ -1092,6 +1453,18 @@ def _validate_output(
             f"(*, {scratch.num_q_heads}, {scratch.head_dim_vo}), got "
             f"{tuple(output.shape)}"
         )
+    plan = getattr(scratch, "_plan", None)
+    if (
+        getattr(scratch, "use_cuda_graph", False)
+        and getattr(scratch, "mode", None) == "decode"
+        and getattr(scratch, "_decode_graph_chunk_pages_lut", None) is not None
+        and plan is not None
+        and int(output.shape[0]) != int(plan.total_q)
+    ):
+        raise ValueError(
+            "decode graph output total_q must exactly match the prepared bucket: "
+            f"got {int(output.shape[0])}, expected {int(plan.total_q)}"
+        )
 
 
 def _metadata_tuple(
@@ -1132,6 +1505,19 @@ def build_paged_attention_binding(
 ) -> SPARKINFERPagedAttentionBinding:
     scratch._validate_static_shapes(q, k_cache, v_cache)
     _validate_output(output, scratch=scratch)
+    plan = getattr(scratch, "_plan", None)
+    if (
+        active_total_q is not None
+        and getattr(scratch, "use_cuda_graph", False)
+        and getattr(scratch, "mode", None) == "decode"
+        and getattr(scratch, "_decode_graph_chunk_pages_lut", None) is not None
+        and plan is not None
+        and int(active_total_q) != int(plan.total_q)
+    ):
+        raise ValueError(
+            "decode graph active_total_q must exactly match the prepared bucket: "
+            f"got {int(active_total_q)}, expected {int(plan.total_q)}"
+        )
     _validate_optional_tensor_device(k_descale, scratch=scratch, name="k_descale")
     _validate_optional_tensor_device(v_descale, scratch=scratch, name="v_descale")
     _validate_optional_tensor_device(
@@ -1193,6 +1579,7 @@ def _materialize_paged_attention_scratch(
     decode_graph_chunk_pages_lut: torch.Tensor | None,
     decode_graph_max_chunks_per_req: int | None,
     use_regular_decode_graph_replay: bool,
+    owner_scratch_plan: SPARKINFERPagedAttentionScratchPlan,
 ) -> SPARKINFERPagedAttentionScratch:
     request_indices, _ = materialize_scratch_view(
         scratch_storage,
@@ -1318,6 +1705,57 @@ def _materialize_paged_attention_scratch(
             dtype=torch.int32,
         )
 
+    uses_plan_owned_decode_graph_metadata = (
+        caps.use_cuda_graph
+        and caps.mode == "decode"
+        and not caps.msa_block_sparse
+        and plan is not None
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan_metadata_cache is not None
+        and decode_graph_chunk_pages_lut is not None
+    )
+    if uses_plan_owned_decode_graph_metadata:
+        # The workspace manager may hand the same numerical scratch allocation
+        # to every attention layer.  Schedule metadata therefore cannot be
+        # treated as persistent in that shared allocation.  Bind the Plan's
+        # preallocated replay tensors directly: static fields stay immutable,
+        # live fields are overwritten by the captured device updater, and two
+        # Plans sharing numerical scratch cannot contaminate one another.
+        assert plan_metadata_cache is not None
+        request_indices = plan_metadata_cache.request_indices
+        qo_tile_indices = plan_metadata_cache.qo_tile_indices
+        kv_tile_indices = plan_metadata_cache.kv_tile_indices
+        merge_indptr = plan_metadata_cache.merge_indptr
+        o_indptr = plan_metadata_cache.o_indptr
+        block_valid_mask = plan_metadata_cache.block_valid_mask
+        kv_window_start_tokens = plan_metadata_cache.kv_window_start_tokens
+        kv_chunk_size_ptr = plan_metadata_cache.kv_chunk_size_ptr
+        total_num_rows_ptr = plan_metadata_cache.total_num_rows_ptr
+        if plan.split_kv:
+            partial_rows_capacity = (
+                int(plan.padded_batch_size)
+                if use_regular_decode_graph_replay
+                else int(plan.total_num_partial_rows)
+            )
+            if (
+                tmp_output is None
+                or tmp_lse is None
+                or int(tmp_output.shape[0]) < partial_rows_capacity
+                or int(tmp_lse.shape[0]) < partial_rows_capacity
+            ):
+                raise ValueError(
+                    "decode graph split plan requires caller-owned partial "
+                    f"capacity {partial_rows_capacity}"
+                )
+            # Regular decode merge derives its request stride from this shape.
+            # Compact decode has multiple work items writing disjoint head
+            # tiles into each partial row, so its partial capacity is smaller
+            # than the work-item grid by the query-tile factor.
+            tmp_output = tmp_output[:partial_rows_capacity]
+            tmp_lse = tmp_lse[:partial_rows_capacity]
+
     return SPARKINFERPagedAttentionScratch(
         shared_scratch=scratch_storage,
         device=caps.device,
@@ -1367,6 +1805,10 @@ def _materialize_paged_attention_scratch(
         _decode_graph_chunk_pages_lut=decode_graph_chunk_pages_lut,
         _decode_graph_max_chunks_per_req=decode_graph_max_chunks_per_req,
         _use_regular_decode_graph_replay=use_regular_decode_graph_replay,
+        _uses_plan_owned_decode_graph_metadata=(
+            uses_plan_owned_decode_graph_metadata
+        ),
+        _owner_scratch_plan=owner_scratch_plan,
     )
 
 
@@ -1386,6 +1828,19 @@ class SPARKINFERPagedAttentionScratchPlan:
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
     _q2k_indices_data_ptr: int | None = None
+    _decode_graph_replay_state_captured: bool = False
+
+    def _mark_decode_graph_replay_state_captured(
+        self,
+        metadata_cache: _SPARKINFERPagedPlanMetadataCache | None,
+    ) -> None:
+        """Pin the exact Plan metadata referenced by a captured binding."""
+        if metadata_cache is None or metadata_cache is not self._plan_metadata_cache:
+            raise RuntimeError(
+                "cannot capture a stale paged attention binding after its "
+                "owning scratch Plan was re-prepared; bind again and recapture"
+            )
+        self._decode_graph_replay_state_captured = True
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -1507,7 +1962,10 @@ class SPARKINFERPagedAttentionScratchPlan:
             )
         if self.caps.mode == "decode":
             raise RuntimeError("decode plans require prepare_decode_graph_replay_state")
-        if torch.cuda.is_current_stream_capturing():
+        if (
+            self.caps.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
             raise RuntimeError(
                 "prepare_graph_replay_state must be called before CUDA graph capture"
             )
@@ -1567,8 +2025,29 @@ class SPARKINFERPagedAttentionScratchPlan:
         max_cache_page_count: int | None = None,
         fixed_split_size: int = -1,
         window_left: int = -1,
-        force_split_kv: bool = False,
+        force_split_kv: bool | None = None,
     ) -> "SPARKINFERPagedAttentionScratchPlan":
+        """Prepare persistent, fixed-address decode graph replay metadata.
+
+        The prepared Plan must outlive every CUDA graph captured from it.  Its
+        live schedule tensors are intentionally shared by captures of this
+        same Plan, so concurrent replay on different streams requires distinct
+        Plans.  Re-preparation after a capture is rejected because replacing
+        those tensors would invalidate addresses referenced by the graph.
+        """
+        if (
+            self.caps.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "prepare_decode_graph_replay_state must be called before "
+                "CUDA graph capture"
+            )
+        if self._decode_graph_replay_state_captured:
+            raise RuntimeError(
+                "cannot replace decode graph replay state after capture; "
+                "create a new scratch Plan and recapture the graph"
+            )
         if not self.caps.use_cuda_graph:
             raise RuntimeError(
                 "prepare_decode_graph_replay_state is only valid for graph-mode "
@@ -1597,6 +2076,16 @@ class SPARKINFERPagedAttentionScratchPlan:
         if window_left < -1:
             raise ValueError(
                 "window_left must be -1 for full attention or a non-negative token count"
+            )
+        if batch != int(self.caps.max_batch):
+            raise ValueError(
+                "decode graph replay batch must exactly match its scratch bucket: "
+                f"got batch={batch}, expected max_batch={self.caps.max_batch}"
+            )
+        if total_q_capacity < batch:
+            raise ValueError(
+                "decode graph total_q_capacity must cover one query per request: "
+                f"got {total_q_capacity} < {batch}"
             )
 
         if self.caps.msa_block_sparse:
@@ -1669,50 +2158,34 @@ class SPARKINFERPagedAttentionScratchPlan:
 
         from sparkinfer.attention.paged.graph_replay import (
             make_decode_chunk_pages_lut_tensor,
-            summarize_decode_chunk_pages_lut,
         )
 
-        max_effective_kv_pages = int(max_cache_page_count)
-        if window_left >= 0:
-            max_effective_kv_pages = min(
-                max_effective_kv_pages,
-                max(
-                    1,
-                    (int(window_left) + self.caps.page_size + self.caps.page_size - 1)
-                    // self.caps.page_size,
-                ),
-            )
-        graph_ctas_per_sm = resolve_decode_graph_ctas_per_sm(
-            kv_dtype=self.caps.kv_dtype,
-            batch=batch,
-            page_size=self.caps.page_size,
-            head_dim_qk=self.caps.head_dim_qk,
-            head_dim_vo=self.caps.head_dim_vo,
-            gqa_group_size=self.caps.num_q_heads // self.caps.num_kv_heads,
-        )
-        max_chunks_per_req_budget = decode_graph_max_chunks_per_request_budget(
+        capacity = plan_decode_graph_capacity(
             device=self.caps.device,
-            num_kv_heads=self.caps.num_kv_heads,
-            batch=batch,
-            graph_ctas_per_sm=graph_ctas_per_sm,
-        )
-        decode_chunk_pages_lut = build_decode_chunk_pages_lut(
             q_dtype=self.caps.dtype,
             kv_dtype=self.caps.kv_dtype,
-            batch=batch,
-            page_size=self.caps.page_size,
+            num_q_heads=self.caps.num_q_heads,
+            num_kv_heads=self.caps.num_kv_heads,
             head_dim_qk=self.caps.head_dim_qk,
             head_dim_vo=self.caps.head_dim_vo,
-            gqa_group_size=self.caps.num_q_heads // self.caps.num_kv_heads,
-            max_effective_kv_pages=max_effective_kv_pages,
-            max_chunks_per_req=max_chunks_per_req_budget,
+            page_size=self.caps.page_size,
+            batch=batch,
+            max_cache_page_count=max_cache_page_count,
+            window_left=window_left,
+            max_work_items=self.caps.max_work_items,
+            max_partial_rows=self.caps.max_partial_rows,
+            force_split_kv=force_split_kv,
         )
-        worst_page_count, max_chunks_per_req = summarize_decode_chunk_pages_lut(
-            decode_chunk_pages_lut
-        )
-        capacity_cache_seqlen = int(worst_page_count) * self.caps.page_size
-        if window_left >= 0:
-            capacity_cache_seqlen = int(max_cache_page_count) * self.caps.page_size - 1
+        decode_chunk_pages_lut = capacity.chunk_pages_lut
+        max_chunks_per_req = capacity.max_chunks_per_request
+        # Chunk policy is not monotone in the effective page count.  Materialize
+        # the exact LUT row that needs the most chunks rather than assuming the
+        # longest cache/window span produces the largest schedule.  The +1
+        # token form yields exactly ``worst_page_count`` visible pages even when
+        # a sliding-window start falls inside the preceding page.
+        capacity_cache_seqlen = (
+            int(capacity.worst_page_count) - 1
+        ) * self.caps.page_size + 1
         max_cache_seqlens = torch.full(
             (batch,),
             int(capacity_cache_seqlen),
@@ -1742,12 +2215,16 @@ class SPARKINFERPagedAttentionScratchPlan:
             max_cu_seqlens_q,
             mode="decode",
             fixed_split_size=-1,
-            disable_split_kv=not force_split_kv,
+            disable_split_kv=force_split_kv is False,
             force_split_kv=force_split_kv,
             window_left=int(window_left),
             enable_cuda_graph=True,
             graph_chunk_policy=True,
-            plan_budget=None,
+            # The device LUT can never select more than this many chunks.
+            # Keep the capture grid at that fixed worst-case capacity rather
+            # than padding to the device-wide CTA heuristic a second time.
+            max_batch_size_if_split=capacity.max_work_items,
+            plan_budget=self._planner_budget,
         )
         self._ensure_capacity(plan)
         self._plan = plan
@@ -1804,6 +2281,7 @@ class SPARKINFERPagedAttentionScratchPlan:
             decode_graph_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
             decode_graph_max_chunks_per_req=self._decode_graph_max_chunks_per_req,
             use_regular_decode_graph_replay=self._use_regular_decode_graph_replay,
+            owner_scratch_plan=self,
         )
         scratch_views._q2k_indices_data_ptr = self._q2k_indices_data_ptr
         binding = build_paged_attention_binding(
@@ -1825,6 +2303,20 @@ class SPARKINFERPagedAttentionScratchPlan:
             relative_attention_bias=relative_attention_bias,
             q2k_indices=q2k_indices,
         )
+        if (
+            self.caps.use_cuda_graph
+            and self.caps.mode == "decode"
+            and self._plan_metadata_cache is not None
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Every prepared decode capture embeds Plan-owned addresses.  Dense
+            # split binds them directly; MSA and no-split graphs capture D2D
+            # copies whose sources are the same Plan cache.  Fail closed against
+            # replacing either kind of address after capture.  Multiple captures
+            # may reuse the state, but replaying them concurrently is unsupported.
+            self._mark_decode_graph_replay_state_captured(
+                scratch_views._plan_metadata_cache
+            )
         self._q2k_indices_data_ptr = scratch_views._q2k_indices_data_ptr
         return binding
 
@@ -1880,9 +2372,11 @@ def plan_paged_attention_scratch(
 
 __all__ = [
     "SPARKINFERPagedAttentionBinding",
+    "SPARKINFERPagedDecodeGraphScratchEnvelope",
     "SPARKINFERPagedAttentionScratch",
     "SPARKINFERPagedAttentionScratchCaps",
     "SPARKINFERPagedAttentionScratchPlan",
     "build_paged_attention_binding",
+    "plan_decode_graph_scratch_envelope",
     "plan_paged_attention_scratch",
 ]

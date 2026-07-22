@@ -453,6 +453,7 @@ class _RawCase:
     fp8_kv: bool
     split_kv: bool
     cta_tile_q: int | None = None
+    page_size: int = _PAGE_SIZE
 
 
 _RAW_CASES = (
@@ -470,12 +471,16 @@ def _raw_kernel(case: _RawCase):
     if case.family == "fp8_decode":
         return PagedFp8DecodeRawForwardKernel()
     if case.family == "bf16_extend":
-        return PagedBf16ExtendRawForwardKernel(split_kv=case.split_kv)
+        return PagedBf16ExtendRawForwardKernel(
+            split_kv=case.split_kv,
+            page_size=case.page_size,
+        )
     if case.family == "fp8_extend":
         assert case.cta_tile_q is not None
         return PagedFp8ExtendRawForwardKernel(
             split_kv=case.split_kv,
             cta_tile_q=case.cta_tile_q,
+            page_size=case.page_size,
         )
     raise AssertionError(f"unknown raw family {case.family}")
 
@@ -578,6 +583,7 @@ def _compile_raw_launch(
         ("case", case.id),
         ("split_kv", case.split_kv),
         ("cta_tile_q", case.cta_tile_q),
+        ("page_size", case.page_size),
     )
     compiled = sparkinfer_compile(kernel, *args, compile_spec=raw_spec)
 
@@ -760,6 +766,167 @@ def test_paged_unreachable_raw_body_graph_oracle(case: _RawCase) -> None:
         expected_lse,
         fp8_kv=case.fp8_kv,
     )
+
+
+_RAW_PAGE128_HIGH_PID_CASES = (
+    _RawCase(
+        id="bf16-extend-page128-high-pid",
+        family="bf16_extend",
+        q_len=8,
+        fp8_kv=False,
+        split_kv=False,
+        page_size=128,
+    ),
+    _RawCase(
+        id="fp8-extend-q32-page128-high-pid",
+        family="fp8_extend",
+        q_len=4,
+        fp8_kv=True,
+        split_kv=False,
+        cta_tile_q=32,
+        page_size=128,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _RAW_PAGE128_HIGH_PID_CASES,
+    ids=lambda case: case.id,
+)
+@torch.inference_mode()
+def test_raw_extend_page128_graph_handles_high_pool_page_id(case: _RawCase) -> None:
+    """Exercise raw two/four-plane TMA helpers beyond a 2^31 byte offset."""
+    device = require_sparkinfer()
+    torch.manual_seed(20260722 + case.q_len)
+
+    kv_dtype = torch.float8_e4m3fn if case.fp8_kv else torch.bfloat16
+    element_size = torch.empty((), dtype=kv_dtype).element_size()
+    page_stride_bytes = (
+        case.page_size * _KV_HEADS * _HEAD_DIM * element_size
+    )
+    int32_max = torch.iinfo(torch.int32).max
+    high_page_id = int32_max // page_stride_bytes + 2
+    num_cache_pages = high_page_id + 1
+
+    # Keep the multi-GiB pool uninitialized except for the single live tail
+    # page.  Allocator-recycled ids in serving routinely expose this exact
+    # address range even when unit-test page tables usually start at zero.
+    cache_shape = (
+        num_cache_pages,
+        case.page_size,
+        _KV_HEADS,
+        _HEAD_DIM,
+    )
+    k_cache = torch.empty(cache_shape, dtype=kv_dtype, device=device)
+    v_cache = torch.empty(cache_shape, dtype=kv_dtype, device=device)
+    assert k_cache.stride(0) * k_cache.element_size() == page_stride_bytes
+    assert high_page_id * page_stride_bytes > int32_max
+
+    live_shape = (case.page_size, _KV_HEADS, _HEAD_DIM)
+    live_k = torch.randn(live_shape, dtype=torch.bfloat16, device=device) / 4
+    live_v = torch.randn(live_shape, dtype=torch.bfloat16, device=device) / 4
+    k_cache[high_page_id].copy_(live_k.to(kv_dtype))
+    v_cache[high_page_id].copy_(live_v.to(kv_dtype))
+    live_k_expected = k_cache[high_page_id].clone()
+    live_v_expected = v_cache[high_page_id].clone()
+
+    # The manual helpers flatten each page into stage-row TMA coordinates.
+    # Check that the coordinate's underlying byte address—not merely the
+    # allocation size—crosses the signed-Int32 boundary.
+    stage_tile_rows = 64 if case.fp8_kv else 32
+    page_tiles_per_page = case.page_size // stage_tile_rows
+    tile_stride_bytes = stage_tile_rows * _HEAD_DIM * element_size
+    assert (
+        high_page_id * page_tiles_per_page * tile_stride_bytes > int32_max
+    )
+
+    q = torch.randn(
+        (case.q_len, _Q_HEADS, _HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    ) / 4
+    page_table = torch.tensor(
+        [[high_page_id]], dtype=torch.int32, device=device
+    )
+    page_table_expected = page_table.clone()
+    cache_seqlens = torch.tensor(
+        [case.page_size], dtype=torch.int32, device=device
+    )
+    cu_seqlens_q = torch.tensor(
+        [0, case.q_len], dtype=torch.int32, device=device
+    )
+    k_descale = (
+        torch.ones(1, dtype=torch.float32, device=device)
+        if case.fp8_kv
+        else None
+    )
+    v_descale = (
+        torch.ones(1, dtype=torch.float32, device=device)
+        if case.fp8_kv
+        else None
+    )
+    expected, expected_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+    )
+    (
+        compiled,
+        args,
+        merge_compiled,
+        merge_args,
+        final_output,
+        final_lse,
+        keepalive,
+    ) = _compile_raw_launch(
+        case,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    assert keepalive
+    assert merge_compiled is None
+    assert merge_args is None
+
+    _launch_compiled_pair(compiled, args, merge_compiled, merge_args)
+    torch.cuda.synchronize(device)
+    _assert_paged_result(
+        final_output,
+        final_lse,
+        expected,
+        expected_lse,
+        fp8_kv=case.fp8_kv,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch_compiled_pair(compiled, args, merge_compiled, merge_args)
+    final_output.fill_(torch.nan)
+    final_lse.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    _assert_paged_result(
+        final_output,
+        final_lse,
+        expected,
+        expected_lse,
+        fp8_kv=case.fp8_kv,
+    )
+    assert torch.equal(k_cache[high_page_id], live_k_expected)
+    assert torch.equal(v_cache[high_page_id], live_v_expected)
+    assert torch.equal(page_table, page_table_expected)
 
 
 def _fp8_planewords_expected(v_cache: torch.Tensor, page_idx: int) -> torch.Tensor:

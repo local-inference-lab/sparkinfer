@@ -1436,6 +1436,12 @@ def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
         binding = bind_current()
         paged_attention_forward(binding=binding)
 
+    with pytest.raises(RuntimeError, match="cannot replace decode graph replay state"):
+        scratch_plan.prepare_decode_graph_replay_state(
+            batch=1,
+            max_page_table_width=page_table_width,
+            max_cache_page_count=page_table_width,
+        )
     graph.replay()
     torch.cuda.synchronize()
 

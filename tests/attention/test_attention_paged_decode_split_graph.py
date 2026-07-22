@@ -1,4 +1,4 @@
-"""Regression tests for force-split dense decode under CUDA graphs.
+"""Regression tests for dense split decode under CUDA graphs.
 
 Covers the gqa_group_size > 8 case (e.g. MiniMax-M3 dense layers: 64 q heads /
 4 KV heads = gqa 16, head_dim 128) where the single-qtile / regularized decode
@@ -14,6 +14,8 @@ persistent buffers).
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 from sparkinfer.attention.paged.reference import paged_attention_reference
@@ -27,7 +29,7 @@ from tests._reference.paged_attention_helpers import make_paged_inputs
 
 
 class _ForcedSplitDecodeGraphHarness:
-    """Decode-graph harness with split-KV forced on (dense split decode)."""
+    """Decode-graph harness using the default dense split planner policy."""
 
     def __init__(self, q, k_cache, v_cache):
         self.q = q
@@ -51,8 +53,9 @@ class _ForcedSplitDecodeGraphHarness:
             cu_seqlens_q,
             mode="decode",
             enable_cuda_graph=True,
-            force_split_kv=True,
+            graph_chunk_policy=True,
         )
+        assert plan.split_kv
         if self._scratch_plan is None:
             batch = page_table.shape[0]
             self._scratch_plan = plan_paged_attention_scratch(
@@ -233,4 +236,131 @@ def test_forced_split_decode_graph_gqa16_head_dim128_batch2() -> None:
         head_dim=128,
         cache_seqlens_capture=[4096, 2048],
         cache_seqlens_replay=[1024, 4096],
+    )
+
+
+@torch.inference_mode()
+def test_direct_decode_graph_gqa128_writes_every_query_tile() -> None:
+    """GQA128 / CTA16 must consume all eight q tiles and write every head."""
+    device = require_sparkinfer()
+    clear_attention_caches()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        make_paged_inputs(
+            q_seqlens=[1],
+            cache_seqlens=[193],
+            page_size=64,
+            seed=197,
+            q_heads=128,
+            kv_heads=1,
+            head_dim=256,
+            page_table_width=4,
+            num_pages=8,
+        )
+    )
+    bootstrap_plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        mode="decode",
+        disable_split_kv=True,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+    )
+    assert bootstrap_plan.cta_tile_q == 16
+    assert tuple(bootstrap_plan.qo_tile_indices) == tuple(range(8))
+
+    scratch_plan = plan_paged_attention_scratch(
+        SPARKINFERPagedAttentionScratchCaps(
+            device=device,
+            mode="decode",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            head_dim_qk=q.shape[2],
+            head_dim_vo=v_cache.shape[3],
+            page_size=k_cache.shape[1],
+            max_total_q=1,
+            max_batch=1,
+            max_page_table_width=page_table.shape[1],
+            max_work_items=8,
+            max_partial_rows=0,
+            num_cache_pages=k_cache.shape[0],
+            use_cuda_graph=True,
+            copy_runtime_metadata=True,
+        )
+    )
+    scratch_plan.prepare_decode_graph_replay_state(
+        batch=1,
+        total_q_capacity=1,
+        max_page_table_width=page_table.shape[1],
+        max_cache_page_count=page_table.shape[1],
+        force_split_kv=False,
+    )
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in scratch_plan.scratch_specs()
+    )
+    output = torch.full_like(q, torch.nan)
+
+    def bind():
+        return scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            disable_split_kv=True,
+            active_total_q=1,
+        )
+
+    warm_binding = bind()
+    warm_binding.run()
+    torch.cuda.synchronize(device)
+    assert warm_binding.scratch.plan.split_kv is False
+    assert warm_binding.scratch.plan.cta_tile_q == 16
+    assert tuple(warm_binding.scratch.plan.qo_tile_indices) == tuple(range(8))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_binding = bind()
+        _, captured_lse = captured_binding.run()
+
+    # Poison every destination after capture.  The old qtile-blind kernel
+    # rewrote heads 0..63 twice and left the upper half poisoned.
+    output.fill_(torch.nan)
+    captured_lse.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    reference_output, reference_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    assert torch.isfinite(output).all().item()
+    assert torch.isfinite(captured_lse).all().item()
+    assert output[:, :64].abs().max().item() > 0
+    assert output[:, 64:].abs().max().item() > 0
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        reference_output.to(torch.float32),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+    torch.testing.assert_close(
+        captured_lse.to(torch.float32) * math.log(2.0),
+        reference_lse.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
     )

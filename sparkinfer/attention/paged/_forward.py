@@ -425,7 +425,7 @@ def _build_merge_kernel(
         dtype == torch.bfloat16
         and head_dim == 128
         and regular_decode_graph
-        and int(total_q) == 4
+        and int(total_q) in (1, 4)
     ):
         merge_bdy = 4
     return PagedPersistentMergeKernel(
@@ -508,24 +508,45 @@ def _resolve_paged_attention_binding(
 def _capture_decode_graph_replay_metadata_if_needed(
     scratch: object,
 ) -> None:
+    scratch_device = getattr(scratch, "device", None)
+    if scratch_device is not None and torch.device(scratch_device).type != "cuda":
+        return
     if not torch.cuda.is_current_stream_capturing():
         return
     if not (
         getattr(scratch, "use_cuda_graph", False)
         and getattr(scratch, "mode", None) == "decode"
-        and getattr(scratch, "_decode_graph_chunk_pages_lut", None) is not None
-        and getattr(scratch, "_plan", None) is not None
     ):
         return
-    if getattr(scratch, "_decode_graph_metadata_captured_in_graph", False):
-        return
+    if (
+        getattr(scratch, "_decode_graph_chunk_pages_lut", None) is None
+        or getattr(scratch, "_plan", None) is None
+    ):
+        raise RuntimeError(
+            "decode CUDA graph capture requires "
+            "prepare_decode_graph_replay_state before capture"
+        )
+    owner_scratch_plan = getattr(scratch, "_owner_scratch_plan", None)
+    if owner_scratch_plan is not None:
+        # ``Plan.bind()`` may have run before capture.  In that case the graph
+        # first sees the Plan-owned schedule addresses here, in ``run()``, and
+        # the owner must be pinned before a later prepare can replace them.
+        owner_scratch_plan._mark_decode_graph_replay_state_captured(
+            getattr(scratch, "_plan_metadata_cache", None)
+        )
     update_metadata = getattr(
         scratch,
         "update_decode_graph_replay_metadata_from_runtime_cache_seqlens",
         None,
     )
     if update_metadata is None:
-        return
+        raise RuntimeError(
+            "decode CUDA graph scratch does not expose a replay metadata updater"
+        )
+    # Capture one device updater for every forward invocation.  The lifetime
+    # flag below records that fixed addresses escaped into at least one graph;
+    # it must not suppress the updater when the same prepared state is captured
+    # into a second graph.
     update_metadata()
     scratch._decode_graph_metadata_captured_in_graph = True
 
@@ -576,7 +597,16 @@ def paged_attention_forward(
         raise ValueError(
             "split-kv plan requires tmp_output and tmp_lse in the scratch binding"
         )
-    _capture_decode_graph_replay_metadata_if_needed(workspace)
+    exact_decode_graph_bucket = (
+        getattr(workspace, "use_cuda_graph", False)
+        and getattr(workspace, "mode", None) == "decode"
+        and getattr(workspace, "_decode_graph_chunk_pages_lut", None) is not None
+    )
+    if exact_decode_graph_bucket and int(q.shape[0]) != int(plan.total_q):
+        raise ValueError(
+            "decode graph q total_q must exactly match the prepared bucket: "
+            f"got {int(q.shape[0])}, expected {int(plan.total_q)}"
+        )
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
         k_descale = k_descale[:, 0].contiguous()
     if v_descale is not None and v_descale.ndim == 2 and int(v_descale.shape[1]) == 1:
@@ -584,6 +614,11 @@ def paged_attention_forward(
     if output.ndim != 3:
         raise ValueError(
             f"output must be rank-3 [total_q, heads, head_dim], got {tuple(output.shape)}"
+        )
+    if exact_decode_graph_bucket and int(output.shape[0]) != int(plan.total_q):
+        raise ValueError(
+            "decode graph output total_q must exactly match the prepared bucket: "
+            f"got {int(output.shape[0])}, expected {int(plan.total_q)}"
         )
     if int(output.shape[0]) < int(plan.total_q):
         raise ValueError(
@@ -594,6 +629,7 @@ def paged_attention_forward(
             "output shape must match the prepared scratch contract: "
             f"expected (*, {plan.num_q_heads}, {plan.head_dim_vo}), got {tuple(output.shape)}"
         )
+    _capture_decode_graph_replay_metadata_if_needed(workspace)
 
     if (
         k_cache.dtype == torch.float8_e4m3fn or v_cache.dtype == torch.float8_e4m3fn
@@ -708,13 +744,13 @@ def paged_attention_forward(
         k_tiles_per_entry = _paged_kv_tiles_per_table_entry(
             k_cache,
             page_size=page_size,
-            tile_rows=64,
+            tile_rows=traits.cta_tile_kv,
             name="k_cache",
         )
         v_tiles_per_entry = _paged_kv_tiles_per_table_entry(
             v_cache,
             page_size=page_size,
-            tile_rows=64,
+            tile_rows=traits.cta_tile_kv,
             name="v_cache",
         )
         if k_tiles_per_entry != v_tiles_per_entry:

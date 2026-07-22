@@ -930,7 +930,15 @@ class _VarlenAttentionForwardLaunch:
             qhead_per_kvhead=qhead_per_kvhead,
             is_causal=causal,
             is_local=is_local,
-            pack_gqa=qhead_per_kvhead != 1,
+            # Packed GQA folds the group dimension into M.  The resulting
+            # layout can only compose with the fixed TMA tile when the group
+            # divides tile_m (Laguna uses group=9 with tile_m=128).  Keep the
+            # existing unpacked-head kernel as the static fallback for those
+            # shapes; this choice depends only on plan geometry and is graph
+            # capture safe.
+            pack_gqa=(
+                qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0
+            ),
             tile_m=tile_m,
             tile_n=tile_n,
         )

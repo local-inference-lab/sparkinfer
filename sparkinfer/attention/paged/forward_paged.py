@@ -308,7 +308,13 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
             full_mbar_ptr,
             expected_bytes,
         )
-    src_idx = page_id * page_tiles_per_page + page_tile_idx
+    # A page id is an allocator-owned pool coordinate.  Production pools can
+    # hand out ids whose byte address is beyond the signed-Int32 range even
+    # though the page table itself stores Int32 ids, so widen before scaling it
+    # into the flattened TMA-tile coordinate.
+    src_idx = (
+        Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
+    )
     load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
@@ -345,7 +351,10 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
             full_mbar_ptr,
             expected_bytes,
         )
-    src_idx = page_id * page_tiles_per_page + page_tile_idx
+    # Keep the page-scaled coordinate in Int64 for large/recycled serving pools.
+    src_idx = (
+        Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
+    )
     load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma2(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
@@ -2755,7 +2764,12 @@ class PagedForwardKernel:
             raise ValueError(
                 "page_size=64 paged decode requires page_tiles_per_entry=1"
             )
-        if self.page_tiles_per_entry < self.page_size // 64:
+        if self.page_size % traits.cta_tile_kv != 0:
+            raise ValueError(
+                "paged decode stage tile must divide page_size: "
+                f"cta_tile_kv={traits.cta_tile_kv}, page_size={self.page_size}"
+            )
+        if self.page_tiles_per_entry < self.page_size // traits.cta_tile_kv:
             raise ValueError(
                 "page_tiles_per_entry must cover at least the logical page rows: "
                 f"got {self.page_tiles_per_entry} for page_size={self.page_size}"
@@ -2849,6 +2863,24 @@ class PagedForwardKernel:
             and traits.head_dim_qk <= 256
             and traits.head_dim_vo <= 256
         )
+        laguna_page128_kv128_decode = (
+            decode_only
+            and self.split_kv
+            and not self.msa_block_sparse
+            and self.page_size == 128
+            and self.kv_is_fp8
+            and dtype_q == cutlass.BFloat16
+            and dtype_o == cutlass.BFloat16
+            and traits.head_dim_qk == 128
+            and traits.head_dim_vo == 128
+            and traits.cta_tile_q == 16
+            and traits.cta_tile_kv == 128
+            and traits.num_mma_q == 1
+            and traits.num_mma_kv == 2
+            and traits.num_warps_q == 1
+            and traits.num_warps_kv == 4
+            and self.gqa_group_size == 9
+        )
         base_use_paged_kv_tma_decode = (
             dtype_q == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
@@ -2856,10 +2888,12 @@ class PagedForwardKernel:
             and (self.num_stages == 1 or bf16_minimax_head128_decode)
             and traits.num_warps_kv > 1
             and traits.num_warps_q == 1
-            and self.stage_tile_rows == 64
             and traits.cta_tile_q == 16
             and traits.num_mma_q == 1
-            and traits.num_mma_kv == 1
+            and (
+                (self.stage_tile_rows == 64 and traits.num_mma_kv == 1)
+                or laguna_page128_kv128_decode
+            )
         )
         self.use_paged_kv_tma_exact_plane_bf16_layout = base_use_paged_kv_tma_decode
         self.use_paged_kv_tma = self.use_paged_kv_tma_exact_plane_bf16_layout
@@ -3098,12 +3132,14 @@ class PagedForwardKernel:
         return tile_token_base // page_size
 
     @cute.jit
-    def _tile_sub64_idx(self, tile_token_base):
-        """64-row tile index within one page-table entry (always 0 at page_size=64)."""
+    def _tile_subtile_idx(self, tile_token_base):
+        """Stage-tile index within one page-table entry."""
         if const_expr(self.page_size == 64):
             return Int32(0)
         page_j = tile_token_base // Int32(self.page_size)
-        return (tile_token_base - page_j * Int32(self.page_size)) // Int32(64)
+        return (tile_token_base - page_j * Int32(self.page_size)) // Int32(
+            self.stage_tile_rows
+        )
 
     @cute.jit
     def _tile_key_base(
@@ -3188,8 +3224,10 @@ class PagedForwardKernel:
     @cute.jit
     def _tile_src_idx_from_page_id(self, page_id, sub_tile):
         if const_expr(self.page_size == 64):
-            return page_id
-        return page_id * Int32(self.page_tiles_per_entry) + sub_tile
+            return Int64(page_id)
+        return (
+            Int64(page_id) * Int64(self.page_tiles_per_entry) + Int64(sub_tile)
+        )
 
     @cute.jit
     def _issue_paged_kv_tma_copy_planes(
@@ -3671,6 +3709,7 @@ class PagedForwardKernel:
                 request_partial_end = mOIndptr[request_idx + 1]
             elif const_expr(self.decode_only):
                 request_idx = mRequestIndices[work_idx]
+                qo_tile_idx = mQoTileIndices[work_idx]
                 kv_tile_idx = mKvTileIndices[work_idx]
                 q_start = request_idx
                 qo_len = Int32(1)
@@ -3692,14 +3731,6 @@ class PagedForwardKernel:
         ):
             packed_tile_start = Int32(0)
             packed_tile_end = packed_qo_len
-        elif const_expr(self.decode_only):
-            packed_tile_start = Int32(0)
-            packed_tile_limit = self.traits.cta_tile_q
-            packed_tile_end = cutlass.select_(
-                packed_tile_limit < packed_qo_len,
-                packed_tile_limit,
-                packed_qo_len,
-            )
         else:
             packed_tile_start = qo_tile_idx * self.traits.cta_tile_q
             packed_tile_limit = packed_tile_start + self.traits.cta_tile_q
@@ -4338,7 +4369,7 @@ class PagedForwardKernel:
                         role_prefetch_base,
                         page_size,
                     )
-                    role_sub_tile = self._tile_sub64_idx(role_prefetch_base)
+                    role_sub_tile = self._tile_subtile_idx(role_prefetch_base)
                     self._issue_paged_kv_tma_copy_2planes(
                         load_K_tma0,
                         load_K_tma1,
@@ -4502,7 +4533,7 @@ class PagedForwardKernel:
         )
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
         decode_q_head_base = (
-            Int32(kv_head_idx * group_size)
+            Int32(kv_head_idx * group_size + packed_tile_start)
             if const_expr(decode_row_metadata_fastpath)
             else Int32(0)
         )
@@ -4613,7 +4644,7 @@ class PagedForwardKernel:
                         prefetch_base,
                         page_size,
                     )
-                    prefetch_sub_tile = self._tile_sub64_idx(prefetch_base)
+                    prefetch_sub_tile = self._tile_subtile_idx(prefetch_base)
                     if const_expr(self.k_tma_plane_count > 3):
                         self._issue_paged_kv_tma_copy_planes(
                             load_K_tma0,
@@ -5306,7 +5337,7 @@ class PagedForwardKernel:
                                     next_tile_base,
                                     page_size,
                                 )
-                                next_sub_tile = self._tile_sub64_idx(next_tile_base)
+                                next_sub_tile = self._tile_subtile_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
                                     self._issue_paged_kv_tma_copy_planes(
                                         load_K_tma0,
@@ -5461,7 +5492,7 @@ class PagedForwardKernel:
                                     next_tile_base,
                                     page_size,
                                 )
-                                next_sub_tile = self._tile_sub64_idx(next_tile_base)
+                                next_sub_tile = self._tile_subtile_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
                                     self._issue_paged_kv_tma_copy_planes(
                                         load_K_tma0,
@@ -5841,7 +5872,7 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
-                            next_sub_tile = self._tile_sub64_idx(next_tile_base)
+                            next_sub_tile = self._tile_subtile_idx(next_tile_base)
                             if const_expr(self.v_tma_plane_count > 3):
                                 self._issue_paged_kv_tma_copy_planes(
                                     load_V_tma0,
@@ -7751,7 +7782,7 @@ class PagedFp8DecodeRawForwardKernel:
 
 
 class PagedBf16ExtendRawForwardKernel:
-    def __init__(self, *, split_kv: bool):
+    def __init__(self, *, split_kv: bool, page_size: int = 64):
         self.split_kv = split_kv
         self.cta_tile_q = 64
         self.stage_tile_rows = 32
@@ -7765,7 +7796,12 @@ class PagedBf16ExtendRawForwardKernel:
         self.num_threads = 128
         self.head_dim_qk = 256
         self.head_dim_vo = 256
-        self.page_size = 64
+        self.page_size = int(page_size)
+        if self.page_size not in (64, 128):
+            raise ValueError(
+                "raw BF16 paged extend requires page_size 64 or 128, got "
+                f"{self.page_size}"
+            )
         self.q_dtype = cutlass.BFloat16
         self.o_dtype = cutlass.BFloat16
         self.kv_storage_dtype = cutlass.BFloat16
@@ -8700,7 +8736,7 @@ class PagedBf16ExtendRawForwardKernel:
 
 
 class PagedFp8ExtendRawForwardKernel:
-    def __init__(self, *, split_kv: bool, cta_tile_q: int):
+    def __init__(self, *, split_kv: bool, cta_tile_q: int, page_size: int = 64):
         self.split_kv = split_kv
         self.cta_tile_q = cta_tile_q
         self.use_q48_long_form = cta_tile_q == 48
@@ -8716,7 +8752,12 @@ class PagedFp8ExtendRawForwardKernel:
         self.num_threads = self.num_warps_q * 32
         self.head_dim_qk = 256
         self.head_dim_vo = 256
-        self.page_size = 64
+        self.page_size = int(page_size)
+        if self.page_size not in (64, 128):
+            raise ValueError(
+                "raw FP8 paged extend requires page_size 64 or 128, got "
+                f"{self.page_size}"
+            )
         self.q_dtype = cutlass.BFloat16
         self.o_dtype = cutlass.BFloat16
         self.kv_storage_dtype = cutlass.Uint8

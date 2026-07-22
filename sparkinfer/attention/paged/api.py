@@ -19,13 +19,31 @@ from ._scratch import (
     SPARKINFERPagedAttentionScratchPlan as Plan,
 )
 from ._scratch import (
+    SPARKINFERPagedDecodeGraphScratchEnvelope as DecodeGraphScratchEnvelope,
+)
+from ._scratch import (
+    plan_decode_graph_scratch_envelope as decode_graph_scratch_envelope,
+)
+from ._scratch import (
     plan_paged_attention_scratch as plan,
+)
+from .planner import (
+    PagedDecodeGraphCapacity as DecodeGraphCapacity,
+)
+from .planner import (
+    PagedVerifyGraphCapacity as VerifyGraphCapacity,
 )
 from .planner import (
     PagedPlanBudget as Budget,
 )
 from .planner import (
     infer_paged_mode as infer_mode,
+)
+from .planner import (
+    plan_decode_graph_capacity as decode_graph_capacity,
+)
+from .planner import (
+    plan_verify_graph_capacity as verify_graph_capacity,
 )
 from .workspace import (
     PagedAttentionWorkspace as Workspace,
@@ -53,6 +71,12 @@ __all__ = [
     "Binding",
     "Workspace",
     "Budget",
+    "DecodeGraphCapacity",
+    "VerifyGraphCapacity",
+    "DecodeGraphScratchEnvelope",
+    "decode_graph_capacity",
+    "verify_graph_capacity",
+    "decode_graph_scratch_envelope",
     "plan",
     "bind",
     "run",
