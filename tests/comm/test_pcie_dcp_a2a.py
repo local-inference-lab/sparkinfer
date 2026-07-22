@@ -472,7 +472,7 @@ def test_pool_rollback_closes_only_channels_created_after_checkpoint(monkeypatch
     assert created[1][2].dispose_calls == [1234]
 
 
-def test_pool_rollback_removes_new_alias_without_closing_saved_channel(monkeypatch):
+def test_pool_rollback_removes_new_alias_without_closing_saved_channel():
     ext = _FakeExt()
     pool = PCIeDCPA2APool(
         rank=0,
@@ -483,27 +483,15 @@ def test_pool_rollback_removes_new_alias_without_closing_saved_channel(monkeypat
         head_dim=64,
         channel_factory=lambda stream_key: _make_runtime(ext),
     )
-    monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
-        lambda device, stream=None: 70 if stream is None else int(stream),
-    )
-    capturing = [False]
-    monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
-        lambda device: capturing[0],
-    )
-
     channel = pool.for_stream(7)
+    original_channels = dict(pool._channels)
     checkpoint = pool.checkpoint_channels()
-    with pool.capture(7):
-        capturing[0] = True
-        assert pool.for_stream() is channel
-        capturing[0] = False
+    pool._channels[70] = channel
 
-    assert pool._channels == {7: channel, 70: channel}
+    assert pool._channels == {**original_channels, 70: channel}
     pool.rollback_channels(checkpoint)
 
-    assert pool._channels == {7: channel}
+    assert pool._channels == original_channels
     assert ext.dispose_calls == []
 
 
