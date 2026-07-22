@@ -470,6 +470,9 @@ def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
     assert execution.n == 352
     assert kernel_n == 384
     assert available_bytes >= required_bytes
+    assert available_bytes < (
+        required_bytes + execution.k * tp_moe_impl._dtype_nbytes(intermediate.dtype)
+    )
 
 
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
