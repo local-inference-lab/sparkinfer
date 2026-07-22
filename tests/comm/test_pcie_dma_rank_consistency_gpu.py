@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Four-GPU gate for rank-identical FP8 PCIe-DMA all-reduce outputs.
+"""Four-GPU gate for rank-identical compressed PCIe-DMA all-reduce outputs.
 
 Run inside the target image after installing the overlay:
 
     python test_pcie_dma_rank_consistency_gpu.py --mode ag
     python test_pcie_dma_rank_consistency_gpu.py --mode ring
     python test_pcie_dma_rank_consistency_gpu.py --mode a2a
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8_ring
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8_a2a
 """
 
 from __future__ import annotations
@@ -124,7 +127,11 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=("ag", "ring", "a2a"))
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=("ag", "ring", "a2a", "i8", "i8_ring", "i8_a2a"),
+    )
     args = parser.parse_args()
     world = 4
     if not torch.cuda.is_available() or torch.cuda.device_count() < world:
