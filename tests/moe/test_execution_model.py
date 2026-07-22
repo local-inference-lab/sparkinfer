@@ -240,8 +240,12 @@ def test_workspace_plan_uses_weight_plan_source_contract() -> None:
     assert plan.spec.source_weight_scale is ScaleEncoding.E8M0_K32
 
 
-def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8() -> None:
+def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The GLM decode M=8 case uses dynamic's atomic output contract."""
+
+    monkeypatch.delenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
 
     weights = _weight_plan(
         "nvfp4",
@@ -250,12 +254,15 @@ def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8() -> None:
         n=2048 // 8,
         num_experts=256,
     )
+    # Planner construction is allocation-free. Use a CUDA device descriptor so
+    # the serving-only deterministic-output policy is exercised on CPU CI.
+    device = torch.device("cuda")
 
     plans = {
         m: plan_tp_moe_execution(
             num_tokens=m,
             num_topk=8,
-            device=torch.device("cpu"),
+            device=device,
             weight_plan=weights,
             quant_mode="nvfp4",
         )
@@ -265,6 +272,17 @@ def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8() -> None:
     assert plans[7].implementation == "micro"
     assert plans[8].implementation == "dynamic"
     assert not plans[8].deterministic_output
+
+    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    deterministic_m8 = plan_tp_moe_execution(
+        num_tokens=8,
+        num_topk=8,
+        device=device,
+        weight_plan=weights,
+        quant_mode="nvfp4",
+    )
+    assert deterministic_m8.implementation == "dynamic"
+    assert deterministic_m8.deterministic_output
 
 
 def test_native_w4a8_m1_alone_selects_fixed_materialized_regime(
