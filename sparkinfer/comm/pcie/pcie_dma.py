@@ -89,7 +89,9 @@ def _normalize_fp8_mode(value: str | None) -> str:
         return "i8_ring"
     if raw in ("i8_a2a", "i8-a2a", "int8_a2a", "int8-a2a", "a2a_i8"):
         return "i8_a2a"
-    return "ag"
+    if raw in ("ag", "1"):
+        return "ag"
+    raise ValueError(f"unrecognized PCIe DMA wire mode: {value!r}")
 
 
 @lru_cache(maxsize=1)
