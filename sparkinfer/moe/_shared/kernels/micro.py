@@ -4911,10 +4911,15 @@ class MoEMicroKernelBackend:
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
             block=(self.launch_block_dim, 1, 1),
-            # The fused and FC1-only bodies are 512-thread cooperative CTAs;
+            # The fused and FC1-only bodies use 512-thread CTAs;
             # the FC2-only m=1 specialization is a 256-thread independent CTA.
             # One block per SM preserves each variant's register budget.
             min_blocks_per_mp=1,
+            # The fused phase crosses a software all-CTA barrier between FC1
+            # and FC2.  Require whole-grid admission so auxiliary-stream work
+            # cannot leave resident CTAs spinning while peers remain queued.
+            # Split FC1/FC2 phases have no grid barrier and stay noncooperative.
+            cooperative=self.compile_time_phase == 0,
             stream=stream,
         )
 
