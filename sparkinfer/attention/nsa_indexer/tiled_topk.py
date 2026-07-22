@@ -455,8 +455,12 @@ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
     return cute_tensor
 
 
-def _tensor_compile_key(name, tensor, *, dynamic_dims=()):
-    return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
+def _tensor_compile_key(
+    name, tensor, *, dynamic_dims=(), dynamic_strides=()
+):
+    return tensor_compile_fact(
+        name, tensor, dynamic_dims=dynamic_dims, dynamic_strides=dynamic_strides
+    )
 
 
 def _flat_tensor_compile_key(name, tensor, *, dynamic=False):
@@ -1490,10 +1494,17 @@ def run_tiled_topk(
         _tensor_compile_key(
             "output_page_table",
             output_page_table_key_tensor,
-            dynamic_dims=(0,),
+            dynamic_dims=(0, 1),
+            # The kernel indexes output_page_table[row, page_col] at runtime
+            # (page_col = gidx // output_page_size); neither shape[1] (the live
+            # page-table width, which grows with KV-cache capacity) nor stride(0)
+            # (which is the same width for the contiguous view) is a compile-time
+            # input. Pinning either into the key re-links a fresh cubin on every
+            # capacity bump, per TP rank, on the first serving run.
+            dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v22",
+            "tiled_topk_v23",
             topk,
             block_q,
             block_k,

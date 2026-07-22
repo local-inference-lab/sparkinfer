@@ -230,3 +230,56 @@ def test_paged_prefill_topk_carry_fold_overflow(monkeypatch) -> None:
         monkeypatch, scene, supertile_k=8192, output_physical_slots=True
     )
     _assert_selects_true_topk(scene, selected, output_physical_slots=True)
+
+
+def test_paged_prefill_topk_width_does_not_recompile(monkeypatch) -> None:
+    """The page-table width must not be part of the tiled top-k compile cache key.
+
+    output_page_table is indexed at runtime as output_page_table[row, page_col]
+    (page_col = gidx // output_page_size), so neither shape[1] (the live KV-cache
+    page-table width, which grows with sequence/capacity) nor stride(0) (the same
+    width for a contiguous page table) is a compile-time input. Pinning either
+    into the key re-links a fresh cubin on every capacity bump, per TP rank, on
+    the first serving run.
+
+    Two consecutive prefill runs at distinct page-table widths must compile the
+    tiled top-k kernel exactly once: the second width reuses the first's cubin.
+    """
+    from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+
+    device = torch.device("cuda")
+    scene_narrow = _build_scene(device, 16384, "monotonic")
+    scene_wide = _build_scene(device, 32768, "monotonic")
+    width_narrow = scene_narrow["width_blocks"]
+    width_wide = scene_wide["width_blocks"]
+    assert width_narrow != width_wide, (
+        f"test requires distinct page-table widths, got {width_narrow} and {width_wide}"
+    )
+
+    # Force every cache key to actually compile (skip the on-disk cache) but keep
+    # the in-memory cache on so a repeated identical key is a hit, not a recompile.
+    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
+    clear_compile_cache()
+
+    selected_narrow = _run_indexer(
+        monkeypatch, scene_narrow, supertile_k=32768, output_physical_slots=True
+    )
+    misses_after_narrow = compile_cache_info()["compile_misses"]
+    assert misses_after_narrow >= 1, (
+        "run A compiled no kernels; the test is not exercising the topk compile path"
+    )
+
+    selected_wide = _run_indexer(
+        monkeypatch, scene_wide, supertile_k=32768, output_physical_slots=True
+    )
+    misses_after_wide = compile_cache_info()["compile_misses"]
+
+    assert misses_after_wide == misses_after_narrow, (
+        f"page-table width leaked into the compile cache key: width "
+        f"{width_narrow} -> {width_wide} triggered "
+        f"{misses_after_wide - misses_after_narrow} extra compile(s); "
+        f"misses {misses_after_narrow} -> {misses_after_wide}"
+    )
+    _assert_selects_true_topk(scene_narrow, selected_narrow, output_physical_slots=True)
+    _assert_selects_true_topk(scene_wide, selected_wide, output_physical_slots=True)
