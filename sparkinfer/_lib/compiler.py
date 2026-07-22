@@ -2043,6 +2043,11 @@ def _semantic_compile_manifest_payload(
     semantic: dict[str, Any] = {
         "cache_format": cache_format,
         "target": _semantic_target_key(cache_payload[1]),
+        # device_arch is cache_payload index 4 in both the v6_explicit_spec and
+        # v3 formats. Include it in the semantic identity so two payloads that
+        # differ only by GPU architecture hash to distinct semantic keys and the
+        # device-aware cache format cannot be aliased across architectures.
+        "device_arch": _manifest_json_value(cache_payload[4]),
     }
     if cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec":
         semantic["compile_spec_hash"] = cache_payload[5]
