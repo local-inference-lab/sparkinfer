@@ -60,6 +60,10 @@ def _fp8_mode() -> str:
     signed-INT8 payload. Both codecs use the same layout: one payload byte
     per value plus one fp32 scale per 128 values.
 
+    "mx" / "mx_ring" / "mx_a2a": standard MXFP8, with E4M3 payload values
+    and one E8M0 scale per 32 values. Four scale bytes per 128 values retain
+    the same wire footprint as the other compressed codecs.
+
     Every compressed mode materializes the locally owned reduced shard through
     the same wire payload as its peers. An all-reduce result must be
     rank-identical; retaining a pre-wire BF16 owner shard while peers dequantize
@@ -89,6 +93,32 @@ def _normalize_fp8_mode(value: str | None) -> str:
         return "i8_ring"
     if raw in ("i8_a2a", "i8-a2a", "int8_a2a", "int8-a2a", "a2a_i8"):
         return "i8_a2a"
+    if raw in (
+        "mx",
+        "mxfp8",
+        "mx_ag",
+        "mx-ag",
+        "mxfp8_ag",
+        "mxfp8-ag",
+        "ag_mx",
+    ):
+        return "mx"
+    if raw in (
+        "mx_ring",
+        "mx-ring",
+        "mxfp8_ring",
+        "mxfp8-ring",
+        "ring_mx",
+    ):
+        return "mx_ring"
+    if raw in (
+        "mx_a2a",
+        "mx-a2a",
+        "mxfp8_a2a",
+        "mxfp8-a2a",
+        "a2a_mx",
+    ):
+        return "mx_a2a"
     return "ag"
 
 
@@ -200,6 +230,9 @@ class PCIeDmaAllReduce:
             "i8": "int8-ag",
             "i8_ring": "int8-ring",
             "i8_a2a": "int8-a2a",
+            "mx": "mxfp8-ag",
+            "mx_ring": "mxfp8-ring",
+            "mx_a2a": "mxfp8-a2a",
         }
         self.wire_mode = wire_modes.get(
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
@@ -327,29 +360,35 @@ class PCIeDmaAllReduce:
             and shard_elems % FP8_QUANT_BLOCK == 0
         )
         int8_wire = compressed_eligible and self._fp8.startswith("i8")
-        if compressed_eligible and self._fp8 in ("a2a", "i8_a2a"):
-            return self._all_reduce_fp8(
-                inp, out, shard_elems, int8_wire=int8_wire
-            )
+        mxfp8_wire = compressed_eligible and self._fp8.startswith("mx")
+        wire_codec = "i8" if int8_wire else "mx" if mxfp8_wire else "e4m3"
+        if compressed_eligible and self._fp8 in ("a2a", "i8_a2a", "mx_a2a"):
+            return self._all_reduce_fp8(inp, out, shard_elems, wire_codec=wire_codec)
         compressed_ring = compressed_eligible and self._fp8 in (
             "ring",
             "i8_ring",
+            "mx_ring",
         )
         compressed_ag = compressed_eligible and self._fp8 in (
             "ag",
             "ring",
             "i8",
             "i8_ring",
+            "mx",
+            "mx_ring",
         )
-        quantize = ext.dma_quant_i8 if int8_wire else ext.dma_quant
-        dequantize_store = (
-            ext.dma_dequant_store_i8 if int8_wire else ext.dma_dequant_store
-        )
-        dequantize_add_quant = (
-            ext.dma_dequant_add_quant_i8
-            if int8_wire
-            else ext.dma_dequant_add_quant
-        )
+        if wire_codec == "i8":
+            quantize = ext.dma_quant_i8
+            dequantize_store = ext.dma_dequant_store_i8
+            dequantize_add_quant = ext.dma_dequant_add_quant_i8
+        elif wire_codec == "mx":
+            quantize = ext.dma_quant_mx
+            dequantize_store = ext.dma_dequant_store_mx
+            dequantize_add_quant = ext.dma_dequant_add_quant_mx
+        else:
+            quantize = ext.dma_quant
+            dequantize_store = ext.dma_dequant_store
+            dequantize_add_quant = ext.dma_dequant_add_quant
 
         base = out.data_ptr()
 
@@ -418,9 +457,7 @@ class PCIeDmaAllReduce:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
             compressed_reduce = compressed_ring and reduce_phase
-            compressed_step = compressed_reduce or (
-                compressed_ag and not reduce_phase
-            )
+            compressed_step = compressed_reduce or (compressed_ag and not reduce_phase)
             if compressed_step and k == world - 1:
                 # The AG-only mode quantizes the fully reduced owner chunk
                 # here.  The FP8 ring's fused final reduce hop already
@@ -578,7 +615,7 @@ class PCIeDmaAllReduce:
         out: torch.Tensor,
         shard_elems: int,
         *,
-        int8_wire: bool = False,
+        wire_codec: str = "e4m3",
     ) -> torch.Tensor:
         """Pipelined quantize-once compressed all-to-all.
 
@@ -594,13 +631,18 @@ class PCIeDmaAllReduce:
         """
 
         ext = self._ext
-        quantize = ext.dma_quant_i8 if int8_wire else ext.dma_quant
-        dequantize_accum = (
-            ext.dma_dequant_accum_i8 if int8_wire else ext.dma_dequant_accum
-        )
-        dequantize_store = (
-            ext.dma_dequant_store_i8 if int8_wire else ext.dma_dequant_store
-        )
+        if wire_codec == "i8":
+            quantize = ext.dma_quant_i8
+            dequantize_accum = ext.dma_dequant_accum_i8
+            dequantize_store = ext.dma_dequant_store_i8
+        elif wire_codec == "mx":
+            quantize = ext.dma_quant_mx
+            dequantize_accum = ext.dma_dequant_accum_mx
+            dequantize_store = ext.dma_dequant_store_mx
+        else:
+            quantize = ext.dma_quant
+            dequantize_accum = ext.dma_dequant_accum
+            dequantize_store = ext.dma_dequant_store
         world = self.world_size
         rank = self.rank
         shard_bytes = shard_elems * 2
