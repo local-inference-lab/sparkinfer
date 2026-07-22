@@ -57,6 +57,20 @@ def warp_reduce(
     return val
 
 
+def _nvvm_fmax_takes_result_type() -> bool:
+    # DSL <=4.5.x exposed ``nvvm.fmax(result_type, a, b, ...)`` on CUDA 12.9
+    # builds; DSL >=4.6.0 unified to ``nvvm.fmax(a, b, *, c=None, ...)`` and
+    # reports its bundled CTK as 12.9, so version sniffing misfires. Probe the
+    # actual signature once instead.
+    import inspect
+
+    params = list(inspect.signature(nvvm.fmax).parameters)
+    return bool(params) and params[0] not in ("a", "b")
+
+
+_NVVM_FMAX_RESULT_TYPE = _nvvm_fmax_takes_result_type()
+
+
 @dsl_user_op
 def fmax(
     a: float | Float32,
@@ -66,23 +80,15 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
+    args = (
+        Float32(a).ir_value(loc=loc, ip=ip),
+        Float32(b).ir_value(loc=loc, ip=ip),
+    )
+    if _NVVM_FMAX_RESULT_TYPE:
+        args = (T.f32(),) + args
     return Float32(
         nvvm.fmax(
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
+            *args,
             c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
             loc=loc,
             ip=ip,
