@@ -3507,25 +3507,25 @@ class W4A16GemmKernel:
                         (self.size_k // 16) * t256_half_n16 * t256_tile_u32
                     )
                     t256_plane_u32 = self.num_experts * t256_proj_expert_u32
-                    b_src_i32 = (
-                        t256_proj * Int32(t256_plane_u32)
-                        + expert_idx * Int32(t256_proj_expert_u32)
-                        + (tile_idx * Int32(self.cta_k_blocks) + t256_kt)
-                        * Int32(t256_half_n16 * t256_tile_u32)
-                        + t256_local_n16 * Int32(t256_tile_u32)
-                        + t256_in_kt * Int32(4)
+                    b_src_i64 = (
+                        Int64(t256_proj) * Int64(t256_plane_u32)
+                        + Int64(expert_idx) * Int64(t256_proj_expert_u32)
+                        + (Int64(tile_idx) * Int64(self.cta_k_blocks) + Int64(t256_kt))
+                        * Int64(t256_half_n16 * t256_tile_u32)
+                        + Int64(t256_local_n16) * Int64(t256_tile_u32)
+                        + Int64(t256_in_kt) * Int64(4)
                     )
                 else:
-                    b_src_i32 = (
-                        Int32(t256_expert_u32) * expert_idx
-                        + (tile_idx * Int32(self.cta_k_blocks) + t256_kt)
-                        * Int32(t256_n16 * t256_tile_u32)
-                        + output_n_tile * Int32(self.cta_n_blocks * t256_tile_u32)
-                        + t256_in_kt * Int32(4)
+                    b_src_i64 = (
+                        Int64(t256_expert_u32) * Int64(expert_idx)
+                        + (Int64(tile_idx) * Int64(self.cta_k_blocks) + Int64(t256_kt))
+                        * Int64(t256_n16 * t256_tile_u32)
+                        + Int64(output_n_tile) * Int64(self.cta_n_blocks * t256_tile_u32)
+                        + Int64(t256_in_kt) * Int64(4)
                     )
                 cp_async4_shared_global_pred(
                     b_dst,
-                    get_ptr_as_int64(b_i32_flat, b_src_i32),
+                    get_ptr_as_int64(b_i32_flat, b_src_i64),
                     (t256_chunk < Int32(t256_total_chunks)).to(Int32),
                 )
 

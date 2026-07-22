@@ -39,14 +39,14 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "Binding",
     "Caps",
     "Plan",
     "Weights",
-    "Binding",
+    "bind",
+    "clear_caches",
+    "is_supported",
     "plan",
     "prepare_weights",
-    "bind",
     "run",
-    "is_supported",
-    "clear_caches",
 ]
