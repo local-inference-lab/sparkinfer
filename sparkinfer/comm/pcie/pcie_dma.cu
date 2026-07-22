@@ -114,6 +114,8 @@ __global__ void __launch_bounds__(256, 1) add_kernel(T* __restrict__ dst,
 // summation precision rises versus the bf16 ring's per-hop bf16 adds.
 
 constexpr int kQuantBlock = 128;
+constexpr int kMxScaleBlock = 32;
+constexpr int kMxScalesPerBlock = kQuantBlock / kMxScaleBlock;
 constexpr float kFp8Max = 448.0f;
 constexpr float kInt8Max = 127.0f;
 
@@ -168,6 +170,25 @@ __device__ __forceinline__ void store_i8x4(
   *reinterpret_cast<char4*>(dst) = packed;
 }
 
+__device__ __forceinline__ unsigned char mxfp8_scale_byte(float amax) {
+  if (amax == 0.0f) return 127;
+  return __nv_cvt_float_to_e8m0(
+      amax / kFp8Max, __NV_SATFINITE, cudaRoundPosInf);
+}
+
+__device__ __forceinline__ float mxfp8_scale(unsigned char scale_byte) {
+  if (scale_byte == 0) return __uint_as_float(0x00400000U);
+  if (scale_byte == 255) return __uint_as_float(0x7fffffffU);
+  return __uint_as_float(static_cast<unsigned int>(scale_byte) << 23);
+}
+
+__device__ __forceinline__ float mxfp8_inv_scale(unsigned char scale_byte) {
+  if (scale_byte == 254) return __uint_as_float(0x00400000U);
+  if (scale_byte == 255) return __uint_as_float(0x7fffffffU);
+  return __uint_as_float(
+      static_cast<unsigned int>(254 - scale_byte) << 23);
+}
+
 // One warp per 128-element block: 4 elements per lane, warp amax, scale,
 // convert, store.
 __global__ void __launch_bounds__(256, 1) quant_kernel(
@@ -220,6 +241,41 @@ __global__ void __launch_bounds__(256, 1) quant_i8_kernel(
     if (lane == 0) scales[block] = scale;
     const float inv_scale = 1.0f / scale;
     store_i8x4(
+        payload + elem0,
+        make_float4(v.x * inv_scale, v.y * inv_scale,
+                    v.z * inv_scale, v.w * inv_scale));
+  }
+}
+
+// Standard MXFP8 wire layout: E4M3 values with one E8M0 scale per 32
+// elements. Four one-byte scales preserve the existing 132-byte envelope for
+// every 128 values.
+__global__ void __launch_bounds__(256, 1) quant_mx_kernel(
+    const nv_bfloat16* __restrict__ src,
+    __nv_fp8_e4m3* __restrict__ payload,
+    unsigned char* __restrict__ scales,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int scale_group = lane >> 3;
+  const int scale_lane = lane & 7;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const float4 v = load_bf16x4(src + elem0);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                       fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+      amax = fmaxf(
+          amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
+    }
+    const unsigned char scale_byte = mxfp8_scale_byte(amax);
+    if (scale_lane == 0) {
+      scales[block * kMxScalesPerBlock + scale_group] = scale_byte;
+    }
+    const float inv_scale = mxfp8_inv_scale(scale_byte);
+    store_fp8x4(
         payload + elem0,
         make_float4(v.x * inv_scale, v.y * inv_scale,
                     v.z * inv_scale, v.w * inv_scale));
@@ -281,6 +337,37 @@ __global__ void __launch_bounds__(256, 1) dequant_accum_i8_kernel(
   }
 }
 
+__global__ void __launch_bounds__(256, 1) dequant_accum_mx_kernel(
+    nv_bfloat16* __restrict__ out,
+    const nv_bfloat16* __restrict__ inp,
+    SrcPtrs payloads,
+    SrcPtrs scales,
+    int nsrc,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int scale_group = lane >> 3;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const long long scale_index = block * kMxScalesPerBlock + scale_group;
+    float4 acc = load_bf16x4(inp + elem0);
+    for (int j = 0; j < nsrc; ++j) {
+      const __nv_fp8_e4m3* p =
+          reinterpret_cast<const __nv_fp8_e4m3*>(payloads.ptrs[j]) + elem0;
+      const auto* scale_bytes =
+          reinterpret_cast<const unsigned char*>(scales.ptrs[j]);
+      const float scale = mxfp8_scale(scale_bytes[scale_index]);
+      const float4 v = load_fp8x4(p);
+      acc.x += v.x * scale;
+      acc.y += v.y * scale;
+      acc.z += v.z * scale;
+      acc.w += v.w * scale;
+    }
+    store_bf16x4(out + elem0, acc);
+  }
+}
+
 __global__ void __launch_bounds__(256, 1) dequant_store_kernel(
     nv_bfloat16* __restrict__ out,
     const __nv_fp8_e4m3* __restrict__ payload,
@@ -311,6 +398,26 @@ __global__ void __launch_bounds__(256, 1) dequant_store_i8_kernel(
     const long long elem0 = block * kQuantBlock + lane * 4;
     const float scale = scales[block];
     const float4 v = load_i8x4(payload + elem0);
+    store_bf16x4(
+        out + elem0,
+        make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale));
+  }
+}
+
+__global__ void __launch_bounds__(256, 1) dequant_store_mx_kernel(
+    nv_bfloat16* __restrict__ out,
+    const __nv_fp8_e4m3* __restrict__ payload,
+    const unsigned char* __restrict__ scales,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int scale_group = lane >> 3;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const float scale = mxfp8_scale(
+        scales[block * kMxScalesPerBlock + scale_group]);
+    const float4 v = load_fp8x4(payload + elem0);
     store_bf16x4(
         out + elem0,
         make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale));
@@ -387,6 +494,47 @@ __global__ void __launch_bounds__(256, 1) dequant_add_quant_i8_kernel(
     if (lane == 0) scales_out[block] = scale_out;
     const float inv_scale = 1.0f / scale_out;
     store_i8x4(
+        payload_out + elem0,
+        make_float4(v.x * inv_scale, v.y * inv_scale,
+                    v.z * inv_scale, v.w * inv_scale));
+    if constexpr (StoreBf16) store_bf16x4(out + elem0, v);
+  }
+}
+
+template <bool StoreBf16>
+__global__ void __launch_bounds__(256, 1) dequant_add_quant_mx_kernel(
+    nv_bfloat16* __restrict__ out,
+    const nv_bfloat16* __restrict__ local,
+    const __nv_fp8_e4m3* __restrict__ payload_in,
+    const unsigned char* __restrict__ scales_in,
+    __nv_fp8_e4m3* __restrict__ payload_out,
+    unsigned char* __restrict__ scales_out,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int scale_group = lane >> 3;
+  const int scale_lane = lane & 7;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const long long scale_index = block * kMxScalesPerBlock + scale_group;
+    const float scale_in = mxfp8_scale(scales_in[scale_index]);
+    const float4 a = load_bf16x4(local + elem0);
+    const float4 b = load_fp8x4(payload_in + elem0);
+    const float4 v = make_float4(
+        a.x + b.x * scale_in, a.y + b.y * scale_in,
+        a.z + b.z * scale_in, a.w + b.w * scale_in);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                       fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+      amax = fmaxf(
+          amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
+    }
+    const unsigned char scale_out = mxfp8_scale_byte(amax);
+    if (scale_lane == 0) scales_out[scale_index] = scale_out;
+    const float inv_scale = mxfp8_inv_scale(scale_out);
+    store_fp8x4(
         payload_out + elem0,
         make_float4(v.x * inv_scale, v.y * inv_scale,
                     v.z * inv_scale, v.w * inv_scale));
@@ -473,6 +621,18 @@ static void dma_quant_i8(int64_t src_ptr, int64_t payload_ptr,
       reinterpret_cast<float*>(scales_ptr), blocks);
 }
 
+static void dma_quant_mx(int64_t src_ptr, int64_t payload_ptr,
+                         int64_t scales_ptr, int64_t elems) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::quant_mx_kernel<<<_fp8_blocks_grid(blocks, threads), threads, 0,
+                              stream>>>(
+      reinterpret_cast<const nv_bfloat16*>(src_ptr),
+      reinterpret_cast<__nv_fp8_e4m3*>(payload_ptr),
+      reinterpret_cast<unsigned char*>(scales_ptr), blocks);
+}
+
 static void dma_dequant_accum(int64_t out_ptr, int64_t inp_ptr,
                               const std::vector<int64_t>& payload_ptrs,
                               const std::vector<int64_t>& scale_ptrs,
@@ -517,6 +677,28 @@ static void dma_dequant_accum_i8(
       static_cast<int>(payload_ptrs.size()), blocks);
 }
 
+static void dma_dequant_accum_mx(
+    int64_t out_ptr, int64_t inp_ptr,
+    const std::vector<int64_t>& payload_ptrs,
+    const std::vector<int64_t>& scale_ptrs, int64_t elems) {
+  TORCH_CHECK(payload_ptrs.size() == scale_ptrs.size());
+  TORCH_CHECK(payload_ptrs.size() <= 8);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  pcie_dma::SrcPtrs payloads{};
+  pcie_dma::SrcPtrs scales{};
+  for (size_t j = 0; j < payload_ptrs.size(); ++j) {
+    payloads.ptrs[j] = reinterpret_cast<const void*>(payload_ptrs[j]);
+    scales.ptrs[j] = reinterpret_cast<const void*>(scale_ptrs[j]);
+  }
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::dequant_accum_mx_kernel<<<
+      _fp8_blocks_grid(blocks, threads), threads, 0, stream>>>(
+      reinterpret_cast<nv_bfloat16*>(out_ptr),
+      reinterpret_cast<const nv_bfloat16*>(inp_ptr), payloads, scales,
+      static_cast<int>(payload_ptrs.size()), blocks);
+}
+
 static void dma_dequant_store(int64_t out_ptr, int64_t payload_ptr,
                               int64_t scales_ptr, int64_t elems) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -539,6 +721,18 @@ static void dma_dequant_store_i8(int64_t out_ptr, int64_t payload_ptr,
       reinterpret_cast<nv_bfloat16*>(out_ptr),
       reinterpret_cast<const signed char*>(payload_ptr),
       reinterpret_cast<const float*>(scales_ptr), blocks);
+}
+
+static void dma_dequant_store_mx(int64_t out_ptr, int64_t payload_ptr,
+                                 int64_t scales_ptr, int64_t elems) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::dequant_store_mx_kernel<<<_fp8_blocks_grid(blocks, threads), threads,
+                                      0, stream>>>(
+      reinterpret_cast<nv_bfloat16*>(out_ptr),
+      reinterpret_cast<const __nv_fp8_e4m3*>(payload_ptr),
+      reinterpret_cast<const unsigned char*>(scales_ptr), blocks);
 }
 
 static void dma_dequant_add_quant(
@@ -590,21 +784,54 @@ static void dma_dequant_add_quant_i8(
 #undef LAUNCH_DEQUANT_ADD_QUANT_I8
 }
 
+static void dma_dequant_add_quant_mx(
+    int64_t out_ptr, int64_t local_ptr, int64_t payload_in_ptr,
+    int64_t scales_in_ptr, int64_t payload_out_ptr, int64_t scales_out_ptr,
+    int64_t elems, bool store_bf16) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  const int grid = _fp8_blocks_grid(blocks, threads);
+#define LAUNCH_DEQUANT_ADD_QUANT_MX(STORE)                                  \
+  pcie_dma::dequant_add_quant_mx_kernel<STORE>                              \
+      <<<grid, threads, 0, stream>>>(                                       \
+          reinterpret_cast<nv_bfloat16*>(out_ptr),                          \
+          reinterpret_cast<const nv_bfloat16*>(local_ptr),                  \
+          reinterpret_cast<const __nv_fp8_e4m3*>(payload_in_ptr),           \
+          reinterpret_cast<const unsigned char*>(scales_in_ptr),            \
+          reinterpret_cast<__nv_fp8_e4m3*>(payload_out_ptr),                \
+          reinterpret_cast<unsigned char*>(scales_out_ptr), blocks)
+  if (store_bf16) {
+    LAUNCH_DEQUANT_ADD_QUANT_MX(true);
+  } else {
+    LAUNCH_DEQUANT_ADD_QUANT_MX(false);
+  }
+#undef LAUNCH_DEQUANT_ADD_QUANT_MX
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dma_quant", &dma_quant, "quantize bf16 to e4m3 with per-128 scales");
   m.def("dma_quant_i8", &dma_quant_i8,
         "quantize bf16 to signed int8 with per-128 scales");
+  m.def("dma_quant_mx", &dma_quant_mx,
+        "quantize bf16 to MXFP8 with per-32 E8M0 scales");
   m.def("dma_dequant_accum", &dma_dequant_accum,
         "out = inp + sum of dequantized sources (fp32 accumulate)");
   m.def("dma_dequant_accum_i8", &dma_dequant_accum_i8,
         "out = inp + sum of signed-int8 sources (fp32 accumulate)");
+  m.def("dma_dequant_accum_mx", &dma_dequant_accum_mx,
+        "out = inp + sum of MXFP8 sources (fp32 accumulate)");
   m.def("dma_dequant_store", &dma_dequant_store, "dequantize e4m3 to bf16");
   m.def("dma_dequant_store_i8", &dma_dequant_store_i8,
         "dequantize signed int8 to bf16");
+  m.def("dma_dequant_store_mx", &dma_dequant_store_mx,
+        "dequantize MXFP8 to bf16");
   m.def("dma_dequant_add_quant", &dma_dequant_add_quant,
         "add a BF16 contribution to an FP8 partial and requantize");
   m.def("dma_dequant_add_quant_i8", &dma_dequant_add_quant_i8,
         "add a BF16 contribution to an INT8 partial and requantize");
+  m.def("dma_dequant_add_quant_mx", &dma_dequant_add_quant_mx,
+        "add a BF16 contribution to an MXFP8 partial and requantize");
   m.def("dma_copy", &dma_copy, "CE peer copy on the current stream");
   m.def("dma_set_flag", &dma_set_flag, "publish a monotonic flag to a peer");
   m.def("dma_wait_flag", &dma_wait_flag, "wait for a monotonic peer flag");

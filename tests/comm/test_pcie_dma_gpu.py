@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce
+from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce, _load_extension
 
 
 pytestmark = pytest.mark.skipif(
@@ -122,7 +122,18 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", ["ag", "a2a", "ring", "i8", "i8_a2a", "i8_ring"]
+    "mode",
+    [
+        "ag",
+        "a2a",
+        "ring",
+        "i8",
+        "i8_a2a",
+        "i8_ring",
+        "mx",
+        "mx_a2a",
+        "mx_ring",
+    ],
 )
 def test_pcie_dma_all_reduce_compressed_wire(mode: str) -> None:
     if not torch.cuda.is_available():
@@ -138,3 +149,46 @@ def test_pcie_dma_all_reduce_compressed_wire(mode: str) -> None:
         nprocs=world_size,
         join=True,
     )
+
+
+def test_pcie_dma_mxfp8_codec_matches_cpu_reference() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    device = torch.device("cuda:0")
+    elems = 4 * 128
+    source = (
+        torch.sin(torch.arange(elems, device=device, dtype=torch.float32) * 0.07)
+        * torch.linspace(0.01, 900.0, elems, device=device)
+    ).to(torch.bfloat16)
+    source[17] = 1200.0
+    source[131] = -0.0002
+    storage = torch.empty(elems + elems // 32, dtype=torch.uint8, device=device)
+    output = torch.empty_like(source)
+
+    ext = _load_extension()
+    ext.dma_quant_mx(
+        source.data_ptr(), storage.data_ptr(), storage.data_ptr() + elems, elems
+    )
+    ext.dma_dequant_store_mx(
+        output.data_ptr(), storage.data_ptr(), storage.data_ptr() + elems, elems
+    )
+    torch.cuda.synchronize(device)
+
+    groups = source.float().cpu().reshape(-1, 32)
+    amax = groups.abs().amax(dim=1)
+    exponents = torch.where(
+        amax > 0,
+        torch.ceil(torch.log2(amax / 448.0)),
+        torch.zeros_like(amax),
+    ).clamp(-127, 127)
+    expected_scales = (exponents + 127).to(torch.uint8)
+    scale_values = torch.pow(2.0, exponents)
+    expected_payload = (groups / scale_values[:, None]).to(torch.float8_e4m3fn)
+    expected_output = (expected_payload.float() * scale_values[:, None]).reshape(-1)
+
+    actual_payload = storage[:elems].cpu()
+    actual_scales = storage[elems:].cpu()
+    assert torch.equal(actual_scales, expected_scales)
+    assert torch.equal(actual_payload, expected_payload.reshape(-1).view(torch.uint8))
+    assert torch.equal(output.cpu(), expected_output.to(torch.bfloat16))
