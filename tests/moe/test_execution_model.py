@@ -35,6 +35,7 @@ def _weight_plan(
     source_format: str,
     k: int = 128,
     n: int = 128,
+    num_experts: int = 32,
     w4a16_layout: PreparedWeightLayout | None = None,
 ):
     return plan_sparkinfer_fp4_moe_weights(
@@ -42,7 +43,7 @@ def _weight_plan(
         source_format=source_format,
         activation="silu",
         params_dtype=torch.bfloat16,
-        num_experts=32,
+        num_experts=num_experts,
         hidden_size=k,
         intermediate_size=n,
         w4a16_layout=w4a16_layout,
@@ -237,6 +238,33 @@ def test_workspace_plan_uses_weight_plan_source_contract() -> None:
 
     assert plan.spec.source_format == "fp4_e8m0_k32"
     assert plan.spec.source_weight_scale is ScaleEncoding.E8M0_K32
+
+
+def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8() -> None:
+    """The GLM decode M=8 case uses dynamic's atomic output contract."""
+
+    weights = _weight_plan(
+        "nvfp4",
+        source_format="modelopt_nvfp4",
+        k=6144,
+        n=2048 // 8,
+        num_experts=256,
+    )
+
+    plans = {
+        m: plan_tp_moe_execution(
+            num_tokens=m,
+            num_topk=8,
+            device=torch.device("cpu"),
+            weight_plan=weights,
+            quant_mode="nvfp4",
+        )
+        for m in (7, 8)
+    }
+
+    assert plans[7].implementation == "micro"
+    assert plans[8].implementation == "dynamic"
+    assert not plans[8].deterministic_output
 
 
 def test_native_w4a8_m1_alone_selects_fixed_materialized_regime(
