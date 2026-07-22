@@ -24,6 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [build-system]
