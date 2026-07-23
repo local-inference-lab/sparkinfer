@@ -1,4 +1,4 @@
-"""Public API for :mod:`sparkinfer.attention.mla_query`."""
+"""Public API for :mod:`sparkinfer.gemm.mla_query_projection`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 
 from ..._lib.gating import default_is_supported
-from ...gemm._bmm import _mxfp8
+from .._shared import mxfp8_bmm as _mxfp8
 from . import META
 
 
@@ -16,9 +16,9 @@ def run(
     q_nope: torch.Tensor,
     weight: tuple[torch.Tensor, torch.Tensor],
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
     out: torch.Tensor,
     *,
+    q_scale: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> torch.Tensor:
     """Assemble an MLA query into caller-owned ``out``.
@@ -26,13 +26,14 @@ def run(
     ``q_nope`` is head-major ``[H,M,192]``; ``weight`` is the N-major native
     MXFP8 ``W_UK_T`` pack; ``q_pe`` and ``out`` are token-major
     ``[M,H,64]`` and ``[M,H,576]``.  ``out`` may be BF16 or E4M3.
+    ``q_scale`` is required only for E4M3 output.
     """
-    return _mxfp8.mla_query(
+    return _mxfp8.mla_query_projection(
         q_nope,
         weight,
         q_pe,
-        q_scale,
         out,
+        q_scale=q_scale,
         b_major="n",
         sf_axis="n",
         stream=stream,
@@ -48,7 +49,7 @@ def prewarm(
     synchronize: bool = True,
 ) -> int:
     """Compile and first-launch each caller-declared graph-visible ``M``."""
-    return _mxfp8.prewarm_mla_query(
+    return _mxfp8.prewarm_mla_query_projection(
         weight,
         m_values,
         output_dtype=output_dtype,
@@ -69,7 +70,7 @@ def can_implement(
     device=None,
 ) -> bool:
     """Return whether the qualified fused-query specialization covers a plan."""
-    return is_supported(device) and _mxfp8.can_implement_mla_query(
+    return is_supported(device) and _mxfp8.can_implement_mla_query_projection(
         batch=num_heads,
         max_m=max_m,
         n=latent_dim,
@@ -86,7 +87,8 @@ def is_supported(device=None) -> bool:
 
 
 def clear_caches() -> None:
-    _mxfp8.clear_mla_query_caches()
+    """Clear compiled fused-query projection specializations."""
+    _mxfp8.clear_mla_query_projection_caches()
 
 
 __all__ = list(META.entry_points)

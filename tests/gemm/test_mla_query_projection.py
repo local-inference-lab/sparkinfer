@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention import mla_query
 from sparkinfer import gemm
+from sparkinfer.gemm import mla_query_projection
 from tests._reference.helpers import require_sparkinfer
 from tests.gemm.test_bmm import _make_pack, _rhs_views, _spec
 
@@ -73,7 +73,13 @@ def test_fused_query_matches_two_stage_reference(
         dtype=output_dtype,
     )
     out = backing[..., :576]
-    returned = mla_query.run(q_nope, weight, q_pe, q_scale, out)
+    returned = mla_query_projection.run(
+        q_nope,
+        weight,
+        q_pe,
+        out,
+        q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
+    )
 
     assert returned is out
     if output_dtype == torch.bfloat16:
@@ -86,12 +92,20 @@ def test_fused_query_matches_two_stage_reference(
 def test_fused_query_cuda_graph_replays_fresh_inputs(output_dtype: torch.dtype) -> None:
     require_sparkinfer()
     q_nope, weight, q_pe, q_scale = _inputs(num_heads=8, m=4)
-    assert mla_query.prewarm(weight, [4], output_dtype=output_dtype) == 1
+    assert mla_query_projection.prewarm(
+        weight, [4], output_dtype=output_dtype
+    ) == 1
     out = torch.empty(4, 8, 576, device="cuda", dtype=output_dtype)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        mla_query.run(q_nope, weight, q_pe, q_scale, out)
+        mla_query_projection.run(
+            q_nope,
+            weight,
+            q_pe,
+            out,
+            q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
+        )
 
     fresh_nope = torch.randn_like(q_nope)
     fresh_pe = torch.randn_like(q_pe)
@@ -122,11 +136,13 @@ def test_fused_query_support_gate_is_narrow() -> None:
         output_dtype=torch.bfloat16,
         device=device,
     )
-    assert mla_query.can_implement(**kwargs)
-    assert mla_query.can_implement(**{**kwargs, "output_dtype": torch.float8_e4m3fn})
-    assert not mla_query.can_implement(**{**kwargs, "num_heads": 11})
-    assert not mla_query.can_implement(**{**kwargs, "max_m": 33})
-    assert not mla_query.can_implement(**{**kwargs, "nope_dim": 256})
+    assert mla_query_projection.can_implement(**kwargs)
+    assert mla_query_projection.can_implement(
+        **{**kwargs, "output_dtype": torch.float8_e4m3fn}
+    )
+    assert not mla_query_projection.can_implement(**{**kwargs, "num_heads": 11})
+    assert not mla_query_projection.can_implement(**{**kwargs, "max_m": 33})
+    assert not mla_query_projection.can_implement(**{**kwargs, "nope_dim": 256})
 
 
 def test_fused_query_rejects_wrong_rope_layout() -> None:
@@ -135,4 +151,15 @@ def test_fused_query_rejects_wrong_rope_layout() -> None:
     out = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="q_pe must have shape"):
-        mla_query.run(q_nope, weight, q_pe[..., :32], q_scale, out)
+        mla_query_projection.run(q_nope, weight, q_pe[..., :32], out)
+
+
+def test_fused_query_requires_scale_only_for_fp8() -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe, _ = _inputs(num_heads=8, m=2)
+    out_bf16 = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
+    mla_query_projection.run(q_nope, weight, q_pe, out_bf16)
+
+    out_fp8 = torch.empty(2, 8, 576, device="cuda", dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="q_scale is required"):
+        mla_query_projection.run(q_nope, weight, q_pe, out_fp8)
