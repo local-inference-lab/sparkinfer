@@ -43,6 +43,7 @@ _OPS: tuple[str, ...] = (
     "attention.sparse_mla",
     "attention.compressed_mla",
     "attention.nsa_indexer",
+    "attention.mla_query",
     "attention.varlen",
     "comm.pcie",
     "gemm.blockscaled",

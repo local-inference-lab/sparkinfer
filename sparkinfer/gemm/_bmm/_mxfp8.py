@@ -81,6 +81,9 @@ _CTA_THREADS = 128  # 4 warps; each warp owns a 32-wide N slice of the tile.
 _MAX_M = 32
 _KERNEL_ID = "gemm.bmm.mxfp8"
 _KERNEL_VERSION = 1
+_MLA_QUERY_KERNEL_ID = "attention.mla_query.mxfp8"
+_MLA_QUERY_KERNEL_VERSION = 1
+_MLA_QUERY_ROPE_DIM = 64
 
 
 class _BMajor(IntEnum):
@@ -268,6 +271,160 @@ def pack_f32x2_to_bfloat2_rn(x0: Float32, x1: Float32, *, loc=None, ip=None) -> 
             ],
             "cvt.rn.bf16x2.f32 $0, $2, $1;",
             "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_global_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Load one naturally aligned uint32 from global memory."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_global_f32(base_ptr: Int64, *, loc=None, ip=None) -> Float32:
+    """Load one naturally aligned float32 from global memory."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_global_u16(base_ptr: Int64, value: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits of ``value`` to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.u16 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def reciprocal_rn_f32(value: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute the IEEE round-to-nearest float32 reciprocal used by vLLM."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 one; mov.f32 one, 0f3f800000; div.rn.f32 $0, one, $1; }",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def scale_bfloat2_to_e4m3x2(
+    packed: Uint32, inv_scale: Float32, *, loc=None, ip=None
+) -> Uint32:
+    """BF16 -> FP32 multiply -> saturated E4M3, matching static FP8 quant."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(packed).ir_value(loc=loc, ip=ip),
+                Float32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 b0, b1, e;
+                .reg .f32 f0, f1;
+                mov.b32 {b0, b1}, $1;
+                cvt.f32.bf16 f0, b0;
+                cvt.f32.bf16 f1, b1;
+                mul.rn.f32 f0, f0, $2;
+                mul.rn.f32 f1, f1, $2;
+                min.f32 f0, f0, 0f43e00000;
+                max.f32 f0, f0, 0fc3e00000;
+                min.f32 f1, f1, 0f43e00000;
+                max.f32 f1, f1, 0fc3e00000;
+                cvt.rn.satfinite.e4m3x2.f32 e, f1, f0;
+                cvt.u32.u16 $0, e;
+            }
+            """,
+            "=r,r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def round_f32x2_to_bf16_then_scale_e4m3x2(
+    x0: Float32, x1: Float32, inv_scale: Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Preserve the existing BF16 BMM epilogue before static FP8 quantization."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(x0).ir_value(loc=loc, ip=ip),
+                Float32(x1).ir_value(loc=loc, ip=ip),
+                Float32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b32 packed;
+                .reg .b16 b0, b1, e;
+                .reg .f32 f0, f1;
+                cvt.rn.bf16x2.f32 packed, $2, $1;
+                mov.b32 {b0, b1}, packed;
+                cvt.f32.bf16 f0, b0;
+                cvt.f32.bf16 f1, b1;
+                mul.rn.f32 f0, f0, $3;
+                mul.rn.f32 f1, f1, $3;
+                min.f32 f0, f0, 0f43e00000;
+                max.f32 f0, f0, 0fc3e00000;
+                min.f32 f1, f1, 0f43e00000;
+                max.f32 f1, f1, 0fc3e00000;
+                cvt.rn.satfinite.e4m3x2.f32 e, f1, f0;
+                cvt.u32.u16 $0, e;
+            }
+            """,
+            "=r,f,f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -878,6 +1035,308 @@ class _Mxfp8Kernel:
                     )
 
 
+class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
+    """MXFP8 absorbed-query BMM with a query-assembly epilogue.
+
+    The GEMM accumulator is rounded through BF16 exactly as in ``bmm``.  The
+    BF16 output mode then writes that result and the existing RoPE query into a
+    caller-owned token-major ``[M,H,576]`` workspace.  The FP8 mode additionally
+    applies vLLM's static per-tensor E4M3 quantization in the same launch.
+    """
+
+    def __init__(self, *, output_fp8: bool, **kwargs):
+        super().__init__(**kwargs)
+        self.output_fp8 = bool(output_fp8)
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (*super().__cache_key__, self.output_fp8)
+
+    @cute.jit
+    def __call__(
+        self,
+        a_ptr: cute.Pointer,  # bf16 A [H, M, K]
+        b_ptr: cute.Pointer,  # u8 values [H,K,N]
+        s_ptr: cute.Pointer,  # u8 scales [H,K,N/32]
+        q_pe_ptr: cute.Pointer,  # bf16 RoPE query [M,H,64]
+        q_scale_ptr: cute.Pointer,  # f32 scalar; ignored for BF16 output
+        out_ptr: cute.Pointer,  # bf16/fp8 assembled query [M,H,N+64]
+        a_stride_g: cutlass.Int64,
+        a_stride_m: cutlass.Int64,
+        b_stride_g: cutlass.Int64,
+        b_stride_row: cutlass.Int64,
+        s_stride_g: cutlass.Int64,
+        s_stride_row: cutlass.Int64,
+        q_pe_stride_m: cutlass.Int64,
+        q_pe_stride_g: cutlass.Int64,
+        out_stride_m: cutlass.Int64,
+        out_stride_g: cutlass.Int64,
+        stream: cuda.CUstream,
+    ):
+        a_span = (
+            Int64(self.groups - 1) * a_stride_g
+            + Int64(self.m - 1) * a_stride_m
+            + Int64(self.gemm_k)
+        )
+        b_span = (
+            Int64(self.groups - 1) * b_stride_g
+            + Int64(self.physical_rows - 1) * b_stride_row
+            + Int64(self.physical_cols)
+        )
+        s_span = (
+            Int64(self.groups - 1) * s_stride_g
+            + Int64(self.physical_rows - 1) * s_stride_row
+            + Int64(self.scale_cols)
+        )
+        q_pe_span = (
+            Int64(self.m - 1) * q_pe_stride_m
+            + Int64(self.groups - 1) * q_pe_stride_g
+            + Int64(_MLA_QUERY_ROPE_DIM)
+        )
+        out_span = (
+            Int64(self.m - 1) * out_stride_m
+            + Int64(self.groups - 1) * out_stride_g
+            + Int64(self.gemm_n + _MLA_QUERY_ROPE_DIM)
+        )
+        a_flat = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((a_span,), stride=(1,))
+        )
+        b_flat = cute.make_tensor(
+            b_ptr, layout=cute.make_layout((b_span,), stride=(1,))
+        )
+        s_flat = cute.make_tensor(
+            s_ptr, layout=cute.make_layout((s_span,), stride=(1,))
+        )
+        q_pe_flat = cute.make_tensor(
+            q_pe_ptr, layout=cute.make_layout((q_pe_span,), stride=(1,))
+        )
+        q_scale = cute.make_tensor(
+            q_scale_ptr, layout=cute.make_layout((1,), stride=(1,))
+        )
+        out_flat = cute.make_tensor(
+            out_ptr, layout=cute.make_layout((out_span,), stride=(1,))
+        )
+        self.kernel_mla_query(
+            a_flat,
+            b_flat,
+            s_flat,
+            q_pe_flat,
+            q_scale,
+            out_flat,
+            a_stride_g,
+            a_stride_m,
+            b_stride_g,
+            b_stride_row,
+            s_stride_g,
+            s_stride_row,
+            q_pe_stride_m,
+            q_pe_stride_g,
+            out_stride_m,
+            out_stride_g,
+        ).launch(
+            grid=(self.grid_x, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel_mla_query(
+        self,
+        a_flat: cute.Tensor,
+        b_flat: cute.Tensor,
+        s_flat: cute.Tensor,
+        q_pe_flat: cute.Tensor,
+        q_scale: cute.Tensor,
+        out_flat: cute.Tensor,
+        a_stride_g: cutlass.Int64,
+        a_stride_m: cutlass.Int64,
+        b_stride_g: cutlass.Int64,
+        b_stride_row: cutlass.Int64,
+        s_stride_g: cutlass.Int64,
+        s_stride_row: cutlass.Int64,
+        q_pe_stride_m: cutlass.Int64,
+        q_pe_stride_g: cutlass.Int64,
+        out_stride_m: cutlass.Int64,
+        out_stride_g: cutlass.Int64,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.smem_words],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        group = cta // Int32(self.n_tiles)
+        jt = cta - group * Int32(self.n_tiles)
+
+        acc = cute.make_rmem_tensor((self.m_blocks, 4, 4), cutlass.Float32)
+        acc.fill(0.0)
+        a_regs = cute.make_rmem_tensor((self.m_blocks, 4), Uint32)
+
+        for stage in cutlass.range_constexpr(self.stages - 1):
+            self._stage_tile(
+                a_flat,
+                b_flat,
+                s_flat,
+                smem_base,
+                tid,
+                group,
+                jt,
+                Int32(stage),
+                Int32(stage),
+                a_stride_g,
+                a_stride_m,
+                b_stride_g,
+                b_stride_row,
+                s_stride_g,
+                s_stride_row,
+            )
+
+        kt = Int32(0)
+        while kt < Int32(self.k_tiles):
+            cute.arch.cp_async_wait_group(self.stages - 2)
+            cute.arch.sync_threads()
+            slot = kt % Int32(self.stages)
+            self._consume_tile(smem_base, tid, slot, acc, a_regs)
+            next_kt = kt + Int32(self.stages - 1)
+            if next_kt < Int32(self.k_tiles):
+                self._stage_tile(
+                    a_flat,
+                    b_flat,
+                    s_flat,
+                    smem_base,
+                    tid,
+                    group,
+                    jt,
+                    next_kt,
+                    next_kt % Int32(self.stages),
+                    a_stride_g,
+                    a_stride_m,
+                    b_stride_g,
+                    b_stride_row,
+                    s_stride_g,
+                    s_stride_row,
+                )
+            else:
+                cute.arch.cp_async_commit_group()
+            kt += Int32(1)
+
+        self._store_mla_query_output(
+            q_pe_flat,
+            q_scale,
+            out_flat,
+            tid,
+            group,
+            jt,
+            acc,
+            q_pe_stride_m,
+            q_pe_stride_g,
+            out_stride_m,
+            out_stride_g,
+        )
+
+    @cute.jit
+    def _store_mla_query_output(
+        self,
+        q_pe_flat: cute.Tensor,
+        q_scale: cute.Tensor,
+        out_flat: cute.Tensor,
+        tid: Int32,
+        group: Int32,
+        jt: Int32,
+        acc: cute.Tensor,
+        q_pe_stride_m: Int64,
+        q_pe_stride_g: Int64,
+        out_stride_m: Int64,
+        out_stride_g: Int64,
+    ):
+        lane = tid & Int32(31)
+        warp = tid // Int32(32)
+        lane_group = lane // Int32(4)
+        lane_in_group = lane - lane_group * Int32(4)
+        col0 = jt * Int32(self.tile_n) + warp * Int32(32) + lane_in_group * Int32(2)
+        out_group = Int64(group) * out_stride_g
+
+        inv_scale = Float32(1.0)
+        if cutlass.const_expr(self.output_fp8):
+            inv_scale = reciprocal_rn_f32(
+                ld_global_f32(get_ptr_as_int64(q_scale, Int64(0)))
+            )
+
+        for mb in cutlass.range_constexpr(self.m_blocks):
+            row0 = Int32(16 * mb) + lane_group
+            row1 = row0 + Int32(8)
+            for jj in cutlass.range_constexpr(4):
+                col = col0 + Int32(8 * jj)
+                if row0 < Int32(self.m):
+                    off = Int64(row0) * out_stride_m + out_group + Int64(col)
+                    if cutlass.const_expr(self.output_fp8):
+                        st_global_u16(
+                            get_ptr_as_int64(out_flat, off),
+                            round_f32x2_to_bf16_then_scale_e4m3x2(
+                                acc[mb, jj, 0], acc[mb, jj, 1], inv_scale
+                            ),
+                        )
+                    else:
+                        st_global_u32(
+                            get_ptr_as_int64(out_flat, off),
+                            pack_f32x2_to_bfloat2_rn(acc[mb, jj, 0], acc[mb, jj, 1]),
+                        )
+                if row1 < Int32(self.m):
+                    off = Int64(row1) * out_stride_m + out_group + Int64(col)
+                    if cutlass.const_expr(self.output_fp8):
+                        st_global_u16(
+                            get_ptr_as_int64(out_flat, off),
+                            round_f32x2_to_bf16_then_scale_e4m3x2(
+                                acc[mb, jj, 2], acc[mb, jj, 3], inv_scale
+                            ),
+                        )
+                    else:
+                        st_global_u32(
+                            get_ptr_as_int64(out_flat, off),
+                            pack_f32x2_to_bfloat2_rn(acc[mb, jj, 2], acc[mb, jj, 3]),
+                        )
+
+        # Exactly one N tile copies the 64-d RoPE suffix for this head.
+        if jt == Int32(0):
+            pair_count = self.m * (_MLA_QUERY_ROPE_DIM // 2)
+            for iteration in cutlass.range_constexpr(
+                (pair_count + self.cta_threads - 1) // self.cta_threads
+            ):
+                pair_idx = Int32(iteration * self.cta_threads) + tid
+                if pair_idx < Int32(pair_count):
+                    row = pair_idx // Int32(_MLA_QUERY_ROPE_DIM // 2)
+                    pair = pair_idx - row * Int32(_MLA_QUERY_ROPE_DIM // 2)
+                    q_off = (
+                        Int64(row) * q_pe_stride_m
+                        + Int64(group) * q_pe_stride_g
+                        + Int64(pair) * Int64(2)
+                    )
+                    out_off = (
+                        Int64(row) * out_stride_m
+                        + out_group
+                        + Int64(self.gemm_n)
+                        + Int64(pair) * Int64(2)
+                    )
+                    packed = ld_global_u32(get_ptr_as_int64(q_pe_flat, q_off))
+                    if cutlass.const_expr(self.output_fp8):
+                        st_global_u16(
+                            get_ptr_as_int64(out_flat, out_off),
+                            scale_bfloat2_to_e4m3x2(packed, inv_scale),
+                        )
+                    else:
+                        st_global_u32(get_ptr_as_int64(out_flat, out_off), packed)
+
+
 # ---------------------------------------------------------------------------
 # Host-side compile cache + launch.
 # ---------------------------------------------------------------------------
@@ -890,6 +1349,7 @@ class _Mxfp8Launch:
 
 
 _LAUNCH_CACHE: dict[tuple[object, ...], _Mxfp8Launch] = {}
+_MLA_QUERY_LAUNCH_CACHE: dict[tuple[object, ...], _Mxfp8Launch] = {}
 _QUALIFIED_BATCHES = frozenset((8, 16))
 _QUALIFIED_GEOMETRIES = {
     _BMajor.N: (192, 512),
@@ -993,6 +1453,103 @@ def _compile(
     )
     launch = _Mxfp8Launch(compiled=compiled, kernel=kernel)
     _LAUNCH_CACHE[cache_key] = launch
+    return launch
+
+
+def _compile_mla_query(
+    *,
+    b_major: _BMajor,
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    output_fp8: bool,
+    device: torch.device,
+) -> _Mxfp8Launch:
+    device_index = int(device.index if device.index is not None else 0)
+    tile_m = _tile_m_for_m(m)
+    cache_key = (
+        _MLA_QUERY_KERNEL_ID,
+        int(b_major),
+        int(groups),
+        int(m),
+        int(n),
+        int(k),
+        bool(output_fp8),
+        device_index,
+        (tile_m, _TILE_N, _TILE_K, _STAGES, _CTA_THREADS),
+    )
+    cached = _MLA_QUERY_LAUNCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MLA query compile miss during CUDA-graph capture for "
+            f"B={groups}, M={m}, N={n}, K={k}, output_fp8={output_fp8}. "
+            "Precompile every graph-visible M with prewarm_mla_query(...)."
+        )
+
+    kernel = _Mxfp8MlaQueryKernel(
+        output_fp8=output_fp8,
+        b_major=b_major,
+        groups=groups,
+        m=m,
+        n=n,
+        k=k,
+        tile_n=_TILE_N,
+        tile_k=_TILE_K,
+        stages=_STAGES,
+    )
+
+    def dummy(dt, align=16):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+    output_dtype = cutlass.Float8E4M3FN if output_fp8 else cutlass.BFloat16
+    output_align = 2 if output_fp8 else 4
+    compiled = sparkinfer_compile(
+        kernel,
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8, align=4),
+        dummy(cutlass.BFloat16, align=4),
+        dummy(cutlass.Float32, align=4),
+        dummy(output_dtype, align=output_align),
+        Int64(kernel.gemm_k),
+        Int64(kernel.gemm_k),
+        Int64(kernel.physical_cols),
+        Int64(kernel.physical_cols),
+        Int64(kernel.scale_cols),
+        Int64(kernel.scale_cols),
+        Int64(kernel.groups * _MLA_QUERY_ROPE_DIM),
+        Int64(_MLA_QUERY_ROPE_DIM),
+        Int64(kernel.groups * (kernel.gemm_n + _MLA_QUERY_ROPE_DIM)),
+        Int64(kernel.gemm_n + _MLA_QUERY_ROPE_DIM),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_facts(
+            _MLA_QUERY_KERNEL_ID,
+            _MLA_QUERY_KERNEL_VERSION,
+            ("device_index", device_index),
+            ("a_dtype", "bfloat16"),
+            ("b_dtype", "float8_e4m3fn"),
+            ("sf_dtype", "float8_e8m0fnu"),
+            ("output_dtype", "float8_e4m3fn" if output_fp8 else "bfloat16"),
+            ("b_major", b_major.name.lower()),
+            ("groups", int(groups)),
+            ("m", int(m)),
+            ("n", int(n)),
+            ("k", int(k)),
+            ("rope_dim", int(_MLA_QUERY_ROPE_DIM)),
+            ("tile_m", int(tile_m)),
+            ("tile_n", int(_TILE_N)),
+            ("tile_k", int(_TILE_K)),
+            ("stages", int(_STAGES)),
+            ("cta_threads", int(_CTA_THREADS)),
+            ("grid_x", int(kernel.grid_x)),
+        ),
+    )
+    launch = _Mxfp8Launch(compiled=compiled, kernel=kernel)
+    _MLA_QUERY_LAUNCH_CACHE[cache_key] = launch
     return launch
 
 
@@ -1271,6 +1828,217 @@ def _run(
     )
 
 
+def _check_mla_query_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, int, int],
+    dtype: torch.dtype,
+    ptr_align: int,
+    stride_mod: int,
+) -> None:
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+    if tensor.stride(2) != 1:
+        raise ValueError(f"{name} inner dim must be contiguous")
+    if tensor.stride(0) <= 0 or tensor.stride(1) <= 0:
+        raise ValueError(
+            f"{name} outer strides must be positive, got {tensor.stride()}"
+        )
+    if tensor.stride(0) % stride_mod or tensor.stride(1) % stride_mod:
+        raise ValueError(
+            f"{name} outer strides {tensor.stride(0)}/{tensor.stride(1)} must "
+            f"be multiples of {stride_mod} elements"
+        )
+    if tensor.data_ptr() % ptr_align:
+        raise ValueError(f"{name} base pointer must be {ptr_align}-byte aligned")
+    if _has_internal_overlap(tensor):
+        raise ValueError(f"{name} must not have internal storage overlap")
+
+
+def _validate_mla_query_launch(
+    a: torch.Tensor,
+    b_values: torch.Tensor,
+    b_scales: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    b_major: str | _BMajor | int,
+    sf_axis: str,
+) -> tuple[_BMajor, int, int, int, int, bool]:
+    major, b_groups, n, b_k = _rhs_geometry(
+        b_values, b_scales, b_major=b_major, sf_axis=sf_axis
+    )
+    if major is not _BMajor.N:
+        raise NotImplementedError(
+            "the fused MLA query epilogue requires b_major='n', "
+            f"got {major.name.lower()!r}"
+        )
+    if a.ndim != 3:
+        raise ValueError(f"lhs must have shape [H,M,K], got {tuple(a.shape)}")
+    groups, m, k = map(int, a.shape)
+    if groups != b_groups or k != b_k:
+        raise ValueError(
+            "lhs and rhs head/K dimensions must match: "
+            f"lhs is [H,M,K]=[{groups},{m},{k}], rhs implies "
+            f"H={b_groups}, K={b_k}"
+        )
+    if n != 512:
+        raise NotImplementedError(
+            f"the fused MLA query epilogue requires N=512, got {n}"
+        )
+
+    output_fp8 = out.dtype == torch.float8_e4m3fn
+    if not output_fp8 and out.dtype != torch.bfloat16:
+        raise ValueError(
+            f"assembled query output must be bfloat16 or float8_e4m3fn, got {out.dtype}"
+        )
+    _check_operand("lhs", a, shape=(groups, m, k), stride_mod=8, ptr_align=16)
+    _check_mla_query_tensor(
+        "q_pe",
+        q_pe,
+        shape=(m, groups, _MLA_QUERY_ROPE_DIM),
+        dtype=torch.bfloat16,
+        ptr_align=4,
+        stride_mod=2,
+    )
+    _check_mla_query_tensor(
+        "out",
+        out,
+        shape=(m, groups, n + _MLA_QUERY_ROPE_DIM),
+        dtype=out.dtype,
+        ptr_align=2 if output_fp8 else 4,
+        stride_mod=2,
+    )
+    _validate_rhs_storage(b_values, b_scales)
+    if q_scale.dtype != torch.float32 or q_scale.numel() != 1:
+        raise ValueError(
+            "q_scale must be a scalar float32 tensor, "
+            f"got shape={tuple(q_scale.shape)}, dtype={q_scale.dtype}"
+        )
+    if q_scale.data_ptr() % 4:
+        raise ValueError("q_scale base pointer must be 4-byte aligned")
+
+    tensors = (a, b_values, b_scales, q_pe, q_scale, out)
+    if not all(tensor.is_cuda for tensor in tensors):
+        raise ValueError("MLA query operands must be CUDA tensors")
+    if any(tensor.device != a.device for tensor in tensors[1:]):
+        raise ValueError("MLA query operands must be on the same CUDA device")
+    if not _geometry_is_qualified(b_major=major, groups=groups, m=m, n=n, k=k):
+        raise NotImplementedError(
+            "the fused MLA query specialization is qualified for "
+            "[H,K,N]=[8|16,192,512] with 1<=M<=32; "
+            f"got H={groups}, M={m}, N={n}, K={k}"
+        )
+    for source_name, source in (
+        ("lhs", a),
+        ("rhs values", b_values),
+        ("rhs scales", b_scales),
+        ("q_pe", q_pe),
+        ("q_scale", q_scale),
+    ):
+        if _overlaps(out, source):
+            raise ValueError(f"out must not overlap {source_name}")
+    return major, groups, m, n, k, output_fp8
+
+
+def _run_mla_query(
+    a: torch.Tensor,
+    b_values: torch.Tensor,
+    b_scales: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    b_major: str | _BMajor | int,
+    sf_axis: str,
+    stream: Optional[int] = None,
+) -> None:
+    major, groups, m, n, k, output_fp8 = _validate_mla_query_launch(
+        a,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
+        out,
+        b_major=b_major,
+        sf_axis=sf_axis,
+    )
+    launch = _compile_mla_query(
+        b_major=major,
+        groups=groups,
+        m=m,
+        n=n,
+        k=k,
+        output_fp8=output_fp8,
+        device=a.device,
+    )
+
+    if stream is not None:
+        launch_stream = (
+            torch.cuda.default_stream(a.device)
+            if int(stream) == 0
+            else torch.cuda.ExternalStream(int(stream), device=a.device)
+        )
+        for tensor in (a, b_values, b_scales, q_pe, q_scale, out):
+            tensor.record_stream(launch_stream)
+    stream_int = (
+        int(stream)
+        if stream is not None
+        else torch.cuda.current_stream(a.device).cuda_stream
+    )
+    output_dtype = cutlass.Float8E4M3FN if output_fp8 else cutlass.BFloat16
+    launch.compiled(
+        make_ptr(
+            cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            b_values.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            b_scales.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.BFloat16,
+            q_pe.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            q_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            output_dtype,
+            out.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=2 if output_fp8 else 4,
+        ),
+        Int64(int(a.stride(0))),
+        Int64(int(a.stride(1))),
+        Int64(int(b_values.stride(0))),
+        Int64(int(b_values.stride(1))),
+        Int64(int(b_scales.stride(0))),
+        Int64(int(b_scales.stride(1))),
+        Int64(int(q_pe.stride(0))),
+        Int64(int(q_pe.stride(1))),
+        Int64(int(out.stride(0))),
+        Int64(int(out.stride(1))),
+        cuda.CUstream(stream_int),
+    )
+
+
 # ---------------------------------------------------------------------------
 # One opaque, out-mutating custom op for this private dtype specialization.
 # The public API selects it from dtype/layout metadata before crossing the
@@ -1312,6 +2080,46 @@ def _fake(
     return None
 
 
+@torch.library.custom_op("sparkinfer::mla_query_mxfp8", mutates_args=("out",))
+def _mla_query_op(
+    lhs: torch.Tensor,
+    b_values: torch.Tensor,
+    b_scales: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+    b_major: int,
+    stream_int: Optional[int] = None,
+) -> None:
+    major = _coerce_b_major(b_major)
+    _run_mla_query(
+        lhs,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
+        out,
+        b_major=major,
+        sf_axis=major.name.lower(),
+        stream=stream_int,
+    )
+
+
+@_mla_query_op.register_fake
+def _mla_query_fake(
+    lhs: torch.Tensor,
+    b_values: torch.Tensor,
+    b_scales: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+    b_major: int,
+    stream_int: Optional[int] = None,
+) -> None:
+    del lhs, b_values, b_scales, q_pe, q_scale, out, b_major, stream_int
+    return None
+
+
 def mm(
     lhs: torch.Tensor,
     rhs: tuple[torch.Tensor, torch.Tensor],
@@ -1335,6 +2143,40 @@ def mm(
         lhs,
         b_values,
         b_scales,
+        out,
+        int(major),
+        stream_int,
+    )
+    return out
+
+
+def mla_query(
+    lhs: torch.Tensor,
+    rhs: tuple[torch.Tensor, torch.Tensor],
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    b_major: str = "n",
+    sf_axis: str = "n",
+    stream: Optional[object] = None,
+) -> torch.Tensor:
+    """Launch the fused absorbed-query BMM and query-assembly epilogue."""
+    b_values, b_scales = _rhs_tensors(rhs)
+    major, _, _, _ = _rhs_geometry(b_values, b_scales, b_major=b_major, sf_axis=sf_axis)
+    stream_int = None
+    if stream is not None:
+        if not b_values.is_cuda or not b_scales.is_cuda:
+            raise ValueError("MLA query RHS tensors must be CUDA tensors")
+        if b_values.device != b_scales.device:
+            raise ValueError("MLA query RHS tensors must be on the same CUDA device")
+        stream_int = int(_torch_stream(stream, b_values.device).cuda_stream)
+    torch.ops.sparkinfer.mla_query_mxfp8(
+        lhs,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
         out,
         int(major),
         stream_int,
@@ -1438,6 +2280,84 @@ def prewarm(
     return len(unique_m)
 
 
+def prewarm_mla_query(
+    rhs: tuple[torch.Tensor, torch.Tensor],
+    m_values: Iterable[int],
+    *,
+    output_dtype: torch.dtype,
+    b_major: str = "n",
+    sf_axis: str = "n",
+    stream: Optional[object] = None,
+    synchronize: bool = True,
+) -> int:
+    """Compile and first-launch each graph-visible fused-query specialization."""
+    if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            f"output_dtype must be bfloat16 or float8_e4m3fn, got {output_dtype}"
+        )
+    b_values, b_scales = _rhs_tensors(rhs)
+    major, groups, n, k = _rhs_geometry(
+        b_values, b_scales, b_major=b_major, sf_axis=sf_axis
+    )
+    _validate_rhs_storage(b_values, b_scales)
+    unique_m: list[int] = []
+    seen: set[int] = set()
+    for raw_m in m_values:
+        m = int(raw_m)
+        if m not in seen:
+            unique_m.append(m)
+            seen.add(m)
+    for m in unique_m:
+        if not can_implement_mla_query(
+            batch=groups,
+            max_m=m,
+            n=n,
+            k=k,
+            output_dtype=output_dtype,
+            b_major=major.name.lower(),
+            sf_axis=major.name.lower(),
+        ):
+            raise NotImplementedError(
+                "the fused MLA query specialization cannot prewarm "
+                f"H={groups}, M={m}, N={n}, K={k}, "
+                f"output_dtype={output_dtype}"
+            )
+    device = b_values.device
+    torch_stream = _torch_stream(stream, device)
+    stream_int = int(torch_stream.cuda_stream)
+    with torch.cuda.stream(torch_stream):
+        q_scale = torch.ones(1, dtype=torch.float32, device=device)
+        for m in unique_m:
+            lhs = torch.zeros((groups, m, k), dtype=torch.bfloat16, device=device)
+            q_pe = torch.zeros(
+                (m, groups, _MLA_QUERY_ROPE_DIM),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            out = torch.empty(
+                (m, groups, n + _MLA_QUERY_ROPE_DIM),
+                dtype=output_dtype,
+                device=device,
+            )
+            torch.ops.sparkinfer.mla_query_mxfp8(
+                lhs,
+                b_values,
+                b_scales,
+                q_pe,
+                q_scale,
+                out,
+                int(major),
+                stream_int,
+            )
+            lhs.record_stream(torch_stream)
+            q_pe.record_stream(torch_stream)
+            out.record_stream(torch_stream)
+        q_scale.record_stream(torch_stream)
+    if synchronize:
+        torch_stream.synchronize()
+    return len(unique_m)
+
+
 def can_implement(
     *,
     batch: int,
@@ -1463,13 +2383,53 @@ def can_implement(
     )
 
 
+def can_implement_mla_query(
+    *,
+    batch: int,
+    max_m: int,
+    n: int,
+    k: int,
+    output_dtype: torch.dtype,
+    b_major: str = "n",
+    sf_axis: str = "n",
+) -> bool:
+    """Return whether the fused absorbed-query epilogue covers a geometry."""
+    try:
+        major = _coerce_b_major(b_major)
+    except ValueError:
+        return False
+    return (
+        major is _BMajor.N
+        and isinstance(sf_axis, str)
+        and sf_axis.lower() == "n"
+        and int(n) == 512
+        and output_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and _geometry_is_qualified(
+            b_major=major,
+            groups=int(batch),
+            m=int(max_m),
+            n=int(n),
+            k=int(k),
+        )
+    )
+
+
 def clear_caches() -> None:
     _LAUNCH_CACHE.clear()
+    _MLA_QUERY_LAUNCH_CACHE.clear()
+
+
+def clear_mla_query_caches() -> None:
+    _MLA_QUERY_LAUNCH_CACHE.clear()
 
 
 __all__ = [
     "can_implement",
+    "can_implement_mla_query",
     "clear_caches",
+    "clear_mla_query_caches",
+    "mla_query",
     "mm",
     "prewarm",
+    "prewarm_mla_query",
 ]
