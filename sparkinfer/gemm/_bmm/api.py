@@ -8,8 +8,8 @@ from typing import Literal, Optional
 import torch
 
 from ..._lib.gating import default_is_supported
+from .._shared import mxfp8_bmm as _mxfp8
 from . import META
-from . import _mxfp8
 
 _MXFP8_SPECIALIZATION = (
     "bfloat16",

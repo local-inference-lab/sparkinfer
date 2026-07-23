@@ -1,4 +1,4 @@
-"""Fused SM12x MLA absorbed-query assembly.
+"""Fused SM12x MLA absorbed-query projection and assembly.
 
 The operation multiplies BF16 ``q_nope`` by the native rowwise-MXFP8
 ``W_UK_T`` pack and writes the result directly into a token-major MLA query.
@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
-    name="mla_query",
-    group="attention",
+    name="mla_query_projection",
+    group="gemm",
     api_style="oneshot",
     entry_points=(
         "run",
@@ -26,13 +26,16 @@ META = OpMeta(
         "clear_caches",
     ),
     dtypes=("bf16", "fp8_e4m3"),
-    recipes=("glm_nsa",),
+    recipes=("mxfp8", "glm_nsa"),
     provenance=Provenance(
         repo="https://github.com/local-inference-lab/sparkinfer",
-        commit="1a88b389",
-        paths=("sparkinfer/gemm/_bmm/_mxfp8.py",),
+        commit="982d7319",
+        paths=(
+            "sparkinfer/attention/mla_query/",
+            "sparkinfer/gemm/_bmm/_mxfp8.py",
+        ),
     ),
-    test_path="tests/attention/test_mla_query.py",
+    test_path="tests/gemm/test_mla_query_projection.py",
     since="1.0.1",
     notes="Fused MXFP8 query BMM, RoPE append, and optional static E4M3 quant.",
 )

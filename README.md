@@ -21,7 +21,7 @@ JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `sparkinfer.<group>.<op>` (15 total; `list_ops()`
+Every kernel is one op at `sparkinfer.<group>.<op>` (16 total; `list_ops()`
 enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.
@@ -29,7 +29,8 @@ kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 **`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
 out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
 (`gemm.mxfp8_linear`), 128×128 block-FP8 (`gemm.block_fp8_linear`), and the
-grouped WO-projection (`gemm.wo_projection`) used by MLA attention output.
+fused MLA query projection (`gemm.mla_query_projection`) and grouped
+WO-projection (`gemm.wo_projection`) used around MLA attention.
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and

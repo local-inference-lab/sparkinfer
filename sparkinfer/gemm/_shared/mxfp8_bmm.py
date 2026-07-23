@@ -1,7 +1,7 @@
-"""Rowwise-MXFP8 specialization of :func:`sparkinfer.gemm.bmm`.
+"""Shared rowwise-MXFP8 BMM lowering for GEMM-family operations.
 
-The public operation is a conventional batched matrix multiply over a BF16
-left-hand side and a rowwise-MXFP8 right-hand side::
+The generic public operation is a conventional batched matrix multiply over a
+BF16 left-hand side and a rowwise-MXFP8 right-hand side::
 
     C[g, m, n] = sum_k A[g, m, k] * dequant(W[g, k, n])
 
@@ -36,6 +36,10 @@ declared in ``_QUALIFIED_GEOMETRIES``.  The launch is deterministic, K-unsplit,
 workspace free, allocation free, and CUDA-graph safe after explicit
 prewarming.  A JIT miss during capture raises instead of recording a corrupt
 graph.
+
+``gemm.mla_query_projection`` reuses the same tiled BMM core with a
+query-assembly and optional static-FP8 epilogue. Keeping both lowerings here
+avoids either public operation reaching through the other's private package.
 """
 
 from __future__ import annotations
@@ -81,7 +85,7 @@ _CTA_THREADS = 128  # 4 warps; each warp owns a 32-wide N slice of the tile.
 _MAX_M = 32
 _KERNEL_ID = "gemm.bmm.mxfp8"
 _KERNEL_VERSION = 1
-_MLA_QUERY_KERNEL_ID = "attention.mla_query.mxfp8"
+_MLA_QUERY_KERNEL_ID = "gemm.mla_query_projection.mxfp8"
 _MLA_QUERY_KERNEL_VERSION = 1
 _MLA_QUERY_ROPE_DIM = 64
 
@@ -1456,7 +1460,7 @@ def _compile(
     return launch
 
 
-def _compile_mla_query(
+def _compile_mla_query_projection(
     *,
     b_major: _BMajor,
     groups: int,
@@ -1487,7 +1491,8 @@ def _compile_mla_query(
         raise RuntimeError(
             "MLA query compile miss during CUDA-graph capture for "
             f"B={groups}, M={m}, N={n}, K={k}, output_fp8={output_fp8}. "
-            "Precompile every graph-visible M with prewarm_mla_query(...)."
+            "Precompile every graph-visible M with "
+            "prewarm_mla_query_projection(...)."
         )
 
     kernel = _Mxfp8MlaQueryKernel(
@@ -1863,7 +1868,7 @@ def _validate_mla_query_launch(
     b_values: torch.Tensor,
     b_scales: torch.Tensor,
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
     *,
     b_major: str | _BMajor | int,
@@ -1914,15 +1919,21 @@ def _validate_mla_query_launch(
         stride_mod=2,
     )
     _validate_rhs_storage(b_values, b_scales)
-    if q_scale.dtype != torch.float32 or q_scale.numel() != 1:
-        raise ValueError(
-            "q_scale must be a scalar float32 tensor, "
-            f"got shape={tuple(q_scale.shape)}, dtype={q_scale.dtype}"
-        )
-    if q_scale.data_ptr() % 4:
-        raise ValueError("q_scale base pointer must be 4-byte aligned")
+    if output_fp8:
+        if q_scale is None:
+            raise ValueError("q_scale is required for float8_e4m3fn output")
+        if q_scale.dtype != torch.float32 or q_scale.numel() != 1:
+            raise ValueError(
+                "q_scale must be a scalar float32 tensor, "
+                f"got shape={tuple(q_scale.shape)}, dtype={q_scale.dtype}"
+            )
+        if q_scale.data_ptr() % 4:
+            raise ValueError("q_scale base pointer must be 4-byte aligned")
 
-    tensors = (a, b_values, b_scales, q_pe, q_scale, out)
+    tensors = [a, b_values, b_scales, q_pe, out]
+    if output_fp8:
+        assert q_scale is not None
+        tensors.append(q_scale)
     if not all(tensor.is_cuda for tensor in tensors):
         raise ValueError("MLA query operands must be CUDA tensors")
     if any(tensor.device != a.device for tensor in tensors[1:]):
@@ -1933,24 +1944,27 @@ def _validate_mla_query_launch(
             "[H,K,N]=[8|16,192,512] with 1<=M<=32; "
             f"got H={groups}, M={m}, N={n}, K={k}"
         )
-    for source_name, source in (
+    sources = [
         ("lhs", a),
         ("rhs values", b_values),
         ("rhs scales", b_scales),
         ("q_pe", q_pe),
-        ("q_scale", q_scale),
-    ):
+    ]
+    if output_fp8:
+        assert q_scale is not None
+        sources.append(("q_scale", q_scale))
+    for source_name, source in sources:
         if _overlaps(out, source):
             raise ValueError(f"out must not overlap {source_name}")
     return major, groups, m, n, k, output_fp8
 
 
-def _run_mla_query(
+def _run_mla_query_projection(
     a: torch.Tensor,
     b_values: torch.Tensor,
     b_scales: torch.Tensor,
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
     *,
     b_major: str | _BMajor | int,
@@ -1967,7 +1981,7 @@ def _run_mla_query(
         b_major=b_major,
         sf_axis=sf_axis,
     )
-    launch = _compile_mla_query(
+    launch = _compile_mla_query_projection(
         b_major=major,
         groups=groups,
         m=m,
@@ -1983,7 +1997,10 @@ def _run_mla_query(
             if int(stream) == 0
             else torch.cuda.ExternalStream(int(stream), device=a.device)
         )
-        for tensor in (a, b_values, b_scales, q_pe, q_scale, out):
+        tensors = [a, b_values, b_scales, q_pe, out]
+        if q_scale is not None:
+            tensors.append(q_scale)
+        for tensor in tensors:
             tensor.record_stream(launch_stream)
     stream_int = (
         int(stream)
@@ -2015,7 +2032,7 @@ def _run_mla_query(
         ),
         make_ptr(
             cutlass.Float32,
-            q_scale.data_ptr(),
+            q_scale.data_ptr() if q_scale is not None else out.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
@@ -2080,19 +2097,21 @@ def _fake(
     return None
 
 
-@torch.library.custom_op("sparkinfer::mla_query_mxfp8", mutates_args=("out",))
-def _mla_query_op(
+@torch.library.custom_op(
+    "sparkinfer::mla_query_projection_mxfp8", mutates_args=("out",)
+)
+def _mla_query_projection_op(
     lhs: torch.Tensor,
     b_values: torch.Tensor,
     b_scales: torch.Tensor,
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
     b_major: int,
     stream_int: Optional[int] = None,
 ) -> None:
     major = _coerce_b_major(b_major)
-    _run_mla_query(
+    _run_mla_query_projection(
         lhs,
         b_values,
         b_scales,
@@ -2105,13 +2124,13 @@ def _mla_query_op(
     )
 
 
-@_mla_query_op.register_fake
-def _mla_query_fake(
+@_mla_query_projection_op.register_fake
+def _mla_query_projection_fake(
     lhs: torch.Tensor,
     b_values: torch.Tensor,
     b_scales: torch.Tensor,
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
     b_major: int,
     stream_int: Optional[int] = None,
@@ -2150,13 +2169,13 @@ def mm(
     return out
 
 
-def mla_query(
+def mla_query_projection(
     lhs: torch.Tensor,
     rhs: tuple[torch.Tensor, torch.Tensor],
     q_pe: torch.Tensor,
-    q_scale: torch.Tensor,
     out: torch.Tensor,
     *,
+    q_scale: Optional[torch.Tensor] = None,
     b_major: str = "n",
     sf_axis: str = "n",
     stream: Optional[object] = None,
@@ -2171,7 +2190,7 @@ def mla_query(
         if b_values.device != b_scales.device:
             raise ValueError("MLA query RHS tensors must be on the same CUDA device")
         stream_int = int(_torch_stream(stream, b_values.device).cuda_stream)
-    torch.ops.sparkinfer.mla_query_mxfp8(
+    torch.ops.sparkinfer.mla_query_projection_mxfp8(
         lhs,
         b_values,
         b_scales,
@@ -2280,7 +2299,7 @@ def prewarm(
     return len(unique_m)
 
 
-def prewarm_mla_query(
+def prewarm_mla_query_projection(
     rhs: tuple[torch.Tensor, torch.Tensor],
     m_values: Iterable[int],
     *,
@@ -2308,7 +2327,7 @@ def prewarm_mla_query(
             unique_m.append(m)
             seen.add(m)
     for m in unique_m:
-        if not can_implement_mla_query(
+        if not can_implement_mla_query_projection(
             batch=groups,
             max_m=m,
             n=n,
@@ -2326,7 +2345,11 @@ def prewarm_mla_query(
     torch_stream = _torch_stream(stream, device)
     stream_int = int(torch_stream.cuda_stream)
     with torch.cuda.stream(torch_stream):
-        q_scale = torch.ones(1, dtype=torch.float32, device=device)
+        q_scale = (
+            torch.ones(1, dtype=torch.float32, device=device)
+            if output_dtype == torch.float8_e4m3fn
+            else None
+        )
         for m in unique_m:
             lhs = torch.zeros((groups, m, k), dtype=torch.bfloat16, device=device)
             q_pe = torch.zeros(
@@ -2339,7 +2362,7 @@ def prewarm_mla_query(
                 dtype=output_dtype,
                 device=device,
             )
-            torch.ops.sparkinfer.mla_query_mxfp8(
+            torch.ops.sparkinfer.mla_query_projection_mxfp8(
                 lhs,
                 b_values,
                 b_scales,
@@ -2352,7 +2375,8 @@ def prewarm_mla_query(
             lhs.record_stream(torch_stream)
             q_pe.record_stream(torch_stream)
             out.record_stream(torch_stream)
-        q_scale.record_stream(torch_stream)
+        if q_scale is not None:
+            q_scale.record_stream(torch_stream)
     if synchronize:
         torch_stream.synchronize()
     return len(unique_m)
@@ -2383,7 +2407,7 @@ def can_implement(
     )
 
 
-def can_implement_mla_query(
+def can_implement_mla_query_projection(
     *,
     batch: int,
     max_m: int,
@@ -2416,20 +2440,19 @@ def can_implement_mla_query(
 
 def clear_caches() -> None:
     _LAUNCH_CACHE.clear()
-    _MLA_QUERY_LAUNCH_CACHE.clear()
 
 
-def clear_mla_query_caches() -> None:
+def clear_mla_query_projection_caches() -> None:
     _MLA_QUERY_LAUNCH_CACHE.clear()
 
 
 __all__ = [
     "can_implement",
-    "can_implement_mla_query",
+    "can_implement_mla_query_projection",
     "clear_caches",
-    "clear_mla_query_caches",
-    "mla_query",
+    "clear_mla_query_projection_caches",
+    "mla_query_projection",
     "mm",
     "prewarm",
-    "prewarm_mla_query",
+    "prewarm_mla_query_projection",
 ]
