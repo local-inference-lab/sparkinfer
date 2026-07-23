@@ -962,6 +962,59 @@ def test_w4a16_tc_decode_fused_sum_matches_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_tc_decode_ultra_fc2_tile_round_trips_forced_repin() -> None:
+    """A GB10-selected ultra-wide FC2 tile must survive custom-op re-pinning."""
+    props = torch.cuda.get_device_properties(0)
+    compile_kwargs = {
+        "size_m": 1,
+        "hidden_size": 4096,
+        "intermediate_size": 1024,
+        "num_experts": 256,
+        "top_k": 6,
+        "activation": "silu",
+        "apply_router_weight_on_input": False,
+        "zero_fc2_output": False,
+        "moe_block_size": 8,
+        "max_m_blocks": 6,
+        "element_dtype": "bf16",
+        # The wave-balance override is specific to the 48-SM GB10 geometry.
+        "sms": 48,
+        "max_shared_mem": int(props.shared_memory_per_block_optin),
+        "weight_layout": "packed",
+        "scale_format": "e8m0_k32",
+        "w13_layout": "w13",
+        "direct_topk_routes": True,
+        "tc_decode_fused_sum": True,
+    }
+
+    auto = compile_w4a16_fused_moe(**compile_kwargs)
+    tile_config = (
+        int(auto.fc1_tile_k),
+        int(auto.fc1_tile_n),
+        int(auto.fc2_tile_k),
+        int(auto.fc2_tile_n),
+    )
+    assert tile_config == (64, 256, 32, 512)
+
+    repinned = compile_w4a16_fused_moe(
+        **compile_kwargs,
+        force_tile_config=tile_config,
+    )
+    assert (
+        int(repinned.fc1_tile_k),
+        int(repinned.fc1_tile_n),
+        int(repinned.fc2_tile_k),
+        int(repinned.fc2_tile_n),
+    ) == tile_config
+
+    with pytest.raises(ValueError, match="force_tile_config fc2 tile"):
+        compile_w4a16_fused_moe(
+            **(compile_kwargs | {"hidden_size": 3840}),
+            force_tile_config=tile_config,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [1, 2, 3, 6, 8])
 def test_w4a16_tc_decode_preplanned_launch_matches_oracle(m: int) -> None:
     """The vLLM binding path passes a *preplanned* fused launch. Validate that a
