@@ -21,7 +21,7 @@ JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `sparkinfer.<group>.<op>` (16 total; `list_ops()`
+Every kernel is one op at `sparkinfer.<group>.<op>` (17 total; `list_ops()`
 enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.
