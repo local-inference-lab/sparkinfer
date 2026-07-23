@@ -215,6 +215,8 @@ _LARGE_BATCH_TILE_CONFIGS = (
     (64, 128, 128),
     (128, 64, 128),
 )
+_TC_DECODE_ULTRA_FC2_TILE_K = 32
+_TC_DECODE_ULTRA_FC2_TILE_N = 512
 
 
 def _covering_count(total: int, quantum: int) -> int:
@@ -401,6 +403,43 @@ def _candidate_tile_fits(
         weight_layout=weight_layout,
     )
     return smem_bytes <= int(max_shared_mem)
+
+
+def _tc_decode_ultra_fc2_tile_fits(
+    *,
+    problem_n: int,
+    problem_k: int,
+    cta_m_blocks: int,
+    tile_n: int,
+    tile_k: int,
+    max_shared_mem: int,
+    scale_format: str,
+    weight_layout: str,
+) -> bool:
+    """Validate the one TC-decode tile below the generic tile-k floor."""
+    if (
+        int(tile_n) != _TC_DECODE_ULTRA_FC2_TILE_N
+        or int(tile_k) != _TC_DECODE_ULTRA_FC2_TILE_K
+    ):
+        return False
+    scale_group_size = _scale_group_size(scale_format)
+    if (
+        int(problem_n) % int(tile_n) != 0
+        or int(problem_k) % int(tile_k) != 0
+        or int(problem_k) % scale_group_size != 0
+        or int(tile_k) % scale_group_size != 0
+    ):
+        return False
+    return (
+        _shared_memory_footprint(
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+        )
+        <= int(max_shared_mem)
+    )
 
 
 def _select_tile_config(
@@ -6202,20 +6241,18 @@ def compile_w4a16_fused_moe(
         and (fc2_mn_after // 2) <= fc1_mn_after
         and fc1_mn_after <= int(sms)
     ):
-        ultra_fc2_tile_k = 32
-        ultra_smem = _shared_memory_footprint(
+        if _tc_decode_ultra_fc2_tile_fits(
+            problem_n=hidden_size,
+            problem_k=intermediate_size,
             cta_m_blocks=_covering_count(moe_block_size, 16),
-            tile_n=512,
-            tile_k=ultra_fc2_tile_k,
+            tile_n=_TC_DECODE_ULTRA_FC2_TILE_N,
+            tile_k=_TC_DECODE_ULTRA_FC2_TILE_K,
+            max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
             weight_layout=weight_layout,
-        )
-        if (
-            int(intermediate_size) % ultra_fc2_tile_k == 0
-            and ultra_smem <= int(max_shared_mem) - 512
         ):
-            fc2_tile_n = 512
-            fc2_tile_k = ultra_fc2_tile_k
+            fc2_tile_n = _TC_DECODE_ULTRA_FC2_TILE_N
+            fc2_tile_k = _TC_DECODE_ULTRA_FC2_TILE_K
             fc2_cta_threads = 256
     if force_tile_config is not None:
         # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
@@ -6238,10 +6275,21 @@ def compile_w4a16_fused_moe(
             ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
             ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
         ):
-            if not _candidate_tile_fits(
+            cta_m_blocks = _covering_count(moe_block_size, 16)
+            ultra_fc2_fits = name == "fc2" and _tc_decode_ultra_fc2_tile_fits(
                 problem_n=forced_pn,
                 problem_k=forced_pk,
-                cta_m_blocks=_covering_count(moe_block_size, 16),
+                cta_m_blocks=cta_m_blocks,
+                tile_n=forced_tn,
+                tile_k=forced_tk,
+                max_shared_mem=int(max_shared_mem) - 512,
+                scale_format=scale_format,
+                weight_layout=weight_layout,
+            )
+            generic_tile_fits = _candidate_tile_fits(
+                problem_n=forced_pn,
+                problem_k=forced_pk,
+                cta_m_blocks=cta_m_blocks,
                 tile_n=forced_tn,
                 tile_k=forced_tk,
                 cta_threads=fc1_cta_threads,
@@ -6249,7 +6297,8 @@ def compile_w4a16_fused_moe(
                 scale_format=scale_format,
                 weight_layout=weight_layout,
                 allow_logical_tail=allow_native_logical_tail,
-            ):
+            )
+            if not ultra_fc2_fits and not generic_tile_fits:
                 raise ValueError(
                     f"force_tile_config {name} tile "
                     f"(tile_k={forced_tk}, tile_n={forced_tn}) does not fit "
