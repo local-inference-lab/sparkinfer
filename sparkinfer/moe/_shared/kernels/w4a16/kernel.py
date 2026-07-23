@@ -4460,6 +4460,11 @@ class W4A16FusedMoeKernel:
             grid=grid,
             block=[self.cta_threads, 1, 1],
             min_blocks_per_mp=self.blocks_per_sm,
+            # The fused body crosses software all-CTA barriers between FC1,
+            # activation, and FC2. Require whole-grid admission so unrelated
+            # work cannot occupy an SM while resident CTAs wait for peers that
+            # have not been scheduled yet.
+            cooperative=True,
             stream=stream,
         )
 
@@ -5211,6 +5216,10 @@ class W4A16FusedMoeHybridKernel:
             grid=(grid_x, 1, 1),
             block=[self.cta_threads, 1, 1],
             min_blocks_per_mp=self.blocks_per_sm,
+            # This fused two-tier body uses the same software all-CTA barriers
+            # as W4A16FusedMoeKernel and therefore has the same whole-grid
+            # residency requirement.
+            cooperative=True,
             stream=stream,
         )
 
