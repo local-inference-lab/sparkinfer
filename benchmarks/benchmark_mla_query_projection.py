@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Benchmark fused MLA query projection against the existing staged path.
 
-The benchmark uses CUDA-graph replay for both arms, checks bitwise equality
+The benchmark uses CUDA-graph replay for both arms, gates numerical correctness
 before timing, records raw samples, and emits enough environment metadata to
-reproduce a performance claim.
+reproduce a performance claim. Native MXFP8 output remains bitwise checked;
+BF16 weights use a bounded tolerance because Triton and cuBLAS accumulate in a
+different order.
 """
 
 from __future__ import annotations
@@ -44,7 +46,8 @@ BMM_SPEC = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--heads", type=int, choices=(8, 16), default=8)
+    parser.add_argument("--weight-format", choices=("mxfp8", "bf16"), default="mxfp8")
+    parser.add_argument("--heads", type=int, choices=(8, 11, 16), default=8)
     parser.add_argument("--m", type=int, choices=range(1, 33), default=1)
     parser.add_argument("--output-dtype", choices=("bf16", "fp8"), default="fp8")
     parser.add_argument("--warmup", type=int, default=100)
@@ -177,8 +180,27 @@ def main() -> None:
     output_dtype = (
         torch.bfloat16 if args.output_dtype == "bf16" else torch.float8_e4m3fn
     )
+    if args.weight_format == "mxfp8" and args.heads not in (8, 16):
+        raise ValueError("MXFP8 query projection supports 8 or 16 heads")
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    weight = make_weight(heads=args.heads, device=device, generator=generator)
+    if args.weight_format == "mxfp8":
+        weight: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = make_weight(
+            heads=args.heads,
+            device=device,
+            generator=generator,
+        )
+    else:
+        weight = (
+            torch.randn(
+                args.heads,
+                NOPE_DIM,
+                LATENT_DIM,
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
+            * 0.05
+        )
     q_nope = torch.randn(
         args.heads,
         args.m,
@@ -198,10 +220,10 @@ def main() -> None:
     q_pe = q_full[..., LATENT_DIM:]
     q_scale = torch.tensor([0.037], device=device, dtype=torch.float32)
 
-    gemm.prewarm_bmm(weight, [args.m], **BMM_SPEC)
-    mla_query_projection.prewarm(
-        weight, [args.m], output_dtype=output_dtype
-    )
+    if args.weight_format == "mxfp8":
+        assert isinstance(weight, tuple)
+        gemm.prewarm_bmm(weight, [args.m], **BMM_SPEC)
+    mla_query_projection.prewarm(weight, [args.m], output_dtype=output_dtype)
 
     projected = torch.empty(
         args.heads,
@@ -227,7 +249,10 @@ def main() -> None:
     inv_scale = torch.reciprocal(q_scale)
 
     def baseline() -> None:
-        gemm.bmm(q_nope, weight, projected, **BMM_SPEC)
+        if isinstance(weight, torch.Tensor):
+            torch.bmm(q_nope, weight, out=projected)
+        else:
+            gemm.bmm(q_nope, weight, projected, **BMM_SPEC)
         torch.cat((projected.transpose(0, 1), q_pe), dim=-1, out=assembled_bf16)
         if output_dtype == torch.float8_e4m3fn:
             scaled_fp32.copy_(assembled_bf16)
@@ -252,10 +277,33 @@ def main() -> None:
     )
     finite = bool(torch.isfinite(fused_out.float()).all().item())
     nonzero = bool(torch.count_nonzero(fused_out).item())
-    if not bitwise_equal or not finite or not nonzero:
+    difference = (baseline_out.float() - fused_out.float()).abs()
+    max_abs = float(difference.max().item())
+    mean_abs = float(difference.mean().item())
+    close = bool(
+        torch.allclose(
+            baseline_out.float(),
+            fused_out.float(),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+    )
+    rope_equal = torch.equal(
+        baseline_out[..., LATENT_DIM:].view(torch.uint8),
+        fused_out[..., LATENT_DIM:].view(torch.uint8),
+    )
+    correctness_passed = (
+        finite
+        and nonzero
+        and rope_equal
+        and (bitwise_equal if args.weight_format == "mxfp8" else close)
+    )
+    if not correctness_passed:
         raise RuntimeError(
             "correctness gate failed: "
-            f"bitwise_equal={bitwise_equal}, finite={finite}, nonzero={nonzero}"
+            f"bitwise_equal={bitwise_equal}, close={close}, "
+            f"rope_equal={rope_equal}, finite={finite}, nonzero={nonzero}, "
+            f"max_abs={max_abs}, mean_abs={mean_abs}"
         )
 
     baseline_graph = capture_graph(baseline)
@@ -280,7 +328,12 @@ def main() -> None:
         "compute_capability": torch.cuda.get_device_capability(device),
         "gpu_snapshot": gpu_snapshot(),
         "correctness": {
+            "passed": correctness_passed,
             "bitwise_equal": bitwise_equal,
+            "close_rtol_2e-2_atol_2e-2": close,
+            "rope_suffix_bitwise_equal": rope_equal,
+            "max_abs": max_abs,
+            "mean_abs": mean_abs,
             "finite": finite,
             "nonzero": nonzero,
             "cuda_graph_replay": True,
@@ -291,6 +344,7 @@ def main() -> None:
             "nope_dim": NOPE_DIM,
             "latent_dim": LATENT_DIM,
             "rope_dim": ROPE_DIM,
+            "weight_format": args.weight_format,
             "output_dtype": args.output_dtype,
         },
         "warmup": args.warmup,
