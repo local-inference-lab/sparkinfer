@@ -345,7 +345,8 @@ def _validate_cache_artifact(
         f"{location}: unsupported compile manifest schema",
     )
     _require(
-        manifest.get("cache_format") == "sparkinfer_cute_compile_cache_v5_explicit_spec",
+        manifest.get("cache_format")
+        == "sparkinfer_cute_compile_cache_v6_explicit_spec",
         f"{location}: exact explicit compile specification is required",
     )
     cache_key = manifest.get("cache_key")

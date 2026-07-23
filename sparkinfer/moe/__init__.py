@@ -4,6 +4,7 @@
   activation -> FC2 -> scatter); recipes nvfp4/mxfp4/w4a8_mx/w4a8_nvfp4/w4a16.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
+- ``trellis_moe``: planned full-rotation MCG EXL3 routed experts.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("fused_moe", "ep_moe")
+_OP_MODULES = ("fused_moe", "ep_moe", "trellis_moe")
 
 
 def __getattr__(name: str) -> Any:

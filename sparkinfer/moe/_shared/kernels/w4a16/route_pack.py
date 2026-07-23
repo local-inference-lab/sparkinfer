@@ -302,6 +302,7 @@ def pack_topk_routes_by_expert(
     block_expert_ids: torch.Tensor | None = None,
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
+    expert_counts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
@@ -406,7 +407,35 @@ def pack_topk_routes_by_expert(
                 triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
             ),
         )
-        if not torch.cuda.is_current_stream_capturing():
+        if expert_counts is not None:
+            expert_counts = _workspace_slice(
+                expert_counts,
+                name="expert_counts",
+                elements=int(num_experts),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            )
+            expert_counts.zero_()
+            _w4a16_route_count_kernel[(triton.cdiv(numel, _FAST_COUNT_BLOCK_T),)](
+                topk_ids,
+                expert_map_tensor,
+                expert_counts,
+                numel,
+                NUM_EXPERTS=int(num_experts),
+                HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_T=_FAST_COUNT_BLOCK_T,
+                num_warps=4,
+            )
+            _w4a16_route_prefix_from_counts_kernel[(1,)](
+                expert_counts,
+                packed_route_count,
+                expert_offsets,
+                BLOCK_SIZE=int(block_size),
+                NUM_EXPERTS=int(num_experts),
+                BLOCK_E=block_e,
+                num_warps=4,
+            )
+        elif not torch.cuda.is_current_stream_capturing():
             # FAST (eager prefill): parallel atomic count + tiny over-experts
             # block-padded prefix, replacing the single-CTA count+prefix
             # (~7-31x measured at prefill). Only the large path (routes > 4096,

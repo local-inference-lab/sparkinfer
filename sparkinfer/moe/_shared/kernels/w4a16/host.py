@@ -38,6 +38,9 @@ class W4A16PackedBuffers:
     block_expert_ids: torch.Tensor | None = None
     packed_route_count: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
+    expert_counts: torch.Tensor | None = None
+    rotation_a_gate: torch.Tensor | None = None
+    rotation_a_up: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,8 @@ class W4A16BufferPlan:
     fc2_c_tmp_elements: int
     intermediate_cache13_elements: int
     intermediate_cache2_elements: int
+    block_size_m: int
+    rotation_a_elements: int = 0
 
 
 def validate_activation(activation: str) -> bool:
@@ -272,6 +277,8 @@ def plan_w4a16_buffers(
     topk: int,
     route_num_experts: int | None = None,
     sms: int,
+    full_rotation: bool = False,
+    block_size_m: int | None = None,
 ) -> W4A16BufferPlan:
     routed_rows = int(m) * int(topk)
     route_num_experts = (
@@ -282,7 +289,15 @@ def plan_w4a16_buffers(
     intermediate_size = int(prepared.intermediate_size)
     hidden_size = int(prepared.hidden_size)
     fc1_cols = (2 if prepared.is_gated else 1) * intermediate_size
-    block_size_m = select_route_block_size_m(m, topk, route_num_experts)
+    if block_size_m is None:
+        block_size_m = select_route_block_size_m(m, topk, route_num_experts)
+    else:
+        block_size_m = int(block_size_m)
+        if block_size_m not in _W4A16_ALLOWED_ROUTED_SIZES:
+            raise ValueError(
+                "block_size_m must be one of "
+                f"{_W4A16_ALLOWED_ROUTED_SIZES}, got {block_size_m}"
+            )
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
     scratch_sms = int(sms)
@@ -305,6 +320,8 @@ def plan_w4a16_buffers(
         ),
         intermediate_cache13_elements=routed_rows * max(fc1_cols, hidden_size),
         intermediate_cache2_elements=routed_rows * intermediate_size,
+        block_size_m=block_size_m,
+        rotation_a_elements=(routed_rows * hidden_size if full_rotation else 0),
     )
 
 
@@ -316,6 +333,8 @@ def make_w4a16_packed_buffers(
     dtype: torch.dtype,
     device: torch.device,
     route_num_experts: int | None = None,
+    full_rotation: bool = False,
+    block_size_m: int | None = None,
 ) -> W4A16PackedBuffers:
     route_num_experts = (
         int(prepared.num_experts)
@@ -329,6 +348,8 @@ def make_w4a16_packed_buffers(
         topk=topk,
         route_num_experts=route_num_experts,
         sms=sms,
+        full_rotation=full_rotation,
+        block_size_m=block_size_m,
     )
     fc1_c_tmp = torch.empty(
         (plan.fc1_c_tmp_elements,),
@@ -351,7 +372,11 @@ def make_w4a16_packed_buffers(
             dtype=dtype,
             device=device,
         ),
-        output=torch.empty((m, prepared.hidden_size), dtype=dtype, device=device),
+        output=torch.empty(
+            (m, prepared.hidden_size),
+            dtype=torch.float32 if full_rotation else dtype,
+            device=device,
+        ),
         fc1_c_tmp=fc1_c_tmp,
         fc2_c_tmp=fc2_c_tmp,
         packed_route_indices=torch.empty(
@@ -363,6 +388,27 @@ def make_w4a16_packed_buffers(
         packed_route_count=torch.empty((1,), dtype=torch.int32, device=device),
         expert_offsets=torch.empty(
             (route_num_experts + 1,), dtype=torch.int32, device=device
+        ),
+        expert_counts=torch.empty(
+            (route_num_experts,), dtype=torch.int32, device=device
+        ),
+        rotation_a_gate=(
+            torch.empty(
+                (plan.routed_rows, int(prepared.hidden_size)),
+                dtype=torch.float16,
+                device=device,
+            )
+            if full_rotation
+            else None
+        ),
+        rotation_a_up=(
+            torch.empty(
+                (plan.routed_rows, int(prepared.hidden_size)),
+                dtype=torch.float16,
+                device=device,
+            )
+            if full_rotation
+            else None
         ),
     )
 

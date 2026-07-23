@@ -765,25 +765,25 @@ def _semantic_target_key(target_key: Any) -> Any:
 
 
 def _semantic_payload_from_cache_payload(cache_payload: list[Any]) -> dict[str, Any]:
-    if len(cache_payload) != 10:
+    if len(cache_payload) != 11:
         raise RuntimeError(f"explicit cache payload has {len(cache_payload)} fields")
-    if cache_payload[0] != "sparkinfer_cute_compile_cache_v5_explicit_spec":
+    if cache_payload[0] != "sparkinfer_cute_compile_cache_v6_explicit_spec":
         raise RuntimeError(f"unsupported cache format {cache_payload[0]!r}")
     semantic: dict[str, Any] = {
         "cache_format": cache_payload[0],
         "target": _semantic_target_key(cache_payload[1]),
-        "compile_spec_hash": cache_payload[4],
+        "compile_spec_hash": cache_payload[5],
     }
     semantic["compile_spec"] = _load_json_document(
-        str(cache_payload[5]), "cache-payload compile spec"
+        str(cache_payload[6]), "cache-payload compile spec"
     )
-    if cache_payload[6]:
-        semantic["compile_kwargs_hash"] = cache_payload[6]
+    if cache_payload[7]:
+        semantic["compile_kwargs_hash"] = cache_payload[7]
         semantic["compile_kwargs"] = _load_json_document(
-            str(cache_payload[7]), "cache-payload compile kwargs"
+            str(cache_payload[8]), "cache-payload compile kwargs"
         )
-    semantic["compile_options"] = _manifest_json_value(cache_payload[8])
-    semantic["compile_environment"] = _manifest_json_value(cache_payload[9])
+    semantic["compile_options"] = _manifest_json_value(cache_payload[9])
+    semantic["compile_environment"] = _manifest_json_value(cache_payload[10])
     return semantic
 
 
@@ -883,8 +883,8 @@ def _validate_compile_manifest(
         toolchain_names.append(entry[0])
     if len(toolchain_names) != len(set(toolchain_names)):
         raise RuntimeError("compile manifest toolchain repeats a component")
-    compile_spec_hash = cache_payload[4]
-    compile_spec_json = cache_payload[5]
+    compile_spec_hash = cache_payload[5]
+    compile_spec_json = cache_payload[6]
     if (
         not isinstance(compile_spec_hash, str)
         or not _SHA256_RE.fullmatch(compile_spec_hash)
@@ -912,8 +912,8 @@ def _validate_compile_manifest(
     if raw.get("compile_spec_version") != compile_spec.get("version"):
         raise RuntimeError("compile manifest version differs from compile spec")
 
-    compile_kwargs_hash = cache_payload[6]
-    compile_kwargs_json = cache_payload[7]
+    compile_kwargs_hash = cache_payload[7]
+    compile_kwargs_json = cache_payload[8]
     if (
         raw.get("compile_kwargs_hash") != compile_kwargs_hash
         or raw.get("compile_kwargs_json") != compile_kwargs_json
@@ -930,13 +930,13 @@ def _validate_compile_manifest(
         _load_json_document(compile_kwargs_json, "compile kwargs")
     elif compile_kwargs_hash:
         raise RuntimeError("compile manifest has a kwargs hash without JSON")
-    if raw.get("compile_options") != cache_payload[8]:
+    if raw.get("compile_options") != cache_payload[9]:
         raise RuntimeError("compile manifest compile options differ from payload")
     if not isinstance(raw["compile_options"], list) or any(
         not isinstance(option, str) or not option for option in raw["compile_options"]
     ):
         raise RuntimeError("compile manifest compile options are invalid")
-    if raw.get("compile_environment") != cache_payload[9]:
+    if raw.get("compile_environment") != cache_payload[10]:
         raise RuntimeError("compile manifest compile environment differs from payload")
     compile_environment = raw["compile_environment"]
     if not isinstance(compile_environment, list) or any(

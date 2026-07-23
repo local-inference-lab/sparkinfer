@@ -11,6 +11,7 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     W4A16PackedBuffers,
     make_w4a16_packed_buffers as _make_w4a16_packed_buffers,
     unswizzle_expert_scales,
+    validate_activation,
     validate_nf3_moe_inputs,
     validate_w4a16_packed_inputs,
 )
@@ -127,6 +128,48 @@ class PreparedNF3MoeWeights:
     w13_layout: str = "packed"
     weight_layout: str = "nf3_2p1"
     scale_format: str = "e4m3_k32"
+    # Native trellis tiles are codebook-agnostic storage.  The current
+    # trellis3_t256 decoder is still MCG-only, but retaining the checkpoint
+    # codebook here lets callers fail closed instead of silently mis-decoding a
+    # MUL1 (or default-codebook) tensor.
+    trellis_codebook: str | None = None
+    trellis_bits: int = 3
+    # Projection-specific EXL3 input incoherence scales.  They remain optional
+    # for non-trellis and synthetic oracle preparation, but the coherent
+    # projection-major runtime binds both so gate/up can stage distinct rotated
+    # A operands without copying either table.
+    gate_suh: torch.Tensor | None = None
+    up_suh: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PreparedTrellis256DenseWeight:
+    """Zero-copy native EXL3 tensor plus its outer rotations.
+
+    ``trellis`` is the flattened int32 view of one native
+    ``[K/16,N/16,16*bits]i16`` payload. ``suh`` and ``svh`` retain the
+    checkpoint tensors by reference. The current compute decoder is MCG-only;
+    MUL1 is preserved as metadata so execution can reject it rather than
+    misdecode it.
+    """
+
+    trellis: torch.Tensor
+    suh: torch.Tensor
+    svh: torch.Tensor
+    scale: torch.Tensor
+    global_scale: torch.Tensor
+    workspace: torch.Tensor
+    in_features: int
+    out_features: int
+    params_dtype: torch.dtype
+    trellis_bits: int
+    trellis_codebook: str
+    mcg: torch.Tensor | None = None
+    mul1: torch.Tensor | None = None
+    num_experts: int = 1
+    weight_layout: str = "trellis3_t256"
+    scale_format: str = "e4m3_k32"
+    w13_layout: str = "packed"
 
 
 def _make_workspace(
@@ -1428,6 +1471,597 @@ def prepare_nf3_moe_weights(
     )
 
 
+_TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
+_TRELLIS256_CODEBOOKS = {
+    "default": "default",
+    "cb0": "default",
+    "mcg": "mcg",
+    "cb1": "mcg",
+    "mul1": "mul1",
+    "cb2": "mul1",
+}
+_TRELLIS256_CODEBOOK_SENTINELS = {
+    0: "default",
+    0xCBAC1FED: "mcg",
+    0x83DCD12D: "mul1",
+}
+
+
+def _normalize_trellis256_codebook(codebook: str | int) -> str:
+    if isinstance(codebook, int):
+        normalized = _TRELLIS256_CODEBOOK_SENTINELS.get(
+            int(codebook) & 0xFFFFFFFF
+        )
+        if normalized is None:
+            raise ValueError(
+                "unsupported trellis256 codebook sentinel "
+                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected default "
+                "0x00000000, MCG 0xcbac1fed, or MUL1 0x83dcd12d"
+            )
+        return normalized
+    normalized = _TRELLIS256_CODEBOOKS.get(str(codebook).strip().lower())
+    if normalized is None:
+        raise ValueError(
+            f"unsupported trellis256 codebook {codebook!r}; expected "
+            "'default', 'mcg', or 'mul1'"
+        )
+    return normalized
+
+
+def _trellis256_random_native_tensor(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Generate all 32-bit native tile words without changing their bit pattern."""
+    raw = torch.randint(
+        0,
+        1 << 32,
+        shape,
+        dtype=torch.int64,
+        device=device,
+        generator=generator,
+    )
+    raw = torch.where(raw >= 2**31, raw - 2**32, raw)
+    return raw.to(torch.int32).contiguous()
+
+
+def _trellis256_bits_from_native_tensor(tensor: torch.Tensor, *, name: str) -> int:
+    """Recover the EXL3 bitrate from the native tile's final dimension."""
+    if tensor.ndim < 1:
+        raise ValueError(f"trellis3_t256 {name} must have at least one dimension")
+    words_per_bit = 16 if tensor.dtype == torch.int16 else 8
+    if tensor.dtype not in (torch.int16, torch.int32):
+        raise TypeError(
+            f"trellis3_t256 {name} must use native int16 or int32 storage, "
+            f"got {tensor.dtype}"
+        )
+    last = int(tensor.shape[-1])
+    if last % words_per_bit != 0:
+        raise ValueError(
+            f"trellis3_t256 {name} final dimension {last} is not a native "
+            f"{tensor.dtype} tile width"
+        )
+    bits = last // words_per_bit
+    if bits not in (3, 4, 5, 6):
+        raise ValueError(
+            f"trellis3_t256 {name} encodes unsupported {bits}-bpw storage; "
+            "expected 3, 4, 5, or 6"
+        )
+    return bits
+
+
+def _trellis256_flat_native_view(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    expected_prefix_shape: tuple[int, ...],
+    trellis_bits: int,
+    device: torch.device,
+) -> torch.Tensor:
+    trellis_bits = int(trellis_bits)
+    expected_i16_shape = expected_prefix_shape + (16 * trellis_bits,)
+    expected_i32_shape = expected_prefix_shape + (8 * trellis_bits,)
+    if tensor.device != device:
+        raise ValueError(
+            f"trellis3_t256 {name} must be on {device}, got {tensor.device}"
+        )
+    if tensor.dtype == torch.int16:
+        expected_shape = expected_i16_shape
+    elif tensor.dtype == torch.int32:
+        expected_shape = expected_i32_shape
+    else:
+        raise TypeError(
+            f"trellis3_t256 {name} must be native int16 tiles ({16 * trellis_bits} words) "
+            f"or the identical int32 view ({8 * trellis_bits} words), got {tensor.dtype}"
+        )
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(
+            f"trellis3_t256 {name} requires native {trellis_bits}-bit EXL3 shape "
+            f"{expected_shape} for dtype {tensor.dtype}, got {tuple(tensor.shape)}"
+        )
+    if not tensor.is_contiguous():
+        raise ValueError(f"trellis3_t256 {name} must be contiguous")
+    if int(tensor.data_ptr()) % 16 != 0:
+        raise ValueError(
+            f"trellis3_t256 {name} must be at least 16-byte aligned for cp.async"
+        )
+    return tensor.view(torch.int32).reshape(-1)
+
+
+def prepare_trellis256_moe_weights(
+    w13: torch.Tensor | None = None,
+    w2: torch.Tensor | None = None,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    fc1_tile_n: int,
+    fc2_tile_n: int,
+    device: torch.device | str | int | None = None,
+    seed: int = 0,
+    params_dtype: torch.dtype = torch.bfloat16,
+    w13_layout: str = "packed",
+    trellis_bits: int | None = None,
+    dummy_scale: torch.Tensor | None = None,
+    codebook: str | int = "mcg",
+    gate_suh: torch.Tensor | None = None,
+    up_suh: torch.Tensor | None = None,
+) -> PreparedNF3MoeWeights:
+    """Wrap or synthesize native EXL3 tiles for ``trellis3_t256``.
+
+    Supplying both ``w13`` and ``w2`` is the production path: no bytes are
+    copied or permuted; each tensor is only viewed as contiguous int32 words and
+    flattened.  Omitting both tensors is the deterministic full-GEMM-oracle
+    path selected by ``device`` and ``seed``.  ``gate_suh`` and ``up_suh`` are
+    optional zero-copy bindings for the two projection-specific EXL3 input
+    rotations; when supplied, both must be contiguous fp16 ``[E,H]`` tensors on
+    the weight device.
+
+    Plain FC1 storage is expert-major
+    ``[E,H/16,FC1_N/16,16*bits]i16``. ``trellis3_t256_proj`` instead requires one
+    projection-major backing ``[2,E,H/16,I/16,16*bits]i16`` so gate/up fallback views
+    can continue to alias the same live storage.  FC2 is always the plain native
+    ``[E,I/16,H/16,16*bits]i16`` layout.
+    """
+    hidden_size = int(hidden_size)
+    intermediate_size = int(intermediate_size)
+    num_experts = int(num_experts)
+    fc1_tile_n = int(fc1_tile_n)
+    fc2_tile_n = int(fc2_tile_n)
+    if params_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "trellis3_t256 W4A16 weights require fp16 or bf16 activations"
+        )
+    requested_trellis_bits = None if trellis_bits is None else int(trellis_bits)
+    if requested_trellis_bits is not None and requested_trellis_bits not in (3, 4, 5, 6):
+        raise ValueError(
+            "trellis3_t256 bits must be one of 3, 4, 5, or 6, "
+            f"got {requested_trellis_bits}"
+        )
+    if num_experts <= 0:
+        raise ValueError(
+            f"trellis3_t256 requires num_experts > 0, got {num_experts}"
+        )
+    if hidden_size <= 0 or intermediate_size <= 0:
+        raise ValueError(
+            "trellis3_t256 requires positive hidden_size and intermediate_size, "
+            f"got H={hidden_size} I={intermediate_size}"
+        )
+    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        raise ValueError(
+            "native EXL3 tiles require hidden_size and intermediate_size to be "
+            f"multiples of 16, got H={hidden_size} I={intermediate_size}"
+        )
+    if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+        raise ValueError(
+            "trellis3_t256 uses E4M3 K/32 kernel plumbing and therefore requires "
+            "hidden_size and intermediate_size to be multiples of 32; "
+            f"got H={hidden_size} I={intermediate_size}"
+        )
+    for name, tile_n in (("fc1_tile_n", fc1_tile_n), ("fc2_tile_n", fc2_tile_n)):
+        if tile_n < 64 or tile_n % 16 != 0:
+            raise ValueError(
+                f"trellis3_t256 {name} must be a multiple of 16 and at least "
+                f"64 for the current W4A16 kernel, got {tile_n}"
+            )
+
+    is_gated = validate_activation(activation)
+    w13_rows = intermediate_size * (2 if is_gated else 1)
+    if w13_layout not in _TRELLIS256_W13_LAYOUTS:
+        raise ValueError(
+            f"unsupported trellis3_t256 w13_layout {w13_layout!r}; expected "
+            "'packed' or 'trellis3_t256_proj'"
+        )
+    if w13_layout == "trellis3_t256_proj":
+        if not is_gated:
+            raise ValueError(
+                "trellis3_t256_proj requires a gated activation with separate "
+                "gate/up FC1 projections"
+            )
+        if intermediate_size % fc1_tile_n != 0:
+            raise ValueError(
+                "trellis3_t256_proj requires each FC1 projection to contain an "
+                f"integral number of CTA N tiles: I={intermediate_size}, "
+                f"fc1_tile_n={fc1_tile_n}"
+            )
+    elif w13_rows % fc1_tile_n != 0:
+        raise ValueError(
+            "trellis3_t256 has no FC1 logical-tail path: "
+            f"FC1_N={w13_rows} must be divisible by fc1_tile_n={fc1_tile_n}"
+        )
+    if hidden_size % fc2_tile_n != 0:
+        raise ValueError(
+            "trellis3_t256 has no FC2 logical-tail path: "
+            f"FC2_N={hidden_size} must be divisible by fc2_tile_n={fc2_tile_n}"
+        )
+    normalized_codebook = _normalize_trellis256_codebook(codebook)
+
+    have_w13 = w13 is not None
+    have_w2 = w2 is not None
+    if have_w13 != have_w2:
+        raise ValueError("trellis3_t256 requires both w13 and w2, or neither")
+    synthetic = not have_w13
+    if synthetic:
+        resolved_trellis_bits = requested_trellis_bits or 3
+        if device is None:
+            raise ValueError(
+                "device is required when synthesizing trellis3_t256 oracle weights"
+            )
+        if isinstance(device, int):
+            resolved_device = torch.device("cuda", int(device))
+        else:
+            resolved_device = torch.device(device)
+        if resolved_device.type != "cuda":
+            raise ValueError(
+                "trellis3_t256 W4A16 weights require a CUDA device, got "
+                f"{resolved_device}"
+            )
+        generator = torch.Generator(device=resolved_device)
+        generator.manual_seed(int(seed))
+        if w13_layout == "trellis3_t256_proj":
+            w13_i32_shape = (
+                2,
+                num_experts,
+                hidden_size // 16,
+                intermediate_size // 16,
+                8 * resolved_trellis_bits,
+            )
+        else:
+            w13_i32_shape = (
+                num_experts,
+                hidden_size // 16,
+                w13_rows // 16,
+                8 * resolved_trellis_bits,
+            )
+        w2_i32_shape = (
+            num_experts,
+            intermediate_size // 16,
+            hidden_size // 16,
+            8 * resolved_trellis_bits,
+        )
+        packed_w13 = _trellis256_random_native_tensor(
+            w13_i32_shape, device=resolved_device, generator=generator
+        ).reshape(-1)
+        packed_w2 = _trellis256_random_native_tensor(
+            w2_i32_shape, device=resolved_device, generator=generator
+        ).reshape(-1)
+    else:
+        assert w13 is not None and w2 is not None
+        w13_bits = _trellis256_bits_from_native_tensor(w13, name="w13")
+        w2_bits = _trellis256_bits_from_native_tensor(w2, name="w2")
+        if w13_bits != w2_bits:
+            raise ValueError(
+                f"trellis3_t256 w13/w2 bitrate mismatch: {w13_bits} vs {w2_bits}"
+            )
+        resolved_trellis_bits = w13_bits
+        if (
+            requested_trellis_bits is not None
+            and requested_trellis_bits != resolved_trellis_bits
+        ):
+            raise ValueError(
+                "explicit trellis_bits disagrees with native tensor shape: "
+                f"requested={requested_trellis_bits}, inferred={resolved_trellis_bits}"
+            )
+        resolved_device = w13.device
+        if resolved_device.type != "cuda":
+            raise ValueError(
+                "trellis3_t256 W4A16 weights require CUDA storage, got "
+                f"{resolved_device}"
+            )
+        if device is not None:
+            requested_device = (
+                torch.device("cuda", int(device))
+                if isinstance(device, int)
+                else torch.device(device)
+            )
+            device_matches = (
+                requested_device.type == resolved_device.type
+                and (
+                    requested_device.index is None
+                    or requested_device.index == resolved_device.index
+                )
+            )
+            if not device_matches:
+                raise ValueError(
+                    "explicit trellis3_t256 device does not match supplied weights: "
+                    f"device={requested_device}, weights={resolved_device}"
+                )
+        if w13_layout == "trellis3_t256_proj":
+            expected_w13_prefix = (
+                2,
+                num_experts,
+                hidden_size // 16,
+                intermediate_size // 16,
+            )
+        else:
+            expected_w13_prefix = (
+                num_experts,
+                hidden_size // 16,
+                w13_rows // 16,
+            )
+        expected_w2_prefix = (
+            num_experts,
+            intermediate_size // 16,
+            hidden_size // 16,
+        )
+        packed_w13 = _trellis256_flat_native_view(
+            w13,
+            name="w13",
+            expected_prefix_shape=expected_w13_prefix,
+            trellis_bits=resolved_trellis_bits,
+            device=resolved_device,
+        )
+        packed_w2 = _trellis256_flat_native_view(
+            w2,
+            name="w2",
+            expected_prefix_shape=expected_w2_prefix,
+            trellis_bits=resolved_trellis_bits,
+            device=resolved_device,
+        )
+
+    have_gate_suh = gate_suh is not None
+    have_up_suh = up_suh is not None
+    if have_gate_suh != have_up_suh:
+        raise ValueError(
+            "trellis3_t256 projection input scales require both gate_suh and up_suh"
+        )
+    if have_gate_suh:
+        if w13_layout != "trellis3_t256_proj":
+            raise ValueError(
+                "trellis3_t256 gate_suh/up_suh bindings require "
+                "w13_layout='trellis3_t256_proj'"
+            )
+        assert gate_suh is not None and up_suh is not None
+        for name, scale in (("gate_suh", gate_suh), ("up_suh", up_suh)):
+            if scale.device != resolved_device:
+                raise ValueError(
+                    f"trellis3_t256 {name} must be on {resolved_device}, got {scale.device}"
+                )
+            if scale.dtype != torch.float16:
+                raise TypeError(
+                    f"trellis3_t256 {name} must be torch.float16, got {scale.dtype}"
+                )
+            if tuple(scale.shape) != (num_experts, hidden_size):
+                raise ValueError(
+                    f"trellis3_t256 {name} must have shape "
+                    f"{(num_experts, hidden_size)}, got {tuple(scale.shape)}"
+                )
+            if not scale.is_contiguous():
+                raise ValueError(f"trellis3_t256 {name} must be contiguous")
+
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=resolved_device)
+    else:
+        dummy_device_matches = (
+            dummy_scale.device.type == resolved_device.type
+            and (
+                resolved_device.index is None
+                or dummy_scale.device.index == resolved_device.index
+            )
+        )
+        if not dummy_device_matches:
+            raise ValueError(
+                "trellis3_t256 dummy_scale must share the weight device, got "
+                f"{dummy_scale.device} and {resolved_device}"
+            )
+        if dummy_scale.dtype != torch.uint8:
+            raise TypeError(
+                f"trellis3_t256 dummy_scale must be torch.uint8, got {dummy_scale.dtype}"
+            )
+        if not dummy_scale.is_contiguous() or tuple(dummy_scale.shape) != (4,):
+            raise ValueError(
+                "trellis3_t256 dummy_scale must be a contiguous four-byte "
+                f"tensor with shape (4,), got {tuple(dummy_scale.shape)}"
+            )
+        if int(dummy_scale.data_ptr()) % 16 != 0:
+            raise ValueError(
+                "trellis3_t256 dummy_scale must be at least 16-byte aligned"
+            )
+
+    global_scale = torch.ones(
+        (num_experts,), dtype=torch.float32, device=resolved_device
+    )
+    return PreparedNF3MoeWeights(
+        w13=packed_w13,
+        w13_scale=dummy_scale,
+        w13_global_scale=global_scale,
+        w2=packed_w2,
+        w2_scale=dummy_scale,
+        w2_global_scale=global_scale,
+        workspace=_make_workspace(resolved_device, max_blocks_per_sm=4),
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=is_gated,
+        params_dtype=params_dtype,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_n=fc2_tile_n,
+        source_format="trellis3_t256",
+        w13_layout=w13_layout,
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        trellis_codebook=normalized_codebook,
+        trellis_bits=resolved_trellis_bits,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+    )
+
+
+def _trellis256_marker_codebook(
+    *,
+    mcg: torch.Tensor | None,
+    mul1: torch.Tensor | None,
+    codebook: str | int | None,
+) -> str:
+    if mcg is not None and mul1 is not None:
+        raise ValueError("trellis256 accepts exactly one of mcg or mul1, not both")
+    marker_codebook: str | None = None
+    marker = mcg if mcg is not None else mul1
+    if marker is not None:
+        name = "mcg" if mcg is not None else "mul1"
+        if marker.numel() != 1 or marker.dtype not in (torch.int32, torch.uint32):
+            raise ValueError(
+                f"trellis256 {name} marker must be a scalar int32/uint32 tensor"
+            )
+        marker_value = int(marker.item()) & 0xFFFFFFFF
+        marker_codebook = _normalize_trellis256_codebook(marker_value)
+        if marker_codebook != name:
+            raise ValueError(
+                f"trellis256 {name} marker has unexpected value {marker_value:#010x}"
+            )
+    explicit = (
+        None if codebook is None else _normalize_trellis256_codebook(codebook)
+    )
+    if marker_codebook is not None and explicit is not None and marker_codebook != explicit:
+        raise ValueError(
+            "trellis256 codebook metadata disagrees: "
+            f"marker={marker_codebook!r}, codebook={explicit!r}"
+        )
+    normalized = marker_codebook or explicit
+    if normalized is None:
+        raise ValueError(
+            "trellis256 dense preparation requires mcg=, mul1=, or explicit codebook="
+        )
+    return normalized
+
+
+def prepare_trellis256_dense_weight(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    *,
+    mcg: torch.Tensor | None = None,
+    mul1: torch.Tensor | None = None,
+    codebook: str | int | None = None,
+    params_dtype: torch.dtype = torch.float16,
+    dummy_scale: torch.Tensor | None = None,
+) -> PreparedTrellis256DenseWeight:
+    """Prepare one native EXL3 linear for the dense trellis256 entry point.
+
+    The native payload is ``[K/16,N/16,16*bits]i16`` (or the byte-identical
+    ``[...,8*bits]i32`` view), optionally with a leading singleton expert axis.
+    The bitrate is inferred from that final dimension. No trellis or rotation
+    bytes are copied, permuted, stacked, or concatenated.
+    """
+    if params_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "trellis3_t256 dense compute requires fp16 or bf16 MMA inputs"
+        )
+    if trellis.ndim not in (3, 4):
+        raise ValueError(
+            "trellis3_t256 dense payload must have rank 3 or a leading E=1 axis"
+        )
+    if trellis.ndim == 4:
+        if int(trellis.shape[0]) != 1:
+            raise ValueError(
+                f"trellis3_t256 dense payload requires E=1, got {int(trellis.shape[0])}"
+            )
+        k16, n16 = int(trellis.shape[1]), int(trellis.shape[2])
+    else:
+        k16, n16 = int(trellis.shape[0]), int(trellis.shape[1])
+    trellis_bits = _trellis256_bits_from_native_tensor(
+        trellis, name="dense trellis"
+    )
+    in_features = k16 * 16
+    out_features = n16 * 16
+    if in_features <= 0 or out_features <= 0:
+        raise ValueError(
+            f"trellis3_t256 dense dimensions must be positive, got {in_features}x{out_features}"
+        )
+    if in_features % 128 != 0 or out_features % 128 != 0:
+        raise ValueError(
+            "trellis3_t256 dense rotations require K and N divisible by 128; "
+            f"got K={in_features} N={out_features}"
+        )
+    expected_prefix_shape = (
+        (1, k16, n16) if trellis.ndim == 4 else (k16, n16)
+    )
+    device = trellis.device
+    if device.type != "cuda":
+        raise ValueError(
+            f"trellis3_t256 dense weights require CUDA storage, got {device}"
+        )
+    packed = _trellis256_flat_native_view(
+        trellis,
+        name="dense trellis",
+        expected_prefix_shape=expected_prefix_shape,
+        trellis_bits=trellis_bits,
+        device=device,
+    )
+    for name, scale, width in (
+        ("suh", suh, in_features),
+        ("svh", svh, out_features),
+    ):
+        if scale.device != device:
+            raise ValueError(f"trellis3_t256 dense {name} must be on {device}")
+        if scale.dtype != torch.float16:
+            raise TypeError(
+                f"trellis3_t256 dense {name} must be torch.float16, got {scale.dtype}"
+            )
+        if tuple(scale.shape) != (width,):
+            raise ValueError(
+                f"trellis3_t256 dense {name} must have shape {(width,)}, "
+                f"got {tuple(scale.shape)}"
+            )
+        if not scale.is_contiguous():
+            raise ValueError(f"trellis3_t256 dense {name} must be contiguous")
+    normalized_codebook = _trellis256_marker_codebook(
+        mcg=mcg, mul1=mul1, codebook=codebook
+    )
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    else:
+        if (
+            dummy_scale.device != device
+            or dummy_scale.dtype != torch.uint8
+            or tuple(dummy_scale.shape) != (4,)
+            or not dummy_scale.is_contiguous()
+            or int(dummy_scale.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                "trellis3_t256 dense dummy_scale must be a contiguous, 16-byte-"
+                "aligned four-byte uint8 tensor on the weight device"
+            )
+    return PreparedTrellis256DenseWeight(
+        trellis=packed,
+        suh=suh,
+        svh=svh,
+        scale=dummy_scale,
+        global_scale=torch.ones(1, dtype=torch.float32, device=device),
+        workspace=_make_workspace(device, max_blocks_per_sm=4),
+        in_features=in_features,
+        out_features=out_features,
+        params_dtype=params_dtype,
+        trellis_bits=trellis_bits,
+        trellis_codebook=normalized_codebook,
+        mcg=mcg,
+        mul1=mul1,
+    )
+
+
 def _nf3_pack_selftest() -> None:
     """Prove the packer matches the kernel's read+dequant chain (torch/CPU).
 
@@ -1544,11 +2178,14 @@ def _nf3_pack_selftest() -> None:
 
 __all__ = [
     "PreparedNF3MoeWeights",
+    "PreparedTrellis256DenseWeight",
     "W4A16PackedBuffers",
     "W4A16ModelOptWeights",
     "W4A16PackedWeights",
     "make_w4a16_packed_buffers",
     "prepare_nf3_moe_weights",
+    "prepare_trellis256_moe_weights",
+    "prepare_trellis256_dense_weight",
     "prepare_w4a16_compressed_tensors_weights",
     "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fp4_e8m0_k32_weights",

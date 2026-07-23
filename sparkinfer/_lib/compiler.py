@@ -1072,12 +1072,16 @@ def _compile_cache_payload_log_value(
 ) -> dict[str, Any]:
     if payload is None:
         return {}
-    if len(payload) == 10 and payload[0] == "sparkinfer_cute_compile_cache_v5_explicit_spec":
+    if (
+        len(payload) == 11
+        and payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    ):
         (
             _version,
             target_key,
             _sparkinfer_fingerprint,
             toolchain_key,
+            _device_arch,
             spec_hash,
             spec_json,
             kwargs_hash,
@@ -1146,13 +1150,14 @@ def _compile_cache_payload_log_value(
                 summary["toolchain"] = toolchain_summary
         return summary
 
-    if len(payload) != 8:
+    if len(payload) != 9:
         return {}
     (
         _version,
         target_key,
         _sparkinfer_fingerprint,
         toolchain_key,
+        _device_arch,
         args_key,
         kwargs_key,
         options_key,
@@ -1183,8 +1188,8 @@ def _compile_cache_payload_log_value(
 def _is_explicit_spec_payload(payload: tuple[object, ...] | None) -> bool:
     return (
         payload is not None
-        and len(payload) == 10
-        and payload[0] == "sparkinfer_cute_compile_cache_v5_explicit_spec"
+        and len(payload) == 11
+        and payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
     )
 
 
@@ -1443,6 +1448,33 @@ def _distribution_version(name: str) -> str:
         return ""
 
 
+_DEVICE_ARCH_KEY: tuple[object, ...] | None = None
+
+
+def _device_arch_key() -> tuple[object, ...]:
+    """Compute capability of the device this process will compile for.
+
+    Deliberately NOT lru_cached on failure: if CUDA is not initialized yet the
+    query is retried on the next call, so an early call can never memoize a
+    bogus "unknown" and let a cubin built for one architecture be served to
+    another from the shared on-disk cache.
+    """
+    global _DEVICE_ARCH_KEY
+    if _DEVICE_ARCH_KEY is not None:
+        return _DEVICE_ARCH_KEY
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return ("arch", "unavailable")
+        major, minor = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name()
+    except Exception:
+        return ("arch", "unavailable")
+    _DEVICE_ARCH_KEY = ("arch", int(major), int(minor), str(name))
+    return _DEVICE_ARCH_KEY
+
+
 @lru_cache(maxsize=1)
 def _runtime_toolchain_key() -> tuple[object, ...]:
     from .runtime_patches import cutlass_runtime_patch_status
@@ -1538,6 +1570,7 @@ def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
     return (
         _sparkinfer_package_fingerprint(),
         _runtime_toolchain_key(),
+        _device_arch_key(),
         _compile_options_cache_key(compile_callable),
         _compile_environment_key(),
     )
@@ -1849,16 +1882,18 @@ def _compile_disk_cache_payload(
     (
         package_fingerprint,
         runtime_toolchain,
+        device_arch,
         compile_options,
         compile_environment,
     ) = _static_compile_cache_context(compile_callable)
     if compile_spec is not None:
         kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
-            "sparkinfer_cute_compile_cache_v5_explicit_spec",
+            "sparkinfer_cute_compile_cache_v6_explicit_spec",
             _explicit_spec_compile_target(func),
             package_fingerprint,
             runtime_toolchain,
+            device_arch,
             compile_spec.hash_key,
             compile_spec.json_key,
             kwargs_hash_key,
@@ -1867,10 +1902,11 @@ def _compile_disk_cache_payload(
             compile_environment,
         )
     return (
-        "sparkinfer_cute_compile_cache_v2",
+        "sparkinfer_cute_compile_cache_v3",
         _normalize_compile_target(func, set()),
         package_fingerprint,
         runtime_toolchain,
+        device_arch,
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
         compile_options,
@@ -2007,26 +2043,31 @@ def _semantic_compile_manifest_payload(
     semantic: dict[str, Any] = {
         "cache_format": cache_format,
         "target": _semantic_target_key(cache_payload[1]),
+        # device_arch is cache_payload index 4 in both the v6_explicit_spec and
+        # v3 formats. Include it in the semantic identity so two payloads that
+        # differ only by GPU architecture hash to distinct semantic keys and the
+        # device-aware cache format cannot be aliased across architectures.
+        "device_arch": _manifest_json_value(cache_payload[4]),
     }
-    if cache_format == "sparkinfer_cute_compile_cache_v5_explicit_spec":
-        semantic["compile_spec_hash"] = cache_payload[4]
+    if cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec":
+        semantic["compile_spec_hash"] = cache_payload[5]
         try:
-            semantic["compile_spec"] = json.loads(str(cache_payload[5]))
+            semantic["compile_spec"] = json.loads(str(cache_payload[6]))
         except (TypeError, ValueError, json.JSONDecodeError):
-            semantic["compile_spec"] = str(cache_payload[5])
-        if cache_payload[6]:
-            semantic["compile_kwargs_hash"] = cache_payload[6]
+            semantic["compile_spec"] = str(cache_payload[6])
+        if cache_payload[7]:
+            semantic["compile_kwargs_hash"] = cache_payload[7]
             try:
-                semantic["compile_kwargs"] = json.loads(str(cache_payload[7]))
+                semantic["compile_kwargs"] = json.loads(str(cache_payload[8]))
             except (TypeError, ValueError, json.JSONDecodeError):
-                semantic["compile_kwargs"] = str(cache_payload[7])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[8])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[9])
+                semantic["compile_kwargs"] = str(cache_payload[8])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[9])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[10])
     else:
-        semantic["args"] = _semantic_structural_key(cache_payload[4])
-        semantic["kwargs"] = _semantic_structural_key(cache_payload[5])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[6])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[7])
+        semantic["args"] = _semantic_structural_key(cache_payload[5])
+        semantic["kwargs"] = _semantic_structural_key(cache_payload[6])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[7])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[8])
     return semantic
 
 
@@ -2260,9 +2301,9 @@ def _build_compile_manifest(
         allow_nan=False,
     )
     cache_format = str(cache_payload[0]) if cache_payload else "unknown"
-    explicit = cache_format == "sparkinfer_cute_compile_cache_v5_explicit_spec"
-    options_index = 8 if explicit else 6
-    environment_index = 9 if explicit else 7
+    explicit = cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    options_index = 9 if explicit else 7
+    environment_index = 10 if explicit else 8
     launch_metadata = (
         _extract_launch_dynamic_smem_bytes(compiled)
         if compiled is not None
@@ -2308,12 +2349,12 @@ def _build_compile_manifest(
         ).hexdigest(),
     }
     if explicit:
-        manifest["compile_spec_hash"] = str(cache_payload[4])
-        manifest["compile_spec_json"] = str(cache_payload[5])
-        manifest["compile_kwargs_hash"] = str(cache_payload[6])
-        manifest["compile_kwargs_json"] = str(cache_payload[7])
+        manifest["compile_spec_hash"] = str(cache_payload[5])
+        manifest["compile_spec_json"] = str(cache_payload[6])
+        manifest["compile_kwargs_hash"] = str(cache_payload[7])
+        manifest["compile_kwargs_json"] = str(cache_payload[8])
         try:
-            spec = json.loads(str(cache_payload[5]))
+            spec = json.loads(str(cache_payload[6]))
         except (TypeError, ValueError, json.JSONDecodeError):
             spec = None
         if isinstance(spec, dict):

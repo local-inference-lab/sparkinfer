@@ -5815,3 +5815,221 @@ def nf3_codebook_pools(codebook) -> tuple:
         lo[reg] |= (bf16 & 0xFF) << (8 * slot)
         hi[reg] |= ((bf16 >> 8) & 0xFF) << (8 * slot)
     return lo[0], lo[1], hi[0], hi[1]
+
+# ===== TRELLIS-3.0 (QTIP/EXL3 3INST cb=1) dequant — added for NF3->trellis swap =====
+_TRELLIS_MCG  = 0xCBAC1FED   # codebook.cuh:39  MCG multiplier (cb==1)
+_TRELLIS_MASK = 0x8FFF8FFF   # codebook.cuh:41  lop3 operand b
+_TRELLIS_OR   = 0x3B603B60   # codebook.cuh:41  lop3 operand c ; immLut 0x6a == (a & b) ^ c
+
+
+@dsl_user_op
+def packed_dequant_trellis_to_half2x4(
+    win_a, win_b, bits: int = 3, *, loc=None, ip=None
+):
+    """8 trellis windows -> 4 fp16x2 fragments for one compile-time bitrate.
+
+    win_a/win_b: two 32-bit funnel windows extracted from the staged unit by the
+    caller (_trellis_funnel32). Element/lane order matches the NF3 primitive:
+      o0=(dec w0, dec w1) o1=(dec w2, dec w3) o2=(dec w4, dec w5) o3=(dec w6, dec w7)
+    with w7=win_a, w6=win_a>>bits, ... w4=win_a>>(3*bits), and
+         w3=win_b, w2=win_b>>bits, ... w0=win_b>>(3*bits).
+
+    ``bits`` is a trace-time specialization in {3,4,5,6}, so the generated PTX
+    keeps the same immediate shifts as exl3's templated dq4/dq8 implementations.
+    The caller supplies independently valid four-weight windows for 5/6 bpw,
+    whose full eight-weight span can cross three ring words.
+    """
+    bits = int(bits)
+    if bits not in (3, 4, 5, 6):
+        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
+    asm = """
+        {
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
+            mov.b32 M, 0xCBAC1FED;
+            and.b32 w7, $4, 0xffff;
+            shr.u32 w6, $4, __B1__;  and.b32 w6, w6, 0xffff;
+            shr.u32 w5, $4, __B2__;  and.b32 w5, w5, 0xffff;
+            shr.u32 w4, $4, __B3__;  and.b32 w4, w4, 0xffff;
+            and.b32 w3, $5, 0xffff;
+            shr.u32 w2, $5, __B1__;  and.b32 w2, w2, 0xffff;
+            shr.u32 w1, $5, __B2__;  and.b32 w1, w1, 0xffff;
+            shr.u32 w0, $5, __B3__;  and.b32 w0, w0, 0xffff;
+            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
+            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
+            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
+            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
+            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
+        }
+        """
+    asm = (
+        asm.replace("__B1__", str(bits))
+        .replace("__B2__", str(2 * bits))
+        .replace("__B3__", str(3 * bits))
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Uint32(win_a).ir_value(loc=loc, ip=ip), Uint32(win_b).ir_value(loc=loc, ip=ip)],
+        asm,
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    o2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    o3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(o0), Uint32(o1), Uint32(o2), Uint32(o3)
+
+
+@dsl_user_op
+def packed_dequant_trellis_stream_to_half2x4(
+    stream_lo, stream_hi, bits: int, *, loc=None, ip=None
+):
+    """Decode eight windows from a bitrate-strided 64-bit aligned stream.
+
+    Bit zero of ``{stream_hi,stream_lo}`` begins w7; w6..w0 begin at successive
+    ``bits`` offsets. This is required at 6 bpw, where four 16-bit windows span
+    34 bits and cannot be represented by one 32-bit base window.
+    """
+    bits = int(bits)
+    if bits not in (3, 4, 5, 6):
+        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
+    asm = """
+        {
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
+            mov.b32 M, 0xCBAC1FED;
+            and.b32 w7, $4, 0xffff;
+            __I6__
+            __I5__
+            __I4__
+            __I3__
+            __I2__
+            __I1__
+            __I0__
+            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
+            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
+            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
+            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
+            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
+        }
+        """
+    for name, register, multiple in (
+        ("__I6__", "w6", 1), ("__I5__", "w5", 2),
+        ("__I4__", "w4", 3), ("__I3__", "w3", 4),
+        ("__I2__", "w2", 5), ("__I1__", "w1", 6),
+        ("__I0__", "w0", 7),
+    ):
+        shift = multiple * bits
+        if shift < 32:
+            instruction = (
+                f"shf.r.wrap.b32 {register}, $4, $5, {shift}; "
+                f"and.b32 {register}, {register}, 0xffff;"
+            )
+        else:
+            instruction = (
+                f"shr.u32 {register}, $5, {shift - 32}; "
+                f"and.b32 {register}, {register}, 0xffff;"
+            )
+        asm = asm.replace(name, instruction)
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(stream_lo).ir_value(loc=loc, ip=ip),
+            Uint32(stream_hi).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    o2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    o3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(o0), Uint32(o1), Uint32(o2), Uint32(o3)
+
+
+@dsl_user_op
+def packed_dequant_trellis3_to_half2x4(win_a, win_b, *, loc=None, ip=None):
+    """Compatibility wrapper for the original 3-bpw primitive."""
+    return packed_dequant_trellis_to_half2x4(win_a, win_b, 3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
+    """{hi_f16, lo_f16} -> {hi_bf16, lo_bf16}, RNE, lane order preserved."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()]),
+        [Uint32(p).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 hlo, hhi;
+            .reg .f32 flo, fhi;
+            mov.b32 {hlo, hhi}, $1;
+            cvt.f32.f16 flo, hlo;
+            cvt.f32.f16 fhi, hhi;
+            cvt.rn.bf16x2.f32 $0, fhi, flo;
+        }
+        """,
+        "=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
+
+
+@dsl_user_op
+def packed_dequant_trellis_to_bfloat2x4(
+    win_a, win_b, bits: int = 3, *, loc=None, ip=None
+):
+    """Diagnostic bf16 conversion of the generalized fp16 trellis decode.
+
+    Production trellis kernels should use the fp16 primitive and fp16 MMA arm:
+    that is bit-faithful to exl3 and saves 16 conversion instructions per
+    fragment.  This wrapper remains available for the D4 bf16 A/B gate.
+    """
+    h0, h1, h2, h3 = packed_dequant_trellis_to_half2x4(
+        win_a, win_b, bits, loc=loc, ip=ip
+    )
+    return (_f16x2_to_bf16x2(h0, loc=loc, ip=ip), _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
+            _f16x2_to_bf16x2(h2, loc=loc, ip=ip), _f16x2_to_bf16x2(h3, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def packed_dequant_trellis_stream_to_bfloat2x4(
+    stream_lo, stream_hi, bits: int, *, loc=None, ip=None
+):
+    """Diagnostic bf16 conversion of the 64-bit-stream trellis decode."""
+    h0, h1, h2, h3 = packed_dequant_trellis_stream_to_half2x4(
+        stream_lo, stream_hi, bits, loc=loc, ip=ip
+    )
+    return (
+        _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h2, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h3, loc=loc, ip=ip),
+    )
+
+
+@dsl_user_op
+def packed_dequant_trellis3_to_bfloat2x4(win_a, win_b, *, loc=None, ip=None):
+    """Compatibility wrapper for the former 3-bpw bf16 primitive."""
+    return packed_dequant_trellis_to_bfloat2x4(
+        win_a, win_b, 3, loc=loc, ip=ip
+    )

@@ -1,3 +1,13 @@
-"""Internal CuTeDSL W4A16 MoE implementation package."""
+"""Public preparation and execution surfaces for CuTeDSL W4A16 kernels."""
 
-__all__: list[str] = []
+from .kernel import run_trellis256_dense
+from .prepare import (
+    PreparedTrellis256DenseWeight,
+    prepare_trellis256_dense_weight,
+)
+
+__all__ = [
+    "PreparedTrellis256DenseWeight",
+    "prepare_trellis256_dense_weight",
+    "run_trellis256_dense",
+]
