@@ -40,6 +40,7 @@ FLAG_SLOTS = 256
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
+OUTPUT_TAIL_PADDING = 64 << 10
 
 
 def _fp8_mode() -> str:
@@ -141,6 +142,22 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _persistent_output_view(
+    storage: torch.Tensor,
+    inp: torch.Tensor,
+    max_bytes: int,
+) -> torch.Tensor:
+    """Return an input-shaped view over a reusable byte workspace."""
+    size_bytes = inp.numel() * inp.element_size()
+    if size_bytes > max_bytes:
+        raise ValueError(
+            f"input needs {size_bytes} output bytes, capacity is {max_bytes}"
+        )
+    if storage.device != inp.device or storage.dtype is not torch.uint8:
+        raise ValueError("output storage must be uint8 on the input device")
+    return storage.view(inp.dtype)[: inp.numel()].view(inp.shape)
+
+
 class PCIeDmaAllReduce:
     """Single-channel ring allreduce over IPC scratch buffers.
 
@@ -195,6 +212,12 @@ class PCIeDmaAllReduce:
         self._wait_counters = torch.zeros(
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
+        # CustomAllreduce is constructed before vLLM takes its initial memory
+        # snapshot. Allocate this workspace on the first DMA dispatch instead,
+        # which occurs during the profiling forward and is therefore deducted
+        # from the KV-cache budget. It must still remain persistent afterward:
+        # allocating a large result after KV sizing can OOM at long prefill.
+        self._output_storage: torch.Tensor | None = None
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
         # Separate CE/flag streams for the a2a broadcast phase so allgather
@@ -332,6 +355,20 @@ class PCIeDmaAllReduce:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
+    def _ensure_output_storage(self) -> torch.Tensor:
+        if self._output_storage is None:
+            # Leave a mapped tail for CUDA consumers that legally read through
+            # their final vector tile beyond the logical tensor boundary.
+            output_storage_bytes = (
+                _align_up(self.max_bytes, 8) + OUTPUT_TAIL_PADDING
+            )
+            self._output_storage = torch.empty(
+                output_storage_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        return self._output_storage
+
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -340,8 +377,13 @@ class PCIeDmaAllReduce:
                 "input does not satisfy ring allreduce requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
+        output_storage = self._ensure_output_storage()
         if out is None:
-            out = torch.empty_like(inp)
+            out = _persistent_output_view(
+                output_storage,
+                inp,
+                self.max_bytes,
+            )
         elif (
             out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous()
         ):

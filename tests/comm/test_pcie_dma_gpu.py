@@ -8,7 +8,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce, _load_extension
+from sparkinfer.comm.pcie.pcie_dma import (
+    OUTPUT_TAIL_PADDING,
+    PCIeDmaAllReduce,
+    _load_extension,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -76,6 +80,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_bytes=max_rows * hidden * 4,
     )
     try:
+        assert ring._output_storage is None
+        default_output_ptr = None
         for dtype in (torch.bfloat16,):
             for rows in (8, 64, 256):
                 inp = _make_input(rows, hidden, dtype, device, rank, 0)
@@ -83,6 +89,13 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 out = ring.all_reduce(inp)
                 torch.cuda.synchronize(device)
                 _assert_close(out, ref, world_size)
+                if default_output_ptr is None:
+                    default_output_ptr = out.data_ptr()
+                else:
+                    assert out.data_ptr() == default_output_ptr
+
+        assert ring._output_storage is not None
+        assert ring._output_storage.numel() >= ring.max_bytes + OUTPUT_TAIL_PADDING
 
         # Graph capture and replay with changing inputs.
         rows = 256
