@@ -50,6 +50,29 @@ def _reference_fp8(query: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
     return (query.float() * inv_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
 
+def _bf16_inputs(
+    *, num_heads: int, m: int, seed: int = 47
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    q_nope = torch.randn(num_heads, m, 192, device="cuda", dtype=torch.bfloat16) * 0.5
+    weight = (
+        torch.randn(num_heads, 192, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    q_full = torch.randn(m, num_heads, 576, device="cuda", dtype=torch.bfloat16)
+    q_pe = q_full[..., 512:]
+    q_scale = torch.tensor([0.037], device="cuda", dtype=torch.float32)
+    return q_nope, weight, q_pe, q_scale
+
+
+def _reference_bf16_weight(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+) -> torch.Tensor:
+    projected = torch.bmm(q_nope, weight).transpose(0, 1)
+    return torch.cat((projected, q_pe), dim=-1)
+
+
 @pytest.mark.parametrize("num_heads", [8, 16])
 @pytest.mark.parametrize("m", [1, 6, 9, 32])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -92,9 +115,7 @@ def test_fused_query_matches_two_stage_reference(
 def test_fused_query_cuda_graph_replays_fresh_inputs(output_dtype: torch.dtype) -> None:
     require_sparkinfer()
     q_nope, weight, q_pe, q_scale = _inputs(num_heads=8, m=4)
-    assert mla_query_projection.prewarm(
-        weight, [4], output_dtype=output_dtype
-    ) == 1
+    assert mla_query_projection.prewarm(weight, [4], output_dtype=output_dtype) == 1
     out = torch.empty(4, 8, 576, device="cuda", dtype=output_dtype)
 
     graph = torch.cuda.CUDAGraph()
@@ -157,6 +178,111 @@ def test_fused_query_rejects_wrong_rope_layout() -> None:
 def test_fused_query_requires_scale_only_for_fp8() -> None:
     require_sparkinfer()
     q_nope, weight, q_pe, _ = _inputs(num_heads=8, m=2)
+    out_bf16 = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
+    mla_query_projection.run(q_nope, weight, q_pe, out_bf16)
+
+    out_fp8 = torch.empty(2, 8, 576, device="cuda", dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="q_scale is required"):
+        mla_query_projection.run(q_nope, weight, q_pe, out_fp8)
+
+
+@pytest.mark.parametrize("num_heads", [8, 11, 16])
+@pytest.mark.parametrize("m", [1, 6, 17, 32])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bf16_weight_matches_staged_projection(
+    num_heads: int, m: int, output_dtype: torch.dtype
+) -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=num_heads, m=m)
+    reference_bf16 = _reference_bf16_weight(q_nope, weight, q_pe)
+
+    # Exercise the pitched caller-owned layout used by DCP workspaces.
+    backing = torch.empty(m, num_heads, 584, device="cuda", dtype=output_dtype)
+    out = backing[..., :576]
+    returned = mla_query_projection.run(
+        q_nope,
+        weight,
+        q_pe,
+        out,
+        q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
+    )
+
+    assert returned is out
+    if output_dtype == torch.bfloat16:
+        torch.testing.assert_close(out, reference_bf16, rtol=2e-2, atol=2e-2)
+        assert torch.equal(out[..., 512:], q_pe)
+    else:
+        fused_bf16 = torch.empty(
+            (m, num_heads, 576), device="cuda", dtype=torch.bfloat16
+        )
+        mla_query_projection.run(q_nope, weight, q_pe, fused_bf16)
+        torch.testing.assert_close(fused_bf16, reference_bf16, rtol=2e-2, atol=2e-2)
+        expected = _reference_fp8(fused_bf16, q_scale)
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bf16_weight_cuda_graph_replays_fresh_inputs(
+    output_dtype: torch.dtype,
+) -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=11, m=4)
+    assert mla_query_projection.prewarm(weight, [4], output_dtype=output_dtype) == 1
+    out = torch.empty(4, 11, 576, device="cuda", dtype=output_dtype)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mla_query_projection.run(
+            q_nope,
+            weight,
+            q_pe,
+            out,
+            q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
+        )
+
+    fresh_nope = torch.randn_like(q_nope) * 0.5
+    fresh_pe = torch.randn_like(q_pe)
+    q_nope.copy_(fresh_nope)
+    q_pe.copy_(fresh_pe)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    reference_bf16 = _reference_bf16_weight(fresh_nope, weight, fresh_pe)
+    if output_dtype == torch.bfloat16:
+        torch.testing.assert_close(out, reference_bf16, rtol=2e-2, atol=2e-2)
+    else:
+        fused_bf16 = torch.empty_like(out, dtype=torch.bfloat16)
+        mla_query_projection.run(fresh_nope, weight, fresh_pe, fused_bf16)
+        torch.testing.assert_close(fused_bf16, reference_bf16, rtol=2e-2, atol=2e-2)
+        expected = _reference_fp8(fused_bf16, q_scale)
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_bf16_weight_supports_virtual_tp_heads() -> None:
+    device = require_sparkinfer()
+    kwargs = dict(
+        num_heads=11,
+        max_m=32,
+        nope_dim=192,
+        latent_dim=512,
+        output_dtype=torch.bfloat16,
+        weight_format="bf16",
+        device=device,
+    )
+    assert mla_query_projection.can_implement(**kwargs)
+    assert mla_query_projection.can_implement(
+        **{**kwargs, "output_dtype": torch.float8_e4m3fn}
+    )
+    assert not mla_query_projection.can_implement(**{**kwargs, "num_heads": 12})
+    assert not mla_query_projection.can_implement(**{**kwargs, "max_m": 33})
+    assert not mla_query_projection.can_implement(
+        **{**kwargs, "weight_format": "mxfp8"}
+    )
+
+
+def test_bf16_weight_requires_scale_only_for_fp8() -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe, _ = _bf16_inputs(num_heads=8, m=2)
     out_bf16 = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
     mla_query_projection.run(q_nope, weight, q_pe, out_bf16)
 
