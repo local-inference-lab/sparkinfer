@@ -6,8 +6,9 @@ threshold bucket in a fixed 4096-slot shared buffer (``_SMEM_CANDS``). When a si
 bucket holds more than 4096 candidates -- e.g. many tokens with near-equal scores, as
 happens on low-contrast attention rows at longer context -- the pre-fix code silently
 dropped the overflow and kept the lowest-indexed (here lowest-scoring) survivors, so it
-selected tokens far below the true top-k threshold. The fix re-runs an exact, buffer-free
-MSD radix (``_exact_overflow_fallback``) whenever the bucket overflows.
+selected tokens far below the true top-k threshold. The fast overflow path narrows the
+coarse bucket with one exact FP32 radix rescan and resumes buffered selection when it fits;
+an exact, buffer-free MSD radix remains for persistent overflow such as all-equal scores.
 
 Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 
@@ -21,6 +22,7 @@ Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 * carry fold (``supertile_k`` < context): multi-chunk streaming fold, so the overflow
   fallback runs in the ``is_first=False`` carry path through the virtual value loader.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -138,7 +140,9 @@ def _run_indexer(
         build_schedule=False,
         shared_page_table=True,
     )
-    selected = torch.empty((_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device)
+    selected = torch.empty(
+        (_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device
+    )
     clear_indexer_caches()
     index_topk_fp8(
         q_fp8=scene["q_fp8"],
@@ -177,9 +181,7 @@ def _assert_selects_true_topk(
         )
     logical = raw_logical.clamp(0, seq_len - 1)
     selected_score = torch.gather(scene["ref_logits"], 1, logical)
-    n_below = int(
-        (selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item()
-    )
+    n_below = int((selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item())
     assert n_below == 0, (
         f"{n_below}/{_ROWS * _TOPK} selected tokens score below the true top-{_TOPK} "
         f"threshold at seq_len={seq_len}"
@@ -199,7 +201,7 @@ def test_paged_prefill_topk_selects_true_topk_at_long_context(
 
 
 def test_paged_prefill_topk_all_equal_scores_tie_fill(monkeypatch) -> None:
-    """One bucket holds every token: the fallback must tie-fill the whole top-k."""
+    """Persistent overflow must reach the exact fallback and tie-fill the top-k."""
     device = torch.device("cuda")
     scene = _build_scene(device, 32768, "equal")
     selected = _run_indexer(

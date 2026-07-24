@@ -455,9 +455,7 @@ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
     return cute_tensor
 
 
-def _tensor_compile_key(
-    name, tensor, *, dynamic_dims=(), dynamic_strides=()
-):
+def _tensor_compile_key(name, tensor, *, dynamic_dims=(), dynamic_strides=()):
     return tensor_compile_fact(
         name, tensor, dynamic_dims=dynamic_dims, dynamic_strides=dynamic_strides
     )
@@ -910,11 +908,14 @@ class SparseNSATiledTopkKernel:
                         else:
                             if Int32(bin8) == threshold_bin:
                                 cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
+                                key32 = _convert_to_uint32(raw_input)
+                                sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                                # Keep the histogram exact even when the candidate
+                                # buffer fills. The overflow path uses it to narrow
+                                # the bucket with one full-input rescan.
+                                _smem_red_add(h0, Int32(sub_bin), Int32(1))
                                 if cand_pos < Int32(_SMEM_CANDS):
                                     s_cand0[cand_pos] = idx
-                                    key32 = _convert_to_uint32(raw_input)
-                                    sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
-                                    _smem_red_add(h0, Int32(sub_bin), Int32(1))
                     idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
                 while idx_base < total_len:
                     raw_input = _load_value_virtual(
@@ -937,11 +938,11 @@ class SparseNSATiledTopkKernel:
                     else:
                         if Int32(bin8) == threshold_bin:
                             cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
+                            key32 = _convert_to_uint32(raw_input)
+                            sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                            _smem_red_add(h0, Int32(sub_bin), Int32(1))
                             if cand_pos < Int32(_SMEM_CANDS):
                                 s_cand0[cand_pos] = idx_base
-                                key32 = _convert_to_uint32(raw_input)
-                                sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
-                                _smem_red_add(h0, Int32(sub_bin), Int32(1))
                     idx_base = idx_base + Int32(_THREADS_PER_CTA)
 
                 cute.arch.sync_threads()
@@ -951,9 +952,132 @@ class SparseNSATiledTopkKernel:
                 # bucket overflowed the candidate buffer (winners dropped past the cap).
                 bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
+                # Most long-context overflows are broad only in the coarse FP16
+                # bucket. Use the exact FP32-byte histogram collected above to pick
+                # its next radix bucket, then rescan once into cand1. This preserves
+                # exact selection while avoiding the six full-input scans in the
+                # fallback whenever one additional byte fits in shared memory.
+                refined_overflow_count = Int32(0)
+                if bin_count > Int32(_SMEM_CANDS):
+                    for stage in cutlass.range_constexpr(8):
+                        j = Int32(1 << stage)
+                        if tx < Int32(256):
+                            if (stage & 1) == 0:
+                                value = Int32(s_hist0[tx])
+                                if tx < Int32(256) - j:
+                                    value = value + Int32(s_hist0[tx + j])
+                                s_hist1[tx] = value
+                            else:
+                                value = Int32(s_hist1[tx])
+                                if tx < Int32(256) - j:
+                                    value = value + Int32(s_hist1[tx + j])
+                                s_hist0[tx] = value
+                        cute.arch.sync_threads()
+
+                    if tx < Int32(256):
+                        val_tx = Int32(s_hist0[tx])
+                        val_tx1 = Int32(s_hist0[tx + Int32(1)])
+                        if val_tx > topk:
+                            if val_tx1 <= topk:
+                                _smem_st(thr, Int32(0), Int32(tx))
+                                _smem_st(ni1, Int32(0), Int32(0))
+                                _smem_st(lr, Int32(0), topk - val_tx1)
+
+                    cute.arch.sync_threads()
+                    sub_threshold = _smem_ld(thr, Int32(0))
+                    topk = topk - Int32(s_hist0[sub_threshold + Int32(1)])
+
+                    if tx < Int32(257):
+                        s_hist0[tx] = Int32(0)
+                    cute.arch.sync_threads()
+
+                    idx_base = Int32(tx)
+                    full_scan_limit = total_len - Int32(
+                        (_SCAN_UNROLL - 1) * _THREADS_PER_CTA
+                    )
+                    while idx_base < full_scan_limit:
+                        for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+                            idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                            raw_input = _load_value_virtual(
+                                input_tensor,
+                                carry_values,
+                                row_base,
+                                row_start,
+                                out_base,
+                                length,
+                                idx,
+                                self.block_q,
+                                self.block_k,
+                                self.is_tiled,
+                                self.is_first,
+                            )
+                            bin8 = _convert_to_uint8(raw_input)
+                            if Int32(bin8) == threshold_bin:
+                                key32 = _convert_to_uint32(raw_input)
+                                sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                                if Int32(sub_bin) > sub_threshold:
+                                    pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                                    s_out[pos] = idx
+                                else:
+                                    if Int32(sub_bin) == sub_threshold:
+                                        if topk != Int32(0):
+                                            cand_pos = _smem_xadd(
+                                                ni1, Int32(0), Int32(1)
+                                            )
+                                            next_bin = (key32 >> Uint32(16)) & Uint32(
+                                                0xFF
+                                            )
+                                            _smem_red_add(h0, Int32(next_bin), Int32(1))
+                                            if cand_pos < Int32(_SMEM_CANDS):
+                                                s_cand1[cand_pos] = idx
+                        idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+                    while idx_base < total_len:
+                        raw_input = _load_value_virtual(
+                            input_tensor,
+                            carry_values,
+                            row_base,
+                            row_start,
+                            out_base,
+                            length,
+                            idx_base,
+                            self.block_q,
+                            self.block_k,
+                            self.is_tiled,
+                            self.is_first,
+                        )
+                        bin8 = _convert_to_uint8(raw_input)
+                        if Int32(bin8) == threshold_bin:
+                            key32 = _convert_to_uint32(raw_input)
+                            sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                            if Int32(sub_bin) > sub_threshold:
+                                pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                                s_out[pos] = idx_base
+                            else:
+                                if Int32(sub_bin) == sub_threshold:
+                                    if topk != Int32(0):
+                                        cand_pos = _smem_xadd(ni1, Int32(0), Int32(1))
+                                        next_bin = (key32 >> Uint32(16)) & Uint32(0xFF)
+                                        _smem_red_add(h0, Int32(next_bin), Int32(1))
+                                        if cand_pos < Int32(_SMEM_CANDS):
+                                            s_cand1[cand_pos] = idx_base
+                        idx_base = idx_base + Int32(_THREADS_PER_CTA)
+
+                    cute.arch.sync_threads()
+                    refined_overflow_count = Int32(_smem_ld(ni1, Int32(0)))
+                    if topk == Int32(0):
+                        topk = Int32(-1)
+
                 # Stage 2: refine with 8-bit radix passes
                 for round_idx in cutlass.range_constexpr(4):
-                    if topk != Int32(-1):
+                    run_round = topk != Int32(-1)
+                    if cutlass.const_expr(round_idx == 0):
+                        run_round = run_round & (bin_count <= Int32(_SMEM_CANDS))
+                    else:
+                        run_round = run_round & (
+                            (bin_count <= Int32(_SMEM_CANDS))
+                            | (refined_overflow_count <= Int32(_SMEM_CANDS))
+                        )
+                    if run_round:
                         r_idx_is_0 = (round_idx % 2) == 0
                         r_idx_next_is_0 = not r_idx_is_0
 
@@ -1098,10 +1222,10 @@ class SparseNSATiledTopkKernel:
 
                             cute.arch.sync_threads()
 
-                # Exact overflow fallback: the buffered refine above dropped
-                # winners when more than _SMEM_CANDS candidates shared the coarse
-                # threshold bucket. Redo the selection exactly by re-scanning.
-                if bin_count > Int32(_SMEM_CANDS):
+                # Degenerate scores can still share both the coarse bucket and
+                # the first FP32 byte. Retain the buffer-free exact path for that
+                # case; ordinary long-context overflow has already been resolved.
+                if refined_overflow_count > Int32(_SMEM_CANDS):
                     _exact_overflow_fallback(
                         tx,
                         total_len,
@@ -1504,7 +1628,7 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v23",
+            "tiled_topk_v24",
             topk,
             block_q,
             block_k,
