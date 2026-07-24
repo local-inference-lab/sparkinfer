@@ -11,9 +11,9 @@ MSD radix (``_exact_overflow_fallback``) whenever the bucket overflows.
 
 Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 
-* ``seq_len`` sweep: 32768 keeps the hot bucket at 8191 <= 8192 (never overflowed);
-  32832 pushes it just over 8192 with almost no extra context, proving the trigger is the
-  candidate cap and not the context length; 65536 overflows it hard.
+* ``seq_len`` sweep: 32768 and 32832 straddle the old 8-bit/8192-candidate
+  boundary, while 65536 verifies that the wider coarse radix remains exact at long
+  context without relying on the historical truncated result.
 * all-equal scores: one coarse+fine bucket holds every token, so the fallback's tie-fill
   branch must fill the whole top-k from a single pivot key.
 * logical output (``output_physical_slots=False``): exercises the two-level fold, whose
