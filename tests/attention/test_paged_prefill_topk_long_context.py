@@ -222,8 +222,9 @@ def test_paged_prefill_topk_logical_output_two_level_fold(monkeypatch) -> None:
 def test_paged_prefill_topk_carry_fold_overflow(monkeypatch) -> None:
     """supertile_k < context forces the multi-chunk carry fold (is_first=False path).
 
-    All-equal scores guarantee every 8192-token chunk overflows its single bucket, so
-    the exact fallback runs through the virtual (carry-aware) value loader.
+    All-equal scores put each 8192-token local chunk in one bucket. The first chunk
+    exactly fills the 8192-slot buffer; the next fold adds the carried 2048 winners and
+    therefore overflows, exercising the virtual (carry-aware) exact fallback.
     """
     device = torch.device("cuda")
     scene = _build_scene(device, 32768, "equal")

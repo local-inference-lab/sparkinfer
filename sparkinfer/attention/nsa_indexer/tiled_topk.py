@@ -954,6 +954,14 @@ class SparseNSATiledTopkKernel:
                 # bucket overflowed the candidate buffer (winners dropped past the cap).
                 bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
+                # The exact fallback below rebuilds all top-k outputs from the full
+                # row.  Do not spend four radix rounds refining a truncated candidate
+                # buffer first: none of those intermediate outputs survive.  This is
+                # a CTA-uniform branch because every thread reads the same shared
+                # counter after the barrier above.
+                if bin_count > Int32(_SMEM_CANDS):
+                    topk = Int32(-1)
+
                 # Stage 2: refine with 8-bit radix passes
                 for round_idx in cutlass.range_constexpr(4):
                     if topk != Int32(-1):
@@ -1507,7 +1515,7 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v24",
+            "tiled_topk_v25",
             topk,
             block_q,
             block_k,
