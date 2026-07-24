@@ -1109,36 +1109,9 @@ class SparseNSATiledTopkKernel:
 
                             cute.arch.sync_threads()
 
-                # Exact overflow fallback: the buffered refine above dropped
-                # winners when more than _SMEM_CANDS candidates shared the coarse
-                # threshold bucket. Redo the selection exactly by re-scanning.
-                if bin_count > Int32(_SMEM_CANDS):
-                    _exact_overflow_fallback(
-                        tx,
-                        total_len,
-                        topk_static,
-                        s_hist0,
-                        s_hist1,
-                        s_out,
-                        h0,
-                        ctr,
-                        thr,
-                        ni0,
-                        ni1,
-                        lr,
-                        flat=False,
-                        flat_values=input_tensor,
-                        input_tensor=input_tensor,
-                        carry_values=carry_values,
-                        row_base=row_base,
-                        row_start=row_start,
-                        carry_base=out_base,
-                        chunk_len=length,
-                        block_q=self.block_q,
-                        block_k=self.block_k,
-                        is_tiled=self.is_tiled,
-                        is_first=self.is_first,
-                    )
+                # Diagnostic-only branch: intentionally retain the historical
+                # truncated result so E2E timing isolates the exact fallback.
+                # This worktree must never be used for a release image.
 
             cute.arch.sync_threads()
             idx0 = Int32(tx)
@@ -1515,7 +1488,7 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v25",
+            "tiled_topk_v26_no_fallback_diag",
             topk,
             block_q,
             block_k,
