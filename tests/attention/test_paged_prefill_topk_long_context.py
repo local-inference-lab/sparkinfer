@@ -2,8 +2,8 @@
 
 The tiled radix-select top-k (``SparseNSATiledTopkKernel``, reached via ``index_topk_fp8``
 / ``packed_contiguous``) buckets candidates by the top bits of the score and stores the
-threshold bucket in a fixed 4096-slot shared buffer (``_SMEM_CANDS``). When a single
-bucket holds more than 4096 candidates -- e.g. many tokens with near-equal scores, as
+threshold bucket in a fixed shared buffer (``_SMEM_CANDS``). When a single bucket
+holds more candidates than that buffer -- e.g. many tokens with near-equal scores, as
 happens on low-contrast attention rows at longer context -- the pre-fix code silently
 dropped the overflow and kept the lowest-indexed (here lowest-scoring) survivors, so it
 selected tokens far below the true top-k threshold. The fix re-runs an exact, buffer-free
@@ -11,9 +11,9 @@ MSD radix (``_exact_overflow_fallback``) whenever the bucket overflows.
 
 Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 
-* ``seq_len`` sweep: 16384 keeps the hot bucket at 4091 <= 4096 (never overflowed);
-  16448 pushes it just over 4096 with almost no extra context, proving the trigger is the
-  4096 bucket cap and not the context length; 32768 overflows it hard.
+* ``seq_len`` sweep: 32768 keeps the hot bucket at 8191 <= 8192 (never overflowed);
+  32832 pushes it just over 8192 with almost no extra context, proving the trigger is the
+  candidate cap and not the context length; 65536 overflows it hard.
 * all-equal scores: one coarse+fine bucket holds every token, so the fallback's tie-fill
   branch must fill the whole top-k from a single pivot key.
 * logical output (``output_physical_slots=False``): exercises the two-level fold, whose
@@ -21,6 +21,7 @@ Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 * carry fold (``supertile_k`` < context): multi-chunk streaming fold, so the overflow
   fallback runs in the ``is_first=False`` carry path through the virtual value loader.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -138,7 +139,9 @@ def _run_indexer(
         build_schedule=False,
         shared_page_table=True,
     )
-    selected = torch.empty((_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device)
+    selected = torch.empty(
+        (_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device
+    )
     clear_indexer_caches()
     index_topk_fp8(
         q_fp8=scene["q_fp8"],
@@ -177,16 +180,14 @@ def _assert_selects_true_topk(
         )
     logical = raw_logical.clamp(0, seq_len - 1)
     selected_score = torch.gather(scene["ref_logits"], 1, logical)
-    n_below = int(
-        (selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item()
-    )
+    n_below = int((selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item())
     assert n_below == 0, (
         f"{n_below}/{_ROWS * _TOPK} selected tokens score below the true top-{_TOPK} "
         f"threshold at seq_len={seq_len}"
     )
 
 
-@pytest.mark.parametrize("seq_len", [16384, 16448, 32768])
+@pytest.mark.parametrize("seq_len", [32768, 32832, 65536])
 def test_paged_prefill_topk_selects_true_topk_at_long_context(
     monkeypatch, seq_len: int
 ) -> None:

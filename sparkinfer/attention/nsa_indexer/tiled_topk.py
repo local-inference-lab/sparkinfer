@@ -41,7 +41,12 @@ _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
 _SUPPORTED_TOPK = (512, 1024, 2048)
 _RADIX = 256
-_SMEM_CANDS = 4096
+# A 1024-thread selector CTA is already limited to one resident block per SM on
+# SM120 (1536 threads/SM).  Keeping 8192 candidates therefore avoids the common
+# long-context overflow without reducing occupancy; the complete shared-memory
+# allocation remains below the 99 KiB opt-in block limit.  The exact rescan below
+# still covers wider or degenerate threshold buckets.
+_SMEM_CANDS = 8192
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "SPARKINFER_NSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
@@ -455,9 +460,7 @@ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
     return cute_tensor
 
 
-def _tensor_compile_key(
-    name, tensor, *, dynamic_dims=(), dynamic_strides=()
-):
+def _tensor_compile_key(name, tensor, *, dynamic_dims=(), dynamic_strides=()):
     return tensor_compile_fact(
         name, tensor, dynamic_dims=dynamic_dims, dynamic_strides=dynamic_strides
     )
@@ -1504,7 +1507,7 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v23",
+            "tiled_topk_v24",
             topk,
             block_q,
             block_k,
