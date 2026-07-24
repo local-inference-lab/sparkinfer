@@ -2,8 +2,8 @@
 
 The tiled radix-select top-k (``SparseNSATiledTopkKernel``, reached via ``index_topk_fp8``
 / ``packed_contiguous``) buckets candidates by the top bits of the score and stores the
-threshold bucket in a fixed 4096-slot shared buffer (``_SMEM_CANDS``). When a single
-bucket holds more than 4096 candidates -- e.g. many tokens with near-equal scores, as
+threshold bucket in a fixed shared buffer (``_SMEM_CANDS``). When a single bucket
+holds more candidates than that buffer -- e.g. many tokens with near-equal scores, as
 happens on low-contrast attention rows at longer context -- the pre-fix code silently
 dropped the overflow and kept the lowest-indexed (here lowest-scoring) survivors, so it
 selected tokens far below the true top-k threshold. The fix re-runs an exact, buffer-free
@@ -11,9 +11,9 @@ MSD radix (``_exact_overflow_fallback``) whenever the bucket overflows.
 
 Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 
-* ``seq_len`` sweep: 16384 keeps the hot bucket at 4091 <= 4096 (never overflowed);
-  16448 pushes it just over 4096 with almost no extra context, proving the trigger is the
-  4096 bucket cap and not the context length; 32768 overflows it hard.
+* ``seq_len`` sweep: 32768 and 32832 straddle the old 8-bit/8192-candidate
+  boundary, while 65536 verifies that the wider coarse radix remains exact at long
+  context without relying on the historical truncated result.
 * all-equal scores: one coarse+fine bucket holds every token, so the fallback's tie-fill
   branch must fill the whole top-k from a single pivot key.
 * logical output (``output_physical_slots=False``): exercises the two-level fold, whose
@@ -21,6 +21,7 @@ Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 * carry fold (``supertile_k`` < context): multi-chunk streaming fold, so the overflow
   fallback runs in the ``is_first=False`` carry path through the virtual value loader.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -138,7 +139,9 @@ def _run_indexer(
         build_schedule=False,
         shared_page_table=True,
     )
-    selected = torch.empty((_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device)
+    selected = torch.empty(
+        (_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device
+    )
     clear_indexer_caches()
     index_topk_fp8(
         q_fp8=scene["q_fp8"],
@@ -177,16 +180,14 @@ def _assert_selects_true_topk(
         )
     logical = raw_logical.clamp(0, seq_len - 1)
     selected_score = torch.gather(scene["ref_logits"], 1, logical)
-    n_below = int(
-        (selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item()
-    )
+    n_below = int((selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item())
     assert n_below == 0, (
         f"{n_below}/{_ROWS * _TOPK} selected tokens score below the true top-{_TOPK} "
         f"threshold at seq_len={seq_len}"
     )
 
 
-@pytest.mark.parametrize("seq_len", [16384, 16448, 32768])
+@pytest.mark.parametrize("seq_len", [32768, 32832, 65536])
 def test_paged_prefill_topk_selects_true_topk_at_long_context(
     monkeypatch, seq_len: int
 ) -> None:
@@ -221,8 +222,9 @@ def test_paged_prefill_topk_logical_output_two_level_fold(monkeypatch) -> None:
 def test_paged_prefill_topk_carry_fold_overflow(monkeypatch) -> None:
     """supertile_k < context forces the multi-chunk carry fold (is_first=False path).
 
-    All-equal scores guarantee every 8192-token chunk overflows its single bucket, so
-    the exact fallback runs through the virtual (carry-aware) value loader.
+    All-equal scores put each 8192-token local chunk in one bucket. The first chunk
+    exactly fills the 8192-slot buffer; the next fold adds the carried 2048 winners and
+    therefore overflows, exercising the virtual (carry-aware) exact fallback.
     """
     device = torch.device("cuda")
     scene = _build_scene(device, 32768, "equal")
