@@ -11,6 +11,10 @@ pools via ``<Class>Pool``.
 - ``TwoShotReduceScatter``: two-shot sequence-parallel collectives with
   per-token FP8-e4m3 transport.
 - ``DcpAllToAll``: DCP attention exchange with fused LSE reduce-scatter.
+- ``SelectedRecordExchange``: direct peer writes for destination-selected,
+  fixed-width records.
+- ``SelectedRecordCopyExchange``: compact, copy-engine transfer, and unpack
+  for destination-selected fixed-width records.
 
 Raw CUDA (not CuTe): each class JIT-builds its colocated ``.cu`` via
 torch.utils.cpp_extension, so nvcc must be available at runtime.
@@ -33,12 +37,15 @@ META = OpMeta(
         "TwoShotReduceScatter",
         "DcpAllToAll",
         "DcpAllToAllPool",
+        "SelectedRecordExchange",
+        "SelectedRecordExchangeInitializationError",
+        "SelectedRecordCopyExchange",
         "autotune_dma_crossovers",
         "parse_oneshot_max_size",
         "lse_reduce_scatter_reference",
         "is_supported",
     ),
-    dtypes=("bf16", "fp32", "fp8_e4m3"),
+    dtypes=("bf16", "fp32", "fp8_e4m3", "uint8"),
     requires=("multi_gpu",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/sparkinfer",
@@ -57,6 +64,9 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         DmaAllReduce,
         OneshotAllReduce,
         OneshotAllReducePool,
+        SelectedRecordExchange,
+        SelectedRecordExchangeInitializationError,
+        SelectedRecordCopyExchange,
         TwoShotReduceScatter,
         autotune_dma_crossovers,
         is_supported,
