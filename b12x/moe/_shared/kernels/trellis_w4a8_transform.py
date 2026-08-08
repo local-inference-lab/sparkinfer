@@ -211,7 +211,6 @@ class TrellisW4A8InputRotationKernel(_Hadamard128):
         stream: cuda.CUstream,
     ) -> None:
         routes = tokens * Int32(self.topk)
-        output_rows = tokens if self.broadcast_suh else routes
         source = cute.make_tensor(
             source_ptr,
             cute.make_ordered_layout((tokens, self.hidden_size), order=(1, 0)),
@@ -547,17 +546,38 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
 
 
 class TrellisW4A8ActivationRotationKernel(_Hadamard128):
-    """Undo FC1 output rotations, apply SiTU, then apply down SUH/H128."""
+    """Undo FC1 output rotations, apply the activation, then apply down SUH/H128."""
 
     threads = _THREADS
 
-    def __init__(self, *, fast_math: bool = False) -> None:
+    def __init__(self, *, activation: str, fast_math: bool = False) -> None:
+        activation = str(activation).lower()
+        if activation not in {"silu", "situ"}:
+            raise ValueError(
+                f"trellis W4A8 activation must be 'silu' or 'situ', got {activation!r}"
+            )
+        self.activation = activation
+        self.is_situ = activation == "situ"
         self.fast_math = bool(fast_math)
 
     @cute.jit
     def _sigmoid(self, x: Float32) -> Float32:
         e = cute.math.exp(-x, fastmath=self.fast_math)
         return Float32(1.0) / (Float32(1.0) + e)
+
+    @cute.jit
+    def _activate(self, gate: Float32, up: Float32) -> Float32:
+        if cutlass.const_expr(self.is_situ):
+            beta = Float32(SITU_DEFAULT_BETA)
+            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+            return (
+                beta
+                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                * self._sigmoid(gate)
+                * linear_beta
+                * cute.math.tanh(up / linear_beta, fastmath=self.fast_math)
+            )
+        return gate * self._sigmoid(gate) * up
 
     @cute.jit
     def __call__(
@@ -648,40 +668,10 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
             sd1 = rotations[scale_expert, 512 + col + Int32(1)].to(Float32)
             sd2 = rotations[scale_expert, 512 + col + Int32(2)].to(Float32)
             sd3 = rotations[scale_expert, 512 + col + Int32(3)].to(Float32)
-            beta = Float32(SITU_DEFAULT_BETA)
-            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
-            a0 = (
-                beta
-                * cute.math.tanh(ig0 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig0)
-                * linear_beta
-                * cute.math.tanh(iu0 / linear_beta, fastmath=self.fast_math)
-                * sd0
-            )
-            a1 = (
-                beta
-                * cute.math.tanh(ig1 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig1)
-                * linear_beta
-                * cute.math.tanh(iu1 / linear_beta, fastmath=self.fast_math)
-                * sd1
-            )
-            a2 = (
-                beta
-                * cute.math.tanh(ig2 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig2)
-                * linear_beta
-                * cute.math.tanh(iu2 / linear_beta, fastmath=self.fast_math)
-                * sd2
-            )
-            a3 = (
-                beta
-                * cute.math.tanh(ig3 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig3)
-                * linear_beta
-                * cute.math.tanh(iu3 / linear_beta, fastmath=self.fast_math)
-                * sd3
-            )
+            a0 = self._activate(ig0, iu0) * sd0
+            a1 = self._activate(ig1, iu1) * sd1
+            a2 = self._activate(ig2, iu2) * sd2
+            a3 = self._activate(ig3, iu3) * sd3
             if valid == Int32(0):
                 a0 = Float32(0.0)
                 a1 = Float32(0.0)
@@ -697,7 +687,7 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
 class TrellisW4A8ActivationRotationQuantKernel(
     TrellisW4A8ActivationRotationKernel, _NativeMXFP8
 ):
-    """Fuse inverse FC1 rotation, SiTU, down rotation, and MXFP8 quantization."""
+    """Fuse inverse FC1 rotation, activation, down rotation, and MXFP8 quantization."""
 
     groups_k = 8
 
@@ -810,40 +800,10 @@ class TrellisW4A8ActivationRotationQuantKernel(
             sd1 = rotations[scale_expert, 512 + col + Int32(1)].to(Float32)
             sd2 = rotations[scale_expert, 512 + col + Int32(2)].to(Float32)
             sd3 = rotations[scale_expert, 512 + col + Int32(3)].to(Float32)
-            beta = Float32(SITU_DEFAULT_BETA)
-            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
-            a0 = (
-                beta
-                * cute.math.tanh(ig0 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig0)
-                * linear_beta
-                * cute.math.tanh(iu0 / linear_beta, fastmath=self.fast_math)
-                * sd0
-            )
-            a1 = (
-                beta
-                * cute.math.tanh(ig1 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig1)
-                * linear_beta
-                * cute.math.tanh(iu1 / linear_beta, fastmath=self.fast_math)
-                * sd1
-            )
-            a2 = (
-                beta
-                * cute.math.tanh(ig2 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig2)
-                * linear_beta
-                * cute.math.tanh(iu2 / linear_beta, fastmath=self.fast_math)
-                * sd2
-            )
-            a3 = (
-                beta
-                * cute.math.tanh(ig3 / beta, fastmath=self.fast_math)
-                * self._sigmoid(ig3)
-                * linear_beta
-                * cute.math.tanh(iu3 / linear_beta, fastmath=self.fast_math)
-                * sd3
-            )
+            a0 = self._activate(ig0, iu0) * sd0
+            a1 = self._activate(ig1, iu1) * sd1
+            a2 = self._activate(ig2, iu2) * sd2
+            a3 = self._activate(ig3, iu3) * sd3
             if valid == Int32(0):
                 a0 = Float32(0.0)
                 a1 = Float32(0.0)
@@ -967,9 +927,13 @@ def _compile_input_rotation_quant(
 
 
 @functools.cache
-def _compile_activation_rotation(fast_math: bool, device_index: int):
-    launch = TrellisW4A8ActivationRotationKernel(fast_math=fast_math)
-    key = (bool(fast_math), int(device_index))
+def _compile_activation_rotation(
+    fast_math: bool, activation: str, device_index: int
+):
+    launch = TrellisW4A8ActivationRotationKernel(
+        activation=activation, fast_math=fast_math
+    )
+    key = (bool(fast_math), str(activation), int(device_index))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,
@@ -982,15 +946,19 @@ def _compile_activation_rotation(fast_math: bool, device_index: int):
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "moe.trellis_w4a8_activation_rotation", 1, key
+            "moe.trellis_w4a8_activation_rotation", 2, key
         ),
     )
 
 
 @functools.cache
-def _compile_activation_rotation_quant(fast_math: bool, device_index: int):
-    launch = TrellisW4A8ActivationRotationQuantKernel(fast_math=fast_math)
-    key = (bool(fast_math), int(device_index))
+def _compile_activation_rotation_quant(
+    fast_math: bool, activation: str, device_index: int
+):
+    launch = TrellisW4A8ActivationRotationQuantKernel(
+        activation=activation, fast_math=fast_math
+    )
+    key = (bool(fast_math), str(activation), int(device_index))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,
@@ -1005,7 +973,7 @@ def _compile_activation_rotation_quant(fast_math: bool, device_index: int):
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "moe.trellis_w4a8_activation_rotation_quant", 1, key
+            "moe.trellis_w4a8_activation_rotation_quant", 2, key
         ),
     )
 
@@ -1093,7 +1061,9 @@ def run_trellis_w4a8_activation_rotation(
     fast_math: bool = False,
 ) -> None:
     compiled = _compile_activation_rotation(
-        bool(fast_math), _device_index(gate.device)
+        bool(fast_math),
+        str(getattr(prepared, "activation", "")).lower(),
+        _device_index(gate.device),
     )
     compiled(
         _ptr(cutlass.Float16, gate.data_ptr()),
@@ -1116,10 +1086,12 @@ def run_trellis_w4a8_activation_rotation_quant(
     *,
     fast_math: bool = False,
 ) -> None:
-    """Apply SiTU/rotation directly into native-order MXFP8 rows."""
+    """Apply activation/rotation directly into native-order MXFP8 rows."""
 
     compiled = _compile_activation_rotation_quant(
-        bool(fast_math), _device_index(gate.device)
+        bool(fast_math),
+        str(getattr(prepared, "activation", "")).lower(),
+        _device_index(gate.device),
     )
     compiled(
         _ptr(cutlass.Float16, gate.data_ptr()),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -11,11 +12,22 @@ pytest.importorskip("cutlass")
 
 from b12x.moe import fused_moe
 from b12x.moe.fused_moe import META as FUSED_MOE_META
+from b12x.gemm._shared.wo_mxfp8 import (
+    dequantize_mxfp8_rows_torch,
+    quantize_mxfp8_rows_torch,
+)
+from b12x.moe._shared.kernels.trellis_w4a8 import (
+    make_trellis_w4a8_moe_scratch,
+    run_trellis_w4a8_moe,
+    view_trellis_w4a8_moe_scratch,
+)
+from b12x.moe._shared.kernels.trellis_w4a8_transform import (
+    TrellisW4A8ActivationRotationKernel,
+)
 from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.prepare import (
-    PreparedW4A16MoeWeights,
     prepare_qsrt_atom_moe_weights,
     prepare_qsrt_pair_moe_weights,
 )
@@ -27,6 +39,89 @@ _MCG = np.uint64(0xCBAC1FED)
 _MCG_MASK = np.uint32(0x8FFF8FFF)
 _MCG_OR = np.uint32(0x3B603B60)
 
+
+
+@pytest.mark.parametrize("shared_suh", [True, False])
+def test_trellis_w4a8_scratch_modes_have_allocation_free_prefix_views(
+    shared_suh: bool,
+) -> None:
+    max_m = 5
+    m = 2
+    topk = 3
+    hidden = 1024
+    scratch = make_trellis_w4a8_moe_scratch(
+        m=max_m,
+        topk=topk,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+        shared_suh=shared_suh,
+    )
+    expected_capacity_rows = max_m if shared_suh else max_m * topk
+    assert scratch.gate_quantized.values.shape == (expected_capacity_rows, hidden)
+    assert scratch.up_quantized.values.shape == (expected_capacity_rows, hidden)
+
+    view = view_trellis_w4a8_moe_scratch(
+        scratch, m=m, topk=topk, shared_suh=shared_suh
+    )
+    expected_rows = m if shared_suh else m * topk
+    assert view.gate_quantized.values.shape == (expected_rows, hidden)
+    assert view.up_quantized.values.shape == (expected_rows, hidden)
+    assert view.activated_quantized.values.shape == (m * topk, 256)
+    assert view.route_experts.shape == (m * topk,)
+    assert view.output.shape == (m, hidden)
+    for original, prefix in (
+        (scratch.gate_quantized, view.gate_quantized),
+        (scratch.up_quantized, view.up_quantized),
+        (scratch.activated_quantized, view.activated_quantized),
+    ):
+        assert prefix.values.data_ptr() == original.values.data_ptr()
+        assert prefix.scale_rows.data_ptr() == original.scale_rows.data_ptr()
+        assert prefix.scale_mma.data_ptr() == original.scale_mma.data_ptr()
+    assert view.route_experts.data_ptr() == scratch.route_experts.data_ptr()
+    assert view.output.data_ptr() == scratch.output.data_ptr()
+
+
+def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> None:
+    m = 2
+    topk = 3
+    hidden = 1024
+    experts = 4
+    source = torch.zeros((m, hidden), dtype=torch.float16)
+    ids = torch.zeros((m, topk), dtype=torch.int32)
+    weights = torch.zeros((m, topk), dtype=torch.float32)
+    shared_scratch = make_trellis_w4a8_moe_scratch(
+        m=m,
+        topk=topk,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+    )
+    assert shared_scratch.gate_quantized.values.shape == (m, hidden)
+    prepared = SimpleNamespace(
+        hidden_size=hidden,
+        intermediate_size=256,
+        num_experts=experts,
+        trellis_codebook="sqg_xor_cheb_t12",
+        activation="silu",
+        shared_suh=True,
+        gate_suh=torch.ones((1, hidden), dtype=torch.float16),
+        up_suh=torch.ones((experts, hidden), dtype=torch.float16),
+    )
+    with pytest.raises(ValueError, match="disagree with shared_suh"):
+        run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
+
+    prepared.gate_suh = torch.ones((experts, hidden), dtype=torch.float16)
+    prepared.shared_suh = False
+    with pytest.raises(
+        ValueError, match=r"scratch\.gate_quantized\.values must have shape"
+    ):
+        run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
+
+
+def test_trellis_w4a8_activation_dispatch_fails_closed() -> None:
+    with pytest.raises(ValueError, match="must be 'silu' or 'situ'"):
+        TrellisW4A8ActivationRotationKernel(activation="relu")
 
 def _weight_plan(
     *,
@@ -518,9 +613,6 @@ def _reference_full_rotation(
 ) -> torch.Tensor:
     device = x.device
     experts = int(w2.shape[0])
-    intermediate = int(w2.shape[1]) * 16
-    hidden = int(w2.shape[2]) * 16
-    hadamard = _hadamard_128(device)
     gate_weights = torch.stack(
         [_reconstruct_native(w13[0, expert]) for expert in range(experts)]
     ).to(device)
@@ -545,6 +637,13 @@ def _reference_full_rotation(
     )
 
 
+
+def _mxfp8_roundtrip(value: torch.Tensor) -> torch.Tensor:
+    quantized = quantize_mxfp8_rows_torch(value)
+    return dequantize_mxfp8_rows_torch(
+        quantized.values, quantized.scale_rows
+    )
+
 def _reference_full_rotation_decoded(
     x: torch.Tensor,
     local_ids: torch.Tensor,
@@ -558,9 +657,9 @@ def _reference_full_rotation_decoded(
     down_svh: torch.Tensor,
     *,
     activation: str = "silu",
+    mxfp8: bool = False,
 ) -> torch.Tensor:
     device = x.device
-    experts = int(down_weights.shape[0])
     intermediate = int(down_weights.shape[1])
     hidden = int(down_weights.shape[2])
     hadamard = _hadamard_128(device)
@@ -585,19 +684,22 @@ def _reference_full_rotation_decoded(
                 suh=up_suh[h_side_expert],
                 store_fp16=True,
             )
+            if mxfp8:
+                gate_a = _mxfp8_roundtrip(gate_a)
+                up_a = _mxfp8_roundtrip(up_a)
             gate = (gate_a.float() @ gate_weights[expert].float()).to(torch.float16)
             up = (up_a.float() @ up_weights[expert].float()).to(torch.float16)
             gate = _had128(
                 gate,
                 hadamard,
                 svh=gate_svh[expert],
-                store_fp16=True,
+                store_fp16=not mxfp8,
             )
             up = _had128(
                 up,
                 hadamard,
                 svh=up_svh[expert],
-                store_fp16=True,
+                store_fp16=not mxfp8,
             )
             if activation == "situ":
                 activated = (
@@ -606,17 +708,23 @@ def _reference_full_rotation_decoded(
                     * torch.sigmoid(gate.float())
                     * 25.0
                     * torch.tanh(up.float() / 25.0)
-                ).to(torch.float16)
+                )
             else:
-                activated = (
-                    gate.float() * torch.sigmoid(gate.float()) * up.float()
-                ).to(torch.float16)
-            down_a = _had128(
-                activated,
-                hadamard,
-                suh=down_suh[expert],
-                store_fp16=True,
-            )
+                activated = gate.float() * torch.sigmoid(gate.float()) * up.float()
+            if mxfp8:
+                down_a = _had128(
+                    activated * down_suh[expert].float(),
+                    hadamard,
+                    store_fp16=True,
+                )
+                down_a = _mxfp8_roundtrip(down_a)
+            else:
+                down_a = _had128(
+                    activated.to(torch.float16),
+                    hadamard,
+                    suh=down_suh[expert],
+                    store_fp16=True,
+                )
             down = (down_a.float() @ down_weights[expert].float()).to(torch.float16)
             route = _had128(
                 down,
@@ -646,8 +754,13 @@ def _qsrt_atom_extent_from_pair_payloads(
 
     _, experts, pair_words = w13_payload.shape
     hidden_tiles = pair_words // (8 * 16 * 6)
+    matrix_atom_bytes = hidden_tiles * 16 * 6 * 2
+    atom_trellis_bytes = 3 * matrix_atom_bytes
+    atom_bundle_bytes = atom_trellis_bytes + 3 * 64
     device = w13_payload.device
-    atoms = torch.zeros((8, experts, 129_216), dtype=torch.uint8, device=device)
+    atoms = torch.zeros(
+        (8, experts, atom_bundle_bytes), dtype=torch.uint8, device=device
+    )
 
     def store_matrix(
         payload: torch.Tensor,
@@ -657,7 +770,9 @@ def _qsrt_atom_extent_from_pair_payloads(
         fc1: bool,
     ) -> None:
         matrix_atoms = torch.zeros(
-            (8, experts, 21_504), dtype=torch.int16, device=device
+            (8, experts, matrix_atom_bytes // 2),
+            dtype=torch.int16,
+            device=device,
         )
         for mode, (low_bits, high_bits) in ((0, (3, 3)), (1, (2, 4))):
             ids = torch.nonzero(modes == mode, as_tuple=False).flatten()
@@ -686,14 +801,26 @@ def _qsrt_atom_extent_from_pair_payloads(
             selected_atoms = matrix_atoms.index_select(1, ids)
             selected_atoms[..., : joined.shape[-1]].copy_(joined)
             matrix_atoms.index_copy_(1, ids, selected_atoms)
-        atoms[:, :, offset : offset + 43_008].copy_(
-            matrix_atoms.contiguous().view(torch.uint8).reshape(8, experts, 43_008)
+        atoms[:, :, offset : offset + matrix_atom_bytes].copy_(
+            matrix_atoms.contiguous().view(torch.uint8).reshape(
+                8, experts, matrix_atom_bytes
+            )
         )
 
     store_matrix(w13_payload[0], fc1_modes, offset=0, fc1=True)
-    store_matrix(w13_payload[1], fc1_modes, offset=43_008, fc1=True)
-    store_matrix(w2_payload, fc2_modes, offset=86_016, fc1=False)
-    for matrix, offset in enumerate((129_024, 129_088, 129_152)):
+    store_matrix(
+        w13_payload[1], fc1_modes, offset=matrix_atom_bytes, fc1=True
+    )
+    store_matrix(
+        w2_payload, fc2_modes, offset=2 * matrix_atom_bytes, fc1=False
+    )
+    for matrix, offset in enumerate(
+        (
+            atom_trellis_bytes,
+            atom_trellis_bytes + 64,
+            atom_trellis_bytes + 128,
+        )
+    ):
         values = intermediate_rotations[:, matrix * 256 : (matrix + 1) * 256]
         scale_atoms = torch.cat(
             (
@@ -710,14 +837,18 @@ def _qsrt_atom_extent_from_pair_payloads(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("pair_case", ["P24", "P33", "PDYNAMIC"])
+@pytest.mark.parametrize("hidden", [256, 1024])
 def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     pair_case: str,
+    hidden: int,
 ) -> None:
     """Close compact FC1-N/FC2-K pairs through the actual routed kernel."""
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
     experts = topk = m = 2
-    hidden, intermediate = 256, 256
+    intermediate = 256
+    activation = "silu" if hidden == 1024 else "situ"
+    suh_rows = experts if hidden == 1024 else 1
     hidden_tiles = hidden // 16
     if pair_case == "PDYNAMIC":
         fc1_kinds = ["P24", "P33"]
@@ -771,13 +902,13 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     w13_payloads: list[list[torch.Tensor]] = [[], []]
     w13_decoded: list[list[torch.Tensor]] = [[], []]
     for projection in range(2):
-        for expert, kind in enumerate(fc1_kinds):
+        for kind in fc1_kinds:
             payload, decoded = make_pair(kind, (hidden_tiles, 8))
             w13_payloads[projection].append(payload)
             w13_decoded[projection].append(decoded)
     w2_payloads: list[torch.Tensor] = []
     w2_decoded: list[torch.Tensor] = []
-    for expert, kind in enumerate(fc2_kinds):
+    for kind in fc2_kinds:
         payload, decoded = make_pair(kind, (8, hidden_tiles), is_fc2=True)
         w2_payloads.append(payload)
         w2_decoded.append(decoded)
@@ -789,10 +920,16 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     def scales(shape: tuple[int, ...]) -> torch.Tensor:
         return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
 
-    gate_suh = scales((1, hidden)).contiguous()
-    up_suh = scales((1, hidden)).contiguous()
+    gate_suh = scales((suh_rows, hidden)).contiguous()
+    up_suh = scales((suh_rows, hidden)).contiguous()
     intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
-    down_svh = scales((1, hidden)).contiguous()
+    if suh_rows == experts:
+        expert_contrast = torch.tensor(
+            [[0.5], [1.5]], dtype=torch.float16, device=device
+        )
+        gate_suh.mul_(expert_contrast)
+        up_suh.mul_(expert_contrast)
+    down_svh = scales((suh_rows, hidden)).contiguous()
     atom_payload = _qsrt_atom_extent_from_pair_payloads(
         w13_payload,
         w2_payload,
@@ -800,7 +937,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         fc2_pair_spec,
         intermediate_rotations,
     )
-    expert_ids = torch.tensor([0, 12], dtype=torch.int32, device=device)
+    expert_ids = torch.tensor([0, 16], dtype=torch.int32, device=device)
     if pair_case == "P24":
         format_codes = torch.tensor([0x11, 0x11], dtype=torch.uint8, device=device)
     elif pair_case == "P33":
@@ -816,7 +953,10 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         hidden_size=hidden,
         intermediate_size=intermediate,
         num_experts=experts,
-        activation="situ",
+        atom_slots=16,
+        experts_per_layer=256,
+        rotation_multiplier=5,
+        activation=activation,
         gate_suh=gate_suh,
         up_suh=up_suh,
         down_svh=down_svh,
@@ -830,7 +970,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         hidden_size=hidden,
         intermediate_size=intermediate,
         num_experts=experts,
-        activation="situ",
+        activation=activation,
         fc1_pair_kind=fc1_pair_spec,
         fc2_pair_kind=fc2_pair_spec,
         gate_suh=gate_suh,
@@ -847,6 +987,10 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         prepared.intermediate_rotations, intermediate_rotations, rtol=0, atol=0
     )
     assert prepared.trellis_codebook == "sqg_xor_cheb_t12"
+    assert prepared.activation == activation
+    assert pair_prepared.activation == activation
+    assert prepared.shared_suh is (suh_rows == 1)
+    assert pair_prepared.shared_suh is (suh_rows == 1)
     assert prepared.fc1_trellis_pair_kind == "PDYNAMIC"
     assert prepared.fc2_trellis_pair_kind == "PDYNAMIC"
     assert torch.equal(prepared.fc1_trellis_pair_modes, fc1_pair_spec)
@@ -879,7 +1023,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
             prepared,
             router_weights,
             ids,
-            activation="situ",
+            activation=activation,
             intermediate_cache13=buffers.intermediate_cache13,
             intermediate_cache2=buffers.intermediate_cache2,
             output=buffers.output,
@@ -913,7 +1057,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         up_suh,
         intermediate_rotations,
         down_svh,
-        activation="situ",
+        activation=activation,
     )
     relative_error = (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
     cosine = torch.nn.functional.cosine_similarity(
@@ -921,13 +1065,58 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999
+    if hidden == 1024:
+        w4a8_scratch = make_trellis_w4a8_moe_scratch(
+            m=m,
+            topk=topk,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            device=device,
+            shared_suh=False,
+        )
+        assert w4a8_scratch.gate_quantized.values.shape[0] == m * topk
+        with pytest.raises(ValueError, match="disagree with shared_suh"):
+            run_trellis_w4a8_moe(
+                x,
+                replace(prepared, shared_suh=suh_rows != 1),
+                router_weights,
+                ids,
+                w4a8_scratch,
+            )
+        w4a8_actual = run_trellis_w4a8_moe(
+            x, prepared, router_weights, ids, w4a8_scratch
+        ).clone()
+        torch.cuda.synchronize(device)
+        w4a8_reference = _reference_full_rotation_decoded(
+            x,
+            ids,
+            router_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            gate_suh,
+            up_suh,
+            intermediate_rotations,
+            down_svh,
+            activation=activation,
+            mxfp8=True,
+        )
+        w4a8_relative_error = (
+            (w4a8_actual - w4a8_reference).norm()
+            / w4a8_reference.norm().clamp_min(1.0e-9)
+        )
+        w4a8_cosine = torch.nn.functional.cosine_similarity(
+            w4a8_actual.flatten(), w4a8_reference.flatten(), dim=0
+        )
+        assert float(w4a8_relative_error) <= 4.0e-2
+        assert float(w4a8_cosine) >= 0.998
 
     public_weight_plan = _weight_plan(
         num_experts=experts,
         hidden_size=hidden,
         intermediate_size=intermediate,
         input_dtype=x.dtype,
-        activation="situ",
+        activation=activation,
         storage_format="qsrt_atoms_v1",
         source_format="qsrt_sqg_e4m3",
     )
@@ -939,12 +1128,16 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         qsrt_layer_index=1,
         qsrt_expert_ids=expert_ids,
         qsrt_format_codes=format_codes,
+        qsrt_atom_slots=16,
+        qsrt_experts_per_layer=256,
+        qsrt_rotation_multiplier=5,
         gate_suh=gate_suh,
         up_suh=up_suh,
         down_svh=down_svh,
     )
     public_prepared = public_weights.representation_for("w4a16")
     assert torch.equal(public_prepared.w13, prepared.w13)
+    assert public_prepared.shared_suh is (suh_rows == 1)
     public_plan = _plan(
         public_weights,
         max_tokens=m,
@@ -989,7 +1182,10 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     experts = 2
     hidden = intermediate = 256
-    atoms = torch.zeros((8, experts, 129_216), dtype=torch.uint8, device=device)
+    atom_bundle_bytes = 3 * (32 * hidden * 3 // 8) + 3 * 64
+    atoms = torch.zeros(
+        (8, experts, atom_bundle_bytes), dtype=torch.uint8, device=device
+    )
     rotations = torch.ones((1, hidden), dtype=torch.float16, device=device)
     expert_ids = torch.tensor([0, 12], dtype=torch.int32, device=device)
     format_codes = torch.tensor([0x10, 0x01], dtype=torch.uint8, device=device)
@@ -1001,6 +1197,9 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
         hidden_size=hidden,
         intermediate_size=intermediate,
         num_experts=experts,
+        atom_slots=96,
+        experts_per_layer=896,
+        rotation_multiplier=5,
         activation="situ",
         gate_suh=rotations,
         up_suh=rotations,
@@ -1027,6 +1226,9 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
         qsrt_layer_index=1,
         qsrt_expert_ids=expert_ids,
         qsrt_format_codes=format_codes,
+        qsrt_atom_slots=96,
+        qsrt_experts_per_layer=896,
+        qsrt_rotation_multiplier=5,
         gate_suh=rotations,
         up_suh=rotations,
         down_svh=rotations,

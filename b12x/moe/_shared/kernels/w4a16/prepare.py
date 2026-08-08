@@ -29,14 +29,7 @@ _E8M0_K32_BF16_MAX_SCALE_BYTE = 247
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _QSRT_ATOM_CHANNELS = 32
 _QSRT_ATOMS_PER_PAIR = 8
-_QSRT_ATOMS_PER_EXPERT = 96
-_QSRT_MATRIX_ATOM_TRELLIS_BYTES = 43_008
 _QSRT_MATRIX_ATOM_SCALE_BYTES = 64
-_QSRT_ATOM_TRELLIS_BYTES = 129_024
-_QSRT_ATOM_BUNDLE_BYTES = 129_216
-_QSRT_MATRIX_TRELLIS_OFFSETS = (0, 43_008, 86_016)
-_QSRT_MATRIX_SCALE_OFFSETS = (129_024, 129_088, 129_152)
-_QSRT_EXPERT_ROTATION_MULTIPLIER = 5
 # Canonical W13 layout names are "w13"/"w31"; accept the physical FC1-half
 # spellings as aliases. Logical checkpoint order "w13" arrives up/gate and
 # needs a swap before the kernel's SwiGLU; "w31" is already kernel-native
@@ -143,6 +136,7 @@ class PreparedW4A16MoeWeights:
     params_dtype: torch.dtype
     fc1_tile_n: int
     fc2_tile_n: int
+    activation: str
     source_format: str = "qsrt_sqg_e4m3"
     w13_layout: str = "packed"
     weight_layout: str = "trellis3_t256"
@@ -169,6 +163,9 @@ class PreparedW4A16MoeWeights:
     intermediate_rotations: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
     tile_config: tuple[int, int, int, int] | None = None
+    # Explicit source rotation contract. QSRT preparation sets this to True
+    # for one shared gate/up row and False for per-expert rows.
+    shared_suh: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -1987,6 +1984,7 @@ def prepare_trellis256_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
+        activation=activation,
         source_format="exl3_trellis_mcg",
         w13_layout=w13_layout,
         weight_layout="trellis3_t256",
@@ -2493,6 +2491,7 @@ def prepare_qsrt_pair_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
+        activation=activation,
         source_format="qsrt_sqg_e4m3",
         w13_layout="trellis3_t256_proj",
         weight_layout="trellis3_t256",
@@ -2507,6 +2506,7 @@ def prepare_qsrt_pair_moe_weights(
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
+        shared_suh=gate_suh.shape[0] == 1,
         tile_config=tile_config,
     )
 
@@ -2521,6 +2521,9 @@ def prepare_qsrt_atom_moe_weights(
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
+    atom_slots: int,
+    experts_per_layer: int,
+    rotation_multiplier: int,
     activation: str,
     gate_suh: torch.Tensor,
     up_suh: torch.Tensor,
@@ -2533,22 +2536,24 @@ def prepare_qsrt_atom_moe_weights(
 ) -> PreparedW4A16MoeWeights:
     """Prepare one canonical QSRT atom extent for the fused decoder.
 
-    ``atom_payload`` is the de-padded checkpoint tensor
-    ``[atom_slots, E, 129216]u8``.  Storage is independent of a deployment's
-    shard count: every first-axis entry owns a complete 32-channel physical
-    atom.  The currently qualified fused kernel consumes one aligned extent of
-    eight atoms (256 channels), so this load-time transform restores its local
-    P24/P33 view without decoding or re-encoding any trellis symbols.
+    ``atom_payload`` is one de-padded checkpoint extent with eight complete
+    32-channel physical atoms. The atom bundle width is derived from
+    ``hidden_size``; ``atom_slots`` carries the checkpoint's global
+    intermediate-axis geometry. This load-time transform restores one local
+    P24/P33 pair without decoding or re-encoding any trellis symbols.
 
     Expert format bytes encode ``r13`` in the high nibble and ``r2`` in the
-    low nibble.  The physical atom rotation is inverted from ``layer_index``
-    and the global ``expert_ids``; no rank-local pair-mode side table exists in
-    the checkpoint.
+    low nibble. The physical atom rotation is inverted from ``layer_index``,
+    ``rotation_multiplier``, and the global ``expert_ids``; no rank-local
+    pair-mode side table exists in the checkpoint.
     """
 
     hidden_size = int(hidden_size)
     intermediate_size = int(intermediate_size)
     num_experts = int(num_experts)
+    atom_slots = int(atom_slots)
+    experts_per_layer = int(experts_per_layer)
+    rotation_multiplier = int(rotation_multiplier)
     if hidden_size <= 0 or hidden_size % 128:
         raise ValueError(
             "QSRT atoms require hidden_size to be a positive multiple "
@@ -2562,6 +2567,12 @@ def prepare_qsrt_atom_moe_weights(
         )
     if num_experts <= 0:
         raise ValueError("QSRT atoms require num_experts > 0")
+    if atom_slots <= 0 or atom_slots % _QSRT_ATOMS_PER_PAIR:
+        raise ValueError("QSRT atom_slots must be a positive multiple of eight")
+    if experts_per_layer <= 0:
+        raise ValueError("QSRT experts_per_layer must be positive")
+    if rotation_multiplier < 0:
+        raise ValueError("QSRT rotation_multiplier must be nonnegative")
     if not validate_activation(activation):
         raise ValueError("QSRT atoms require a gated expert activation")
     if params_dtype != torch.float16:
@@ -2570,20 +2581,29 @@ def prepare_qsrt_atom_moe_weights(
         raise TypeError("QSRT atom payloads must use torch.uint8")
     if not atom_payload.is_cuda:
         raise ValueError("QSRT atom preparation requires CUDA storage")
-    expected_atoms = (
-        _QSRT_ATOMS_PER_PAIR,
-        num_experts,
-        _QSRT_ATOM_BUNDLE_BYTES,
+    matrix_atom_trellis_bytes = _QSRT_ATOM_CHANNELS * hidden_size * 3 // 8
+    atom_trellis_bytes = 3 * matrix_atom_trellis_bytes
+    atom_bundle_bytes = atom_trellis_bytes + 3 * _QSRT_MATRIX_ATOM_SCALE_BYTES
+    matrix_trellis_offsets = (
+        0,
+        matrix_atom_trellis_bytes,
+        2 * matrix_atom_trellis_bytes,
     )
+    matrix_scale_offsets = (
+        atom_trellis_bytes,
+        atom_trellis_bytes + _QSRT_MATRIX_ATOM_SCALE_BYTES,
+        atom_trellis_bytes + 2 * _QSRT_MATRIX_ATOM_SCALE_BYTES,
+    )
+    expected_atoms = (_QSRT_ATOMS_PER_PAIR, num_experts, atom_bundle_bytes)
     if tuple(atom_payload.shape) != expected_atoms:
         raise ValueError(
             f"atom_payload must have shape {expected_atoms}, got "
             f"{tuple(atom_payload.shape)}"
         )
-    expected_inner_strides = (_QSRT_ATOM_BUNDLE_BYTES, 1)
+    expected_inner_strides = (atom_bundle_bytes, 1)
     if tuple(atom_payload.stride()[1:]) != expected_inner_strides or int(
         atom_payload.stride(0)
-    ) < num_experts * _QSRT_ATOM_BUNDLE_BYTES:
+    ) < num_experts * atom_bundle_bytes:
         raise ValueError(
             "QSRT atom payloads must be expert-major within each atom row; "
             "the row stride may include checkpoint alignment padding"
@@ -2591,14 +2611,12 @@ def prepare_qsrt_atom_moe_weights(
     device = atom_payload.device
     first_atom_slot = int(first_atom_slot)
     layer_index = int(layer_index)
-    if not 0 <= first_atom_slot < _QSRT_ATOMS_PER_EXPERT:
-        raise ValueError(
-            f"first_atom_slot must be in 0..{_QSRT_ATOMS_PER_EXPERT - 1}"
-        )
+    if not 0 <= first_atom_slot < atom_slots:
+        raise ValueError(f"first_atom_slot must be in 0..{atom_slots - 1}")
     if first_atom_slot % _QSRT_ATOMS_PER_PAIR:
         raise ValueError("the current QSRT kernel requires a pair-aligned atom extent")
-    if not 1 <= layer_index <= 92:
-        raise ValueError("layer_index must identify a Kimi-K3 MoE layer in 1..92")
+    if layer_index < 0:
+        raise ValueError("layer_index must be nonnegative")
 
     def _normalize_vector(name: str, value: torch.Tensor) -> torch.Tensor:
         if not isinstance(value, torch.Tensor):
@@ -2619,17 +2637,20 @@ def prepare_qsrt_atom_moe_weights(
 
     expert_ids_i32 = _normalize_vector("expert_ids", expert_ids)
     format_codes_i32 = _normalize_vector("format_codes", format_codes)
-    if not bool(torch.all((expert_ids_i32 >= 0) & (expert_ids_i32 < 896))):
-        raise ValueError("expert_ids must lie in 0..895")
+    if not bool(
+        torch.all((expert_ids_i32 >= 0) & (expert_ids_i32 < experts_per_layer))
+    ):
+        raise ValueError(f"expert_ids must lie in 0..{experts_per_layer - 1}")
     r13 = format_codes_i32 >> 4
     r2 = format_codes_i32 & 0xF
     if not bool(torch.all((r13 >= 0) & (r13 <= 2) & (r2 >= 0) & (r2 <= 2))):
         raise ValueError("compressed QSRT format codes must encode R0/R1/R2")
+    pair_count = atom_slots // _QSRT_ATOMS_PER_PAIR
     physical_pair = first_atom_slot // _QSRT_ATOMS_PER_PAIR
     rotation = (
-        _QSRT_EXPERT_ROTATION_MULTIPLIER * expert_ids_i32 + layer_index
-    ) % 12
-    logical_pair = (physical_pair - rotation) % 12
+        rotation_multiplier * expert_ids_i32 + layer_index
+    ) % pair_count
+    logical_pair = (physical_pair - rotation) % pair_count
     fc1_pair_modes = (logical_pair < r13).to(dtype=torch.int32).contiguous()
     fc2_pair_modes = (logical_pair < r2).to(dtype=torch.int32).contiguous()
     fc1_pair_kind = "PDYNAMIC"
@@ -2637,12 +2658,12 @@ def prepare_qsrt_atom_moe_weights(
 
     hidden_tiles = hidden_size // 16
     pair_words = hidden_tiles * 8 * 16 * 6
-    words_per_atom = _QSRT_MATRIX_ATOM_TRELLIS_BYTES // 2
+    words_per_atom = matrix_atom_trellis_bytes // 2
 
     def _matrix_words(matrix_index: int) -> torch.Tensor:
-        begin = _QSRT_MATRIX_TRELLIS_OFFSETS[matrix_index]
+        begin = matrix_trellis_offsets[matrix_index]
         raw = atom_payload.narrow(
-            2, begin, _QSRT_MATRIX_ATOM_TRELLIS_BYTES
+            2, begin, matrix_atom_trellis_bytes
         ).contiguous()
         return raw.view(torch.int16).reshape(
             _QSRT_ATOMS_PER_PAIR, num_experts, words_per_atom
@@ -2703,7 +2724,7 @@ def prepare_qsrt_atom_moe_weights(
     ).reshape(-1)
 
     def _local_scale(matrix_index: int) -> torch.Tensor:
-        begin = _QSRT_MATRIX_SCALE_OFFSETS[matrix_index]
+        begin = matrix_scale_offsets[matrix_index]
         raw = atom_payload.narrow(
             2, begin, _QSRT_MATRIX_ATOM_SCALE_BYTES
         ).contiguous()
@@ -2805,6 +2826,7 @@ def prepare_qsrt_atom_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
+        activation=activation,
         source_format="qsrt_sqg_e4m3",
         w13_layout="trellis3_t256_proj",
         weight_layout="trellis3_t256",
@@ -2820,6 +2842,7 @@ def prepare_qsrt_atom_moe_weights(
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
         tile_config=tile_config,
+        shared_suh=gate_suh.shape[0] == 1,
     )
 
 
